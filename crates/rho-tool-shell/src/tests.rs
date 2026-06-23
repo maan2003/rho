@@ -77,6 +77,30 @@ async fn accepts_timeout_argument_name() {
     assert_eq!(content["termination_reason"], "timeout");
 }
 
+#[tokio::test]
+async fn timeout_kills_shell_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("marker");
+    let tools = ShellTools::new(Duration::from_secs(30));
+    let result = tools
+        .call(ToolCall {
+            id: ToolCallId("call-1".to_owned()),
+            name: SHELL_COMMAND_TOOL_NAME.to_owned(),
+            tool_type: ToolType::Function,
+            arguments: json!({
+                "command": format!("sleep 2; touch {}", marker.display()),
+                "timeout": 1,
+            }),
+        })
+        .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    let content: Value = serde_json::from_str(&result.output.content).unwrap();
+    assert_eq!(content["timed_out"], true);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!marker.exists());
+}
+
 #[test]
 fn specs_expose_only_shell_command_and_apply_patch() {
     let tools = ShellTools::new(Duration::from_secs(2));

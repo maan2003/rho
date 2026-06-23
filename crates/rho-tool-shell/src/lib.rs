@@ -14,6 +14,7 @@ use anyhow::{Result, anyhow};
 use rho::{ToolCall, ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec, ToolType};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time;
 
@@ -144,14 +145,39 @@ impl ShellTools {
 
         let mut command = Command::new("sh");
         command.arg("-c").arg(&args.command);
+        command.kill_on_drop(true);
         if let Some(cwd) = args.cwd {
             command.current_dir(cwd);
         }
 
         let started = Instant::now();
-        let output = match time::timeout(timeout, command.output()).await {
-            Ok(output) => output?,
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        let mut child = command.spawn()?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
+        let stdout_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
+
+        let status = match time::timeout(timeout, child.wait()).await {
+            Ok(status) => status?,
             Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
                 return Ok(details_json(CommandDetails {
                     status: None,
                     signal: None,
@@ -168,29 +194,35 @@ impl ShellTools {
                 }));
             }
         };
+        let stdout = stdout_task
+            .await
+            .map_err(|error| anyhow!("stdout task failed: {error}"))??;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| anyhow!("stderr task failed: {error}"))??;
 
         let elapsed = started.elapsed();
         let duration_seconds = (Duration::from_secs(SLOW_COMMAND_EXEC_TIME_THRESHOLD_SECS)
             < elapsed)
             .then(|| elapsed.as_secs_f64().ceil() as u64);
-        let status = output.status.code();
+        let status_code = status.code();
         #[cfg(unix)]
-        let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+        let signal = std::os::unix::process::ExitStatusExt::signal(&status);
         #[cfg(not(unix))]
         let signal = None;
 
-        let (stdout, stdout_valid_utf8) = decode_output(output.stdout);
-        let (stderr, stderr_valid_utf8) = decode_output(output.stderr);
+        let (stdout, stdout_valid_utf8) = decode_output(stdout);
+        let (stderr, stderr_valid_utf8) = decode_output(stderr);
         let output = combine_output(&stdout, &stderr);
 
         let truncated = truncate::truncate_line_oriented(&output);
 
         Ok(details_json(CommandDetails {
-            status,
+            status: status_code,
             signal,
             timed_out: false,
             duration_seconds,
-            termination_reason: if output_status_success(status, signal) {
+            termination_reason: if output_status_success(status_code, signal) {
                 "exit"
             } else if signal.is_some() {
                 "signal"
