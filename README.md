@@ -98,7 +98,7 @@ Current parity is strongest around Tau's ChatGPT/Codex Responses path:
   and standard-library file locking.
 - Previous-response chaining, with stale chain recovery owned by the provider.
 - Encrypted reasoning replay, compaction items, message phase support,
-  prompt-cache keys, custom tool formats, provider-session model knobs, and
+  prompt-cache keys, custom tool formats, fixed Codex request shaping, and
   usage.
 - CBOR and redb transcript stores as concrete persistence building blocks.
 - Tool surface is intentionally limited to `shell_command` and `apply_patch`.

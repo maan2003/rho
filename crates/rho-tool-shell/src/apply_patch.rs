@@ -12,7 +12,21 @@ pub(crate) const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("apply_patch.lark
 
 pub(crate) fn apply_patch(patch: &str) -> Result<String> {
     let hunks = parse_patch(patch).map_err(anyhow::Error::msg)?;
-    let changes = apply_hunks(&hunks).map_err(|failure| anyhow::Error::msg(failure.message))?;
+    let changes = match apply_hunks(&hunks) {
+        Ok(changes) => changes,
+        Err(failure) => {
+            let message = if failure.changes.is_empty() {
+                failure.message
+            } else {
+                format!(
+                    "{}\n\n{}",
+                    failure.message,
+                    format_partial_summary(&failure.changes)
+                )
+            };
+            return Err(anyhow::Error::msg(message));
+        }
+    };
     Ok(format_summary(&changes))
 }
 
@@ -66,23 +80,26 @@ struct AppliedChange {
 #[derive(Debug, Eq, PartialEq)]
 struct ApplyPatchFailure {
     message: String,
+    changes: Vec<AppliedChange>,
 }
 
 impl ApplyPatchFailure {
-    fn new(message: impl Into<String>) -> Self {
+    fn new(message: impl Into<String>, changes: &[AppliedChange]) -> Self {
         Self {
             message: message.into(),
+            changes: changes.to_vec(),
         }
     }
 }
 
 fn apply_hunks(hunks: &[Hunk]) -> Result<Vec<AppliedChange>, ApplyPatchFailure> {
     if hunks.is_empty() {
-        return Err(ApplyPatchFailure::new("No files were modified."));
+        return Err(ApplyPatchFailure::new("No files were modified.", &[]));
     }
 
-    let cwd = std::env::current_dir()
-        .map_err(|error| ApplyPatchFailure::new(format!("Failed to get current dir: {error}")))?;
+    let cwd = std::env::current_dir().map_err(|error| {
+        ApplyPatchFailure::new(format!("Failed to get current dir: {error}"), &[])
+    })?;
     let mut changes = Vec::with_capacity(hunks.len());
 
     for hunk in hunks {
@@ -90,20 +107,23 @@ fn apply_hunks(hunks: &[Hunk]) -> Result<Vec<AppliedChange>, ApplyPatchFailure> 
             Hunk::Add { path, contents } => {
                 let abs = resolve_path(&cwd, path);
                 if read_optional_file(&abs)
-                    .map_err(ApplyPatchFailure::new)?
+                    .map_err(|message| ApplyPatchFailure::new(message, &changes))?
                     .is_some()
                 {
-                    return Err(ApplyPatchFailure::new(format!(
-                        "Add File target already exists: {}",
-                        render_path(&abs)
-                    )));
+                    return Err(ApplyPatchFailure::new(
+                        format!("Add File target already exists: {}", render_path(&abs)),
+                        &changes,
+                    ));
                 }
                 write_file_creating_parent(&abs, contents).map_err(|error| {
-                    ApplyPatchFailure::new(format!(
-                        "Failed to write file {}: {}",
-                        render_path(&abs),
-                        render_diagnostic(error)
-                    ))
+                    ApplyPatchFailure::new(
+                        format!(
+                            "Failed to write file {}: {}",
+                            render_path(&abs),
+                            render_diagnostic(error)
+                        ),
+                        &changes,
+                    )
                 })?;
                 changes.push(AppliedChange {
                     display_path: render_path(path),
@@ -113,16 +133,22 @@ fn apply_hunks(hunks: &[Hunk]) -> Result<Vec<AppliedChange>, ApplyPatchFailure> 
             Hunk::Delete { path } => {
                 let abs = resolve_path(&cwd, path);
                 if abs.is_dir() {
-                    return Err(ApplyPatchFailure::new(format!(
-                        "Failed to delete file {}",
-                        render_path(&abs)
-                    )));
+                    return Err(ApplyPatchFailure::new(
+                        format!("Failed to delete file {}", render_path(&abs)),
+                        &changes,
+                    ));
                 }
                 read_to_string_limited(&abs).map_err(|_| {
-                    ApplyPatchFailure::new(format!("Failed to delete file {}", render_path(&abs)))
+                    ApplyPatchFailure::new(
+                        format!("Failed to delete file {}", render_path(&abs)),
+                        &changes,
+                    )
                 })?;
                 fs::remove_file(&abs).map_err(|_| {
-                    ApplyPatchFailure::new(format!("Failed to delete file {}", render_path(&abs)))
+                    ApplyPatchFailure::new(
+                        format!("Failed to delete file {}", render_path(&abs)),
+                        &changes,
+                    )
                 })?;
                 changes.push(AppliedChange {
                     display_path: render_path(path),
@@ -136,56 +162,73 @@ fn apply_hunks(hunks: &[Hunk]) -> Result<Vec<AppliedChange>, ApplyPatchFailure> 
             } => {
                 let abs = resolve_path(&cwd, path);
                 let old_content = read_to_string_limited(&abs).map_err(|error| {
-                    ApplyPatchFailure::new(format!(
-                        "Failed to read file to update {}: {}",
-                        render_path(&abs),
-                        render_diagnostic(error)
-                    ))
+                    ApplyPatchFailure::new(
+                        format!(
+                            "Failed to read file to update {}: {}",
+                            render_path(&abs),
+                            render_diagnostic(error)
+                        ),
+                        &changes,
+                    )
                 })?;
                 let new_content = derive_new_contents_from_chunks(&abs, &old_content, chunks)
-                    .map_err(ApplyPatchFailure::new)?;
+                    .map_err(|message| ApplyPatchFailure::new(message, &changes))?;
 
                 if let Some(move_path) = move_path {
                     let dest_abs = resolve_path(&cwd, move_path);
                     if read_optional_file(&dest_abs)
-                        .map_err(ApplyPatchFailure::new)?
+                        .map_err(|message| ApplyPatchFailure::new(message, &changes))?
                         .is_some()
                     {
-                        return Err(ApplyPatchFailure::new(format!(
-                            "Move destination already exists: {}",
-                            render_path(&dest_abs)
-                        )));
+                        return Err(ApplyPatchFailure::new(
+                            format!(
+                                "Move destination already exists: {}",
+                                render_path(&dest_abs)
+                            ),
+                            &changes,
+                        ));
                     }
                     write_file_creating_parent(&dest_abs, &new_content).map_err(|error| {
-                        ApplyPatchFailure::new(format!(
-                            "Failed to write file {}: {}",
-                            render_path(&dest_abs),
-                            render_diagnostic(error)
-                        ))
+                        ApplyPatchFailure::new(
+                            format!(
+                                "Failed to write file {}: {}",
+                                render_path(&dest_abs),
+                                render_diagnostic(error)
+                            ),
+                            &changes,
+                        )
                     })?;
-                    if abs.is_dir() {
-                        return Err(ApplyPatchFailure::new(format!(
-                            "Failed to remove original {}",
-                            render_path(&abs)
-                        )));
-                    }
-                    fs::remove_file(&abs).map_err(|_| {
-                        ApplyPatchFailure::new(format!(
-                            "Failed to remove original {}",
-                            render_path(&abs)
-                        ))
-                    })?;
+                    let dest_write_change_index = changes.len();
                     changes.push(AppliedChange {
                         display_path: render_path(move_path),
-                        status: ChangeStatus::Modify,
+                        status: ChangeStatus::Add,
                     });
+                    if abs.is_dir() {
+                        return Err(ApplyPatchFailure::new(
+                            format!("Failed to remove original {}", render_path(&abs)),
+                            &changes,
+                        ));
+                    }
+                    fs::remove_file(&abs).map_err(|_| {
+                        ApplyPatchFailure::new(
+                            format!("Failed to remove original {}", render_path(&abs)),
+                            &changes,
+                        )
+                    })?;
+                    changes[dest_write_change_index] = AppliedChange {
+                        display_path: render_path(move_path),
+                        status: ChangeStatus::Modify,
+                    };
                 } else {
                     fs::write(&abs, new_content.as_bytes()).map_err(|error| {
-                        ApplyPatchFailure::new(format!(
-                            "Failed to write file {}: {}",
-                            render_path(&abs),
-                            render_diagnostic(error)
-                        ))
+                        ApplyPatchFailure::new(
+                            format!(
+                                "Failed to write file {}: {}",
+                                render_path(&abs),
+                                render_diagnostic(error)
+                            ),
+                            &changes,
+                        )
                     })?;
                     changes.push(AppliedChange {
                         display_path: render_path(path),
@@ -197,6 +240,24 @@ fn apply_hunks(hunks: &[Hunk]) -> Result<Vec<AppliedChange>, ApplyPatchFailure> 
     }
 
     Ok(changes)
+}
+
+fn format_partial_summary(changes: &[AppliedChange]) -> String {
+    let mut lines = vec!["Partial changes applied before failure:".to_owned()];
+    for status in [
+        ChangeStatus::Add,
+        ChangeStatus::Modify,
+        ChangeStatus::Delete,
+    ] {
+        for change in changes.iter().filter(|change| change.status == status) {
+            lines.push(format!(
+                "{} {}",
+                change.status.short_name(),
+                change.display_path
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 fn format_summary(changes: &[AppliedChange]) -> String {

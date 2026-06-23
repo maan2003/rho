@@ -38,6 +38,7 @@ fn add_file_rejects_existing_target() {
     .expect_err("add file should reject existing target");
 
     assert!(err.message.contains("Add File target already exists"));
+    assert!(err.changes.is_empty());
     assert_eq!(
         std::fs::read_to_string(&path).expect("read original"),
         "original\n"
@@ -67,4 +68,24 @@ fn applies_add_update_and_delete() {
     assert_eq!(std::fs::read_to_string(add_path).unwrap(), "new\n");
     assert_eq!(std::fs::read_to_string(update_path).unwrap(), "new\n");
     assert!(!delete_path.exists());
+}
+
+#[test]
+fn failed_patch_reports_partial_changes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let add_path = temp.path().join("added.txt");
+    let missing_path = temp.path().join("missing.txt");
+
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: {}\n+created\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch",
+        add_path.display(),
+        missing_path.display(),
+    );
+    let error = apply_patch(&patch).expect_err("second hunk should fail");
+    let message = error.to_string();
+
+    assert!(message.contains("Failed to read file to update"));
+    assert!(message.contains("Partial changes applied before failure:"));
+    assert!(message.contains(&format!("A {}", add_path.display())));
+    assert_eq!(std::fs::read_to_string(add_path).unwrap(), "created\n");
 }
