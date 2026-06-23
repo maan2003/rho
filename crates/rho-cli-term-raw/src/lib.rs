@@ -712,7 +712,7 @@ fn key_binding_for_event(key: KeyEvent, ctrl: bool) -> Option<KeyBinding> {
 }
 /// High-level events surfaced to the downstream event loop.
 pub enum Event {
-    /// The user submitted a line with Ctrl-Enter or `submit-prompt`
+    /// The user submitted a line with Enter, Ctrl-Enter, or `submit-prompt`
     /// outside the completion menu, or with no candidate selected.
     Line(String),
     /// The user signalled EOF (Ctrl-D on empty line).
@@ -2167,7 +2167,7 @@ impl Term {
                 if let Some(action) = self.binding_action(&binding) {
                     return Ok(Some(Event::Binding(action)));
                 }
-                return Ok(Some(self.insert_newline()));
+                return Ok(Some(self.submit_or_accept_completion()));
             }
 
             KeyCode::Char('d') if ctrl => {

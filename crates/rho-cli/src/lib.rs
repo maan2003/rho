@@ -397,6 +397,15 @@ impl ChatApp {
         };
         handle.abort();
         let _ = handle.await;
+        if let Err(error) = self
+            .agent
+            .lock()
+            .await
+            .cancel_current_turn("cancelled")
+            .await
+        {
+            self.term.print_error(&error.to_string());
+        }
         self.term.renderer_lock().finish_turn();
         if print_cancelled {
             self.term.print_system("cancelled");
@@ -470,6 +479,10 @@ impl ChatTerm {
 
     fn print_system(&self, text: &str) {
         print_system_on_handle(&self.handle, text);
+    }
+
+    fn print_error(&self, text: &str) {
+        print_error_on_handle(&self.handle, text);
     }
 
     fn print_history(&self, blocks: &[ItemBlock]) {

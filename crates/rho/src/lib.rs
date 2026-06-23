@@ -232,6 +232,19 @@ impl ToolResult {
         }
     }
 
+    pub fn cancelled(call_id: ToolCallId, reason: impl Into<String>) -> Self {
+        Self {
+            call_id,
+            tool_type: ToolType::Function,
+            status: ToolResultStatus::Cancelled {
+                reason: reason.into(),
+            },
+            output: ToolOutput {
+                content: String::new(),
+            },
+        }
+    }
+
     pub fn rendered_output(&self) -> String {
         match &self.status {
             ToolResultStatus::Success => self.output.content.clone(),

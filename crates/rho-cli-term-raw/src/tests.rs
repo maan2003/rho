@@ -4211,12 +4211,12 @@ fn terminal_scrollback_matches_known_lines_model_across_visible_churn() {
     );
 }
 
-/// Enter, Shift+Enter, and Alt+Enter all insert a `\n` at the cursor
-/// without submitting the line. Mirrors the affordance users expect
+/// Shift+Enter and Alt+Enter insert a `\n` at the cursor without submitting
+/// the line. Plain Enter submits. Mirrors the affordance users expect
 /// from chat UIs. Shift+Enter covers terminals that speak the kitty
 /// keyboard protocol; Alt+Enter (the `\e\r` byte sequence) is the
 /// universal fallback for terminals that don't.
-/// A buffer ending in `\n` (as produced by Enter / Shift+Enter / Alt+Enter)
+/// A buffer ending in `\n` (as produced by Shift+Enter / Alt+Enter)
 /// must render with an extra blank row so the cursor visibly lands
 /// on a new line — otherwise the prompt height doesn't grow until
 /// the next character is typed.
@@ -4257,16 +4257,16 @@ fn exact_width_prompt_end_grows_prompt_height_for_cursor() {
     assert_eq!(parser.screen().cursor_position(), (2, 0));
 }
 
-/// Enter, Shift-Enter, and Alt-Enter should insert newlines for multiline
-/// prompts, while Ctrl-Enter submits.
+/// Enter submits for chat-style prompts. Shift-Enter and Alt-Enter insert
+/// newlines for multiline prompts, while Ctrl-Enter also submits.
 #[test]
-fn enter_variants_insert_newline_and_ctrl_enter_submits() {
+fn enter_submits_and_modified_enter_inserts_newlines() {
     let buf = SharedBuffer::new();
     let (term, handle, input_tx) = Term::new_virtual(80, 24, "> ", Box::new(buf), CursorShape::Bar);
 
     handle.set_buffer("line one".to_owned(), "line one".len());
 
-    // Plain Enter: stay on the line, surface BufferChanged.
+    // Plain Enter submits.
     input_tx
         .send(RawEvent::Key(KeyEvent::new(
             KeyCode::Enter,
@@ -4275,11 +4275,11 @@ fn enter_variants_insert_newline_and_ctrl_enter_submits() {
         .expect("send enter");
     assert!(matches!(
         term.get_next_event().expect("event"),
-        Event::BufferChanged
+        Event::Line(line) if line == "line one"
     ));
-    assert_eq!(handle.get_buffer(), "line one\n");
+    assert_eq!(handle.get_buffer(), "");
 
-    // Shift+Enter: same behavior as plain Enter.
+    // Shift+Enter inserts a newline.
     handle.set_buffer("line one".to_owned(), "line one".len());
     input_tx
         .send(RawEvent::Key(KeyEvent::new(
@@ -4324,7 +4324,7 @@ fn enter_variants_insert_newline_and_ctrl_enter_submits() {
 }
 
 /// Enter and Ctrl-Enter can be bound explicitly; those bindings take precedence
-/// over the default newline and submit behavior, without stealing the explicit
+/// over the default submit behavior, without stealing the explicit
 /// Shift-Enter / Alt-Enter multiline affordance.
 #[test]
 fn enter_bindings_override_default_newline_and_submit() {

@@ -156,6 +156,46 @@ async fn run_until_idle_errors_when_step_limit_is_exhausted() {
 }
 
 #[tokio::test]
+async fn cancel_current_turn_records_assistant_cancellation() {
+    let provider = test_provider(|_request| async { Ok(text_response("done")) }.boxed());
+    let mut agent = Agent::new(provider);
+
+    agent.push_user_message("hello");
+    agent.step().await.unwrap();
+    agent.cancel_current_turn("cancelled").await.unwrap();
+
+    assert!(agent.is_idle());
+    assert!(
+        matches!(agent.items().last().map(|item| &item.kind), Some(ItemKind::Message(message)) if message.role == Role::Assistant && message.text_content() == "cancelled")
+    );
+}
+
+#[tokio::test]
+async fn cancel_current_turn_records_cancelled_tool_results() {
+    let provider = test_provider(|_request| {
+        async {
+            Ok(tool_call_response(
+                "call-1",
+                "shell_command",
+                json!({"command": "sleep 30"}),
+            ))
+        }
+        .boxed()
+    });
+    let mut agent = Agent::new(provider)
+        .with_tool(AgentTools::Shell(ShellTools::new(Duration::from_secs(120))));
+
+    agent.push_user_message("hello");
+    agent.run_until_idle(2).await.unwrap_err();
+    agent.cancel_current_turn("cancelled").await.unwrap();
+
+    assert!(agent.is_idle());
+    assert!(agent.items().iter().any(|item| {
+        matches!(&item.kind, ItemKind::ToolResult(result) if matches!(&result.status, rho::ToolResultStatus::Cancelled { reason } if reason == "cancelled"))
+    }));
+}
+
+#[tokio::test]
 async fn idle_step_after_final_answer_does_not_call_provider_again() {
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow, bail};
 use futures::future::{BoxFuture, FutureExt, join_all};
 use rho::{
-    Item, ItemBlock, ItemKind, Message, ProviderRequest, ProviderResponse, ReasoningText,
-    ReasoningTextKind, Role, ToolCall, ToolResult,
+    Item, ItemBlock, ItemKind, Message, MessagePhase, ProviderRequest, ProviderResponse,
+    ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult,
 };
 use rho_provider_responses::{ProviderSession, ResponsesUpdate};
 use rho_store_cbor::CborLog;
@@ -61,9 +61,14 @@ pub enum AgentState {
         future: ProviderFuture,
     },
     WaitingForTools {
-        futures: Vec<ToolFuture>,
+        futures: Vec<PendingToolCall>,
         results: Vec<ToolResult>,
     },
+}
+
+pub struct PendingToolCall {
+    pub call: ToolCall,
+    pub future: ToolFuture,
 }
 
 #[derive(Debug)]
@@ -180,6 +185,37 @@ impl Agent {
             .push_back(QueueItem::UserMessage(Message::text(Role::User, content)));
     }
 
+    pub async fn cancel_current_turn(&mut self, reason: impl Into<String>) -> Result<()> {
+        let reason = reason.into();
+        let state = std::mem::take(&mut self.state);
+        if let AgentState::WaitingForTools { futures, .. } = state {
+            let results = futures
+                .into_iter()
+                .map(|pending| {
+                    let mut result = ToolResult::cancelled(pending.call.id, reason.clone());
+                    result.tool_type = pending.call.tool_type;
+                    result
+                })
+                .collect::<Vec<_>>();
+            if !results.is_empty() {
+                let block = self.tool_results_to_block(results);
+                self.record_block(block).await?;
+            }
+        }
+        self.queue.clear();
+        self.pending_tool_results.clear();
+        let id = self.alloc_item_id();
+        self.record_block(ItemBlock::Local {
+            items: vec![Item {
+                id,
+                kind: ItemKind::Message(
+                    Message::text(Role::Assistant, reason).with_phase(MessagePhase::FinalAnswer),
+                ),
+            }],
+        })
+        .await
+    }
+
     pub async fn run_until_idle(&mut self, max_steps: usize) -> Result<usize> {
         for steps in 0..max_steps {
             if self.is_idle() {
@@ -230,7 +266,7 @@ impl Agent {
                 futures,
                 mut results,
             } => {
-                results.extend(join_all(futures).await);
+                results.extend(join_all(futures.into_iter().map(|pending| pending.future)).await);
                 self.push_tool_results(results);
                 self.start_next_request().await?
             }
@@ -318,7 +354,8 @@ impl Agent {
                     .ok_or_else(|| anyhow!("no tool registered for {}", call.name))
                     .map(|tool| tool.call(call.clone()))?;
                 let agent_updates = self.agent_updates.clone();
-                Ok(async move {
+                let pending_call = call.clone();
+                let future = async move {
                     notify_agent_update(&agent_updates, AgentUpdate::ToolCallStarted(call));
                     let result = future.await;
                     notify_agent_update(
@@ -327,7 +364,11 @@ impl Agent {
                     );
                     result
                 }
-                .boxed())
+                .boxed();
+                Ok(PendingToolCall {
+                    call: pending_call,
+                    future,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
