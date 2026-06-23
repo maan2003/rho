@@ -27,6 +27,8 @@ use rho_provider_responses::{
 };
 use rho_store_cbor::CborLog;
 use rho_tool_shell::ShellTools;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
 
 #[cfg(test)]
 mod tests;
@@ -248,7 +250,11 @@ async fn run_interactive(args: ChatArgs) -> Result<()> {
     let term = ChatTerm::new()?;
     let agent = build_agent(&args, Some(term.renderer())).await?;
     term.print_history(agent.blocks());
-    let mut app = ChatApp { agent, term };
+    let mut app = ChatApp {
+        agent: Arc::new(AsyncMutex::new(agent)),
+        running_turn: None,
+        term,
+    };
     app.run().await
 }
 
@@ -314,13 +320,15 @@ fn build_provider_session(args: &ChatArgs) -> ProviderSession {
 }
 
 struct ChatApp {
-    agent: Agent,
+    agent: Arc<AsyncMutex<Agent>>,
+    running_turn: Option<JoinHandle<()>>,
     term: ChatTerm,
 }
 
 impl ChatApp {
     async fn run(&mut self) -> Result<()> {
         loop {
+            self.reap_finished_turn().await;
             match self.term.term.get_next_event()? {
                 Event::Line(line) => {
                     let line = line.trim().to_owned();
@@ -328,22 +336,28 @@ impl ChatApp {
                         continue;
                     }
                     if matches!(line.as_str(), "/quit" | "/exit") {
+                        self.stop_running_turn(false).await;
                         break;
+                    }
+                    if self.turn_is_running() {
+                        self.term
+                            .print_system("agent is running; press Ctrl-C twice to cancel");
+                        continue;
                     }
                     self.term.print_user(&line);
                     self.term.set_status("running");
-                    self.agent.push_user_message(line);
-                    match self.agent.run_until_idle(MAX_AGENT_STEPS_PER_PROMPT).await {
-                        Ok(_) => self.term.renderer_lock().finish_turn(),
-                        Err(error) => {
-                            self.term.renderer_lock().finish_turn();
-                            self.term.print_error(&error.to_string());
-                        }
-                    }
-                    self.term.set_status("/quit");
+                    self.running_turn = Some(spawn_agent_turn(
+                        Arc::clone(&self.agent),
+                        line,
+                        self.term.renderer(),
+                        self.term.handle.clone(),
+                    ));
                 }
-                Event::Eof => break,
-                Event::CancelPrompt => self.term.print_system("cancel is not wired yet"),
+                Event::Eof => {
+                    self.stop_running_turn(false).await;
+                    break;
+                }
+                Event::CancelPrompt => self.cancel_running_turn().await,
                 Event::Resize { .. } | Event::BufferChanged | Event::CompletionAccept => {}
                 Event::FocusChanged { .. } => {}
                 Event::BackTab | Event::Escape | Event::ExternalEditor | Event::Binding(_) => {}
@@ -352,6 +366,65 @@ impl ChatApp {
         }
         Ok(())
     }
+
+    fn turn_is_running(&self) -> bool {
+        self.running_turn
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    async fn reap_finished_turn(&mut self) {
+        let Some(handle) = self.running_turn.take() else {
+            return;
+        };
+        if handle.is_finished() {
+            let _ = handle.await;
+        } else {
+            self.running_turn = Some(handle);
+        }
+    }
+
+    async fn cancel_running_turn(&mut self) {
+        self.stop_running_turn(true).await;
+    }
+
+    async fn stop_running_turn(&mut self, print_cancelled: bool) {
+        let Some(handle) = self.running_turn.take() else {
+            if print_cancelled {
+                self.term.print_system("nothing running");
+            }
+            return;
+        };
+        handle.abort();
+        let _ = handle.await;
+        self.term.renderer_lock().finish_turn();
+        if print_cancelled {
+            self.term.print_system("cancelled");
+        }
+        self.term.set_status("/quit");
+    }
+}
+
+fn spawn_agent_turn(
+    agent: Arc<AsyncMutex<Agent>>,
+    line: String,
+    renderer: UpdateRenderer,
+    handle: TermHandle,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = {
+            let mut agent = agent.lock().await;
+            agent.push_user_message(line);
+            agent.run_until_idle(MAX_AGENT_STEPS_PER_PROMPT).await
+        };
+        if let Ok(mut renderer) = renderer.lock() {
+            renderer.finish_turn();
+        }
+        if let Err(error) = result {
+            print_error_on_handle(&handle, &error.to_string());
+        }
+        set_status_on_handle(&handle, "/quit");
+    })
 }
 
 type UpdateRenderer = Arc<Mutex<StreamingRenderer>>;
@@ -396,25 +469,7 @@ impl ChatTerm {
     }
 
     fn print_system(&self, text: &str) {
-        self.handle.print_output(
-            "system",
-            StyledBlock::new(StyledText::from(Span::new(
-                text.to_owned(),
-                Style::default().fg(Color::DarkGrey),
-            )))
-            .margin_left(1),
-        );
-    }
-
-    fn print_error(&self, text: &str) {
-        self.handle.print_output(
-            "error",
-            StyledBlock::new(StyledText::from(vec![
-                Span::new("error\n", Style::default().fg(Color::DarkRed).bold()),
-                Span::plain(text.to_owned()),
-            ]))
-            .margin_left(1),
-        );
+        print_system_on_handle(&self.handle, text);
     }
 
     fn print_history(&self, blocks: &[ItemBlock]) {
@@ -470,9 +525,35 @@ impl ChatTerm {
     }
 
     fn set_status(&self, text: &str) {
-        self.handle.set_right_prompt(dim_text(text));
-        self.handle.redraw();
+        set_status_on_handle(&self.handle, text);
     }
+}
+
+fn print_system_on_handle(handle: &TermHandle, text: &str) {
+    handle.print_output(
+        "system",
+        StyledBlock::new(StyledText::from(Span::new(
+            text.to_owned(),
+            Style::default().fg(Color::DarkGrey),
+        )))
+        .margin_left(1),
+    );
+}
+
+fn print_error_on_handle(handle: &TermHandle, text: &str) {
+    handle.print_output(
+        "error",
+        StyledBlock::new(StyledText::from(vec![
+            Span::new("error\n", Style::default().fg(Color::DarkRed).bold()),
+            Span::plain(text.to_owned()),
+        ]))
+        .margin_left(1),
+    );
+}
+
+fn set_status_on_handle(handle: &TermHandle, text: &str) {
+    handle.set_right_prompt(dim_text(text));
+    handle.redraw();
 }
 
 #[derive(Default)]
