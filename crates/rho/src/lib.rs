@@ -24,7 +24,7 @@ pub enum ItemBlock {
         items: Vec<Item>,
     },
     ProviderResponse {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         provider_response_id: Option<String>,
         items: Vec<Item>,
     },
@@ -43,7 +43,7 @@ pub enum ItemKind {
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentPart>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<MessagePhase>,
 }
 
@@ -73,7 +73,7 @@ pub struct ToolSpec {
     pub tool_type: ToolType,
     pub description: String,
     pub input_schema: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<ToolFormat>,
 }
 
@@ -253,5 +253,75 @@ impl ToolResult {
             }
             ToolResultStatus::Cancelled { reason } => format!("cancelled: {reason}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn optional_core_fields_serialize_only_when_present() {
+        let message = Message::text(Role::User, "hello");
+        let message_json = serde_json::to_value(&message).unwrap();
+        assert!(message_json.get("phase").is_none());
+
+        let tool = ToolSpec {
+            name: "shell_command".to_owned(),
+            tool_type: ToolType::Function,
+            description: "run a shell command".to_owned(),
+            input_schema: json!({"type": "object"}),
+            format: None,
+        };
+        let tool_json = serde_json::to_value(&tool).unwrap();
+        assert!(tool_json.get("format").is_none());
+
+        let block = ItemBlock::ProviderResponse {
+            provider_response_id: None,
+            items: Vec::new(),
+        };
+        let block_json = serde_json::to_value(&block).unwrap();
+        assert!(
+            block_json
+                .get("ProviderResponse")
+                .unwrap()
+                .get("provider_response_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn optional_core_fields_deserialize_when_missing() {
+        let message: Message = serde_json::from_value(json!({
+            "role": "User",
+            "content": [{ "Text": { "text": "hello" } }]
+        }))
+        .unwrap();
+        assert_eq!(message.phase, None);
+
+        let tool: ToolSpec = serde_json::from_value(json!({
+            "name": "shell_command",
+            "tool_type": "Function",
+            "description": "run a shell command",
+            "input_schema": { "type": "object" }
+        }))
+        .unwrap();
+        assert_eq!(tool.format, None);
+
+        let block: ItemBlock = serde_json::from_value(json!({
+            "ProviderResponse": {
+                "items": []
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            block,
+            ItemBlock::ProviderResponse {
+                provider_response_id: None,
+                items: Vec::new()
+            }
+        );
     }
 }

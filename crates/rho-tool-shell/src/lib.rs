@@ -32,9 +32,7 @@ pub struct ShellTools {
 struct ShellArgs {
     #[serde(alias = "cmd")]
     command: String,
-    #[serde(default)]
     cwd: Option<String>,
-    #[serde(default)]
     timeout: Option<u64>,
 }
 
