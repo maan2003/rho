@@ -8,16 +8,12 @@ use serde_json::{Value, json};
 
 use crate::{
     ContextManagementRequest, ProviderSession, ReasoningContext, ReasoningEffort, ReasoningRequest,
-    ReasoningSummary, ResponsesConfig, ResponsesRequest, ServiceTier, TextRequest, ToolChoice,
-    Verbosity, encode_tool_name,
+    ReasoningSummary, ResponsesRequest, ServiceTier, TextRequest, ToolChoice, Verbosity,
+    encode_tool_name,
 };
 
 impl ResponsesRequest {
-    pub fn from_provider_request(
-        config: &ResponsesConfig,
-        session: &ProviderSession,
-        request: ProviderRequest,
-    ) -> Self {
+    pub fn from_provider_request(session: &ProviderSession, request: ProviderRequest) -> Self {
         let mut previous_response = None;
         for (index, block) in request.input.iter().enumerate() {
             let ItemBlock::ProviderResponse {
@@ -43,19 +39,17 @@ impl ResponsesRequest {
             }
         }
 
-        Self::from_provider_request_with_previous(config, session, request, previous_response)
+        Self::from_provider_request_with_previous(session, request, previous_response)
     }
 
     pub(crate) fn from_provider_request_full_replay(
-        config: &ResponsesConfig,
         session: &ProviderSession,
         request: ProviderRequest,
     ) -> Self {
-        Self::from_provider_request_with_previous(config, session, request, None)
+        Self::from_provider_request_with_previous(session, request, None)
     }
 
     fn from_provider_request_with_previous(
-        config: &ResponsesConfig,
         session: &ProviderSession,
         request: ProviderRequest,
         previous_response: Option<(String, usize)>,
@@ -81,11 +75,7 @@ impl ResponsesRequest {
             })
             .map(|item| item.kind.clone())
             .collect::<Vec<_>>();
-        let input_items = if config.supports_compaction {
-            trim_before_latest_compaction(&input_items)
-        } else {
-            input_items.as_slice()
-        };
+        let input_items = trim_before_latest_compaction(&input_items);
         let local_tool_wire_names = request
             .tools
             .iter()
@@ -97,7 +87,7 @@ impl ResponsesRequest {
             .map(convert_tool_spec)
             .collect::<Vec<_>>();
         for item in input_items.iter().cloned() {
-            convert_item_kind(config, &local_tool_wire_names, item, &mut input);
+            convert_item_kind(&local_tool_wire_names, item, &mut input);
         }
         let tool_choice = match (session.tool_choice, tools.is_empty()) {
             (ToolChoice::None, _) => Some("none"),
@@ -106,22 +96,13 @@ impl ResponsesRequest {
         };
         let temperature = session.temperature;
         let max_output_tokens = session.max_output_tokens;
-        let effort = config
-            .supports_reasoning_effort
-            .then_some(session.reasoning_effort)
-            .flatten();
-        let summary = config
-            .supports_reasoning_summary
-            .then_some(reasoning_summary_wire(session.reasoning_summary))
-            .flatten();
+        let effort = session.reasoning_effort;
+        let summary = reasoning_summary_wire(session.reasoning_summary);
         let verbosity = session.verbosity;
         let service_tier = session.service_tier;
         let prompt_cache_key = session.prompt_cache_key.clone();
         let previous_response_id = previous_response.map(|(id, _)| id);
-        let active_compaction = config
-            .supports_compaction
-            .then_some(config.compaction.as_ref())
-            .flatten();
+        let active_compaction = session.compaction.as_ref();
         if active_compaction.is_some() {
             input.insert(0, json!({"type": "compaction_trigger"}));
         }
@@ -129,9 +110,11 @@ impl ResponsesRequest {
             .map(|compaction| {
                 vec![ContextManagementRequest {
                     ty: "compaction",
-                    compact_threshold: Some(compaction.compact_threshold.unwrap_or_else(|| {
-                        provider_default_compaction_threshold(config.context_window)
-                    })),
+                    compact_threshold: Some(
+                        compaction
+                            .compact_threshold
+                            .unwrap_or_else(provider_default_compaction_threshold),
+                    ),
                 }]
             })
             .unwrap_or_default();
@@ -142,7 +125,7 @@ impl ResponsesRequest {
             input,
             temperature,
             max_output_tokens,
-            store: Some(config.surface.store_value()),
+            store: Some(false),
             tools,
             tool_choice,
             reasoning: (effort.is_some() || summary.is_some()).then(|| ReasoningRequest {
@@ -150,22 +133,15 @@ impl ResponsesRequest {
                 effort: effort.map(effort_wire),
                 summary,
             }),
-            text: config.supports_verbosity.then_some(TextRequest {
+            text: Some(TextRequest {
                 verbosity: verbosity.map(verbosity_wire).unwrap_or("medium"),
             }),
-            include: if config.supports_encrypted_reasoning {
-                vec!["reasoning.encrypted_content"]
-            } else {
-                Vec::new()
-            },
-            prompt_cache_key: config
-                .supports_prompt_cache_key
-                .then_some(prompt_cache_key)
-                .flatten(),
+            include: vec!["reasoning.encrypted_content"],
+            prompt_cache_key,
             service_tier: service_tier.map(service_tier_wire),
             context_management,
             previous_response_id,
-            extra_body: config.extra_body.clone(),
+            extra_body: session.extra_body.clone(),
         }
     }
 }
@@ -180,13 +156,12 @@ fn instruction_text_from_item(item: &ItemKind) -> Option<String> {
 }
 
 fn convert_item_kind(
-    config: &ResponsesConfig,
     local_tool_wire_names: &BTreeMap<String, String>,
     item: ItemKind,
     out: &mut Vec<Value>,
 ) {
     match item {
-        ItemKind::Message(message) => convert_message(config, message, out),
+        ItemKind::Message(message) => convert_message(message, out),
         ItemKind::ToolCall(call) => {
             let wire_name = local_tool_wire_names
                 .get(&call.name)
@@ -231,22 +206,21 @@ fn convert_item_kind(
         }
         ItemKind::ToolResult(result) => out.push(convert_tool_result(result)),
         ItemKind::ReasoningText(_) => {}
-        ItemKind::ProviderItem(item) if should_replay_provider_item(config, item.kind) => {
+        ItemKind::ProviderItem(item) if should_replay_provider_item(item.kind) => {
             out.push(item.payload);
         }
         ItemKind::ProviderItem(_) => {}
     }
 }
 
-fn should_replay_provider_item(config: &ResponsesConfig, kind: ProviderItemKind) -> bool {
+fn should_replay_provider_item(kind: ProviderItemKind) -> bool {
     match kind {
-        ProviderItemKind::Reasoning => config.supports_encrypted_reasoning,
-        ProviderItemKind::Compaction => config.supports_compaction,
+        ProviderItemKind::Reasoning | ProviderItemKind::Compaction => true,
         ProviderItemKind::Unknown => false,
     }
 }
 
-fn convert_message(config: &ResponsesConfig, message: Message, out: &mut Vec<Value>) {
+fn convert_message(message: Message, out: &mut Vec<Value>) {
     let text = message.text_content();
     match message.role {
         Role::System | Role::Developer => {}
@@ -267,11 +241,9 @@ fn convert_message(config: &ResponsesConfig, message: Message, out: &mut Vec<Val
                     "annotations": [],
                 }],
             });
-            if config.supports_phase {
-                item["phase"] = json!(message_phase_wire(
-                    message.phase.unwrap_or(MessagePhase::FinalAnswer)
-                ));
-            }
+            item["phase"] = json!(message_phase_wire(
+                message.phase.unwrap_or(MessagePhase::FinalAnswer)
+            ));
             out.push(item);
         }
     }
@@ -373,8 +345,8 @@ fn service_tier_wire(service_tier: ServiceTier) -> &'static str {
     }
 }
 
-fn provider_default_compaction_threshold(context_window: u64) -> u64 {
-    (context_window * 9 / 10).max(1000)
+fn provider_default_compaction_threshold() -> u64 {
+    (crate::DEFAULT_CONTEXT_WINDOW * 9 / 10).max(1000)
 }
 
 fn trim_before_latest_compaction(input_items: &[ItemKind]) -> &[ItemKind] {

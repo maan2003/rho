@@ -13,7 +13,7 @@ use rho::{
     Item, ItemBlock, ItemKind, Message, ProviderRequest, ProviderResponse, ReasoningText,
     ReasoningTextKind, Role, ToolResult,
 };
-use rho_provider_responses::{ProviderSession, ResponsesProvider, ResponsesUpdate};
+use rho_provider_responses::{ProviderSession, ResponsesUpdate};
 use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use rho_tool_shell::ShellTools;
@@ -24,10 +24,7 @@ type ProviderUpdateHandler = Arc<Mutex<Box<dyn FnMut(ResponsesUpdate) + Send>>>;
 pub type StreamedTranscript = Arc<Mutex<StreamingTranscript>>;
 
 pub enum AgentProvider {
-    Responses {
-        provider: Box<ResponsesProvider>,
-        session: ProviderSession,
-    },
+    Responses(Box<ProviderSession>),
     #[cfg(test)]
     Test {
         complete: Arc<
@@ -500,8 +497,8 @@ impl AgentProvider {
         streamed_transcript: StreamedTranscript,
     ) -> ProviderFuture {
         match self {
-            AgentProvider::Responses { provider, session } => provider
-                .complete_streaming(session, request, move |update| {
+            AgentProvider::Responses(session) => session
+                .complete_streaming(request, move |update| {
                     streamed_transcript
                         .lock()
                         .expect("streamed transcript lock")

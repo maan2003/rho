@@ -1,10 +1,14 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_util::{Sink, Stream};
 use rho::{Item, ItemBlock, ItemId, ToolFormat, ToolGrammarSyntax, ToolResult, ToolType};
 use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use super::oauth::ResolvedAuth;
+use super::ws::{WebSocketPoolKey, WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 
 fn first_message(response: &ProviderResponse) -> &Message {
@@ -76,26 +80,14 @@ impl Sink<WsMessage> for PendingSocket {
 fn builds_responses_request_with_tools_and_item_timeline() {
     let mut extra_body = BTreeMap::new();
     extra_body.insert("metadata".to_owned(), json!({"project": "rho"}));
-    let config = ResponsesConfig {
-        supports_reasoning_effort: true,
-        supports_reasoning_summary: true,
-        supports_verbosity: true,
-        supports_prompt_cache_key: true,
-        supports_encrypted_reasoning: true,
-        extra_body,
-        ..Default::default()
-    };
-    let session = ProviderSession {
-        model: "gpt-test".to_owned(),
-        temperature: Some(0.5),
-        max_output_tokens: None,
-        reasoning_effort: Some(ReasoningEffort::Medium),
-        reasoning_summary: ReasoningSummary::Detailed,
-        verbosity: Some(Verbosity::High),
-        service_tier: Some(ServiceTier::Flex),
-        tool_choice: ToolChoice::Auto,
-        prompt_cache_key: Some("cache-key".to_owned()),
-    };
+    let mut session = ProviderSession::new("gpt-test");
+    session.extra_body = extra_body;
+    session.temperature = Some(0.5);
+    session.reasoning_effort = Some(ReasoningEffort::Medium);
+    session.reasoning_summary = ReasoningSummary::Detailed;
+    session.verbosity = Some(Verbosity::High);
+    session.service_tier = Some(ServiceTier::Flex);
+    session.prompt_cache_key = Some("cache-key".to_owned());
     let request = ProviderRequest {
         input: vec![
             ItemBlock::Local {
@@ -142,7 +134,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
         }],
     };
 
-    let body = ResponsesRequest::from_provider_request(&config, &session, request);
+    let body = ResponsesRequest::from_provider_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["model"], "gpt-test");
@@ -155,7 +147,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     assert_eq!(json["input"][2]["type"], "function_call_output");
     assert_eq!(json["tools"][0]["name"], "shell_run");
     assert_eq!(json["tool_choice"], "auto");
-    assert_eq!(json["store"], true);
+    assert_eq!(json["store"], false);
     assert_eq!(json["reasoning"]["effort"], "medium");
     assert_eq!(json["reasoning"]["summary"], "detailed");
     assert_eq!(json["reasoning"]["context"], "all_turns");
@@ -169,10 +161,8 @@ fn builds_responses_request_with_tools_and_item_timeline() {
 
 #[test]
 fn serializes_forced_no_tool_choice_without_declared_tools() {
-    let session = ProviderSession {
-        tool_choice: ToolChoice::None,
-        ..ProviderSession::new("gpt-test")
-    };
+    let mut session = ProviderSession::new("gpt-test");
+    session.tool_choice = ToolChoice::None;
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -183,29 +173,10 @@ fn serializes_forced_no_tool_choice_without_declared_tools() {
         tools: Vec::new(),
     };
 
-    let body =
-        ResponsesRequest::from_provider_request(&ResponsesConfig::default(), &session, request);
+    let body = ResponsesRequest::from_provider_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["tool_choice"], "none");
-}
-
-#[test]
-fn chatgpt_codex_config_enables_websocket_pool() {
-    let config = ResponsesConfig::chatgpt_codex(ResponsesAuth::None);
-
-    assert_eq!(
-        config.websocket_pool_max_connections,
-        DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS
-    );
-    assert_eq!(
-        config.websocket_pool_max_connection_age_secs,
-        DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS
-    );
-    assert_eq!(
-        config.websocket_pool_checkout_wait_ms,
-        DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS
-    );
 }
 
 #[test]
@@ -214,10 +185,8 @@ fn websocket_pool_key_requires_chatgpt_pool_and_prompt_cache_key() {
         bearer_token: "token".to_owned(),
         account_id: Some("acct".to_owned()),
     };
-    let mut config = ResponsesConfig::chatgpt_codex(ResponsesAuth::None);
     let session = ProviderSession::new("gpt-test").with_prompt_cache_key("thread-1");
     let mut body = ResponsesRequest::from_provider_request(
-        &config,
         &session,
         ProviderRequest {
             input: vec![ItemBlock::Local {
@@ -230,38 +199,20 @@ fn websocket_pool_key_requires_chatgpt_pool_and_prompt_cache_key() {
         },
     );
 
-    let key = WebSocketPoolKey::from_request(&config, &body, Some(&auth)).unwrap();
+    let key = WebSocketPoolKey::from_request(&session, &body, Some(&auth)).unwrap();
 
-    assert_eq!(key.surface, ResponsesSurface::ChatGptCodex);
     assert_eq!(key.base_url, DEFAULT_CHATGPT_BASE_URL);
     assert_eq!(key.account_id.as_deref(), Some("acct"));
     assert_eq!(key.thread_id, "thread-1");
 
     body.prompt_cache_key = None;
-    assert!(WebSocketPoolKey::from_request(&config, &body, Some(&auth)).is_none());
-
-    config.websocket_pool_max_connections = 0;
-    body.prompt_cache_key = Some("thread-1".to_owned());
-    assert!(WebSocketPoolKey::from_request(&config, &body, Some(&auth)).is_none());
-
-    config.websocket_pool_max_connections = DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS;
-    config.surface = ResponsesSurface::OpenAi;
-    assert!(WebSocketPoolKey::from_request(&config, &body, Some(&auth)).is_none());
-}
-
-#[tokio::test]
-async fn prewarm_websocket_is_noop_when_pool_is_disabled() {
-    let provider = ResponsesProvider::new(ResponsesConfig::default());
-
-    assert!(!provider.prewarm_websocket("thread-1").await.unwrap());
+    assert!(WebSocketPoolKey::from_request(&session, &body, Some(&auth)).is_none());
 }
 
 #[test]
 fn serializes_max_output_tokens_when_set() {
-    let session = ProviderSession {
-        max_output_tokens: Some(1234),
-        ..ProviderSession::new("gpt-test")
-    };
+    let mut session = ProviderSession::new("gpt-test");
+    session.max_output_tokens = Some(1234);
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -272,8 +223,7 @@ fn serializes_max_output_tokens_when_set() {
         tools: Vec::new(),
     };
 
-    let body =
-        ResponsesRequest::from_provider_request(&ResponsesConfig::default(), &session, request);
+    let body = ResponsesRequest::from_provider_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["max_output_tokens"], 1234);
@@ -282,10 +232,6 @@ fn serializes_max_output_tokens_when_set() {
 
 #[test]
 fn stamps_phase_on_assistant_messages_when_supported() {
-    let config = ResponsesConfig {
-        supports_phase: true,
-        ..Default::default()
-    };
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![
@@ -305,11 +251,7 @@ fn stamps_phase_on_assistant_messages_when_supported() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &config,
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["phase"], "commentary");
@@ -317,36 +259,7 @@ fn stamps_phase_on_assistant_messages_when_supported() {
 }
 
 #[test]
-fn omits_phase_on_assistant_messages_when_unsupported() {
-    let request = ProviderRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(
-                    Message::text(Role::Assistant, "commentary")
-                        .with_phase(MessagePhase::Commentary),
-                ),
-            }],
-        }],
-        tools: Vec::new(),
-    };
-
-    let body = ResponsesRequest::from_provider_request(
-        &ResponsesConfig::default(),
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
-    let json = serde_json::to_value(body).unwrap();
-
-    assert!(json["input"][0].get("phase").is_none());
-}
-
-#[test]
 fn omits_empty_reasoning_request_when_no_effort_is_set() {
-    let config = ResponsesConfig {
-        supports_reasoning_effort: true,
-        ..Default::default()
-    };
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -357,11 +270,7 @@ fn omits_empty_reasoning_request_when_no_effort_is_set() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &config,
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("reasoning").is_none());
@@ -369,14 +278,8 @@ fn omits_empty_reasoning_request_when_no_effort_is_set() {
 
 #[test]
 fn serializes_reasoning_summary_when_supported() {
-    let config = ResponsesConfig {
-        supports_reasoning_summary: true,
-        ..Default::default()
-    };
-    let session = ProviderSession {
-        reasoning_summary: ReasoningSummary::Concise,
-        ..ProviderSession::new("gpt-test")
-    };
+    let mut session = ProviderSession::new("gpt-test");
+    session.reasoning_summary = ReasoningSummary::Concise;
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -387,7 +290,7 @@ fn serializes_reasoning_summary_when_supported() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&config, &session, request);
+    let body = ResponsesRequest::from_provider_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json["reasoning"].get("effort").is_none());
@@ -397,16 +300,9 @@ fn serializes_reasoning_summary_when_supported() {
 
 #[test]
 fn serializes_reasoning_effort_and_summary_together() {
-    let config = ResponsesConfig {
-        supports_reasoning_effort: true,
-        supports_reasoning_summary: true,
-        ..Default::default()
-    };
-    let session = ProviderSession {
-        reasoning_effort: Some(ReasoningEffort::High),
-        reasoning_summary: ReasoningSummary::Detailed,
-        ..ProviderSession::new("gpt-test")
-    };
+    let mut session = ProviderSession::new("gpt-test");
+    session.reasoning_effort = Some(ReasoningEffort::High);
+    session.reasoning_summary = ReasoningSummary::Detailed;
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -417,7 +313,7 @@ fn serializes_reasoning_effort_and_summary_together() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&config, &session, request);
+    let body = ResponsesRequest::from_provider_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["reasoning"]["effort"], "high");
@@ -425,35 +321,7 @@ fn serializes_reasoning_effort_and_summary_together() {
 }
 
 #[test]
-fn omits_reasoning_summary_when_capability_is_disabled() {
-    let config = ResponsesConfig {
-        supports_reasoning_effort: true,
-        ..Default::default()
-    };
-    let session = ProviderSession {
-        reasoning_effort: Some(ReasoningEffort::Low),
-        reasoning_summary: ReasoningSummary::Auto,
-        ..ProviderSession::new("gpt-test")
-    };
-    let request = ProviderRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
-
-    let body = ResponsesRequest::from_provider_request(&config, &session, request);
-    let json = serde_json::to_value(body).unwrap();
-
-    assert_eq!(json["reasoning"]["effort"], "low");
-    assert!(json["reasoning"].get("summary").is_none());
-}
-
-#[test]
-fn omits_prompt_cache_key_when_capability_is_disabled() {
+fn serializes_prompt_cache_key() {
     let session = ProviderSession::new("gpt-test").with_prompt_cache_key("cache-key");
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
@@ -465,11 +333,10 @@ fn omits_prompt_cache_key_when_capability_is_disabled() {
         tools: Vec::new(),
     };
 
-    let body =
-        ResponsesRequest::from_provider_request(&ResponsesConfig::default(), &session, request);
+    let body = ResponsesRequest::from_provider_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
-    assert!(json.get("prompt_cache_key").is_none());
+    assert_eq!(json["prompt_cache_key"], "cache-key");
 }
 
 #[test]
@@ -505,11 +372,7 @@ fn previous_response_hint_slices_input_in_provider() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &ResponsesConfig::default(),
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["instructions"], "system rules");
@@ -545,11 +408,7 @@ fn previous_response_without_valid_boundary_replays_full_history() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &ResponsesConfig::default(),
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("previous_response_id").is_none());
@@ -583,7 +442,6 @@ fn stale_previous_response_error_builds_full_replay_request() {
         tools: Vec::new(),
     };
     let sliced = serde_json::to_value(ResponsesRequest::from_provider_request(
-        &ResponsesConfig::default(),
         &ProviderSession::new("gpt-test"),
         request.clone(),
     ))
@@ -592,7 +450,6 @@ fn stale_previous_response_error_builds_full_replay_request() {
     assert_eq!(sliced["input"].as_array().unwrap().len(), 1);
 
     let replay = stale_previous_response_replay_request(
-        &ResponsesConfig::default(),
         &ProviderSession::new("gpt-test"),
         &request,
         &anyhow::anyhow!("stream error: previous_response_id expired"),
@@ -617,7 +474,6 @@ fn non_stale_previous_response_error_does_not_build_replay_request() {
     };
 
     let replay = stale_previous_response_replay_request(
-        &ResponsesConfig::default(),
         &ProviderSession::new("gpt-test"),
         &request,
         &anyhow::anyhow!("stream error: rate limit"),
@@ -628,7 +484,6 @@ fn non_stale_previous_response_error_does_not_build_replay_request() {
 
 #[test]
 fn chatgpt_codex_request_omits_compaction_request_by_default() {
-    let config = ResponsesConfig::chatgpt_codex(ResponsesAuth::api_key("token"));
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -640,8 +495,7 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
     };
 
     let body = ResponsesRequest::from_provider_request(
-        &config,
-        &ProviderSession::new("gpt-test"),
+        &ProviderSession::chatgpt_codex("gpt-test", ResponsesAuth::api_key("token")),
         request,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -653,13 +507,9 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
 
 #[test]
 fn configured_compaction_threshold_overrides_provider_default() {
-    let config = ResponsesConfig {
-        supports_compaction: true,
-        compaction: Some(ResponsesCompaction {
-            compact_threshold: Some(42_000),
-        }),
-        ..Default::default()
-    };
+    let session = ProviderSession::new("gpt-test").with_compaction(ResponsesCompaction {
+        compact_threshold: Some(42_000),
+    });
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -670,11 +520,7 @@ fn configured_compaction_threshold_overrides_provider_default() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &config,
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["type"], "compaction_trigger");
@@ -685,7 +531,7 @@ fn configured_compaction_threshold_overrides_provider_default() {
 
 #[test]
 fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
-    let config = ResponsesConfig::chatgpt_codex(ResponsesAuth::api_key("token"))
+    let session = ProviderSession::chatgpt_codex("gpt-test", ResponsesAuth::api_key("token"))
         .with_compaction(ResponsesCompaction::default());
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
@@ -697,11 +543,7 @@ fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &config,
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["type"], "compaction_trigger");
@@ -713,10 +555,6 @@ fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
 
 #[test]
 fn compaction_replay_trims_before_latest_compaction_item() {
-    let config = ResponsesConfig {
-        supports_compaction: true,
-        ..Default::default()
-    };
     let request = ProviderRequest {
         input: vec![
             ItemBlock::Local {
@@ -745,11 +583,7 @@ fn compaction_replay_trims_before_latest_compaction_item() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &config,
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"].as_array().unwrap().len(), 2);
@@ -759,7 +593,7 @@ fn compaction_replay_trims_before_latest_compaction_item() {
 }
 
 #[test]
-fn replays_reasoning_provider_item_only_when_encrypted_reasoning_is_supported() {
+fn replays_reasoning_provider_item() {
     let reasoning = ItemKind::ProviderItem(ProviderItem {
         kind: ProviderItemKind::Reasoning,
         payload: json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed"}),
@@ -783,26 +617,13 @@ fn replays_reasoning_provider_item_only_when_encrypted_reasoning_is_supported() 
         tools: Vec::new(),
     };
 
-    let disabled = serde_json::to_value(ResponsesRequest::from_provider_request(
-        &ResponsesConfig::default(),
-        &ProviderSession::new("gpt-test"),
-        request.clone(),
-    ))
-    .unwrap();
-    assert_eq!(disabled["input"].as_array().unwrap().len(), 1);
-    assert_eq!(disabled["input"][0]["content"][0]["text"], "after");
-
-    let enabled = serde_json::to_value(ResponsesRequest::from_provider_request(
-        &ResponsesConfig {
-            supports_encrypted_reasoning: true,
-            ..Default::default()
-        },
+    let body = serde_json::to_value(ResponsesRequest::from_provider_request(
         &ProviderSession::new("gpt-test"),
         request,
     ))
     .unwrap();
-    assert_eq!(enabled["input"].as_array().unwrap().len(), 2);
-    assert_eq!(enabled["input"][0]["encrypted_content"], "sealed");
+    assert_eq!(body["input"].as_array().unwrap().len(), 2);
+    assert_eq!(body["input"][0]["encrypted_content"], "sealed");
 }
 
 #[test]
@@ -829,11 +650,7 @@ fn does_not_replay_unknown_provider_items() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &ResponsesConfig::default(),
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"].as_array().unwrap().len(), 1);
@@ -883,11 +700,7 @@ fn serializes_custom_tool_calls_and_results() {
         }],
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &ResponsesConfig::default(),
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["tools"][0]["type"], "custom");
@@ -926,11 +739,7 @@ fn encoded_tool_name_stays_mapped_to_declared_tool_name() {
         tools: vec![tool.clone()],
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &ResponsesConfig::default(),
-        &ProviderSession::new("gpt-test"),
-        request,
-    );
+    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["tools"][0]["name"], "local_patch");
@@ -1031,54 +840,18 @@ fn tool_name_map_keeps_wire_name_for_ambiguous_collisions() {
 }
 
 #[test]
-fn chatgpt_codex_surface_uses_codex_endpoint_and_store_false() {
-    let surface = ResponsesSurface::ChatGptCodex;
+fn chatgpt_codex_config_sets_endpoint_defaults() {
+    let session = ProviderSession::chatgpt_codex("gpt-test", ResponsesAuth::api_key("token"));
 
-    assert_eq!(
-        surface.responses_url("https://chatgpt.com/backend-api/"),
-        "https://chatgpt.com/backend-api/codex/responses"
-    );
-    assert!(!surface.store_value());
-}
-
-#[test]
-fn chatgpt_codex_config_sets_tau_capability_defaults() {
-    let config = ResponsesConfig::chatgpt_codex(ResponsesAuth::api_key("token"));
-
-    assert_eq!(config.surface, ResponsesSurface::ChatGptCodex);
-    assert_eq!(config.base_url, DEFAULT_CHATGPT_BASE_URL);
-    assert_eq!(config.context_window, DEFAULT_CONTEXT_WINDOW);
-    assert!(config.supports_reasoning_effort);
-    assert!(config.supports_reasoning_summary);
-    assert!(config.supports_verbosity);
-    assert!(config.supports_phase);
-    assert!(config.supports_prompt_cache_key);
-    assert!(config.supports_encrypted_reasoning);
-    assert!(config.supports_compaction);
-    assert_eq!(config.compaction, None);
-    assert_eq!(config.websocket_event_timeout_secs, 120);
-    assert_eq!(config.websocket_ping_interval_secs, 25);
+    assert_eq!(session.base_url, DEFAULT_CHATGPT_BASE_URL);
+    assert_eq!(session.compaction, None);
 }
 
 #[test]
 fn chatgpt_codex_models_match_tau_publication_order() {
     assert_eq!(
-        ResponsesConfig::chatgpt_codex_models(),
+        ProviderSession::chatgpt_codex_models(),
         ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]
-    );
-}
-
-#[test]
-fn default_config_uses_tau_websocket_timeout_and_keepalive_values() {
-    let config = ResponsesConfig::default();
-
-    assert_eq!(
-        config.websocket_event_timeout_secs,
-        DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS
-    );
-    assert_eq!(
-        config.websocket_ping_interval_secs,
-        DEFAULT_WEBSOCKET_PING_INTERVAL_SECS
     );
 }
 
@@ -1111,15 +884,14 @@ async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
 
 #[test]
 fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
-    let config = ResponsesConfig {
-        surface: ResponsesSurface::ChatGptCodex,
-        base_url: "https://chatgpt.com/backend-api".to_owned(),
-        auth: ResponsesAuth::oauth_with_account("token", "acct_1"),
-        ..Default::default()
-    };
+    let mut session = ProviderSession::chatgpt_codex(
+        "gpt-test",
+        ResponsesAuth::oauth_with_account("token", "acct_1"),
+    );
+    session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
-    let auth = config.auth.resolve().unwrap();
-    let request = build_ws_request(&config, Some("thread-1"), auth.as_ref()).unwrap();
+    let auth = session.auth.resolve().unwrap();
+    let request = build_ws_request(&session, Some("thread-1"), auth.as_ref()).unwrap();
 
     assert_eq!(
         request.uri(),
@@ -1134,13 +906,10 @@ fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
 
 #[test]
 fn websocket_request_uses_api_key_bearer_without_account_header() {
-    let config = ResponsesConfig {
-        auth: ResponsesAuth::api_key("sk-test"),
-        ..Default::default()
-    };
+    let session = ProviderSession::chatgpt_codex("gpt-test", ResponsesAuth::api_key("sk-test"));
 
-    let auth = config.auth.resolve().unwrap();
-    let request = build_ws_request(&config, None, auth.as_ref()).unwrap();
+    let auth = session.auth.resolve().unwrap();
+    let request = build_ws_request(&session, None, auth.as_ref()).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer sk-test");
     assert!(!request.headers().contains_key("chatgpt-account-id"));
@@ -1157,15 +926,12 @@ fn websocket_request_uses_oauth_file_credentials() {
         account_id: Some("acct_file".to_owned()),
     })
     .unwrap();
-    let config = ResponsesConfig {
-        surface: ResponsesSurface::ChatGptCodex,
-        base_url: "https://chatgpt.com/backend-api".to_owned(),
-        auth: ResponsesAuth::oauth_file(file.path()),
-        ..Default::default()
-    };
+    let mut session =
+        ProviderSession::chatgpt_codex("gpt-test", ResponsesAuth::oauth_file(file.path()));
+    session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
-    let auth = config.auth.resolve().unwrap();
-    let request = build_ws_request(&config, Some("thread-1"), auth.as_ref()).unwrap();
+    let auth = session.auth.resolve().unwrap();
+    let request = build_ws_request(&session, Some("thread-1"), auth.as_ref()).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer oauth-access");
     assert_eq!(request.headers()["chatgpt-account-id"], "acct_file");
