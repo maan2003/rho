@@ -5,27 +5,24 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::ws::WebSocketPool;
-use crate::{
-    CHATGPT_CODEX_MODELS, DEFAULT_CHATGPT_BASE_URL, DEFAULT_MODEL, ResponsesAuth,
-    ResponsesCompaction,
-};
+use crate::{CHATGPT_CODEX_MODELS, DEFAULT_CHATGPT_BASE_URL, ResponsesAuth, ResponsesCompaction};
 
 #[derive(Clone)]
 pub struct ProviderSession {
     pub(super) websocket_pool: Arc<Mutex<WebSocketPool>>,
-    pub base_url: String,
-    pub auth: ResponsesAuth,
-    pub compaction: Option<ResponsesCompaction>,
-    pub extra_body: BTreeMap<String, Value>,
-    pub model: String,
-    pub temperature: Option<f32>,
-    pub max_output_tokens: Option<u32>,
-    pub reasoning_effort: Option<ReasoningEffort>,
-    pub reasoning_summary: ReasoningSummary,
-    pub verbosity: Option<Verbosity>,
-    pub service_tier: Option<ServiceTier>,
-    pub tool_choice: ToolChoice,
-    pub prompt_cache_key: Option<String>,
+    pub(crate) base_url: String,
+    pub(crate) auth: ResponsesAuth,
+    pub(crate) compaction: Option<ResponsesCompaction>,
+    pub(crate) extra_body: BTreeMap<String, Value>,
+    pub(crate) model: String,
+    pub(crate) temperature: Option<f32>,
+    pub(crate) max_output_tokens: Option<u32>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) reasoning_summary: ReasoningSummary,
+    pub(crate) verbosity: Option<Verbosity>,
+    pub(crate) service_tier: Option<ServiceTier>,
+    pub(crate) tool_choice: ToolChoice,
+    pub(crate) prompt_cache_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,18 +63,12 @@ pub enum ToolChoice {
     None,
 }
 
-impl Default for ProviderSession {
-    fn default() -> Self {
-        Self::new(DEFAULT_MODEL)
-    }
-}
-
 impl ProviderSession {
-    pub fn new(model: impl Into<String>) -> Self {
+    pub(crate) fn new(model: impl Into<String>) -> Self {
         Self {
             websocket_pool: Arc::new(Mutex::new(WebSocketPool::new())),
             base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
-            auth: ResponsesAuth::None,
+            auth: ResponsesAuth::none(),
             compaction: None,
             extra_body: BTreeMap::new(),
             model: model.into(),
@@ -102,14 +93,25 @@ impl ProviderSession {
         CHATGPT_CODEX_MODELS
     }
 
-    pub fn with_compaction(mut self, compaction: ResponsesCompaction) -> Self {
-        self.compaction = Some(compaction);
+    pub fn with_compaction(mut self) -> Self {
+        self.compaction = Some(ResponsesCompaction::default());
+        self
+    }
+
+    pub fn with_compaction_threshold(mut self, compact_threshold: u64) -> Self {
+        self.compaction = Some(ResponsesCompaction {
+            compact_threshold: Some(compact_threshold),
+        });
         self
     }
 
     pub fn with_prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
         self.prompt_cache_key = Some(prompt_cache_key.into());
         self
+    }
+
+    pub fn prompt_cache_key(&self) -> Option<&str> {
+        self.prompt_cache_key.as_deref()
     }
 }
 

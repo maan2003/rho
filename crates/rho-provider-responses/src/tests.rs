@@ -8,6 +8,7 @@ use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::oauth::ResolvedAuth;
+use super::session::{ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice, Verbosity};
 use super::ws::{WebSocketPoolKey, WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 
@@ -31,6 +32,23 @@ fn first_tool_call(response: &ProviderResponse) -> &ToolCall {
             _ => None,
         })
         .expect("tool call item")
+}
+
+fn test_oauth_file(
+    access_token: &str,
+    account_id: Option<&str>,
+) -> (tempfile::TempDir, ResponsesAuth) {
+    let temp = tempfile::tempdir().unwrap();
+    let file = OAuthFile::open_in(temp.path(), "chatgpt").unwrap();
+    file.save(&ResponsesOAuthCredentials {
+        access_token: access_token.to_owned(),
+        refresh_token: "refresh".to_owned(),
+        expires_at_ms: u64::MAX,
+        account_id: account_id.map(str::to_owned),
+    })
+    .unwrap();
+    let auth = ResponsesAuth::oauth_file(file.path());
+    (temp, auth)
 }
 
 #[derive(Default)]
@@ -484,6 +502,7 @@ fn non_stale_previous_response_error_does_not_build_replay_request() {
 
 #[test]
 fn chatgpt_codex_request_omits_compaction_request_by_default() {
+    let (_temp, auth) = test_oauth_file("token", None);
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -495,7 +514,7 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
     };
 
     let body = ResponsesRequest::from_provider_request(
-        &ProviderSession::chatgpt_codex("gpt-test", ResponsesAuth::api_key("token")),
+        &ProviderSession::chatgpt_codex("gpt-test", auth),
         request,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -507,9 +526,7 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
 
 #[test]
 fn configured_compaction_threshold_overrides_provider_default() {
-    let session = ProviderSession::new("gpt-test").with_compaction(ResponsesCompaction {
-        compact_threshold: Some(42_000),
-    });
+    let session = ProviderSession::new("gpt-test").with_compaction_threshold(42_000);
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -531,8 +548,8 @@ fn configured_compaction_threshold_overrides_provider_default() {
 
 #[test]
 fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
-    let session = ProviderSession::chatgpt_codex("gpt-test", ResponsesAuth::api_key("token"))
-        .with_compaction(ResponsesCompaction::default());
+    let (_temp, auth) = test_oauth_file("token", None);
+    let session = ProviderSession::chatgpt_codex("gpt-test", auth).with_compaction();
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -841,7 +858,8 @@ fn tool_name_map_keeps_wire_name_for_ambiguous_collisions() {
 
 #[test]
 fn chatgpt_codex_config_sets_endpoint_defaults() {
-    let session = ProviderSession::chatgpt_codex("gpt-test", ResponsesAuth::api_key("token"));
+    let (_temp, auth) = test_oauth_file("token", None);
+    let session = ProviderSession::chatgpt_codex("gpt-test", auth);
 
     assert_eq!(session.base_url, DEFAULT_CHATGPT_BASE_URL);
     assert_eq!(session.compaction, None);
@@ -884,10 +902,8 @@ async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
 
 #[test]
 fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
-    let mut session = ProviderSession::chatgpt_codex(
-        "gpt-test",
-        ResponsesAuth::oauth_with_account("token", "acct_1"),
-    );
+    let (_temp, auth) = test_oauth_file("token", Some("acct_1"));
+    let mut session = ProviderSession::chatgpt_codex("gpt-test", auth);
     session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
     let auth = session.auth.resolve().unwrap();
@@ -905,8 +921,9 @@ fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
 }
 
 #[test]
-fn websocket_request_uses_api_key_bearer_without_account_header() {
-    let session = ProviderSession::chatgpt_codex("gpt-test", ResponsesAuth::api_key("sk-test"));
+fn websocket_request_uses_oauth_bearer_without_account_header() {
+    let (_temp, auth) = test_oauth_file("sk-test", None);
+    let session = ProviderSession::chatgpt_codex("gpt-test", auth);
 
     let auth = session.auth.resolve().unwrap();
     let request = build_ws_request(&session, None, auth.as_ref()).unwrap();

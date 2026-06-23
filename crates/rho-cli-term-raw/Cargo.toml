@@ -1,0 +1,24 @@
+[package]
+name = "rho-cli-term-raw"
+version.workspace = true
+edition.workspace = true
+description = "Terminal prompt with async output support for rho."
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bon.workspace = true
+crossterm.workspace = true
+rho-blocking-notify-channel.workspace = true
+rho-term-screen.workspace = true
+tracing.workspace = true
+unicode-segmentation.workspace = true
+
+[[bin]]
+name = "rho-cli-term-raw-demo"
+path = "src/main.rs"
+
+[dev-dependencies]
+vt100.workspace = true

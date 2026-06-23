@@ -28,9 +28,7 @@ pub mod session;
 mod ws;
 
 pub use oauth::{OAuthFile, ResponsesAuth, ResponsesOAuthCredentials};
-pub use session::{
-    ProviderSession, ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice, Verbosity,
-};
+pub use session::ProviderSession;
 
 pub const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub const DEFAULT_MODEL: &str = "gpt-5";
@@ -130,7 +128,7 @@ pub(crate) struct TextRequest {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ResponsesCompaction {
+pub(crate) struct ResponsesCompaction {
     pub compact_threshold: Option<u64>,
 }
 

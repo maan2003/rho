@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use futures::future::{BoxFuture, FutureExt, join_all};
 use rho::{
     Item, ItemBlock, ItemKind, Message, ProviderRequest, ProviderResponse, ReasoningText,
-    ReasoningTextKind, Role, ToolResult,
+    ReasoningTextKind, Role, ToolCall, ToolResult,
 };
 use rho_provider_responses::{ProviderSession, ResponsesUpdate};
 use rho_store_cbor::CborLog;
@@ -21,7 +21,14 @@ use rho_tool_shell::ShellTools;
 pub type ProviderFuture = BoxFuture<'static, Result<ProviderResponse>>;
 pub type ToolFuture = BoxFuture<'static, ToolResult>;
 type ProviderUpdateHandler = Arc<Mutex<Box<dyn FnMut(ResponsesUpdate) + Send>>>;
+type AgentUpdateHandler = Arc<Mutex<Box<dyn FnMut(AgentUpdate) + Send>>>;
 pub type StreamedTranscript = Arc<Mutex<StreamingTranscript>>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentUpdate {
+    ToolCallStarted(ToolCall),
+    ToolCallFinished(ToolResult),
+}
 
 pub enum AgentProvider {
     Responses(Box<ProviderSession>),
@@ -73,6 +80,7 @@ pub struct Agent {
     pending_tool_results: Vec<ToolResult>,
     max_provider_retries: u64,
     provider_updates: Option<ProviderUpdateHandler>,
+    agent_updates: Option<AgentUpdateHandler>,
     next_id: u64,
     pub state: AgentState,
 }
@@ -96,6 +104,7 @@ impl Agent {
             pending_tool_results: Vec::new(),
             max_provider_retries: 0,
             provider_updates: None,
+            agent_updates: None,
             next_id: 0,
             state: AgentState::Idle,
         }
@@ -121,6 +130,14 @@ impl Agent {
         on_update: impl FnMut(ResponsesUpdate) + Send + 'static,
     ) -> Self {
         self.provider_updates = Some(Arc::new(Mutex::new(Box::new(on_update))));
+        self
+    }
+
+    pub fn with_agent_updates(
+        mut self,
+        on_update: impl FnMut(AgentUpdate) + Send + 'static,
+    ) -> Self {
+        self.agent_updates = Some(Arc::new(Mutex::new(Box::new(on_update))));
         self
     }
 
@@ -294,11 +311,23 @@ impl Agent {
         let futures = tool_calls
             .into_iter()
             .map(|call| {
-                self.tools
+                let future = self
+                    .tools
                     .iter()
                     .find(|tool| tool.supports(&call.name))
                     .ok_or_else(|| anyhow!("no tool registered for {}", call.name))
-                    .map(|tool| tool.call(call))
+                    .map(|tool| tool.call(call.clone()))?;
+                let agent_updates = self.agent_updates.clone();
+                Ok(async move {
+                    notify_agent_update(&agent_updates, AgentUpdate::ToolCallStarted(call));
+                    let result = future.await;
+                    notify_agent_update(
+                        &agent_updates,
+                        AgentUpdate::ToolCallFinished(result.clone()),
+                    );
+                    result
+                }
+                .boxed())
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -389,9 +418,17 @@ impl Agent {
             pending_tool_results: Vec::new(),
             max_provider_retries: 0,
             provider_updates: None,
+            agent_updates: None,
             next_id,
             state: AgentState::Idle,
         }
+    }
+}
+
+fn notify_agent_update(handler: &Option<AgentUpdateHandler>, update: AgentUpdate) {
+    if let Some(handler) = handler {
+        let mut on_update = handler.lock().expect("agent update lock");
+        on_update(update);
     }
 }
 

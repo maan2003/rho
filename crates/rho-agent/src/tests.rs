@@ -527,6 +527,50 @@ async fn runs_tool_calls_through_agent_policy() {
 }
 
 #[tokio::test]
+async fn emits_tool_execution_updates() {
+    let provider = test_provider(|request: ProviderRequest| {
+        async move {
+            if has_tool_result(&request.input) {
+                Ok(text_response("done"))
+            } else {
+                Ok(tool_call_response(
+                    "call-1",
+                    "shell_command",
+                    json!({"command": "printf tool-output"}),
+                ))
+            }
+        }
+        .boxed()
+    });
+    let updates = Arc::new(Mutex::new(Vec::new()));
+    let seen_updates = Arc::clone(&updates);
+    let mut agent = Agent::new(provider)
+        .with_tool(AgentTools::Shell(ShellTools::new(Duration::from_secs(2))))
+        .with_agent_updates(move |update| {
+            seen_updates
+                .lock()
+                .expect("agent update log lock")
+                .push(update);
+        });
+
+    agent.push_user_message("use a tool");
+    agent.run_until_idle(6).await.unwrap();
+
+    let updates = updates.lock().expect("agent update log lock");
+    assert!(matches!(
+        &updates[0],
+        AgentUpdate::ToolCallStarted(call)
+            if call.id == ToolCallId("call-1".to_owned()) && call.name == "shell_command"
+    ));
+    assert!(matches!(
+        &updates[1],
+        AgentUpdate::ToolCallFinished(result)
+            if result.call_id == ToolCallId("call-1".to_owned())
+                && result.rendered_output().contains("tool-output")
+    ));
+}
+
+#[tokio::test]
 async fn exposes_shell_command_and_apply_patch_tool_specs() {
     let seen_tools = Arc::new(Mutex::new(Vec::new()));
     let captured_tools = Arc::clone(&seen_tools);

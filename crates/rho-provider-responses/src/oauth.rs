@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -5,25 +6,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand::RngCore;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use url::Url;
 
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const REFRESH_EXPIRY_WINDOW: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponsesAuth {
-    #[default]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResponsesAuth {
+    kind: ResponsesAuthKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResponsesAuthKind {
     None,
-    ApiKey {
-        key: String,
-    },
-    OAuth(ResponsesOAuthCredentials),
-    OAuthFile {
-        path: PathBuf,
-    },
+    OAuthFile { path: PathBuf },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,31 +55,27 @@ pub struct OAuthFile {
 }
 
 impl ResponsesAuth {
-    pub fn api_key(key: impl Into<String>) -> Self {
-        Self::ApiKey { key: key.into() }
-    }
-
-    pub fn oauth(access_token: impl Into<String>) -> Self {
-        Self::OAuth(ResponsesOAuthCredentials::from_access_token(access_token))
-    }
-
-    pub fn oauth_with_account(
-        access_token: impl Into<String>,
-        account_id: impl Into<String>,
-    ) -> Self {
-        Self::OAuth(ResponsesOAuthCredentials {
-            access_token: access_token.into(),
-            account_id: Some(account_id.into()),
-            ..Default::default()
-        })
+    pub(crate) fn none() -> Self {
+        Self {
+            kind: ResponsesAuthKind::None,
+        }
     }
 
     pub fn oauth_file(path: impl Into<PathBuf>) -> Self {
-        Self::OAuthFile { path: path.into() }
+        Self {
+            kind: ResponsesAuthKind::OAuthFile { path: path.into() },
+        }
     }
 
     pub fn oauth_file_named(name: impl AsRef<str>) -> io::Result<Self> {
         Ok(Self::oauth_file(OAuthFile::open_default(name)?.path()))
+    }
+
+    pub fn oauth_file_path(&self) -> Option<&Path> {
+        match &self.kind {
+            ResponsesAuthKind::OAuthFile { path } => Some(path),
+            ResponsesAuthKind::None => None,
+        }
     }
 
     pub fn resolve(&self) -> io::Result<Option<ResolvedAuth>> {
@@ -86,15 +86,11 @@ impl ResponsesAuth {
         &self,
         refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
     ) -> io::Result<Option<ResolvedAuth>> {
-        match self {
-            Self::None => Ok(None),
-            Self::ApiKey { key } if key.trim().is_empty() => Ok(None),
-            Self::ApiKey { key } => Ok(Some(ResolvedAuth {
-                bearer_token: key.clone(),
-                account_id: None,
-            })),
-            Self::OAuth(credentials) => Ok(credentials.resolved()),
-            Self::OAuthFile { path } => OAuthFile::new(path).resolve_with_refresh(refresh),
+        match &self.kind {
+            ResponsesAuthKind::None => Ok(None),
+            ResponsesAuthKind::OAuthFile { path } => {
+                OAuthFile::new(path).resolve_with_refresh(refresh)
+            }
         }
     }
 }
@@ -126,22 +122,28 @@ impl ResponsesOAuthCredentials {
 }
 
 impl OAuthFile {
-    pub fn open_default(name: impl AsRef<str>) -> io::Result<Self> {
+    pub fn default_auth_dir() -> io::Result<PathBuf> {
         let state_dir = dirs::state_dir()
             .or_else(dirs::data_local_dir)
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "cannot determine state directory")
             })?
             .join("rho");
-        Self::open_in(state_dir, name)
+        Ok(state_dir.join("auth.d"))
+    }
+
+    pub fn open_default(name: impl AsRef<str>) -> io::Result<Self> {
+        Self::open_at(Self::default_auth_dir()?, name)
     }
 
     pub fn open_in(state_dir: impl Into<PathBuf>, name: impl AsRef<str>) -> io::Result<Self> {
+        Self::open_at(state_dir.into().join("auth.d"), name)
+    }
+
+    pub fn open_at(auth_dir: impl Into<PathBuf>, name: impl AsRef<str>) -> io::Result<Self> {
         let name = name.as_ref();
         validate_auth_file_name(name)?;
-        Ok(Self::new(
-            state_dir.into().join("auth.d").join(format!("{name}.json")),
-        ))
+        Ok(Self::new(auth_dir.into().join(format!("{name}.json"))))
     }
 
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -168,6 +170,14 @@ impl OAuthFile {
 
     pub fn save(&self, credentials: &ResponsesOAuthCredentials) -> io::Result<()> {
         self.with_lock(|locked| locked.save(credentials))
+    }
+
+    pub fn delete(&self) -> io::Result<bool> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn resolve_with_refresh(
@@ -243,6 +253,55 @@ impl LockedOAuthFile<'_> {
         self.save(&refreshed)?;
         Ok(refreshed.resolved())
     }
+}
+
+pub fn openai_codex_auth_url() -> (String, String, String) {
+    let verifier = generate_code_verifier();
+    let challenge = code_challenge(&verifier);
+    let state = generate_state();
+    let url = format!(
+        "{OPENAI_AUTH_URL}?client_id={client_id}&redirect_uri={redirect}&response_type=code&scope={scope}&code_challenge={challenge}&code_challenge_method=S256&state={state}&codex_cli_simplified_flow=true&id_token_add_organizations=true",
+        client_id = OPENAI_CLIENT_ID,
+        redirect = urlencoding(OPENAI_REDIRECT_URI),
+        scope = urlencoding("openid profile email offline_access"),
+    );
+    (url, state, verifier)
+}
+
+pub fn parse_redirect_url(input: &str) -> Result<(String, String), String> {
+    let trimmed = input.trim();
+    let url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Url::parse(trimmed).map_err(|error| format!("invalid URL: {error}"))?
+    } else if trimmed.starts_with('/') || trimmed.starts_with('?') {
+        Url::parse(&format!("http://localhost{trimmed}"))
+            .map_err(|error| format!("invalid URL fragment: {error}"))?
+    } else {
+        return Err("expected full URL, or path/query string starting with '/' or '?'".to_owned());
+    };
+
+    let params: HashMap<_, _> = url.query_pairs().collect();
+    let code = params
+        .get("code")
+        .ok_or("no 'code' parameter in URL")?
+        .to_string();
+    let state = params
+        .get("state")
+        .ok_or("no 'state' parameter in URL")?
+        .to_string();
+
+    Ok((code, state))
+}
+
+pub fn openai_codex_exchange(code: &str, verifier: &str) -> io::Result<ResponsesOAuthCredentials> {
+    let body = format!(
+        "grant_type=authorization_code&code={code}&code_verifier={verifier}&redirect_uri={redirect}&client_id={client_id}",
+        code = urlencoding(code),
+        verifier = urlencoding(verifier),
+        redirect = urlencoding(OPENAI_REDIRECT_URI),
+        client_id = OPENAI_CLIENT_ID,
+    );
+    let json = post_form(OPENAI_TOKEN_URL, &body)?;
+    parse_openai_token_response(&json)
 }
 
 pub fn openai_codex_refresh(refresh_token: &str) -> io::Result<ResponsesOAuthCredentials> {
@@ -445,6 +504,29 @@ fn now_ms() -> u64 {
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn generate_code_verifier() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut rng = rand::thread_rng();
+    (0..64)
+        .map(|_| *CHARSET.choose(&mut rng).expect("non-empty charset") as char)
+        .collect()
+}
+
+fn generate_state() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex_encode(&bytes)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn code_challenge(verifier: &str) -> String {
+    let hash = Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hash)
 }
 
 fn urlencoding(s: &str) -> String {

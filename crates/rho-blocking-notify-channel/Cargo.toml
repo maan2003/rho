@@ -1,0 +1,12 @@
+[package]
+name = "rho-blocking-notify-channel"
+version.workspace = true
+edition.workspace = true
+description = "A small coalescing multi-producer, single-consumer blocking notification channel."
+repository.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+static_assertions = "1.1"
