@@ -395,6 +395,14 @@ impl ChatApp {
             }
             return;
         };
+        if handle.is_finished() {
+            let _ = handle.await;
+            if print_cancelled {
+                self.term.print_system("nothing running");
+            }
+            self.term.set_status("/quit");
+            return;
+        }
         handle.abort();
         let _ = handle.await;
         if let Err(error) = self
