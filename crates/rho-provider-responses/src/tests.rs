@@ -1,0 +1,1453 @@
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures_util::{Sink, Stream};
+use rho::{Item, ItemBlock, ItemId, ToolFormat, ToolGrammarSyntax, ToolResult, ToolType};
+use tokio_tungstenite::tungstenite;
+
+use super::*;
+
+fn first_message(response: &ProviderResponse) -> &Message {
+    response
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ItemKind::Message(message) => Some(message),
+            _ => None,
+        })
+        .expect("message item")
+}
+
+fn first_tool_call(response: &ProviderResponse) -> &ToolCall {
+    response
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ItemKind::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .expect("tool call item")
+}
+
+#[derive(Default)]
+struct PendingSocket {
+    sent: Vec<WsMessage>,
+}
+
+impl Stream for PendingSocket {
+    type Item = std::result::Result<WsMessage, tungstenite::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
+    }
+}
+
+impl Sink<WsMessage> for PendingSocket {
+    type Error = tungstenite::Error;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: WsMessage) -> std::result::Result<(), Self::Error> {
+        self.get_mut().sent.push(item);
+        Ok(())
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn builds_responses_request_with_tools_and_item_timeline() {
+    let mut extra_body = BTreeMap::new();
+    extra_body.insert("metadata".to_owned(), json!({"project": "rho"}));
+    let config = ResponsesConfig {
+        supports_reasoning_effort: true,
+        supports_reasoning_summary: true,
+        supports_verbosity: true,
+        supports_prompt_cache_key: true,
+        supports_encrypted_reasoning: true,
+        extra_body,
+        ..Default::default()
+    };
+    let session = ProviderSession {
+        model: "gpt-test".to_owned(),
+        temperature: Some(0.5),
+        max_output_tokens: None,
+        reasoning_effort: Some(ReasoningEffort::Medium),
+        reasoning_summary: ReasoningSummary::Detailed,
+        verbosity: Some(Verbosity::High),
+        service_tier: Some(ServiceTier::Flex),
+        tool_choice: ToolChoice::Auto,
+        prompt_cache_key: Some("cache-key".to_owned()),
+    };
+    let request = ProviderRequest {
+        input: vec![
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::System, "be concise")),
+                }],
+            },
+            ItemBlock::ProviderResponse {
+                provider_response_id: Some("resp_prev".to_owned()),
+                items: Vec::new(),
+            },
+            ItemBlock::Local {
+                items: vec![
+                    Item {
+                        id: ItemId("item-1".to_owned()),
+                        kind: ItemKind::Message(Message::text(Role::User, "hello")),
+                    },
+                    Item {
+                        id: ItemId("item-2".to_owned()),
+                        kind: ItemKind::ToolCall(ToolCall {
+                            id: ToolCallId("call-1".to_owned()),
+                            name: "shell.run".to_owned(),
+                            tool_type: ToolType::Function,
+                            arguments: json!({"command": "pwd"}),
+                        }),
+                    },
+                    Item {
+                        id: ItemId("item-3".to_owned()),
+                        kind: ItemKind::ToolResult(ToolResult::success(
+                            ToolCallId("call-1".to_owned()),
+                            "done",
+                        )),
+                    },
+                ],
+            },
+        ],
+        tools: vec![ToolSpec {
+            name: "shell.run".to_owned(),
+            tool_type: ToolType::Function,
+            description: "run shell".to_owned(),
+            input_schema: json!({"type": "object"}),
+            format: None,
+        }],
+    };
+
+    let body = ResponsesRequest::from_provider_request(&config, &session, request);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["model"], "gpt-test");
+    assert_eq!(json["instructions"], "be concise");
+    assert_eq!(json["temperature"], 0.5);
+    assert!(json.get("max_output_tokens").is_none());
+    assert_eq!(json["input"][0]["role"], "user");
+    assert_eq!(json["input"][1]["type"], "function_call");
+    assert_eq!(json["input"][1]["name"], "shell_run");
+    assert_eq!(json["input"][2]["type"], "function_call_output");
+    assert_eq!(json["tools"][0]["name"], "shell_run");
+    assert_eq!(json["tool_choice"], "auto");
+    assert_eq!(json["store"], true);
+    assert_eq!(json["reasoning"]["effort"], "medium");
+    assert_eq!(json["reasoning"]["summary"], "detailed");
+    assert_eq!(json["reasoning"]["context"], "all_turns");
+    assert_eq!(json["text"]["verbosity"], "high");
+    assert_eq!(json["service_tier"], "flex");
+    assert_eq!(json["prompt_cache_key"], "cache-key");
+    assert_eq!(json["previous_response_id"], "resp_prev");
+    assert_eq!(json["include"][0], "reasoning.encrypted_content");
+    assert_eq!(json["metadata"]["project"], "rho");
+}
+
+#[test]
+fn serializes_forced_no_tool_choice_without_declared_tools() {
+    let session = ProviderSession {
+        tool_choice: ToolChoice::None,
+        ..ProviderSession::new("gpt-test")
+    };
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body =
+        ResponsesRequest::from_provider_request(&ResponsesConfig::default(), &session, request);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["tool_choice"], "none");
+}
+
+#[test]
+fn chatgpt_codex_config_enables_websocket_pool() {
+    let config = ResponsesConfig::chatgpt_codex(ResponsesAuth::None);
+
+    assert_eq!(
+        config.websocket_pool_max_connections,
+        DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS
+    );
+    assert_eq!(
+        config.websocket_pool_max_connection_age_secs,
+        DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS
+    );
+    assert_eq!(
+        config.websocket_pool_checkout_wait_ms,
+        DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS
+    );
+}
+
+#[test]
+fn websocket_pool_key_requires_chatgpt_pool_and_prompt_cache_key() {
+    let auth = ResolvedAuth {
+        bearer_token: "token".to_owned(),
+        account_id: Some("acct".to_owned()),
+    };
+    let mut config = ResponsesConfig::chatgpt_codex(ResponsesAuth::None);
+    let session = ProviderSession::new("gpt-test").with_prompt_cache_key("thread-1");
+    let mut body = ResponsesRequest::from_provider_request(
+        &config,
+        &session,
+        ProviderRequest {
+            input: vec![ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "hello")),
+                }],
+            }],
+            tools: Vec::new(),
+        },
+    );
+
+    let key = WebSocketPoolKey::from_request(&config, &body, Some(&auth)).unwrap();
+
+    assert_eq!(key.surface, ResponsesSurface::ChatGptCodex);
+    assert_eq!(key.base_url, DEFAULT_CHATGPT_BASE_URL);
+    assert_eq!(key.account_id.as_deref(), Some("acct"));
+    assert_eq!(key.thread_id, "thread-1");
+
+    body.prompt_cache_key = None;
+    assert!(WebSocketPoolKey::from_request(&config, &body, Some(&auth)).is_none());
+
+    config.websocket_pool_max_connections = 0;
+    body.prompt_cache_key = Some("thread-1".to_owned());
+    assert!(WebSocketPoolKey::from_request(&config, &body, Some(&auth)).is_none());
+
+    config.websocket_pool_max_connections = DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS;
+    config.surface = ResponsesSurface::OpenAi;
+    assert!(WebSocketPoolKey::from_request(&config, &body, Some(&auth)).is_none());
+}
+
+#[tokio::test]
+async fn prewarm_websocket_is_noop_when_pool_is_disabled() {
+    let provider = ResponsesProvider::new(ResponsesConfig::default());
+
+    assert!(!provider.prewarm_websocket("thread-1").await.unwrap());
+}
+
+#[test]
+fn serializes_max_output_tokens_when_set() {
+    let session = ProviderSession {
+        max_output_tokens: Some(1234),
+        ..ProviderSession::new("gpt-test")
+    };
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body =
+        ResponsesRequest::from_provider_request(&ResponsesConfig::default(), &session, request);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["max_output_tokens"], 1234);
+    assert!(json.get("temperature").is_none());
+}
+
+#[test]
+fn stamps_phase_on_assistant_messages_when_supported() {
+    let config = ResponsesConfig {
+        supports_phase: true,
+        ..Default::default()
+    };
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![
+                Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: ItemKind::Message(
+                        Message::text(Role::Assistant, "commentary")
+                            .with_phase(MessagePhase::Commentary),
+                    ),
+                },
+                Item {
+                    id: ItemId("item-1".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::Assistant, "legacy answer")),
+                },
+            ],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &config,
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["input"][0]["phase"], "commentary");
+    assert_eq!(json["input"][1]["phase"], "final_answer");
+}
+
+#[test]
+fn omits_phase_on_assistant_messages_when_unsupported() {
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(
+                    Message::text(Role::Assistant, "commentary")
+                        .with_phase(MessagePhase::Commentary),
+                ),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert!(json["input"][0].get("phase").is_none());
+}
+
+#[test]
+fn omits_empty_reasoning_request_when_no_effort_is_set() {
+    let config = ResponsesConfig {
+        supports_reasoning_effort: true,
+        ..Default::default()
+    };
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &config,
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert!(json.get("reasoning").is_none());
+}
+
+#[test]
+fn serializes_reasoning_summary_when_supported() {
+    let config = ResponsesConfig {
+        supports_reasoning_summary: true,
+        ..Default::default()
+    };
+    let session = ProviderSession {
+        reasoning_summary: ReasoningSummary::Concise,
+        ..ProviderSession::new("gpt-test")
+    };
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(&config, &session, request);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert!(json["reasoning"].get("effort").is_none());
+    assert_eq!(json["reasoning"]["summary"], "concise");
+    assert_eq!(json["reasoning"]["context"], "all_turns");
+}
+
+#[test]
+fn serializes_reasoning_effort_and_summary_together() {
+    let config = ResponsesConfig {
+        supports_reasoning_effort: true,
+        supports_reasoning_summary: true,
+        ..Default::default()
+    };
+    let session = ProviderSession {
+        reasoning_effort: Some(ReasoningEffort::High),
+        reasoning_summary: ReasoningSummary::Detailed,
+        ..ProviderSession::new("gpt-test")
+    };
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(&config, &session, request);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["reasoning"]["effort"], "high");
+    assert_eq!(json["reasoning"]["summary"], "detailed");
+}
+
+#[test]
+fn omits_reasoning_summary_when_capability_is_disabled() {
+    let config = ResponsesConfig {
+        supports_reasoning_effort: true,
+        ..Default::default()
+    };
+    let session = ProviderSession {
+        reasoning_effort: Some(ReasoningEffort::Low),
+        reasoning_summary: ReasoningSummary::Auto,
+        ..ProviderSession::new("gpt-test")
+    };
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(&config, &session, request);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["reasoning"]["effort"], "low");
+    assert!(json["reasoning"].get("summary").is_none());
+}
+
+#[test]
+fn omits_prompt_cache_key_when_capability_is_disabled() {
+    let session = ProviderSession::new("gpt-test").with_prompt_cache_key("cache-key");
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body =
+        ResponsesRequest::from_provider_request(&ResponsesConfig::default(), &session, request);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert!(json.get("prompt_cache_key").is_none());
+}
+
+#[test]
+fn previous_response_hint_slices_input_in_provider() {
+    let request = ProviderRequest {
+        input: vec![
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::System, "system rules")),
+                }],
+            },
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-1".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "first")),
+                }],
+            },
+            ItemBlock::ProviderResponse {
+                provider_response_id: Some("resp_1".to_owned()),
+                items: vec![Item {
+                    id: ItemId("item-2".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::Assistant, "done")),
+                }],
+            },
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-3".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "second")),
+                }],
+            },
+        ],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["instructions"], "system rules");
+    assert_eq!(json["previous_response_id"], "resp_1");
+    assert_eq!(json["input"].as_array().unwrap().len(), 1);
+    assert_eq!(json["input"][0]["content"][0]["text"], "second");
+}
+
+#[test]
+fn previous_response_without_valid_boundary_replays_full_history() {
+    let request = ProviderRequest {
+        input: vec![
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "first")),
+                }],
+            },
+            ItemBlock::ProviderResponse {
+                provider_response_id: None,
+                items: vec![Item {
+                    id: ItemId("item-1".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::Assistant, "done")),
+                }],
+            },
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-2".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "second")),
+                }],
+            },
+        ],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert!(json.get("previous_response_id").is_none());
+    assert_eq!(json["input"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn stale_previous_response_error_builds_full_replay_request() {
+    let request = ProviderRequest {
+        input: vec![
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "first")),
+                }],
+            },
+            ItemBlock::ProviderResponse {
+                provider_response_id: Some("resp_1".to_owned()),
+                items: vec![Item {
+                    id: ItemId("item-1".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::Assistant, "done")),
+                }],
+            },
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-2".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "second")),
+                }],
+            },
+        ],
+        tools: Vec::new(),
+    };
+    let sliced = serde_json::to_value(ResponsesRequest::from_provider_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        request.clone(),
+    ))
+    .unwrap();
+    assert_eq!(sliced["previous_response_id"], "resp_1");
+    assert_eq!(sliced["input"].as_array().unwrap().len(), 1);
+
+    let replay = stale_previous_response_replay_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        &request,
+        &anyhow::anyhow!("stream error: previous_response_id expired"),
+    )
+    .expect("stale error should build replay");
+    let replay = serde_json::to_value(replay).unwrap();
+
+    assert!(replay.get("previous_response_id").is_none());
+    assert_eq!(replay["input"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn non_stale_previous_response_error_does_not_build_replay_request() {
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let replay = stale_previous_response_replay_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        &request,
+        &anyhow::anyhow!("stream error: rate limit"),
+    );
+
+    assert!(replay.is_none());
+}
+
+#[test]
+fn chatgpt_codex_request_omits_compaction_request_by_default() {
+    let config = ResponsesConfig::chatgpt_codex(ResponsesAuth::api_key("token"));
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &config,
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert!(json.get("context_management").is_none());
+    assert_eq!(json["input"][0]["content"][0]["text"], "hello");
+    assert_eq!(json["store"], false);
+}
+
+#[test]
+fn configured_compaction_threshold_overrides_provider_default() {
+    let config = ResponsesConfig {
+        supports_compaction: true,
+        compaction: Some(ResponsesCompaction {
+            compact_threshold: Some(42_000),
+        }),
+        ..Default::default()
+    };
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &config,
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["input"][0]["type"], "compaction_trigger");
+    assert_eq!(json["input"][1]["content"][0]["text"], "hello");
+    assert_eq!(json["context_management"][0]["type"], "compaction");
+    assert_eq!(json["context_management"][0]["compact_threshold"], 42_000);
+}
+
+#[test]
+fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
+    let config = ResponsesConfig::chatgpt_codex(ResponsesAuth::api_key("token"))
+        .with_compaction(ResponsesCompaction::default());
+    let request = ProviderRequest {
+        input: vec![ItemBlock::Local {
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::Message(Message::text(Role::User, "hello")),
+            }],
+        }],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &config,
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["input"][0]["type"], "compaction_trigger");
+    assert_eq!(
+        json["context_management"][0]["compact_threshold"],
+        DEFAULT_CONTEXT_WINDOW * 9 / 10
+    );
+}
+
+#[test]
+fn compaction_replay_trims_before_latest_compaction_item() {
+    let config = ResponsesConfig {
+        supports_compaction: true,
+        ..Default::default()
+    };
+    let request = ProviderRequest {
+        input: vec![
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "before")),
+                }],
+            },
+            ItemBlock::ProviderResponse {
+                provider_response_id: Some("resp_compaction".to_owned()),
+                items: vec![Item {
+                    id: ItemId("item-1".to_owned()),
+                    kind: ItemKind::ProviderItem(ProviderItem {
+                        kind: ProviderItemKind::Compaction,
+                        payload: json!({"type": "compaction", "id": "cmp_1"}),
+                    }),
+                }],
+            },
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-2".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "after")),
+                }],
+            },
+        ],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &config,
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["input"].as_array().unwrap().len(), 2);
+    assert_eq!(json["input"][0]["type"], "compaction");
+    assert_eq!(json["input"][1]["content"][0]["text"], "after");
+    assert!(json.get("context_management").is_none());
+}
+
+#[test]
+fn replays_reasoning_provider_item_only_when_encrypted_reasoning_is_supported() {
+    let reasoning = ItemKind::ProviderItem(ProviderItem {
+        kind: ProviderItemKind::Reasoning,
+        payload: json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed"}),
+    });
+    let request = ProviderRequest {
+        input: vec![
+            ItemBlock::ProviderResponse {
+                provider_response_id: None,
+                items: vec![Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: reasoning.clone(),
+                }],
+            },
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-1".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "after")),
+                }],
+            },
+        ],
+        tools: Vec::new(),
+    };
+
+    let disabled = serde_json::to_value(ResponsesRequest::from_provider_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        request.clone(),
+    ))
+    .unwrap();
+    assert_eq!(disabled["input"].as_array().unwrap().len(), 1);
+    assert_eq!(disabled["input"][0]["content"][0]["text"], "after");
+
+    let enabled = serde_json::to_value(ResponsesRequest::from_provider_request(
+        &ResponsesConfig {
+            supports_encrypted_reasoning: true,
+            ..Default::default()
+        },
+        &ProviderSession::new("gpt-test"),
+        request,
+    ))
+    .unwrap();
+    assert_eq!(enabled["input"].as_array().unwrap().len(), 2);
+    assert_eq!(enabled["input"][0]["encrypted_content"], "sealed");
+}
+
+#[test]
+fn does_not_replay_unknown_provider_items() {
+    let request = ProviderRequest {
+        input: vec![
+            ItemBlock::ProviderResponse {
+                provider_response_id: Some("resp_1".to_owned()),
+                items: vec![Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: ItemKind::ProviderItem(ProviderItem {
+                        kind: ProviderItemKind::Unknown,
+                        payload: json!({"type": "computer_call", "id": "cc_1"}),
+                    }),
+                }],
+            },
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-1".to_owned()),
+                    kind: ItemKind::Message(Message::text(Role::User, "after")),
+                }],
+            },
+        ],
+        tools: Vec::new(),
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["input"].as_array().unwrap().len(), 1);
+    assert_eq!(json["input"][0]["content"][0]["text"], "after");
+}
+
+#[test]
+fn serializes_custom_tool_calls_and_results() {
+    let result = ToolResult {
+        call_id: ToolCallId("call-1".to_owned()),
+        tool_type: ToolType::Custom,
+        status: rho::ToolResultStatus::Success,
+        output: rho::ToolOutput {
+            content: "custom output".to_owned(),
+        },
+    };
+    let request = ProviderRequest {
+        input: vec![
+            ItemBlock::ProviderResponse {
+                provider_response_id: None,
+                items: vec![Item {
+                    id: ItemId("item-0".to_owned()),
+                    kind: ItemKind::ToolCall(ToolCall {
+                        id: ToolCallId("call-1".to_owned()),
+                        name: "patch".to_owned(),
+                        tool_type: ToolType::Custom,
+                        arguments: json!("*** Begin Patch\n*** End Patch"),
+                    }),
+                }],
+            },
+            ItemBlock::Local {
+                items: vec![Item {
+                    id: ItemId("item-1".to_owned()),
+                    kind: ItemKind::ToolResult(result),
+                }],
+            },
+        ],
+        tools: vec![ToolSpec {
+            name: "patch".to_owned(),
+            tool_type: ToolType::Custom,
+            description: "apply a patch".to_owned(),
+            input_schema: Value::Null,
+            format: Some(ToolFormat::Grammar {
+                syntax: ToolGrammarSyntax::Lark,
+                definition: "start: /.+/".to_owned(),
+            }),
+        }],
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["tools"][0]["type"], "custom");
+    assert_eq!(json["tools"][0]["format"]["type"], "grammar");
+    assert_eq!(json["tools"][0]["format"]["syntax"], "lark");
+    assert_eq!(json["tools"][0]["format"]["definition"], "start: /.+/");
+    assert_eq!(json["input"][0]["type"], "custom_tool_call");
+    assert_eq!(json["input"][0]["id"], "ctc_call-1");
+    assert_eq!(json["input"][0]["input"], "*** Begin Patch\n*** End Patch");
+    assert_eq!(json["input"][1]["type"], "custom_tool_call_output");
+    assert_eq!(json["input"][1]["output"], "custom output");
+}
+
+#[test]
+fn encoded_tool_name_stays_mapped_to_declared_tool_name() {
+    let tool = ToolSpec {
+        name: "local.patch".to_owned(),
+        tool_type: ToolType::Custom,
+        description: String::new(),
+        input_schema: Value::Null,
+        format: Some(ToolFormat::Text),
+    };
+    let request = ProviderRequest {
+        input: vec![ItemBlock::ProviderResponse {
+            provider_response_id: None,
+            items: vec![Item {
+                id: ItemId("item-0".to_owned()),
+                kind: ItemKind::ToolCall(ToolCall {
+                    id: ToolCallId("call-1".to_owned()),
+                    name: "local.patch".to_owned(),
+                    tool_type: ToolType::Custom,
+                    arguments: json!("patch body"),
+                }),
+            }],
+        }],
+        tools: vec![tool.clone()],
+    };
+
+    let body = ResponsesRequest::from_provider_request(
+        &ResponsesConfig::default(),
+        &ProviderSession::new("gpt-test"),
+        request,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["tools"][0]["name"], "local_patch");
+    assert_eq!(json["input"][0]["name"], "local_patch");
+
+    let mut state = ResponseState::with_tool_names(tool_name_map(&[tool]));
+    let mut updates = Vec::new();
+    apply_response_event(
+        &mut state,
+        &json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "custom_tool_call",
+                "call_id": "call-2",
+                "name": "local_patch",
+                "input": "patch body"
+            }
+        }),
+        &mut |update| updates.push(update),
+    )
+    .unwrap();
+
+    let response = state.finish();
+    let call = first_tool_call(&response);
+    assert_eq!(call.name, "local.patch");
+    assert!(updates.iter().any(|update| {
+        matches!(
+            update,
+            ResponsesUpdate::ToolCall { call, .. } if call.name == "local.patch"
+        )
+    }));
+}
+
+#[test]
+fn parser_maps_wire_tool_name_back_to_declared_tool_name() {
+    let tool_names = tool_name_map(&[ToolSpec {
+        name: "shell.run".to_owned(),
+        tool_type: ToolType::Function,
+        description: "run shell".to_owned(),
+        input_schema: json!({"type": "object"}),
+        format: None,
+    }]);
+    let mut state = ResponseState::with_tool_names(tool_names);
+    let mut updates = Vec::new();
+
+    let done = apply_response_event(
+        &mut state,
+        &json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "shell_run",
+                "arguments": "{\"command\":\"pwd\"}"
+            }
+        }),
+        &mut |update| updates.push(update),
+    )
+    .unwrap();
+
+    assert!(!done);
+    let response = state.finish();
+    let call = first_tool_call(&response);
+    assert_eq!(call.name, "shell.run");
+    assert!(updates.iter().any(|update| {
+        matches!(
+            update,
+            ResponsesUpdate::ToolCall { call, .. } if call.name == "shell.run"
+        )
+    }));
+}
+
+#[test]
+fn tool_name_map_keeps_wire_name_for_ambiguous_collisions() {
+    let tool_names = tool_name_map(&[
+        ToolSpec {
+            name: "shell.run".to_owned(),
+            tool_type: ToolType::Function,
+            description: String::new(),
+            input_schema: Value::Null,
+            format: None,
+        },
+        ToolSpec {
+            name: "shell_run".to_owned(),
+            tool_type: ToolType::Function,
+            description: String::new(),
+            input_schema: Value::Null,
+            format: None,
+        },
+    ]);
+
+    assert_eq!(
+        tool_names.get("shell_run").map(String::as_str),
+        Some("shell_run")
+    );
+}
+
+#[test]
+fn chatgpt_codex_surface_uses_codex_endpoint_and_store_false() {
+    let surface = ResponsesSurface::ChatGptCodex;
+
+    assert_eq!(
+        surface.responses_url("https://chatgpt.com/backend-api/"),
+        "https://chatgpt.com/backend-api/codex/responses"
+    );
+    assert!(!surface.store_value());
+}
+
+#[test]
+fn chatgpt_codex_config_sets_tau_capability_defaults() {
+    let config = ResponsesConfig::chatgpt_codex(ResponsesAuth::api_key("token"));
+
+    assert_eq!(config.surface, ResponsesSurface::ChatGptCodex);
+    assert_eq!(config.base_url, DEFAULT_CHATGPT_BASE_URL);
+    assert_eq!(config.context_window, DEFAULT_CONTEXT_WINDOW);
+    assert!(config.supports_reasoning_effort);
+    assert!(config.supports_reasoning_summary);
+    assert!(config.supports_verbosity);
+    assert!(config.supports_phase);
+    assert!(config.supports_prompt_cache_key);
+    assert!(config.supports_encrypted_reasoning);
+    assert!(config.supports_compaction);
+    assert_eq!(config.compaction, None);
+    assert_eq!(config.websocket_event_timeout_secs, 120);
+    assert_eq!(config.websocket_ping_interval_secs, 25);
+}
+
+#[test]
+fn chatgpt_codex_models_match_tau_publication_order() {
+    assert_eq!(
+        ResponsesConfig::chatgpt_codex_models(),
+        ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]
+    );
+}
+
+#[test]
+fn default_config_uses_tau_websocket_timeout_and_keepalive_values() {
+    let config = ResponsesConfig::default();
+
+    assert_eq!(
+        config.websocket_event_timeout_secs,
+        DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS
+    );
+    assert_eq!(
+        config.websocket_ping_interval_secs,
+        DEFAULT_WEBSOCKET_PING_INTERVAL_SECS
+    );
+}
+
+#[tokio::test]
+async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
+    let mut socket = PendingSocket::default();
+    let mut last_event_at = tokio::time::Instant::now();
+    let mut ping_interval = Some(tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(5),
+        Duration::from_millis(5),
+    ));
+
+    let error = next_ws_message(
+        &mut socket,
+        Duration::from_millis(25),
+        &mut last_event_at,
+        &mut ping_interval,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("produced no events"));
+    assert!(
+        socket
+            .sent
+            .iter()
+            .any(|message| matches!(message, WsMessage::Ping(_)))
+    );
+}
+
+#[test]
+fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
+    let config = ResponsesConfig {
+        surface: ResponsesSurface::ChatGptCodex,
+        base_url: "https://chatgpt.com/backend-api".to_owned(),
+        auth: ResponsesAuth::oauth_with_account("token", "acct_1"),
+        ..Default::default()
+    };
+
+    let auth = config.auth.resolve().unwrap();
+    let request = build_ws_request(&config, Some("thread-1"), auth.as_ref()).unwrap();
+
+    assert_eq!(
+        request.uri(),
+        "wss://chatgpt.com/backend-api/codex/responses"
+    );
+    assert_eq!(request.headers()["OpenAI-Beta"], OPENAI_BETA_WS);
+    assert_eq!(request.headers()["Authorization"], "Bearer token");
+    assert_eq!(request.headers()["session-id"], "thread-1");
+    assert_eq!(request.headers()["thread-id"], "thread-1");
+    assert_eq!(request.headers()["chatgpt-account-id"], "acct_1");
+}
+
+#[test]
+fn websocket_request_uses_api_key_bearer_without_account_header() {
+    let config = ResponsesConfig {
+        auth: ResponsesAuth::api_key("sk-test"),
+        ..Default::default()
+    };
+
+    let auth = config.auth.resolve().unwrap();
+    let request = build_ws_request(&config, None, auth.as_ref()).unwrap();
+
+    assert_eq!(request.headers()["Authorization"], "Bearer sk-test");
+    assert!(!request.headers().contains_key("chatgpt-account-id"));
+}
+
+#[test]
+fn websocket_request_uses_oauth_file_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = OAuthFile::open_in(temp.path(), "chatgpt").unwrap();
+    file.save(&ResponsesOAuthCredentials {
+        access_token: "oauth-access".to_owned(),
+        refresh_token: "oauth-refresh".to_owned(),
+        expires_at_ms: u64::MAX,
+        account_id: Some("acct_file".to_owned()),
+    })
+    .unwrap();
+    let config = ResponsesConfig {
+        surface: ResponsesSurface::ChatGptCodex,
+        base_url: "https://chatgpt.com/backend-api".to_owned(),
+        auth: ResponsesAuth::oauth_file(file.path()),
+        ..Default::default()
+    };
+
+    let auth = config.auth.resolve().unwrap();
+    let request = build_ws_request(&config, Some("thread-1"), auth.as_ref()).unwrap();
+
+    assert_eq!(request.headers()["Authorization"], "Bearer oauth-access");
+    assert_eq!(request.headers()["chatgpt-account-id"], "acct_file");
+}
+
+#[test]
+fn websocket_envelope_has_response_create_type() {
+    let body = ResponsesRequest {
+        model: "gpt-test".to_owned(),
+        instructions: None,
+        input: Vec::new(),
+        temperature: None,
+        max_output_tokens: None,
+        store: Some(false),
+        tools: Vec::new(),
+        tool_choice: None,
+        reasoning: None,
+        text: None,
+        include: Vec::new(),
+        prompt_cache_key: Some("thread-1".to_owned()),
+        service_tier: None,
+        context_management: Vec::new(),
+        previous_response_id: None,
+        extra_body: BTreeMap::new(),
+    };
+
+    let json = serde_json::to_value(WsResponseCreate {
+        ty: "response.create",
+        body,
+    })
+    .unwrap();
+
+    assert_eq!(json["type"], "response.create");
+    assert_eq!(json["model"], "gpt-test");
+}
+
+#[test]
+fn parses_text_delta_stream() {
+    let response = parse_response_events([
+        r#"{"type":"response.output_text.delta","delta":"hel","output_index":0}"#,
+        r#"{"type":"response.output_text.delta","delta":"lo","output_index":0}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_1"}}"#,
+    ])
+    .unwrap();
+
+    assert_eq!(
+        first_message(&response),
+        &Message::text(Role::Assistant, "hello")
+    );
+    assert!(
+        !response
+            .items
+            .iter()
+            .any(|item| matches!(item, ItemKind::ToolCall(_)))
+    );
+}
+
+#[test]
+fn parses_text_deltas_by_output_index() {
+    let response = parse_response_events([
+        r#"{"type":"response.output_text.delta","delta":"first","output_index":0}"#,
+        r#"{"type":"response.output_text.delta","delta":"second","output_index":2}"#,
+        r#"{"type":"response.completed"}"#,
+    ])
+    .unwrap();
+
+    let messages = response
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ItemKind::Message(message) => Some(message.text_content()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(messages, ["first", "second"]);
+}
+
+#[test]
+fn preserves_nonzero_text_output_order() {
+    let response = parse_response_events([
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"ciphertext","summary":[]}}"#,
+            r#"{"type":"response.output_text.delta","delta":"after reasoning","output_index":2}"#,
+            r#"{"type":"response.completed"}"#,
+        ])
+        .unwrap();
+
+    assert!(matches!(
+        &response.items[0],
+        ItemKind::ProviderItem(provider_item)
+            if provider_item.kind == ProviderItemKind::Reasoning
+    ));
+    assert!(matches!(
+        &response.items[1],
+        ItemKind::Message(message) if message.text_content() == "after reasoning"
+    ));
+}
+
+#[test]
+fn streaming_parser_emits_typed_updates() {
+    let mut updates = Vec::new();
+    let response = parse_response_events_with_updates(
+            [
+                r#"{"type":"response.output_text.delta","delta":"hel","output_index":0}"#,
+                r#"{"type":"response.output_text.delta","delta":"lo","output_index":0}"#,
+                r#"{"type":"response.reasoning_summary_text.delta","delta":"think","output_index":1}"#,
+                r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":2,"output_tokens":3}}}"#,
+            ],
+            |update| updates.push(update),
+        )
+        .unwrap();
+
+    assert_eq!(first_message(&response).text_content(), "hello");
+    assert!(matches!(
+        &updates[0],
+        ResponsesUpdate::TextDelta { output_index: 0, text } if text == "hel"
+    ));
+    assert!(updates.iter().any(|update| {
+        matches!(
+            update,
+            ResponsesUpdate::ReasoningTextDelta {
+                output_index: 1,
+                kind: ReasoningTextKind::Summary,
+                text,
+            } if text == "think"
+        )
+    }));
+    assert!(
+        updates
+            .iter()
+            .any(|update| matches!(update, ResponsesUpdate::ResponseId(id) if id == "resp_1"))
+    );
+    assert!(matches!(updates.last(), Some(ResponsesUpdate::Finished(_))));
+}
+
+#[test]
+fn parses_function_call_stream() {
+    let response = parse_response_events([
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"shell"}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"command\":\"p"}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"wd\"}"}"#,
+            r#"{"type":"response.completed"}"#,
+        ])
+        .unwrap();
+
+    let call = first_tool_call(&response);
+    assert_eq!(call.id, ToolCallId("call_1".to_owned()));
+    assert_eq!(call.name, "shell");
+    assert_eq!(call.tool_type, ToolType::Function);
+    assert_eq!(call.arguments, json!({"command": "pwd"}));
+}
+
+#[test]
+fn parses_custom_tool_call_stream() {
+    let response = parse_response_events([
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"patch"}}"#,
+            r#"{"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"*** Begin"}"#,
+            r#"{"type":"response.custom_tool_call_input.done","output_index":0,"input":"*** Begin Patch\n*** End Patch"}"#,
+            r#"{"type":"response.completed"}"#,
+        ])
+        .unwrap();
+
+    let call = first_tool_call(&response);
+    assert_eq!(call.tool_type, ToolType::Custom);
+    assert_eq!(call.name, "patch");
+    assert_eq!(call.arguments, json!("*** Begin Patch\n*** End Patch"));
+    assert!(matches!(
+        &response.items[0],
+        ItemKind::ToolCall(call) if call.tool_type == ToolType::Custom
+    ));
+}
+
+#[test]
+fn parses_final_message_item() {
+    let response = parse_response_events([
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"final","annotations":[]}]}}"#,
+            r#"{"type":"response.completed"}"#,
+        ])
+        .unwrap();
+
+    assert_eq!(first_message(&response).text_content(), "final");
+}
+
+#[test]
+fn parses_message_phase_from_final_message_item() {
+    let response = parse_response_events([
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","phase":"commentary","content":[{"type":"output_text","text":"draft","annotations":[]}]}}"#,
+            r#"{"type":"response.completed"}"#,
+        ])
+        .unwrap();
+
+    assert_eq!(
+        first_message(&response).phase,
+        Some(MessagePhase::Commentary)
+    );
+}
+
+#[test]
+fn errors_when_stream_ends_without_terminal_event() {
+    let error = parse_response_events([
+        r#"{"type":"response.output_text.delta","delta":"partial","output_index":0}"#,
+    ])
+    .unwrap_err();
+
+    assert!(error.to_string().contains("before response.completed"));
+}
+
+#[test]
+fn captures_response_id_and_usage() {
+    let response = parse_response_events([r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":4},"output_tokens":7}}}"#])
+            .unwrap();
+
+    assert_eq!(response.provider_response_id.as_deref(), Some("resp_1"));
+    assert_eq!(
+        response.usage,
+        Some(TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 4,
+            output_tokens: 7,
+        })
+    );
+}
+
+#[test]
+fn captures_reasoning_summary_and_encrypted_reasoning_item() {
+    let response = parse_response_events([
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"thinking"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"ciphertext","summary":[]}}"#,
+            r#"{"type":"response.completed"}"#,
+        ])
+        .unwrap();
+
+    assert!(response.items.iter().any(|item| {
+        matches!(item, ItemKind::ReasoningText(reasoning) if reasoning.text == "thinking")
+    }));
+    assert!(response.items.iter().any(|item| {
+        matches!(
+            item,
+            ItemKind::ProviderItem(provider_item)
+                if provider_item.kind == ProviderItemKind::Reasoning
+                    && provider_item.payload["encrypted_content"] == "ciphertext"
+        )
+    }));
+}
+
+#[test]
+fn preserves_unknown_completed_provider_items() {
+    let mut updates = Vec::new();
+    let response = parse_response_events_with_updates(
+            [
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"computer_call","id":"cc_1","action":{"type":"screenshot"}}}"#,
+                r#"{"type":"response.completed"}"#,
+            ],
+            |update| updates.push(update),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        &response.items[0],
+        ItemKind::ProviderItem(provider_item)
+            if provider_item.kind == ProviderItemKind::Unknown
+                && provider_item.payload["type"] == "computer_call"
+    ));
+    assert!(updates.iter().any(|update| {
+        matches!(
+            update,
+            ResponsesUpdate::OutputItem {
+                output_index: 0,
+                item: ItemKind::ProviderItem(provider_item),
+            } if provider_item.kind == ProviderItemKind::Unknown
+                && provider_item.payload["id"] == "cc_1"
+        )
+    }));
+}
+
+#[test]
+fn surfaces_stream_error() {
+    let error = parse_response_events([
+        r#"{"type":"error","error":{"message":"rate limit","code":"rate_limit_exceeded"}}"#,
+    ])
+    .unwrap_err();
+
+    assert!(error.to_string().contains("rate limit"));
+    assert!(error.to_string().contains("type=rate_limit_exceeded"));
+}

@@ -1,0 +1,8 @@
+/.direnv
+/.envrc.local
+/result
+/result-*
+/target
+/tmp
+/tmp/
+/.isolate
