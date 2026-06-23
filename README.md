@@ -72,6 +72,10 @@ provider prompt-cache key. Use `--no-store` for a disposable run that does not
 read/write a transcript or send a provider prompt-cache key. The default tool
 surface is intentionally small: `shell_command` and `apply_patch`.
 
+In the interactive chat UI, `Enter` sends the prompt, `Shift-Enter` or
+`Alt-Enter` inserts a newline, double `Ctrl-C` cancels the running response, and
+`Ctrl-D` exits from an empty prompt.
+
 For one-shot use:
 
 ```sh

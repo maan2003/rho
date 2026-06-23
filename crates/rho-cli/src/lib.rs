@@ -1107,4 +1107,10 @@ Auth:
   provider add               Browser OAuth setup and save credentials
   provider list              List file-based provider credentials
   provider remove            Remove file-based provider credentials
+
+Controls:
+  Enter                       Send the prompt
+  Shift-Enter, Alt-Enter      Insert a newline
+  Ctrl-C twice                Cancel the running response
+  Ctrl-D                      Exit from an empty prompt
 ";
