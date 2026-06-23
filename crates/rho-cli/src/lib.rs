@@ -284,7 +284,7 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 }
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
-    let provider = AgentProvider::Responses(Box::new(build_provider_session(args)));
+    let provider = AgentProvider::Responses(build_provider_session(args));
     let tools = AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT));
     let mut agent = if args.no_store {
         Agent::new(provider)

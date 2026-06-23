@@ -31,7 +31,7 @@ pub enum AgentUpdate {
 }
 
 pub enum AgentProvider {
-    Responses(Box<ProviderSession>),
+    Responses(ProviderSession),
     #[cfg(test)]
     Test {
         complete: Arc<
