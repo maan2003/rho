@@ -8,7 +8,6 @@ use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::oauth::ResolvedAuth;
-use super::session::{ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice, Verbosity};
 use super::ws::{WebSocketPoolKey, WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 
@@ -96,16 +95,7 @@ impl Sink<WsMessage> for PendingSocket {
 
 #[test]
 fn builds_responses_request_with_tools_and_item_timeline() {
-    let mut extra_body = BTreeMap::new();
-    extra_body.insert("metadata".to_owned(), json!({"project": "rho"}));
-    let mut session = ProviderSession::new("gpt-test");
-    session.extra_body = extra_body;
-    session.temperature = Some(0.5);
-    session.reasoning_effort = Some(ReasoningEffort::Medium);
-    session.reasoning_summary = ReasoningSummary::Detailed;
-    session.verbosity = Some(Verbosity::High);
-    session.service_tier = Some(ServiceTier::Flex);
-    session.prompt_cache_key = Some("cache-key".to_owned());
+    let session = ProviderSession::new("gpt-test").with_prompt_cache_key("cache-key");
     let request = ProviderRequest {
         input: vec![
             ItemBlock::Local {
@@ -157,7 +147,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
 
     assert_eq!(json["model"], "gpt-test");
     assert_eq!(json["instructions"], "be concise");
-    assert_eq!(json["temperature"], 0.5);
+    assert!(json.get("temperature").is_none());
     assert!(json.get("max_output_tokens").is_none());
     assert_eq!(json["input"][0]["role"], "user");
     assert_eq!(json["input"][1]["type"], "function_call");
@@ -166,21 +156,17 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     assert_eq!(json["tools"][0]["name"], "shell_run");
     assert_eq!(json["tool_choice"], "auto");
     assert_eq!(json["store"], false);
-    assert_eq!(json["reasoning"]["effort"], "medium");
-    assert_eq!(json["reasoning"]["summary"], "detailed");
-    assert_eq!(json["reasoning"]["context"], "all_turns");
-    assert_eq!(json["text"]["verbosity"], "high");
-    assert_eq!(json["service_tier"], "flex");
+    assert!(json.get("reasoning").is_none());
+    assert_eq!(json["text"]["verbosity"], "medium");
+    assert!(json.get("service_tier").is_none());
     assert_eq!(json["prompt_cache_key"], "cache-key");
     assert_eq!(json["previous_response_id"], "resp_prev");
     assert_eq!(json["include"][0], "reasoning.encrypted_content");
-    assert_eq!(json["metadata"]["project"], "rho");
 }
 
 #[test]
-fn serializes_forced_no_tool_choice_without_declared_tools() {
-    let mut session = ProviderSession::new("gpt-test");
-    session.tool_choice = ToolChoice::None;
+fn omits_tool_choice_without_declared_tools() {
+    let session = ProviderSession::new("gpt-test");
     let request = ProviderRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
@@ -194,7 +180,7 @@ fn serializes_forced_no_tool_choice_without_declared_tools() {
     let body = ResponsesRequest::from_provider_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
-    assert_eq!(json["tool_choice"], "none");
+    assert!(json.get("tool_choice").is_none());
 }
 
 #[test]
@@ -225,27 +211,6 @@ fn websocket_pool_key_requires_chatgpt_pool_and_prompt_cache_key() {
 
     body.prompt_cache_key = None;
     assert!(WebSocketPoolKey::from_request(&session, &body, Some(&auth)).is_none());
-}
-
-#[test]
-fn serializes_max_output_tokens_when_set() {
-    let mut session = ProviderSession::new("gpt-test");
-    session.max_output_tokens = Some(1234);
-    let request = ProviderRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
-
-    let body = ResponsesRequest::from_provider_request(&session, request);
-    let json = serde_json::to_value(body).unwrap();
-
-    assert_eq!(json["max_output_tokens"], 1234);
-    assert!(json.get("temperature").is_none());
 }
 
 #[test]
@@ -292,50 +257,6 @@ fn omits_empty_reasoning_request_when_no_effort_is_set() {
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("reasoning").is_none());
-}
-
-#[test]
-fn serializes_reasoning_summary_when_supported() {
-    let mut session = ProviderSession::new("gpt-test");
-    session.reasoning_summary = ReasoningSummary::Concise;
-    let request = ProviderRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
-
-    let body = ResponsesRequest::from_provider_request(&session, request);
-    let json = serde_json::to_value(body).unwrap();
-
-    assert!(json["reasoning"].get("effort").is_none());
-    assert_eq!(json["reasoning"]["summary"], "concise");
-    assert_eq!(json["reasoning"]["context"], "all_turns");
-}
-
-#[test]
-fn serializes_reasoning_effort_and_summary_together() {
-    let mut session = ProviderSession::new("gpt-test");
-    session.reasoning_effort = Some(ReasoningEffort::High);
-    session.reasoning_summary = ReasoningSummary::Detailed;
-    let request = ProviderRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
-
-    let body = ResponsesRequest::from_provider_request(&session, request);
-    let json = serde_json::to_value(body).unwrap();
-
-    assert_eq!(json["reasoning"]["effort"], "high");
-    assert_eq!(json["reasoning"]["summary"], "detailed");
 }
 
 #[test]
@@ -865,14 +786,6 @@ fn chatgpt_codex_config_sets_endpoint_defaults() {
     assert_eq!(session.compaction, None);
 }
 
-#[test]
-fn chatgpt_codex_models_match_tau_publication_order() {
-    assert_eq!(
-        ProviderSession::chatgpt_codex_models(),
-        ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]
-    );
-}
-
 #[tokio::test]
 async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
     let mut socket = PendingSocket::default();
@@ -960,19 +873,14 @@ fn websocket_envelope_has_response_create_type() {
         model: "gpt-test".to_owned(),
         instructions: None,
         input: Vec::new(),
-        temperature: None,
-        max_output_tokens: None,
         store: Some(false),
         tools: Vec::new(),
         tool_choice: None,
-        reasoning: None,
         text: None,
         include: Vec::new(),
         prompt_cache_key: Some("thread-1".to_owned()),
-        service_tier: None,
         context_management: Vec::new(),
         previous_response_id: None,
-        extra_body: BTreeMap::new(),
     };
 
     let json = serde_json::to_value(WsResponseCreate {

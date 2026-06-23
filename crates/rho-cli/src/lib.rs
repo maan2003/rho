@@ -1100,7 +1100,7 @@ Usage:
   rho provider remove [NAME]
 
 Options:
-  --model MODEL              Responses model to use [default: gpt-5]
+  --model MODEL              Responses model to use [default: gpt-5.5]
   --auth-file NAME_OR_PATH   OAuth file name under state/rho/auth.d or explicit path [default: default]
   --session NAME             Persistent local session name [default: default]
   --session-path PATH        Explicit CBOR transcript path

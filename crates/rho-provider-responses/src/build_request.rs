@@ -6,10 +6,8 @@ use rho::{
 };
 use serde_json::{Value, json};
 
-use crate::session::{ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice, Verbosity};
 use crate::{
-    ContextManagementRequest, ProviderSession, ReasoningContext, ReasoningRequest,
-    ResponsesRequest, TextRequest, encode_tool_name,
+    ContextManagementRequest, ProviderSession, ResponsesRequest, TextRequest, encode_tool_name,
 };
 
 impl ResponsesRequest {
@@ -89,17 +87,7 @@ impl ResponsesRequest {
         for item in input_items.iter().cloned() {
             convert_item_kind(&local_tool_wire_names, item, &mut input);
         }
-        let tool_choice = match (session.tool_choice, tools.is_empty()) {
-            (ToolChoice::None, _) => Some("none"),
-            (ToolChoice::Auto, false) => Some("auto"),
-            (ToolChoice::Auto, true) => None,
-        };
-        let temperature = session.temperature;
-        let max_output_tokens = session.max_output_tokens;
-        let effort = session.reasoning_effort;
-        let summary = reasoning_summary_wire(session.reasoning_summary);
-        let verbosity = session.verbosity;
-        let service_tier = session.service_tier;
+        let tool_choice = (!tools.is_empty()).then_some("auto");
         let prompt_cache_key = session.prompt_cache_key.clone();
         let previous_response_id = previous_response.map(|(id, _)| id);
         let active_compaction = session.compaction.as_ref();
@@ -123,25 +111,16 @@ impl ResponsesRequest {
             model: session.model.clone(),
             instructions: (!instructions.is_empty()).then(|| instructions.join("\n\n")),
             input,
-            temperature,
-            max_output_tokens,
             store: Some(false),
             tools,
             tool_choice,
-            reasoning: (effort.is_some() || summary.is_some()).then(|| ReasoningRequest {
-                context: Some(ReasoningContext::AllTurns),
-                effort: effort.map(effort_wire),
-                summary,
-            }),
             text: Some(TextRequest {
-                verbosity: verbosity.map(verbosity_wire).unwrap_or("medium"),
+                verbosity: "medium",
             }),
             include: vec!["reasoning.encrypted_content"],
             prompt_cache_key,
-            service_tier: service_tier.map(service_tier_wire),
             context_management,
             previous_response_id,
-            extra_body: session.extra_body.clone(),
         }
     }
 }
@@ -308,40 +287,6 @@ fn convert_tool_format(format: ToolFormat) -> Value {
             },
             "definition": definition,
         }),
-    }
-}
-
-fn effort_wire(effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-    }
-}
-
-fn reasoning_summary_wire(reasoning_summary: ReasoningSummary) -> Option<&'static str> {
-    match reasoning_summary {
-        ReasoningSummary::Off => None,
-        ReasoningSummary::Auto => Some("auto"),
-        ReasoningSummary::Concise => Some("concise"),
-        ReasoningSummary::Detailed => Some("detailed"),
-    }
-}
-
-fn verbosity_wire(verbosity: Verbosity) -> &'static str {
-    match verbosity {
-        Verbosity::Low => "low",
-        Verbosity::Medium => "medium",
-        Verbosity::High => "high",
-    }
-}
-
-fn service_tier_wire(service_tier: ServiceTier) -> &'static str {
-    match service_tier {
-        ServiceTier::Auto => "auto",
-        ServiceTier::Default => "default",
-        ServiceTier::Flex => "flex",
     }
 }
 

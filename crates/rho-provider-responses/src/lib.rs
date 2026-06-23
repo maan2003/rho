@@ -24,22 +24,21 @@ use serde_json::json;
 
 mod build_request;
 pub mod oauth;
-pub mod session;
+mod session;
 mod ws;
 
 pub use oauth::{OAuthFile, ResponsesAuth, ResponsesOAuthCredentials};
 pub use session::ProviderSession;
 
 pub const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
-pub const DEFAULT_MODEL: &str = "gpt-5";
-pub const DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
-pub const DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS: u64 = 120;
-pub const DEFAULT_WEBSOCKET_PING_INTERVAL_SECS: u64 = 25;
-pub const DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS: usize = 10;
-pub const DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS: u64 = 55 * 60;
-pub const DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS: u64 = 50;
-pub const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
-pub const CHATGPT_CODEX_MODELS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"];
+pub const DEFAULT_MODEL: &str = "gpt-5.5";
+pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
+pub(crate) const DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS: u64 = 120;
+pub(crate) const DEFAULT_WEBSOCKET_PING_INTERVAL_SECS: u64 = 25;
+pub(crate) const DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS: usize = 10;
+pub(crate) const DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS: u64 = 55 * 60;
+pub(crate) const DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS: u64 = 50;
+pub(crate) const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
 
 pub type ResponsesFuture = BoxFuture<'static, Result<ProviderResponse>>;
 pub type ResponsesStream = BoxStream<'static, Result<ResponsesUpdate>>;
@@ -79,47 +78,21 @@ pub(crate) struct ResponsesRequest {
     pub instructions: Option<String>,
     pub input: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<ReasoningRequest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextRequest>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub context_management: Vec<ContextManagementRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
-    #[serde(flatten)]
-    pub extra_body: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct ReasoningRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<ReasoningContext>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<&'static str>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(crate) enum ReasoningContext {
-    #[serde(rename = "all_turns")]
-    AllTurns,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
