@@ -4,14 +4,14 @@ use tokio::sync::Mutex;
 
 use super::oauth::InferenceAuth;
 use super::ws::WebSocketPool;
-use super::{DEFAULT_CHATGPT_BASE_URL, DEFAULT_MODEL, ResponsesCompaction};
+use super::{Compaction, DEFAULT_CHATGPT_BASE_URL, DEFAULT_MODEL};
 
 #[derive(Clone)]
 pub struct InferenceService {
     pub(super) websocket_pool: Arc<Mutex<WebSocketPool>>,
     pub(crate) base_url: String,
     pub(crate) auth: InferenceAuth,
-    pub(crate) compaction: Option<ResponsesCompaction>,
+    pub(crate) compaction: Option<Compaction>,
     pub(crate) model: String,
     pub(crate) prompt_cache_key: Option<String>,
 }
@@ -31,14 +31,12 @@ impl InferenceService {
     }
 
     pub fn with_compaction(mut self) -> Self {
-        self.compaction = Some(ResponsesCompaction::default());
+        self.compaction = Some(Compaction::Default);
         self
     }
 
     pub fn with_compaction_threshold(mut self, compact_threshold: u64) -> Self {
-        self.compaction = Some(ResponsesCompaction {
-            compact_threshold: Some(compact_threshold),
-        });
+        self.compaction = Some(Compaction::Threshold(compact_threshold));
         self
     }
 

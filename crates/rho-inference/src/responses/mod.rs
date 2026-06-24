@@ -32,9 +32,12 @@ pub(crate) const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
 
 pub type InferenceStream = BoxStream<'static, Result<InferenceUpdate>>;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ResponsesCompaction {
-    pub compact_threshold: Option<u64>,
+/// How the Responses API should compact long threads. `Default` lets the
+/// provider pick the threshold; `Threshold` pins an explicit token count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Compaction {
+    Default,
+    Threshold(u64),
 }
 
 fn responses_url(base_url: &str) -> String {

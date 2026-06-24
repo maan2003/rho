@@ -10,7 +10,7 @@ use rho_core::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{InferenceService, encode_tool_name};
+use super::{Compaction, InferenceService, encode_tool_name};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ResponsesRequest {
@@ -129,16 +129,16 @@ impl ResponsesRequest {
         let tool_choice = (!tools.is_empty()).then_some("auto");
         let prompt_cache_key = session.prompt_cache_key.clone();
         let previous_response_id = previous_response.map(|(id, _)| id);
-        let active_compaction = session.compaction.as_ref();
-        let context_management = active_compaction
+        let context_management = session
+            .compaction
             .map(|compaction| {
+                let compact_threshold = match compaction {
+                    Compaction::Default => provider_default_compaction_threshold(),
+                    Compaction::Threshold(value) => value,
+                };
                 vec![ContextManagementRequest {
                     ty: "compaction",
-                    compact_threshold: Some(
-                        compaction
-                            .compact_threshold
-                            .unwrap_or_else(provider_default_compaction_threshold),
-                    ),
+                    compact_threshold: Some(compact_threshold),
                 }]
             })
             .unwrap_or_default();
