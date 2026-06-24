@@ -1,0 +1,33 @@
+# Security and reliability context
+
+`rho` is a Rust toolkit and CLI for local AI-agent workflows. The main
+production/runtime surfaces are local terminal use, local transcript/session
+stores, local shell/apply-patch tools, and provider crates that talk to external
+AI APIs.
+
+## Trust boundaries
+
+- Local users control prompts, session names/paths, provider auth setup/import,
+  and tool inputs.
+- Provider APIs and streamed provider events are remote, semi-trusted inputs and
+  must be parsed defensively.
+- Local filesystem state may contain transcripts and OAuth credentials;
+  credential files are secrets.
+- Shell/apply-patch tools can affect the caller's workspace and must remain
+  explicit user-facing capabilities.
+
+## Runtime assumptions
+
+- Runtime code is primarily Tokio async Rust plus local CLI/TUI code.
+- Network paths must have bounded waits or documented cancellation behavior.
+- Queues and streams on provider/tool paths should provide backpressure or
+  document accepted bounds.
+- Production paths should not panic on malformed provider data, bad local input,
+  missing files, or network failures.
+
+## Future review notes
+
+Future changes that add providers, credential storage, transcript persistence,
+subprocess execution, filesystem writes, or background tasks must update this
+file and document their primary trust boundaries, resource bounds, cancellation
+behavior, and tests.
