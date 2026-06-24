@@ -3,6 +3,7 @@
 //! This crate intentionally avoids owning agent policy. Harnesses, providers,
 //! tools, and stores can add their own richer types around these basics.
 
+use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -192,6 +193,12 @@ pub enum InferenceUpdate {
     Usage(TokenUsage),
     ResponseId(String),
     Finished(InferenceResponse),
+}
+
+pub type InferenceStream = BoxStream<'static, anyhow::Result<InferenceUpdate>>;
+
+pub trait IInferenceService: Send + Sync + 'static {
+    fn stream(&self, request: InferenceRequest) -> InferenceStream;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

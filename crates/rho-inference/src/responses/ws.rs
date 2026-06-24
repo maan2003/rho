@@ -157,8 +157,7 @@ impl WebSocketConnection {
         let event_timeout = Duration::from_secs(DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS);
         let mut last_event_at = tokio::time::Instant::now();
         let ping = Duration::from_secs(DEFAULT_WEBSOCKET_PING_INTERVAL_SECS);
-        let mut ping_interval =
-            tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
+        let mut ping_interval = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
         while let Some(message) = next_ws_message(
             &mut self.socket,
             event_timeout,

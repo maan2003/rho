@@ -98,7 +98,7 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 }
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
-    let inference = AgentInference::Service(build_inference_service(args)?);
+    let inference = AgentInference::new(Box::new(build_inference_service(args)?));
     let tools = vec![AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT))];
     let mut agent = if args.no_store {
         Agent::new(inference, tools)

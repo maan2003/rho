@@ -12,15 +12,17 @@ are local edits to crates, structs, enums, futures, and streams.
 ## Shape
 
 - `rho-core`: small shared item vocabulary for messages, tool calls, tool
-  results, reasoning text, opaque provider items, inference requests, streaming
-  inference updates/responses, ids, usage, and token usage.
+  results, reasoning text, opaque provider items, inference requests, the
+  streaming inference-service trait, inference updates/responses, ids, usage,
+  and token usage.
 - `rho-inference`: concrete inference provider integrations behind a
   provider-neutral public API, plus the auth-management CLI workflow. Its
   current private implementation provides WebSocket-only OpenAI Responses and
   ChatGPT/Codex inference support.
 - `rho-agent`: an opinionated, forkable harness that owns queueing, retries,
   tool scheduling, persistence hooks, streamed transcript handling, and
-  inference response block persistence.
+  inference response block persistence while depending only on the core
+  inference-service trait.
 - `rho-cli`: an interactive terminal chat agent assembled from `rho-agent`, the
   inference service, shell/apply_patch tools, CBOR persistence, and copied Tau
   terminal rendering building blocks.

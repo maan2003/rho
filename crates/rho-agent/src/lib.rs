@@ -13,11 +13,10 @@ use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt, join_all};
 use rho_core::{
-    InferenceRequest, InferenceResponse, InferenceUpdate, Item, ItemBlock, ItemKind, Message,
-    MessagePhase, ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult, ToolSpec,
+    IInferenceService, InferenceRequest, InferenceResponse, InferenceStream, InferenceUpdate, Item,
+    ItemBlock, ItemKind, Message, MessagePhase, ReasoningText, ReasoningTextKind, Role, ToolCall,
+    ToolResult, ToolSpec,
 };
-use rho_inference::InferenceService;
-pub use rho_inference::InferenceStream;
 use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use rho_tool_shell::ShellTools;
@@ -36,12 +35,14 @@ pub enum AgentUpdate {
     ToolCallFinished(ToolResult),
 }
 
-pub enum AgentInference {
-    Service(InferenceService),
-    #[cfg(test)]
-    Test {
-        stream: Arc<dyn Fn(InferenceRequest) -> InferenceStream + Send + Sync>,
-    },
+pub struct AgentInference {
+    service: Box<dyn IInferenceService>,
+}
+
+impl AgentInference {
+    pub fn new(service: Box<dyn IInferenceService>) -> Self {
+        Self { service }
+    }
 }
 
 pub enum AgentTools {
@@ -524,11 +525,7 @@ impl AgentStore {
 
 impl AgentInference {
     fn stream(&self, request: InferenceRequest) -> InferenceStream {
-        match self {
-            AgentInference::Service(session) => session.stream(request),
-            #[cfg(test)]
-            AgentInference::Test { stream } => stream(request),
-        }
+        self.service.stream(request)
     }
 }
 

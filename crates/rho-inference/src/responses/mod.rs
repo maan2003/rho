@@ -9,9 +9,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use futures::StreamExt;
-use futures::stream::{self, BoxStream};
-use rho_core::{InferenceRequest, InferenceUpdate, ToolSpec};
+use futures::{StreamExt, stream};
+use rho_core::{IInferenceService, InferenceRequest, InferenceStream, InferenceUpdate, ToolSpec};
 
 pub(crate) mod oauth;
 mod session;
@@ -29,8 +28,6 @@ pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-a
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.5";
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
 pub(crate) const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
-
-pub type InferenceStream = BoxStream<'static, Result<InferenceUpdate>>;
 
 /// How the Responses API should compact long threads. `Default` lets the
 /// provider pick the threshold; `Threshold` pins an explicit token count.
@@ -61,6 +58,12 @@ impl InferenceService {
             receiver.recv().await.map(|item| (item, receiver))
         })
         .boxed()
+    }
+}
+
+impl IInferenceService for InferenceService {
+    fn stream(&self, request: InferenceRequest) -> InferenceStream {
+        InferenceService::stream(self, request)
     }
 }
 

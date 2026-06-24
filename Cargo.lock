@@ -942,7 +942,6 @@ dependencies = [
  "anyhow",
  "futures",
  "rho-core",
- "rho-inference",
  "rho-store-cbor",
  "rho-store-redb",
  "rho-tool-shell",
@@ -993,6 +992,8 @@ dependencies = [
 name = "rho-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "futures",
  "serde",
  "serde_json",
 ]

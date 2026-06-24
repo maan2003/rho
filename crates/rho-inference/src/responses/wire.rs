@@ -442,7 +442,10 @@ impl ResponseState {
                 items.push(explicit);
             } else {
                 if !message_text.is_empty() {
-                    items.push(ItemKind::Message(Message::text(Role::Assistant, message_text)));
+                    items.push(ItemKind::Message(Message::text(
+                        Role::Assistant,
+                        message_text,
+                    )));
                 }
                 if let Some(call) = tool_call.finish() {
                     items.push(ItemKind::ToolCall(call));

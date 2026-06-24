@@ -4,14 +4,24 @@ use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use rho_core::{
-    InferenceResponse, ItemKind, Message, ProviderItem, ProviderItemKind, Role, ToolCall,
-    ToolCallId, ToolType,
+    IInferenceService, InferenceResponse, ItemKind, Message, ProviderItem, ProviderItemKind, Role,
+    ToolCall, ToolCallId, ToolType,
 };
 use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use serde_json::json;
 
 use super::*;
+
+struct TestInferenceService {
+    stream: Arc<dyn Fn(InferenceRequest) -> InferenceStream + Send + Sync>,
+}
+
+impl IInferenceService for TestInferenceService {
+    fn stream(&self, request: InferenceRequest) -> InferenceStream {
+        (self.stream)(request)
+    }
+}
 
 fn test_items(blocks: &[ItemBlock]) -> Vec<&rho_core::Item> {
     blocks
@@ -29,22 +39,22 @@ fn test_provider(
     + 'static,
 ) -> AgentInference {
     let complete = Arc::new(complete);
-    AgentInference::Test {
+    AgentInference::new(Box::new(TestInferenceService {
         stream: Arc::new(move |request| {
             let future = complete(request);
             futures::stream::once(async move { future.await.map(InferenceUpdate::Finished) })
                 .boxed()
         }),
-    }
+    }))
 }
 
 fn test_streaming_provider(
     stream: impl Fn(InferenceRequest) -> InferenceStream + Send + Sync + 'static,
 ) -> AgentInference {
     let stream = Arc::new(stream);
-    AgentInference::Test {
+    AgentInference::new(Box::new(TestInferenceService {
         stream: Arc::new(move |request| stream(request)),
-    }
+    }))
 }
 
 fn text_response(content: impl Into<String>) -> InferenceResponse {

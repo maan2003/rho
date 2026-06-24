@@ -14,6 +14,8 @@ The public surface is intentionally small:
 - `InferenceService::stream` accepts a `rho_core::InferenceRequest` and returns
   an `InferenceStream` of `rho_core::InferenceUpdate` values ending in
   `InferenceUpdate::Finished`.
+- `InferenceService` implements `rho_core::IInferenceService` so harness crates
+  can depend on `rho-core` instead of this provider crate.
 - `auth_cli::AuthArgs` and `run_auth_cli` own the user-facing auth management
   workflow for add/list/remove/path/status/import.
 - `rho_core::InferenceUpdate` is the provider-neutral streaming update contract
