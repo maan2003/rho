@@ -26,14 +26,15 @@ use anyhow::{Result, anyhow};
 use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rho_core::{
-    IInferenceSession, InferenceUpdate, Item, ItemBlock, ItemKind, Message, MessagePhase, Role,
-    ToolCall, ToolResult, ToolSpec,
+    ContextBlock, ContextItem, IInferenceSession, InferenceUpdate, ItemKind, Message, MessagePhase,
+    Role, ToolCall, ToolResult, ToolSpec,
 };
 use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use rho_tool_shell::ShellTools;
 use tokio::sync::{broadcast, mpsc};
 
+mod agent2;
 mod invariants;
 mod observable;
 
@@ -99,14 +100,14 @@ impl Agent {
     }
 
     /// The conversation so far.
-    pub fn blocks(&self) -> Vec<ItemBlock> {
+    pub fn blocks(&self) -> Vec<ContextBlock> {
         self.invariants.snapshot()
     }
 
     /// Current conversation history plus a receiver for every block appended
     /// afterwards, taken atomically. Consumers (a UI) fold the stream to mirror
     /// the conversation without polling.
-    pub fn subscribe(&self) -> (Vec<ItemBlock>, broadcast::Receiver<ItemBlock>) {
+    pub fn subscribe(&self) -> (Vec<ContextBlock>, broadcast::Receiver<ContextBlock>) {
         self.invariants.subscribe()
     }
 
@@ -141,7 +142,7 @@ pub struct AgentBuilder {
     inference: Box<dyn IInferenceSession>,
     tools: Vec<AgentTools>,
     store: Option<AgentStore>,
-    store_blocks: Option<Vec<ItemBlock>>,
+    store_blocks: Option<Vec<ContextBlock>>,
 }
 
 impl AgentBuilder {
@@ -250,12 +251,12 @@ async fn run(mut agent: AgentLoop, mut commands: mpsc::UnboundedReceiver<Command
                 let items = response
                     .items
                     .into_iter()
-                    .map(|kind| Item {
+                    .map(|kind| ContextItem {
                         id: alloc_item_id(),
                         kind,
                     })
                     .collect::<Vec<_>>();
-                agent.record_block(ItemBlock::InferenceResponse {
+                agent.record_block(ContextBlock::InferenceResponse {
                     provider_response_id,
                     items,
                 }).await;
@@ -325,8 +326,8 @@ impl AgentLoop {
     /// is visible in the conversation rather than swallowed.
     async fn finish_with_error(&mut self, error: anyhow::Error) {
         if self.active.is_some() {
-            self.record_block(ItemBlock::Local {
-                items: vec![Item {
+            self.record_block(ContextBlock::Local {
+                items: vec![ContextItem {
                     id: alloc_item_id(),
                     kind: ItemKind::Message(
                         // review: we can't add Assistant role messages ourselves! this must be an
@@ -342,8 +343,8 @@ impl AgentLoop {
     }
 
     async fn append_user_message(&mut self, content: String) {
-        let block = ItemBlock::Local {
-            items: vec![Item {
+        let block = ContextBlock::Local {
+            items: vec![ContextItem {
                 id: alloc_item_id(),
                 kind: ItemKind::Message(Message::text(Role::User, content)),
             }],
@@ -390,27 +391,27 @@ impl AgentLoop {
         }
     }
 
-    async fn record_block(&mut self, block: ItemBlock) {
+    async fn record_block(&mut self, block: ContextBlock) {
         if let Some(store) = &self.store {
             store.append_block(&block).await;
         }
         self.invariants.append_block(block);
     }
 
-    fn tool_results_to_block(&self, results: Vec<ToolResult>) -> ItemBlock {
+    fn tool_results_to_block(&self, results: Vec<ToolResult>) -> ContextBlock {
         let items = results
             .into_iter()
-            .map(|result| Item {
+            .map(|result| ContextItem {
                 id: alloc_item_id(),
                 kind: ItemKind::ToolResult(result),
             })
             .collect();
-        ItemBlock::Local { items }
+        ContextBlock::Local { items }
     }
 }
 
 /// Tool calls in `blocks` that have no matching tool result yet.
-fn unanswered_tool_calls(blocks: &[ItemBlock]) -> Vec<ToolCall> {
+fn unanswered_tool_calls(blocks: &[ContextBlock]) -> Vec<ToolCall> {
     let mut answered = HashSet::new();
     for item in block_items(blocks) {
         if let ItemKind::ToolResult(result) = &item.kind {
@@ -425,9 +426,9 @@ fn unanswered_tool_calls(blocks: &[ItemBlock]) -> Vec<ToolCall> {
         .collect()
 }
 
-fn block_items(blocks: &[ItemBlock]) -> impl Iterator<Item = &Item> {
+fn block_items(blocks: &[ContextBlock]) -> impl Iterator<Item = &ContextItem> {
     blocks.iter().flat_map(|block| match block {
-        ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
+        ContextBlock::Local { items } | ContextBlock::InferenceResponse { items, .. } => items,
     })
 }
 
@@ -453,7 +454,7 @@ impl AgentStore {
     /// Append a block, panicking on a store failure: a write failure here means
     /// the on-disk transcript is broken, which the agent cannot meaningfully
     /// recover from mid-turn.
-    async fn append_block(&self, block: &ItemBlock) {
+    async fn append_block(&self, block: &ContextBlock) {
         let result = match self {
             AgentStore::CborLog(log) => log.append_block(block).await,
             AgentStore::RedbLog(log) => log.append_block(block).await,
@@ -461,7 +462,7 @@ impl AgentStore {
         result.expect("agent store append failed");
     }
 
-    async fn read_blocks(&self) -> Result<Vec<ItemBlock>> {
+    async fn read_blocks(&self) -> Result<Vec<ContextBlock>> {
         match self {
             AgentStore::CborLog(log) => log.read_blocks().await,
             AgentStore::RedbLog(log) => log.read_blocks().await,

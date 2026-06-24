@@ -60,11 +60,11 @@ fn test_session(
     })
 }
 
-fn test_items(blocks: &[ItemBlock]) -> Vec<&rho_core::Item> {
+fn test_items(blocks: &[ContextBlock]) -> Vec<&rho_core::ContextItem> {
     blocks
         .iter()
         .flat_map(|block| match block {
-            ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
+            ContextBlock::Local { items } | ContextBlock::InferenceResponse { items, .. } => items,
         })
         .collect()
 }
@@ -135,9 +135,9 @@ fn custom_tool_call_response(
     }
 }
 
-fn has_tool_result(input: &[ItemBlock]) -> bool {
+fn has_tool_result(input: &[ContextBlock]) -> bool {
     input.iter().any(|block| match block {
-        ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items
+        ContextBlock::Local { items } | ContextBlock::InferenceResponse { items, .. } => items
             .iter()
             .any(|item| matches!(item.kind, ItemKind::ToolResult(_))),
     })
@@ -275,10 +275,10 @@ async fn inference_request_keeps_full_block_history() {
     assert_eq!(requests[0].len(), 1);
     assert_eq!(requests[1].len(), 3);
     assert!(
-        matches!(&requests[1][0], ItemBlock::Local { items } if matches!(&items[0].kind, ItemKind::Message(message) if message.text_content() == "first"))
+        matches!(&requests[1][0], ContextBlock::Local { items } if matches!(&items[0].kind, ItemKind::Message(message) if message.text_content() == "first"))
     );
     assert!(
-        matches!(&requests[1][2], ItemBlock::Local { items } if matches!(&items[0].kind, ItemKind::Message(message) if message.text_content() == "second"))
+        matches!(&requests[1][2], ContextBlock::Local { items } if matches!(&items[0].kind, ItemKind::Message(message) if message.text_content() == "second"))
     );
 }
 
@@ -300,7 +300,7 @@ async fn records_provider_response_block() {
 
     assert!(matches!(
         agent.blocks()[1],
-        ItemBlock::InferenceResponse { .. }
+        ContextBlock::InferenceResponse { .. }
     ));
 }
 
@@ -322,14 +322,14 @@ async fn restored_provider_response_block_forwards_full_history_with_boundary() 
     let path =
         temp_log_path("restored_provider_response_block_forwards_full_history_with_boundary");
     let log = CborLog::new(&path);
-    log.append_block(&ItemBlock::Local {
-        items: vec![Item::message("item-0", Role::User, "first")],
+    log.append_block(&ContextBlock::Local {
+        items: vec![ContextItem::message("item-0", Role::User, "first")],
     })
     .await
     .unwrap();
-    log.append_block(&ItemBlock::InferenceResponse {
+    log.append_block(&ContextBlock::InferenceResponse {
         provider_response_id: Some("resp_1".to_owned()),
-        items: vec![Item::message("item-1", Role::Assistant, "done")],
+        items: vec![ContextItem::message("item-1", Role::Assistant, "done")],
     })
     .await
     .unwrap();
@@ -346,10 +346,10 @@ async fn restored_provider_response_block_forwards_full_history_with_boundary() 
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests[0].len(), 3);
     assert!(
-        matches!(&requests[0][0], ItemBlock::Local { items } if matches!(&items[0].kind, ItemKind::Message(message) if message.text_content() == "first"))
+        matches!(&requests[0][0], ContextBlock::Local { items } if matches!(&items[0].kind, ItemKind::Message(message) if message.text_content() == "first"))
     );
     assert!(
-        matches!(&requests[0][2], ItemBlock::Local { items } if matches!(&items[0].kind, ItemKind::Message(message) if message.text_content() == "second"))
+        matches!(&requests[0][2], ContextBlock::Local { items } if matches!(&items[0].kind, ItemKind::Message(message) if message.text_content() == "second"))
     );
 }
 
@@ -743,8 +743,8 @@ async fn loads_transcript_items_from_cbor_log() {
     let path = temp_log_path("loads_transcript_items_from_cbor_log");
     let _ = tokio::fs::remove_file(&path).await;
     let log = CborLog::new(&path);
-    log.append_block(&ItemBlock::Local {
-        items: vec![Item::message("item-0", Role::User, "persisted")],
+    log.append_block(&ContextBlock::Local {
+        items: vec![ContextItem::message("item-0", Role::User, "persisted")],
     })
     .await
     .unwrap();
@@ -795,14 +795,14 @@ async fn loaded_transcript_replays_full_history_with_provider_block_boundary() {
     let path = temp_log_path("loaded_transcript_replays_full_history_with_provider_block_boundary");
     let _ = tokio::fs::remove_file(&path).await;
     let log = CborLog::new(&path);
-    log.append_block(&ItemBlock::Local {
-        items: vec![Item::message("item-0", Role::User, "first")],
+    log.append_block(&ContextBlock::Local {
+        items: vec![ContextItem::message("item-0", Role::User, "first")],
     })
     .await
     .unwrap();
-    log.append_block(&ItemBlock::InferenceResponse {
+    log.append_block(&ContextBlock::InferenceResponse {
         provider_response_id: Some("resp_1".to_owned()),
-        items: vec![Item::message("item-1", Role::Assistant, "done")],
+        items: vec![ContextItem::message("item-1", Role::Assistant, "done")],
     })
     .await
     .unwrap();

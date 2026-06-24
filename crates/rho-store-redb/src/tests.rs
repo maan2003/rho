@@ -1,4 +1,4 @@
-use rho_core::{Item, ItemBlock, Role};
+use rho_core::{ContextBlock, ContextItem, Role};
 
 use super::*;
 
@@ -7,10 +7,10 @@ async fn appends_and_reads_blocks() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("items.redb");
     let log = RedbLog::open(&path).await.unwrap();
-    let first = Item::message("item-1", Role::User, "hello");
-    let second = Item::message("item-2", Role::Assistant, "hi");
-    let first_block = ItemBlock::Local { items: vec![first] };
-    let second_block = ItemBlock::Local {
+    let first = ContextItem::message("item-1", Role::User, "hello");
+    let second = ContextItem::message("item-2", Role::Assistant, "hi");
+    let first_block = ContextBlock::Local { items: vec![first] };
+    let second_block = ContextBlock::Local {
         items: vec![second],
     };
 
@@ -27,10 +27,10 @@ async fn appends_and_reads_blocks() {
 async fn reopens_existing_database() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("items.redb");
-    let first = Item::message("item-1", Role::User, "hello");
-    let second = Item::message("item-2", Role::Assistant, "hi");
-    let first_block = ItemBlock::Local { items: vec![first] };
-    let second_block = ItemBlock::Local {
+    let first = ContextItem::message("item-1", Role::User, "hello");
+    let second = ContextItem::message("item-2", Role::Assistant, "hi");
+    let first_block = ContextBlock::Local { items: vec![first] };
+    let second_block = ContextBlock::Local {
         items: vec![second],
     };
 

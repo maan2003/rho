@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use futures_util::{Sink, Stream};
 use rho_core::{
-    InferenceResponse, InferenceUpdate, Item, ItemBlock, ItemId, ItemKind, Message, MessagePhase,
-    ProviderItem, ProviderItemKind, ReasoningTextKind, Role, TokenUsage, ToolCall, ToolCallId,
-    ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec, ToolType,
+    ContextBlock, ContextItem, InferenceResponse, InferenceUpdate, ItemId, ItemKind, Message,
+    MessagePhase, ProviderItem, ProviderItemKind, ReasoningTextKind, Role, TokenUsage, ToolCall,
+    ToolCallId, ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec, ToolType,
 };
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;

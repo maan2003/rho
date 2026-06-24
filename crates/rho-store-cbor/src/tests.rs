@@ -1,4 +1,4 @@
-use rho_core::{Item, Role};
+use rho_core::{ContextItem, Role};
 
 use super::*;
 
@@ -12,8 +12,8 @@ async fn appends_and_reads_blocks() {
     let _ = fs::remove_file(&path).await;
 
     let log = CborLog::new(&path);
-    let item = Item::message("item-1", Role::User, "hello");
-    let block = ItemBlock::Local { items: vec![item] };
+    let item = ContextItem::message("item-1", Role::User, "hello");
+    let block = ContextBlock::Local { items: vec![item] };
 
     log.append_block(&block).await.unwrap();
     let blocks = log.read_blocks().await.unwrap();

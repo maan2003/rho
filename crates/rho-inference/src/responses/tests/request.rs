@@ -5,23 +5,23 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     let session = test_inference_service("gpt-test").with_prompt_cache_key("cache-key");
     let request = InferenceRequest {
         input: vec![
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-0".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::System, "be concise")),
                 }],
             },
-            ItemBlock::InferenceResponse {
+            ContextBlock::InferenceResponse {
                 provider_response_id: Some("resp_prev".to_owned()),
                 items: Vec::new(),
             },
-            ItemBlock::Local {
+            ContextBlock::Local {
                 items: vec![
-                    Item {
+                    ContextItem {
                         id: ItemId("item-1".to_owned()),
                         kind: ItemKind::Message(Message::text(Role::User, "hello")),
                     },
-                    Item {
+                    ContextItem {
                         id: ItemId("item-2".to_owned()),
                         kind: ItemKind::ToolCall(ToolCall {
                             id: ToolCallId("call-1".to_owned()),
@@ -30,7 +30,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
                             arguments: json!({"command": "pwd"}),
                         }),
                     },
-                    Item {
+                    ContextItem {
                         id: ItemId("item-3".to_owned()),
                         kind: ItemKind::ToolResult(ToolResult::success(
                             ToolCallId("call-1".to_owned()),
@@ -75,8 +75,8 @@ fn builds_responses_request_with_tools_and_item_timeline() {
 fn omits_tool_choice_without_declared_tools() {
     let session = test_inference_service("gpt-test");
     let request = InferenceRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
+        input: vec![ContextBlock::Local {
+            items: vec![ContextItem {
                 id: ItemId("item-0".to_owned()),
                 kind: ItemKind::Message(Message::text(Role::User, "hello")),
             }],
@@ -93,16 +93,16 @@ fn omits_tool_choice_without_declared_tools() {
 #[test]
 fn stamps_phase_on_assistant_messages_when_supported() {
     let request = InferenceRequest {
-        input: vec![ItemBlock::Local {
+        input: vec![ContextBlock::Local {
             items: vec![
-                Item {
+                ContextItem {
                     id: ItemId("item-0".to_owned()),
                     kind: ItemKind::Message(
                         Message::text(Role::Assistant, "commentary")
                             .with_phase(MessagePhase::Commentary),
                     ),
                 },
-                Item {
+                ContextItem {
                     id: ItemId("item-1".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::Assistant, "legacy answer")),
                 },
@@ -122,8 +122,8 @@ fn stamps_phase_on_assistant_messages_when_supported() {
 #[test]
 fn omits_empty_reasoning_request_when_no_effort_is_set() {
     let request = InferenceRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
+        input: vec![ContextBlock::Local {
+            items: vec![ContextItem {
                 id: ItemId("item-0".to_owned()),
                 kind: ItemKind::Message(Message::text(Role::User, "hello")),
             }],
@@ -142,8 +142,8 @@ fn omits_empty_reasoning_request_when_no_effort_is_set() {
 fn serializes_prompt_cache_key() {
     let session = test_inference_service("gpt-test").with_prompt_cache_key("cache-key");
     let request = InferenceRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
+        input: vec![ContextBlock::Local {
+            items: vec![ContextItem {
                 id: ItemId("item-0".to_owned()),
                 kind: ItemKind::Message(Message::text(Role::User, "hello")),
             }],
@@ -161,27 +161,27 @@ fn serializes_prompt_cache_key() {
 fn previous_response_hint_slices_input_in_provider() {
     let request = InferenceRequest {
         input: vec![
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-0".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::System, "system rules")),
                 }],
             },
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-1".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "first")),
                 }],
             },
-            ItemBlock::InferenceResponse {
+            ContextBlock::InferenceResponse {
                 provider_response_id: Some("resp_1".to_owned()),
-                items: vec![Item {
+                items: vec![ContextItem {
                     id: ItemId("item-2".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::Assistant, "done")),
                 }],
             },
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-3".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "second")),
                 }],
@@ -204,21 +204,21 @@ fn previous_response_hint_slices_input_in_provider() {
 fn previous_response_without_valid_boundary_replays_full_history() {
     let request = InferenceRequest {
         input: vec![
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-0".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "first")),
                 }],
             },
-            ItemBlock::InferenceResponse {
+            ContextBlock::InferenceResponse {
                 provider_response_id: None,
-                items: vec![Item {
+                items: vec![ContextItem {
                     id: ItemId("item-1".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::Assistant, "done")),
                 }],
             },
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-2".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "second")),
                 }],
@@ -239,21 +239,21 @@ fn previous_response_without_valid_boundary_replays_full_history() {
 fn stale_previous_response_error_builds_full_replay_request() {
     let request = InferenceRequest {
         input: vec![
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-0".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "first")),
                 }],
             },
-            ItemBlock::InferenceResponse {
+            ContextBlock::InferenceResponse {
                 provider_response_id: Some("resp_1".to_owned()),
-                items: vec![Item {
+                items: vec![ContextItem {
                     id: ItemId("item-1".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::Assistant, "done")),
                 }],
             },
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-2".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "second")),
                 }],
@@ -297,8 +297,8 @@ fn non_stale_previous_response_error_is_not_classified_stale() {
 fn chatgpt_codex_request_omits_compaction_request_by_default() {
     let (_temp, auth) = test_oauth_file("token", None);
     let request = InferenceRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
+        input: vec![ContextBlock::Local {
+            items: vec![ContextItem {
                 id: ItemId("item-0".to_owned()),
                 kind: ItemKind::Message(Message::text(Role::User, "hello")),
             }],
@@ -319,8 +319,8 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
 fn configured_compaction_threshold_overrides_provider_default() {
     let session = test_inference_service("gpt-test").with_compaction_threshold(42_000);
     let request = InferenceRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
+        input: vec![ContextBlock::Local {
+            items: vec![ContextItem {
                 id: ItemId("item-0".to_owned()),
                 kind: ItemKind::Message(Message::text(Role::User, "hello")),
             }],
@@ -342,8 +342,8 @@ fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
     let (_temp, auth) = test_oauth_file("token", None);
     let session = InferenceSession::new("gpt-test", auth).with_compaction();
     let request = InferenceRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
+        input: vec![ContextBlock::Local {
+            items: vec![ContextItem {
                 id: ItemId("item-0".to_owned()),
                 kind: ItemKind::Message(Message::text(Role::User, "hello")),
             }],
@@ -366,15 +366,15 @@ fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
 fn compaction_replay_trims_before_latest_compaction_item() {
     let request = InferenceRequest {
         input: vec![
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-0".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "before")),
                 }],
             },
-            ItemBlock::InferenceResponse {
+            ContextBlock::InferenceResponse {
                 provider_response_id: Some("resp_compaction".to_owned()),
-                items: vec![Item {
+                items: vec![ContextItem {
                     id: ItemId("item-1".to_owned()),
                     kind: ItemKind::ProviderItem(ProviderItem {
                         kind: ProviderItemKind::Compaction,
@@ -382,8 +382,8 @@ fn compaction_replay_trims_before_latest_compaction_item() {
                     }),
                 }],
             },
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-2".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "after")),
                 }],
@@ -410,15 +410,15 @@ fn replays_reasoning_provider_item() {
     });
     let request = InferenceRequest {
         input: vec![
-            ItemBlock::InferenceResponse {
+            ContextBlock::InferenceResponse {
                 provider_response_id: None,
-                items: vec![Item {
+                items: vec![ContextItem {
                     id: ItemId("item-0".to_owned()),
                     kind: reasoning.clone(),
                 }],
             },
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-1".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "after")),
                 }],
@@ -440,9 +440,9 @@ fn replays_reasoning_provider_item() {
 fn does_not_replay_unknown_provider_items() {
     let request = InferenceRequest {
         input: vec![
-            ItemBlock::InferenceResponse {
+            ContextBlock::InferenceResponse {
                 provider_response_id: Some("resp_1".to_owned()),
-                items: vec![Item {
+                items: vec![ContextItem {
                     id: ItemId("item-0".to_owned()),
                     kind: ItemKind::ProviderItem(ProviderItem {
                         kind: ProviderItemKind::Unknown,
@@ -450,8 +450,8 @@ fn does_not_replay_unknown_provider_items() {
                     }),
                 }],
             },
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-1".to_owned()),
                     kind: ItemKind::Message(Message::text(Role::User, "after")),
                 }],
@@ -480,9 +480,9 @@ fn serializes_custom_tool_calls_and_results() {
     };
     let request = InferenceRequest {
         input: vec![
-            ItemBlock::InferenceResponse {
+            ContextBlock::InferenceResponse {
                 provider_response_id: None,
-                items: vec![Item {
+                items: vec![ContextItem {
                     id: ItemId("item-0".to_owned()),
                     kind: ItemKind::ToolCall(ToolCall {
                         id: ToolCallId("call-1".to_owned()),
@@ -492,8 +492,8 @@ fn serializes_custom_tool_calls_and_results() {
                     }),
                 }],
             },
-            ItemBlock::Local {
-                items: vec![Item {
+            ContextBlock::Local {
+                items: vec![ContextItem {
                     id: ItemId("item-1".to_owned()),
                     kind: ItemKind::ToolResult(result),
                 }],
@@ -536,9 +536,9 @@ fn encoded_tool_name_stays_mapped_to_declared_tool_name() {
         format: Some(ToolFormat::Text),
     };
     let request = InferenceRequest {
-        input: vec![ItemBlock::InferenceResponse {
+        input: vec![ContextBlock::InferenceResponse {
             provider_response_id: None,
-            items: vec![Item {
+            items: vec![ContextItem {
                 id: ItemId("item-0".to_owned()),
                 kind: ItemKind::ToolCall(ToolCall {
                     id: ToolCallId("call-1".to_owned()),

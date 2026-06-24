@@ -19,7 +19,7 @@ use rho_cli_term_raw::{
     Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
 use rho_core::{
-    InferenceUpdate, ItemBlock, ItemKind, ReasoningTextKind, Role, ToolCall, ToolResult,
+    ContextBlock, InferenceUpdate, ItemKind, ReasoningTextKind, Role, ToolCall, ToolResult,
     ToolResultStatus,
 };
 use rho_inference::{AuthArgs, InferenceAuth, InferenceSession, run_auth_cli};
@@ -301,7 +301,7 @@ impl ChatTerm {
         print_system_on_handle(&self.handle, text);
     }
 
-    fn print_history(&self, blocks: &[ItemBlock]) {
+    fn print_history(&self, blocks: &[ContextBlock]) {
         if blocks.is_empty() {
             self.print_system("rho ready");
             return;
@@ -309,7 +309,9 @@ impl ChatTerm {
         self.print_system("loaded previous session");
         for block in blocks {
             for item in match block {
-                ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
+                ContextBlock::Local { items } | ContextBlock::InferenceResponse { items, .. } => {
+                    items
+                }
             } {
                 match &item.kind {
                     ItemKind::Message(message) => {

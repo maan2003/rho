@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use rho_core::{
-    InferenceRequest, InferenceResponse, InferenceUpdate, ItemBlock, ItemKind, Message,
-    MessagePhase, ProviderItem, ProviderItemKind, ReasoningText, ReasoningTextKind, Role,
+    ContextBlock, InferenceRequest, InferenceResponse, InferenceUpdate, ItemKind, Message,
+    MessagePhase, ProviderItem, ProviderItemKind, ReasoningItem, ReasoningTextKind, Role,
     TokenUsage, ToolCall, ToolCallId, ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec,
     ToolType,
 };
@@ -56,7 +56,7 @@ impl ResponsesRequest {
     ) -> Self {
         let mut previous_response = None;
         for (index, block) in request.input.iter().enumerate() {
-            let ItemBlock::InferenceResponse {
+            let ContextBlock::InferenceResponse {
                 provider_response_id,
                 items,
             } = block
@@ -98,7 +98,9 @@ impl ResponsesRequest {
             .input
             .iter()
             .flat_map(|block| match block {
-                ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
+                ContextBlock::Local { items } | ContextBlock::InferenceResponse { items, .. } => {
+                    items
+                }
             })
             .filter_map(|item| instruction_text_from_item(&item.kind))
             .collect::<Vec<_>>();
@@ -111,7 +113,9 @@ impl ResponsesRequest {
         let input_items = input_blocks
             .iter()
             .flat_map(|block| match block {
-                ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
+                ContextBlock::Local { items } | ContextBlock::InferenceResponse { items, .. } => {
+                    items
+                }
             })
             .map(|item| item.kind.clone())
             .collect::<Vec<_>>();
@@ -435,7 +439,7 @@ impl ResponseState {
             } = output;
 
             if !reasoning_summary.is_empty() {
-                items.push(ItemKind::ReasoningText(ReasoningText {
+                items.push(ItemKind::ReasoningText(ReasoningItem {
                     kind: ReasoningTextKind::Summary,
                     text: reasoning_summary,
                 }));

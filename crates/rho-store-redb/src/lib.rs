@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use rho_core::ItemBlock;
+use rho_core::ContextBlock;
 use tokio::fs;
 
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
@@ -43,7 +43,7 @@ impl RedbLog {
         &self.path
     }
 
-    pub async fn append_block(&self, block: &ItemBlock) -> Result<()> {
+    pub async fn append_block(&self, block: &ContextBlock) -> Result<()> {
         let database = Arc::clone(&self.database);
         let block = block.clone();
 
@@ -69,7 +69,7 @@ impl RedbLog {
         Ok(())
     }
 
-    pub async fn read_blocks(&self) -> Result<Vec<ItemBlock>> {
+    pub async fn read_blocks(&self) -> Result<Vec<ContextBlock>> {
         let database = Arc::clone(&self.database);
 
         tokio::task::spawn_blocking(move || {

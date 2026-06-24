@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use rho_core::ItemBlock;
+use rho_core::ContextBlock;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -21,7 +21,7 @@ impl CborLog {
         &self.path
     }
 
-    pub async fn append_block(&self, block: &ItemBlock) -> Result<()> {
+    pub async fn append_block(&self, block: &ContextBlock) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -39,7 +39,7 @@ impl CborLog {
         Ok(())
     }
 
-    pub async fn read_blocks(&self) -> Result<Vec<ItemBlock>> {
+    pub async fn read_blocks(&self) -> Result<Vec<ContextBlock>> {
         let mut file = match fs::File::open(&self.path).await {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

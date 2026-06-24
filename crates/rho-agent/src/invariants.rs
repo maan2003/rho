@@ -9,7 +9,7 @@
 //! Together these fields are the persistent inputs to an inference request
 //! (`inference_request`): the conversation so far plus the tools available.
 
-use rho_core::{InferenceRequest, ItemBlock, ToolSpec};
+use rho_core::{ContextBlock, InferenceRequest, ToolSpec};
 use tokio::sync::broadcast;
 
 use crate::observable::Observable;
@@ -19,34 +19,34 @@ pub(crate) struct AgentInvariantsEnforcer {
     /// Invariant: append-only. Blocks are only ever pushed — never removed,
     /// replaced, or reordered. Enforced by `Observable`, which exposes `update`
     /// (used here only to append) and no remove/set-by-index.
-    blocks: Observable<Vec<ItemBlock>, ItemBlock>,
+    blocks: Observable<Vec<ContextBlock>, ContextBlock>,
     /// Invariant: immutable. Set once at construction and never changed for the
     /// life of the agent. Enforced by exposing no mutator.
     tool_specs: Vec<ToolSpec>,
 }
 
 impl AgentInvariantsEnforcer {
-    pub(crate) fn new(tool_specs: Vec<ToolSpec>, blocks: Vec<ItemBlock>) -> Self {
+    pub(crate) fn new(tool_specs: Vec<ToolSpec>, blocks: Vec<ContextBlock>) -> Self {
         Self {
             blocks: Observable::new(blocks),
             tool_specs,
         }
     }
 
-    pub(crate) fn append_block(&self, block: ItemBlock) {
+    pub(crate) fn append_block(&self, block: ContextBlock) {
         self.blocks.update(|blocks| {
             blocks.push(block.clone());
             block
         });
     }
 
-    pub(crate) fn snapshot(&self) -> Vec<ItemBlock> {
+    pub(crate) fn snapshot(&self) -> Vec<ContextBlock> {
         self.blocks.snapshot()
     }
 
     /// Current history plus a receiver for every later appended block, taken
     /// atomically so a follower misses nothing and double-counts nothing.
-    pub(crate) fn subscribe(&self) -> (Vec<ItemBlock>, broadcast::Receiver<ItemBlock>) {
+    pub(crate) fn subscribe(&self) -> (Vec<ContextBlock>, broadcast::Receiver<ContextBlock>) {
         self.blocks.subscribe()
     }
 
@@ -60,7 +60,7 @@ impl AgentInvariantsEnforcer {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::{Item, ItemBlock, Role, ToolSpec, ToolType};
+    use rho_core::{ContextBlock, ContextItem, Role, ToolSpec, ToolType};
     use serde_json::json;
 
     use super::*;
@@ -69,18 +69,18 @@ mod tests {
     fn keeps_blocks_append_only_and_ordered() {
         let enforcer = AgentInvariantsEnforcer::new(Vec::new(), Vec::new());
 
-        enforcer.append_block(ItemBlock::Local {
-            items: vec![Item::message("item-0", Role::User, "first")],
+        enforcer.append_block(ContextBlock::Local {
+            items: vec![ContextItem::message("item-0", Role::User, "first")],
         });
-        enforcer.append_block(ItemBlock::InferenceResponse {
+        enforcer.append_block(ContextBlock::InferenceResponse {
             provider_response_id: Some("resp_1".to_owned()),
-            items: vec![Item::message("item-1", Role::Assistant, "done")],
+            items: vec![ContextItem::message("item-1", Role::Assistant, "done")],
         });
 
         let blocks = enforcer.snapshot();
-        assert!(matches!(&blocks[0], ItemBlock::Local { items } if items[0].id.0 == "item-0"));
+        assert!(matches!(&blocks[0], ContextBlock::Local { items } if items[0].id.0 == "item-0"));
         assert!(
-            matches!(&blocks[1], ItemBlock::InferenceResponse { items, .. } if items[0].id.0 == "item-1")
+            matches!(&blocks[1], ContextBlock::InferenceResponse { items, .. } if items[0].id.0 == "item-1")
         );
         assert_eq!(blocks.len(), 2);
     }
@@ -97,13 +97,13 @@ mod tests {
             }],
             Vec::new(),
         );
-        enforcer.append_block(ItemBlock::Local {
-            items: vec![Item::message("item-0", Role::User, "hello")],
+        enforcer.append_block(ContextBlock::Local {
+            items: vec![ContextItem::message("item-0", Role::User, "hello")],
         });
 
         let request = enforcer.inference_request();
-        enforcer.append_block(ItemBlock::Local {
-            items: vec![Item::message("item-1", Role::User, "later")],
+        enforcer.append_block(ContextBlock::Local {
+            items: vec![ContextItem::message("item-1", Role::User, "later")],
         });
 
         assert_eq!(request.input.len(), 1);
