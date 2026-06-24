@@ -9,17 +9,16 @@ vocabulary and the provider-specific Responses WebSocket protocol.
 The public surface is intentionally small:
 
 - `ProviderSession` configures provider access, prompt-cache/thread behavior,
-  compaction, and owns the WebSocket pool.
+  compaction, ChatGPT/Codex auth-file selection, auth-file management helpers,
+  and owns the WebSocket pool.
 - `ProviderSession::stream` accepts a `rho::ProviderRequest` and returns a
   stream of `ResponsesUpdate` values ending in `ResponsesUpdate::Finished`.
-- `ProviderSession::prewarm_websocket` can pre-open a pooled WebSocket for a
-  prompt-cache key.
 - `ResponsesUpdate` is the streaming update contract consumed by `rho-agent` and
   UIs.
-- OAuth helpers (`ResponsesAuth`, `OAuthFile`, `ResponsesOAuthCredentials`, and
-  the `oauth` module functions) own ChatGPT/Codex credential loading,
-  refreshing, and browser-flow support.
-- `parse_response_events` is a pure parser for recorded/provider event JSON.
+- Raw OAuth helpers, credential DTOs, credential files, token refresh, and
+  recorded-event parsers are internal implementation details. CLI and UI crates
+  should use the `ProviderSession` facade instead of importing provider auth
+  plumbing directly.
 
 The crate should not own agent policy such as tool scheduling, retries beyond
 provider-chain replay, transcript persistence, terminal rendering, or CLI
@@ -34,8 +33,8 @@ configuration.
 - `session.rs` owns session configuration and shared WebSocket-pool state.
 - `ws.rs` owns WebSocket request construction, connection checkout/release,
   event-loop timeouts/pings, and pool keying.
-- `oauth.rs` owns credential files, OAuth token exchange/refresh, account id
-  extraction, and file locking.
+- `oauth.rs` owns private credential files, OAuth token exchange/refresh,
+  account id extraction, and file locking behind the `ProviderSession` facade.
 
 ## Request and replay model
 
@@ -83,7 +82,8 @@ running in the background or return that turn's connection to the reusable pool.
 
 ## OAuth credential ownership
 
-`OAuthFile` is the source of truth for persisted ChatGPT/Codex credentials. It
-stores `ResponsesOAuthCredentials` JSON under the rho auth directory or an
-explicit auth directory, protects refresh/save with a sibling lock file, and
-writes credentials with private filesystem permissions where supported.
+The provider auth file is the source of truth for persisted ChatGPT/Codex
+credentials. It stores access-token, refresh-token, expiry, and optional account
+id JSON under the rho auth directory or an explicit auth directory, protects
+refresh/save with a sibling lock file, and writes credentials with private
+filesystem permissions where supported.

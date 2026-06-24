@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use rho::{ProviderResponse, ToolCall, ToolCallId, ToolResult, ToolType};
 use rho_cli_term_raw::{CursorShape, Term};
-use rho_provider_responses::{DEFAULT_MODEL, ResponsesOAuthCredentials, ResponsesUpdate};
+use rho_provider_responses::{ProviderSession, ResponsesUpdate};
 
 use super::*;
 
@@ -18,11 +18,11 @@ fn parses_default_chat_command() {
         panic!("expected chat command");
     };
 
-    assert_eq!(chat.model, DEFAULT_MODEL);
+    assert_eq!(chat.model, ProviderSession::DEFAULT_MODEL);
     assert_eq!(chat.session, DEFAULT_SESSION_NAME);
     assert!(!chat.prompt_stdin);
     assert!(chat.session_path.is_none());
-    assert!(chat.auth.oauth_file_path().is_some());
+    assert!(chat.auth_file.ends_with("default.json"));
 }
 
 #[test]
@@ -49,10 +49,7 @@ fn parses_chat_overrides() {
         Some(PathBuf::from("/tmp/rho-session.cbor"))
     );
     assert!(chat.prompt_stdin);
-    assert_eq!(
-        chat.auth.oauth_file_path(),
-        Some(std::path::Path::new("/tmp/rho-auth.json"))
-    );
+    assert_eq!(chat.auth_file, std::path::Path::new("/tmp/rho-auth.json"));
 }
 
 #[test]
@@ -125,49 +122,6 @@ fn parses_auth_status_command() {
     };
 
     assert_eq!(name, "work");
-}
-
-#[test]
-fn auth_status_line_reports_missing_credentials() {
-    let line = auth_status_line(std::path::Path::new("/tmp/auth.json"), None);
-
-    assert_eq!(line, "missing path=/tmp/auth.json");
-}
-
-#[test]
-fn auth_status_line_reports_invalid_empty_access_token() {
-    let credentials = ResponsesOAuthCredentials::default();
-    let line = auth_status_line(std::path::Path::new("/tmp/auth.json"), Some(&credentials));
-
-    assert!(line.contains("present path=/tmp/auth.json status=invalid"));
-    assert!(line.contains("refresh_token=no"));
-}
-
-#[test]
-fn auth_status_line_reports_refresh_due() {
-    let credentials = ResponsesOAuthCredentials {
-        access_token: "token".to_owned(),
-        refresh_token: "refresh".to_owned(),
-        expires_at_ms: 0,
-        account_id: Some("acct".to_owned()),
-    };
-    let line = auth_status_line(std::path::Path::new("/tmp/auth.json"), Some(&credentials));
-
-    assert!(line.contains("status=refresh_due"));
-    assert!(line.contains("account=acct"));
-    assert!(line.contains("refresh_token=yes"));
-}
-
-#[test]
-fn auth_status_line_reports_fresh() {
-    let credentials = ResponsesOAuthCredentials {
-        access_token: "token".to_owned(),
-        expires_at_ms: u64::MAX,
-        ..Default::default()
-    };
-    let line = auth_status_line(std::path::Path::new("/tmp/auth.json"), Some(&credentials));
-
-    assert!(line.contains("status=fresh"));
 }
 
 #[test]

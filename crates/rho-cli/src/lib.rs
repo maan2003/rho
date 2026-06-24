@@ -18,13 +18,7 @@ use rho_agent::{Agent, AgentProvider, AgentStore, AgentTools, AgentUpdate};
 use rho_cli_term_raw::{
     Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
-use rho_provider_responses::oauth::{
-    oauth_token_should_refresh, openai_codex_auth_url, openai_codex_exchange, parse_redirect_url,
-};
-use rho_provider_responses::{
-    DEFAULT_MODEL, OAuthFile, ProviderSession, ResponsesAuth, ResponsesOAuthCredentials,
-    ResponsesUpdate,
-};
+use rho_provider_responses::{ProviderSession, ResponsesUpdate};
 use rho_store_cbor::CborLog;
 use rho_tool_shell::ShellTools;
 use tokio::sync::Mutex as AsyncMutex;
@@ -72,19 +66,20 @@ async fn run_provider(command: ProviderCommand) -> Result<()> {
     match command {
         ProviderCommand::Add => {
             let name = prompt_with_default("Provider namespace", DEFAULT_AUTH_NAME)?;
-            let credentials = login_openai_codex()?;
-            let file = OAuthFile::open_default(name.trim())?;
-            file.save(&credentials)?;
-            println!("{}", auth_status_line(&file.path(), Some(&credentials)));
+            let credentials_json = login_openai_codex()?;
+            println!(
+                "{}",
+                ProviderSession::chatgpt_codex_auth_save_json(name.trim(), &credentials_json)?
+            );
             Ok(())
         }
         ProviderCommand::List => list_providers(),
         ProviderCommand::Remove { name } => {
-            let file = OAuthFile::open_default(name.trim())?;
-            if file.delete()? {
-                println!("removed {}", file.path().display());
+            let (path, deleted) = ProviderSession::chatgpt_codex_auth_delete(name.trim())?;
+            if deleted {
+                println!("removed {}", path.display());
             } else {
-                println!("missing {}", file.path().display());
+                println!("missing {}", path.display());
             }
             Ok(())
         }
@@ -94,27 +89,29 @@ async fn run_provider(command: ProviderCommand) -> Result<()> {
 async fn run_auth(command: AuthCommand) -> Result<()> {
     match command {
         AuthCommand::Path { name } => {
-            let file = OAuthFile::open_default(name)?;
-            println!("{}", file.path().display());
+            println!(
+                "{}",
+                ProviderSession::chatgpt_codex_auth_file_path(name)?.display()
+            );
             Ok(())
         }
         AuthCommand::Status { name } => {
-            let file = OAuthFile::open_default(name)?;
-            println!("{}", auth_status_line(&file.path(), file.load()?.as_ref()));
+            println!("{}", ProviderSession::chatgpt_codex_auth_status_line(name)?);
             Ok(())
         }
         AuthCommand::Import { name, path } => {
-            let credentials = read_oauth_credentials(path)?;
-            let file = OAuthFile::open_default(name)?;
-            file.save(&credentials)?;
-            println!("{}", auth_status_line(&file.path(), Some(&credentials)));
+            let credentials_json = read_oauth_credentials_json(path)?;
+            println!(
+                "{}",
+                ProviderSession::chatgpt_codex_auth_save_json(name, &credentials_json)?
+            );
             Ok(())
         }
     }
 }
 
-fn login_openai_codex() -> Result<ResponsesOAuthCredentials> {
-    let (auth_url, expected_state, verifier) = openai_codex_auth_url();
+fn login_openai_codex() -> Result<String> {
+    let (auth_url, expected_state, verifier) = ProviderSession::chatgpt_codex_auth_login_url();
 
     eprintln!();
     eprintln!("Open this URL in your browser:");
@@ -128,14 +125,13 @@ fn login_openai_codex() -> Result<ResponsesOAuthCredentials> {
 
     let mut redirect_input = String::new();
     io::stdin().read_line(&mut redirect_input)?;
-    let (code, state) =
-        parse_redirect_url(&redirect_input).map_err(|error| anyhow::anyhow!(error))?;
-    if state != expected_state {
-        bail!("state mismatch; restart login and use the newest URL");
-    }
-
     eprintln!("Exchanging code for tokens...");
-    openai_codex_exchange(&code, &verifier).context("exchanging OAuth code")
+    ProviderSession::chatgpt_codex_exchange_redirect_url(
+        &redirect_input,
+        &expected_state,
+        &verifier,
+    )
+    .context("exchanging OAuth code")
 }
 
 fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
@@ -151,99 +147,31 @@ fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
     }
 }
 
-fn read_oauth_credentials(path: Option<PathBuf>) -> Result<ResponsesOAuthCredentials> {
+fn read_oauth_credentials_json(path: Option<PathBuf>) -> Result<String> {
     let text = match path {
         Some(path) => std::fs::read_to_string(&path)
             .with_context(|| format!("reading OAuth credentials from {}", path.display()))?,
         None => {
             let mut text = String::new();
-            io::stdin().read_to_string(&mut text)?;
+            std::io::Read::read_to_string(&mut io::stdin(), &mut text)?;
             text
         }
     };
-    serde_json::from_str(&text).context("parsing OAuth credentials JSON")
+    serde_json::from_str::<serde_json::Value>(&text).context("parsing OAuth credentials JSON")?;
+    Ok(text)
 }
 
 fn list_providers() -> Result<()> {
-    let auth_dir = OAuthFile::default_auth_dir()?;
-    let entries = match std::fs::read_dir(&auth_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            println!("No provider credentials configured.");
-            return Ok(());
-        }
-        Err(error) => return Err(error).context("reading provider credentials directory"),
-    };
-
-    let mut names = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        names.push(name.to_owned());
-    }
-    names.sort();
-
-    if names.is_empty() {
+    let providers = ProviderSession::chatgpt_codex_auth_list()
+        .context("reading provider credentials directory")?;
+    if providers.is_empty() {
         println!("No provider credentials configured.");
         return Ok(());
     }
-
-    for name in names {
-        let file = OAuthFile::open_at(&auth_dir, &name)?;
-        println!(
-            "{name}\tchatgpt\t{}",
-            auth_status_label(file.load()?.as_ref())
-        );
+    for (name, status) in providers {
+        println!("{name}\tchatgpt\t{status}");
     }
     Ok(())
-}
-
-fn auth_status_label(credentials: Option<&ResponsesOAuthCredentials>) -> &'static str {
-    let Some(credentials) = credentials else {
-        return "missing";
-    };
-    if credentials.access_token.trim().is_empty() {
-        "invalid"
-    } else if oauth_token_should_refresh(&credentials.access_token, credentials.expires_at_ms) {
-        "refresh-due"
-    } else {
-        "logged-in"
-    }
-}
-
-fn auth_status_line(
-    path: &std::path::Path,
-    credentials: Option<&ResponsesOAuthCredentials>,
-) -> String {
-    let Some(credentials) = credentials else {
-        return format!("missing path={}", path.display());
-    };
-    let status = if credentials.access_token.trim().is_empty() {
-        "invalid"
-    } else if oauth_token_should_refresh(&credentials.access_token, credentials.expires_at_ms) {
-        "refresh_due"
-    } else {
-        "fresh"
-    };
-    let account = credentials.account_id.as_deref().unwrap_or("unknown");
-    let refresh = if credentials.refresh_token.trim().is_empty() {
-        "no"
-    } else {
-        "yes"
-    };
-    format!(
-        "present path={} status={} account={} refresh_token={} expires_at_ms={}",
-        path.display(),
-        status,
-        account,
-        refresh,
-        credentials.expires_at_ms
-    )
 }
 
 async fn run_interactive(args: ChatArgs) -> Result<()> {
@@ -309,8 +237,9 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
 }
 
 fn build_provider_session(args: &ChatArgs) -> ProviderSession {
-    let mut session = ProviderSession::chatgpt_codex(args.model.clone(), args.auth.clone())
-        .with_compaction_threshold(DEFAULT_COMPACTION_THRESHOLD);
+    let mut session =
+        ProviderSession::chatgpt_codex_with_auth_file(args.model.clone(), args.auth_file.clone())
+            .with_compaction_threshold(DEFAULT_COMPACTION_THRESHOLD);
     if !args.no_store {
         session = session.with_prompt_cache_key(args.session.clone());
     }
@@ -855,7 +784,7 @@ enum ProviderCommand {
 #[derive(Clone)]
 struct ChatArgs {
     model: String,
-    auth: ResponsesAuth,
+    auth_file: PathBuf,
     session: String,
     session_path: Option<PathBuf>,
     prompt_stdin: bool,
@@ -960,8 +889,8 @@ impl AuthCommand {
 impl ChatArgs {
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
         let mut output = Self {
-            model: DEFAULT_MODEL.to_owned(),
-            auth: ResponsesAuth::oauth_file_named(DEFAULT_AUTH_NAME)
+            model: ProviderSession::DEFAULT_MODEL.to_owned(),
+            auth_file: ProviderSession::chatgpt_codex_auth_file_path(DEFAULT_AUTH_NAME)
                 .context("opening default OAuth file")?,
             session: DEFAULT_SESSION_NAME.to_owned(),
             session_path: None,
@@ -974,10 +903,10 @@ impl ChatArgs {
                 "--model" => output.model = take_arg(&mut args, "--model")?,
                 "--auth-file" => {
                     let value = take_arg(&mut args, "--auth-file")?;
-                    output.auth = if value.contains('/') {
-                        ResponsesAuth::oauth_file(value)
+                    output.auth_file = if value.contains('/') {
+                        value.into()
                     } else {
-                        ResponsesAuth::oauth_file_named(value)?
+                        ProviderSession::chatgpt_codex_auth_file_path(value)?
                     };
                 }
                 "--session" => output.session = take_arg(&mut args, "--session")?,

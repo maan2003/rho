@@ -13,33 +13,14 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderMap;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
+use crate::build_request::ResponsesRequest;
 use crate::oauth::ResolvedAuth;
 use crate::{
     DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS, DEFAULT_WEBSOCKET_PING_INTERVAL_SECS,
     DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS, DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS,
-    DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS, OPENAI_BETA_WS, ProviderSession, ResponsesRequest,
-    ResponsesUpdate, apply_response_event, responses_url,
+    DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS, OPENAI_BETA_WS, ProviderSession, ResponsesUpdate,
+    apply_response_event, responses_url,
 };
-
-pub(crate) async fn prewarm_websocket(
-    session: ProviderSession,
-    prompt_cache_key: String,
-) -> Result<bool> {
-    let websocket_pool = Arc::clone(&session.websocket_pool);
-    let auth = session.auth.clone();
-    let resolved_auth = tokio::task::spawn_blocking(move || auth.resolve()).await??;
-    let Some(key) =
-        WebSocketPoolKey::from_thread_id(&session, prompt_cache_key, resolved_auth.as_ref())
-    else {
-        return Ok(false);
-    };
-
-    let connection =
-        checkout_websocket_pool(&session, &websocket_pool, &key, resolved_auth.as_ref()).await?;
-    let mut pool = websocket_pool.lock().await;
-    pool.release(key, connection, DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS);
-    Ok(true)
-}
 
 pub(crate) async fn send_websocket(
     session: &ProviderSession,

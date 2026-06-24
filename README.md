@@ -55,8 +55,7 @@ nix develop -c cargo run -p rho-cli -- auth import --name default --file credent
 `provider add` runs the browser OAuth setup flow and saves credentials to a
 file under the rho state directory. `provider list` and `provider remove` inspect
 and delete those file-based credentials. `auth import` is available for copying
-an existing file-based credential; `credentials.json` is a
-`ResponsesOAuthCredentials` JSON object:
+an existing file-based credential; `credentials.json` uses this JSON shape:
 
 ```json
 {

@@ -20,7 +20,7 @@ const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const REFRESH_EXPIRY_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResponsesAuth {
+pub(crate) struct ResponsesAuth {
     kind: ResponsesAuthKind,
 }
 
@@ -32,25 +32,25 @@ enum ResponsesAuthKind {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ResponsesOAuthCredentials {
+pub(crate) struct ResponsesOAuthCredentials {
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub access_token: String,
+    pub(crate) access_token: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub refresh_token: String,
+    pub(crate) refresh_token: String,
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub expires_at_ms: u64,
+    pub(crate) expires_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedAuth {
-    pub bearer_token: String,
-    pub account_id: Option<String>,
+pub(crate) struct ResolvedAuth {
+    pub(crate) bearer_token: String,
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-pub struct OAuthFile {
+pub(crate) struct OAuthFile {
     path: PathBuf,
 }
 
@@ -61,28 +61,21 @@ impl ResponsesAuth {
         }
     }
 
-    pub fn oauth_file(path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn oauth_file(path: impl Into<PathBuf>) -> Self {
         Self {
             kind: ResponsesAuthKind::OAuthFile { path: path.into() },
         }
     }
 
-    pub fn oauth_file_named(name: impl AsRef<str>) -> io::Result<Self> {
+    pub(crate) fn oauth_file_named(name: impl AsRef<str>) -> io::Result<Self> {
         Ok(Self::oauth_file(OAuthFile::open_default(name)?.path()))
     }
 
-    pub fn oauth_file_path(&self) -> Option<&Path> {
-        match &self.kind {
-            ResponsesAuthKind::OAuthFile { path } => Some(path),
-            ResponsesAuthKind::None => None,
-        }
-    }
-
-    pub fn resolve(&self) -> io::Result<Option<ResolvedAuth>> {
+    pub(crate) fn resolve(&self) -> io::Result<Option<ResolvedAuth>> {
         self.resolve_with_refresh(openai_codex_refresh)
     }
 
-    pub fn resolve_with_refresh(
+    pub(crate) fn resolve_with_refresh(
         &self,
         refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
     ) -> io::Result<Option<ResolvedAuth>> {
@@ -96,7 +89,8 @@ impl ResponsesAuth {
 }
 
 impl ResponsesOAuthCredentials {
-    pub fn from_access_token(access_token: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_access_token(access_token: impl Into<String>) -> Self {
         let access_token = access_token.into();
         let account_id = openai_account_id_from_jwt(&access_token);
         Self {
@@ -106,7 +100,7 @@ impl ResponsesOAuthCredentials {
         }
     }
 
-    pub fn resolved(&self) -> Option<ResolvedAuth> {
+    pub(crate) fn resolved(&self) -> Option<ResolvedAuth> {
         if self.access_token.trim().is_empty() {
             return None;
         }
@@ -122,7 +116,7 @@ impl ResponsesOAuthCredentials {
 }
 
 impl OAuthFile {
-    pub fn default_auth_dir() -> io::Result<PathBuf> {
+    pub(crate) fn default_auth_dir() -> io::Result<PathBuf> {
         let state_dir = dirs::state_dir()
             .or_else(dirs::data_local_dir)
             .ok_or_else(|| {
@@ -132,33 +126,37 @@ impl OAuthFile {
         Ok(state_dir.join("auth.d"))
     }
 
-    pub fn open_default(name: impl AsRef<str>) -> io::Result<Self> {
+    pub(crate) fn open_default(name: impl AsRef<str>) -> io::Result<Self> {
         Self::open_at(Self::default_auth_dir()?, name)
     }
 
-    pub fn open_in(state_dir: impl Into<PathBuf>, name: impl AsRef<str>) -> io::Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open_in(
+        state_dir: impl Into<PathBuf>,
+        name: impl AsRef<str>,
+    ) -> io::Result<Self> {
         Self::open_at(state_dir.into().join("auth.d"), name)
     }
 
-    pub fn open_at(auth_dir: impl Into<PathBuf>, name: impl AsRef<str>) -> io::Result<Self> {
+    pub(crate) fn open_at(auth_dir: impl Into<PathBuf>, name: impl AsRef<str>) -> io::Result<Self> {
         let name = name.as_ref();
         validate_auth_file_name(name)?;
         Ok(Self::new(auth_dir.into().join(format!("{name}.json"))))
     }
 
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
-    pub fn path(&self) -> PathBuf {
+    pub(crate) fn path(&self) -> PathBuf {
         self.path.clone()
     }
 
-    pub fn lock_path(&self) -> PathBuf {
+    pub(crate) fn lock_path(&self) -> PathBuf {
         self.path.with_extension("lock")
     }
 
-    pub fn load(&self) -> io::Result<Option<ResponsesOAuthCredentials>> {
+    pub(crate) fn load(&self) -> io::Result<Option<ResponsesOAuthCredentials>> {
         match fs::read_to_string(&self.path) {
             Ok(text) => serde_json::from_str(&text)
                 .map(Some)
@@ -168,11 +166,11 @@ impl OAuthFile {
         }
     }
 
-    pub fn save(&self, credentials: &ResponsesOAuthCredentials) -> io::Result<()> {
+    pub(crate) fn save(&self, credentials: &ResponsesOAuthCredentials) -> io::Result<()> {
         self.with_lock(|locked| locked.save(credentials))
     }
 
-    pub fn delete(&self) -> io::Result<bool> {
+    pub(crate) fn delete(&self) -> io::Result<bool> {
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -180,7 +178,7 @@ impl OAuthFile {
         }
     }
 
-    pub fn resolve_with_refresh(
+    pub(crate) fn resolve_with_refresh(
         &self,
         refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
     ) -> io::Result<Option<ResolvedAuth>> {
@@ -255,7 +253,7 @@ impl LockedOAuthFile<'_> {
     }
 }
 
-pub fn openai_codex_auth_url() -> (String, String, String) {
+pub(crate) fn openai_codex_auth_url() -> (String, String, String) {
     let verifier = generate_code_verifier();
     let challenge = code_challenge(&verifier);
     let state = generate_state();
@@ -268,7 +266,7 @@ pub fn openai_codex_auth_url() -> (String, String, String) {
     (url, state, verifier)
 }
 
-pub fn parse_redirect_url(input: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_redirect_url(input: &str) -> Result<(String, String), String> {
     let trimmed = input.trim();
     let url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         Url::parse(trimmed).map_err(|error| format!("invalid URL: {error}"))?
@@ -292,7 +290,10 @@ pub fn parse_redirect_url(input: &str) -> Result<(String, String), String> {
     Ok((code, state))
 }
 
-pub fn openai_codex_exchange(code: &str, verifier: &str) -> io::Result<ResponsesOAuthCredentials> {
+pub(crate) fn openai_codex_exchange(
+    code: &str,
+    verifier: &str,
+) -> io::Result<ResponsesOAuthCredentials> {
     let body = format!(
         "grant_type=authorization_code&code={code}&code_verifier={verifier}&redirect_uri={redirect}&client_id={client_id}",
         code = urlencoding(code),
@@ -304,7 +305,7 @@ pub fn openai_codex_exchange(code: &str, verifier: &str) -> io::Result<Responses
     parse_openai_token_response(&json)
 }
 
-pub fn openai_codex_refresh(refresh_token: &str) -> io::Result<ResponsesOAuthCredentials> {
+pub(crate) fn openai_codex_refresh(refresh_token: &str) -> io::Result<ResponsesOAuthCredentials> {
     let body = format!(
         "grant_type=refresh_token&refresh_token={refresh_token}&client_id={client_id}",
         refresh_token = urlencoding(refresh_token),
@@ -314,7 +315,7 @@ pub fn openai_codex_refresh(refresh_token: &str) -> io::Result<ResponsesOAuthCre
     parse_openai_token_response(&json)
 }
 
-pub fn oauth_token_should_refresh(access_token: &str, expires_at_ms: u64) -> bool {
+pub(crate) fn oauth_token_should_refresh(access_token: &str, expires_at_ms: u64) -> bool {
     let now_ms = now_ms();
     if let Some(issued_at_ms) = jwt_issued_at_ms(access_token) {
         let lifetime_ms = expires_at_ms.saturating_sub(issued_at_ms);

@@ -10,28 +10,26 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use futures::StreamExt;
-use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{self, BoxStream};
 use rho::{
     ItemKind, Message, MessagePhase, ProviderItem, ProviderItemKind, ProviderRequest,
     ProviderResponse, ReasoningText, ReasoningTextKind, Role, TokenUsage, ToolCall, ToolCallId,
     ToolSpec, ToolType,
 };
-use serde::Serialize;
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
 
 mod build_request;
-pub mod oauth;
+mod oauth;
 mod session;
 mod ws;
 
-pub use oauth::{OAuthFile, ResponsesAuth, ResponsesOAuthCredentials};
+use build_request::ResponsesRequest;
 pub use session::ProviderSession;
 
-pub const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
-pub const DEFAULT_MODEL: &str = "gpt-5.5";
+pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+pub(crate) const DEFAULT_MODEL: &str = "gpt-5.5";
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
 pub(crate) const DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS: u64 = 120;
 pub(crate) const DEFAULT_WEBSOCKET_PING_INTERVAL_SECS: u64 = 25;
@@ -69,45 +67,8 @@ pub enum ResponsesUpdate {
     Finished(ProviderResponse),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct ResponsesRequest {
-    pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    pub input: Vec<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub store: Option<bool>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<TextRequest>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub include: Vec<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub context_management: Vec<ContextManagementRequest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct TextRequest {
-    pub verbosity: &'static str,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ResponsesCompaction {
-    pub compact_threshold: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct ContextManagementRequest {
-    #[serde(rename = "type")]
-    pub ty: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_threshold: Option<u64>,
 }
 
@@ -132,15 +93,6 @@ impl ProviderSession {
             receiver.recv().await.map(|item| (item, receiver))
         })
         .boxed()
-    }
-
-    pub fn prewarm_websocket(
-        &self,
-        prompt_cache_key: impl Into<String>,
-    ) -> BoxFuture<'static, Result<bool>> {
-        let session = self.clone();
-        let prompt_cache_key = prompt_cache_key.into();
-        async move { ws::prewarm_websocket(session, prompt_cache_key).await }.boxed()
     }
 }
 
@@ -181,7 +133,8 @@ async fn stream_provider_request(
     }
 }
 
-pub fn parse_response_events(
+#[allow(dead_code)]
+pub(crate) fn parse_response_events(
     events: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<ProviderResponse> {
     let mut state = ResponseState::default();
@@ -360,6 +313,7 @@ impl ToolCallAccumulator {
     }
 }
 
+#[allow(dead_code)]
 fn apply_response_event_str(
     state: &mut ResponseState,
     data: &str,

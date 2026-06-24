@@ -4,11 +4,47 @@ use rho::{
     ItemBlock, ItemKind, Message, MessagePhase, ProviderItemKind, ProviderRequest, Role,
     ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec, ToolType,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{
-    ContextManagementRequest, ProviderSession, ResponsesRequest, TextRequest, encode_tool_name,
-};
+use crate::{ProviderSession, encode_tool_name};
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ResponsesRequest {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    pub input: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextRequest>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_management: Vec<ContextManagementRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct TextRequest {
+    pub verbosity: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ContextManagementRequest {
+    #[serde(rename = "type")]
+    pub ty: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_threshold: Option<u64>,
+}
 
 impl ResponsesRequest {
     pub fn from_provider_request(session: &ProviderSession, request: ProviderRequest) -> Self {
