@@ -3,7 +3,7 @@
 //! The agent owns this shape so providers receive stable `ItemBlock` snapshots
 //! without being responsible for local queue/tool-result policy.
 
-use rho::{InferenceRequest, ItemBlock, ToolSpec};
+use rho_core::{InferenceRequest, ItemBlock, ToolSpec};
 
 #[derive(Clone, Debug)]
 pub(crate) struct AgentThread {
@@ -34,7 +34,7 @@ impl AgentThread {
 
 #[cfg(test)]
 mod tests {
-    use rho::{Item, ItemBlock, Role, ToolSpec, ToolType};
+    use rho_core::{Item, ItemBlock, Role, ToolSpec, ToolType};
     use serde_json::json;
 
     use super::*;

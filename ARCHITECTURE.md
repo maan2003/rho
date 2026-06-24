@@ -5,12 +5,12 @@ than by running a supervisor, extension protocol, or daemon process graph.
 
 ## Crate layering
 
-- `rho` owns the shared vocabulary: transcript items, inference requests and
-  responses, tool calls/results, usage, roles, message phases, and opaque
-  provider items. It should stay policy-light.
-- Inference crates, currently `rho-inference-responses`, translate `rho` inference
+- `rho-core` owns the shared vocabulary: transcript items, inference requests,
+  streaming inference updates and responses, tool calls/results, usage, roles,
+  message phases, and opaque provider items. It should stay policy-light.
+- Inference crates, currently `rho-inference`, translate `rho-core` inference
   requests into provider-specific wire protocols and translate provider events
-  back into `rho` items and updates.
+  back into `rho-core` items and updates.
 - `rho-agent` owns the opinionated harness policy: queueing, retries/tool
   scheduling, streamed transcript handling, inference response block recording,
   and persistence hooks.
@@ -20,19 +20,19 @@ than by running a supervisor, extension protocol, or daemon process graph.
   execution.
 
 Dependencies should flow from higher-level assembly/policy crates toward lower
-reusable crates. The shared `rho` crate must not depend on provider, agent,
+reusable crates. The shared `rho-core` crate must not depend on provider, agent,
 store, tool, or CLI crates.
 
 ## Transcript and inference data ownership
 
-`rho::ItemBlock` is the transcript unit passed between stores, agents, and
+`rho_core::ItemBlock` is the transcript unit passed between stores, agents, and
 providers.
 
 - `ItemBlock::Local` is local/user/tool/agent-owned transcript data.
 - `ItemBlock::InferenceResponse` is provider-owned output plus the optional
   provider response id needed for provider-side chaining.
 - Provider-specific data that must be replayed but is not part of the shared
-  semantic vocabulary is carried as `rho::ProviderItem` with an opaque JSON
+  semantic vocabulary is carried as `rho_core::ProviderItem` with an opaque JSON
   payload and a coarse `ProviderItemKind`.
 
 `rho-agent` is the canonical owner of the in-memory transcript during an agent

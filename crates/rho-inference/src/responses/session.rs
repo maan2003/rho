@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::oauth::{
+use super::oauth::{
     OAuthFile, ResponsesAuth, oauth_token_should_refresh, openai_codex_auth_url,
     openai_codex_exchange, parse_redirect_url,
 };
-use crate::ws::WebSocketPool;
-use crate::{DEFAULT_CHATGPT_BASE_URL, DEFAULT_MODEL, ResponsesCompaction};
+use super::ws::WebSocketPool;
+use super::{DEFAULT_CHATGPT_BASE_URL, DEFAULT_MODEL, ResponsesCompaction};
 
 #[derive(Clone)]
 pub struct InferenceService {
@@ -161,34 +161,50 @@ impl InferenceService {
     }
 }
 
-fn chatgpt_codex_auth_status_label(
-    credentials: Option<&crate::oauth::ResponsesOAuthCredentials>,
-) -> &'static str {
+#[derive(Clone, Copy)]
+enum AuthStatus {
+    Missing,
+    Invalid,
+    RefreshDue,
+    Fresh,
+}
+
+fn auth_status(credentials: Option<&super::oauth::ResponsesOAuthCredentials>) -> AuthStatus {
     let Some(credentials) = credentials else {
-        return "missing";
+        return AuthStatus::Missing;
     };
     if credentials.access_token.trim().is_empty() {
-        "invalid"
+        AuthStatus::Invalid
     } else if oauth_token_should_refresh(&credentials.access_token, credentials.expires_at_ms) {
-        "refresh-due"
+        AuthStatus::RefreshDue
     } else {
-        "logged-in"
+        AuthStatus::Fresh
+    }
+}
+
+fn chatgpt_codex_auth_status_label(
+    credentials: Option<&super::oauth::ResponsesOAuthCredentials>,
+) -> &'static str {
+    match auth_status(credentials) {
+        AuthStatus::Missing => "missing",
+        AuthStatus::Invalid => "invalid",
+        AuthStatus::RefreshDue => "refresh-due",
+        AuthStatus::Fresh => "logged-in",
     }
 }
 
 fn chatgpt_codex_auth_status_line_for(
     path: &Path,
-    credentials: Option<&crate::oauth::ResponsesOAuthCredentials>,
+    credentials: Option<&super::oauth::ResponsesOAuthCredentials>,
 ) -> String {
     let Some(credentials) = credentials else {
         return format!("missing path={}", path.display());
     };
-    let status = if credentials.access_token.trim().is_empty() {
-        "invalid"
-    } else if oauth_token_should_refresh(&credentials.access_token, credentials.expires_at_ms) {
-        "refresh_due"
-    } else {
-        "fresh"
+    let status = match auth_status(Some(credentials)) {
+        AuthStatus::Missing => unreachable!("credentials are present"),
+        AuthStatus::Invalid => "invalid",
+        AuthStatus::RefreshDue => "refresh_due",
+        AuthStatus::Fresh => "fresh",
     };
     let account = credentials.account_id.as_deref().unwrap_or("unknown");
     let refresh = if credentials.refresh_token.trim().is_empty() {

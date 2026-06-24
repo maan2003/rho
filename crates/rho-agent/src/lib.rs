@@ -12,11 +12,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt, join_all};
-use rho::{
-    InferenceRequest, InferenceResponse, Item, ItemBlock, ItemKind, Message, MessagePhase,
-    ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult, ToolSpec,
+use rho_core::{
+    InferenceRequest, InferenceResponse, InferenceUpdate, Item, ItemBlock, ItemKind, Message,
+    MessagePhase, ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult, ToolSpec,
 };
-use rho_inference_responses::{InferenceService, ResponsesStream, ResponsesUpdate};
+use rho_inference::InferenceService;
+pub use rho_inference::InferenceStream;
 use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use rho_tool_shell::ShellTools;
@@ -25,9 +26,8 @@ mod thread;
 
 use thread::AgentThread;
 
-pub type InferenceStream = ResponsesStream;
 pub type ToolFuture = BoxFuture<'static, ToolResult>;
-type InferenceUpdateHandler = Box<dyn FnMut(ResponsesUpdate) + Send>;
+type InferenceUpdateHandler = Box<dyn FnMut(InferenceUpdate) + Send>;
 type AgentUpdateHandler = Arc<Mutex<Box<dyn FnMut(AgentUpdate) + Send>>>;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,7 +37,7 @@ pub enum AgentUpdate {
 }
 
 pub enum AgentInference {
-    Responses(InferenceService),
+    Service(InferenceService),
     #[cfg(test)]
     Test {
         stream: Arc<dyn Fn(InferenceRequest) -> InferenceStream + Send + Sync>,
@@ -110,7 +110,7 @@ impl Agent {
 
     pub fn with_inference_updates(
         mut self,
-        on_update: impl FnMut(ResponsesUpdate) + Send + 'static,
+        on_update: impl FnMut(InferenceUpdate) + Send + 'static,
     ) -> Self {
         self.inference_updates = Some(Box::new(on_update));
         self
@@ -207,7 +207,7 @@ impl Agent {
                     Some(Ok(update)) => {
                         streamed_transcript.record(&update);
                         notify_inference_update(&mut self.inference_updates, update.clone());
-                        if let ResponsesUpdate::Finished(response) = update {
+                        if let InferenceUpdate::Finished(response) = update {
                             break self
                                 .finish_inference_request(response, streamed_transcript)
                                 .await?;
@@ -399,7 +399,7 @@ impl Agent {
 
 static NEXT_ITEM_ID: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
 
-fn alloc_item_id() -> rho::ItemId {
+fn alloc_item_id() -> rho_core::ItemId {
     let counter = NEXT_ITEM_ID.get_or_init(|| {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -408,7 +408,7 @@ fn alloc_item_id() -> rho::ItemId {
             .min(u128::from(u64::MAX)) as u64;
         AtomicU64::new(seed)
     });
-    rho::ItemId(format!("item-{}", counter.fetch_add(1, Ordering::Relaxed)))
+    rho_core::ItemId(format!("item-{}", counter.fetch_add(1, Ordering::Relaxed)))
 }
 
 fn tool_specs(tools: &[AgentTools]) -> Vec<ToolSpec> {
@@ -422,22 +422,22 @@ fn notify_agent_update(handler: &Option<AgentUpdateHandler>, update: AgentUpdate
     }
 }
 
-fn notify_inference_update(handler: &mut Option<InferenceUpdateHandler>, update: ResponsesUpdate) {
+fn notify_inference_update(handler: &mut Option<InferenceUpdateHandler>, update: InferenceUpdate) {
     if let Some(handler) = handler {
         handler(update);
     }
 }
 
 impl StreamingTranscript {
-    fn record(&mut self, update: &ResponsesUpdate) {
+    fn record(&mut self, update: &InferenceUpdate) {
         match update {
-            ResponsesUpdate::TextDelta { output_index, text } => {
+            InferenceUpdate::TextDelta { output_index, text } => {
                 self.text_by_output_index
                     .entry(*output_index)
                     .or_default()
                     .push_str(text);
             }
-            ResponsesUpdate::ReasoningTextDelta {
+            InferenceUpdate::ReasoningTextDelta {
                 output_index,
                 kind,
                 text,
@@ -447,17 +447,17 @@ impl StreamingTranscript {
                     .or_default()
                     .push_str(text);
             }
-            ResponsesUpdate::ToolCall { output_index, call } => {
+            InferenceUpdate::ToolCall { output_index, call } => {
                 self.output_items
                     .insert(*output_index, ItemKind::ToolCall(call.clone()));
             }
-            ResponsesUpdate::OutputItem { output_index, item } => {
+            InferenceUpdate::OutputItem { output_index, item } => {
                 self.output_items.insert(*output_index, item.clone());
             }
-            ResponsesUpdate::CompactionStarted { .. }
-            | ResponsesUpdate::Usage(_)
-            | ResponsesUpdate::ResponseId(_)
-            | ResponsesUpdate::Finished(_) => {}
+            InferenceUpdate::CompactionStarted { .. }
+            | InferenceUpdate::Usage(_)
+            | InferenceUpdate::ResponseId(_)
+            | InferenceUpdate::Finished(_) => {}
         }
     }
 
@@ -525,7 +525,7 @@ impl AgentStore {
 impl AgentInference {
     fn stream(&self, request: InferenceRequest) -> InferenceStream {
         match self {
-            AgentInference::Responses(session) => session.stream(request),
+            AgentInference::Service(session) => session.stream(request),
             #[cfg(test)]
             AgentInference::Test { stream } => stream(request),
         }
@@ -533,7 +533,7 @@ impl AgentInference {
 }
 
 impl AgentTools {
-    fn specs(&self) -> Vec<rho::ToolSpec> {
+    fn specs(&self) -> Vec<rho_core::ToolSpec> {
         match self {
             AgentTools::Shell(tool) => tool.specs(),
         }
@@ -545,7 +545,7 @@ impl AgentTools {
         }
     }
 
-    fn call(&self, call: rho::ToolCall) -> ToolFuture {
+    fn call(&self, call: rho_core::ToolCall) -> ToolFuture {
         match self {
             AgentTools::Shell(tool) => {
                 let tool = tool.clone();

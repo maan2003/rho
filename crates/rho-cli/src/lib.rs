@@ -2,7 +2,7 @@
 //!
 //! This crate deliberately assembles concrete rho building blocks instead of
 //! defining a reusable CLI framework: `rho-agent` owns the harness loop,
-//! `rho-inference-responses` owns ChatGPT/Codex Responses transport, and
+//! `rho-inference` owns inference transport, and
 //! `rho-tool-shell` owns the built-in shell/apply_patch tools. Fork this crate
 //! when the desired user experience diverges.
 
@@ -14,12 +14,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rho::{ItemBlock, ItemKind, ReasoningTextKind, Role, ToolCall, ToolResult, ToolResultStatus};
 use rho_agent::{Agent, AgentInference, AgentStore, AgentTools, AgentUpdate};
 use rho_cli_term_raw::{
     Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
-use rho_inference_responses::{InferenceService, ResponsesUpdate};
+use rho_core::{
+    InferenceUpdate, ItemBlock, ItemKind, ReasoningTextKind, Role, ToolCall, ToolResult,
+    ToolResultStatus,
+};
+use rho_inference::InferenceService;
 use rho_store_cbor::CborLog;
 use rho_tool_shell::ShellTools;
 use tokio::sync::Mutex as AsyncMutex;
@@ -203,7 +206,7 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 }
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
-    let inference = AgentInference::Responses(build_inference_service(args));
+    let inference = AgentInference::Service(build_inference_service(args));
     let tools = vec![AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT))];
     let mut agent = if args.no_store {
         Agent::new(inference, tools)
@@ -552,20 +555,20 @@ impl StreamingRenderer {
         }
     }
 
-    fn handle_inference(&mut self, update: ResponsesUpdate) {
+    fn handle_inference(&mut self, update: InferenceUpdate) {
         match update {
-            ResponsesUpdate::TextDelta { text, .. } => {
+            InferenceUpdate::TextDelta { text, .. } => {
                 self.assistant_text.push_str(&text);
                 self.render_assistant();
             }
-            ResponsesUpdate::ReasoningTextDelta { kind, text, .. } => {
+            InferenceUpdate::ReasoningTextDelta { kind, text, .. } => {
                 if kind == ReasoningTextKind::Summary {
                     self.thinking_text.push_str(&text);
                     self.render_thinking();
                 }
             }
-            ResponsesUpdate::ToolCall { call, .. } => self.render_tool_call(&call),
-            ResponsesUpdate::OutputItem { item, .. } => {
+            InferenceUpdate::ToolCall { call, .. } => self.render_tool_call(&call),
+            InferenceUpdate::OutputItem { item, .. } => {
                 if self.assistant_text.is_empty()
                     && let ItemKind::Message(message) = item
                 {
@@ -573,9 +576,9 @@ impl StreamingRenderer {
                     self.render_assistant();
                 }
             }
-            ResponsesUpdate::CompactionStarted { .. } => self.render_notice("compacting context"),
-            ResponsesUpdate::Usage(_) | ResponsesUpdate::ResponseId(_) => {}
-            ResponsesUpdate::Finished(response) => {
+            InferenceUpdate::CompactionStarted { .. } => self.render_notice("compacting context"),
+            InferenceUpdate::Usage(_) | InferenceUpdate::ResponseId(_) => {}
+            InferenceUpdate::Finished(response) => {
                 let requests_tool_calls = response
                     .items
                     .iter()

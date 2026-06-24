@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -89,17 +92,6 @@ impl ResponsesAuth {
 }
 
 impl ResponsesOAuthCredentials {
-    #[cfg(test)]
-    pub(crate) fn from_access_token(access_token: impl Into<String>) -> Self {
-        let access_token = access_token.into();
-        let account_id = openai_account_id_from_jwt(&access_token);
-        Self {
-            access_token,
-            account_id,
-            ..Default::default()
-        }
-    }
-
     pub(crate) fn resolved(&self) -> Option<ResolvedAuth> {
         if self.access_token.trim().is_empty() {
             return None;
@@ -128,14 +120,6 @@ impl OAuthFile {
 
     pub(crate) fn open_default(name: impl AsRef<str>) -> io::Result<Self> {
         Self::open_at(Self::default_auth_dir()?, name)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn open_in(
-        state_dir: impl Into<PathBuf>,
-        name: impl AsRef<str>,
-    ) -> io::Result<Self> {
-        Self::open_at(state_dir.into().join("auth.d"), name)
     }
 
     pub(crate) fn open_at(auth_dir: impl Into<PathBuf>, name: impl AsRef<str>) -> io::Result<Self> {
@@ -533,6 +517,3 @@ fn code_challenge(verifier: &str) -> String {
 fn urlencoding(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
-
-#[cfg(test)]
-mod tests;

@@ -936,21 +936,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "rho-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
- "rho",
- "rho-inference-responses",
+ "rho-core",
+ "rho-inference",
  "rho-store-cbor",
  "rho-store-redb",
  "rho-tool-shell",
@@ -973,10 +965,10 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
- "rho",
  "rho-agent",
  "rho-cli-term-raw",
- "rho-inference-responses",
+ "rho-core",
+ "rho-inference",
  "rho-store-cbor",
  "rho-tool-shell",
  "serde_json",
@@ -998,7 +990,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-inference-responses"
+name = "rho-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rho-inference"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1007,7 +1007,7 @@ dependencies = [
  "futures",
  "futures-util",
  "rand 0.8.6",
- "rho",
+ "rho-core",
  "serde",
  "serde_json",
  "sha2",
@@ -1023,7 +1023,7 @@ name = "rho-store-cbor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "rho",
+ "rho-core",
  "serde",
  "serde_cbor",
  "tokio",
@@ -1035,7 +1035,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "redb",
- "rho",
+ "rho-core",
  "serde_cbor",
  "tempfile",
  "tokio",
@@ -1057,7 +1057,7 @@ name = "rho-tool-shell"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "rho",
+ "rho-core",
  "serde",
  "serde_json",
  "tempfile",

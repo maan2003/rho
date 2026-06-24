@@ -1,4 +1,4 @@
-use rho::{Item, Role};
+use rho_core::{Item, Role};
 
 use super::*;
 

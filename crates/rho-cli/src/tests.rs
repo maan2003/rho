@@ -1,9 +1,8 @@
 use std::io;
 use std::path::PathBuf;
 
-use rho::{InferenceResponse, ToolCall, ToolCallId, ToolResult, ToolType};
 use rho_cli_term_raw::{CursorShape, Term};
-use rho_inference_responses::ResponsesUpdate;
+use rho_core::{InferenceResponse, InferenceUpdate, ToolCall, ToolCallId, ToolResult, ToolType};
 
 use super::*;
 
@@ -55,13 +54,13 @@ fn inference_tool_call_response_keeps_tool_block_live_until_turn_finish() {
         arguments: serde_json::json!({"command": "printf hi"}),
     };
 
-    renderer.handle_inference(ResponsesUpdate::ToolCall {
+    renderer.handle_inference(InferenceUpdate::ToolCall {
         output_index: 0,
         call: call.clone(),
     });
     assert_eq!(renderer.tool_blocks.len(), 1);
 
-    renderer.handle_inference(ResponsesUpdate::Finished(InferenceResponse {
+    renderer.handle_inference(InferenceUpdate::Finished(InferenceResponse {
         items: vec![ItemKind::ToolCall(call.clone())],
         usage: None,
         provider_response_id: None,
@@ -90,13 +89,13 @@ fn inference_text_response_finalizes_without_outer_loop() {
     );
     let mut renderer = StreamingRenderer::new(handle);
 
-    renderer.handle_inference(ResponsesUpdate::TextDelta {
+    renderer.handle_inference(InferenceUpdate::TextDelta {
         output_index: 0,
         text: "done".to_owned(),
     });
     assert!(renderer.assistant_block.is_some());
 
-    renderer.handle_inference(ResponsesUpdate::Finished(InferenceResponse {
+    renderer.handle_inference(InferenceUpdate::Finished(InferenceResponse {
         items: Vec::new(),
         usage: None,
         provider_response_id: None,

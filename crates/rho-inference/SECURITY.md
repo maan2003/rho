@@ -1,9 +1,9 @@
-# rho-inference-responses security and reliability context
+# rho-inference security and reliability context
 
-`rho-inference-responses` is a library crate for OpenAI Responses / ChatGPT Codex
-inference support. It builds request bodies from `rho` inference requests, opens
-ChatGPT/Codex WebSockets, parses streamed inference events, and manages
-file-backed OAuth credentials.
+`rho-inference` is a library crate for inference provider integrations. Its
+current Responses module builds request bodies from `rho-core` inference
+requests, opens ChatGPT/Codex WebSockets, parses streamed inference events, and
+manages file-backed OAuth credentials.
 
 ## Runtime and trust boundaries
 

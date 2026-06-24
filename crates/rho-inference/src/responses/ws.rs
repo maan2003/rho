@@ -13,13 +13,13 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderMap;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
-use crate::build_request::ResponsesRequest;
-use crate::oauth::ResolvedAuth;
-use crate::{
+use super::oauth::ResolvedAuth;
+use super::wire::ResponsesRequest;
+use super::{
     DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS, DEFAULT_WEBSOCKET_PING_INTERVAL_SECS,
     DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS, DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS,
-    DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS, InferenceService, OPENAI_BETA_WS, ResponsesUpdate,
-    apply_response_event, responses_url,
+    DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS, InferenceService, InferenceUpdate, OPENAI_BETA_WS,
+    responses_url,
 };
 
 pub(crate) async fn send_websocket(
@@ -27,7 +27,7 @@ pub(crate) async fn send_websocket(
     websocket_pool: &Arc<Mutex<WebSocketPool>>,
     body: ResponsesRequest,
     tool_names: &BTreeMap<String, String>,
-    updates: &mpsc::UnboundedSender<Result<ResponsesUpdate>>,
+    updates: &mpsc::UnboundedSender<Result<InferenceUpdate>>,
 ) -> Result<()> {
     let auth = session.auth.clone();
     let resolved_auth = tokio::task::spawn_blocking(move || auth.resolve()).await??;
@@ -61,7 +61,7 @@ async fn send_pooled_websocket(
     auth: Option<&ResolvedAuth>,
     body: ResponsesRequest,
     tool_names: &BTreeMap<String, String>,
-    updates: &mpsc::UnboundedSender<Result<ResponsesUpdate>>,
+    updates: &mpsc::UnboundedSender<Result<InferenceUpdate>>,
 ) -> Result<()> {
     let mut connection = checkout_websocket_pool(session, websocket_pool, &key, auth).await?;
     match connection.run_turn(body, tool_names, updates).await {
@@ -98,7 +98,7 @@ async fn checkout_websocket_pool(
             WebSocketPoolCheckout::Ready(connection) => return Ok(*connection),
             WebSocketPoolCheckout::OpenNew => {
                 let connection = async {
-                    let request = build_ws_request(session, Some(&key.thread_id), auth)?;
+                    let request = build_ws_request(session, Some(key.thread_id.as_str()), auth)?;
                     let (socket, _response) = connect_async(request).await?;
                     Ok::<_, anyhow::Error>(WebSocketConnection::new(socket, auth))
                 }
@@ -143,7 +143,7 @@ impl WebSocketConnection {
         &mut self,
         body: ResponsesRequest,
         tool_names: &BTreeMap<String, String>,
-        updates: &mpsc::UnboundedSender<Result<ResponsesUpdate>>,
+        updates: &mpsc::UnboundedSender<Result<InferenceUpdate>>,
     ) -> Result<()> {
         self.socket
             .send(WsMessage::Text(
@@ -155,7 +155,7 @@ impl WebSocketConnection {
             ))
             .await?;
 
-        let mut state = crate::ResponseState::with_tool_names(tool_names.clone());
+        let mut state = super::ResponseState::with_tool_names(tool_names.clone());
         let mut completed = false;
         let event_timeout = Duration::from_secs(DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS);
         let mut last_event_at = tokio::time::Instant::now();
@@ -177,7 +177,7 @@ impl WebSocketConnection {
                         Ok(event) => event,
                         Err(_) => continue,
                     };
-                    let (done, event_updates) = apply_response_event(&mut state, &event)?;
+                    let (done, event_updates) = state.apply_event(&event)?;
                     for update in event_updates {
                         let _ = updates.send(Ok(update));
                     }
@@ -205,7 +205,7 @@ impl WebSocketConnection {
             bail!("stream error: websocket ended before response.completed");
         }
         let response = state.finish();
-        let _ = updates.send(Ok(ResponsesUpdate::Finished(response)));
+        let _ = updates.send(Ok(InferenceUpdate::Finished(response)));
         Ok(())
     }
 }
@@ -214,7 +214,16 @@ impl WebSocketConnection {
 pub(crate) struct WebSocketPoolKey {
     pub(crate) base_url: String,
     pub(crate) account_id: Option<String>,
-    pub(crate) thread_id: String,
+    pub(crate) thread_id: WebSocketThreadId,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct WebSocketThreadId(String);
+
+impl WebSocketThreadId {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl WebSocketPoolKey {
@@ -223,19 +232,23 @@ impl WebSocketPoolKey {
         body: &ResponsesRequest,
         auth: Option<&ResolvedAuth>,
     ) -> Option<Self> {
-        Self::from_thread_id(session, body.prompt_cache_key.clone()?, auth)
+        Some(Self::from_thread_id(
+            session,
+            WebSocketThreadId(body.prompt_cache_key.clone()?),
+            auth,
+        ))
     }
 
     fn from_thread_id(
         session: &InferenceService,
-        thread_id: String,
+        thread_id: WebSocketThreadId,
         auth: Option<&ResolvedAuth>,
-    ) -> Option<Self> {
-        Some(Self {
+    ) -> Self {
+        Self {
             base_url: session.base_url.clone(),
             account_id: auth.and_then(|auth| auth.account_id.clone()),
             thread_id,
-        })
+        }
     }
 }
 

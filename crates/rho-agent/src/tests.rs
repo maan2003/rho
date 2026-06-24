@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
-use rho::{
+use rho_core::{
     InferenceResponse, ItemKind, Message, ProviderItem, ProviderItemKind, Role, ToolCall,
     ToolCallId, ToolType,
 };
@@ -13,7 +13,7 @@ use serde_json::json;
 
 use super::*;
 
-fn test_items(blocks: &[ItemBlock]) -> Vec<&rho::Item> {
+fn test_items(blocks: &[ItemBlock]) -> Vec<&rho_core::Item> {
     blocks
         .iter()
         .flat_map(|block| match block {
@@ -32,7 +32,7 @@ fn test_provider(
     AgentInference::Test {
         stream: Arc::new(move |request| {
             let future = complete(request);
-            futures::stream::once(async move { future.await.map(ResponsesUpdate::Finished) })
+            futures::stream::once(async move { future.await.map(InferenceUpdate::Finished) })
                 .boxed()
         }),
     }
@@ -184,7 +184,7 @@ async fn cancel_current_turn_records_cancelled_tool_results() {
 
     assert!(agent.is_idle());
     assert!(test_items(agent.blocks()).iter().any(|item| {
-        matches!(&item.kind, ItemKind::ToolResult(result) if matches!(&result.status, rho::ToolResultStatus::Cancelled { reason } if reason == "cancelled"))
+        matches!(&item.kind, ItemKind::ToolResult(result) if matches!(&result.status, rho_core::ToolResultStatus::Cancelled { reason } if reason == "cancelled"))
     }));
 }
 
@@ -360,15 +360,15 @@ async fn forwards_streaming_inference_updates() {
     let seen_updates = Arc::clone(&updates);
     let provider = test_streaming_provider(|_request| {
         futures::stream::iter([
-            Ok(ResponsesUpdate::TextDelta {
+            Ok(InferenceUpdate::TextDelta {
                 output_index: 0,
                 text: "do".to_owned(),
             }),
-            Ok(ResponsesUpdate::TextDelta {
+            Ok(InferenceUpdate::TextDelta {
                 output_index: 0,
                 text: "ne".to_owned(),
             }),
-            Ok(ResponsesUpdate::Finished(text_response("done"))),
+            Ok(InferenceUpdate::Finished(text_response("done"))),
         ])
         .boxed()
     });
@@ -385,11 +385,11 @@ async fn forwards_streaming_inference_updates() {
     let updates = updates.lock().expect("provider update log lock");
     assert!(matches!(
         &updates[0],
-        ResponsesUpdate::TextDelta { output_index: 0, text } if text == "do"
+        InferenceUpdate::TextDelta { output_index: 0, text } if text == "do"
     ));
     assert!(matches!(
         &updates[1],
-        ResponsesUpdate::TextDelta { output_index: 0, text } if text == "ne"
+        InferenceUpdate::TextDelta { output_index: 0, text } if text == "ne"
     ));
 }
 
@@ -397,20 +397,20 @@ async fn forwards_streaming_inference_updates() {
 async fn records_streamed_text_when_final_response_is_sparse() {
     let provider = test_streaming_provider(|_request| {
         futures::stream::iter([
-            Ok(ResponsesUpdate::TextDelta {
+            Ok(InferenceUpdate::TextDelta {
                 output_index: 0,
                 text: "do".to_owned(),
             }),
-            Ok(ResponsesUpdate::TextDelta {
+            Ok(InferenceUpdate::TextDelta {
                 output_index: 0,
                 text: "ne".to_owned(),
             }),
-            Ok(ResponsesUpdate::ReasoningTextDelta {
+            Ok(InferenceUpdate::ReasoningTextDelta {
                 output_index: 1,
                 kind: ReasoningTextKind::Summary,
                 text: "thought".to_owned(),
             }),
-            Ok(ResponsesUpdate::Finished(InferenceResponse {
+            Ok(InferenceUpdate::Finished(InferenceResponse {
                 items: Vec::new(),
                 usage: None,
                 provider_response_id: None,
@@ -443,11 +443,11 @@ async fn records_streamed_text_when_final_response_is_sparse() {
 async fn streamed_text_does_not_duplicate_final_response_items() {
     let provider = test_streaming_provider(|_request| {
         futures::stream::iter([
-            Ok(ResponsesUpdate::TextDelta {
+            Ok(InferenceUpdate::TextDelta {
                 output_index: 0,
                 text: "done".to_owned(),
             }),
-            Ok(ResponsesUpdate::Finished(text_response("done"))),
+            Ok(InferenceUpdate::Finished(text_response("done"))),
         ])
         .boxed()
     });

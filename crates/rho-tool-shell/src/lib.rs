@@ -11,7 +11,7 @@ mod truncate;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use rho::{ToolCall, ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec, ToolType};
+use rho_core::{ToolCall, ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec, ToolType};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;

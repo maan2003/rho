@@ -13,7 +13,7 @@ behavior, without dragging the whole system along.
 
 Crate boundaries exist to reduce tight coupling:
 
-- `rho` / core types: small shared vocabulary like items, messages, tool calls,
+- `rho-core` / core types: small shared vocabulary like items, messages, tool calls,
   tool results, provider requests/responses, ids, and model params.
 - provider crates: concrete provider adapters that produce futures/streams.
 - tool crates: concrete tool implementations and helpers.
@@ -37,7 +37,7 @@ until they are truly needed. `rho-agent` can assemble components with local enum
 ```rust
 enum AgentInference {
     ChatCompletions(rho_provider_chat_completions::Provider),
-    Responses(rho_inference_responses::Provider),
+    Service(rho_inference::InferenceService),
 }
 
 enum AgentState {

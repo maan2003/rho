@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use rho::ItemBlock;
+use rho_core::ItemBlock;
 use tokio::fs;
 
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");

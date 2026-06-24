@@ -1,4 +1,4 @@
-use rho::{Item, ItemBlock, Role};
+use rho_core::{Item, ItemBlock, Role};
 
 use super::*;
 

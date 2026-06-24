@@ -11,11 +11,12 @@ are local edits to crates, structs, enums, futures, and streams.
 
 ## Shape
 
-- `rho`: small shared item vocabulary for messages, tool calls, tool results,
-  reasoning text, opaque provider items, inference requests/responses, ids, usage,
-  and token usage.
-- `rho-inference-responses`: WebSocket-only OpenAI Responses and ChatGPT/Codex
-  inference support.
+- `rho-core`: small shared item vocabulary for messages, tool calls, tool
+  results, reasoning text, opaque provider items, inference requests, streaming
+  inference updates/responses, ids, usage, and token usage.
+- `rho-inference`: concrete inference provider integrations behind a
+  provider-neutral public API. Its current private implementation provides
+  WebSocket-only OpenAI Responses and ChatGPT/Codex inference support.
 - `rho-agent`: an opinionated, forkable harness that owns queueing, retries,
   tool scheduling, persistence hooks, streamed transcript handling, and
   inference response block persistence.

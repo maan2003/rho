@@ -167,6 +167,33 @@ pub struct InferenceResponse {
     pub provider_response_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum InferenceUpdate {
+    TextDelta {
+        output_index: usize,
+        text: String,
+    },
+    ReasoningTextDelta {
+        output_index: usize,
+        kind: ReasoningTextKind,
+        text: String,
+    },
+    ToolCall {
+        output_index: usize,
+        call: ToolCall,
+    },
+    OutputItem {
+        output_index: usize,
+        item: ItemKind,
+    },
+    CompactionStarted {
+        output_index: usize,
+    },
+    Usage(TokenUsage),
+    ResponseId(String),
+    Finished(InferenceResponse),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u64,

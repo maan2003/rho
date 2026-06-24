@@ -1,8 +1,8 @@
-# rho-inference-responses architecture
+# rho-inference architecture
 
-`rho-inference-responses` provides OpenAI Responses / ChatGPT Codex inference
-support for rho. It is the boundary between the shared `rho` transcript
-vocabulary and the OpenAI Responses WebSocket protocol.
+`rho-inference` provides concrete inference provider integrations for rho. Its
+public API is intentionally provider-neutral; the current private implementation
+module uses the OpenAI Responses WebSocket protocol.
 
 ## Public API boundary
 
@@ -11,10 +11,11 @@ The public surface is intentionally small:
 - `InferenceService` configures inference access, prompt-cache/thread behavior,
   compaction, ChatGPT/Codex auth-file selection, auth-file management helpers,
   and owns the WebSocket pool.
-- `InferenceService::stream` accepts a `rho::InferenceRequest` and returns a
-  stream of `ResponsesUpdate` values ending in `ResponsesUpdate::Finished`.
-- `ResponsesUpdate` is the streaming update contract consumed by `rho-agent` and
-  UIs.
+- `InferenceService::stream` accepts a `rho_core::InferenceRequest` and returns
+  an `InferenceStream` of `rho_core::InferenceUpdate` values ending in
+  `InferenceUpdate::Finished`.
+- `rho_core::InferenceUpdate` is the provider-neutral streaming update contract
+  consumed by `rho-agent` and UIs.
 - Raw OAuth helpers, credential DTOs, credential files, token refresh, and
   recorded-event parsers are internal implementation details. CLI and UI crates
   should use the `InferenceService` facade instead of importing inference auth
@@ -26,14 +27,14 @@ configuration.
 
 ## Internal components
 
-- `build_request.rs` converts `rho::InferenceRequest` and `InferenceService`
-  settings into the Responses request JSON shape.
-- `lib.rs` owns event parsing, `ResponseState`, streaming update production,
-  stale `previous_response_id` fallback, and public re-exports.
-- `session.rs` owns session configuration and shared WebSocket-pool state.
-- `ws.rs` owns WebSocket request construction, connection checkout/release,
+- `responses/wire.rs` converts `rho_core::InferenceRequest` and
+  `InferenceService` settings into the Responses request JSON shape; it also
+  owns Responses event parsing, `ResponseState`, streaming update
+  production, and stale `previous_response_id` fallback.
+- `responses/session.rs` owns session configuration and shared WebSocket-pool state.
+- `responses/ws.rs` owns WebSocket request construction, connection checkout/release,
   event-loop timeouts/pings, and pool keying.
-- `oauth.rs` owns private credential files, OAuth token exchange/refresh,
+- `responses/oauth.rs` owns private credential files, OAuth token exchange/refresh,
   account id extraction, and file locking behind the `InferenceService` facade.
 
 ## Request and replay model
@@ -64,7 +65,7 @@ provider response id by provider output index. Streaming updates are emitted as
 events arrive, and the final `InferenceResponse` is built from the accumulated
 state.
 
-`ResponsesUpdate::Finished` is the only successful terminal update. Consumers
+`InferenceUpdate::Finished` is the only successful terminal update. Consumers
 should treat a stream ending before `Finished` as an error.
 
 ## WebSocket pool ownership

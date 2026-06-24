@@ -8,10 +8,27 @@ fn jwt_with_claims(claims: Value) -> String {
     format!("{header}.{payload}.signature")
 }
 
+fn oauth_file_open_in(
+    state_dir: impl Into<PathBuf>,
+    name: impl AsRef<str>,
+) -> io::Result<OAuthFile> {
+    OAuthFile::open_at(state_dir.into().join("auth.d"), name)
+}
+
+fn credentials_from_access_token(access_token: impl Into<String>) -> ResponsesOAuthCredentials {
+    let access_token = access_token.into();
+    let account_id = openai_account_id_from_jwt(&access_token);
+    ResponsesOAuthCredentials {
+        access_token,
+        account_id,
+        ..Default::default()
+    }
+}
+
 #[test]
 fn oauth_file_saves_loads_and_resolves_credentials() {
     let temp = tempfile::tempdir().unwrap();
-    let file = OAuthFile::open_in(temp.path(), "chatgpt").unwrap();
+    let file = oauth_file_open_in(temp.path(), "chatgpt").unwrap();
     file.save(&ResponsesOAuthCredentials {
         access_token: "access".to_owned(),
         refresh_token: "refresh".to_owned(),
@@ -55,11 +72,10 @@ fn oauth_file_open_at_uses_exact_auth_dir() {
 #[test]
 fn oauth_file_delete_reports_whether_file_existed() {
     let temp = tempfile::tempdir().unwrap();
-    let file = OAuthFile::open_in(temp.path(), "chatgpt").unwrap();
+    let file = oauth_file_open_in(temp.path(), "chatgpt").unwrap();
 
     assert!(!file.delete().unwrap());
-    file.save(&ResponsesOAuthCredentials::from_access_token("access"))
-        .unwrap();
+    file.save(&credentials_from_access_token("access")).unwrap();
     assert!(file.delete().unwrap());
     assert!(!file.delete().unwrap());
 }
@@ -67,7 +83,7 @@ fn oauth_file_delete_reports_whether_file_existed() {
 #[test]
 fn oauth_file_refreshes_expired_credentials_and_persists_them() {
     let temp = tempfile::tempdir().unwrap();
-    let file = OAuthFile::open_in(temp.path(), "chatgpt").unwrap();
+    let file = oauth_file_open_in(temp.path(), "chatgpt").unwrap();
     file.save(&ResponsesOAuthCredentials {
         access_token: "old".to_owned(),
         refresh_token: "refresh".to_owned(),
@@ -112,7 +128,7 @@ fn oauth_extracts_account_id_from_openai_jwt() {
         },
     }));
 
-    let credentials = ResponsesOAuthCredentials::from_access_token(token);
+    let credentials = credentials_from_access_token(token);
 
     assert_eq!(credentials.account_id.as_deref(), Some("acct_from_jwt"));
 }
@@ -120,7 +136,7 @@ fn oauth_extracts_account_id_from_openai_jwt() {
 #[test]
 fn oauth_file_rejects_unsafe_names() {
     for name in ["", ".hidden", "-leading", "has/slash", "has space"] {
-        assert!(OAuthFile::open_in("/tmp", name).is_err());
+        assert!(oauth_file_open_in("/tmp", name).is_err());
     }
 }
 
