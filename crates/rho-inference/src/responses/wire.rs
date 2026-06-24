@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use rho_core::{
@@ -345,13 +345,21 @@ fn trim_before_latest_compaction(input_items: &[ItemKind]) -> &[ItemKind] {
 
 #[derive(Default)]
 pub(crate) struct ResponseState {
-    message_text_by_output_index: BTreeMap<usize, String>,
-    tool_calls_by_output_index: BTreeMap<usize, ToolCallAccumulator>,
-    items_by_output_index: BTreeMap<usize, ItemKind>,
-    reasoning_summary_by_output_index: BTreeMap<usize, String>,
+    outputs: BTreeMap<usize, OutputAccumulator>,
     tool_names_by_wire: BTreeMap<String, String>,
     usage: Option<TokenUsage>,
     provider_response_id: Option<String>,
+}
+
+/// Everything streamed for a single `output_index`, reconciled in `finish`.
+#[derive(Default)]
+struct OutputAccumulator {
+    reasoning_summary: String,
+    /// A finalized item from `response.output_item.done`; when present it wins
+    /// over the streamed `message_text` / `tool_call` fallbacks below.
+    explicit: Option<ItemKind>,
+    message_text: String,
+    tool_call: ToolCallAccumulator,
 }
 
 #[derive(Clone)]
@@ -388,75 +396,62 @@ impl ResponseState {
             .unwrap_or_else(|| wire_name.to_owned())
     }
 
+    fn output_mut(&mut self, output_index: usize) -> &mut OutputAccumulator {
+        self.outputs.entry(output_index).or_default()
+    }
+
     fn tool_call_at_mut(
         &mut self,
         output_index: usize,
         tool_type: ToolType,
     ) -> &mut ToolCallAccumulator {
-        let call = self
-            .tool_calls_by_output_index
-            .entry(output_index)
-            .or_default();
+        let call = &mut self.output_mut(output_index).tool_call;
         call.tool_type = tool_type;
         call
     }
 
     pub(crate) fn finish(self) -> InferenceResponse {
         let ResponseState {
-            message_text_by_output_index,
-            tool_calls_by_output_index,
-            items_by_output_index,
-            reasoning_summary_by_output_index,
+            outputs,
             tool_names_by_wire: _,
             usage,
             provider_response_id,
         } = self;
 
-        let explicit_indexes = items_by_output_index
-            .keys()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let mut ordered_items = Vec::new();
+        // `outputs` is keyed by `output_index`, so iterating it yields items in
+        // provider order. Within one output, emit the reasoning summary first,
+        // then the finalized item if we have one, otherwise the streamed
+        // message and tool-call fallbacks.
+        let mut items = Vec::new();
+        for output in outputs.into_values() {
+            let OutputAccumulator {
+                reasoning_summary,
+                explicit,
+                message_text,
+                tool_call,
+            } = output;
 
-        for (index, reasoning_summary) in reasoning_summary_by_output_index {
             if !reasoning_summary.is_empty() {
-                ordered_items.push((
-                    index,
-                    0,
-                    ItemKind::ReasoningText(ReasoningText {
-                        kind: ReasoningTextKind::Summary,
-                        text: reasoning_summary,
-                    }),
-                ));
+                items.push(ItemKind::ReasoningText(ReasoningText {
+                    kind: ReasoningTextKind::Summary,
+                    text: reasoning_summary,
+                }));
+            }
+
+            if let Some(explicit) = explicit {
+                items.push(explicit);
+            } else {
+                if !message_text.is_empty() {
+                    items.push(ItemKind::Message(Message::text(Role::Assistant, message_text)));
+                }
+                if let Some(call) = tool_call.finish() {
+                    items.push(ItemKind::ToolCall(call));
+                }
             }
         }
-
-        for (index, item) in items_by_output_index {
-            ordered_items.push((index, 1, item));
-        }
-
-        for (index, text) in message_text_by_output_index {
-            if !text.is_empty() && !explicit_indexes.contains(&index) {
-                ordered_items.push((
-                    index,
-                    2,
-                    ItemKind::Message(Message::text(Role::Assistant, text)),
-                ));
-            }
-        }
-
-        for (index, call) in tool_calls_by_output_index {
-            if !explicit_indexes.contains(&index)
-                && let Some(call) = call.finish()
-            {
-                ordered_items.push((index, 3, ItemKind::ToolCall(call)));
-            }
-        }
-
-        ordered_items.sort_by_key(|(index, priority, _)| (*index, *priority));
 
         InferenceResponse {
-            items: ordered_items.into_iter().map(|(_, _, item)| item).collect(),
+            items,
             usage,
             provider_response_id,
         }
@@ -489,10 +484,7 @@ impl ResponseState {
             "response.output_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
                     let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                    self.message_text_by_output_index
-                        .entry(output_index)
-                        .or_default()
-                        .push_str(delta);
+                    self.output_mut(output_index).message_text.push_str(delta);
                     updates.push(InferenceUpdate::TextDelta {
                         output_index,
                         text: delta.to_owned(),
@@ -502,8 +494,7 @@ impl ResponseState {
             "response.output_text.done" => {
                 if let Some(text) = event["text"].as_str() {
                     let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                    self.message_text_by_output_index
-                        .insert(output_index, text.to_owned());
+                    self.output_mut(output_index).message_text = text.to_owned();
                     updates.push(InferenceUpdate::OutputItem {
                         output_index,
                         item: ItemKind::Message(Message::text(Role::Assistant, text)),
@@ -513,9 +504,8 @@ impl ResponseState {
             "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
                     let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                    self.reasoning_summary_by_output_index
-                        .entry(output_index)
-                        .or_default()
+                    self.output_mut(output_index)
+                        .reasoning_summary
                         .push_str(delta);
                     updates.push(InferenceUpdate::ReasoningTextDelta {
                         output_index,
@@ -526,10 +516,7 @@ impl ResponseState {
             }
             "response.reasoning_summary_part.added" => {
                 let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                let summary = self
-                    .reasoning_summary_by_output_index
-                    .entry(output_index)
-                    .or_default();
+                let summary = &mut self.output_mut(output_index).reasoning_summary;
                 if !summary.is_empty() {
                     summary.push_str("\n\n");
                 }
@@ -602,9 +589,9 @@ impl ResponseState {
                     {
                         let mut message = Message::text(Role::Assistant, text.clone());
                         message.phase = message_phase_from_output_item(item);
-                        self.message_text_by_output_index.insert(output_index, text);
-                        self.items_by_output_index
-                            .insert(output_index, ItemKind::Message(message.clone()));
+                        let output = self.output_mut(output_index);
+                        output.message_text = text;
+                        output.explicit = Some(ItemKind::Message(message.clone()));
                         updates.push(InferenceUpdate::OutputItem {
                             output_index,
                             item: ItemKind::Message(message),
@@ -618,8 +605,8 @@ impl ResponseState {
                             kind: ProviderItemKind::Reasoning,
                             payload: item.clone(),
                         };
-                        self.items_by_output_index
-                            .insert(output_index, ItemKind::ProviderItem(provider_item.clone()));
+                        self.output_mut(output_index).explicit =
+                            Some(ItemKind::ProviderItem(provider_item.clone()));
                         updates.push(InferenceUpdate::OutputItem {
                             output_index,
                             item: ItemKind::ProviderItem(provider_item),
@@ -633,10 +620,8 @@ impl ResponseState {
                                 kind: ProviderItemKind::Compaction,
                                 payload: item.clone(),
                             };
-                            self.items_by_output_index.insert(
-                                output_index,
-                                ItemKind::ProviderItem(provider_item.clone()),
-                            );
+                            self.output_mut(output_index).explicit =
+                                Some(ItemKind::ProviderItem(provider_item.clone()));
                             updates.push(InferenceUpdate::OutputItem {
                                 output_index,
                                 item: ItemKind::ProviderItem(provider_item),
@@ -650,8 +635,8 @@ impl ResponseState {
                             kind: ProviderItemKind::Unknown,
                             payload: item.clone(),
                         };
-                        self.items_by_output_index
-                            .insert(output_index, ItemKind::ProviderItem(provider_item.clone()));
+                        self.output_mut(output_index).explicit =
+                            Some(ItemKind::ProviderItem(provider_item.clone()));
                         updates.push(InferenceUpdate::OutputItem {
                             output_index,
                             item: ItemKind::ProviderItem(provider_item),
