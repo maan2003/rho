@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::http::HeaderMap;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use super::oauth::ResolvedAuth;
-use super::wire::ResponsesRequest;
+use super::wire::{ResponseState, ResponsesRequest};
 use super::{InferenceService, InferenceUpdate, OPENAI_BETA_WS, responses_url};
 
 const DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS: u64 = 120;
@@ -152,7 +152,7 @@ impl WebSocketConnection {
             ))
             .await?;
 
-        let mut state = super::ResponseState::with_tool_names(tool_names.clone());
+        let mut state = ResponseState::with_tool_names(tool_names.clone());
         let mut completed = false;
         let event_timeout = Duration::from_secs(DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS);
         let mut last_event_at = tokio::time::Instant::now();

@@ -50,7 +50,10 @@ pub(crate) struct ContextManagementRequest {
 }
 
 impl ResponsesRequest {
-    pub fn from_inference_request(session: &InferenceService, request: InferenceRequest) -> Self {
+    pub(crate) fn from_inference_request(
+        session: &InferenceService,
+        request: InferenceRequest,
+    ) -> Self {
         let mut previous_response = None;
         for (index, block) in request.input.iter().enumerate() {
             let ItemBlock::InferenceResponse {

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rho_agent::{Agent, AgentInference, AgentStore, AgentTools, AgentUpdate};
+use rho_agent::{Agent, AgentStore, AgentTools, AgentUpdate};
 use rho_cli_term_raw::{
     Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
@@ -98,7 +98,7 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 }
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
-    let inference = AgentInference::new(Box::new(build_inference_service(args)?));
+    let inference = Box::new(build_inference_service(args)?);
     let tools = vec![AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT))];
     let mut agent = if args.no_store {
         Agent::new(inference, tools)

@@ -197,7 +197,7 @@ pub enum InferenceUpdate {
 
 pub type InferenceStream = BoxStream<'static, anyhow::Result<InferenceUpdate>>;
 
-pub trait IInferenceService: Send + Sync + 'static {
+pub trait IInferenceSession: Send + Sync + 'static {
     fn stream(&self, request: InferenceRequest) -> InferenceStream;
 }
 

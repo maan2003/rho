@@ -13,9 +13,9 @@ use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt, join_all};
 use rho_core::{
-    IInferenceService, InferenceRequest, InferenceResponse, InferenceStream, InferenceUpdate, Item,
-    ItemBlock, ItemKind, Message, MessagePhase, ReasoningText, ReasoningTextKind, Role, ToolCall,
-    ToolResult, ToolSpec,
+    IInferenceSession, InferenceResponse, InferenceStream, InferenceUpdate, Item, ItemBlock,
+    ItemKind, Message, MessagePhase, ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult,
+    ToolSpec,
 };
 use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
@@ -33,16 +33,6 @@ type AgentUpdateHandler = Arc<Mutex<Box<dyn FnMut(AgentUpdate) + Send>>>;
 pub enum AgentUpdate {
     ToolCallStarted(ToolCall),
     ToolCallFinished(ToolResult),
-}
-
-pub struct AgentInference {
-    service: Box<dyn IInferenceService>,
-}
-
-impl AgentInference {
-    pub fn new(service: Box<dyn IInferenceService>) -> Self {
-        Self { service }
-    }
 }
 
 pub enum AgentTools {
@@ -80,7 +70,7 @@ enum QueueItem {
 }
 
 pub struct Agent {
-    inference: AgentInference,
+    inference: Box<dyn IInferenceSession>,
     tools: Vec<AgentTools>,
     store: Option<AgentStore>,
     thread: AgentThread,
@@ -100,7 +90,7 @@ pub struct StreamingTranscript {
 }
 
 impl Agent {
-    pub fn new(inference: AgentInference, tools: Vec<AgentTools>) -> Self {
+    pub fn new(inference: Box<dyn IInferenceSession>, tools: Vec<AgentTools>) -> Self {
         Self::from_blocks(inference, tools, Vec::new())
     }
 
@@ -126,7 +116,7 @@ impl Agent {
     }
 
     pub async fn from_store(
-        inference: AgentInference,
+        inference: Box<dyn IInferenceSession>,
         tools: Vec<AgentTools>,
         store: AgentStore,
     ) -> Result<Self> {
@@ -379,7 +369,7 @@ impl Agent {
 
 impl Agent {
     fn from_blocks(
-        inference: AgentInference,
+        inference: Box<dyn IInferenceSession>,
         tools: Vec<AgentTools>,
         blocks: Vec<ItemBlock>,
     ) -> Self {
@@ -520,12 +510,6 @@ impl AgentStore {
             AgentStore::CborLog(log) => log.read_blocks().await,
             AgentStore::RedbLog(log) => log.read_blocks().await,
         }
-    }
-}
-
-impl AgentInference {
-    fn stream(&self, request: InferenceRequest) -> InferenceStream {
-        self.service.stream(request)
     }
 }
 

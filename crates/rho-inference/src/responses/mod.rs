@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::{StreamExt, stream};
-use rho_core::{IInferenceService, InferenceRequest, InferenceStream, InferenceUpdate, ToolSpec};
+use rho_core::{IInferenceSession, InferenceRequest, InferenceStream, InferenceUpdate, ToolSpec};
 
 pub(crate) mod oauth;
 mod session;
@@ -21,7 +21,6 @@ mod ws;
 
 pub use oauth::InferenceAuth;
 pub use session::InferenceService;
-pub(crate) use wire::ResponseState;
 use wire::ResponsesRequest;
 
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -61,7 +60,7 @@ impl InferenceService {
     }
 }
 
-impl IInferenceService for InferenceService {
+impl IInferenceSession for InferenceService {
     fn stream(&self, request: InferenceRequest) -> InferenceStream {
         InferenceService::stream(self, request)
     }

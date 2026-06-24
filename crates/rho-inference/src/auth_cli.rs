@@ -71,7 +71,7 @@ pub fn run_auth_cli(command: AuthArgs) -> Result<()> {
     }
 }
 
-pub(crate) fn file_path(name: impl AsRef<str>) -> io::Result<PathBuf> {
+fn file_path(name: impl AsRef<str>) -> io::Result<PathBuf> {
     Ok(OAuthFile::open_default(name)?.path())
 }
 

@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::oauth::{InferenceAuth, OAuthFile, ResolvedAuth, ResponsesOAuthCredentials};
-use super::wire::ResponsesRequest;
+use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{WebSocketPoolKey, WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 
