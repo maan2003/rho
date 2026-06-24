@@ -36,10 +36,10 @@ fn websocket_pool_key_requires_chatgpt_pool_and_prompt_cache_key() {
 async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
     let mut socket = PendingSocket::default();
     let mut last_event_at = tokio::time::Instant::now();
-    let mut ping_interval = Some(tokio::time::interval_at(
+    let mut ping_interval = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_millis(5),
         Duration::from_millis(5),
-    ));
+    );
 
     let error = next_ws_message(
         &mut socket,

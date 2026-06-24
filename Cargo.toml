@@ -1,7 +1,7 @@
 [workspace]
 members = [
   "crates/rho-blocking-notify-channel",
-  "crates/rho",
+  "crates/rho-core",
   "crates/rho-agent",
   "crates/rho-cli",
   "crates/rho-cli-term-raw",
@@ -34,7 +34,7 @@ futures = "0.3"
 futures-util = "0.3"
 redb = "4.1.0"
 rand = "0.8"
-rho-core = { path = "crates/rho" }
+rho-core = { path = "crates/rho-core" }
 rho-agent = { path = "crates/rho-agent" }
 rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
 rho-cli = { path = "crates/rho-cli" }

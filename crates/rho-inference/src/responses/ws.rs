@@ -156,10 +156,9 @@ impl WebSocketConnection {
         let mut completed = false;
         let event_timeout = Duration::from_secs(DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS);
         let mut last_event_at = tokio::time::Instant::now();
-        let mut ping_interval = (DEFAULT_WEBSOCKET_PING_INTERVAL_SECS > 0).then(|| {
-            let interval = Duration::from_secs(DEFAULT_WEBSOCKET_PING_INTERVAL_SECS);
-            tokio::time::interval_at(tokio::time::Instant::now() + interval, interval)
-        });
+        let ping = Duration::from_secs(DEFAULT_WEBSOCKET_PING_INTERVAL_SECS);
+        let mut ping_interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
         while let Some(message) = next_ws_message(
             &mut self.socket,
             event_timeout,
@@ -330,7 +329,7 @@ pub(crate) async fn next_ws_message<S>(
     socket: &mut S,
     event_timeout: Duration,
     last_event_at: &mut tokio::time::Instant,
-    ping_interval: &mut Option<tokio::time::Interval>,
+    ping_interval: &mut tokio::time::Interval,
 ) -> Result<Option<S::Item>>
 where
     S: futures_util::Stream<
@@ -343,32 +342,18 @@ where
         let deadline = *last_event_at + event_timeout;
         let timeout_sleep = tokio::time::sleep_until(deadline);
         tokio::pin!(timeout_sleep);
-        if let Some(ping_interval) = ping_interval.as_mut() {
-            tokio::select! {
-                _ = &mut timeout_sleep => {
-                    bail!("stream error: ws turn produced no events for {timeout_secs}s");
-                }
-                _ = ping_interval.tick() => {
-                    socket.send(WsMessage::Ping(Vec::new().into())).await?;
-                }
-                message = socket.next() => {
-                    if let Some(Ok(WsMessage::Text(_))) = message.as_ref() {
-                        *last_event_at = tokio::time::Instant::now();
-                    }
-                    return Ok(message);
-                }
+        tokio::select! {
+            _ = &mut timeout_sleep => {
+                bail!("stream error: ws turn produced no events for {timeout_secs}s");
             }
-        } else {
-            tokio::select! {
-                _ = &mut timeout_sleep => {
-                    bail!("stream error: ws turn produced no events for {timeout_secs}s");
+            _ = ping_interval.tick() => {
+                socket.send(WsMessage::Ping(Vec::new().into())).await?;
+            }
+            message = socket.next() => {
+                if let Some(Ok(WsMessage::Text(_))) = message.as_ref() {
+                    *last_event_at = tokio::time::Instant::now();
                 }
-                message = socket.next() => {
-                    if let Some(Ok(WsMessage::Text(_))) = message.as_ref() {
-                        *last_event_at = tokio::time::Instant::now();
-                    }
-                    return Ok(message);
-                }
+                return Ok(message);
             }
         }
     }
