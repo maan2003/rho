@@ -22,7 +22,7 @@ use rho_core::{
     InferenceUpdate, ItemBlock, ItemKind, ReasoningTextKind, Role, ToolCall, ToolResult,
     ToolResultStatus,
 };
-use rho_inference::InferenceService;
+use rho_inference::{AuthArgs, InferenceAuth, InferenceService, run_auth_cli};
 use rho_store_cbor::CborLog;
 use rho_tool_shell::ShellTools;
 use tokio::sync::Mutex as AsyncMutex;
@@ -32,7 +32,6 @@ use tokio::task::JoinHandle;
 mod tests;
 
 const DEFAULT_SESSION_NAME: &str = "default";
-const DEFAULT_AUTH_NAME: &str = "default";
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_AGENT_STEPS_PER_PROMPT: usize = 128;
 const DEFAULT_COMPACTION_THRESHOLD: u64 = 220_000;
@@ -54,118 +53,11 @@ async fn run(command: Command) -> Result<()> {
                 run_interactive(args).await
             }
         }
-        Command::Auth(auth) => run_auth(auth).await,
-    }
-}
-
-async fn run_auth(command: AuthCommand) -> Result<()> {
-    match command {
-        AuthCommand::Add => {
-            let name = prompt_with_default("Auth namespace", DEFAULT_AUTH_NAME)?;
-            let credentials_json = login_openai_codex()?;
-            println!(
-                "{}",
-                InferenceService::chatgpt_codex_auth_save_json(name.trim(), &credentials_json)?
-            );
-            Ok(())
-        }
-        AuthCommand::List => list_auth_credentials(),
-        AuthCommand::Remove { name } => {
-            let (path, deleted) = InferenceService::chatgpt_codex_auth_delete(name.trim())?;
-            if deleted {
-                println!("removed {}", path.display());
-            } else {
-                println!("missing {}", path.display());
-            }
-            Ok(())
-        }
-        AuthCommand::Path { name } => {
-            println!(
-                "{}",
-                InferenceService::chatgpt_codex_auth_file_path(name)?.display()
-            );
-            Ok(())
-        }
-        AuthCommand::Status { name } => {
-            println!(
-                "{}",
-                InferenceService::chatgpt_codex_auth_status_line(name)?
-            );
-            Ok(())
-        }
-        AuthCommand::Import { name, path } => {
-            let credentials_json = read_oauth_credentials_json(path)?;
-            println!(
-                "{}",
-                InferenceService::chatgpt_codex_auth_save_json(name, &credentials_json)?
-            );
+        Command::Auth(auth) => {
+            run_auth_cli(auth)?;
             Ok(())
         }
     }
-}
-
-fn login_openai_codex() -> Result<String> {
-    let (auth_url, expected_state, verifier) = InferenceService::chatgpt_codex_auth_login_url();
-
-    eprintln!();
-    eprintln!("Open this URL in your browser:");
-    eprintln!();
-    eprintln!("{auth_url}");
-    eprintln!("\x1b]8;;{auth_url}\x1b\\Or click here.\x1b]8;;\x1b\\");
-    eprintln!();
-    eprintln!("After logging in, copy the full redirect URL from the browser address bar.");
-    eprint!("Redirect URL: ");
-    io::stderr().flush()?;
-
-    let mut redirect_input = String::new();
-    io::stdin().read_line(&mut redirect_input)?;
-    eprintln!("Exchanging code for tokens...");
-    InferenceService::chatgpt_codex_exchange_redirect_url(
-        &redirect_input,
-        &expected_state,
-        &verifier,
-    )
-    .context("exchanging OAuth code")
-}
-
-fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
-    eprint!("{prompt} [{default}]: ");
-    io::stderr().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Ok(default.to_owned())
-    } else {
-        Ok(trimmed.to_owned())
-    }
-}
-
-fn read_oauth_credentials_json(path: Option<PathBuf>) -> Result<String> {
-    let text = match path {
-        Some(path) => std::fs::read_to_string(&path)
-            .with_context(|| format!("reading OAuth credentials from {}", path.display()))?,
-        None => {
-            let mut text = String::new();
-            std::io::Read::read_to_string(&mut io::stdin(), &mut text)?;
-            text
-        }
-    };
-    serde_json::from_str::<serde_json::Value>(&text).context("parsing OAuth credentials JSON")?;
-    Ok(text)
-}
-
-fn list_auth_credentials() -> Result<()> {
-    let credentials = InferenceService::chatgpt_codex_auth_list()
-        .context("reading auth credentials directory")?;
-    if credentials.is_empty() {
-        println!("No auth credentials configured.");
-        return Ok(());
-    }
-    for (name, status) in credentials {
-        println!("{name}\tchatgpt\t{status}");
-    }
-    Ok(())
 }
 
 async fn run_interactive(args: ChatArgs) -> Result<()> {
@@ -206,7 +98,7 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 }
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
-    let inference = AgentInference::Service(build_inference_service(args));
+    let inference = AgentInference::Service(build_inference_service(args)?);
     let tools = vec![AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT))];
     let mut agent = if args.no_store {
         Agent::new(inference, tools)
@@ -230,14 +122,14 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
     Ok(agent)
 }
 
-fn build_inference_service(args: &ChatArgs) -> InferenceService {
-    let mut session =
-        InferenceService::chatgpt_codex_with_auth_file(args.model.clone(), args.auth_file.clone())
-            .with_compaction_threshold(DEFAULT_COMPACTION_THRESHOLD);
+fn build_inference_service(args: &ChatArgs) -> Result<InferenceService> {
+    let auth = InferenceAuth::named(&args.auth)?;
+    let mut session = InferenceService::new(args.model.clone(), auth)
+        .with_compaction_threshold(DEFAULT_COMPACTION_THRESHOLD);
     if !args.no_store {
         session = session.with_prompt_cache_key(args.session.clone());
     }
-    session
+    Ok(session)
 }
 
 struct ChatApp {
@@ -757,7 +649,7 @@ struct Args {
 #[derive(Clone)]
 enum Command {
     Chat(ChatArgs),
-    Auth(AuthCommand),
+    Auth(AuthArgs),
 }
 
 #[derive(Parser)]
@@ -774,33 +666,7 @@ struct Cli {
 enum CliCommand {
     Auth {
         #[command(subcommand)]
-        command: AuthCommand,
-    },
-}
-
-#[derive(Clone, Subcommand)]
-enum AuthCommand {
-    Add,
-    #[command(alias = "ls")]
-    List,
-    #[command(alias = "delete")]
-    Remove {
-        #[arg(default_value = DEFAULT_AUTH_NAME)]
-        name: String,
-    },
-    Path {
-        #[arg(long, default_value = DEFAULT_AUTH_NAME)]
-        name: String,
-    },
-    Status {
-        #[arg(long, default_value = DEFAULT_AUTH_NAME)]
-        name: String,
-    },
-    Import {
-        #[arg(long, default_value = DEFAULT_AUTH_NAME)]
-        name: String,
-        #[arg(long = "file")]
-        path: Option<PathBuf>,
+        command: AuthArgs,
     },
 }
 
@@ -808,8 +674,8 @@ enum AuthCommand {
 struct ChatArgs {
     #[arg(long, default_value_t = InferenceService::DEFAULT_MODEL.to_owned())]
     model: String,
-    #[arg(long = "auth-file", default_value = DEFAULT_AUTH_NAME, value_parser = auth_file_arg)]
-    auth_file: PathBuf,
+    #[arg(long = "auth", default_value = "default")]
+    auth: String,
     #[arg(long, default_value = DEFAULT_SESSION_NAME)]
     session: String,
     #[arg(long = "session-path")]
@@ -861,14 +727,6 @@ impl ChatArgs {
             .join("rho")
             .join("sessions")
             .join(format!("{}.cbor", self.session)))
-    }
-}
-
-fn auth_file_arg(value: &str) -> std::result::Result<PathBuf, String> {
-    if value.contains('/') {
-        Ok(value.into())
-    } else {
-        InferenceService::chatgpt_codex_auth_file_path(value).map_err(|error| error.to_string())
     }
 }
 

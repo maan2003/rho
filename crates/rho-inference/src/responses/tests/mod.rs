@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use super::oauth::{OAuthFile, ResolvedAuth, ResponsesAuth, ResponsesOAuthCredentials};
+use super::oauth::{InferenceAuth, OAuthFile, ResolvedAuth, ResponsesOAuthCredentials};
 use super::wire::ResponsesRequest;
 use super::ws::{WebSocketPoolKey, WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
@@ -43,7 +43,7 @@ fn first_tool_call(response: &InferenceResponse) -> &ToolCall {
 fn test_oauth_file(
     access_token: &str,
     account_id: Option<&str>,
-) -> (tempfile::TempDir, ResponsesAuth) {
+) -> (tempfile::TempDir, InferenceAuth) {
     let temp = tempfile::tempdir().unwrap();
     let file = test_oauth_file_in(temp.path(), "chatgpt").unwrap();
     file.save(&ResponsesOAuthCredentials {
@@ -53,8 +53,13 @@ fn test_oauth_file(
         account_id: account_id.map(str::to_owned),
     })
     .unwrap();
-    let auth = ResponsesAuth::oauth_file(file.path());
+    let auth = InferenceAuth::oauth_file(file.path());
     (temp, auth)
+}
+
+fn test_inference_service(model: impl Into<String>) -> InferenceService {
+    let (_temp, auth) = test_oauth_file("token", None);
+    InferenceService::new(model, auth)
 }
 
 fn test_oauth_file_in(

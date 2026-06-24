@@ -8,18 +8,20 @@ module uses the OpenAI Responses WebSocket protocol.
 
 The public surface is intentionally small:
 
+- `InferenceAuth` selects the named auth credentials required for inference.
 - `InferenceService` configures inference access, prompt-cache/thread behavior,
-  compaction, ChatGPT/Codex auth-file selection, auth-file management helpers,
   and owns the WebSocket pool.
 - `InferenceService::stream` accepts a `rho_core::InferenceRequest` and returns
   an `InferenceStream` of `rho_core::InferenceUpdate` values ending in
   `InferenceUpdate::Finished`.
+- `auth_cli::AuthArgs` and `run_auth_cli` own the user-facing auth management
+  workflow for add/list/remove/path/status/import.
 - `rho_core::InferenceUpdate` is the provider-neutral streaming update contract
   consumed by `rho-agent` and UIs.
 - Raw OAuth helpers, credential DTOs, credential files, token refresh, and
   recorded-event parsers are internal implementation details. CLI and UI crates
-  should use the `InferenceService` facade instead of importing inference auth
-  plumbing directly.
+  should use `InferenceAuth` for inference and `run_auth_cli` for auth
+  management instead of importing inference auth plumbing directly.
 
 The crate should not own agent policy such as tool scheduling, retries beyond
 provider-chain replay, transcript persistence, terminal rendering, or CLI
@@ -33,9 +35,10 @@ configuration.
   production, and stale `previous_response_id` fallback.
 - `responses/session.rs` owns session configuration and shared WebSocket-pool state.
 - `responses/ws.rs` owns WebSocket request construction, connection checkout/release,
-  event-loop timeouts/pings, and pool keying.
+  WebSocket defaults, event-loop timeouts/pings, and pool keying.
 - `responses/oauth.rs` owns private credential files, OAuth token exchange/refresh,
-  account id extraction, and file locking behind the `InferenceService` facade.
+  account id extraction, and file locking.
+- `auth_cli.rs` owns the auth-management CLI workflow exposed by `run_auth_cli`.
 
 ## Request and replay model
 

@@ -37,10 +37,9 @@ fn oauth_file_saves_loads_and_resolves_credentials() {
     })
     .unwrap();
 
-    let auth = ResponsesAuth::oauth_file(file.path());
+    let auth = InferenceAuth::oauth_file(file.path());
     let resolved = auth
         .resolve_with_refresh(|_| panic!("should not refresh"))
-        .unwrap()
         .unwrap();
 
     assert_eq!(resolved.bearer_token, "access");
@@ -92,7 +91,7 @@ fn oauth_file_refreshes_expired_credentials_and_persists_them() {
     })
     .unwrap();
 
-    let auth = ResponsesAuth::oauth_file(file.path());
+    let auth = InferenceAuth::oauth_file(file.path());
     let resolved = auth
         .resolve_with_refresh(|refresh_token| {
             assert_eq!(refresh_token, "refresh");
@@ -103,7 +102,6 @@ fn oauth_file_refreshes_expired_credentials_and_persists_them() {
                 account_id: Some("new-account".to_owned()),
             })
         })
-        .unwrap()
         .unwrap();
 
     assert_eq!(resolved.bearer_token, "new");

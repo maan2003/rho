@@ -6,7 +6,9 @@ fn websocket_pool_key_requires_chatgpt_pool_and_prompt_cache_key() {
         bearer_token: "token".to_owned(),
         account_id: Some("acct".to_owned()),
     };
-    let session = InferenceService::new("gpt-test").with_prompt_cache_key("thread-1");
+    let (_temp, inference_auth) = test_oauth_file("token", None);
+    let session =
+        InferenceService::new("gpt-test", inference_auth).with_prompt_cache_key("thread-1");
     let mut body = ResponsesRequest::from_inference_request(
         &session,
         InferenceRequest {
@@ -20,14 +22,14 @@ fn websocket_pool_key_requires_chatgpt_pool_and_prompt_cache_key() {
         },
     );
 
-    let key = WebSocketPoolKey::from_request(&session, &body, Some(&auth)).unwrap();
+    let key = WebSocketPoolKey::from_request(&session, &body, &auth).unwrap();
 
     assert_eq!(key.base_url, DEFAULT_CHATGPT_BASE_URL);
     assert_eq!(key.account_id.as_deref(), Some("acct"));
     assert_eq!(key.thread_id.as_str(), "thread-1");
 
     body.prompt_cache_key = None;
-    assert!(WebSocketPoolKey::from_request(&session, &body, Some(&auth)).is_none());
+    assert!(WebSocketPoolKey::from_request(&session, &body, &auth).is_none());
 }
 
 #[tokio::test]
@@ -60,11 +62,11 @@ async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
 #[test]
 fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
     let (_temp, auth) = test_oauth_file("token", Some("acct_1"));
-    let mut session = InferenceService::chatgpt_codex_with_auth("gpt-test", auth);
+    let mut session = InferenceService::new("gpt-test", auth);
     session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
     let auth = session.auth.resolve().unwrap();
-    let request = build_ws_request(&session, Some("thread-1"), auth.as_ref()).unwrap();
+    let request = build_ws_request(&session, Some("thread-1"), &auth).unwrap();
 
     assert_eq!(
         request.uri(),
@@ -80,10 +82,10 @@ fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
 #[test]
 fn websocket_request_uses_oauth_bearer_without_account_header() {
     let (_temp, auth) = test_oauth_file("sk-test", None);
-    let session = InferenceService::chatgpt_codex_with_auth("gpt-test", auth);
+    let session = InferenceService::new("gpt-test", auth);
 
     let auth = session.auth.resolve().unwrap();
-    let request = build_ws_request(&session, None, auth.as_ref()).unwrap();
+    let request = build_ws_request(&session, None, &auth).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer sk-test");
     assert!(!request.headers().contains_key("chatgpt-account-id"));
@@ -100,14 +102,11 @@ fn websocket_request_uses_oauth_file_credentials() {
         account_id: Some("acct_file".to_owned()),
     })
     .unwrap();
-    let mut session = InferenceService::chatgpt_codex_with_auth(
-        "gpt-test",
-        ResponsesAuth::oauth_file(file.path()),
-    );
+    let mut session = InferenceService::new("gpt-test", InferenceAuth::oauth_file(file.path()));
     session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
     let auth = session.auth.resolve().unwrap();
-    let request = build_ws_request(&session, Some("thread-1"), auth.as_ref()).unwrap();
+    let request = build_ws_request(&session, Some("thread-1"), &auth).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer oauth-access");
     assert_eq!(request.headers()["chatgpt-account-id"], "acct_file");

@@ -15,12 +15,13 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use super::oauth::ResolvedAuth;
 use super::wire::ResponsesRequest;
-use super::{
-    DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS, DEFAULT_WEBSOCKET_PING_INTERVAL_SECS,
-    DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS, DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS,
-    DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS, InferenceService, InferenceUpdate, OPENAI_BETA_WS,
-    responses_url,
-};
+use super::{InferenceService, InferenceUpdate, OPENAI_BETA_WS, responses_url};
+
+const DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_WEBSOCKET_PING_INTERVAL_SECS: u64 = 25;
+const DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS: usize = 10;
+const DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS: u64 = 55 * 60;
+const DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS: u64 = 50;
 
 pub(crate) async fn send_websocket(
     session: &InferenceService,
@@ -31,12 +32,12 @@ pub(crate) async fn send_websocket(
 ) -> Result<()> {
     let auth = session.auth.clone();
     let resolved_auth = tokio::task::spawn_blocking(move || auth.resolve()).await??;
-    if let Some(key) = WebSocketPoolKey::from_request(session, &body, resolved_auth.as_ref()) {
+    if let Some(key) = WebSocketPoolKey::from_request(session, &body, &resolved_auth) {
         return send_pooled_websocket(
             session,
             websocket_pool,
             key,
-            resolved_auth.as_ref(),
+            &resolved_auth,
             body,
             tool_names,
             updates,
@@ -44,13 +45,9 @@ pub(crate) async fn send_websocket(
         .await;
     }
 
-    let request = build_ws_request(
-        session,
-        body.prompt_cache_key.as_deref(),
-        resolved_auth.as_ref(),
-    )?;
+    let request = build_ws_request(session, body.prompt_cache_key.as_deref(), &resolved_auth)?;
     let (socket, _response) = connect_async(request).await?;
-    let mut connection = WebSocketConnection::new(socket, resolved_auth.as_ref());
+    let mut connection = WebSocketConnection::new(socket, &resolved_auth);
     connection.run_turn(body, tool_names, updates).await
 }
 
@@ -58,7 +55,7 @@ async fn send_pooled_websocket(
     session: &InferenceService,
     websocket_pool: &Arc<Mutex<WebSocketPool>>,
     key: WebSocketPoolKey,
-    auth: Option<&ResolvedAuth>,
+    auth: &ResolvedAuth,
     body: ResponsesRequest,
     tool_names: &BTreeMap<String, String>,
     updates: &mpsc::UnboundedSender<Result<InferenceUpdate>>,
@@ -82,7 +79,7 @@ async fn checkout_websocket_pool(
     session: &InferenceService,
     websocket_pool: &Arc<Mutex<WebSocketPool>>,
     key: &WebSocketPoolKey,
-    auth: Option<&ResolvedAuth>,
+    auth: &ResolvedAuth,
 ) -> Result<WebSocketConnection> {
     loop {
         let checkout = {
@@ -125,17 +122,17 @@ async fn checkout_websocket_pool(
 struct WebSocketConnection {
     socket: WebSocket,
     opened_at: tokio::time::Instant,
-    bearer_token: Option<String>,
+    bearer_token: String,
 }
 
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 impl WebSocketConnection {
-    fn new(socket: WebSocket, auth: Option<&ResolvedAuth>) -> Self {
+    fn new(socket: WebSocket, auth: &ResolvedAuth) -> Self {
         Self {
             socket,
             opened_at: tokio::time::Instant::now(),
-            bearer_token: auth.map(|auth| auth.bearer_token.clone()),
+            bearer_token: auth.bearer_token.clone(),
         }
     }
 
@@ -230,7 +227,7 @@ impl WebSocketPoolKey {
     pub(crate) fn from_request(
         session: &InferenceService,
         body: &ResponsesRequest,
-        auth: Option<&ResolvedAuth>,
+        auth: &ResolvedAuth,
     ) -> Option<Self> {
         Some(Self::from_thread_id(
             session,
@@ -242,11 +239,11 @@ impl WebSocketPoolKey {
     fn from_thread_id(
         session: &InferenceService,
         thread_id: WebSocketThreadId,
-        auth: Option<&ResolvedAuth>,
+        auth: &ResolvedAuth,
     ) -> Self {
         Self {
             base_url: session.base_url.clone(),
-            account_id: auth.and_then(|auth| auth.account_id.clone()),
+            account_id: auth.account_id.clone(),
             thread_id,
         }
     }
@@ -270,7 +267,7 @@ impl WebSocketPool {
     fn checkout(
         &mut self,
         key: &WebSocketPoolKey,
-        auth: Option<&ResolvedAuth>,
+        auth: &ResolvedAuth,
         max_age: Duration,
     ) -> WebSocketPoolCheckout {
         if self.busy.contains(key) {
@@ -284,8 +281,7 @@ impl WebSocketPool {
         };
         self.remove_lru_key(key);
 
-        if connection.bearer_token != auth.map(|auth| auth.bearer_token.clone())
-            || connection.opened_at.elapsed() >= max_age
+        if connection.bearer_token != auth.bearer_token || connection.opened_at.elapsed() >= max_age
         {
             return WebSocketPoolCheckout::OpenNew;
         }
@@ -389,23 +385,21 @@ pub(crate) struct WsResponseCreate {
 pub(crate) fn build_ws_request(
     session: &InferenceService,
     thread_id: Option<&str>,
-    auth: Option<&ResolvedAuth>,
+    auth: &ResolvedAuth,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     let url = build_ws_url(session)?;
     let mut request = url.into_client_request()?;
     set_header(request.headers_mut(), "OpenAI-Beta", OPENAI_BETA_WS)?;
-    if let Some(auth) = auth {
-        set_header(
-            request.headers_mut(),
-            "Authorization",
-            &format!("Bearer {}", auth.bearer_token),
-        )?;
-    }
+    set_header(
+        request.headers_mut(),
+        "Authorization",
+        &format!("Bearer {}", auth.bearer_token),
+    )?;
     if let Some(thread_id) = thread_id {
         set_header(request.headers_mut(), "session-id", thread_id)?;
         set_header(request.headers_mut(), "thread-id", thread_id)?;
     }
-    if let Some(account_id) = auth.and_then(|auth| auth.account_id.as_deref()) {
+    if let Some(account_id) = auth.account_id.as_deref() {
         set_header(request.headers_mut(), "chatgpt-account-id", account_id)?;
     }
     Ok(request)

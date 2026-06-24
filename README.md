@@ -15,14 +15,15 @@ are local edits to crates, structs, enums, futures, and streams.
   results, reasoning text, opaque provider items, inference requests, streaming
   inference updates/responses, ids, usage, and token usage.
 - `rho-inference`: concrete inference provider integrations behind a
-  provider-neutral public API. Its current private implementation provides
-  WebSocket-only OpenAI Responses and ChatGPT/Codex inference support.
+  provider-neutral public API, plus the auth-management CLI workflow. Its
+  current private implementation provides WebSocket-only OpenAI Responses and
+  ChatGPT/Codex inference support.
 - `rho-agent`: an opinionated, forkable harness that owns queueing, retries,
   tool scheduling, persistence hooks, streamed transcript handling, and
   inference response block persistence.
 - `rho-cli`: an interactive terminal chat agent assembled from `rho-agent`, the
-  Responses inference service, shell/apply_patch tools, CBOR persistence, and copied
-  Tau terminal rendering building blocks.
+  inference service, shell/apply_patch tools, CBOR persistence, and copied Tau
+  terminal rendering building blocks.
 - `rho-cli-term-raw`, `rho-term-screen`, `rho-blocking-notify-channel`:
   terminal UI building blocks adapted from Tau for normal-buffer interactive
   rendering with streaming output.

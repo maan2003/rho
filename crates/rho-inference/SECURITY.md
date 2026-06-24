@@ -8,7 +8,7 @@ manages file-backed OAuth credentials.
 ## Runtime and trust boundaries
 
 - Callers provide `InferenceRequest`, tool specs, prompt-cache keys,
-  model/session configuration, and optional OAuth credential paths.
+  model/session configuration, and a named auth credential.
 - OpenAI OAuth/token endpoints and ChatGPT/Codex WebSocket messages are remote,
   semi-trusted inputs.
 - OAuth credential JSON files contain bearer and refresh tokens and must be
@@ -21,8 +21,8 @@ manages file-backed OAuth credentials.
 - Streaming uses Tokio tasks and a WebSocket pool protected by
   `tokio::sync::Mutex`.
 - WebSocket turns have an event-idle timeout and keepalive pings.
-- OAuth credential refresh is synchronous and is run from async paths with
-  `spawn_blocking`.
+- OAuth credential refresh is synchronous and is run from async inference paths
+  with `spawn_blocking`; auth-management commands are owned by `run_auth_cli`.
 - WebSocket pool entries are keyed by base URL, account id, and
   prompt-cache/thread id.
 

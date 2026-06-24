@@ -2,7 +2,7 @@
 mod tests;
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,14 +23,13 @@ const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const REFRESH_EXPIRY_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ResponsesAuth {
-    kind: ResponsesAuthKind,
+pub struct InferenceAuth {
+    kind: InferenceAuthKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ResponsesAuthKind {
-    None,
-    OAuthFile { path: PathBuf },
+enum InferenceAuthKind {
+    OAuthFile(OAuthFile),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -52,21 +51,19 @@ pub(crate) struct ResolvedAuth {
     pub(crate) account_id: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OAuthFile {
     path: PathBuf,
 }
 
-impl ResponsesAuth {
-    pub(crate) fn none() -> Self {
-        Self {
-            kind: ResponsesAuthKind::None,
-        }
+impl InferenceAuth {
+    pub fn named(name: impl AsRef<str>) -> io::Result<Self> {
+        Self::oauth_file_named(name)
     }
 
     pub(crate) fn oauth_file(path: impl Into<PathBuf>) -> Self {
         Self {
-            kind: ResponsesAuthKind::OAuthFile { path: path.into() },
+            kind: InferenceAuthKind::OAuthFile(OAuthFile::new(path)),
         }
     }
 
@@ -74,29 +71,29 @@ impl ResponsesAuth {
         Ok(Self::oauth_file(OAuthFile::open_default(name)?.path()))
     }
 
-    pub(crate) fn resolve(&self) -> io::Result<Option<ResolvedAuth>> {
+    pub(crate) fn resolve(&self) -> io::Result<ResolvedAuth> {
         self.resolve_with_refresh(openai_codex_refresh)
     }
 
     pub(crate) fn resolve_with_refresh(
         &self,
         refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
-    ) -> io::Result<Option<ResolvedAuth>> {
+    ) -> io::Result<ResolvedAuth> {
         match &self.kind {
-            ResponsesAuthKind::None => Ok(None),
-            ResponsesAuthKind::OAuthFile { path } => {
-                OAuthFile::new(path).resolve_with_refresh(refresh)
-            }
+            InferenceAuthKind::OAuthFile(file) => file.resolve_with_refresh(refresh),
         }
     }
 }
 
 impl ResponsesOAuthCredentials {
-    pub(crate) fn resolved(&self) -> Option<ResolvedAuth> {
+    pub(crate) fn resolved(&self) -> io::Result<ResolvedAuth> {
         if self.access_token.trim().is_empty() {
-            return None;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OAuth credentials are missing an access token",
+            ));
         }
-        Some(ResolvedAuth {
+        Ok(ResolvedAuth {
             bearer_token: self.access_token.clone(),
             account_id: self
                 .account_id
@@ -151,7 +148,7 @@ impl OAuthFile {
     }
 
     pub(crate) fn save(&self, credentials: &ResponsesOAuthCredentials) -> io::Result<()> {
-        self.with_lock(|locked| locked.save(credentials))
+        self.with_lock(|| self.write(credentials))
     }
 
     pub(crate) fn delete(&self) -> io::Result<bool> {
@@ -164,12 +161,42 @@ impl OAuthFile {
 
     pub(crate) fn resolve_with_refresh(
         &self,
-        refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
-    ) -> io::Result<Option<ResolvedAuth>> {
-        self.with_lock(|locked| locked.resolve_with_refresh(refresh))
+        mut refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
+    ) -> io::Result<ResolvedAuth> {
+        self.with_lock(|| {
+            let Some(current) = self.load()? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "OAuth credentials file is missing",
+                ));
+            };
+            if !oauth_token_should_refresh(&current.access_token, current.expires_at_ms)
+                || current.refresh_token.trim().is_empty()
+            {
+                return current.resolved();
+            }
+
+            let mut refreshed = refresh(&current.refresh_token)?;
+            if refreshed.account_id.is_none() {
+                refreshed.account_id = current.account_id;
+            }
+            self.write(&refreshed)?;
+            refreshed.resolved()
+        })
     }
 
-    fn with_lock<R>(&self, f: impl FnOnce(&LockedOAuthFile<'_>) -> io::Result<R>) -> io::Result<R> {
+    fn write(&self, credentials: &ResponsesOAuthCredentials) -> io::Result<()> {
+        let dir = self.path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no parent for OAuth auth path")
+        })?;
+        create_private_dir(dir)?;
+        let json = serde_json::to_string_pretty(credentials)?;
+        atomic_write_private(&self.path, json.as_bytes())
+    }
+
+    /// Runs `f` while holding an exclusive cross-process lock on the auth file,
+    /// so concurrent reads, refreshes, and writes stay serialized.
+    fn with_lock<R>(&self, f: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
         let lock_path = self.lock_path();
         let lock_dir = lock_path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "no parent for OAuth lock path")
@@ -182,58 +209,12 @@ impl OAuthFile {
             .truncate(false)
             .open(&lock_path)?;
         lock_file.lock()?;
-        let locked = LockedOAuthFile {
-            oauth_file: self,
-            lock_file,
-        };
-        let result = f(&locked);
-        let unlock_result = locked.lock_file.unlock();
+        let result = f();
+        let unlock_result = lock_file.unlock();
         match (result, unlock_result) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         }
-    }
-}
-
-struct LockedOAuthFile<'a> {
-    oauth_file: &'a OAuthFile,
-    lock_file: File,
-}
-
-impl LockedOAuthFile<'_> {
-    fn load(&self) -> io::Result<Option<ResponsesOAuthCredentials>> {
-        self.oauth_file.load()
-    }
-
-    fn save(&self, credentials: &ResponsesOAuthCredentials) -> io::Result<()> {
-        let path = &self.oauth_file.path;
-        let dir = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no parent for OAuth auth path")
-        })?;
-        create_private_dir(dir)?;
-        let json = serde_json::to_string_pretty(credentials)?;
-        atomic_write_private(path, json.as_bytes())
-    }
-
-    fn resolve_with_refresh(
-        &self,
-        mut refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
-    ) -> io::Result<Option<ResolvedAuth>> {
-        let Some(current) = self.load()? else {
-            return Ok(None);
-        };
-        if !oauth_token_should_refresh(&current.access_token, current.expires_at_ms)
-            || current.refresh_token.trim().is_empty()
-        {
-            return Ok(current.resolved());
-        }
-
-        let mut refreshed = refresh(&current.refresh_token)?;
-        if refreshed.account_id.is_none() {
-            refreshed.account_id = current.account_id;
-        }
-        self.save(&refreshed)?;
-        Ok(refreshed.resolved())
     }
 }
 

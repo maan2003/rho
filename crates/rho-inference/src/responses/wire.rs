@@ -130,9 +130,6 @@ impl ResponsesRequest {
         let prompt_cache_key = session.prompt_cache_key.clone();
         let previous_response_id = previous_response.map(|(id, _)| id);
         let active_compaction = session.compaction.as_ref();
-        if active_compaction.is_some() {
-            input.insert(0, json!({"type": "compaction_trigger"}));
-        }
         let context_management = active_compaction
             .map(|compaction| {
                 vec![ContextManagementRequest {

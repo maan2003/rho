@@ -1,5 +1,4 @@
 use std::io;
-use std::path::PathBuf;
 
 use rho_cli_term_raw::{CursorShape, Term};
 use rho_core::{InferenceResponse, InferenceUpdate, ToolCall, ToolCallId, ToolResult, ToolType};
@@ -9,7 +8,7 @@ use super::*;
 fn chat_args() -> ChatArgs {
     ChatArgs {
         model: "gpt-test".to_owned(),
-        auth_file: PathBuf::from("/tmp/rho-auth.json"),
+        auth: "default".to_owned(),
         session: DEFAULT_SESSION_NAME.to_owned(),
         session_path: None,
         prompt_stdin: false,
@@ -22,7 +21,7 @@ fn no_store_disables_inference_prompt_cache_key() {
     let mut args = chat_args();
     args.no_store = true;
 
-    let service = build_inference_service(&args);
+    let service = build_inference_service(&args).unwrap();
 
     assert!(service.prompt_cache_key().is_none());
 }
@@ -32,7 +31,7 @@ fn stored_sessions_use_session_name_as_inference_prompt_cache_key() {
     let mut args = chat_args();
     args.session = "work".to_owned();
 
-    let service = build_inference_service(&args);
+    let service = build_inference_service(&args).unwrap();
 
     assert_eq!(service.prompt_cache_key(), Some("work"));
 }

@@ -13,13 +13,14 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use rho_core::{InferenceRequest, InferenceUpdate, ToolSpec};
 
-mod oauth;
+pub(crate) mod oauth;
 mod session;
 #[cfg(test)]
 mod tests;
 mod wire;
 mod ws;
 
+pub use oauth::InferenceAuth;
 pub use session::InferenceService;
 pub(crate) use wire::ResponseState;
 use wire::ResponsesRequest;
@@ -27,11 +28,6 @@ use wire::ResponsesRequest;
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.5";
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
-pub(crate) const DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS: u64 = 120;
-pub(crate) const DEFAULT_WEBSOCKET_PING_INTERVAL_SECS: u64 = 25;
-pub(crate) const DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS: usize = 10;
-pub(crate) const DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS: u64 = 55 * 60;
-pub(crate) const DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS: u64 = 50;
 pub(crate) const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
 
 pub type InferenceStream = BoxStream<'static, Result<InferenceUpdate>>;
