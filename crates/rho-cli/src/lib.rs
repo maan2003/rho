@@ -63,7 +63,7 @@ async fn run(command: Command) -> Result<()> {
 async fn run_interactive(args: ChatArgs) -> Result<()> {
     let term = ChatTerm::new()?;
     let agent = build_agent(&args, Some(term.renderer())).await?;
-    term.print_history(agent.blocks());
+    term.print_history(&agent.blocks());
     let mut app = ChatApp {
         agent: Arc::new(AsyncMutex::new(agent)),
         running_turn: None,

@@ -117,7 +117,7 @@ async fn records_message_and_provider_response() {
     agent.step().await.unwrap();
 
     assert!(matches!(agent.state, AgentState::Idle));
-    assert_eq!(test_items(agent.blocks()).len(), 2);
+    assert_eq!(test_items(&agent.blocks()).len(), 2);
 }
 
 #[tokio::test]
@@ -130,7 +130,7 @@ async fn run_until_idle_drives_full_text_turn() {
 
     assert_eq!(steps, 2);
     assert!(agent.is_idle());
-    assert_eq!(test_items(agent.blocks()).len(), 2);
+    assert_eq!(test_items(&agent.blocks()).len(), 2);
 }
 
 #[tokio::test]
@@ -167,7 +167,7 @@ async fn cancel_current_turn_records_assistant_cancellation() {
 
     assert!(agent.is_idle());
     assert!(
-        matches!(test_items(agent.blocks()).last().map(|item| &item.kind), Some(ItemKind::Message(message)) if message.role == Role::Assistant && message.text_content() == "cancelled")
+        matches!(test_items(&agent.blocks()).last().map(|item| &item.kind), Some(ItemKind::Message(message)) if message.role == Role::Assistant && message.text_content() == "cancelled")
     );
 }
 
@@ -193,7 +193,7 @@ async fn cancel_current_turn_records_cancelled_tool_results() {
     agent.cancel_current_turn("cancelled").await.unwrap();
 
     assert!(agent.is_idle());
-    assert!(test_items(agent.blocks()).iter().any(|item| {
+    assert!(test_items(&agent.blocks()).iter().any(|item| {
         matches!(&item.kind, ItemKind::ToolResult(result) if matches!(&result.status, rho_core::ToolResultStatus::Cancelled { reason } if reason == "cancelled"))
     }));
 }
@@ -218,7 +218,7 @@ async fn idle_step_after_final_answer_does_not_call_provider_again() {
     agent.step().await.unwrap();
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(test_items(agent.blocks()).len(), 2);
+    assert_eq!(test_items(&agent.blocks()).len(), 2);
     assert!(matches!(agent.state, AgentState::Idle));
 }
 
@@ -433,14 +433,14 @@ async fn records_streamed_text_when_final_response_is_sparse() {
     agent.push_user_message("hello");
     agent.run_until_idle(4).await.unwrap();
 
-    assert!(test_items(agent.blocks()).iter().any(|item| {
+    assert!(test_items(&agent.blocks()).iter().any(|item| {
         matches!(
             &item.kind,
             ItemKind::Message(message)
                 if message.role == Role::Assistant && message.text_content() == "done"
         )
     }));
-    assert!(test_items(agent.blocks()).iter().any(|item| {
+    assert!(test_items(&agent.blocks()).iter().any(|item| {
         matches!(
             &item.kind,
             ItemKind::ReasoningText(reasoning)
@@ -466,7 +466,7 @@ async fn streamed_text_does_not_duplicate_final_response_items() {
     agent.push_user_message("hello");
     agent.run_until_idle(4).await.unwrap();
 
-    let assistant_messages = test_items(agent.blocks())
+    let assistant_messages = test_items(&agent.blocks())
         .into_iter()
         .filter(|item| {
             matches!(
@@ -533,7 +533,7 @@ async fn runs_tool_calls_through_agent_policy() {
     agent.step().await.unwrap();
 
     assert!(
-        test_items(agent.blocks())
+        test_items(&agent.blocks())
             .into_iter()
             .any(|item| matches!(&item.kind, ItemKind::ToolResult(_)))
     );
@@ -651,7 +651,7 @@ async fn routes_apply_patch_custom_tool_through_agent_policy() {
     agent.run_until_idle(6).await.unwrap();
 
     assert_eq!(std::fs::read_to_string(path).unwrap(), "patched\n");
-    assert!(test_items(agent.blocks()).iter().any(|item| {
+    assert!(test_items(&agent.blocks()).iter().any(|item| {
         matches!(
             &item.kind,
             ItemKind::ToolResult(result)
@@ -708,7 +708,7 @@ async fn waits_for_tool_calls_concurrently() {
         "tool calls were not scheduled concurrently: elapsed={elapsed:?}"
     );
     assert_eq!(
-        test_items(agent.blocks())
+        test_items(&agent.blocks())
             .into_iter()
             .filter(|item| matches!(&item.kind, ItemKind::ToolResult(_)))
             .count(),
@@ -749,9 +749,9 @@ async fn loads_transcript_items_from_cbor_log() {
         .await
         .unwrap();
 
-    assert_eq!(test_items(agent.blocks()).len(), 1);
+    assert_eq!(test_items(&agent.blocks()).len(), 1);
     assert!(
-        matches!(&test_items(agent.blocks())[0].kind, ItemKind::Message(message) if message.text_content() == "persisted")
+        matches!(&test_items(&agent.blocks())[0].kind, ItemKind::Message(message) if message.text_content() == "persisted")
     );
     let _ = tokio::fs::remove_file(&path).await;
 }

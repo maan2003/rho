@@ -21,9 +21,10 @@ use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use rho_tool_shell::ShellTools;
 
-mod thread;
+mod observable;
+mod invariants;
 
-use thread::AgentThread;
+use invariants::AgentInvariantsEnforcer;
 
 pub type ToolFuture = BoxFuture<'static, ToolResult>;
 type InferenceUpdateHandler = Box<dyn FnMut(InferenceUpdate) + Send>;
@@ -73,7 +74,7 @@ pub struct Agent {
     inference: Box<dyn IInferenceSession>,
     tools: Vec<AgentTools>,
     store: Option<AgentStore>,
-    thread: AgentThread,
+    invariants: AgentInvariantsEnforcer,
     queue: VecDeque<QueueItem>,
     pending_tool_results: Vec<ToolResult>,
     inference_updates: Option<InferenceUpdateHandler>,
@@ -124,8 +125,15 @@ impl Agent {
         Ok(Self::from_blocks(inference, tools, blocks).with_store(store))
     }
 
-    pub fn blocks(&self) -> &[ItemBlock] {
-        self.thread.blocks()
+    pub fn blocks(&self) -> Vec<ItemBlock> {
+        self.invariants.snapshot()
+    }
+
+    /// Current conversation history plus a receiver for every block appended
+    /// afterwards, taken atomically. Consumers (a UI) fold the stream to mirror
+    /// the conversation without polling.
+    pub fn subscribe(&self) -> (Vec<ItemBlock>, tokio::sync::broadcast::Receiver<ItemBlock>) {
+        self.invariants.subscribe()
     }
 
     pub fn is_idle(&self) -> bool {
@@ -237,13 +245,13 @@ impl Agent {
             recorded_local_work = true;
         }
 
-        if !recorded_local_work || self.thread.blocks().is_empty() {
+        if !recorded_local_work || self.invariants.is_empty() {
             return Ok(AgentState::Idle);
         }
 
         let streamed_transcript = StreamingTranscript::default();
         Ok(AgentState::ApiRequest {
-            stream: self.inference.stream(self.thread.inference_request()),
+            stream: self.inference.stream(self.invariants.inference_request()),
             streamed_transcript,
         })
     }
@@ -334,7 +342,7 @@ impl Agent {
         if let Some(store) = &self.store {
             store.append_block(&block).await?;
         }
-        self.thread.append_block(block);
+        self.invariants.append_block(block);
         Ok(())
     }
 
@@ -373,12 +381,12 @@ impl Agent {
         tools: Vec<AgentTools>,
         blocks: Vec<ItemBlock>,
     ) -> Self {
-        let thread = AgentThread::new(tool_specs(&tools), blocks);
+        let invariants = AgentInvariantsEnforcer::new(tool_specs(&tools), blocks);
         Self {
             inference,
             tools,
             store: None,
-            thread,
+            invariants,
             queue: VecDeque::new(),
             pending_tool_results: Vec::new(),
             inference_updates: None,
