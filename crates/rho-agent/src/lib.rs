@@ -19,6 +19,10 @@ use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use rho_tool_shell::ShellTools;
 
+mod thread;
+
+use thread::AgentThread;
+
 pub type ProviderStream = ResponsesStream;
 pub type ToolFuture = BoxFuture<'static, ToolResult>;
 type ProviderUpdateHandler = Box<dyn FnMut(ResponsesUpdate) + Send>;
@@ -76,7 +80,7 @@ pub struct Agent {
     provider: AgentProvider,
     tools: Vec<AgentTools>,
     store: Option<AgentStore>,
-    blocks: Vec<ItemBlock>,
+    thread: AgentThread,
     queue: VecDeque<QueueItem>,
     pending_tool_results: Vec<ToolResult>,
     provider_updates: Option<ProviderUpdateHandler>,
@@ -99,7 +103,7 @@ impl Agent {
             provider,
             tools: Vec::new(),
             store: None,
-            blocks: Vec::new(),
+            thread: AgentThread::default(),
             queue: VecDeque::new(),
             pending_tool_results: Vec::new(),
             provider_updates: None,
@@ -111,6 +115,7 @@ impl Agent {
 
     pub fn with_tool(mut self, tool: AgentTools) -> Self {
         self.tools.push(tool);
+        self.thread.replace_tools(self.tool_specs());
         self
     }
 
@@ -150,17 +155,11 @@ impl Agent {
     }
 
     pub fn items(&self) -> Vec<Item> {
-        self.blocks
-            .iter()
-            .flat_map(|block| match block {
-                ItemBlock::Local { items } | ItemBlock::ProviderResponse { items, .. } => items,
-            })
-            .cloned()
-            .collect()
+        self.thread.items()
     }
 
     pub fn blocks(&self) -> &[ItemBlock] {
-        &self.blocks
+        self.thread.blocks()
     }
 
     pub fn is_idle(&self) -> bool {
@@ -272,18 +271,13 @@ impl Agent {
             recorded_local_work = true;
         }
 
-        if !recorded_local_work || self.blocks.is_empty() {
+        if !recorded_local_work || self.thread.is_empty() {
             return Ok(AgentState::Idle);
         }
 
-        let request = ProviderRequest {
-            input: self.blocks.clone(),
-            tools: self.tools.iter().flat_map(AgentTools::specs).collect(),
-        };
-
         let streamed_transcript = StreamingTranscript::default();
         Ok(AgentState::ApiRequest {
-            stream: self.provider.stream(request),
+            stream: self.provider.stream(self.thread.provider_request()),
             streamed_transcript,
         })
     }
@@ -374,7 +368,7 @@ impl Agent {
         if let Some(store) = &self.store {
             store.append_block(&block).await?;
         }
-        self.blocks.push(block);
+        self.thread.append_block(block);
         Ok(())
     }
 
@@ -410,23 +404,21 @@ impl Agent {
         self.next_id += 1;
         rho::ItemId(format!("item-{id}"))
     }
+
+    fn tool_specs(&self) -> Vec<rho::ToolSpec> {
+        self.tools.iter().flat_map(AgentTools::specs).collect()
+    }
 }
 
 impl Agent {
     fn from_blocks(provider: AgentProvider, blocks: Vec<ItemBlock>) -> Self {
-        let next_id = blocks
-            .iter()
-            .map(|block| match block {
-                ItemBlock::Local { items } | ItemBlock::ProviderResponse { items, .. } => {
-                    items.len()
-                }
-            })
-            .sum::<usize>() as u64;
+        let thread = AgentThread::from_blocks(blocks);
+        let next_id = thread.next_item_index();
         Self {
             provider,
             tools: Vec::new(),
             store: None,
-            blocks,
+            thread,
             queue: VecDeque::new(),
             pending_tool_results: Vec::new(),
             provider_updates: None,

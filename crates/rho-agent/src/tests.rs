@@ -255,7 +255,7 @@ async fn records_provider_response_block() {
     agent.run_until_idle(4).await.unwrap();
 
     assert!(matches!(
-        agent.blocks[1],
+        agent.blocks()[1],
         ItemBlock::ProviderResponse { .. }
     ));
 }
@@ -700,7 +700,7 @@ async fn persists_transcript_items_to_cbor_log() {
     agent.step().await.unwrap();
 
     let persisted = log.read_blocks().await.unwrap();
-    assert_eq!(persisted, agent.blocks);
+    assert_eq!(persisted, agent.blocks());
     let _ = tokio::fs::remove_file(&path).await;
 }
 
@@ -739,14 +739,14 @@ async fn persists_and_loads_transcript_items_from_redb_log() {
     agent.run_until_idle(4).await.unwrap();
 
     let persisted = log.read_blocks().await.unwrap();
-    assert_eq!(persisted, agent.blocks);
+    assert_eq!(persisted, agent.blocks());
 
     let provider = test_provider(|_request| async { Ok(text_response("unused")) }.boxed());
     let loaded = Agent::from_store(provider, AgentStore::RedbLog(log))
         .await
         .unwrap();
 
-    assert_eq!(loaded.blocks, persisted);
+    assert_eq!(loaded.blocks(), persisted);
 }
 
 #[tokio::test]
