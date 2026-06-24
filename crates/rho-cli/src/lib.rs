@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rho_agent::{Agent, AgentStore, AgentTools, AgentUpdate};
+use rho_agent::{Agent, AgentStatus, AgentStore, AgentTools, AgentUpdate};
 use rho_cli_term_raw::{
     Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
@@ -25,7 +25,6 @@ use rho_core::{
 use rho_inference::{AuthArgs, InferenceAuth, InferenceSession, run_auth_cli};
 use rho_store_cbor::CborLog;
 use rho_tool_shell::ShellTools;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
@@ -33,7 +32,6 @@ mod tests;
 
 const DEFAULT_SESSION_NAME: &str = "default";
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_AGENT_STEPS_PER_PROMPT: usize = 128;
 const DEFAULT_COMPACTION_THRESHOLD: u64 = 220_000;
 
 pub fn main() -> Result<()> {
@@ -65,7 +63,7 @@ async fn run_interactive(args: ChatArgs) -> Result<()> {
     let agent = build_agent(&args, Some(term.renderer())).await?;
     term.print_history(&agent.blocks());
     let mut app = ChatApp {
-        agent: Arc::new(AsyncMutex::new(agent)),
+        agent,
         running_turn: None,
         term,
     };
@@ -81,9 +79,9 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 
     let renderer = PlainRenderer::default();
     let output = renderer.output();
-    let mut agent = build_agent(&args, Some(output)).await?;
-    agent.push_user_message(prompt);
-    agent.run_until_idle(MAX_AGENT_STEPS_PER_PROMPT).await?;
+    let agent = build_agent(&args, Some(output)).await?;
+    agent.send(prompt);
+    wait_idle(&agent).await;
 
     let text = renderer.finish();
     if !text.is_empty() {
@@ -100,22 +98,28 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
     let inference = Box::new(build_inference_session(args)?);
     let tools = vec![AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT))];
-    let mut agent = if args.no_store {
-        Agent::new(inference, tools)
-    } else {
+    let mut builder = Agent::builder(inference, tools);
+    if !args.no_store {
         let store = AgentStore::CborLog(CborLog::new(args.session_path()?));
-        Agent::from_store(inference, tools, store).await?
-    };
+        builder = builder.with_store_loaded(store).await?;
+    }
+    let agent = builder.spawn();
     if let Some(renderer) = renderer {
+        let (_, mut inference_updates) = agent.subscribe_inference_updates();
         let inference_renderer = Arc::clone(&renderer);
-        agent = agent.with_inference_updates(move |update| {
-            if let Ok(mut renderer) = inference_renderer.lock() {
-                renderer.handle_inference(update);
+        tokio::spawn(async move {
+            while let Ok(update) = inference_updates.recv().await {
+                if let Ok(mut renderer) = inference_renderer.lock() {
+                    renderer.handle_inference(update);
+                }
             }
         });
-        agent = agent.with_agent_updates(move |update| {
-            if let Ok(mut renderer) = renderer.lock() {
-                renderer.handle_agent(update);
+        let (_, mut agent_updates) = agent.subscribe_agent_updates();
+        tokio::spawn(async move {
+            while let Ok(update) = agent_updates.recv().await {
+                if let Ok(mut renderer) = renderer.lock() {
+                    renderer.handle_agent(update);
+                }
             }
         });
     }
@@ -133,7 +137,7 @@ fn build_inference_session(args: &ChatArgs) -> Result<InferenceSession> {
 }
 
 struct ChatApp {
-    agent: Arc<AsyncMutex<Agent>>,
+    agent: Agent,
     running_turn: Option<JoinHandle<()>>,
     term: ChatTerm,
 }
@@ -159,9 +163,9 @@ impl ChatApp {
                     }
                     self.term.print_user(&line);
                     self.term.set_status("running");
-                    self.running_turn = Some(spawn_agent_turn(
-                        Arc::clone(&self.agent),
-                        line,
+                    self.agent.send(line);
+                    self.running_turn = Some(spawn_turn_watcher(
+                        self.agent.clone(),
                         self.term.renderer(),
                         self.term.handle.clone(),
                     ));
@@ -216,18 +220,10 @@ impl ChatApp {
             self.term.set_status("/quit");
             return;
         }
-        handle.abort();
+        // Ask the agent loop to interrupt; the spawned `send` task records the
+        // cancellation, flushes its rendering, and then completes.
+        self.agent.cancel();
         let _ = handle.await;
-        if let Err(error) = self
-            .agent
-            .lock()
-            .await
-            .cancel_current_turn("cancelled")
-            .await
-        {
-            self.term.print_error(&error.to_string());
-        }
-        self.term.renderer_lock().finish_turn();
         if print_cancelled {
             self.term.print_system("cancelled");
         }
@@ -235,23 +231,30 @@ impl ChatApp {
     }
 }
 
-fn spawn_agent_turn(
-    agent: Arc<AsyncMutex<Agent>>,
-    line: String,
+async fn wait_idle(agent: &Agent) {
+    let (_, mut changes) = agent.subscribe_status();
+    let mut saw_running = false;
+    while let Ok(status) = changes.recv().await {
+        match status {
+            AgentStatus::Running => saw_running = true,
+            AgentStatus::Idle if saw_running => return,
+            AgentStatus::Idle => {}
+        }
+    }
+}
+
+/// Watch the already-started turn: when the agent goes idle, flush the
+/// renderer and reset the status. The turn's outcome (including any error)
+/// lands in the conversation, so there is nothing to return.
+fn spawn_turn_watcher(
+    agent: Agent,
     renderer: UpdateRenderer,
     handle: TermHandle,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let result = {
-            let mut agent = agent.lock().await;
-            agent.push_user_message(line);
-            agent.run_until_idle(MAX_AGENT_STEPS_PER_PROMPT).await
-        };
+        wait_idle(&agent).await;
         if let Ok(mut renderer) = renderer.lock() {
             renderer.finish_turn();
-        }
-        if let Err(error) = result {
-            print_error_on_handle(&handle, &error.to_string());
         }
         set_status_on_handle(&handle, "/quit");
     })
@@ -283,10 +286,6 @@ impl ChatTerm {
         Arc::clone(&self.renderer)
     }
 
-    fn renderer_lock(&self) -> std::sync::MutexGuard<'_, StreamingRenderer> {
-        self.renderer.lock().expect("renderer lock")
-    }
-
     fn print_user(&self, text: &str) {
         self.handle.print_output(
             "user",
@@ -300,10 +299,6 @@ impl ChatTerm {
 
     fn print_system(&self, text: &str) {
         print_system_on_handle(&self.handle, text);
-    }
-
-    fn print_error(&self, text: &str) {
-        print_error_on_handle(&self.handle, text);
     }
 
     fn print_history(&self, blocks: &[ItemBlock]) {
@@ -370,17 +365,6 @@ fn print_system_on_handle(handle: &TermHandle, text: &str) {
             text.to_owned(),
             Style::default().fg(Color::DarkGrey),
         )))
-        .margin_left(1),
-    );
-}
-
-fn print_error_on_handle(handle: &TermHandle, text: &str) {
-    handle.print_output(
-        "error",
-        StyledBlock::new(StyledText::from(vec![
-            Span::new("error\n", Style::default().fg(Color::DarkRed).bold()),
-            Span::plain(text.to_owned()),
-        ]))
         .margin_left(1),
     );
 }

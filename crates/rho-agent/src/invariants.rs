@@ -44,10 +44,6 @@ impl AgentInvariantsEnforcer {
         self.blocks.snapshot()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.blocks.read().is_empty()
-    }
-
     /// Current history plus a receiver for every later appended block, taken
     /// atomically so a follower misses nothing and double-counts nothing.
     pub(crate) fn subscribe(&self) -> (Vec<ItemBlock>, broadcast::Receiver<ItemBlock>) {

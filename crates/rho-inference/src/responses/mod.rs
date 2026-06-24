@@ -6,11 +6,10 @@
 //! fork should own those runtime policies.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use anyhow::Result;
-use futures::{StreamExt, stream};
-use rho_core::{IInferenceSession, InferenceRequest, InferenceStream, InferenceUpdate, ToolSpec};
+use futures::future::BoxFuture;
+use rho_core::{IInferenceSession, InferenceRequest, InferenceUpdate, ToolSpec};
 
 pub(crate) mod oauth;
 mod session;
@@ -21,7 +20,6 @@ mod ws;
 
 pub use oauth::InferenceAuth;
 pub use session::InferenceSession;
-use wire::ResponsesRequest;
 
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.5";
@@ -40,51 +38,17 @@ fn responses_url(base_url: &str) -> String {
     format!("{}/codex/responses", base_url.trim_end_matches('/'))
 }
 
-impl InferenceSession {
-    pub fn stream(&self, request: InferenceRequest) -> InferenceStream {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let session = self.clone();
-        let connection = Arc::clone(&self.connection);
-        tokio::spawn(async move {
-            if let Err(error) =
-                stream_inference_request(session, connection, request, &sender).await
-            {
-                let _ = sender.send(Err(error));
-            }
-        });
-
-        stream::unfold(receiver, |mut receiver| async {
-            receiver.recv().await.map(|item| (item, receiver))
-        })
-        .boxed()
-    }
-}
-
 impl IInferenceSession for InferenceSession {
-    fn stream(&self, request: InferenceRequest) -> InferenceStream {
-        InferenceSession::stream(self, request)
+    fn request(&mut self, request: InferenceRequest) {
+        InferenceSession::request(self, request);
     }
-}
 
-async fn stream_inference_request(
-    session: InferenceSession,
-    connection: Arc<tokio::sync::Mutex<Option<ws::WebSocketConnection>>>,
-    request: InferenceRequest,
-    updates: &tokio::sync::mpsc::UnboundedSender<Result<InferenceUpdate>>,
-) -> Result<()> {
-    let tool_names = tool_name_map(&request.tools);
-    let responses_request = ResponsesRequest::from_inference_request(&session, request.clone());
-    match ws::send_websocket(&session, &connection, responses_request, &tool_names, updates).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if let Some(replay_request) =
-                stale_previous_response_replay_request(&session, &request, &error)
-            {
-                ws::send_websocket(&session, &connection, replay_request, &tool_names, updates).await
-            } else {
-                Err(error)
-            }
-        }
+    fn run(&mut self) -> BoxFuture<'_, Result<InferenceUpdate>> {
+        Box::pin(InferenceSession::run(self))
+    }
+
+    fn abort(&mut self) {
+        InferenceSession::abort(self);
     }
 }
 
@@ -115,24 +79,6 @@ fn encode_tool_name(name: &str) -> String {
             }
         })
         .collect()
-}
-
-fn stale_previous_response_replay_request(
-    session: &InferenceSession,
-    request: &InferenceRequest,
-    error: &anyhow::Error,
-) -> Option<ResponsesRequest> {
-    if !is_stale_previous_response_error(error) {
-        return None;
-    }
-
-    let sliced = ResponsesRequest::from_inference_request(session, request.clone());
-    sliced.previous_response_id.as_ref()?;
-
-    Some(ResponsesRequest::from_inference_request_full_replay(
-        session,
-        request.clone(),
-    ))
 }
 
 fn is_stale_previous_response_error(error: &anyhow::Error) -> bool {

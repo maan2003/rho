@@ -11,7 +11,7 @@ async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
 
     let error = next_ws_message(
         &mut socket,
-        Duration::from_millis(25),
+        Some(Duration::from_millis(25)),
         &mut last_event_at,
         &mut ping_interval,
     )

@@ -1,164 +1,95 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderMap;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::oauth::ResolvedAuth;
-use super::wire::{ResponseState, ResponsesRequest};
-use super::{InferenceSession, InferenceUpdate, OPENAI_BETA_WS, responses_url};
+use super::wire::ResponsesRequest;
+use super::{InferenceSession, OPENAI_BETA_WS, responses_url};
 
-const DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS: u64 = 120;
-const DEFAULT_WEBSOCKET_PING_INTERVAL_SECS: u64 = 25;
+/// How long an active turn may go without any provider event before we treat
+/// the socket as wedged and fail the turn. Not applied while idle.
+pub(crate) const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
+const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// Margin under the server's ~60-minute hard cap: a connection this old is
 /// reopened before sending, so a turn never dies mid-stream from the server
 /// closing an aged socket.
-const MAX_CONNECTION_AGE: Duration = Duration::from_secs(55 * 60);
-
-/// Run one turn on the session's warm socket, reusing it when still valid and
-/// reopening otherwise.
-///
-/// The session owns a single connection behind an async `Mutex`, so the guard
-/// is held for the whole turn: a session runs its turns sequentially, and a
-/// rare concurrent turn on the same session serializes here instead of opening
-/// a duplicate socket. A failed turn drops the socket so the next turn starts
-/// clean.
-pub(crate) async fn send_websocket(
-    session: &InferenceSession,
-    connection: &Arc<Mutex<Option<WebSocketConnection>>>,
-    body: ResponsesRequest,
-    tool_names: &BTreeMap<String, String>,
-    updates: &mpsc::UnboundedSender<Result<InferenceUpdate>>,
-) -> Result<()> {
-    let auth = session.auth.clone();
-    let resolved_auth = tokio::task::spawn_blocking(move || auth.resolve()).await??;
-
-    let mut slot = connection.lock().await;
-    // Reuse the warm socket unless OAuth rotated the bearer or it is nearing the
-    // server's age cap; otherwise open a fresh one in place.
-    let reusable = slot.as_ref().is_some_and(|connection| {
-        connection.bearer_token == resolved_auth.bearer_token
-            && connection.opened_at.elapsed() < MAX_CONNECTION_AGE
-    });
-    if !reusable {
-        let request = build_ws_request(session, body.prompt_cache_key.as_deref(), &resolved_auth)?;
-        let (socket, _response) = connect_async(request).await?;
-        *slot = Some(WebSocketConnection::new(socket, &resolved_auth));
-    }
-
-    let connection = slot.as_mut().expect("connection present after refresh");
-    match connection.run_turn(body, tool_names, updates).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // The socket is in an unknown state after a failed turn; drop it so
-            // the next turn reconnects.
-            *slot = None;
-            Err(error)
-        }
-    }
-}
-
-pub(crate) struct WebSocketConnection {
-    socket: WebSocket,
-    opened_at: tokio::time::Instant,
-    bearer_token: String,
-}
+pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(55 * 60);
 
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// One live WebSocket to the Responses endpoint, kept warm across turns. The
+/// keepalive ping timer and the last-event clock live here so they persist
+/// across the many short `run` calls that drive a single turn.
+pub(crate) struct WebSocketConnection {
+    socket: WebSocket,
+    pub(crate) opened_at: tokio::time::Instant,
+    pub(crate) bearer_token: String,
+    ping_interval: tokio::time::Interval,
+    last_event_at: tokio::time::Instant,
+}
+
 impl WebSocketConnection {
-    fn new(socket: WebSocket, auth: &ResolvedAuth) -> Self {
+    pub(crate) fn new(socket: WebSocket, auth: &ResolvedAuth) -> Self {
+        let now = tokio::time::Instant::now();
         Self {
             socket,
-            opened_at: tokio::time::Instant::now(),
+            opened_at: now,
             bearer_token: auth.bearer_token.clone(),
+            ping_interval: tokio::time::interval_at(now + PING_INTERVAL, PING_INTERVAL),
+            last_event_at: now,
         }
     }
 
-    async fn run_turn(
+    /// Read the next frame, sending a keepalive ping if the ping timer fires
+    /// first. `event_timeout` bounds the wait only while a turn is active;
+    /// pass `None` when idle so a quiet socket is not treated as wedged.
+    pub(crate) async fn next_message(
         &mut self,
-        body: ResponsesRequest,
-        tool_names: &BTreeMap<String, String>,
-        updates: &mpsc::UnboundedSender<Result<InferenceUpdate>>,
-    ) -> Result<()> {
-        self.socket
-            .send(WsMessage::Text(
-                serde_json::to_string(&WsResponseCreate {
-                    ty: "response.create",
-                    body,
-                })?
-                .into(),
-            ))
-            .await?;
-
-        let mut state = ResponseState::with_tool_names(tool_names.clone());
-        let mut completed = false;
-        let event_timeout = Duration::from_secs(DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS);
-        let mut last_event_at = tokio::time::Instant::now();
-        let ping = Duration::from_secs(DEFAULT_WEBSOCKET_PING_INTERVAL_SECS);
-        let mut ping_interval = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
-        while let Some(message) = next_ws_message(
+        event_timeout: Option<Duration>,
+    ) -> Result<Option<WsMessage>> {
+        next_ws_message(
             &mut self.socket,
             event_timeout,
-            &mut last_event_at,
-            &mut ping_interval,
+            &mut self.last_event_at,
+            &mut self.ping_interval,
         )
-        .await?
-        {
-            match message? {
-                WsMessage::Text(text) => {
-                    let event: Value = match serde_json::from_str(text.as_ref()) {
-                        Ok(event) => event,
-                        Err(_) => continue,
-                    };
-                    let (done, event_updates) = state.apply_event(&event)?;
-                    for update in event_updates {
-                        let _ = updates.send(Ok(update));
-                    }
-                    if done {
-                        completed = true;
-                        break;
-                    }
-                }
-                WsMessage::Close(frame) => {
-                    bail!(
-                        "stream error: websocket closed mid-stream ({})",
-                        frame
-                            .map(|frame| format!("code={} reason={}", frame.code, frame.reason))
-                            .unwrap_or_else(|| "no close frame".to_owned())
-                    );
-                }
-                WsMessage::Ping(payload) => {
-                    self.socket.send(WsMessage::Pong(payload)).await?;
-                }
-                WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {}
-            }
-        }
+        .await
+    }
 
-        if !completed {
-            bail!("stream error: websocket ended before response.completed");
-        }
-        let response = state.finish();
-        let _ = updates.send(Ok(InferenceUpdate::Finished(response)));
+    /// Send a `response.create` envelope and reset the event clock so the first
+    /// event of the new turn is timed from now, not from the previous turn.
+    pub(crate) async fn send_envelope(&mut self, body: ResponsesRequest) -> Result<()> {
+        let text = serde_json::to_string(&WsResponseCreate {
+            ty: "response.create",
+            body,
+        })?;
+        self.socket.send(WsMessage::Text(text.into())).await?;
+        self.last_event_at = tokio::time::Instant::now();
+        Ok(())
+    }
+
+    pub(crate) async fn pong(
+        &mut self,
+        payload: tokio_tungstenite::tungstenite::Bytes,
+    ) -> Result<()> {
+        self.socket.send(WsMessage::Pong(payload)).await?;
         Ok(())
     }
 }
 
 pub(crate) async fn next_ws_message<S>(
     socket: &mut S,
-    event_timeout: Duration,
+    event_timeout: Option<Duration>,
     last_event_at: &mut tokio::time::Instant,
     ping_interval: &mut tokio::time::Interval,
-) -> Result<Option<S::Item>>
+) -> Result<Option<WsMessage>>
 where
     S: futures_util::Stream<
             Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
@@ -166,13 +97,18 @@ where
         + Unpin,
 {
     loop {
-        let timeout_secs = event_timeout.as_secs();
-        let deadline = *last_event_at + event_timeout;
-        let timeout_sleep = tokio::time::sleep_until(deadline);
+        let deadline = event_timeout.map(|timeout| *last_event_at + timeout);
+        let timeout_sleep = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::pin!(timeout_sleep);
         tokio::select! {
             _ = &mut timeout_sleep => {
-                bail!("stream error: ws turn produced no events for {timeout_secs}s");
+                let secs = event_timeout.map(|t| t.as_secs()).unwrap_or_default();
+                bail!("stream error: ws turn produced no events for {secs}s");
             }
             _ = ping_interval.tick() => {
                 socket.send(WsMessage::Ping(Vec::new().into())).await?;
@@ -181,7 +117,7 @@ where
                 if let Some(Ok(WsMessage::Text(_))) = message.as_ref() {
                     *last_event_at = tokio::time::Instant::now();
                 }
-                return Ok(message);
+                return Ok(message.transpose()?);
             }
         }
     }

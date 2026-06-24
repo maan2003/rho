@@ -3,37 +3,56 @@
 //! This crate deliberately owns the state/inference/tool policy for one
 //! simple workflow. Users who need different behavior should patch this code or
 //! fork the crate while keeping the lower crates reusable.
+//!
+//! The agent runs as an in-process actor. A spawned loop owns the inference
+//! session, tools, and store outright and drives turns. That loop is a single
+//! `select!` whose arms — incoming commands, the inference session's `run`, and
+//! tool completion — are the agent's whole event surface ("a distributed
+//! `select!`"). Because the inference session's `run` is always one of those
+//! arms, the connection stays warm whether or not a turn is in flight, with no
+//! separate keepalive machinery.
+//!
+//! Callers hold a cheap [`Agent`] handle: they send work in over a command
+//! channel and observe the conversation out through an append-only history
+//! subscription plus an idle/running [`AgentStatus`] watch. Nothing reaches
+//! into the loop's state; the shared, readable things are history and status,
+//! both behind observables.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow, bail};
-use futures::StreamExt;
-use futures::future::{BoxFuture, FutureExt, join_all};
+use anyhow::{Result, anyhow};
+use futures::future::{BoxFuture, FutureExt};
+use futures::stream::{FuturesUnordered, StreamExt};
 use rho_core::{
-    IInferenceSession, InferenceResponse, InferenceStream, InferenceUpdate, Item, ItemBlock,
-    ItemKind, Message, MessagePhase, ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult,
-    ToolSpec,
+    IInferenceSession, InferenceUpdate, Item, ItemBlock, ItemKind, Message, MessagePhase, Role,
+    ToolCall, ToolResult, ToolSpec,
 };
 use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use rho_tool_shell::ShellTools;
+use tokio::sync::{broadcast, mpsc};
 
-mod observable;
 mod invariants;
+mod observable;
 
 use invariants::AgentInvariantsEnforcer;
+use observable::Observable;
 
 pub type ToolFuture = BoxFuture<'static, ToolResult>;
-type InferenceUpdateHandler = Box<dyn FnMut(InferenceUpdate) + Send>;
-type AgentUpdateHandler = Arc<Mutex<Box<dyn FnMut(AgentUpdate) + Send>>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentUpdate {
     ToolCallStarted(ToolCall),
     ToolCallFinished(ToolResult),
+}
+
+/// Whether the agent is between turns or driving one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentStatus {
+    Idle,
+    Running,
 }
 
 pub enum AgentTools {
@@ -46,85 +65,40 @@ pub enum AgentStore {
     RedbLog(RedbLog),
 }
 
-#[derive(Default)]
-pub enum AgentState {
-    #[default]
-    Idle,
-    ApiRequest {
-        streamed_transcript: StreamingTranscript,
-        stream: InferenceStream,
-    },
-    WaitingForTools {
-        futures: Vec<PendingToolCall>,
-        results: Vec<ToolResult>,
-    },
+/// Work sent from a handle into the agent loop.
+enum Command {
+    /// Add a user message and run a turn. Completion is observed through the
+    /// status watch, not signalled back per-command.
+    UserMessage { content: String },
+    /// Interrupt the running turn, if any.
+    Cancel,
 }
 
-pub struct PendingToolCall {
-    pub call: ToolCall,
-    pub future: ToolFuture,
-}
-
-#[derive(Debug)]
-enum QueueItem {
-    UserMessage(Message),
-}
-
+/// A cheap, cloneable handle to a running agent.
+///
+/// Commands go in over a channel; the conversation comes out through
+/// [`Agent::subscribe`] and turn boundaries through the [`AgentStatus`] watch.
+/// The loop keeps running until every handle is dropped.
+#[derive(Clone)]
 pub struct Agent {
-    inference: Box<dyn IInferenceSession>,
-    tools: Vec<AgentTools>,
-    store: Option<AgentStore>,
+    commands: mpsc::UnboundedSender<Command>,
     invariants: AgentInvariantsEnforcer,
-    queue: VecDeque<QueueItem>,
-    pending_tool_results: Vec<ToolResult>,
-    inference_updates: Option<InferenceUpdateHandler>,
-    agent_updates: Option<AgentUpdateHandler>,
-    pub state: AgentState,
-}
-
-#[doc(hidden)]
-#[derive(Default)]
-pub struct StreamingTranscript {
-    output_items: BTreeMap<usize, ItemKind>,
-    text_by_output_index: BTreeMap<usize, String>,
-    reasoning_by_output_index: BTreeMap<(usize, ReasoningTextKind), String>,
+    status: Observable<AgentStatus, AgentStatus>,
+    inference_updates: Observable<(), InferenceUpdate>,
+    agent_updates: Observable<(), AgentUpdate>,
 }
 
 impl Agent {
-    pub fn new(inference: Box<dyn IInferenceSession>, tools: Vec<AgentTools>) -> Self {
-        Self::from_blocks(inference, tools, Vec::new())
+    pub fn builder(inference: Box<dyn IInferenceSession>, tools: Vec<AgentTools>) -> AgentBuilder {
+        AgentBuilder {
+            inference,
+            tools,
+            store: None,
+            store_blocks: None,
+        }
     }
 
-    pub fn with_store(mut self, store: AgentStore) -> Self {
-        self.store = Some(store);
-        self
-    }
-
-    pub fn with_inference_updates(
-        mut self,
-        on_update: impl FnMut(InferenceUpdate) + Send + 'static,
-    ) -> Self {
-        self.inference_updates = Some(Box::new(on_update));
-        self
-    }
-
-    pub fn with_agent_updates(
-        mut self,
-        on_update: impl FnMut(AgentUpdate) + Send + 'static,
-    ) -> Self {
-        self.agent_updates = Some(Arc::new(Mutex::new(Box::new(on_update))));
-        self
-    }
-
-    pub async fn from_store(
-        inference: Box<dyn IInferenceSession>,
-        tools: Vec<AgentTools>,
-        store: AgentStore,
-    ) -> Result<Self> {
-        let blocks = store.read_blocks().await?;
-        Ok(Self::from_blocks(inference, tools, blocks).with_store(store))
-    }
-
+    /// The conversation so far.
     pub fn blocks(&self) -> Vec<ItemBlock> {
         self.invariants.snapshot()
     }
@@ -132,159 +106,253 @@ impl Agent {
     /// Current conversation history plus a receiver for every block appended
     /// afterwards, taken atomically. Consumers (a UI) fold the stream to mirror
     /// the conversation without polling.
-    pub fn subscribe(&self) -> (Vec<ItemBlock>, tokio::sync::broadcast::Receiver<ItemBlock>) {
+    pub fn subscribe(&self) -> (Vec<ItemBlock>, broadcast::Receiver<ItemBlock>) {
         self.invariants.subscribe()
     }
 
-    pub fn is_idle(&self) -> bool {
-        matches!(self.state, AgentState::Idle)
-            && self.queue.is_empty()
-            && self.pending_tool_results.is_empty()
+    pub fn subscribe_status(&self) -> (AgentStatus, broadcast::Receiver<AgentStatus>) {
+        self.status.subscribe()
     }
 
-    pub fn push_user_message(&mut self, content: impl Into<String>) {
-        self.queue
-            .push_back(QueueItem::UserMessage(Message::text(Role::User, content)));
+    pub fn subscribe_inference_updates(&self) -> ((), broadcast::Receiver<InferenceUpdate>) {
+        self.inference_updates.subscribe()
     }
 
-    pub async fn cancel_current_turn(&mut self, reason: impl Into<String>) -> Result<()> {
-        let reason = reason.into();
-        let state = std::mem::take(&mut self.state);
-        if let AgentState::WaitingForTools { futures, .. } = state {
-            let results = futures
-                .into_iter()
-                .map(|pending| {
-                    let mut result = ToolResult::cancelled(pending.call.id, reason.clone());
-                    result.tool_type = pending.call.tool_type;
-                    result
-                })
-                .collect::<Vec<_>>();
-            if !results.is_empty() {
-                let block = self.tool_results_to_block(results);
-                self.record_block(block).await?;
-            }
+    pub fn subscribe_agent_updates(&self) -> ((), broadcast::Receiver<AgentUpdate>) {
+        self.agent_updates.subscribe()
+    }
+
+    /// Add a user message and start a turn. Returns immediately: observe
+    /// progress through the history and status watches; errors surface in the
+    /// conversation.
+    pub fn send(&self, content: impl Into<String>) {
+        let _ = self.commands.send(Command::UserMessage {
+            content: content.into(),
+        });
+    }
+
+    /// Ask the loop to interrupt the running turn.
+    pub fn cancel(&self) {
+        let _ = self.commands.send(Command::Cancel);
+    }
+}
+
+pub struct AgentBuilder {
+    inference: Box<dyn IInferenceSession>,
+    tools: Vec<AgentTools>,
+    store: Option<AgentStore>,
+    store_blocks: Option<Vec<ItemBlock>>,
+}
+
+impl AgentBuilder {
+    pub fn with_store(mut self, store: AgentStore) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Load existing history from `store` and keep writing to it.
+    pub async fn with_store_loaded(mut self, store: AgentStore) -> Result<Self> {
+        self.store_blocks = Some(store.read_blocks().await?);
+        self.store = Some(store);
+        Ok(self)
+    }
+
+    /// Spawn the agent loop and return a handle to it.
+    pub fn spawn(self) -> Agent {
+        let invariants = AgentInvariantsEnforcer::new(
+            tool_specs(&self.tools),
+            self.store_blocks.unwrap_or_default(),
+        );
+        let status = Observable::new(AgentStatus::Idle);
+        let inference_updates = Observable::new(());
+        let agent_updates = Observable::new(());
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let loop_state = AgentLoop {
+            inference: self.inference,
+            tools: self.tools,
+            store: self.store,
+            invariants: invariants.clone(),
+            status: status.clone(),
+            inference_updates: inference_updates.clone(),
+            agent_updates: agent_updates.clone(),
+            active: None,
+        };
+        tokio::spawn(run(loop_state, command_rx));
+        Agent {
+            commands,
+            invariants,
+            status,
+            inference_updates,
+            agent_updates,
         }
-        self.queue.clear();
-        self.pending_tool_results.clear();
-        let id = alloc_item_id();
-        self.record_block(ItemBlock::Local {
-            items: vec![Item {
-                id,
-                kind: ItemKind::Message(
-                    Message::text(Role::Assistant, reason).with_phase(MessagePhase::FinalAnswer),
-                ),
-            }],
-        })
-        .await
     }
+}
 
-    pub async fn run_until_idle(&mut self, max_steps: usize) -> Result<usize> {
-        for steps in 0..max_steps {
-            if self.is_idle() {
-                return Ok(steps);
-            }
-            self.step().await?;
-        }
+/// The loop-owned half of the agent: it owns the inference session, tools, and
+/// store, and is the only thing that mutates history.
+struct AgentLoop {
+    inference: Box<dyn IInferenceSession>,
+    tools: Vec<AgentTools>,
+    store: Option<AgentStore>,
+    invariants: AgentInvariantsEnforcer,
+    status: Observable<AgentStatus, AgentStatus>,
+    inference_updates: Observable<(), InferenceUpdate>,
+    agent_updates: Observable<(), AgentUpdate>,
+    active: Option<ActiveTurn>,
+}
 
-        if self.is_idle() {
-            Ok(max_steps)
-        } else {
-            bail!("agent did not become idle within {max_steps} steps")
-        }
-    }
+/// State for the turn currently in flight.
+struct ActiveTurn {
+    /// The tools requested by the last response, running concurrently. Empty
+    /// while waiting on inference rather than tools.
+    tools: FuturesUnordered<ToolFuture>,
+}
 
-    pub async fn step(&mut self) -> Result<()> {
-        let state = std::mem::take(&mut self.state);
-
-        self.state = match state {
-            AgentState::Idle => self.start_next_request().await?,
-            AgentState::ApiRequest {
-                mut streamed_transcript,
-                mut stream,
-            } => loop {
-                match stream.next().await {
-                    Some(Ok(update)) => {
-                        streamed_transcript.record(&update);
-                        notify_inference_update(&mut self.inference_updates, update.clone());
-                        if let InferenceUpdate::Finished(response) = update {
-                            break self
-                                .finish_inference_request(response, streamed_transcript)
-                                .await?;
-                        }
+/// The agent's event loop: one `select!` over incoming commands, inference
+/// updates, and tool completion. The inference `run` arm is always present, so
+/// the connection is kept warm whether the agent is streaming a response,
+/// running tools, or idle.
+async fn run(mut agent: AgentLoop, mut commands: mpsc::UnboundedReceiver<Command>) {
+    loop {
+        let tools_running = agent.tools_running();
+        tokio::select! {
+            // Prefer draining inference progress before handling a command, so a
+            // cancel always sees a consistent, fully-recorded turn state. This
+            // can't starve commands: between network events `run` pends, which
+            // lets the command arm fire.
+            biased;
+            update = agent.inference.run() => {
+                let update = match update {
+                    Ok(update) => update,
+                    Err(error) => {
+                        agent.finish_with_error(error).await;
+                        continue;
                     }
-                    Some(Err(error)) => return Err(error),
-                    None => bail!("inference stream ended before final response"),
+                };
+                if agent.active.is_none() {
+                    continue;
+                }
+                agent.inference_updates.update(|()| update.clone());
+
+                let InferenceUpdate::Finished(response) = update else {
+                    continue;
+                };
+
+                let provider_response_id = response.provider_response_id.clone();
+                let tool_calls = response
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ItemKind::ToolCall(call) => Some(call.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let items = response
+                    .items
+                    .into_iter()
+                    .map(|kind| Item {
+                        id: alloc_item_id(),
+                        kind,
+                    })
+                    .collect::<Vec<_>>();
+                agent.record_block(ItemBlock::InferenceResponse {
+                    provider_response_id,
+                    items,
+                }).await;
+                if tool_calls.is_empty() {
+                    agent.finish_turn();
+                    continue;
+                }
+                match agent.tool_futures(tool_calls) {
+                    Ok(futures) => {
+                        agent.active.as_mut().unwrap().tools = futures;
+                    }
+                    Err(error) => agent.finish_with_error(error).await,
                 }
             },
-            AgentState::WaitingForTools {
-                futures,
-                mut results,
-            } => {
-                results.extend(join_all(futures.into_iter().map(|pending| pending.future)).await);
-                self.push_tool_results(results);
-                self.start_next_request().await?
+            command = commands.recv() => match command {
+                Some(Command::UserMessage { content }) => {
+                    // A handle gates concurrent sends; ignore a stray one rather than
+                    // disturbing the running turn.
+                    if agent.active.is_some() {
+                        return;
+                    }
+                    agent.status.set(AgentStatus::Running);
+                    agent.append_user_message(content).await;
+                    agent.inference.request(agent.invariants.inference_request());
+                    agent.active = Some(ActiveTurn { tools: FuturesUnordered::new() });
+                }
+                Some(Command::Cancel) => {
+                    if agent.active.is_some() {
+                        agent.inference.abort();
+                        agent.cancel().await;
+                        agent.finish_turn();
+                    }
+                }
+                None => break,
+            },
+            result = async {
+                agent.active.as_mut().unwrap().tools.next().await
+            }, if tools_running => {
+                let Some(result) = result else {
+                    continue;
+                };
+                let block = agent.tool_results_to_block(vec![result]);
+                agent.record_block(block).await;
+                if agent.active.as_ref().is_some_and(|active| active.tools.is_empty()) {
+                    agent.inference.request(agent.invariants.inference_request());
+                }
             }
+        }
+    }
+}
+
+impl AgentLoop {
+    fn tools_running(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| !active.tools.is_empty())
+    }
+
+    fn finish_turn(&mut self) {
+        if self.active.take().is_some() {
+            self.status.set(AgentStatus::Idle);
+        }
+    }
+
+    /// End the turn after a fatal inference/tool error by recording it as a
+    /// final assistant message — the same shape as a cancellation, so the error
+    /// is visible in the conversation rather than swallowed.
+    async fn finish_with_error(&mut self, error: anyhow::Error) {
+        if self.active.is_some() {
+            self.record_block(ItemBlock::Local {
+                items: vec![Item {
+                    id: alloc_item_id(),
+                    kind: ItemKind::Message(
+                        // review: we can't add Assistant role messages ourselves! this must be an
+                        // invariant
+                        Message::text(Role::Assistant, error.to_string())
+                            .with_phase(MessagePhase::FinalAnswer),
+                    ),
+                }],
+            })
+            .await;
+            self.finish_turn();
+        }
+    }
+
+    async fn append_user_message(&mut self, content: String) {
+        let block = ItemBlock::Local {
+            items: vec![Item {
+                id: alloc_item_id(),
+                kind: ItemKind::Message(Message::text(Role::User, content)),
+            }],
         };
-
-        Ok(())
+        self.record_block(block).await;
     }
 
-    async fn start_next_request(&mut self) -> Result<AgentState> {
-        let mut recorded_local_work = false;
-
-        if !self.pending_tool_results.is_empty() {
-            let results = std::mem::take(&mut self.pending_tool_results);
-            let block = self.tool_results_to_block(results);
-            self.record_block(block).await?;
-            recorded_local_work = true;
-        }
-
-        while let Some(item) = self.queue.pop_front() {
-            let block = self.queue_item_to_block(item);
-            self.record_block(block).await?;
-            recorded_local_work = true;
-        }
-
-        if !recorded_local_work || self.invariants.is_empty() {
-            return Ok(AgentState::Idle);
-        }
-
-        let streamed_transcript = StreamingTranscript::default();
-        Ok(AgentState::ApiRequest {
-            stream: self.inference.stream(self.invariants.inference_request()),
-            streamed_transcript,
-        })
-    }
-
-    async fn finish_inference_request(
-        &mut self,
-        mut response: InferenceResponse,
-        streamed_transcript: StreamingTranscript,
-    ) -> Result<AgentState> {
-        streamed_transcript.supplement_response(&mut response);
-        let provider_response_id = response.provider_response_id.clone();
-
-        let tool_calls = response
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                ItemKind::ToolCall(call) => Some(call.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        let response_items = response
-            .items
-            .into_iter()
-            .map(|kind| {
-                let id = alloc_item_id();
-                Item { id, kind }
-            })
-            .collect::<Vec<_>>();
-        self.record_provider_response_block(response_items, provider_response_id.clone())
-            .await?;
-
-        let futures = tool_calls
+    fn tool_futures(&self, tool_calls: Vec<ToolCall>) -> Result<FuturesUnordered<ToolFuture>> {
+        tool_calls
             .into_iter()
             .map(|call| {
                 let future = self
@@ -294,106 +362,73 @@ impl Agent {
                     .ok_or_else(|| anyhow!("no tool registered for {}", call.name))
                     .map(|tool| tool.call(call.clone()))?;
                 let agent_updates = self.agent_updates.clone();
-                let pending_call = call.clone();
-                let future = async move {
-                    notify_agent_update(&agent_updates, AgentUpdate::ToolCallStarted(call));
+                Ok(async move {
+                    agent_updates.update(|()| AgentUpdate::ToolCallStarted(call));
                     let result = future.await;
-                    notify_agent_update(
-                        &agent_updates,
-                        AgentUpdate::ToolCallFinished(result.clone()),
-                    );
+                    agent_updates.update(|()| AgentUpdate::ToolCallFinished(result.clone()));
                     result
                 }
-                .boxed();
-                Ok(PendingToolCall {
-                    call: pending_call,
-                    future,
-                })
+                .boxed())
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect()
+    }
 
-        if futures.is_empty() {
-            Ok(AgentState::Idle)
-        } else {
-            Ok(AgentState::WaitingForTools {
-                futures,
-                results: Vec::new(),
-            })
+    /// Record cancelled results for any tool calls still awaiting them.
+    async fn cancel(&mut self) {
+        let pending = unanswered_tool_calls(&self.invariants.snapshot());
+        if !pending.is_empty() {
+            let results = pending
+                .into_iter()
+                .map(|call| {
+                    let mut result = ToolResult::cancelled(call.id, "cancelled");
+                    result.tool_type = call.tool_type;
+                    result
+                })
+                .collect::<Vec<_>>();
+            let block = self.tool_results_to_block(results);
+            self.record_block(block).await;
         }
     }
 
-    fn push_tool_results(&mut self, results: Vec<ToolResult>) {
-        self.pending_tool_results.extend(results);
-    }
-
-    async fn record_provider_response_block(
-        &mut self,
-        items: Vec<Item>,
-        provider_response_id: Option<String>,
-    ) -> Result<()> {
-        self.record_block(ItemBlock::InferenceResponse {
-            provider_response_id,
-            items,
-        })
-        .await
-    }
-
-    async fn record_block(&mut self, block: ItemBlock) -> Result<()> {
+    async fn record_block(&mut self, block: ItemBlock) {
         if let Some(store) = &self.store {
-            store.append_block(&block).await?;
+            store.append_block(&block).await;
         }
         self.invariants.append_block(block);
-        Ok(())
     }
 
-    fn queue_item_to_block(&mut self, item: QueueItem) -> ItemBlock {
-        match item {
-            QueueItem::UserMessage(message) => {
-                let id = alloc_item_id();
-                ItemBlock::Local {
-                    items: vec![Item {
-                        id,
-                        kind: ItemKind::Message(message),
-                    }],
-                }
-            }
-        }
-    }
-
-    fn tool_results_to_block(&mut self, results: Vec<ToolResult>) -> ItemBlock {
+    fn tool_results_to_block(&self, results: Vec<ToolResult>) -> ItemBlock {
         let items = results
             .into_iter()
-            .map(|result| {
-                let id = alloc_item_id();
-                Item {
-                    id,
-                    kind: ItemKind::ToolResult(result),
-                }
+            .map(|result| Item {
+                id: alloc_item_id(),
+                kind: ItemKind::ToolResult(result),
             })
             .collect();
         ItemBlock::Local { items }
     }
 }
 
-impl Agent {
-    fn from_blocks(
-        inference: Box<dyn IInferenceSession>,
-        tools: Vec<AgentTools>,
-        blocks: Vec<ItemBlock>,
-    ) -> Self {
-        let invariants = AgentInvariantsEnforcer::new(tool_specs(&tools), blocks);
-        Self {
-            inference,
-            tools,
-            store: None,
-            invariants,
-            queue: VecDeque::new(),
-            pending_tool_results: Vec::new(),
-            inference_updates: None,
-            agent_updates: None,
-            state: AgentState::Idle,
+/// Tool calls in `blocks` that have no matching tool result yet.
+fn unanswered_tool_calls(blocks: &[ItemBlock]) -> Vec<ToolCall> {
+    let mut answered = HashSet::new();
+    for item in block_items(blocks) {
+        if let ItemKind::ToolResult(result) = &item.kind {
+            answered.insert(result.call_id.clone());
         }
     }
+    block_items(blocks)
+        .filter_map(|item| match &item.kind {
+            ItemKind::ToolCall(call) if !answered.contains(&call.id) => Some(call.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn block_items(blocks: &[ItemBlock]) -> impl Iterator<Item = &Item> {
+    blocks.iter().flat_map(|block| match block {
+        ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
+    })
 }
 
 static NEXT_ITEM_ID: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
@@ -414,103 +449,16 @@ fn tool_specs(tools: &[AgentTools]) -> Vec<ToolSpec> {
     tools.iter().flat_map(AgentTools::specs).collect()
 }
 
-fn notify_agent_update(handler: &Option<AgentUpdateHandler>, update: AgentUpdate) {
-    if let Some(handler) = handler {
-        let mut on_update = handler.lock().expect("agent update lock");
-        on_update(update);
-    }
-}
-
-fn notify_inference_update(handler: &mut Option<InferenceUpdateHandler>, update: InferenceUpdate) {
-    if let Some(handler) = handler {
-        handler(update);
-    }
-}
-
-impl StreamingTranscript {
-    fn record(&mut self, update: &InferenceUpdate) {
-        match update {
-            InferenceUpdate::TextDelta { output_index, text } => {
-                self.text_by_output_index
-                    .entry(*output_index)
-                    .or_default()
-                    .push_str(text);
-            }
-            InferenceUpdate::ReasoningTextDelta {
-                output_index,
-                kind,
-                text,
-            } => {
-                self.reasoning_by_output_index
-                    .entry((*output_index, *kind))
-                    .or_default()
-                    .push_str(text);
-            }
-            InferenceUpdate::ToolCall { output_index, call } => {
-                self.output_items
-                    .insert(*output_index, ItemKind::ToolCall(call.clone()));
-            }
-            InferenceUpdate::OutputItem { output_index, item } => {
-                self.output_items.insert(*output_index, item.clone());
-            }
-            InferenceUpdate::CompactionStarted { .. }
-            | InferenceUpdate::Usage(_)
-            | InferenceUpdate::ResponseId(_)
-            | InferenceUpdate::Finished(_) => {}
-        }
-    }
-
-    fn supplement_response(&self, response: &mut InferenceResponse) {
-        let mut streamed_items = self.output_items.clone();
-        for (output_index, text) in &self.text_by_output_index {
-            streamed_items
-                .entry(*output_index)
-                .or_insert_with(|| ItemKind::Message(Message::text(Role::Assistant, text.clone())));
-        }
-        for ((output_index, kind), text) in &self.reasoning_by_output_index {
-            streamed_items.entry(*output_index).or_insert_with(|| {
-                ItemKind::ReasoningText(ReasoningText {
-                    kind: *kind,
-                    text: text.clone(),
-                })
-            });
-        }
-
-        for item in streamed_items.into_values() {
-            if !response
-                .items
-                .iter()
-                .any(|existing| same_item(existing, &item))
-            {
-                response.items.push(item);
-            }
-        }
-    }
-}
-
-fn same_item(left: &ItemKind, right: &ItemKind) -> bool {
-    match (left, right) {
-        (ItemKind::Message(left), ItemKind::Message(right)) => {
-            left.role == right.role
-                && left.text_content() == right.text_content()
-                && left.phase == right.phase
-        }
-        (ItemKind::ReasoningText(left), ItemKind::ReasoningText(right)) => left == right,
-        (ItemKind::ToolCall(left), ItemKind::ToolCall(right)) => left.id == right.id,
-        (ItemKind::ToolResult(left), ItemKind::ToolResult(right)) => left.call_id == right.call_id,
-        (ItemKind::ProviderItem(left), ItemKind::ProviderItem(right)) => {
-            left.kind == right.kind && left.payload == right.payload
-        }
-        _ => false,
-    }
-}
-
 impl AgentStore {
-    async fn append_block(&self, block: &ItemBlock) -> Result<()> {
-        match self {
+    /// Append a block, panicking on a store failure: a write failure here means
+    /// the on-disk transcript is broken, which the agent cannot meaningfully
+    /// recover from mid-turn.
+    async fn append_block(&self, block: &ItemBlock) {
+        let result = match self {
             AgentStore::CborLog(log) => log.append_block(block).await,
             AgentStore::RedbLog(log) => log.append_block(block).await,
-        }
+        };
+        result.expect("agent store append failed");
     }
 
     async fn read_blocks(&self) -> Result<Vec<ItemBlock>> {

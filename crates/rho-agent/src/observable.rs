@@ -10,8 +10,8 @@
 //! A follower needs the current state *and* every later change, with nothing
 //! lost in between and nothing delivered twice. One invariant guarantees that:
 //!
-//! * the writer mutates the state **and** broadcasts the event while holding the
-//!   write lock;
+//! * the writer mutates the state **and** broadcasts the event while holding
+//!   the write lock;
 //! * a subscriber clones the snapshot **and** opens its receiver while holding
 //!   the read lock.
 //!
@@ -48,10 +48,10 @@ impl<T, Event: Clone> Observable<T, Event> {
         }
     }
 
-    /// Mutate the value and broadcast the change `f` describes. The mutation and
-    /// the broadcast happen under the same write lock, so a subscriber can never
-    /// observe one without the other. A send error just means there are no live
-    /// subscribers.
+    /// Mutate the value and broadcast the change `f` describes. The mutation
+    /// and the broadcast happen under the same write lock, so a subscriber
+    /// can never observe one without the other. A send error just means
+    /// there are no live subscribers.
     pub(crate) fn update(&self, f: impl FnOnce(&mut T) -> Event) {
         let mut value = self.write();
         let event = f(&mut value);
@@ -81,6 +81,17 @@ impl<T: Clone, Event: Clone> Observable<T, Event> {
         let value = self.read();
         let receiver = self.events.subscribe();
         (value.clone(), receiver)
+    }
+}
+
+impl<T: Clone> Observable<T, T> {
+    /// Replace the value, broadcasting the new value as the change. The
+    /// "value is also the event" shape used for a latest-wins status.
+    pub(crate) fn set(&self, value: T) {
+        self.update(|slot| {
+            *slot = value.clone();
+            value
+        });
     }
 }
 

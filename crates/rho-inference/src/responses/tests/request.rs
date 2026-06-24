@@ -269,37 +269,28 @@ fn stale_previous_response_error_builds_full_replay_request() {
     assert_eq!(sliced["previous_response_id"], "resp_1");
     assert_eq!(sliced["input"].as_array().unwrap().len(), 1);
 
-    let replay = stale_previous_response_replay_request(
+    // A stale-`previous_response` error is recognized, and the full replay drops
+    // `previous_response_id` and forwards the whole history.
+    assert!(is_stale_previous_response_error(&anyhow::anyhow!(
+        "stream error: previous_response_id expired"
+    )));
+    let replay = serde_json::to_value(ResponsesRequest::from_inference_request_full_replay(
         &test_inference_service("gpt-test"),
-        &request,
-        &anyhow::anyhow!("stream error: previous_response_id expired"),
-    )
-    .expect("stale error should build replay");
-    let replay = serde_json::to_value(replay).unwrap();
-
+        request,
+    ))
+    .unwrap();
     assert!(replay.get("previous_response_id").is_none());
     assert_eq!(replay["input"].as_array().unwrap().len(), 3);
 }
 
 #[test]
-fn non_stale_previous_response_error_does_not_build_replay_request() {
-    let request = InferenceRequest {
-        input: vec![ItemBlock::Local {
-            items: vec![Item {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
-
-    let replay = stale_previous_response_replay_request(
-        &test_inference_service("gpt-test"),
-        &request,
-        &anyhow::anyhow!("stream error: rate limit"),
-    );
-
-    assert!(replay.is_none());
+fn non_stale_previous_response_error_is_not_classified_stale() {
+    assert!(!is_stale_previous_response_error(&anyhow::anyhow!(
+        "stream error: rate limit"
+    )));
+    assert!(is_stale_previous_response_error(&anyhow::anyhow!(
+        "response not found"
+    )));
 }
 
 #[test]
