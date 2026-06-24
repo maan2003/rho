@@ -5,14 +5,16 @@
 //! fork the crate while keeping the lower crates reusable.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt, join_all};
 use rho::{
     Item, ItemBlock, ItemKind, Message, MessagePhase, ProviderRequest, ProviderResponse,
-    ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult,
+    ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult, ToolSpec,
 };
 use rho_provider_responses::{ProviderSession, ResponsesStream, ResponsesUpdate};
 use rho_store_cbor::CborLog;
@@ -85,7 +87,6 @@ pub struct Agent {
     pending_tool_results: Vec<ToolResult>,
     provider_updates: Option<ProviderUpdateHandler>,
     agent_updates: Option<AgentUpdateHandler>,
-    next_id: u64,
     pub state: AgentState,
 }
 
@@ -98,25 +99,8 @@ pub struct StreamingTranscript {
 }
 
 impl Agent {
-    pub fn new(provider: AgentProvider) -> Self {
-        Self {
-            provider,
-            tools: Vec::new(),
-            store: None,
-            thread: AgentThread::default(),
-            queue: VecDeque::new(),
-            pending_tool_results: Vec::new(),
-            provider_updates: None,
-            agent_updates: None,
-            next_id: 0,
-            state: AgentState::Idle,
-        }
-    }
-
-    pub fn with_tool(mut self, tool: AgentTools) -> Self {
-        self.tools.push(tool);
-        self.thread.replace_tools(self.tool_specs());
-        self
+    pub fn new(provider: AgentProvider, tools: Vec<AgentTools>) -> Self {
+        Self::from_blocks(provider, tools, Vec::new())
     }
 
     pub fn with_store(mut self, store: AgentStore) -> Self {
@@ -140,22 +124,13 @@ impl Agent {
         self
     }
 
-    pub fn from_items(provider: AgentProvider, items: Vec<Item>) -> Self {
-        let blocks = if items.is_empty() {
-            Vec::new()
-        } else {
-            vec![ItemBlock::Local { items }]
-        };
-        Self::from_blocks(provider, blocks)
-    }
-
-    pub async fn from_store(provider: AgentProvider, store: AgentStore) -> Result<Self> {
+    pub async fn from_store(
+        provider: AgentProvider,
+        tools: Vec<AgentTools>,
+        store: AgentStore,
+    ) -> Result<Self> {
         let blocks = store.read_blocks().await?;
-        Ok(Self::from_blocks(provider, blocks).with_store(store))
-    }
-
-    pub fn items(&self) -> Vec<Item> {
-        self.thread.items()
+        Ok(Self::from_blocks(provider, tools, blocks).with_store(store))
     }
 
     pub fn blocks(&self) -> &[ItemBlock] {
@@ -192,7 +167,7 @@ impl Agent {
         }
         self.queue.clear();
         self.pending_tool_results.clear();
-        let id = self.alloc_item_id();
+        let id = alloc_item_id();
         self.record_block(ItemBlock::Local {
             items: vec![Item {
                 id,
@@ -271,7 +246,7 @@ impl Agent {
             recorded_local_work = true;
         }
 
-        if !recorded_local_work || self.thread.is_empty() {
+        if !recorded_local_work || self.thread.blocks().is_empty() {
             return Ok(AgentState::Idle);
         }
 
@@ -303,7 +278,7 @@ impl Agent {
             .items
             .into_iter()
             .map(|kind| {
-                let id = self.alloc_item_id();
+                let id = alloc_item_id();
                 Item { id, kind }
             })
             .collect::<Vec<_>>();
@@ -375,7 +350,7 @@ impl Agent {
     fn queue_item_to_block(&mut self, item: QueueItem) -> ItemBlock {
         match item {
             QueueItem::UserMessage(message) => {
-                let id = self.alloc_item_id();
+                let id = alloc_item_id();
                 ItemBlock::Local {
                     items: vec![Item {
                         id,
@@ -390,7 +365,7 @@ impl Agent {
         let items = results
             .into_iter()
             .map(|result| {
-                let id = self.alloc_item_id();
+                let id = alloc_item_id();
                 Item {
                     id,
                     kind: ItemKind::ToolResult(result),
@@ -399,34 +374,45 @@ impl Agent {
             .collect();
         ItemBlock::Local { items }
     }
-    fn alloc_item_id(&mut self) -> rho::ItemId {
-        let id = self.next_id;
-        self.next_id += 1;
-        rho::ItemId(format!("item-{id}"))
-    }
-
-    fn tool_specs(&self) -> Vec<rho::ToolSpec> {
-        self.tools.iter().flat_map(AgentTools::specs).collect()
-    }
 }
 
 impl Agent {
-    fn from_blocks(provider: AgentProvider, blocks: Vec<ItemBlock>) -> Self {
-        let thread = AgentThread::from_blocks(blocks);
-        let next_id = thread.next_item_index();
+    fn from_blocks(
+        provider: AgentProvider,
+        tools: Vec<AgentTools>,
+        blocks: Vec<ItemBlock>,
+    ) -> Self {
+        let thread = AgentThread::new(tool_specs(&tools), blocks);
         Self {
             provider,
-            tools: Vec::new(),
+            tools,
             store: None,
             thread,
             queue: VecDeque::new(),
             pending_tool_results: Vec::new(),
             provider_updates: None,
             agent_updates: None,
-            next_id,
             state: AgentState::Idle,
         }
     }
+}
+
+static NEXT_ITEM_ID: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+
+fn alloc_item_id() -> rho::ItemId {
+    let counter = NEXT_ITEM_ID.get_or_init(|| {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        AtomicU64::new(seed)
+    });
+    rho::ItemId(format!("item-{}", counter.fetch_add(1, Ordering::Relaxed)))
+}
+
+fn tool_specs(tools: &[AgentTools]) -> Vec<ToolSpec> {
+    tools.iter().flat_map(AgentTools::specs).collect()
 }
 
 fn notify_agent_update(handler: &Option<AgentUpdateHandler>, update: AgentUpdate) {

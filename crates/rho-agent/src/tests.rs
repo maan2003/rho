@@ -13,6 +13,15 @@ use serde_json::json;
 
 use super::*;
 
+fn test_items(blocks: &[ItemBlock]) -> Vec<&rho::Item> {
+    blocks
+        .iter()
+        .flat_map(|block| match block {
+            ItemBlock::Local { items } | ItemBlock::ProviderResponse { items, .. } => items,
+        })
+        .collect()
+}
+
 fn test_provider(
     complete: impl Fn(ProviderRequest) -> BoxFuture<'static, Result<ProviderResponse>>
     + Send
@@ -91,33 +100,33 @@ fn has_tool_result(input: &[ItemBlock]) -> bool {
 #[tokio::test]
 async fn records_message_and_provider_response() {
     let provider = test_provider(|_request| async { Ok(text_response("done")) }.boxed());
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("hello");
     agent.step().await.unwrap();
     agent.step().await.unwrap();
 
     assert!(matches!(agent.state, AgentState::Idle));
-    assert_eq!(agent.items().len(), 2);
+    assert_eq!(test_items(agent.blocks()).len(), 2);
 }
 
 #[tokio::test]
 async fn run_until_idle_drives_full_text_turn() {
     let provider = test_provider(|_request| async { Ok(text_response("done")) }.boxed());
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("hello");
     let steps = agent.run_until_idle(4).await.unwrap();
 
     assert_eq!(steps, 2);
     assert!(agent.is_idle());
-    assert_eq!(agent.items().len(), 2);
+    assert_eq!(test_items(agent.blocks()).len(), 2);
 }
 
 #[tokio::test]
 async fn run_until_idle_returns_zero_when_already_idle() {
     let provider = test_provider(|_request| async { Ok(text_response("done")) }.boxed());
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     let steps = agent.run_until_idle(4).await.unwrap();
 
@@ -128,7 +137,7 @@ async fn run_until_idle_returns_zero_when_already_idle() {
 #[tokio::test]
 async fn run_until_idle_errors_when_step_limit_is_exhausted() {
     let provider = test_provider(|_request| async { Ok(text_response("done")) }.boxed());
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("hello");
     let error = agent.run_until_idle(1).await.unwrap_err();
@@ -140,7 +149,7 @@ async fn run_until_idle_errors_when_step_limit_is_exhausted() {
 #[tokio::test]
 async fn cancel_current_turn_records_assistant_cancellation() {
     let provider = test_provider(|_request| async { Ok(text_response("done")) }.boxed());
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("hello");
     agent.step().await.unwrap();
@@ -148,7 +157,7 @@ async fn cancel_current_turn_records_assistant_cancellation() {
 
     assert!(agent.is_idle());
     assert!(
-        matches!(agent.items().last().map(|item| &item.kind), Some(ItemKind::Message(message)) if message.role == Role::Assistant && message.text_content() == "cancelled")
+        matches!(test_items(agent.blocks()).last().map(|item| &item.kind), Some(ItemKind::Message(message)) if message.role == Role::Assistant && message.text_content() == "cancelled")
     );
 }
 
@@ -164,15 +173,17 @@ async fn cancel_current_turn_records_cancelled_tool_results() {
         }
         .boxed()
     });
-    let mut agent = Agent::new(provider)
-        .with_tool(AgentTools::Shell(ShellTools::new(Duration::from_secs(120))));
+    let mut agent = Agent::new(
+        provider,
+        vec![AgentTools::Shell(ShellTools::new(Duration::from_secs(120)))],
+    );
 
     agent.push_user_message("hello");
     agent.run_until_idle(2).await.unwrap_err();
     agent.cancel_current_turn("cancelled").await.unwrap();
 
     assert!(agent.is_idle());
-    assert!(agent.items().iter().any(|item| {
+    assert!(test_items(agent.blocks()).iter().any(|item| {
         matches!(&item.kind, ItemKind::ToolResult(result) if matches!(&result.status, rho::ToolResultStatus::Cancelled { reason } if reason == "cancelled"))
     }));
 }
@@ -189,7 +200,7 @@ async fn idle_step_after_final_answer_does_not_call_provider_again() {
         }
         .boxed()
     });
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("hello");
     agent.step().await.unwrap();
@@ -197,7 +208,7 @@ async fn idle_step_after_final_answer_does_not_call_provider_again() {
     agent.step().await.unwrap();
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(agent.items().len(), 2);
+    assert_eq!(test_items(agent.blocks()).len(), 2);
     assert!(matches!(agent.state, AgentState::Idle));
 }
 
@@ -221,7 +232,7 @@ async fn provider_request_keeps_full_block_history() {
         }
         .boxed()
     });
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("first");
     agent.run_until_idle(4).await.unwrap();
@@ -249,7 +260,7 @@ async fn records_provider_response_block() {
         }
         .boxed()
     });
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("first");
     agent.run_until_idle(4).await.unwrap();
@@ -277,6 +288,7 @@ async fn restored_provider_response_block_forwards_full_history_with_boundary() 
     });
     let mut agent = Agent::from_blocks(
         provider,
+        Vec::new(),
         vec![
             ItemBlock::Local {
                 items: vec![Item::message("item-0", Role::User, "first")],
@@ -331,7 +343,7 @@ async fn compaction_response_id_replays_full_history_on_next_turn() {
         }
         .boxed()
     });
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("first");
     agent.run_until_idle(4).await.unwrap();
@@ -360,7 +372,7 @@ async fn forwards_streaming_provider_updates() {
         ])
         .boxed()
     });
-    let mut agent = Agent::new(provider).with_provider_updates(move |update| {
+    let mut agent = Agent::new(provider, Vec::new()).with_provider_updates(move |update| {
         seen_updates
             .lock()
             .expect("provider update log lock")
@@ -406,19 +418,19 @@ async fn records_streamed_text_when_final_response_is_sparse() {
         ])
         .boxed()
     });
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("hello");
     agent.run_until_idle(4).await.unwrap();
 
-    assert!(agent.items().iter().any(|item| {
+    assert!(test_items(agent.blocks()).iter().any(|item| {
         matches!(
             &item.kind,
             ItemKind::Message(message)
                 if message.role == Role::Assistant && message.text_content() == "done"
         )
     }));
-    assert!(agent.items().iter().any(|item| {
+    assert!(test_items(agent.blocks()).iter().any(|item| {
         matches!(
             &item.kind,
             ItemKind::ReasoningText(reasoning)
@@ -439,14 +451,13 @@ async fn streamed_text_does_not_duplicate_final_response_items() {
         ])
         .boxed()
     });
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("hello");
     agent.run_until_idle(4).await.unwrap();
 
-    let assistant_messages = agent
-        .items()
-        .iter()
+    let assistant_messages = test_items(agent.blocks())
+        .into_iter()
         .filter(|item| {
             matches!(
                 &item.kind,
@@ -470,7 +481,7 @@ async fn provider_errors_return_to_caller() {
         }
         .boxed()
     });
-    let mut agent = Agent::new(provider);
+    let mut agent = Agent::new(provider, Vec::new());
 
     agent.push_user_message("hello");
     agent.step().await.unwrap();
@@ -500,8 +511,10 @@ async fn runs_tool_calls_through_agent_policy() {
         }
         .boxed()
     });
-    let mut agent =
-        Agent::new(provider).with_tool(AgentTools::Shell(ShellTools::new(Duration::from_secs(2))));
+    let mut agent = Agent::new(
+        provider,
+        vec![AgentTools::Shell(ShellTools::new(Duration::from_secs(2)))],
+    );
 
     agent.push_user_message("use a tool");
     agent.step().await.unwrap();
@@ -510,10 +523,9 @@ async fn runs_tool_calls_through_agent_policy() {
     agent.step().await.unwrap();
 
     assert!(
-        agent
-            .items()
-            .iter()
-            .any(|item| matches!(item.kind, ItemKind::ToolResult(_)))
+        test_items(agent.blocks())
+            .into_iter()
+            .any(|item| matches!(&item.kind, ItemKind::ToolResult(_)))
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(matches!(agent.state, AgentState::Idle));
@@ -537,14 +549,16 @@ async fn emits_tool_execution_updates() {
     });
     let updates = Arc::new(Mutex::new(Vec::new()));
     let seen_updates = Arc::clone(&updates);
-    let mut agent = Agent::new(provider)
-        .with_tool(AgentTools::Shell(ShellTools::new(Duration::from_secs(2))))
-        .with_agent_updates(move |update| {
-            seen_updates
-                .lock()
-                .expect("agent update log lock")
-                .push(update);
-        });
+    let mut agent = Agent::new(
+        provider,
+        vec![AgentTools::Shell(ShellTools::new(Duration::from_secs(2)))],
+    )
+    .with_agent_updates(move |update| {
+        seen_updates
+            .lock()
+            .expect("agent update log lock")
+            .push(update);
+    });
 
     agent.push_user_message("use a tool");
     agent.run_until_idle(6).await.unwrap();
@@ -578,8 +592,10 @@ async fn exposes_shell_command_and_apply_patch_tool_specs() {
         }
         .boxed()
     });
-    let mut agent =
-        Agent::new(provider).with_tool(AgentTools::Shell(ShellTools::new(Duration::from_secs(2))));
+    let mut agent = Agent::new(
+        provider,
+        vec![AgentTools::Shell(ShellTools::new(Duration::from_secs(2)))],
+    );
 
     agent.push_user_message("hello");
     agent.run_until_idle(4).await.unwrap();
@@ -616,14 +632,16 @@ async fn routes_apply_patch_custom_tool_through_agent_policy() {
         }
         .boxed()
     });
-    let mut agent =
-        Agent::new(provider).with_tool(AgentTools::Shell(ShellTools::new(Duration::from_secs(2))));
+    let mut agent = Agent::new(
+        provider,
+        vec![AgentTools::Shell(ShellTools::new(Duration::from_secs(2)))],
+    );
 
     agent.push_user_message("patch a file");
     agent.run_until_idle(6).await.unwrap();
 
     assert_eq!(std::fs::read_to_string(path).unwrap(), "patched\n");
-    assert!(agent.items().iter().any(|item| {
+    assert!(test_items(agent.blocks()).iter().any(|item| {
         matches!(
             &item.kind,
             ItemKind::ToolResult(result)
@@ -662,8 +680,10 @@ async fn waits_for_tool_calls_concurrently() {
         }
         .boxed()
     });
-    let mut agent =
-        Agent::new(provider).with_tool(AgentTools::Shell(ShellTools::new(Duration::from_secs(3))));
+    let mut agent = Agent::new(
+        provider,
+        vec![AgentTools::Shell(ShellTools::new(Duration::from_secs(3)))],
+    );
 
     agent.push_user_message("use two tools");
     agent.step().await.unwrap();
@@ -678,10 +698,9 @@ async fn waits_for_tool_calls_concurrently() {
         "tool calls were not scheduled concurrently: elapsed={elapsed:?}"
     );
     assert_eq!(
-        agent
-            .items()
-            .iter()
-            .filter(|item| matches!(item.kind, ItemKind::ToolResult(_)))
+        test_items(agent.blocks())
+            .into_iter()
+            .filter(|item| matches!(&item.kind, ItemKind::ToolResult(_)))
             .count(),
         2
     );
@@ -693,7 +712,7 @@ async fn persists_transcript_items_to_cbor_log() {
     let _ = tokio::fs::remove_file(&path).await;
     let log = CborLog::new(&path);
     let provider = test_provider(|_request| async { Ok(text_response("done")) }.boxed());
-    let mut agent = Agent::new(provider).with_store(AgentStore::CborLog(log.clone()));
+    let mut agent = Agent::new(provider, Vec::new()).with_store(AgentStore::CborLog(log.clone()));
 
     agent.push_user_message("hello");
     agent.step().await.unwrap();
@@ -716,13 +735,13 @@ async fn loads_transcript_items_from_cbor_log() {
     .unwrap();
     let provider = test_provider(|_request| async { Ok(text_response("done")) }.boxed());
 
-    let agent = Agent::from_store(provider, AgentStore::CborLog(log))
+    let agent = Agent::from_store(provider, Vec::new(), AgentStore::CborLog(log))
         .await
         .unwrap();
 
-    assert_eq!(agent.items().len(), 1);
+    assert_eq!(test_items(agent.blocks()).len(), 1);
     assert!(
-        matches!(&agent.items()[0].kind, ItemKind::Message(message) if message.text_content() == "persisted")
+        matches!(&test_items(agent.blocks())[0].kind, ItemKind::Message(message) if message.text_content() == "persisted")
     );
     let _ = tokio::fs::remove_file(&path).await;
 }
@@ -733,7 +752,7 @@ async fn persists_and_loads_transcript_items_from_redb_log() {
     let path = temp.path().join("agent.redb");
     let log = RedbLog::open(&path).await.unwrap();
     let provider = test_provider(|_request| async { Ok(text_response("done")) }.boxed());
-    let mut agent = Agent::new(provider).with_store(AgentStore::RedbLog(log.clone()));
+    let mut agent = Agent::new(provider, Vec::new()).with_store(AgentStore::RedbLog(log.clone()));
 
     agent.push_user_message("hello");
     agent.run_until_idle(4).await.unwrap();
@@ -742,7 +761,7 @@ async fn persists_and_loads_transcript_items_from_redb_log() {
     assert_eq!(persisted, agent.blocks());
 
     let provider = test_provider(|_request| async { Ok(text_response("unused")) }.boxed());
-    let loaded = Agent::from_store(provider, AgentStore::RedbLog(log))
+    let loaded = Agent::from_store(provider, Vec::new(), AgentStore::RedbLog(log))
         .await
         .unwrap();
 
@@ -780,7 +799,7 @@ async fn loaded_transcript_replays_full_history_with_provider_block_boundary() {
         .boxed()
     });
 
-    let mut agent = Agent::from_store(provider, AgentStore::CborLog(log.clone()))
+    let mut agent = Agent::from_store(provider, Vec::new(), AgentStore::CborLog(log.clone()))
         .await
         .unwrap();
     agent.push_user_message("second");

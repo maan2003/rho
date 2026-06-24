@@ -285,14 +285,13 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
     let provider = AgentProvider::Responses(build_provider_session(args));
-    let tools = AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT));
+    let tools = vec![AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT))];
     let mut agent = if args.no_store {
-        Agent::new(provider)
+        Agent::new(provider, tools)
     } else {
         let store = AgentStore::CborLog(CborLog::new(args.session_path()?));
-        Agent::from_store(provider, store).await?
-    }
-    .with_tool(tools);
+        Agent::from_store(provider, tools, store).await?
+    };
     if let Some(renderer) = renderer {
         let provider_renderer = Arc::clone(&renderer);
         agent = agent.with_provider_updates(move |update| {
