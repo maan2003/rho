@@ -42,7 +42,7 @@ enum AgentProvider {
 
 enum AgentState {
     Idle,
-    ApiRequest { attempt_count: u64, future: ProviderFuture },
+    ApiRequest { future: ProviderFuture },
     WaitingForTools { futures: ToolFutures, results: Vec<ToolResult> },
 }
 ```

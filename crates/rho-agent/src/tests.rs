@@ -477,35 +477,7 @@ async fn streamed_text_does_not_duplicate_final_response_items() {
 }
 
 #[tokio::test]
-async fn retries_provider_request_until_success() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let provider_calls = Arc::clone(&calls);
-    let provider = test_provider(move |_request| {
-        let calls = Arc::clone(&provider_calls);
-        async move {
-            let call = calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 {
-                Err(anyhow!("transient provider failure"))
-            } else {
-                Ok(text_response("done"))
-            }
-        }
-        .boxed()
-    });
-    let mut agent = Agent::new(provider).with_max_provider_retries(1);
-
-    agent.push_user_message("hello");
-    agent.step().await.unwrap();
-    agent.step().await.unwrap();
-    agent.step().await.unwrap();
-
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(agent.items().len(), 2);
-    assert!(matches!(agent.state, AgentState::Idle));
-}
-
-#[tokio::test]
-async fn returns_error_after_provider_retry_budget_is_exhausted() {
+async fn provider_errors_return_to_caller() {
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
     let provider = test_provider(move |_request| {
@@ -516,15 +488,14 @@ async fn returns_error_after_provider_retry_budget_is_exhausted() {
         }
         .boxed()
     });
-    let mut agent = Agent::new(provider).with_max_provider_retries(1);
+    let mut agent = Agent::new(provider);
 
     agent.push_user_message("hello");
-    agent.step().await.unwrap();
     agent.step().await.unwrap();
     let error = agent.step().await.unwrap_err();
 
     assert!(error.to_string().contains("provider still down"));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

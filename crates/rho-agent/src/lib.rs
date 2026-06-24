@@ -55,8 +55,6 @@ pub enum AgentState {
     #[default]
     Idle,
     ApiRequest {
-        attempt_count: u64,
-        request: ProviderRequest,
         streamed_transcript: StreamedTranscript,
         future: ProviderFuture,
     },
@@ -83,7 +81,6 @@ pub struct Agent {
     blocks: Vec<ItemBlock>,
     queue: VecDeque<QueueItem>,
     pending_tool_results: Vec<ToolResult>,
-    max_provider_retries: u64,
     provider_updates: Option<ProviderUpdateHandler>,
     agent_updates: Option<AgentUpdateHandler>,
     next_id: u64,
@@ -107,7 +104,6 @@ impl Agent {
             blocks: Vec::new(),
             queue: VecDeque::new(),
             pending_tool_results: Vec::new(),
-            max_provider_retries: 0,
             provider_updates: None,
             agent_updates: None,
             next_id: 0,
@@ -122,11 +118,6 @@ impl Agent {
 
     pub fn with_store(mut self, store: AgentStore) -> Self {
         self.store = Some(store);
-        self
-    }
-
-    pub fn with_max_provider_retries(mut self, max_provider_retries: u64) -> Self {
-        self.max_provider_retries = max_provider_retries;
         self
     }
 
@@ -237,28 +228,12 @@ impl Agent {
         self.state = match state {
             AgentState::Idle => self.start_next_request().await?,
             AgentState::ApiRequest {
-                attempt_count,
-                request,
                 streamed_transcript,
                 future,
             } => match future.await {
                 Ok(response) => {
                     self.finish_provider_request(response, streamed_transcript)
                         .await?
-                }
-                Err(_) if attempt_count < self.max_provider_retries => {
-                    let next_attempt_count = attempt_count + 1;
-                    let streamed_transcript = Arc::new(Mutex::new(StreamingTranscript::default()));
-                    AgentState::ApiRequest {
-                        attempt_count: next_attempt_count,
-                        future: self.provider.complete(
-                            request.clone(),
-                            self.provider_updates.clone(),
-                            Arc::clone(&streamed_transcript),
-                        ),
-                        request,
-                        streamed_transcript,
-                    }
                 }
                 Err(error) => return Err(error),
             },
@@ -302,13 +277,11 @@ impl Agent {
 
         let streamed_transcript = Arc::new(Mutex::new(StreamingTranscript::default()));
         Ok(AgentState::ApiRequest {
-            attempt_count: 0,
             future: self.provider.complete(
                 request.clone(),
                 self.provider_updates.clone(),
                 Arc::clone(&streamed_transcript),
             ),
-            request,
             streamed_transcript,
         })
     }
@@ -457,7 +430,6 @@ impl Agent {
             blocks,
             queue: VecDeque::new(),
             pending_tool_results: Vec::new(),
-            max_provider_retries: 0,
             provider_updates: None,
             agent_updates: None,
             next_id,

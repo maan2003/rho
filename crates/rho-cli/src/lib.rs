@@ -292,8 +292,7 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
         let store = AgentStore::CborLog(CborLog::new(args.session_path()?));
         Agent::from_store(provider, store).await?
     }
-    .with_tool(tools)
-    .with_max_provider_retries(1);
+    .with_tool(tools);
     if let Some(renderer) = renderer {
         let provider_renderer = Arc::clone(&renderer);
         agent = agent.with_provider_updates(move |update| {
