@@ -4,11 +4,10 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use rho::ProviderResponse;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderMap;
@@ -19,7 +18,7 @@ use crate::{
     DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS, DEFAULT_WEBSOCKET_PING_INTERVAL_SECS,
     DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS, DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS,
     DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS, OPENAI_BETA_WS, ProviderSession, ResponsesRequest,
-    ResponsesUpdate, ResponsesUpdateCallback, apply_response_event, responses_url,
+    ResponsesUpdate, apply_response_event, responses_url,
 };
 
 pub(crate) async fn prewarm_websocket(
@@ -47,8 +46,8 @@ pub(crate) async fn send_websocket(
     websocket_pool: &Arc<Mutex<WebSocketPool>>,
     body: ResponsesRequest,
     tool_names: &BTreeMap<String, String>,
-    on_update: &mut ResponsesUpdateCallback,
-) -> Result<ProviderResponse> {
+    updates: &mpsc::UnboundedSender<Result<ResponsesUpdate>>,
+) -> Result<()> {
     let auth = session.auth.clone();
     let resolved_auth = tokio::task::spawn_blocking(move || auth.resolve()).await??;
     if let Some(key) = WebSocketPoolKey::from_request(session, &body, resolved_auth.as_ref()) {
@@ -59,7 +58,7 @@ pub(crate) async fn send_websocket(
             resolved_auth.as_ref(),
             body,
             tool_names,
-            on_update,
+            updates,
         )
         .await;
     }
@@ -71,7 +70,7 @@ pub(crate) async fn send_websocket(
     )?;
     let (socket, _response) = connect_async(request).await?;
     let mut connection = WebSocketConnection::new(socket, resolved_auth.as_ref());
-    connection.run_turn(body, tool_names, on_update).await
+    connection.run_turn(body, tool_names, updates).await
 }
 
 async fn send_pooled_websocket(
@@ -81,11 +80,11 @@ async fn send_pooled_websocket(
     auth: Option<&ResolvedAuth>,
     body: ResponsesRequest,
     tool_names: &BTreeMap<String, String>,
-    on_update: &mut ResponsesUpdateCallback,
-) -> Result<ProviderResponse> {
+    updates: &mpsc::UnboundedSender<Result<ResponsesUpdate>>,
+) -> Result<()> {
     let mut connection = checkout_websocket_pool(session, websocket_pool, &key, auth).await?;
-    let response = match connection.run_turn(body, tool_names, on_update).await {
-        Ok(response) => response,
+    match connection.run_turn(body, tool_names, updates).await {
+        Ok(()) => {}
         Err(error) => {
             let mut pool = websocket_pool.lock().await;
             pool.release_busy(&key);
@@ -95,7 +94,7 @@ async fn send_pooled_websocket(
 
     let mut pool = websocket_pool.lock().await;
     pool.release(key, connection, DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS);
-    Ok(response)
+    Ok(())
 }
 
 async fn checkout_websocket_pool(
@@ -163,8 +162,8 @@ impl WebSocketConnection {
         &mut self,
         body: ResponsesRequest,
         tool_names: &BTreeMap<String, String>,
-        on_update: &mut ResponsesUpdateCallback,
-    ) -> Result<ProviderResponse> {
+        updates: &mpsc::UnboundedSender<Result<ResponsesUpdate>>,
+    ) -> Result<()> {
         self.socket
             .send(WsMessage::Text(
                 serde_json::to_string(&WsResponseCreate {
@@ -197,7 +196,11 @@ impl WebSocketConnection {
                         Ok(event) => event,
                         Err(_) => continue,
                     };
-                    if apply_response_event(&mut state, &event, on_update)? {
+                    let (done, event_updates) = apply_response_event(&mut state, &event)?;
+                    for update in event_updates {
+                        let _ = updates.send(Ok(update));
+                    }
+                    if done {
                         completed = true;
                         break;
                     }
@@ -221,8 +224,8 @@ impl WebSocketConnection {
             bail!("stream error: websocket ended before response.completed");
         }
         let response = state.finish();
-        on_update(ResponsesUpdate::Finished(response.clone()));
-        Ok(response)
+        let _ = updates.send(Ok(ResponsesUpdate::Finished(response)));
+        Ok(())
     }
 }
 

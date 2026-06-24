@@ -40,9 +40,7 @@ pub(crate) const DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS: u64 = 55 * 60;
 pub(crate) const DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS: u64 = 50;
 pub(crate) const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
 
-pub type ResponsesFuture = BoxFuture<'static, Result<ProviderResponse>>;
 pub type ResponsesStream = BoxStream<'static, Result<ResponsesUpdate>>;
-pub type ResponsesUpdateCallback = Box<dyn FnMut(ResponsesUpdate) + Send>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResponsesUpdate {
@@ -118,19 +116,15 @@ fn responses_url(base_url: &str) -> String {
 }
 
 impl ProviderSession {
-    pub fn complete(&self, request: ProviderRequest) -> ResponsesFuture {
-        self.complete_streaming(request, |_| {})
-    }
-
     pub fn stream(&self, request: ProviderRequest) -> ResponsesStream {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let error_sender = sender.clone();
-        let future = self.complete_streaming(request, move |update| {
-            let _ = sender.send(Ok(update));
-        });
+        let session = self.clone();
+        let websocket_pool = Arc::clone(&self.websocket_pool);
         tokio::spawn(async move {
-            if let Err(error) = future.await {
-                let _ = error_sender.send(Err(error));
+            if let Err(error) =
+                stream_provider_request(session, websocket_pool, request, &sender).await
+            {
+                let _ = sender.send(Err(error));
             }
         });
 
@@ -148,48 +142,42 @@ impl ProviderSession {
         let prompt_cache_key = prompt_cache_key.into();
         async move { ws::prewarm_websocket(session, prompt_cache_key).await }.boxed()
     }
+}
 
-    pub fn complete_streaming(
-        &self,
-        request: ProviderRequest,
-        on_update: impl FnMut(ResponsesUpdate) + Send + 'static,
-    ) -> ResponsesFuture {
-        let session = self.clone();
-        let websocket_pool = Arc::clone(&self.websocket_pool);
-        async move {
-            let tool_names = tool_name_map(&request.tools);
-            let responses_request =
-                ResponsesRequest::from_provider_request(&session, request.clone());
-            let mut on_update: ResponsesUpdateCallback = Box::new(on_update);
-            match ws::send_websocket(
-                &session,
-                &websocket_pool,
-                responses_request,
-                &tool_names,
-                &mut on_update,
-            )
-            .await
+async fn stream_provider_request(
+    session: ProviderSession,
+    websocket_pool: Arc<tokio::sync::Mutex<ws::WebSocketPool>>,
+    request: ProviderRequest,
+    updates: &tokio::sync::mpsc::UnboundedSender<Result<ResponsesUpdate>>,
+) -> Result<()> {
+    let tool_names = tool_name_map(&request.tools);
+    let responses_request = ResponsesRequest::from_provider_request(&session, request.clone());
+    match ws::send_websocket(
+        &session,
+        &websocket_pool,
+        responses_request,
+        &tool_names,
+        updates,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(replay_request) =
+                stale_previous_response_replay_request(&session, &request, &error)
             {
-                Ok(response) => Ok(response),
-                Err(error) => {
-                    if let Some(replay_request) =
-                        stale_previous_response_replay_request(&session, &request, &error)
-                    {
-                        ws::send_websocket(
-                            &session,
-                            &websocket_pool,
-                            replay_request,
-                            &tool_names,
-                            &mut on_update,
-                        )
-                        .await
-                    } else {
-                        Err(error)
-                    }
-                }
+                ws::send_websocket(
+                    &session,
+                    &websocket_pool,
+                    replay_request,
+                    &tool_names,
+                    updates,
+                )
+                .await
+            } else {
+                Err(error)
             }
         }
-        .boxed()
     }
 }
 
@@ -199,7 +187,7 @@ pub fn parse_response_events(
     let mut state = ResponseState::default();
     let mut completed = false;
     for event in events {
-        if apply_response_event_str(&mut state, event.as_ref(), &mut |_| {})? {
+        if apply_response_event_str(&mut state, event.as_ref())?.0 {
             completed = true;
             break;
         }
@@ -210,14 +198,17 @@ pub fn parse_response_events(
     Ok(state.finish())
 }
 
-pub fn parse_response_events_with_updates(
+#[cfg(test)]
+fn collect_response_events_with_updates(
     events: impl IntoIterator<Item = impl AsRef<str>>,
-    mut on_update: impl FnMut(ResponsesUpdate),
-) -> Result<ProviderResponse> {
+) -> Result<(ProviderResponse, Vec<ResponsesUpdate>)> {
     let mut state = ResponseState::default();
     let mut completed = false;
+    let mut updates = Vec::new();
     for event in events {
-        if apply_response_event_str(&mut state, event.as_ref(), &mut on_update)? {
+        let (done, event_updates) = apply_response_event_str(&mut state, event.as_ref())?;
+        updates.extend(event_updates);
+        if done {
             completed = true;
             break;
         }
@@ -226,8 +217,8 @@ pub fn parse_response_events_with_updates(
         bail!("response stream ended before response.completed");
     }
     let response = state.finish();
-    on_update(ResponsesUpdate::Finished(response.clone()));
-    Ok(response)
+    updates.push(ResponsesUpdate::Finished(response.clone()));
+    Ok((response, updates))
 }
 
 #[derive(Default)]
@@ -372,24 +363,23 @@ impl ToolCallAccumulator {
 fn apply_response_event_str(
     state: &mut ResponseState,
     data: &str,
-    on_update: &mut impl FnMut(ResponsesUpdate),
-) -> Result<bool> {
+) -> Result<(bool, Vec<ResponsesUpdate>)> {
     let data = data.trim_end();
     if data == "[DONE]" {
-        return Ok(true);
+        return Ok((true, Vec::new()));
     }
     let event: Value = match serde_json::from_str(data) {
         Ok(event) => event,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok((false, Vec::new())),
     };
-    apply_response_event(state, &event, on_update)
+    apply_response_event(state, &event)
 }
 
 pub(crate) fn apply_response_event(
     state: &mut ResponseState,
     event: &Value,
-    on_update: &mut (impl FnMut(ResponsesUpdate) + ?Sized),
-) -> Result<bool> {
+) -> Result<(bool, Vec<ResponsesUpdate>)> {
+    let mut updates = Vec::new();
     match event["type"].as_str().unwrap_or_default() {
         "response.output_text.delta" => {
             if let Some(delta) = event["delta"].as_str() {
@@ -399,7 +389,7 @@ pub(crate) fn apply_response_event(
                     .entry(output_index)
                     .or_default()
                     .push_str(delta);
-                on_update(ResponsesUpdate::TextDelta {
+                updates.push(ResponsesUpdate::TextDelta {
                     output_index,
                     text: delta.to_owned(),
                 });
@@ -411,7 +401,7 @@ pub(crate) fn apply_response_event(
                 state
                     .message_text_by_output_index
                     .insert(output_index, text.to_owned());
-                on_update(ResponsesUpdate::OutputItem {
+                updates.push(ResponsesUpdate::OutputItem {
                     output_index,
                     item: ItemKind::Message(Message::text(Role::Assistant, text)),
                 });
@@ -425,7 +415,7 @@ pub(crate) fn apply_response_event(
                     .entry(output_index)
                     .or_default()
                     .push_str(delta);
-                on_update(ResponsesUpdate::ReasoningTextDelta {
+                updates.push(ResponsesUpdate::ReasoningTextDelta {
                     output_index,
                     kind: ReasoningTextKind::Summary,
                     text: delta.to_owned(),
@@ -505,7 +495,7 @@ pub(crate) fn apply_response_event(
                         }
                     }
                     if let Some(call) = call.clone().finish() {
-                        on_update(ResponsesUpdate::ToolCall { output_index, call });
+                        updates.push(ResponsesUpdate::ToolCall { output_index, call });
                     }
                 }
 
@@ -521,7 +511,7 @@ pub(crate) fn apply_response_event(
                     state
                         .items_by_output_index
                         .insert(output_index, ItemKind::Message(message.clone()));
-                    on_update(ResponsesUpdate::OutputItem {
+                    updates.push(ResponsesUpdate::OutputItem {
                         output_index,
                         item: ItemKind::Message(message),
                     });
@@ -537,14 +527,14 @@ pub(crate) fn apply_response_event(
                     state
                         .items_by_output_index
                         .insert(output_index, ItemKind::ProviderItem(provider_item.clone()));
-                    on_update(ResponsesUpdate::OutputItem {
+                    updates.push(ResponsesUpdate::OutputItem {
                         output_index,
                         item: ItemKind::ProviderItem(provider_item),
                     });
                 }
                 if item["type"].as_str() == Some("compaction") {
                     if event["type"].as_str() == Some("response.output_item.added") {
-                        on_update(ResponsesUpdate::CompactionStarted { output_index });
+                        updates.push(ResponsesUpdate::CompactionStarted { output_index });
                     } else if event["type"].as_str() == Some("response.output_item.done") {
                         let provider_item = ProviderItem {
                             kind: ProviderItemKind::Compaction,
@@ -553,7 +543,7 @@ pub(crate) fn apply_response_event(
                         state
                             .items_by_output_index
                             .insert(output_index, ItemKind::ProviderItem(provider_item.clone()));
-                        on_update(ResponsesUpdate::OutputItem {
+                        updates.push(ResponsesUpdate::OutputItem {
                             output_index,
                             item: ItemKind::ProviderItem(provider_item),
                         });
@@ -569,7 +559,7 @@ pub(crate) fn apply_response_event(
                     state
                         .items_by_output_index
                         .insert(output_index, ItemKind::ProviderItem(provider_item.clone()));
-                    on_update(ResponsesUpdate::OutputItem {
+                    updates.push(ResponsesUpdate::OutputItem {
                         output_index,
                         item: ItemKind::ProviderItem(provider_item),
                     });
@@ -579,7 +569,7 @@ pub(crate) fn apply_response_event(
         "response.completed" | "response.done" => {
             state.usage = usage_from_event(event);
             if let Some(usage) = state.usage.clone() {
-                on_update(ResponsesUpdate::Usage(usage));
+                updates.push(ResponsesUpdate::Usage(usage));
             }
             state.provider_response_id = event
                 .get("response")
@@ -587,9 +577,9 @@ pub(crate) fn apply_response_event(
                 .or_else(|| event["id"].as_str())
                 .map(str::to_owned);
             if let Some(response_id) = state.provider_response_id.clone() {
-                on_update(ResponsesUpdate::ResponseId(response_id));
+                updates.push(ResponsesUpdate::ResponseId(response_id));
             }
-            return Ok(true);
+            return Ok((true, updates));
         }
         "response.incomplete" => {
             let reason = event
@@ -626,7 +616,7 @@ pub(crate) fn apply_response_event(
         _ => {}
     }
 
-    Ok(false)
+    Ok((false, updates))
 }
 
 fn should_preserve_unknown_provider_item(item: &Value) -> bool {

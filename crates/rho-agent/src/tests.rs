@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use rho::{
     ItemKind, Message, ProviderItem, ProviderItemKind, ProviderResponse, Role, ToolCall,
     ToolCallId, ToolType,
@@ -13,46 +14,27 @@ use serde_json::json;
 use super::*;
 
 fn test_provider(
-    complete: impl Fn(ProviderRequest) -> ProviderFuture + Send + Sync + 'static,
-) -> AgentProvider {
-    let complete = Arc::new(complete);
-    AgentProvider::Test {
-        complete: Arc::new(move |request, provider_updates| {
-            let future = complete(request);
-            async move {
-                let response = future.await?;
-                if let Some(provider_updates) = provider_updates {
-                    let mut on_update = provider_updates.lock().expect("provider update lock");
-                    on_update(ResponsesUpdate::Finished(response.clone()));
-                }
-                Ok(response)
-            }
-            .boxed()
-        }),
-    }
-}
-
-fn test_streaming_provider(
-    complete: impl Fn(
-        ProviderRequest,
-        rho_provider_responses::ResponsesUpdateCallback,
-    ) -> ProviderFuture
+    complete: impl Fn(ProviderRequest) -> BoxFuture<'static, Result<ProviderResponse>>
     + Send
     + Sync
     + 'static,
 ) -> AgentProvider {
     let complete = Arc::new(complete);
     AgentProvider::Test {
-        complete: Arc::new(move |request, provider_updates| {
-            let complete = Arc::clone(&complete);
-            let on_update = move |update| {
-                if let Some(provider_updates) = &provider_updates {
-                    let mut on_update = provider_updates.lock().expect("provider update lock");
-                    on_update(update);
-                }
-            };
-            complete(request, Box::new(on_update))
+        stream: Arc::new(move |request| {
+            let future = complete(request);
+            futures::stream::once(async move { future.await.map(ResponsesUpdate::Finished) })
+                .boxed()
         }),
+    }
+}
+
+fn test_streaming_provider(
+    stream: impl Fn(ProviderRequest) -> ProviderStream + Send + Sync + 'static,
+) -> AgentProvider {
+    let stream = Arc::new(stream);
+    AgentProvider::Test {
+        stream: Arc::new(move |request| stream(request)),
     }
 }
 
@@ -364,18 +346,18 @@ async fn compaction_response_id_replays_full_history_on_next_turn() {
 async fn forwards_streaming_provider_updates() {
     let updates = Arc::new(Mutex::new(Vec::new()));
     let seen_updates = Arc::clone(&updates);
-    let provider = test_streaming_provider(|_request, mut on_update| {
-        async move {
-            on_update(ResponsesUpdate::TextDelta {
+    let provider = test_streaming_provider(|_request| {
+        futures::stream::iter([
+            Ok(ResponsesUpdate::TextDelta {
                 output_index: 0,
                 text: "do".to_owned(),
-            });
-            on_update(ResponsesUpdate::TextDelta {
+            }),
+            Ok(ResponsesUpdate::TextDelta {
                 output_index: 0,
                 text: "ne".to_owned(),
-            });
-            Ok(text_response("done"))
-        }
+            }),
+            Ok(ResponsesUpdate::Finished(text_response("done"))),
+        ])
         .boxed()
     });
     let mut agent = Agent::new(provider).with_provider_updates(move |update| {
@@ -401,27 +383,27 @@ async fn forwards_streaming_provider_updates() {
 
 #[tokio::test]
 async fn records_streamed_text_when_final_response_is_sparse() {
-    let provider = test_streaming_provider(|_request, mut on_update| {
-        async move {
-            on_update(ResponsesUpdate::TextDelta {
+    let provider = test_streaming_provider(|_request| {
+        futures::stream::iter([
+            Ok(ResponsesUpdate::TextDelta {
                 output_index: 0,
                 text: "do".to_owned(),
-            });
-            on_update(ResponsesUpdate::TextDelta {
+            }),
+            Ok(ResponsesUpdate::TextDelta {
                 output_index: 0,
                 text: "ne".to_owned(),
-            });
-            on_update(ResponsesUpdate::ReasoningTextDelta {
+            }),
+            Ok(ResponsesUpdate::ReasoningTextDelta {
                 output_index: 1,
                 kind: ReasoningTextKind::Summary,
                 text: "thought".to_owned(),
-            });
-            Ok(ProviderResponse {
+            }),
+            Ok(ResponsesUpdate::Finished(ProviderResponse {
                 items: Vec::new(),
                 usage: None,
                 provider_response_id: None,
-            })
-        }
+            })),
+        ])
         .boxed()
     });
     let mut agent = Agent::new(provider);
@@ -447,14 +429,14 @@ async fn records_streamed_text_when_final_response_is_sparse() {
 
 #[tokio::test]
 async fn streamed_text_does_not_duplicate_final_response_items() {
-    let provider = test_streaming_provider(|_request, mut on_update| {
-        async move {
-            on_update(ResponsesUpdate::TextDelta {
+    let provider = test_streaming_provider(|_request| {
+        futures::stream::iter([
+            Ok(ResponsesUpdate::TextDelta {
                 output_index: 0,
                 text: "done".to_owned(),
-            });
-            Ok(text_response("done"))
-        }
+            }),
+            Ok(ResponsesUpdate::Finished(text_response("done"))),
+        ])
         .boxed()
     });
     let mut agent = Agent::new(provider);

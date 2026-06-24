@@ -42,7 +42,7 @@ enum AgentProvider {
 
 enum AgentState {
     Idle,
-    ApiRequest { future: ProviderFuture },
+    ApiRequest { stream: ProviderStream },
     WaitingForTools { futures: ToolFutures, results: Vec<ToolResult> },
 }
 ```

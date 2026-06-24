@@ -684,8 +684,7 @@ fn encoded_tool_name_stays_mapped_to_declared_tool_name() {
     assert_eq!(json["input"][0]["name"], "local_patch");
 
     let mut state = ResponseState::with_tool_names(tool_name_map(&[tool]));
-    let mut updates = Vec::new();
-    apply_response_event(
+    let (_done, updates) = apply_response_event(
         &mut state,
         &json!({
             "type": "response.output_item.done",
@@ -697,7 +696,6 @@ fn encoded_tool_name_stays_mapped_to_declared_tool_name() {
                 "input": "patch body"
             }
         }),
-        &mut |update| updates.push(update),
     )
     .unwrap();
 
@@ -722,9 +720,7 @@ fn parser_maps_wire_tool_name_back_to_declared_tool_name() {
         format: None,
     }]);
     let mut state = ResponseState::with_tool_names(tool_names);
-    let mut updates = Vec::new();
-
-    let done = apply_response_event(
+    let (done, updates) = apply_response_event(
         &mut state,
         &json!({
             "type": "response.output_item.done",
@@ -736,7 +732,6 @@ fn parser_maps_wire_tool_name_back_to_declared_tool_name() {
                 "arguments": "{\"command\":\"pwd\"}"
             }
         }),
-        &mut |update| updates.push(update),
     )
     .unwrap();
 
@@ -957,17 +952,13 @@ fn preserves_nonzero_text_output_order() {
 
 #[test]
 fn streaming_parser_emits_typed_updates() {
-    let mut updates = Vec::new();
-    let response = parse_response_events_with_updates(
-            [
-                r#"{"type":"response.output_text.delta","delta":"hel","output_index":0}"#,
-                r#"{"type":"response.output_text.delta","delta":"lo","output_index":0}"#,
-                r#"{"type":"response.reasoning_summary_text.delta","delta":"think","output_index":1}"#,
-                r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":2,"output_tokens":3}}}"#,
-            ],
-            |update| updates.push(update),
-        )
-        .unwrap();
+    let (response, updates) = collect_response_events_with_updates([
+        r#"{"type":"response.output_text.delta","delta":"hel","output_index":0}"#,
+        r#"{"type":"response.output_text.delta","delta":"lo","output_index":0}"#,
+        r#"{"type":"response.reasoning_summary_text.delta","delta":"think","output_index":1}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":2,"output_tokens":3}}}"#,
+    ])
+    .unwrap();
 
     assert_eq!(first_message(&response).text_content(), "hello");
     assert!(matches!(
@@ -1104,15 +1095,11 @@ fn captures_reasoning_summary_and_encrypted_reasoning_item() {
 
 #[test]
 fn preserves_unknown_completed_provider_items() {
-    let mut updates = Vec::new();
-    let response = parse_response_events_with_updates(
-            [
-                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"computer_call","id":"cc_1","action":{"type":"screenshot"}}}"#,
-                r#"{"type":"response.completed"}"#,
-            ],
-            |update| updates.push(update),
-        )
-        .unwrap();
+    let (response, updates) = collect_response_events_with_updates([
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"computer_call","id":"cc_1","action":{"type":"screenshot"}}}"#,
+        r#"{"type":"response.completed"}"#,
+    ])
+    .unwrap();
 
     assert!(matches!(
         &response.items[0],

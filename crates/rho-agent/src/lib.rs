@@ -8,21 +8,21 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
+use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt, join_all};
 use rho::{
     Item, ItemBlock, ItemKind, Message, MessagePhase, ProviderRequest, ProviderResponse,
     ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult,
 };
-use rho_provider_responses::{ProviderSession, ResponsesUpdate};
+use rho_provider_responses::{ProviderSession, ResponsesStream, ResponsesUpdate};
 use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use rho_tool_shell::ShellTools;
 
-pub type ProviderFuture = BoxFuture<'static, Result<ProviderResponse>>;
+pub type ProviderStream = ResponsesStream;
 pub type ToolFuture = BoxFuture<'static, ToolResult>;
-type ProviderUpdateHandler = Arc<Mutex<Box<dyn FnMut(ResponsesUpdate) + Send>>>;
+type ProviderUpdateHandler = Box<dyn FnMut(ResponsesUpdate) + Send>;
 type AgentUpdateHandler = Arc<Mutex<Box<dyn FnMut(AgentUpdate) + Send>>>;
-pub type StreamedTranscript = Arc<Mutex<StreamingTranscript>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentUpdate {
@@ -34,9 +34,7 @@ pub enum AgentProvider {
     Responses(ProviderSession),
     #[cfg(test)]
     Test {
-        complete: Arc<
-            dyn Fn(ProviderRequest, Option<ProviderUpdateHandler>) -> ProviderFuture + Send + Sync,
-        >,
+        stream: Arc<dyn Fn(ProviderRequest) -> ProviderStream + Send + Sync>,
     },
 }
 
@@ -55,8 +53,8 @@ pub enum AgentState {
     #[default]
     Idle,
     ApiRequest {
-        streamed_transcript: StreamedTranscript,
-        future: ProviderFuture,
+        streamed_transcript: StreamingTranscript,
+        stream: ProviderStream,
     },
     WaitingForTools {
         futures: Vec<PendingToolCall>,
@@ -125,7 +123,7 @@ impl Agent {
         mut self,
         on_update: impl FnMut(ResponsesUpdate) + Send + 'static,
     ) -> Self {
-        self.provider_updates = Some(Arc::new(Mutex::new(Box::new(on_update))));
+        self.provider_updates = Some(Box::new(on_update));
         self
     }
 
@@ -228,14 +226,22 @@ impl Agent {
         self.state = match state {
             AgentState::Idle => self.start_next_request().await?,
             AgentState::ApiRequest {
-                streamed_transcript,
-                future,
-            } => match future.await {
-                Ok(response) => {
-                    self.finish_provider_request(response, streamed_transcript)
-                        .await?
+                mut streamed_transcript,
+                mut stream,
+            } => loop {
+                match stream.next().await {
+                    Some(Ok(update)) => {
+                        streamed_transcript.record(&update);
+                        notify_provider_update(&mut self.provider_updates, update.clone());
+                        if let ResponsesUpdate::Finished(response) = update {
+                            break self
+                                .finish_provider_request(response, streamed_transcript)
+                                .await?;
+                        }
+                    }
+                    Some(Err(error)) => return Err(error),
+                    None => bail!("provider stream ended before final response"),
                 }
-                Err(error) => return Err(error),
             },
             AgentState::WaitingForTools {
                 futures,
@@ -275,13 +281,9 @@ impl Agent {
             tools: self.tools.iter().flat_map(AgentTools::specs).collect(),
         };
 
-        let streamed_transcript = Arc::new(Mutex::new(StreamingTranscript::default()));
+        let streamed_transcript = StreamingTranscript::default();
         Ok(AgentState::ApiRequest {
-            future: self.provider.complete(
-                request.clone(),
-                self.provider_updates.clone(),
-                Arc::clone(&streamed_transcript),
-            ),
+            stream: self.provider.stream(request),
             streamed_transcript,
         })
     }
@@ -289,12 +291,9 @@ impl Agent {
     async fn finish_provider_request(
         &mut self,
         mut response: ProviderResponse,
-        streamed_transcript: StreamedTranscript,
+        streamed_transcript: StreamingTranscript,
     ) -> Result<AgentState> {
-        streamed_transcript
-            .lock()
-            .expect("streamed transcript lock")
-            .supplement_response(&mut response);
+        streamed_transcript.supplement_response(&mut response);
         let provider_response_id = response.provider_response_id.clone();
 
         let tool_calls = response
@@ -445,6 +444,12 @@ fn notify_agent_update(handler: &Option<AgentUpdateHandler>, update: AgentUpdate
     }
 }
 
+fn notify_provider_update(handler: &mut Option<ProviderUpdateHandler>, update: ResponsesUpdate) {
+    if let Some(handler) = handler {
+        handler(update);
+    }
+}
+
 impl StreamingTranscript {
     fn record(&mut self, update: &ResponsesUpdate) {
         match update {
@@ -540,44 +545,11 @@ impl AgentStore {
 }
 
 impl AgentProvider {
-    fn complete(
-        &self,
-        request: ProviderRequest,
-        provider_updates: Option<ProviderUpdateHandler>,
-        streamed_transcript: StreamedTranscript,
-    ) -> ProviderFuture {
+    fn stream(&self, request: ProviderRequest) -> ProviderStream {
         match self {
-            AgentProvider::Responses(session) => session
-                .complete_streaming(request, move |update| {
-                    streamed_transcript
-                        .lock()
-                        .expect("streamed transcript lock")
-                        .record(&update);
-                    if let Some(provider_updates) = &provider_updates {
-                        let mut on_update = provider_updates.lock().expect("provider update lock");
-                        on_update(update);
-                    }
-                })
-                .boxed(),
+            AgentProvider::Responses(session) => session.stream(request),
             #[cfg(test)]
-            AgentProvider::Test { complete } => {
-                let provider_updates = {
-                    let streamed_transcript = Arc::clone(&streamed_transcript);
-                    Some(Arc::new(Mutex::new(Box::new(move |update| {
-                        streamed_transcript
-                            .lock()
-                            .expect("streamed transcript lock")
-                            .record(&update);
-                        if let Some(provider_updates) = &provider_updates {
-                            let mut on_update =
-                                provider_updates.lock().expect("provider update lock");
-                            on_update(update);
-                        }
-                    })
-                        as Box<dyn FnMut(ResponsesUpdate) + Send>)))
-                };
-                complete(request, provider_updates)
-            }
+            AgentProvider::Test { stream } => stream(request),
         }
     }
 }
