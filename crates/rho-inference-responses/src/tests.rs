@@ -12,7 +12,7 @@ use super::oauth::{OAuthFile, ResolvedAuth, ResponsesAuth, ResponsesOAuthCredent
 use super::ws::{WebSocketPoolKey, WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 
-fn first_message(response: &ProviderResponse) -> &Message {
+fn first_message(response: &InferenceResponse) -> &Message {
     response
         .items
         .iter()
@@ -23,7 +23,7 @@ fn first_message(response: &ProviderResponse) -> &Message {
         .expect("message item")
 }
 
-fn first_tool_call(response: &ProviderResponse) -> &ToolCall {
+fn first_tool_call(response: &InferenceResponse) -> &ToolCall {
     response
         .items
         .iter()
@@ -96,8 +96,8 @@ impl Sink<WsMessage> for PendingSocket {
 
 #[test]
 fn builds_responses_request_with_tools_and_item_timeline() {
-    let session = ProviderSession::new("gpt-test").with_prompt_cache_key("cache-key");
-    let request = ProviderRequest {
+    let session = InferenceService::new("gpt-test").with_prompt_cache_key("cache-key");
+    let request = InferenceRequest {
         input: vec![
             ItemBlock::Local {
                 items: vec![Item {
@@ -105,7 +105,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
                     kind: ItemKind::Message(Message::text(Role::System, "be concise")),
                 }],
             },
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: Some("resp_prev".to_owned()),
                 items: Vec::new(),
             },
@@ -143,7 +143,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
         }],
     };
 
-    let body = ResponsesRequest::from_provider_request(&session, request);
+    let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["model"], "gpt-test");
@@ -167,8 +167,8 @@ fn builds_responses_request_with_tools_and_item_timeline() {
 
 #[test]
 fn omits_tool_choice_without_declared_tools() {
-    let session = ProviderSession::new("gpt-test");
-    let request = ProviderRequest {
+    let session = InferenceService::new("gpt-test");
+    let request = InferenceRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
                 id: ItemId("item-0".to_owned()),
@@ -178,7 +178,7 @@ fn omits_tool_choice_without_declared_tools() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&session, request);
+    let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("tool_choice").is_none());
@@ -190,10 +190,10 @@ fn websocket_pool_key_requires_chatgpt_pool_and_prompt_cache_key() {
         bearer_token: "token".to_owned(),
         account_id: Some("acct".to_owned()),
     };
-    let session = ProviderSession::new("gpt-test").with_prompt_cache_key("thread-1");
-    let mut body = ResponsesRequest::from_provider_request(
+    let session = InferenceService::new("gpt-test").with_prompt_cache_key("thread-1");
+    let mut body = ResponsesRequest::from_inference_request(
         &session,
-        ProviderRequest {
+        InferenceRequest {
             input: vec![ItemBlock::Local {
                 items: vec![Item {
                     id: ItemId("item-0".to_owned()),
@@ -216,7 +216,7 @@ fn websocket_pool_key_requires_chatgpt_pool_and_prompt_cache_key() {
 
 #[test]
 fn stamps_phase_on_assistant_messages_when_supported() {
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![ItemBlock::Local {
             items: vec![
                 Item {
@@ -235,7 +235,8 @@ fn stamps_phase_on_assistant_messages_when_supported() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
+    let body =
+        ResponsesRequest::from_inference_request(&InferenceService::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["phase"], "commentary");
@@ -244,7 +245,7 @@ fn stamps_phase_on_assistant_messages_when_supported() {
 
 #[test]
 fn omits_empty_reasoning_request_when_no_effort_is_set() {
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
                 id: ItemId("item-0".to_owned()),
@@ -254,7 +255,8 @@ fn omits_empty_reasoning_request_when_no_effort_is_set() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
+    let body =
+        ResponsesRequest::from_inference_request(&InferenceService::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("reasoning").is_none());
@@ -262,8 +264,8 @@ fn omits_empty_reasoning_request_when_no_effort_is_set() {
 
 #[test]
 fn serializes_prompt_cache_key() {
-    let session = ProviderSession::new("gpt-test").with_prompt_cache_key("cache-key");
-    let request = ProviderRequest {
+    let session = InferenceService::new("gpt-test").with_prompt_cache_key("cache-key");
+    let request = InferenceRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
                 id: ItemId("item-0".to_owned()),
@@ -273,7 +275,7 @@ fn serializes_prompt_cache_key() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&session, request);
+    let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["prompt_cache_key"], "cache-key");
@@ -281,7 +283,7 @@ fn serializes_prompt_cache_key() {
 
 #[test]
 fn previous_response_hint_slices_input_in_provider() {
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![
             ItemBlock::Local {
                 items: vec![Item {
@@ -295,7 +297,7 @@ fn previous_response_hint_slices_input_in_provider() {
                     kind: ItemKind::Message(Message::text(Role::User, "first")),
                 }],
             },
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: Some("resp_1".to_owned()),
                 items: vec![Item {
                     id: ItemId("item-2".to_owned()),
@@ -312,7 +314,8 @@ fn previous_response_hint_slices_input_in_provider() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
+    let body =
+        ResponsesRequest::from_inference_request(&InferenceService::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["instructions"], "system rules");
@@ -323,7 +326,7 @@ fn previous_response_hint_slices_input_in_provider() {
 
 #[test]
 fn previous_response_without_valid_boundary_replays_full_history() {
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![
             ItemBlock::Local {
                 items: vec![Item {
@@ -331,7 +334,7 @@ fn previous_response_without_valid_boundary_replays_full_history() {
                     kind: ItemKind::Message(Message::text(Role::User, "first")),
                 }],
             },
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: None,
                 items: vec![Item {
                     id: ItemId("item-1".to_owned()),
@@ -348,7 +351,8 @@ fn previous_response_without_valid_boundary_replays_full_history() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
+    let body =
+        ResponsesRequest::from_inference_request(&InferenceService::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("previous_response_id").is_none());
@@ -357,7 +361,7 @@ fn previous_response_without_valid_boundary_replays_full_history() {
 
 #[test]
 fn stale_previous_response_error_builds_full_replay_request() {
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![
             ItemBlock::Local {
                 items: vec![Item {
@@ -365,7 +369,7 @@ fn stale_previous_response_error_builds_full_replay_request() {
                     kind: ItemKind::Message(Message::text(Role::User, "first")),
                 }],
             },
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: Some("resp_1".to_owned()),
                 items: vec![Item {
                     id: ItemId("item-1".to_owned()),
@@ -381,8 +385,8 @@ fn stale_previous_response_error_builds_full_replay_request() {
         ],
         tools: Vec::new(),
     };
-    let sliced = serde_json::to_value(ResponsesRequest::from_provider_request(
-        &ProviderSession::new("gpt-test"),
+    let sliced = serde_json::to_value(ResponsesRequest::from_inference_request(
+        &InferenceService::new("gpt-test"),
         request.clone(),
     ))
     .unwrap();
@@ -390,7 +394,7 @@ fn stale_previous_response_error_builds_full_replay_request() {
     assert_eq!(sliced["input"].as_array().unwrap().len(), 1);
 
     let replay = stale_previous_response_replay_request(
-        &ProviderSession::new("gpt-test"),
+        &InferenceService::new("gpt-test"),
         &request,
         &anyhow::anyhow!("stream error: previous_response_id expired"),
     )
@@ -403,7 +407,7 @@ fn stale_previous_response_error_builds_full_replay_request() {
 
 #[test]
 fn non_stale_previous_response_error_does_not_build_replay_request() {
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
                 id: ItemId("item-0".to_owned()),
@@ -414,7 +418,7 @@ fn non_stale_previous_response_error_does_not_build_replay_request() {
     };
 
     let replay = stale_previous_response_replay_request(
-        &ProviderSession::new("gpt-test"),
+        &InferenceService::new("gpt-test"),
         &request,
         &anyhow::anyhow!("stream error: rate limit"),
     );
@@ -425,7 +429,7 @@ fn non_stale_previous_response_error_does_not_build_replay_request() {
 #[test]
 fn chatgpt_codex_request_omits_compaction_request_by_default() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
                 id: ItemId("item-0".to_owned()),
@@ -435,8 +439,8 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(
-        &ProviderSession::chatgpt_codex_with_auth("gpt-test", auth),
+    let body = ResponsesRequest::from_inference_request(
+        &InferenceService::chatgpt_codex_with_auth("gpt-test", auth),
         request,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -448,8 +452,8 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
 
 #[test]
 fn configured_compaction_threshold_overrides_provider_default() {
-    let session = ProviderSession::new("gpt-test").with_compaction_threshold(42_000);
-    let request = ProviderRequest {
+    let session = InferenceService::new("gpt-test").with_compaction_threshold(42_000);
+    let request = InferenceRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
                 id: ItemId("item-0".to_owned()),
@@ -459,7 +463,7 @@ fn configured_compaction_threshold_overrides_provider_default() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&session, request);
+    let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["type"], "compaction_trigger");
@@ -471,8 +475,8 @@ fn configured_compaction_threshold_overrides_provider_default() {
 #[test]
 fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = ProviderSession::chatgpt_codex_with_auth("gpt-test", auth).with_compaction();
-    let request = ProviderRequest {
+    let session = InferenceService::chatgpt_codex_with_auth("gpt-test", auth).with_compaction();
+    let request = InferenceRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {
                 id: ItemId("item-0".to_owned()),
@@ -482,7 +486,7 @@ fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&session, request);
+    let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["type"], "compaction_trigger");
@@ -494,7 +498,7 @@ fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
 
 #[test]
 fn compaction_replay_trims_before_latest_compaction_item() {
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![
             ItemBlock::Local {
                 items: vec![Item {
@@ -502,7 +506,7 @@ fn compaction_replay_trims_before_latest_compaction_item() {
                     kind: ItemKind::Message(Message::text(Role::User, "before")),
                 }],
             },
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: Some("resp_compaction".to_owned()),
                 items: vec![Item {
                     id: ItemId("item-1".to_owned()),
@@ -522,7 +526,8 @@ fn compaction_replay_trims_before_latest_compaction_item() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
+    let body =
+        ResponsesRequest::from_inference_request(&InferenceService::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"].as_array().unwrap().len(), 2);
@@ -537,9 +542,9 @@ fn replays_reasoning_provider_item() {
         kind: ProviderItemKind::Reasoning,
         payload: json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed"}),
     });
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: None,
                 items: vec![Item {
                     id: ItemId("item-0".to_owned()),
@@ -556,8 +561,8 @@ fn replays_reasoning_provider_item() {
         tools: Vec::new(),
     };
 
-    let body = serde_json::to_value(ResponsesRequest::from_provider_request(
-        &ProviderSession::new("gpt-test"),
+    let body = serde_json::to_value(ResponsesRequest::from_inference_request(
+        &InferenceService::new("gpt-test"),
         request,
     ))
     .unwrap();
@@ -567,9 +572,9 @@ fn replays_reasoning_provider_item() {
 
 #[test]
 fn does_not_replay_unknown_provider_items() {
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: Some("resp_1".to_owned()),
                 items: vec![Item {
                     id: ItemId("item-0".to_owned()),
@@ -589,7 +594,8 @@ fn does_not_replay_unknown_provider_items() {
         tools: Vec::new(),
     };
 
-    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
+    let body =
+        ResponsesRequest::from_inference_request(&InferenceService::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"].as_array().unwrap().len(), 1);
@@ -606,9 +612,9 @@ fn serializes_custom_tool_calls_and_results() {
             content: "custom output".to_owned(),
         },
     };
-    let request = ProviderRequest {
+    let request = InferenceRequest {
         input: vec![
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: None,
                 items: vec![Item {
                     id: ItemId("item-0".to_owned()),
@@ -639,7 +645,8 @@ fn serializes_custom_tool_calls_and_results() {
         }],
     };
 
-    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
+    let body =
+        ResponsesRequest::from_inference_request(&InferenceService::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["tools"][0]["type"], "custom");
@@ -662,8 +669,8 @@ fn encoded_tool_name_stays_mapped_to_declared_tool_name() {
         input_schema: Value::Null,
         format: Some(ToolFormat::Text),
     };
-    let request = ProviderRequest {
-        input: vec![ItemBlock::ProviderResponse {
+    let request = InferenceRequest {
+        input: vec![ItemBlock::InferenceResponse {
             provider_response_id: None,
             items: vec![Item {
                 id: ItemId("item-0".to_owned()),
@@ -678,7 +685,8 @@ fn encoded_tool_name_stays_mapped_to_declared_tool_name() {
         tools: vec![tool.clone()],
     };
 
-    let body = ResponsesRequest::from_provider_request(&ProviderSession::new("gpt-test"), request);
+    let body =
+        ResponsesRequest::from_inference_request(&InferenceService::new("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["tools"][0]["name"], "local_patch");
@@ -776,7 +784,7 @@ fn tool_name_map_keeps_wire_name_for_ambiguous_collisions() {
 #[test]
 fn chatgpt_codex_config_sets_endpoint_defaults() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = ProviderSession::chatgpt_codex_with_auth("gpt-test", auth);
+    let session = InferenceService::chatgpt_codex_with_auth("gpt-test", auth);
 
     assert_eq!(session.base_url, DEFAULT_CHATGPT_BASE_URL);
     assert_eq!(session.compaction, None);
@@ -812,7 +820,7 @@ async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
 #[test]
 fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
     let (_temp, auth) = test_oauth_file("token", Some("acct_1"));
-    let mut session = ProviderSession::chatgpt_codex_with_auth("gpt-test", auth);
+    let mut session = InferenceService::chatgpt_codex_with_auth("gpt-test", auth);
     session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
     let auth = session.auth.resolve().unwrap();
@@ -832,7 +840,7 @@ fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
 #[test]
 fn websocket_request_uses_oauth_bearer_without_account_header() {
     let (_temp, auth) = test_oauth_file("sk-test", None);
-    let session = ProviderSession::chatgpt_codex_with_auth("gpt-test", auth);
+    let session = InferenceService::chatgpt_codex_with_auth("gpt-test", auth);
 
     let auth = session.auth.resolve().unwrap();
     let request = build_ws_request(&session, None, auth.as_ref()).unwrap();
@@ -852,7 +860,7 @@ fn websocket_request_uses_oauth_file_credentials() {
         account_id: Some("acct_file".to_owned()),
     })
     .unwrap();
-    let mut session = ProviderSession::chatgpt_codex_with_auth(
+    let mut session = InferenceService::chatgpt_codex_with_auth(
         "gpt-test",
         ResponsesAuth::oauth_file(file.path()),
     );

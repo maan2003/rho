@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
 use rho::{
-    ItemBlock, ItemKind, Message, MessagePhase, ProviderItemKind, ProviderRequest, Role,
+    InferenceRequest, ItemBlock, ItemKind, Message, MessagePhase, ProviderItemKind, Role,
     ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec, ToolType,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{ProviderSession, encode_tool_name};
+use crate::{InferenceService, encode_tool_name};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ResponsesRequest {
@@ -47,10 +47,10 @@ pub(crate) struct ContextManagementRequest {
 }
 
 impl ResponsesRequest {
-    pub fn from_provider_request(session: &ProviderSession, request: ProviderRequest) -> Self {
+    pub fn from_inference_request(session: &InferenceService, request: InferenceRequest) -> Self {
         let mut previous_response = None;
         for (index, block) in request.input.iter().enumerate() {
-            let ItemBlock::ProviderResponse {
+            let ItemBlock::InferenceResponse {
                 provider_response_id,
                 items,
             } = block
@@ -73,26 +73,26 @@ impl ResponsesRequest {
             }
         }
 
-        Self::from_provider_request_with_previous(session, request, previous_response)
+        Self::from_inference_request_with_previous(session, request, previous_response)
     }
 
-    pub(crate) fn from_provider_request_full_replay(
-        session: &ProviderSession,
-        request: ProviderRequest,
+    pub(crate) fn from_inference_request_full_replay(
+        session: &InferenceService,
+        request: InferenceRequest,
     ) -> Self {
-        Self::from_provider_request_with_previous(session, request, None)
+        Self::from_inference_request_with_previous(session, request, None)
     }
 
-    fn from_provider_request_with_previous(
-        session: &ProviderSession,
-        request: ProviderRequest,
+    fn from_inference_request_with_previous(
+        session: &InferenceService,
+        request: InferenceRequest,
         previous_response: Option<(String, usize)>,
     ) -> Self {
         let instructions = request
             .input
             .iter()
             .flat_map(|block| match block {
-                ItemBlock::Local { items } | ItemBlock::ProviderResponse { items, .. } => items,
+                ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
             })
             .filter_map(|item| instruction_text_from_item(&item.kind))
             .collect::<Vec<_>>();
@@ -105,7 +105,7 @@ impl ResponsesRequest {
         let input_items = input_blocks
             .iter()
             .flat_map(|block| match block {
-                ItemBlock::Local { items } | ItemBlock::ProviderResponse { items, .. } => items,
+                ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
             })
             .map(|item| item.kind.clone())
             .collect::<Vec<_>>();

@@ -12,8 +12,8 @@ use anyhow::{Result, bail};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use rho::{
-    ItemKind, Message, MessagePhase, ProviderItem, ProviderItemKind, ProviderRequest,
-    ProviderResponse, ReasoningText, ReasoningTextKind, Role, TokenUsage, ToolCall, ToolCallId,
+    InferenceRequest, InferenceResponse, ItemKind, Message, MessagePhase, ProviderItem,
+    ProviderItemKind, ReasoningText, ReasoningTextKind, Role, TokenUsage, ToolCall, ToolCallId,
     ToolSpec, ToolType,
 };
 use serde_json::Value;
@@ -26,7 +26,7 @@ mod session;
 mod ws;
 
 use build_request::ResponsesRequest;
-pub use session::ProviderSession;
+pub use session::InferenceService;
 
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.5";
@@ -64,7 +64,7 @@ pub enum ResponsesUpdate {
     },
     Usage(TokenUsage),
     ResponseId(String),
-    Finished(ProviderResponse),
+    Finished(InferenceResponse),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -76,14 +76,14 @@ fn responses_url(base_url: &str) -> String {
     format!("{}/codex/responses", base_url.trim_end_matches('/'))
 }
 
-impl ProviderSession {
-    pub fn stream(&self, request: ProviderRequest) -> ResponsesStream {
+impl InferenceService {
+    pub fn stream(&self, request: InferenceRequest) -> ResponsesStream {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let session = self.clone();
         let websocket_pool = Arc::clone(&self.websocket_pool);
         tokio::spawn(async move {
             if let Err(error) =
-                stream_provider_request(session, websocket_pool, request, &sender).await
+                stream_inference_request(session, websocket_pool, request, &sender).await
             {
                 let _ = sender.send(Err(error));
             }
@@ -96,14 +96,14 @@ impl ProviderSession {
     }
 }
 
-async fn stream_provider_request(
-    session: ProviderSession,
+async fn stream_inference_request(
+    session: InferenceService,
     websocket_pool: Arc<tokio::sync::Mutex<ws::WebSocketPool>>,
-    request: ProviderRequest,
+    request: InferenceRequest,
     updates: &tokio::sync::mpsc::UnboundedSender<Result<ResponsesUpdate>>,
 ) -> Result<()> {
     let tool_names = tool_name_map(&request.tools);
-    let responses_request = ResponsesRequest::from_provider_request(&session, request.clone());
+    let responses_request = ResponsesRequest::from_inference_request(&session, request.clone());
     match ws::send_websocket(
         &session,
         &websocket_pool,
@@ -136,7 +136,7 @@ async fn stream_provider_request(
 #[allow(dead_code)]
 pub(crate) fn parse_response_events(
     events: impl IntoIterator<Item = impl AsRef<str>>,
-) -> Result<ProviderResponse> {
+) -> Result<InferenceResponse> {
     let mut state = ResponseState::default();
     let mut completed = false;
     for event in events {
@@ -154,7 +154,7 @@ pub(crate) fn parse_response_events(
 #[cfg(test)]
 fn collect_response_events_with_updates(
     events: impl IntoIterator<Item = impl AsRef<str>>,
-) -> Result<(ProviderResponse, Vec<ResponsesUpdate>)> {
+) -> Result<(InferenceResponse, Vec<ResponsesUpdate>)> {
     let mut state = ResponseState::default();
     let mut completed = false;
     let mut updates = Vec::new();
@@ -232,7 +232,7 @@ impl ResponseState {
         call
     }
 
-    pub(crate) fn finish(self) -> ProviderResponse {
+    pub(crate) fn finish(self) -> InferenceResponse {
         let ResponseState {
             message_text_by_output_index,
             tool_calls_by_output_index,
@@ -286,7 +286,7 @@ impl ResponseState {
 
         ordered_items.sort_by_key(|(index, priority, _)| (*index, *priority));
 
-        ProviderResponse {
+        InferenceResponse {
             items: ordered_items.into_iter().map(|(_, _, item)| item).collect(),
             usage,
             provider_response_id,
@@ -662,18 +662,18 @@ fn encode_tool_name(name: &str) -> String {
 }
 
 fn stale_previous_response_replay_request(
-    session: &ProviderSession,
-    request: &ProviderRequest,
+    session: &InferenceService,
+    request: &InferenceRequest,
     error: &anyhow::Error,
 ) -> Option<ResponsesRequest> {
     if !is_stale_previous_response_error(error) {
         return None;
     }
 
-    let sliced = ResponsesRequest::from_provider_request(session, request.clone());
+    let sliced = ResponsesRequest::from_inference_request(session, request.clone());
     sliced.previous_response_id.as_ref()?;
 
-    Some(ResponsesRequest::from_provider_request_full_replay(
+    Some(ResponsesRequest::from_inference_request_full_replay(
         session,
         request.clone(),
     ))

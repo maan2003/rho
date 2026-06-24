@@ -12,7 +12,7 @@ use crate::ws::WebSocketPool;
 use crate::{DEFAULT_CHATGPT_BASE_URL, DEFAULT_MODEL, ResponsesCompaction};
 
 #[derive(Clone)]
-pub struct ProviderSession {
+pub struct InferenceService {
     pub(super) websocket_pool: Arc<Mutex<WebSocketPool>>,
     pub(crate) base_url: String,
     pub(crate) auth: ResponsesAuth,
@@ -21,7 +21,7 @@ pub struct ProviderSession {
     pub(crate) prompt_cache_key: Option<String>,
 }
 
-impl ProviderSession {
+impl InferenceService {
     pub const DEFAULT_MODEL: &'static str = DEFAULT_MODEL;
 
     pub(crate) fn new(model: impl Into<String>) -> Self {
@@ -206,9 +206,9 @@ fn chatgpt_codex_auth_status_line_for(
     )
 }
 
-impl std::fmt::Debug for ProviderSession {
+impl std::fmt::Debug for InferenceService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProviderSession")
+        f.debug_struct("InferenceService")
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
             .field("compaction", &self.compaction)

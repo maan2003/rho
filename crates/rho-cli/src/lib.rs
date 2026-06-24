@@ -2,7 +2,7 @@
 //!
 //! This crate deliberately assembles concrete rho building blocks instead of
 //! defining a reusable CLI framework: `rho-agent` owns the harness loop,
-//! `rho-provider-responses` owns ChatGPT/Codex Responses transport, and
+//! `rho-inference-responses` owns ChatGPT/Codex Responses transport, and
 //! `rho-tool-shell` owns the built-in shell/apply_patch tools. Fork this crate
 //! when the desired user experience diverges.
 
@@ -12,13 +12,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use rho::{ItemBlock, ItemKind, ReasoningTextKind, Role, ToolCall, ToolResult, ToolResultStatus};
-use rho_agent::{Agent, AgentProvider, AgentStore, AgentTools, AgentUpdate};
+use rho_agent::{Agent, AgentInference, AgentStore, AgentTools, AgentUpdate};
 use rho_cli_term_raw::{
     Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
-use rho_provider_responses::{ProviderSession, ResponsesUpdate};
+use rho_inference_responses::{InferenceService, ResponsesUpdate};
 use rho_store_cbor::CborLog;
 use rho_tool_shell::ShellTools;
 use tokio::sync::Mutex as AsyncMutex;
@@ -34,14 +35,7 @@ const MAX_AGENT_STEPS_PER_PROMPT: usize = 128;
 const DEFAULT_COMPACTION_THRESHOLD: u64 = 220_000;
 
 pub fn main() -> Result<()> {
-    if std::env::args()
-        .skip(1)
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
-        print!("{HELP}");
-        return Ok(());
-    }
-    let args = Args::parse(std::env::args().skip(1))?;
+    let args = Args::parse_or_exit(std::env::args().skip(1));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -58,24 +52,23 @@ async fn run(command: Command) -> Result<()> {
             }
         }
         Command::Auth(auth) => run_auth(auth).await,
-        Command::Provider(provider) => run_provider(provider).await,
     }
 }
 
-async fn run_provider(command: ProviderCommand) -> Result<()> {
+async fn run_auth(command: AuthCommand) -> Result<()> {
     match command {
-        ProviderCommand::Add => {
-            let name = prompt_with_default("Provider namespace", DEFAULT_AUTH_NAME)?;
+        AuthCommand::Add => {
+            let name = prompt_with_default("Auth namespace", DEFAULT_AUTH_NAME)?;
             let credentials_json = login_openai_codex()?;
             println!(
                 "{}",
-                ProviderSession::chatgpt_codex_auth_save_json(name.trim(), &credentials_json)?
+                InferenceService::chatgpt_codex_auth_save_json(name.trim(), &credentials_json)?
             );
             Ok(())
         }
-        ProviderCommand::List => list_providers(),
-        ProviderCommand::Remove { name } => {
-            let (path, deleted) = ProviderSession::chatgpt_codex_auth_delete(name.trim())?;
+        AuthCommand::List => list_auth_credentials(),
+        AuthCommand::Remove { name } => {
+            let (path, deleted) = InferenceService::chatgpt_codex_auth_delete(name.trim())?;
             if deleted {
                 println!("removed {}", path.display());
             } else {
@@ -83,27 +76,25 @@ async fn run_provider(command: ProviderCommand) -> Result<()> {
             }
             Ok(())
         }
-    }
-}
-
-async fn run_auth(command: AuthCommand) -> Result<()> {
-    match command {
         AuthCommand::Path { name } => {
             println!(
                 "{}",
-                ProviderSession::chatgpt_codex_auth_file_path(name)?.display()
+                InferenceService::chatgpt_codex_auth_file_path(name)?.display()
             );
             Ok(())
         }
         AuthCommand::Status { name } => {
-            println!("{}", ProviderSession::chatgpt_codex_auth_status_line(name)?);
+            println!(
+                "{}",
+                InferenceService::chatgpt_codex_auth_status_line(name)?
+            );
             Ok(())
         }
         AuthCommand::Import { name, path } => {
             let credentials_json = read_oauth_credentials_json(path)?;
             println!(
                 "{}",
-                ProviderSession::chatgpt_codex_auth_save_json(name, &credentials_json)?
+                InferenceService::chatgpt_codex_auth_save_json(name, &credentials_json)?
             );
             Ok(())
         }
@@ -111,7 +102,7 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
 }
 
 fn login_openai_codex() -> Result<String> {
-    let (auth_url, expected_state, verifier) = ProviderSession::chatgpt_codex_auth_login_url();
+    let (auth_url, expected_state, verifier) = InferenceService::chatgpt_codex_auth_login_url();
 
     eprintln!();
     eprintln!("Open this URL in your browser:");
@@ -126,7 +117,7 @@ fn login_openai_codex() -> Result<String> {
     let mut redirect_input = String::new();
     io::stdin().read_line(&mut redirect_input)?;
     eprintln!("Exchanging code for tokens...");
-    ProviderSession::chatgpt_codex_exchange_redirect_url(
+    InferenceService::chatgpt_codex_exchange_redirect_url(
         &redirect_input,
         &expected_state,
         &verifier,
@@ -161,14 +152,14 @@ fn read_oauth_credentials_json(path: Option<PathBuf>) -> Result<String> {
     Ok(text)
 }
 
-fn list_providers() -> Result<()> {
-    let providers = ProviderSession::chatgpt_codex_auth_list()
-        .context("reading provider credentials directory")?;
-    if providers.is_empty() {
-        println!("No provider credentials configured.");
+fn list_auth_credentials() -> Result<()> {
+    let credentials = InferenceService::chatgpt_codex_auth_list()
+        .context("reading auth credentials directory")?;
+    if credentials.is_empty() {
+        println!("No auth credentials configured.");
         return Ok(());
     }
-    for (name, status) in providers {
+    for (name, status) in credentials {
         println!("{name}\tchatgpt\t{status}");
     }
     Ok(())
@@ -212,19 +203,19 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 }
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
-    let provider = AgentProvider::Responses(build_provider_session(args));
+    let inference = AgentInference::Responses(build_inference_service(args));
     let tools = vec![AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT))];
     let mut agent = if args.no_store {
-        Agent::new(provider, tools)
+        Agent::new(inference, tools)
     } else {
         let store = AgentStore::CborLog(CborLog::new(args.session_path()?));
-        Agent::from_store(provider, tools, store).await?
+        Agent::from_store(inference, tools, store).await?
     };
     if let Some(renderer) = renderer {
-        let provider_renderer = Arc::clone(&renderer);
-        agent = agent.with_provider_updates(move |update| {
-            if let Ok(mut renderer) = provider_renderer.lock() {
-                renderer.handle_provider(update);
+        let inference_renderer = Arc::clone(&renderer);
+        agent = agent.with_inference_updates(move |update| {
+            if let Ok(mut renderer) = inference_renderer.lock() {
+                renderer.handle_inference(update);
             }
         });
         agent = agent.with_agent_updates(move |update| {
@@ -236,9 +227,9 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
     Ok(agent)
 }
 
-fn build_provider_session(args: &ChatArgs) -> ProviderSession {
+fn build_inference_service(args: &ChatArgs) -> InferenceService {
     let mut session =
-        ProviderSession::chatgpt_codex_with_auth_file(args.model.clone(), args.auth_file.clone())
+        InferenceService::chatgpt_codex_with_auth_file(args.model.clone(), args.auth_file.clone())
             .with_compaction_threshold(DEFAULT_COMPACTION_THRESHOLD);
     if !args.no_store {
         session = session.with_prompt_cache_key(args.session.clone());
@@ -428,7 +419,7 @@ impl ChatTerm {
         self.print_system("loaded previous session");
         for block in blocks {
             for item in match block {
-                ItemBlock::Local { items } | ItemBlock::ProviderResponse { items, .. } => items,
+                ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
             } {
                 match &item.kind {
                     ItemKind::Message(message) => {
@@ -561,7 +552,7 @@ impl StreamingRenderer {
         }
     }
 
-    fn handle_provider(&mut self, update: ResponsesUpdate) {
+    fn handle_inference(&mut self, update: ResponsesUpdate) {
         match update {
             ResponsesUpdate::TextDelta { text, .. } => {
                 self.assistant_text.push_str(&text);
@@ -764,168 +755,98 @@ struct Args {
 enum Command {
     Chat(ChatArgs),
     Auth(AuthCommand),
-    Provider(ProviderCommand),
 }
 
-#[derive(Clone)]
+#[derive(Parser)]
+#[command(name = "rho")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
+    #[command(flatten)]
+    chat: ChatArgs,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+}
+
+#[derive(Clone, Subcommand)]
 enum AuthCommand {
-    Path { name: String },
-    Status { name: String },
-    Import { name: String, path: Option<PathBuf> },
-}
-
-#[derive(Clone)]
-enum ProviderCommand {
     Add,
+    #[command(alias = "ls")]
     List,
-    Remove { name: String },
+    #[command(alias = "delete")]
+    Remove {
+        #[arg(default_value = DEFAULT_AUTH_NAME)]
+        name: String,
+    },
+    Path {
+        #[arg(long, default_value = DEFAULT_AUTH_NAME)]
+        name: String,
+    },
+    Status {
+        #[arg(long, default_value = DEFAULT_AUTH_NAME)]
+        name: String,
+    },
+    Import {
+        #[arg(long, default_value = DEFAULT_AUTH_NAME)]
+        name: String,
+        #[arg(long = "file")]
+        path: Option<PathBuf>,
+    },
 }
 
-#[derive(Clone)]
+#[derive(Clone, clap::Args)]
 struct ChatArgs {
+    #[arg(long, default_value_t = InferenceService::DEFAULT_MODEL.to_owned())]
     model: String,
+    #[arg(long = "auth-file", default_value = DEFAULT_AUTH_NAME, value_parser = auth_file_arg)]
     auth_file: PathBuf,
+    #[arg(long, default_value = DEFAULT_SESSION_NAME)]
     session: String,
+    #[arg(long = "session-path")]
     session_path: Option<PathBuf>,
+    #[arg(long = "prompt-stdin")]
     prompt_stdin: bool,
+    #[arg(long = "no-store")]
     no_store: bool,
 }
 
 impl Args {
-    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
-        let first = args.next();
-        if matches!(first.as_deref(), Some("auth")) {
-            return Ok(Self {
-                command: Command::Auth(AuthCommand::parse(args)?),
-            });
-        }
-        if matches!(first.as_deref(), Some("provider")) {
-            return Ok(Self {
-                command: Command::Provider(ProviderCommand::parse(args)?),
-            });
-        }
-
-        Ok(Self {
-            command: Command::Chat(ChatArgs::parse(first.into_iter().chain(args))?),
-        })
+    fn parse_or_exit(args: impl Iterator<Item = String>) -> Self {
+        Self::try_parse(args).unwrap_or_else(|error| error.exit())
     }
-}
 
-impl ProviderCommand {
-    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
-        let Some(subcommand) = args.next() else {
-            bail!("missing provider command\n\n{HELP}");
+    fn try_parse(args: impl Iterator<Item = String>) -> std::result::Result<Self, clap::Error> {
+        let cli = Cli::try_parse_from(std::iter::once("rho".to_owned()).chain(args))?;
+        let command = match cli.command {
+            Some(CliCommand::Auth { command }) => Command::Auth(command),
+            None => Command::Chat(cli.chat),
         };
-        match subcommand.as_str() {
-            "add" => {
-                if args.next().is_some() {
-                    bail!(
-                        "rho provider add does not accept arguments; it prompts for provider details"
-                    );
-                }
-                Ok(Self::Add)
-            }
-            "list" | "status" => {
-                if args.next().is_some() {
-                    bail!("rho provider {subcommand} does not accept arguments");
-                }
-                Ok(Self::List)
-            }
-            "remove" | "delete" => {
-                let name = args.next().unwrap_or_else(|| DEFAULT_AUTH_NAME.to_owned());
-                if args.next().is_some() {
-                    bail!("rho provider {subcommand} accepts at most one provider namespace");
-                }
-                Ok(Self::Remove { name })
-            }
-            unknown => bail!("unknown provider command `{unknown}`\n\n{HELP}"),
-        }
+        let args = Self { command };
+        args.validate()?;
+        Ok(args)
     }
-}
 
-impl AuthCommand {
-    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
-        let Some(subcommand) = args.next() else {
-            bail!("missing auth command\n\n{HELP}");
-        };
-        match subcommand.as_str() {
-            "path" => {
-                let mut name = DEFAULT_AUTH_NAME.to_owned();
-                while let Some(arg) = args.next() {
-                    match arg.as_str() {
-                        "--name" => name = take_arg(&mut args, "--name")?,
-                        unknown => bail!("unknown auth path argument `{unknown}`\n\n{HELP}"),
-                    }
-                }
-                Ok(Self::Path { name })
+    fn validate(&self) -> std::result::Result<(), clap::Error> {
+        if let Command::Chat(chat) = &self.command {
+            if chat.no_store && chat.session_path.is_some() {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--no-store cannot be used with --session-path",
+                ));
             }
-            "status" => {
-                let mut name = DEFAULT_AUTH_NAME.to_owned();
-                while let Some(arg) = args.next() {
-                    match arg.as_str() {
-                        "--name" => name = take_arg(&mut args, "--name")?,
-                        unknown => bail!("unknown auth status argument `{unknown}`\n\n{HELP}"),
-                    }
-                }
-                Ok(Self::Status { name })
-            }
-            "import" => {
-                let mut name = DEFAULT_AUTH_NAME.to_owned();
-                let mut path = None;
-                while let Some(arg) = args.next() {
-                    match arg.as_str() {
-                        "--name" => name = take_arg(&mut args, "--name")?,
-                        "--file" => path = Some(take_arg(&mut args, "--file")?.into()),
-                        unknown => bail!("unknown auth import argument `{unknown}`\n\n{HELP}"),
-                    }
-                }
-                Ok(Self::Import { name, path })
-            }
-            unknown => bail!("unknown auth command `{unknown}`\n\n{HELP}"),
         }
+        Ok(())
     }
 }
 
 impl ChatArgs {
-    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
-        let mut output = Self {
-            model: ProviderSession::DEFAULT_MODEL.to_owned(),
-            auth_file: ProviderSession::chatgpt_codex_auth_file_path(DEFAULT_AUTH_NAME)
-                .context("opening default OAuth file")?,
-            session: DEFAULT_SESSION_NAME.to_owned(),
-            session_path: None,
-            prompt_stdin: false,
-            no_store: false,
-        };
-
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--model" => output.model = take_arg(&mut args, "--model")?,
-                "--auth-file" => {
-                    let value = take_arg(&mut args, "--auth-file")?;
-                    output.auth_file = if value.contains('/') {
-                        value.into()
-                    } else {
-                        ProviderSession::chatgpt_codex_auth_file_path(value)?
-                    };
-                }
-                "--session" => output.session = take_arg(&mut args, "--session")?,
-                "--session-path" => {
-                    output.session_path = Some(take_arg(&mut args, "--session-path")?.into())
-                }
-                "--prompt-stdin" => output.prompt_stdin = true,
-                "--no-store" => output.no_store = true,
-                "-h" | "--help" => bail!("{}", HELP),
-                unknown => bail!("unknown argument `{unknown}`\n\n{HELP}"),
-            }
-        }
-        if output.no_store && output.session_path.is_some() {
-            bail!("--no-store cannot be used with --session-path");
-        }
-
-        Ok(output)
-    }
-
     fn session_path(&self) -> Result<PathBuf> {
         if let Some(path) = &self.session_path {
             return Ok(path.clone());
@@ -940,9 +861,12 @@ impl ChatArgs {
     }
 }
 
-fn take_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
-    args.next()
-        .with_context(|| format!("{name} requires a value"))
+fn auth_file_arg(value: &str) -> std::result::Result<PathBuf, String> {
+    if value.contains('/') {
+        Ok(value.into())
+    } else {
+        InferenceService::chatgpt_codex_auth_file_path(value).map_err(|error| error.to_string())
+    }
 }
 
 fn prompt_text() -> StyledText {
@@ -1012,40 +936,3 @@ fn dim_text(text: &str) -> StyledText {
         Style::default().fg(Color::DarkGrey),
     ))
 }
-
-const HELP: &str = "\
-rho
-
-Usage:
-  rho [--model MODEL] [--auth-file NAME_OR_PATH] [--session NAME]
-  rho --prompt-stdin [--model MODEL] [--auth-file NAME_OR_PATH] [--session NAME]
-  rho auth path [--name NAME]
-  rho auth status [--name NAME]
-  rho auth import [--name NAME] [--file PATH]
-  rho provider add
-  rho provider list
-  rho provider remove [NAME]
-
-Options:
-  --model MODEL              Responses model to use [default: gpt-5.5]
-  --auth-file NAME_OR_PATH   OAuth file name under state/rho/auth.d or explicit path [default: default]
-  --session NAME             Persistent local session name [default: default]
-  --session-path PATH        Explicit CBOR transcript path
-  --no-store                 Run without reading or writing a transcript store
-  --prompt-stdin             Read one prompt from stdin and print the final answer
-  -h, --help                 Show this help
-
-Auth:
-  auth path                  Print the OAuth credentials path
-  auth status                Show whether OAuth credentials are installed
-  auth import                Save OAuth credentials JSON from stdin or --file
-  provider add               Browser OAuth setup and save credentials
-  provider list              List file-based provider credentials
-  provider remove            Remove file-based provider credentials
-
-Controls:
-  Enter                       Send the prompt
-  Shift-Enter, Alt-Enter      Insert a newline
-  Ctrl-C twice                Cancel the running response
-  Ctrl-D                      Exit from an empty prompt
-";

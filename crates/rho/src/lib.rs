@@ -23,7 +23,7 @@ pub enum ItemBlock {
     Local {
         items: Vec<Item>,
     },
-    ProviderResponse {
+    InferenceResponse {
         #[serde(skip_serializing_if = "Option::is_none")]
         provider_response_id: Option<String>,
         items: Vec<Item>,
@@ -155,13 +155,13 @@ pub enum ProviderItemKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ProviderRequest {
+pub struct InferenceRequest {
     pub input: Vec<ItemBlock>,
     pub tools: Vec<ToolSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ProviderResponse {
+pub struct InferenceResponse {
     pub items: Vec<ItemKind>,
     pub usage: Option<TokenUsage>,
     pub provider_response_id: Option<String>,
@@ -278,14 +278,14 @@ mod tests {
         let tool_json = serde_json::to_value(&tool).unwrap();
         assert!(tool_json.get("format").is_none());
 
-        let block = ItemBlock::ProviderResponse {
+        let block = ItemBlock::InferenceResponse {
             provider_response_id: None,
             items: Vec::new(),
         };
         let block_json = serde_json::to_value(&block).unwrap();
         assert!(
             block_json
-                .get("ProviderResponse")
+                .get("InferenceResponse")
                 .unwrap()
                 .get("provider_response_id")
                 .is_none()
@@ -311,14 +311,14 @@ mod tests {
         assert_eq!(tool.format, None);
 
         let block: ItemBlock = serde_json::from_value(json!({
-            "ProviderResponse": {
+            "InferenceResponse": {
                 "items": []
             }
         }))
         .unwrap();
         assert_eq!(
             block,
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: None,
                 items: Vec::new()
             }

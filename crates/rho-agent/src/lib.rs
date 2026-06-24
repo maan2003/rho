@@ -1,6 +1,6 @@
 //! Opinionated, forkable rho agent harness.
 //!
-//! This crate deliberately owns the state/provider/tool policy for one
+//! This crate deliberately owns the state/inference/tool policy for one
 //! simple workflow. Users who need different behavior should patch this code or
 //! fork the crate while keeping the lower crates reusable.
 
@@ -13,10 +13,10 @@ use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt, join_all};
 use rho::{
-    Item, ItemBlock, ItemKind, Message, MessagePhase, ProviderRequest, ProviderResponse,
+    InferenceRequest, InferenceResponse, Item, ItemBlock, ItemKind, Message, MessagePhase,
     ReasoningText, ReasoningTextKind, Role, ToolCall, ToolResult, ToolSpec,
 };
-use rho_provider_responses::{ProviderSession, ResponsesStream, ResponsesUpdate};
+use rho_inference_responses::{InferenceService, ResponsesStream, ResponsesUpdate};
 use rho_store_cbor::CborLog;
 use rho_store_redb::RedbLog;
 use rho_tool_shell::ShellTools;
@@ -25,9 +25,9 @@ mod thread;
 
 use thread::AgentThread;
 
-pub type ProviderStream = ResponsesStream;
+pub type InferenceStream = ResponsesStream;
 pub type ToolFuture = BoxFuture<'static, ToolResult>;
-type ProviderUpdateHandler = Box<dyn FnMut(ResponsesUpdate) + Send>;
+type InferenceUpdateHandler = Box<dyn FnMut(ResponsesUpdate) + Send>;
 type AgentUpdateHandler = Arc<Mutex<Box<dyn FnMut(AgentUpdate) + Send>>>;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -36,11 +36,11 @@ pub enum AgentUpdate {
     ToolCallFinished(ToolResult),
 }
 
-pub enum AgentProvider {
-    Responses(ProviderSession),
+pub enum AgentInference {
+    Responses(InferenceService),
     #[cfg(test)]
     Test {
-        stream: Arc<dyn Fn(ProviderRequest) -> ProviderStream + Send + Sync>,
+        stream: Arc<dyn Fn(InferenceRequest) -> InferenceStream + Send + Sync>,
     },
 }
 
@@ -60,7 +60,7 @@ pub enum AgentState {
     Idle,
     ApiRequest {
         streamed_transcript: StreamingTranscript,
-        stream: ProviderStream,
+        stream: InferenceStream,
     },
     WaitingForTools {
         futures: Vec<PendingToolCall>,
@@ -79,13 +79,13 @@ enum QueueItem {
 }
 
 pub struct Agent {
-    provider: AgentProvider,
+    inference: AgentInference,
     tools: Vec<AgentTools>,
     store: Option<AgentStore>,
     thread: AgentThread,
     queue: VecDeque<QueueItem>,
     pending_tool_results: Vec<ToolResult>,
-    provider_updates: Option<ProviderUpdateHandler>,
+    inference_updates: Option<InferenceUpdateHandler>,
     agent_updates: Option<AgentUpdateHandler>,
     pub state: AgentState,
 }
@@ -99,8 +99,8 @@ pub struct StreamingTranscript {
 }
 
 impl Agent {
-    pub fn new(provider: AgentProvider, tools: Vec<AgentTools>) -> Self {
-        Self::from_blocks(provider, tools, Vec::new())
+    pub fn new(inference: AgentInference, tools: Vec<AgentTools>) -> Self {
+        Self::from_blocks(inference, tools, Vec::new())
     }
 
     pub fn with_store(mut self, store: AgentStore) -> Self {
@@ -108,11 +108,11 @@ impl Agent {
         self
     }
 
-    pub fn with_provider_updates(
+    pub fn with_inference_updates(
         mut self,
         on_update: impl FnMut(ResponsesUpdate) + Send + 'static,
     ) -> Self {
-        self.provider_updates = Some(Box::new(on_update));
+        self.inference_updates = Some(Box::new(on_update));
         self
     }
 
@@ -125,12 +125,12 @@ impl Agent {
     }
 
     pub async fn from_store(
-        provider: AgentProvider,
+        inference: AgentInference,
         tools: Vec<AgentTools>,
         store: AgentStore,
     ) -> Result<Self> {
         let blocks = store.read_blocks().await?;
-        Ok(Self::from_blocks(provider, tools, blocks).with_store(store))
+        Ok(Self::from_blocks(inference, tools, blocks).with_store(store))
     }
 
     pub fn blocks(&self) -> &[ItemBlock] {
@@ -206,15 +206,15 @@ impl Agent {
                 match stream.next().await {
                     Some(Ok(update)) => {
                         streamed_transcript.record(&update);
-                        notify_provider_update(&mut self.provider_updates, update.clone());
+                        notify_inference_update(&mut self.inference_updates, update.clone());
                         if let ResponsesUpdate::Finished(response) = update {
                             break self
-                                .finish_provider_request(response, streamed_transcript)
+                                .finish_inference_request(response, streamed_transcript)
                                 .await?;
                         }
                     }
                     Some(Err(error)) => return Err(error),
-                    None => bail!("provider stream ended before final response"),
+                    None => bail!("inference stream ended before final response"),
                 }
             },
             AgentState::WaitingForTools {
@@ -252,14 +252,14 @@ impl Agent {
 
         let streamed_transcript = StreamingTranscript::default();
         Ok(AgentState::ApiRequest {
-            stream: self.provider.stream(self.thread.provider_request()),
+            stream: self.inference.stream(self.thread.inference_request()),
             streamed_transcript,
         })
     }
 
-    async fn finish_provider_request(
+    async fn finish_inference_request(
         &mut self,
-        mut response: ProviderResponse,
+        mut response: InferenceResponse,
         streamed_transcript: StreamingTranscript,
     ) -> Result<AgentState> {
         streamed_transcript.supplement_response(&mut response);
@@ -332,7 +332,7 @@ impl Agent {
         items: Vec<Item>,
         provider_response_id: Option<String>,
     ) -> Result<()> {
-        self.record_block(ItemBlock::ProviderResponse {
+        self.record_block(ItemBlock::InferenceResponse {
             provider_response_id,
             items,
         })
@@ -378,19 +378,19 @@ impl Agent {
 
 impl Agent {
     fn from_blocks(
-        provider: AgentProvider,
+        inference: AgentInference,
         tools: Vec<AgentTools>,
         blocks: Vec<ItemBlock>,
     ) -> Self {
         let thread = AgentThread::new(tool_specs(&tools), blocks);
         Self {
-            provider,
+            inference,
             tools,
             store: None,
             thread,
             queue: VecDeque::new(),
             pending_tool_results: Vec::new(),
-            provider_updates: None,
+            inference_updates: None,
             agent_updates: None,
             state: AgentState::Idle,
         }
@@ -422,7 +422,7 @@ fn notify_agent_update(handler: &Option<AgentUpdateHandler>, update: AgentUpdate
     }
 }
 
-fn notify_provider_update(handler: &mut Option<ProviderUpdateHandler>, update: ResponsesUpdate) {
+fn notify_inference_update(handler: &mut Option<InferenceUpdateHandler>, update: ResponsesUpdate) {
     if let Some(handler) = handler {
         handler(update);
     }
@@ -461,7 +461,7 @@ impl StreamingTranscript {
         }
     }
 
-    fn supplement_response(&self, response: &mut ProviderResponse) {
+    fn supplement_response(&self, response: &mut InferenceResponse) {
         let mut streamed_items = self.output_items.clone();
         for (output_index, text) in &self.text_by_output_index {
             streamed_items
@@ -522,12 +522,12 @@ impl AgentStore {
     }
 }
 
-impl AgentProvider {
-    fn stream(&self, request: ProviderRequest) -> ProviderStream {
+impl AgentInference {
+    fn stream(&self, request: InferenceRequest) -> InferenceStream {
         match self {
-            AgentProvider::Responses(session) => session.stream(request),
+            AgentInference::Responses(session) => session.stream(request),
             #[cfg(test)]
-            AgentProvider::Test { stream } => stream(request),
+            AgentInference::Test { stream } => stream(request),
         }
     }
 }

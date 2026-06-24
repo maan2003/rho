@@ -3,7 +3,7 @@
 //! The agent owns this shape so providers receive stable `ItemBlock` snapshots
 //! without being responsible for local queue/tool-result policy.
 
-use rho::{ItemBlock, ProviderRequest, ToolSpec};
+use rho::{InferenceRequest, ItemBlock, ToolSpec};
 
 #[derive(Clone, Debug)]
 pub(crate) struct AgentThread {
@@ -24,8 +24,8 @@ impl AgentThread {
         &self.blocks
     }
 
-    pub(crate) fn provider_request(&self) -> ProviderRequest {
-        ProviderRequest {
+    pub(crate) fn inference_request(&self) -> InferenceRequest {
+        InferenceRequest {
             input: self.blocks.clone(),
             tools: self.tool_specs.clone(),
         }
@@ -46,7 +46,7 @@ mod tests {
         thread.append_block(ItemBlock::Local {
             items: vec![Item::message("item-0", Role::User, "first")],
         });
-        thread.append_block(ItemBlock::ProviderResponse {
+        thread.append_block(ItemBlock::InferenceResponse {
             provider_response_id: Some("resp_1".to_owned()),
             items: vec![Item::message("item-1", Role::Assistant, "done")],
         });
@@ -55,13 +55,13 @@ mod tests {
             matches!(&thread.blocks()[0], ItemBlock::Local { items } if items[0].id.0 == "item-0")
         );
         assert!(
-            matches!(&thread.blocks()[1], ItemBlock::ProviderResponse { items, .. } if items[0].id.0 == "item-1")
+            matches!(&thread.blocks()[1], ItemBlock::InferenceResponse { items, .. } if items[0].id.0 == "item-1")
         );
         assert_eq!(thread.blocks().len(), 2);
     }
 
     #[test]
-    fn provider_request_is_a_snapshot_of_blocks_and_tools() {
+    fn inference_request_is_a_snapshot_of_blocks_and_tools() {
         let mut thread = AgentThread::new(
             vec![ToolSpec {
                 name: "shell_command".to_owned(),
@@ -76,7 +76,7 @@ mod tests {
             items: vec![Item::message("item-0", Role::User, "hello")],
         });
 
-        let request = thread.provider_request();
+        let request = thread.inference_request();
         thread.append_block(ItemBlock::Local {
             items: vec![Item::message("item-1", Role::User, "later")],
         });

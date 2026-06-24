@@ -4,7 +4,7 @@ rho is a Rust toolkit for building AI agents by changing Rust code instead of
 swapping standalone processes.
 
 It borrows useful implementation ideas from Tau, especially the Responses and
-ChatGPT/Codex provider behavior and terminal rendering pieces, but deliberately
+ChatGPT/Codex inference behavior and terminal rendering pieces, but deliberately
 does not copy Tau's protocol, supervisor, extension runtime, socket API, or
 process graph. The core bet is that many agent changes are simpler when they
 are local edits to crates, structs, enums, futures, and streams.
@@ -12,15 +12,15 @@ are local edits to crates, structs, enums, futures, and streams.
 ## Shape
 
 - `rho`: small shared item vocabulary for messages, tool calls, tool results,
-  reasoning text, opaque provider items, provider requests/responses, ids, usage,
+  reasoning text, opaque provider items, inference requests/responses, ids, usage,
   and token usage.
-- `rho-provider-responses`: WebSocket-only OpenAI Responses and ChatGPT/Codex
-  provider support.
+- `rho-inference-responses`: WebSocket-only OpenAI Responses and ChatGPT/Codex
+  inference support.
 - `rho-agent`: an opinionated, forkable harness that owns queueing, retries,
   tool scheduling, persistence hooks, streamed transcript handling, and
-  provider response block persistence.
+  inference response block persistence.
 - `rho-cli`: an interactive terminal chat agent assembled from `rho-agent`, the
-  Responses provider, shell/apply_patch tools, CBOR persistence, and copied
+  Responses inference service, shell/apply_patch tools, CBOR persistence, and copied
   Tau terminal rendering building blocks.
 - `rho-cli-term-raw`, `rho-term-screen`, `rho-blocking-notify-channel`:
   terminal UI building blocks adapted from Tau for normal-buffer interactive
@@ -44,16 +44,16 @@ nix develop -c cargo run -p rho-cli -- --session default
 The CLI uses OAuth credentials from the rho state directory by default:
 
 ```sh
-nix develop -c cargo run -p rho-cli -- provider add
-nix develop -c cargo run -p rho-cli -- provider list
-nix develop -c cargo run -p rho-cli -- provider remove default
+nix develop -c cargo run -p rho-cli -- auth add
+nix develop -c cargo run -p rho-cli -- auth list
+nix develop -c cargo run -p rho-cli -- auth remove default
 nix develop -c cargo run -p rho-cli -- auth path --name default
 nix develop -c cargo run -p rho-cli -- auth status --name default
 nix develop -c cargo run -p rho-cli -- auth import --name default --file credentials.json
 ```
 
-`provider add` runs the browser OAuth setup flow and saves credentials to a
-file under the rho state directory. `provider list` and `provider remove` inspect
+`auth add` runs the browser OAuth setup flow and saves credentials to a
+file under the rho state directory. `auth list` and `auth remove` inspect
 and delete those file-based credentials. `auth import` is available for copying
 an existing file-based credential; `credentials.json` uses this JSON shape:
 
@@ -67,8 +67,8 @@ an existing file-based credential; `credentials.json` uses this JSON shape:
 
 Sessions are append-only CBOR logs under the rho state directory unless
 `--session-path` is supplied. Stored sessions also use the session name as the
-provider prompt-cache key. Use `--no-store` for a disposable run that does not
-read/write a transcript or send a provider prompt-cache key. The default tool
+inference prompt-cache key. Use `--no-store` for a disposable run that does not
+read/write a transcript or send a inference prompt-cache key. The default tool
 surface is intentionally small: `shell_command` and `apply_patch`.
 
 In the interactive chat UI, `Enter` sends the prompt, `Shift-Enter` or
@@ -85,11 +85,11 @@ printf 'summarize this repository\n' | nix develop -c cargo run -p rho-cli -- --
 
 Current parity is strongest around Tau's ChatGPT/Codex Responses path:
 
-- Responses API only for the initial provider surface.
+- Responses API only for the initial inference surface.
 - WebSocket transport only.
 - Persistent ChatGPT/Codex WebSocket pool keyed by prompt-cache/thread id, with
   prewarming support.
-- Item-only provider responses; no top-level messages, tool calls, or terminal
+- Item-only inference responses; no top-level messages, tool calls, or terminal
   events.
 - Streaming updates for text, reasoning text, tool calls, output items,
   compaction, usage, response ids, and completion.
@@ -113,7 +113,7 @@ Intentional differences from Tau:
 - No socket server, config system, skills, site, or e2e harness.
 - CLI/TUI support is intentionally direct and Rust-local: it uses copied Tau
   terminal rendering pieces, not Tau's harness protocol or daemon.
-- No Chat Completions provider.
+- No Chat Completions inference service.
 - No HTTP or SSE Responses transport.
 - No example crate or example files.
 

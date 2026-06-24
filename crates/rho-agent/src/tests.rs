@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use rho::{
-    ItemKind, Message, ProviderItem, ProviderItemKind, ProviderResponse, Role, ToolCall,
+    InferenceResponse, ItemKind, Message, ProviderItem, ProviderItemKind, Role, ToolCall,
     ToolCallId, ToolType,
 };
 use rho_store_cbor::CborLog;
@@ -17,19 +17,19 @@ fn test_items(blocks: &[ItemBlock]) -> Vec<&rho::Item> {
     blocks
         .iter()
         .flat_map(|block| match block {
-            ItemBlock::Local { items } | ItemBlock::ProviderResponse { items, .. } => items,
+            ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items,
         })
         .collect()
 }
 
 fn test_provider(
-    complete: impl Fn(ProviderRequest) -> BoxFuture<'static, Result<ProviderResponse>>
+    complete: impl Fn(InferenceRequest) -> BoxFuture<'static, Result<InferenceResponse>>
     + Send
     + Sync
     + 'static,
-) -> AgentProvider {
+) -> AgentInference {
     let complete = Arc::new(complete);
-    AgentProvider::Test {
+    AgentInference::Test {
         stream: Arc::new(move |request| {
             let future = complete(request);
             futures::stream::once(async move { future.await.map(ResponsesUpdate::Finished) })
@@ -39,16 +39,16 @@ fn test_provider(
 }
 
 fn test_streaming_provider(
-    stream: impl Fn(ProviderRequest) -> ProviderStream + Send + Sync + 'static,
-) -> AgentProvider {
+    stream: impl Fn(InferenceRequest) -> InferenceStream + Send + Sync + 'static,
+) -> AgentInference {
     let stream = Arc::new(stream);
-    AgentProvider::Test {
+    AgentInference::Test {
         stream: Arc::new(move |request| stream(request)),
     }
 }
 
-fn text_response(content: impl Into<String>) -> ProviderResponse {
-    ProviderResponse {
+fn text_response(content: impl Into<String>) -> InferenceResponse {
+    InferenceResponse {
         items: vec![ItemKind::Message(Message::text(Role::Assistant, content))],
         usage: None,
         provider_response_id: None,
@@ -59,8 +59,8 @@ fn tool_call_response(
     id: impl Into<String>,
     name: impl Into<String>,
     arguments: serde_json::Value,
-) -> ProviderResponse {
-    ProviderResponse {
+) -> InferenceResponse {
+    InferenceResponse {
         items: vec![ItemKind::ToolCall(ToolCall {
             id: ToolCallId(id.into()),
             name: name.into(),
@@ -76,8 +76,8 @@ fn custom_tool_call_response(
     id: impl Into<String>,
     name: impl Into<String>,
     input: impl Into<String>,
-) -> ProviderResponse {
-    ProviderResponse {
+) -> InferenceResponse {
+    InferenceResponse {
         items: vec![ItemKind::ToolCall(ToolCall {
             id: ToolCallId(id.into()),
             name: name.into(),
@@ -91,7 +91,7 @@ fn custom_tool_call_response(
 
 fn has_tool_result(input: &[ItemBlock]) -> bool {
     input.iter().any(|block| match block {
-        ItemBlock::Local { items } | ItemBlock::ProviderResponse { items, .. } => items
+        ItemBlock::Local { items } | ItemBlock::InferenceResponse { items, .. } => items
             .iter()
             .any(|item| matches!(item.kind, ItemKind::ToolResult(_))),
     })
@@ -213,10 +213,10 @@ async fn idle_step_after_final_answer_does_not_call_provider_again() {
 }
 
 #[tokio::test]
-async fn provider_request_keeps_full_block_history() {
+async fn inference_request_keeps_full_block_history() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let seen_requests = Arc::clone(&requests);
-    let provider = test_provider(move |request: ProviderRequest| {
+    let provider = test_provider(move |request: InferenceRequest| {
         let seen_requests = Arc::clone(&seen_requests);
         async move {
             seen_requests
@@ -267,7 +267,7 @@ async fn records_provider_response_block() {
 
     assert!(matches!(
         agent.blocks()[1],
-        ItemBlock::ProviderResponse { .. }
+        ItemBlock::InferenceResponse { .. }
     ));
 }
 
@@ -275,7 +275,7 @@ async fn records_provider_response_block() {
 async fn restored_provider_response_block_forwards_full_history_with_boundary() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let seen_requests = Arc::clone(&requests);
-    let provider = test_provider(move |request: ProviderRequest| {
+    let provider = test_provider(move |request: InferenceRequest| {
         let seen_requests = Arc::clone(&seen_requests);
         async move {
             seen_requests
@@ -293,7 +293,7 @@ async fn restored_provider_response_block_forwards_full_history_with_boundary() 
             ItemBlock::Local {
                 items: vec![Item::message("item-0", Role::User, "first")],
             },
-            ItemBlock::ProviderResponse {
+            ItemBlock::InferenceResponse {
                 provider_response_id: Some("resp_1".to_owned()),
                 items: vec![Item::message("item-1", Role::Assistant, "done")],
             },
@@ -317,7 +317,7 @@ async fn restored_provider_response_block_forwards_full_history_with_boundary() 
 async fn compaction_response_id_replays_full_history_on_next_turn() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let seen_requests = Arc::clone(&requests);
-    let provider = test_provider(move |request: ProviderRequest| {
+    let provider = test_provider(move |request: InferenceRequest| {
         let seen_requests = Arc::clone(&seen_requests);
         async move {
             let call_index = seen_requests.lock().expect("request log lock").len();
@@ -326,7 +326,7 @@ async fn compaction_response_id_replays_full_history_on_next_turn() {
                 .expect("request log lock")
                 .push(request.input.clone());
             if call_index == 0 {
-                Ok(ProviderResponse {
+                Ok(InferenceResponse {
                     items: vec![
                         ItemKind::ProviderItem(ProviderItem {
                             kind: ProviderItemKind::Compaction,
@@ -355,7 +355,7 @@ async fn compaction_response_id_replays_full_history_on_next_turn() {
 }
 
 #[tokio::test]
-async fn forwards_streaming_provider_updates() {
+async fn forwards_streaming_inference_updates() {
     let updates = Arc::new(Mutex::new(Vec::new()));
     let seen_updates = Arc::clone(&updates);
     let provider = test_streaming_provider(|_request| {
@@ -372,7 +372,7 @@ async fn forwards_streaming_provider_updates() {
         ])
         .boxed()
     });
-    let mut agent = Agent::new(provider, Vec::new()).with_provider_updates(move |update| {
+    let mut agent = Agent::new(provider, Vec::new()).with_inference_updates(move |update| {
         seen_updates
             .lock()
             .expect("provider update log lock")
@@ -410,7 +410,7 @@ async fn records_streamed_text_when_final_response_is_sparse() {
                 kind: ReasoningTextKind::Summary,
                 text: "thought".to_owned(),
             }),
-            Ok(ResponsesUpdate::Finished(ProviderResponse {
+            Ok(ResponsesUpdate::Finished(InferenceResponse {
                 items: Vec::new(),
                 usage: None,
                 provider_response_id: None,
@@ -495,7 +495,7 @@ async fn provider_errors_return_to_caller() {
 async fn runs_tool_calls_through_agent_policy() {
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = Arc::clone(&calls);
-    let provider = test_provider(move |request: ProviderRequest| {
+    let provider = test_provider(move |request: InferenceRequest| {
         let calls = Arc::clone(&provider_calls);
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -533,7 +533,7 @@ async fn runs_tool_calls_through_agent_policy() {
 
 #[tokio::test]
 async fn emits_tool_execution_updates() {
-    let provider = test_provider(|request: ProviderRequest| {
+    let provider = test_provider(|request: InferenceRequest| {
         async move {
             if has_tool_result(&request.input) {
                 Ok(text_response("done"))
@@ -581,7 +581,7 @@ async fn emits_tool_execution_updates() {
 async fn exposes_shell_command_and_apply_patch_tool_specs() {
     let seen_tools = Arc::new(Mutex::new(Vec::new()));
     let captured_tools = Arc::clone(&seen_tools);
-    let provider = test_provider(move |request: ProviderRequest| {
+    let provider = test_provider(move |request: InferenceRequest| {
         let captured_tools = Arc::clone(&captured_tools);
         async move {
             captured_tools
@@ -621,7 +621,7 @@ async fn routes_apply_patch_custom_tool_through_agent_policy() {
         "*** Begin Patch\n*** Add File: {}\n+patched\n*** End Patch",
         path.display()
     );
-    let provider = test_provider(move |request: ProviderRequest| {
+    let provider = test_provider(move |request: InferenceRequest| {
         let patch = patch.clone();
         async move {
             if has_tool_result(&request.input) {
@@ -653,12 +653,12 @@ async fn routes_apply_patch_custom_tool_through_agent_policy() {
 
 #[tokio::test]
 async fn waits_for_tool_calls_concurrently() {
-    let provider = test_provider(|request: ProviderRequest| {
+    let provider = test_provider(|request: InferenceRequest| {
         async move {
             if has_tool_result(&request.input) {
                 Ok(text_response("done"))
             } else {
-                Ok(ProviderResponse {
+                Ok(InferenceResponse {
                     items: vec![
                         ItemKind::ToolCall(ToolCall {
                             id: ToolCallId("call-1".to_owned()),
@@ -778,7 +778,7 @@ async fn loaded_transcript_replays_full_history_with_provider_block_boundary() {
     })
     .await
     .unwrap();
-    log.append_block(&ItemBlock::ProviderResponse {
+    log.append_block(&ItemBlock::InferenceResponse {
         provider_response_id: Some("resp_1".to_owned()),
         items: vec![Item::message("item-1", Role::Assistant, "done")],
     })
@@ -787,7 +787,7 @@ async fn loaded_transcript_replays_full_history_with_provider_block_boundary() {
 
     let requests = Arc::new(Mutex::new(Vec::new()));
     let seen_requests = Arc::clone(&requests);
-    let provider = test_provider(move |request: ProviderRequest| {
+    let provider = test_provider(move |request: InferenceRequest| {
         let seen_requests = Arc::clone(&seen_requests);
         async move {
             seen_requests

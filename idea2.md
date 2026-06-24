@@ -35,14 +35,14 @@ Prefer concrete Rust over framework abstraction. Avoid defining universal traits
 until they are truly needed. `rho-agent` can assemble components with local enums:
 
 ```rust
-enum AgentProvider {
+enum AgentInference {
     ChatCompletions(rho_provider_chat_completions::Provider),
-    Responses(rho_provider_responses::Provider),
+    Responses(rho_inference_responses::Provider),
 }
 
 enum AgentState {
     Idle,
-    ApiRequest { stream: ProviderStream },
+    ApiRequest { stream: InferenceStream },
     WaitingForTools { futures: ToolFutures, results: Vec<ToolResult> },
 }
 ```

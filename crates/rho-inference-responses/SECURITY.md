@@ -1,19 +1,19 @@
-# rho-provider-responses security and reliability context
+# rho-inference-responses security and reliability context
 
-`rho-provider-responses` is a library crate for OpenAI Responses / ChatGPT Codex
-provider support. It builds request bodies from `rho` provider requests, opens
-ChatGPT/Codex WebSockets, parses streamed provider events, and manages
+`rho-inference-responses` is a library crate for OpenAI Responses / ChatGPT Codex
+inference support. It builds request bodies from `rho` inference requests, opens
+ChatGPT/Codex WebSockets, parses streamed inference events, and manages
 file-backed OAuth credentials.
 
 ## Runtime and trust boundaries
 
-- Callers provide `ProviderRequest`, tool specs, prompt-cache keys,
+- Callers provide `InferenceRequest`, tool specs, prompt-cache keys,
   model/session configuration, and optional OAuth credential paths.
 - OpenAI OAuth/token endpoints and ChatGPT/Codex WebSocket messages are remote,
   semi-trusted inputs.
 - OAuth credential JSON files contain bearer and refresh tokens and must be
   treated as secrets.
-- Provider event JSON must not be trusted to be well-formed, ordered, complete,
+- Inference event JSON must not be trusted to be well-formed, ordered, complete,
   or bounded in size.
 
 ## Concurrency and resource assumptions
@@ -31,11 +31,11 @@ file-backed OAuth credentials.
 - Secret leakage: OAuth files should be created in private directories and
   written with private file permissions; tests should cover Unix credential-file
   mode when available.
-- Hung provider/auth operations: OAuth HTTP calls and WebSocket connect/turn
+- Hung inference/auth operations: OAuth HTTP calls and WebSocket connect/turn
   operations need explicit timeout/cancellation behavior.
-- Unbounded memory/task growth: provider streams should apply backpressure and
+- Unbounded memory/task growth: inference streams should apply backpressure and
   stop promptly when the returned stream is dropped.
-- Provider protocol drift or malformed events: event parsing should ignore
+- Responses protocol drift or malformed events: event parsing should ignore
   unknown/malformed non-terminal events, surface terminal error/incomplete
   events, and preserve provider items needed for replay.
 

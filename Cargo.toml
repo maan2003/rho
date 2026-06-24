@@ -5,7 +5,7 @@ members = [
   "crates/rho-agent",
   "crates/rho-cli",
   "crates/rho-cli-term-raw",
-  "crates/rho-provider-responses",
+  "crates/rho-inference-responses",
   "crates/rho-store-cbor",
   "crates/rho-store-redb",
   "crates/rho-term-screen",
@@ -28,6 +28,7 @@ crossterm = { version = "0.28", default-features = false, features = [
   "bracketed-paste",
   "events",
 ] }
+clap = { version = "4", features = ["derive"] }
 dirs = { version = "6", default-features = false }
 futures = "0.3"
 futures-util = "0.3"
@@ -38,7 +39,7 @@ rho-agent = { path = "crates/rho-agent" }
 rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
 rho-cli = { path = "crates/rho-cli" }
 rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
-rho-provider-responses = { path = "crates/rho-provider-responses" }
+rho-inference-responses = { path = "crates/rho-inference-responses" }
 rho-store-cbor = { path = "crates/rho-store-cbor" }
 rho-store-redb = { path = "crates/rho-store-redb" }
 rho-term-screen = { path = "crates/rho-term-screen" }

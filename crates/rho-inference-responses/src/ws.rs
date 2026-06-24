@@ -18,12 +18,12 @@ use crate::oauth::ResolvedAuth;
 use crate::{
     DEFAULT_WEBSOCKET_EVENT_TIMEOUT_SECS, DEFAULT_WEBSOCKET_PING_INTERVAL_SECS,
     DEFAULT_WEBSOCKET_POOL_CHECKOUT_WAIT_MS, DEFAULT_WEBSOCKET_POOL_MAX_CONNECTION_AGE_SECS,
-    DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS, OPENAI_BETA_WS, ProviderSession, ResponsesUpdate,
+    DEFAULT_WEBSOCKET_POOL_MAX_CONNECTIONS, InferenceService, OPENAI_BETA_WS, ResponsesUpdate,
     apply_response_event, responses_url,
 };
 
 pub(crate) async fn send_websocket(
-    session: &ProviderSession,
+    session: &InferenceService,
     websocket_pool: &Arc<Mutex<WebSocketPool>>,
     body: ResponsesRequest,
     tool_names: &BTreeMap<String, String>,
@@ -55,7 +55,7 @@ pub(crate) async fn send_websocket(
 }
 
 async fn send_pooled_websocket(
-    session: &ProviderSession,
+    session: &InferenceService,
     websocket_pool: &Arc<Mutex<WebSocketPool>>,
     key: WebSocketPoolKey,
     auth: Option<&ResolvedAuth>,
@@ -79,7 +79,7 @@ async fn send_pooled_websocket(
 }
 
 async fn checkout_websocket_pool(
-    session: &ProviderSession,
+    session: &InferenceService,
     websocket_pool: &Arc<Mutex<WebSocketPool>>,
     key: &WebSocketPoolKey,
     auth: Option<&ResolvedAuth>,
@@ -219,7 +219,7 @@ pub(crate) struct WebSocketPoolKey {
 
 impl WebSocketPoolKey {
     pub(crate) fn from_request(
-        session: &ProviderSession,
+        session: &InferenceService,
         body: &ResponsesRequest,
         auth: Option<&ResolvedAuth>,
     ) -> Option<Self> {
@@ -227,7 +227,7 @@ impl WebSocketPoolKey {
     }
 
     fn from_thread_id(
-        session: &ProviderSession,
+        session: &InferenceService,
         thread_id: String,
         auth: Option<&ResolvedAuth>,
     ) -> Option<Self> {
@@ -374,7 +374,7 @@ pub(crate) struct WsResponseCreate {
 }
 
 pub(crate) fn build_ws_request(
-    session: &ProviderSession,
+    session: &InferenceService,
     thread_id: Option<&str>,
     auth: Option<&ResolvedAuth>,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
@@ -398,7 +398,7 @@ pub(crate) fn build_ws_request(
     Ok(request)
 }
 
-fn build_ws_url(session: &ProviderSession) -> Result<String> {
+fn build_ws_url(session: &InferenceService) -> Result<String> {
     let url = responses_url(&session.base_url);
     if let Some(rest) = url.strip_prefix("https://") {
         Ok(format!("wss://{rest}"))
