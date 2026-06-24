@@ -21,7 +21,7 @@ fn no_store_disables_inference_prompt_cache_key() {
     let mut args = chat_args();
     args.no_store = true;
 
-    let service = build_inference_service(&args).unwrap();
+    let service = build_inference_session(&args).unwrap();
 
     assert!(service.prompt_cache_key().is_none());
 }
@@ -31,7 +31,7 @@ fn stored_sessions_use_session_name_as_inference_prompt_cache_key() {
     let mut args = chat_args();
     args.session = "work".to_owned();
 
-    let service = build_inference_service(&args).unwrap();
+    let service = build_inference_session(&args).unwrap();
 
     assert_eq!(service.prompt_cache_key(), Some("work"));
 }

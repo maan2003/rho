@@ -316,7 +316,7 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
     };
 
     let body =
-        ResponsesRequest::from_inference_request(&InferenceService::new("gpt-test", auth), request);
+        ResponsesRequest::from_inference_request(&InferenceSession::new("gpt-test", auth), request);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("context_management").is_none());
@@ -349,7 +349,7 @@ fn configured_compaction_threshold_overrides_provider_default() {
 #[test]
 fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = InferenceService::new("gpt-test", auth).with_compaction();
+    let session = InferenceSession::new("gpt-test", auth).with_compaction();
     let request = InferenceRequest {
         input: vec![ItemBlock::Local {
             items: vec![Item {

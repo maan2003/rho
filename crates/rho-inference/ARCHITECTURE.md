@@ -9,12 +9,12 @@ module uses the OpenAI Responses WebSocket protocol.
 The public surface is intentionally small:
 
 - `InferenceAuth` selects the named auth credentials required for inference.
-- `InferenceService` configures inference access, prompt-cache/thread behavior,
-  and owns the WebSocket pool.
-- `InferenceService::stream` accepts a `rho_core::InferenceRequest` and returns
+- `InferenceSession` configures inference access, prompt-cache/thread behavior,
+  and owns the session's warm WebSocket connection.
+- `InferenceSession::stream` accepts a `rho_core::InferenceRequest` and returns
   an `InferenceStream` of `rho_core::InferenceUpdate` values ending in
   `InferenceUpdate::Finished`.
-- `InferenceService` implements `rho_core::IInferenceSession` so harness crates
+- `InferenceSession` implements `rho_core::IInferenceSession` so harness crates
   can depend on `rho-core` instead of this provider crate.
 - `auth_cli::AuthArgs` and `run_auth_cli` own the user-facing auth management
   workflow for add/list/remove/path/status/import.
@@ -32,12 +32,13 @@ configuration.
 ## Internal components
 
 - `responses/wire.rs` converts `rho_core::InferenceRequest` and
-  `InferenceService` settings into the Responses request JSON shape; it also
+  `InferenceSession` settings into the Responses request JSON shape; it also
   owns Responses event parsing, `ResponseState`, streaming update
   production, and stale `previous_response_id` fallback.
-- `responses/session.rs` owns session configuration and shared WebSocket-pool state.
-- `responses/ws.rs` owns WebSocket request construction, connection checkout/release,
-  WebSocket defaults, event-loop timeouts/pings, and pool keying.
+- `responses/session.rs` owns session configuration and the session's warm
+  WebSocket connection.
+- `responses/ws.rs` owns WebSocket request construction, connection reuse/reopen,
+  WebSocket defaults, and event-loop timeouts/pings.
 - `responses/oauth.rs` owns private credential files, OAuth token exchange/refresh,
   account id extraction, and file locking.
 - `auth_cli.rs` owns the auth-management CLI workflow exposed by `run_auth_cli`.
@@ -73,18 +74,21 @@ state.
 `InferenceUpdate::Finished` is the only successful terminal update. Consumers
 should treat a stream ending before `Finished` as an error.
 
-## WebSocket pool ownership
+## WebSocket connection ownership
 
-Each `InferenceService` owns an `Arc<tokio::sync::Mutex<WebSocketPool>>`. Pooled
-connections are keyed by base URL, optional ChatGPT account id, and
-prompt-cache/thread id. Connections are checked out for a single turn, then
-returned to the pool if the turn completed successfully and the connection is
-still valid. Failed turns release the busy marker and do not return the failed
-connection.
+Each `InferenceSession` owns a single `Arc<tokio::sync::Mutex<Option<WebSocketConnection>>>`
+— one warm socket per session (i.e. per agent/thread), shared across clones of
+the session. A turn locks the slot for its whole duration: it reuses the socket
+when still valid, and reopens it when missing, when OAuth rotated the bearer, or
+when it is nearing the server's ~60-minute age cap. A failed turn drops the
+socket so the next turn reconnects. Because the slot is per session, distinct
+sessions (multiple agents, sub-agent delegations) each keep their own warm
+socket without a shared keyed pool; the number of live sessions bounds the
+number of open sockets.
 
 Runtime ownership and cancellation must remain explicit: dropping a consumer
 stream or aborting the caller's task must not leave an unobserved inference turn
-running in the background or return that turn's connection to the reusable pool.
+running in the background.
 
 ## OAuth credential ownership
 

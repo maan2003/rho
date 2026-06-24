@@ -20,7 +20,7 @@ mod wire;
 mod ws;
 
 pub use oauth::InferenceAuth;
-pub use session::InferenceService;
+pub use session::InferenceSession;
 use wire::ResponsesRequest;
 
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -40,14 +40,14 @@ fn responses_url(base_url: &str) -> String {
     format!("{}/codex/responses", base_url.trim_end_matches('/'))
 }
 
-impl InferenceService {
+impl InferenceSession {
     pub fn stream(&self, request: InferenceRequest) -> InferenceStream {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let session = self.clone();
-        let websocket_pool = Arc::clone(&self.websocket_pool);
+        let connection = Arc::clone(&self.connection);
         tokio::spawn(async move {
             if let Err(error) =
-                stream_inference_request(session, websocket_pool, request, &sender).await
+                stream_inference_request(session, connection, request, &sender).await
             {
                 let _ = sender.send(Err(error));
             }
@@ -60,42 +60,27 @@ impl InferenceService {
     }
 }
 
-impl IInferenceSession for InferenceService {
+impl IInferenceSession for InferenceSession {
     fn stream(&self, request: InferenceRequest) -> InferenceStream {
-        InferenceService::stream(self, request)
+        InferenceSession::stream(self, request)
     }
 }
 
 async fn stream_inference_request(
-    session: InferenceService,
-    websocket_pool: Arc<tokio::sync::Mutex<ws::WebSocketPool>>,
+    session: InferenceSession,
+    connection: Arc<tokio::sync::Mutex<Option<ws::WebSocketConnection>>>,
     request: InferenceRequest,
     updates: &tokio::sync::mpsc::UnboundedSender<Result<InferenceUpdate>>,
 ) -> Result<()> {
     let tool_names = tool_name_map(&request.tools);
     let responses_request = ResponsesRequest::from_inference_request(&session, request.clone());
-    match ws::send_websocket(
-        &session,
-        &websocket_pool,
-        responses_request,
-        &tool_names,
-        updates,
-    )
-    .await
-    {
+    match ws::send_websocket(&session, &connection, responses_request, &tool_names, updates).await {
         Ok(()) => Ok(()),
         Err(error) => {
             if let Some(replay_request) =
                 stale_previous_response_replay_request(&session, &request, &error)
             {
-                ws::send_websocket(
-                    &session,
-                    &websocket_pool,
-                    replay_request,
-                    &tool_names,
-                    updates,
-                )
-                .await
+                ws::send_websocket(&session, &connection, replay_request, &tool_names, updates).await
             } else {
                 Err(error)
             }
@@ -133,7 +118,7 @@ fn encode_tool_name(name: &str) -> String {
 }
 
 fn stale_previous_response_replay_request(
-    session: &InferenceService,
+    session: &InferenceSession,
     request: &InferenceRequest,
     error: &anyhow::Error,
 ) -> Option<ResponsesRequest> {

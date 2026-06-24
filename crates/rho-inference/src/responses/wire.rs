@@ -10,7 +10,7 @@ use rho_core::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{Compaction, InferenceService, encode_tool_name};
+use super::{Compaction, InferenceSession, encode_tool_name};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ResponsesRequest {
@@ -51,7 +51,7 @@ pub(crate) struct ContextManagementRequest {
 
 impl ResponsesRequest {
     pub(crate) fn from_inference_request(
-        session: &InferenceService,
+        session: &InferenceSession,
         request: InferenceRequest,
     ) -> Self {
         let mut previous_response = None;
@@ -83,14 +83,14 @@ impl ResponsesRequest {
     }
 
     pub(crate) fn from_inference_request_full_replay(
-        session: &InferenceService,
+        session: &InferenceSession,
         request: InferenceRequest,
     ) -> Self {
         Self::from_inference_request_with_previous(session, request, None)
     }
 
     fn from_inference_request_with_previous(
-        session: &InferenceService,
+        session: &InferenceSession,
         request: InferenceRequest,
         previous_response: Option<(String, usize)>,
     ) -> Self {

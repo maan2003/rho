@@ -22,7 +22,7 @@ use rho_core::{
     InferenceUpdate, ItemBlock, ItemKind, ReasoningTextKind, Role, ToolCall, ToolResult,
     ToolResultStatus,
 };
-use rho_inference::{AuthArgs, InferenceAuth, InferenceService, run_auth_cli};
+use rho_inference::{AuthArgs, InferenceAuth, InferenceSession, run_auth_cli};
 use rho_store_cbor::CborLog;
 use rho_tool_shell::ShellTools;
 use tokio::sync::Mutex as AsyncMutex;
@@ -98,7 +98,7 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 }
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
-    let inference = Box::new(build_inference_service(args)?);
+    let inference = Box::new(build_inference_session(args)?);
     let tools = vec![AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT))];
     let mut agent = if args.no_store {
         Agent::new(inference, tools)
@@ -122,9 +122,9 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
     Ok(agent)
 }
 
-fn build_inference_service(args: &ChatArgs) -> Result<InferenceService> {
+fn build_inference_session(args: &ChatArgs) -> Result<InferenceSession> {
     let auth = InferenceAuth::named(&args.auth)?;
-    let mut session = InferenceService::new(args.model.clone(), auth)
+    let mut session = InferenceSession::new(args.model.clone(), auth)
         .with_compaction_threshold(DEFAULT_COMPACTION_THRESHOLD);
     if !args.no_store {
         session = session.with_prompt_cache_key(args.session.clone());
@@ -672,7 +672,7 @@ enum CliCommand {
 
 #[derive(Clone, clap::Args)]
 struct ChatArgs {
-    #[arg(long, default_value_t = InferenceService::DEFAULT_MODEL.to_owned())]
+    #[arg(long, default_value_t = InferenceSession::DEFAULT_MODEL.to_owned())]
     model: String,
     #[arg(long = "auth", default_value = "default")]
     auth: String,
