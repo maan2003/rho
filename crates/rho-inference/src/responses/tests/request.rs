@@ -1,64 +1,65 @@
+use std::sync::Arc;
+
+use rho_core::ToolOutput;
+
 use super::*;
+
+fn inference_response(
+    provider_response_id: Option<&str>,
+    items: Vec<InferenceResponseItem>,
+) -> Arc<ContextBlock> {
+    Arc::new(ContextBlock::InferenceResponse {
+        provider_response_id: provider_response_id
+            .map(|id| ProviderResponseId::try_from(id).unwrap()),
+        items,
+    })
+}
+
+fn opaque(tag: &str, payload: Value) -> OpaqueProviderData {
+    OpaqueProviderData {
+        tag: tag.into(),
+        data: payload.to_string().into(),
+    }
+}
 
 #[test]
 fn builds_responses_request_with_tools_and_item_timeline() {
     let session = test_inference_service("gpt-test").with_prompt_cache_key("cache-key");
-    let request = InferenceRequest {
-        input: vec![
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-0".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::System, "be concise")),
+    let request = inference_request(
+        vec![
+            user_block("hello"),
+            inference_response(
+                None,
+                vec![InferenceResponseItem::ToolCall {
+                    id: tool_call_id("call-1"),
+                    name: tool_name("shell_run"),
+                    tool_type: ToolType::Function,
+                    arguments: r#"{"command":"pwd"}"#.to_owned(),
                 }],
-            },
-            ContextBlock::InferenceResponse {
-                provider_response_id: Some("resp_prev".to_owned()),
-                items: Vec::new(),
-            },
-            ContextBlock::Local {
-                items: vec![
-                    ContextItem {
-                        id: ItemId("item-1".to_owned()),
-                        kind: ItemKind::Message(Message::text(Role::User, "hello")),
-                    },
-                    ContextItem {
-                        id: ItemId("item-2".to_owned()),
-                        kind: ItemKind::ToolCall(ToolCall {
-                            id: ToolCallId("call-1".to_owned()),
-                            name: "shell.run".to_owned(),
-                            tool_type: ToolType::Function,
-                            arguments: json!({"command": "pwd"}),
-                        }),
-                    },
-                    ContextItem {
-                        id: ItemId("item-3".to_owned()),
-                        kind: ItemKind::ToolResult(ToolResult::success(
-                            ToolCallId("call-1".to_owned()),
-                            "done",
-                        )),
-                    },
-                ],
-            },
+            ),
+            Arc::new(ContextBlock::ToolResults {
+                results: vec![tool_result_success(tool_call_id("call-1"), "done")],
+            }),
         ],
-        tools: vec![ToolSpec {
-            name: "shell.run".to_owned(),
+        vec![ToolSpec {
+            name: tool_name("shell_run"),
             tool_type: ToolType::Function,
             description: "run shell".to_owned(),
             input_schema: json!({"type": "object"}),
             format: None,
         }],
-    };
+    );
 
     let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["model"], "gpt-test");
-    assert_eq!(json["instructions"], "be concise");
     assert!(json.get("temperature").is_none());
     assert!(json.get("max_output_tokens").is_none());
     assert_eq!(json["input"][0]["role"], "user");
     assert_eq!(json["input"][1]["type"], "function_call");
     assert_eq!(json["input"][1]["name"], "shell_run");
+    assert_eq!(json["input"][1]["arguments"], r#"{"command":"pwd"}"#);
     assert_eq!(json["input"][2]["type"], "function_call_output");
     assert_eq!(json["tools"][0]["name"], "shell_run");
     assert_eq!(json["tool_choice"], "auto");
@@ -67,22 +68,13 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     assert_eq!(json["text"]["verbosity"], "medium");
     assert!(json.get("service_tier").is_none());
     assert_eq!(json["prompt_cache_key"], "cache-key");
-    assert_eq!(json["previous_response_id"], "resp_prev");
     assert_eq!(json["include"][0], "reasoning.encrypted_content");
 }
 
 #[test]
 fn omits_tool_choice_without_declared_tools() {
     let session = test_inference_service("gpt-test");
-    let request = InferenceRequest {
-        input: vec![ContextBlock::Local {
-            items: vec![ContextItem {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
+    let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
@@ -92,24 +84,16 @@ fn omits_tool_choice_without_declared_tools() {
 
 #[test]
 fn stamps_phase_on_assistant_messages_when_supported() {
-    let request = InferenceRequest {
-        input: vec![ContextBlock::Local {
-            items: vec![
-                ContextItem {
-                    id: ItemId("item-0".to_owned()),
-                    kind: ItemKind::Message(
-                        Message::text(Role::Assistant, "commentary")
-                            .with_phase(MessagePhase::Commentary),
-                    ),
-                },
-                ContextItem {
-                    id: ItemId("item-1".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::Assistant, "legacy answer")),
-                },
+    let request = inference_request(
+        vec![inference_response(
+            None,
+            vec![
+                assistant_message_with_phase("commentary", MessagePhase::Commentary),
+                assistant_message("legacy answer"),
             ],
-        }],
-        tools: Vec::new(),
-    };
+        )],
+        Vec::new(),
+    );
 
     let body =
         ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
@@ -121,15 +105,7 @@ fn stamps_phase_on_assistant_messages_when_supported() {
 
 #[test]
 fn omits_empty_reasoning_request_when_no_effort_is_set() {
-    let request = InferenceRequest {
-        input: vec![ContextBlock::Local {
-            items: vec![ContextItem {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
+    let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body =
         ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
@@ -141,15 +117,7 @@ fn omits_empty_reasoning_request_when_no_effort_is_set() {
 #[test]
 fn serializes_prompt_cache_key() {
     let session = test_inference_service("gpt-test").with_prompt_cache_key("cache-key");
-    let request = InferenceRequest {
-        input: vec![ContextBlock::Local {
-            items: vec![ContextItem {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
+    let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
@@ -159,42 +127,19 @@ fn serializes_prompt_cache_key() {
 
 #[test]
 fn previous_response_hint_slices_input_in_provider() {
-    let request = InferenceRequest {
-        input: vec![
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-0".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::System, "system rules")),
-                }],
-            },
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-1".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "first")),
-                }],
-            },
-            ContextBlock::InferenceResponse {
-                provider_response_id: Some("resp_1".to_owned()),
-                items: vec![ContextItem {
-                    id: ItemId("item-2".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::Assistant, "done")),
-                }],
-            },
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-3".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "second")),
-                }],
-            },
+    let request = inference_request(
+        vec![
+            user_block("first"),
+            inference_response(Some("resp_1"), vec![assistant_message("done")]),
+            user_block("second"),
         ],
-        tools: Vec::new(),
-    };
+        Vec::new(),
+    );
 
     let body =
         ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
-    assert_eq!(json["instructions"], "system rules");
     assert_eq!(json["previous_response_id"], "resp_1");
     assert_eq!(json["input"].as_array().unwrap().len(), 1);
     assert_eq!(json["input"][0]["content"][0]["text"], "second");
@@ -202,30 +147,14 @@ fn previous_response_hint_slices_input_in_provider() {
 
 #[test]
 fn previous_response_without_valid_boundary_replays_full_history() {
-    let request = InferenceRequest {
-        input: vec![
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-0".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "first")),
-                }],
-            },
-            ContextBlock::InferenceResponse {
-                provider_response_id: None,
-                items: vec![ContextItem {
-                    id: ItemId("item-1".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::Assistant, "done")),
-                }],
-            },
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-2".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "second")),
-                }],
-            },
+    let request = inference_request(
+        vec![
+            user_block("first"),
+            inference_response(None, vec![assistant_message("done")]),
+            user_block("second"),
         ],
-        tools: Vec::new(),
-    };
+        Vec::new(),
+    );
 
     let body =
         ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
@@ -237,30 +166,14 @@ fn previous_response_without_valid_boundary_replays_full_history() {
 
 #[test]
 fn stale_previous_response_error_builds_full_replay_request() {
-    let request = InferenceRequest {
-        input: vec![
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-0".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "first")),
-                }],
-            },
-            ContextBlock::InferenceResponse {
-                provider_response_id: Some("resp_1".to_owned()),
-                items: vec![ContextItem {
-                    id: ItemId("item-1".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::Assistant, "done")),
-                }],
-            },
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-2".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "second")),
-                }],
-            },
+    let request = inference_request(
+        vec![
+            user_block("first"),
+            inference_response(Some("resp_1"), vec![assistant_message("done")]),
+            user_block("second"),
         ],
-        tools: Vec::new(),
-    };
+        Vec::new(),
+    );
     let sliced = serde_json::to_value(ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test"),
         request.clone(),
@@ -296,15 +209,7 @@ fn non_stale_previous_response_error_is_not_classified_stale() {
 #[test]
 fn chatgpt_codex_request_omits_compaction_request_by_default() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let request = InferenceRequest {
-        input: vec![ContextBlock::Local {
-            items: vec![ContextItem {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
+    let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body =
         ResponsesRequest::from_inference_request(&InferenceSession::new("gpt-test", auth), request);
@@ -318,15 +223,7 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
 #[test]
 fn configured_compaction_threshold_overrides_provider_default() {
     let session = test_inference_service("gpt-test").with_compaction_threshold(42_000);
-    let request = InferenceRequest {
-        input: vec![ContextBlock::Local {
-            items: vec![ContextItem {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
+    let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
@@ -341,15 +238,7 @@ fn configured_compaction_threshold_overrides_provider_default() {
 fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
     let (_temp, auth) = test_oauth_file("token", None);
     let session = InferenceSession::new("gpt-test", auth).with_compaction();
-    let request = InferenceRequest {
-        input: vec![ContextBlock::Local {
-            items: vec![ContextItem {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::Message(Message::text(Role::User, "hello")),
-            }],
-        }],
-        tools: Vec::new(),
-    };
+    let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
@@ -364,33 +253,20 @@ fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
 
 #[test]
 fn compaction_replay_trims_before_latest_compaction_item() {
-    let request = InferenceRequest {
-        input: vec![
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-0".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "before")),
-                }],
-            },
-            ContextBlock::InferenceResponse {
-                provider_response_id: Some("resp_compaction".to_owned()),
-                items: vec![ContextItem {
-                    id: ItemId("item-1".to_owned()),
-                    kind: ItemKind::ProviderItem(ProviderItem {
-                        kind: ProviderItemKind::Compaction,
-                        payload: json!({"type": "compaction", "id": "cmp_1"}),
-                    }),
-                }],
-            },
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-2".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "after")),
-                }],
-            },
+    let request = inference_request(
+        vec![
+            user_block("before"),
+            inference_response(
+                Some("resp_compaction"),
+                vec![InferenceResponseItem::Compaction(opaque(
+                    "compaction",
+                    json!({"type": "compaction", "id": "cmp_1"}),
+                ))],
+            ),
+            user_block("after"),
         ],
-        tools: Vec::new(),
-    };
+        Vec::new(),
+    );
 
     let body =
         ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
@@ -404,28 +280,20 @@ fn compaction_replay_trims_before_latest_compaction_item() {
 
 #[test]
 fn replays_reasoning_provider_item() {
-    let reasoning = ItemKind::ProviderItem(ProviderItem {
-        kind: ProviderItemKind::Reasoning,
-        payload: json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed"}),
-    });
-    let request = InferenceRequest {
-        input: vec![
-            ContextBlock::InferenceResponse {
-                provider_response_id: None,
-                items: vec![ContextItem {
-                    id: ItemId("item-0".to_owned()),
-                    kind: reasoning.clone(),
-                }],
-            },
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-1".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "after")),
-                }],
-            },
-        ],
-        tools: Vec::new(),
+    let reasoning = InferenceResponseItem::EncryptedReasoning {
+        payload: opaque(
+            "reasoning",
+            json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed"}),
+        ),
+        summary: Vec::new(),
     };
+    let request = inference_request(
+        vec![
+            inference_response(None, vec![reasoning]),
+            user_block("after"),
+        ],
+        Vec::new(),
+    );
 
     let body = serde_json::to_value(ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test"),
@@ -438,27 +306,19 @@ fn replays_reasoning_provider_item() {
 
 #[test]
 fn does_not_replay_unknown_provider_items() {
-    let request = InferenceRequest {
-        input: vec![
-            ContextBlock::InferenceResponse {
-                provider_response_id: Some("resp_1".to_owned()),
-                items: vec![ContextItem {
-                    id: ItemId("item-0".to_owned()),
-                    kind: ItemKind::ProviderItem(ProviderItem {
-                        kind: ProviderItemKind::Unknown,
-                        payload: json!({"type": "computer_call", "id": "cc_1"}),
-                    }),
-                }],
-            },
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-1".to_owned()),
-                    kind: ItemKind::Message(Message::text(Role::User, "after")),
-                }],
-            },
+    let request = inference_request(
+        vec![
+            inference_response(
+                None,
+                vec![InferenceResponseItem::Unknown(opaque(
+                    "computer_call",
+                    json!({"type": "computer_call", "id": "cc_1"}),
+                ))],
+            ),
+            user_block("after"),
         ],
-        tools: Vec::new(),
-    };
+        Vec::new(),
+    );
 
     let body =
         ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
@@ -471,36 +331,30 @@ fn does_not_replay_unknown_provider_items() {
 #[test]
 fn serializes_custom_tool_calls_and_results() {
     let result = ToolResult {
-        call_id: ToolCallId("call-1".to_owned()),
+        call_id: tool_call_id("call-1"),
         tool_type: ToolType::Custom,
-        status: rho_core::ToolResultStatus::Success,
-        output: rho_core::ToolOutput {
-            content: "custom output".to_owned(),
+        body: ToolOutput {
+            output: Arc::from("custom output".to_owned()),
+            status: rho_core::ToolOutputStatus::Success,
         },
     };
-    let request = InferenceRequest {
-        input: vec![
-            ContextBlock::InferenceResponse {
-                provider_response_id: None,
-                items: vec![ContextItem {
-                    id: ItemId("item-0".to_owned()),
-                    kind: ItemKind::ToolCall(ToolCall {
-                        id: ToolCallId("call-1".to_owned()),
-                        name: "patch".to_owned(),
-                        tool_type: ToolType::Custom,
-                        arguments: json!("*** Begin Patch\n*** End Patch"),
-                    }),
+    let request = inference_request(
+        vec![
+            inference_response(
+                None,
+                vec![InferenceResponseItem::ToolCall {
+                    id: tool_call_id("call-1"),
+                    name: tool_name("patch"),
+                    tool_type: ToolType::Custom,
+                    arguments: "*** Begin Patch\n*** End Patch".to_owned(),
                 }],
-            },
-            ContextBlock::Local {
-                items: vec![ContextItem {
-                    id: ItemId("item-1".to_owned()),
-                    kind: ItemKind::ToolResult(result),
-                }],
-            },
+            ),
+            Arc::new(ContextBlock::ToolResults {
+                results: vec![result],
+            }),
         ],
-        tools: vec![ToolSpec {
-            name: "patch".to_owned(),
+        vec![ToolSpec {
+            name: tool_name("patch"),
             tool_type: ToolType::Custom,
             description: "apply a patch".to_owned(),
             input_schema: Value::Null,
@@ -509,7 +363,7 @@ fn serializes_custom_tool_calls_and_results() {
                 definition: "start: /.+/".to_owned(),
             }),
         }],
-    };
+    );
 
     let body =
         ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
@@ -524,61 +378,4 @@ fn serializes_custom_tool_calls_and_results() {
     assert_eq!(json["input"][0]["input"], "*** Begin Patch\n*** End Patch");
     assert_eq!(json["input"][1]["type"], "custom_tool_call_output");
     assert_eq!(json["input"][1]["output"], "custom output");
-}
-
-#[test]
-fn encoded_tool_name_stays_mapped_to_declared_tool_name() {
-    let tool = ToolSpec {
-        name: "local.patch".to_owned(),
-        tool_type: ToolType::Custom,
-        description: String::new(),
-        input_schema: Value::Null,
-        format: Some(ToolFormat::Text),
-    };
-    let request = InferenceRequest {
-        input: vec![ContextBlock::InferenceResponse {
-            provider_response_id: None,
-            items: vec![ContextItem {
-                id: ItemId("item-0".to_owned()),
-                kind: ItemKind::ToolCall(ToolCall {
-                    id: ToolCallId("call-1".to_owned()),
-                    name: "local.patch".to_owned(),
-                    tool_type: ToolType::Custom,
-                    arguments: json!("patch body"),
-                }),
-            }],
-        }],
-        tools: vec![tool.clone()],
-    };
-
-    let body =
-        ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
-    let json = serde_json::to_value(body).unwrap();
-
-    assert_eq!(json["tools"][0]["name"], "local_patch");
-    assert_eq!(json["input"][0]["name"], "local_patch");
-
-    let mut state = ResponseState::with_tool_names(tool_name_map(&[tool]));
-    let (_done, updates) = state
-        .apply_event(&json!({
-            "type": "response.output_item.done",
-            "output_index": 0,
-            "item": {
-                "type": "custom_tool_call",
-                "call_id": "call-2",
-                "name": "local_patch",
-                "input": "patch body"
-            }
-        }))
-        .unwrap();
-
-    let response = state.finish();
-    let call = first_tool_call(&response);
-    assert_eq!(call.name, "local.patch");
-    assert!(updates.iter().any(|update| {
-        matches!(
-            update,
-            InferenceUpdate::ToolCall { call, .. } if call.name == "local.patch"
-        )
-    }));
 }

@@ -8,10 +8,14 @@
 mod apply_patch;
 mod truncate;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use rho_core::{ToolCall, ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec, ToolType};
+use rho_core::{
+    ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput, ToolOutputStatus, ToolSpec,
+    ToolType,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -65,7 +69,7 @@ impl ShellTools {
 
     pub fn shell_command_spec(&self) -> ToolSpec {
         ToolSpec {
-            name: SHELL_COMMAND_TOOL_NAME.to_owned(),
+            name: ToolName::try_from(SHELL_COMMAND_TOOL_NAME).expect("valid tool name"),
             tool_type: ToolType::Function,
             description: "Run a shell command and return structured process output.".to_owned(),
             input_schema: json!({
@@ -94,7 +98,7 @@ impl ShellTools {
 
     pub fn apply_patch_spec(&self) -> ToolSpec {
         ToolSpec {
-            name: APPLY_PATCH_TOOL_NAME.to_owned(),
+            name: ToolName::try_from(APPLY_PATCH_TOOL_NAME).expect("valid tool name"),
             tool_type: ToolType::Custom,
             description: "Apply a Codex-style patch to local files.".to_owned(),
             input_schema: Value::Null,
@@ -109,21 +113,24 @@ impl ShellTools {
         matches!(name, SHELL_COMMAND_TOOL_NAME | APPLY_PATCH_TOOL_NAME)
     }
 
-    pub async fn call(&self, call: ToolCall) -> ToolResult {
-        let call_id = call.id.clone();
-        let mut result = match self.call_inner(&call).await {
-            Ok(content) => ToolResult::success(call_id, content),
-            Err(error) => ToolResult::error(call_id, error.to_string()),
-        };
-        result.tool_type = call.tool_type;
-        result
+    pub async fn call(&self, call: ToolCall) -> ToolOutput {
+        match self.call_inner(&call).await {
+            Ok(output) => ToolOutput {
+                output: Arc::from(output),
+                status: ToolOutputStatus::Success,
+            },
+            Err(error) => ToolOutput {
+                output: Arc::from(error.to_string()),
+                status: ToolOutputStatus::Error,
+            },
+        }
     }
 
     async fn call_inner(&self, call: &ToolCall) -> Result<String> {
         match call.name.as_str() {
             SHELL_COMMAND_TOOL_NAME => self.call_shell(call).await,
             APPLY_PATCH_TOOL_NAME => self.call_apply_patch(call),
-            _ => Err(anyhow!("unsupported tool call: {}", call.name)),
+            _ => Err(anyhow!("unsupported tool call: {}", call.name.as_str())),
         }
     }
 
@@ -132,7 +139,7 @@ impl ShellTools {
             return Err(anyhow!("shell_command expects a function tool call"));
         }
 
-        let args: ShellArgs = serde_json::from_value(call.arguments.clone())?;
+        let args: ShellArgs = serde_json::from_str(&call.arguments)?;
         let timeout = args
             .timeout
             .map(Duration::from_secs)
@@ -241,11 +248,7 @@ impl ShellTools {
         if call.tool_type != ToolType::Custom {
             return Err(anyhow!("apply_patch expects a custom tool call"));
         }
-        let patch = call
-            .arguments
-            .as_str()
-            .ok_or_else(|| anyhow!("apply_patch expects freeform patch text"))?;
-        apply_patch::apply_patch(patch)
+        apply_patch::apply_patch(&call.arguments)
     }
 }
 

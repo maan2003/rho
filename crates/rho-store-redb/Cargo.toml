@@ -8,9 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+postcard.workspace = true
 redb.workspace = true
 rho-core.workspace = true
-serde_cbor.workspace = true
+serde.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

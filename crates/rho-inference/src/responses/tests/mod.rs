@@ -1,13 +1,16 @@
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::{Sink, Stream};
 use rho_core::{
-    ContextBlock, ContextItem, InferenceResponse, InferenceUpdate, ItemId, ItemKind, Message,
-    MessagePhase, ProviderItem, ProviderItemKind, ReasoningTextKind, Role, TokenUsage, ToolCall,
-    ToolCallId, ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec, ToolType,
+    ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
+    InferenceResponseItem, MessagePhase, OpaqueProviderData, PendingInferenceResponse,
+    ProviderResponseId, StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolFormat,
+    ToolGrammarSyntax, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolType,
+    text_content,
 };
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
@@ -18,26 +21,165 @@ use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 
-fn first_message(response: &InferenceResponse) -> &Message {
-    response
-        .items
+fn first_assistant_message(
+    items: &[InferenceResponseItem],
+) -> (&[ContentPart], Option<MessagePhase>) {
+    items
         .iter()
         .find_map(|item| match item {
-            ItemKind::Message(message) => Some(message),
+            InferenceResponseItem::AssistantMessage { content, phase } => {
+                Some((content.as_slice(), *phase))
+            }
             _ => None,
         })
-        .expect("message item")
+        .expect("assistant message item")
 }
 
-fn first_tool_call(response: &InferenceResponse) -> &ToolCall {
-    response
-        .items
+fn assistant_message_text(items: &[InferenceResponseItem]) -> String {
+    let (content, _) = first_assistant_message(items);
+    text_content(content)
+}
+
+fn first_tool_call(items: &[InferenceResponseItem]) -> ToolCall {
+    items
         .iter()
         .find_map(|item| match item {
-            ItemKind::ToolCall(call) => Some(call),
+            InferenceResponseItem::ToolCall {
+                id,
+                name,
+                tool_type,
+                arguments,
+            } => Some(ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                tool_type: *tool_type,
+                arguments: arguments.clone(),
+            }),
             _ => None,
         })
         .expect("tool call item")
+}
+
+fn content_parts(text: &str) -> Vec<ContentPart> {
+    vec![ContentPart::Text {
+        text: text.to_owned(),
+    }]
+}
+
+fn assistant_message(text: &str) -> InferenceResponseItem {
+    InferenceResponseItem::AssistantMessage {
+        content: content_parts(text),
+        phase: None,
+    }
+}
+
+fn assistant_message_with_phase(text: &str, phase: MessagePhase) -> InferenceResponseItem {
+    InferenceResponseItem::AssistantMessage {
+        content: content_parts(text),
+        phase: Some(phase),
+    }
+}
+
+/// A `ContextBlock::UserMessage` carrying a single text part.
+fn user_block(text: &str) -> Arc<ContextBlock> {
+    Arc::new(ContextBlock::UserMessage {
+        content: content_parts(text),
+    })
+}
+
+fn tool_result_success(call_id: ToolCallId, content: impl Into<String>) -> ToolResult {
+    ToolResult {
+        call_id,
+        tool_type: ToolType::Function,
+        body: ToolOutput {
+            output: Arc::from(content.into()),
+            status: ToolOutputStatus::Success,
+        },
+    }
+}
+
+fn tool_call_id(id: &str) -> ToolCallId {
+    ToolCallId::try_from(id).unwrap()
+}
+
+fn tool_name(name: &str) -> ToolName {
+    ToolName::try_from(name).unwrap()
+}
+
+fn inference_request(input: Vec<Arc<ContextBlock>>, tools: Vec<ToolSpec>) -> InferenceRequest {
+    InferenceRequest {
+        input,
+        tools: tools.into(),
+    }
+}
+
+/// Drives `ResponseState` over a wire-event stream, folding the emitted
+/// [`InferenceUpdate`]s into a `PendingInferenceResponse` exactly as a consumer
+/// would, then exposes the finalized items alongside the raw event stream.
+#[derive(Debug)]
+struct ParsedResponse {
+    items: Vec<InferenceResponseItem>,
+    usage: Option<TokenUsage>,
+    provider_response_id: Option<String>,
+    events: Vec<(usize, ContextItemEvent)>,
+    saw_finished: bool,
+}
+
+fn parse_response_events(
+    events: impl IntoIterator<Item = impl AsRef<str>>,
+) -> anyhow::Result<ParsedResponse> {
+    let mut state = ResponseState::new();
+    let mut pending = PendingInferenceResponse::default();
+    let mut usage = None;
+    let mut provider_response_id = None;
+    let mut item_events = Vec::new();
+    let mut saw_finished = false;
+    let mut completed = false;
+
+    for event in events {
+        let data = event.as_ref().trim_end();
+        if data == "[DONE]" {
+            completed = true;
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let (done, updates) = state.apply_event(&value)?;
+        for update in updates {
+            match update {
+                InferenceEvent::ContextItem { index, event } => {
+                    pending.apply(index, event.clone());
+                    item_events.push((index, event));
+                }
+                InferenceEvent::Finished {
+                    usage: turn_usage,
+                    provider_response_id: id,
+                } => {
+                    usage = turn_usage;
+                    provider_response_id = id.map(|id| id.as_str().to_owned());
+                    saw_finished = true;
+                }
+                _ => {}
+            }
+        }
+        if done {
+            completed = true;
+            break;
+        }
+    }
+
+    if !completed {
+        anyhow::bail!("response stream ended before response.completed");
+    }
+
+    Ok(ParsedResponse {
+        items: pending.finish()?,
+        usage,
+        provider_response_id,
+        events: item_events,
+        saw_finished,
+    })
 }
 
 fn test_oauth_file(

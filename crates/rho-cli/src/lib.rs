@@ -10,28 +10,26 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rho_agent::{Agent, AgentStatus, AgentStore, AgentTools, AgentUpdate};
+use futures::StreamExt;
+use rho_agent::{Agent, AgentStateKind};
 use rho_cli_term_raw::{
     Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
 use rho_core::{
-    ContextBlock, InferenceUpdate, ItemKind, ReasoningTextKind, Role, ToolCall, ToolResult,
-    ToolResultStatus,
+    ContextBlock, InferenceResponseItem, StreamingContextItem, StreamingContextItemState, ToolCall,
+    ToolOutputStatus, ToolResult, text_content,
 };
 use rho_inference::{AuthArgs, InferenceAuth, InferenceSession, run_auth_cli};
 use rho_store_cbor::CborLog;
-use rho_tool_shell::ShellTools;
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
 mod tests;
 
 const DEFAULT_SESSION_NAME: &str = "default";
-const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_COMPACTION_THRESHOLD: u64 = 220_000;
 
 pub fn main() -> Result<()> {
@@ -79,9 +77,9 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 
     let renderer = PlainRenderer::default();
     let output = renderer.output();
-    let agent = build_agent(&args, Some(output)).await?;
-    agent.send(prompt);
-    wait_idle(&agent).await;
+    let agent = build_agent(&args, None).await?;
+    agent.send_user_message(prompt);
+    watch_agent(&agent, Some(output), None).await;
 
     let text = renderer.finish();
     if !text.is_empty() {
@@ -97,28 +95,42 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
     let inference = Box::new(build_inference_session(args)?);
-    let tools = vec![AgentTools::Shell(ShellTools::new(DEFAULT_TOOL_TIMEOUT))];
-    let mut builder = Agent::builder(inference, tools);
-    if !args.no_store {
-        let store = AgentStore::CborLog(CborLog::new(args.session_path()?));
-        builder = builder.with_store_loaded(store).await?;
-    }
-    let agent = builder.spawn();
-    if let Some(renderer) = renderer {
-        let (_, mut inference_updates) = agent.subscribe_inference_updates();
-        let inference_renderer = Arc::clone(&renderer);
+    let store = if args.no_store {
+        None
+    } else {
+        Some(CborLog::new(args.session_path()?))
+    };
+    let blocks = if let Some(store) = &store {
+        store
+            .read_blocks()
+            .await?
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let agent = Agent::spawn(inference, blocks);
+    if renderer.is_some() || store.is_some() {
+        let changes = agent.subscribe();
+        let mut persisted = agent.blocks().len();
         tokio::spawn(async move {
-            while let Ok(update) = inference_updates.recv().await {
-                if let Ok(mut renderer) = inference_renderer.lock() {
-                    renderer.handle_inference(update);
+            futures::pin_mut!(changes);
+            let mut last_rendered_items = 0usize;
+            while let Some(state) = changes.next().await {
+                if let Some(renderer) = &renderer
+                    && let Ok(mut renderer) = renderer.lock()
+                {
+                    renderer.handle_state_kind(&state.kind, &mut last_rendered_items);
                 }
-            }
-        });
-        let (_, mut agent_updates) = agent.subscribe_agent_updates();
-        tokio::spawn(async move {
-            while let Ok(update) = agent_updates.recv().await {
-                if let Ok(mut renderer) = renderer.lock() {
-                    renderer.handle_agent(update);
+                if let Some(store) = &store {
+                    while persisted < state.blocks.len() {
+                        let _ = store.append_block(&state.blocks[persisted]).await;
+                        persisted += 1;
+                    }
+                }
+                if matches!(state.kind, AgentStateKind::Idle | AgentStateKind::Error(_)) {
+                    last_rendered_items = 0;
                 }
             }
         });
@@ -163,7 +175,7 @@ impl ChatApp {
                     }
                     self.term.print_user(&line);
                     self.term.set_status("running");
-                    self.agent.send(line);
+                    self.agent.send_user_message(line);
                     self.running_turn = Some(spawn_turn_watcher(
                         self.agent.clone(),
                         self.term.renderer(),
@@ -231,16 +243,39 @@ impl ChatApp {
     }
 }
 
-async fn wait_idle(agent: &Agent) {
-    let (_, mut changes) = agent.subscribe_status();
-    let mut saw_running = false;
-    while let Ok(status) = changes.recv().await {
-        match status {
-            AgentStatus::Running => saw_running = true,
-            AgentStatus::Idle if saw_running => return,
-            AgentStatus::Idle => {}
+async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>, store: Option<CborLog>) {
+    let changes = agent.subscribe();
+    futures::pin_mut!(changes);
+    let mut persisted = agent.blocks().len();
+    let mut last_rendered_items = 0usize;
+    let mut saw_running = !matches!(agent.state().kind, AgentStateKind::Idle);
+    loop {
+        let Some(state) = changes.next().await else {
+            return;
+        };
+        if let Some(renderer) = &renderer
+            && let Ok(mut renderer) = renderer.lock()
+        {
+            renderer.handle_state_kind(&state.kind, &mut last_rendered_items);
+        }
+        if let Some(store) = &store {
+            while persisted < state.blocks.len() {
+                let _ = store.append_block(&state.blocks[persisted]).await;
+                persisted += 1;
+            }
+        }
+        if matches!(state.kind, AgentStateKind::Idle | AgentStateKind::Error(_)) {
+            if saw_running {
+                return;
+            }
+        } else {
+            saw_running = true;
         }
     }
+}
+
+async fn wait_idle(agent: &Agent) {
+    watch_agent(agent, None, None).await;
 }
 
 /// Watch the already-started turn: when the agent goes idle, flush the
@@ -301,39 +336,27 @@ impl ChatTerm {
         print_system_on_handle(&self.handle, text);
     }
 
-    fn print_history(&self, blocks: &[ContextBlock]) {
+    fn print_history(&self, blocks: &[Arc<ContextBlock>]) {
         if blocks.is_empty() {
             self.print_system("rho ready");
             return;
         }
         self.print_system("loaded previous session");
         for block in blocks {
-            for item in match block {
-                ContextBlock::Local { items } | ContextBlock::InferenceResponse { items, .. } => {
-                    items
+            match block.as_ref() {
+                ContextBlock::UserMessage { content } => {
+                    self.handle.print_output(
+                        "history-message",
+                        message_block("you", text_content(content)),
+                    );
                 }
-            } {
-                match &item.kind {
-                    ItemKind::Message(message) => {
-                        self.handle.print_output(
-                            "history-message",
-                            message_block(role_label(message.role), message.text_content()),
-                        );
+                ContextBlock::InferenceResponse { items, .. } => {
+                    for item in items {
+                        self.print_history_response_item(item);
                     }
-                    ItemKind::ToolCall(call) => {
-                        self.handle.print_output(
-                            "history-tool-call",
-                            StyledBlock::new(StyledText::from(vec![
-                                Span::new("tool ", Style::default().fg(Color::DarkMagenta).bold()),
-                                Span::new(
-                                    call.name.clone(),
-                                    Style::default().fg(Color::DarkMagenta),
-                                ),
-                            ]))
-                            .margin_left(1),
-                        );
-                    }
-                    ItemKind::ToolResult(result) => {
+                }
+                ContextBlock::ToolResults { results } => {
+                    for result in results {
                         self.handle.print_output(
                             "history-tool-result",
                             StyledBlock::new(StyledText::from(vec![
@@ -342,16 +365,43 @@ impl ChatTerm {
                                     Style::default().fg(Color::DarkMagenta).bold(),
                                 ),
                                 Span::new(
-                                    tool_status_label(&result.status),
+                                    tool_status_label(&result.body.status),
                                     Style::default().fg(Color::DarkGrey),
                                 ),
                             ]))
                             .margin_left(1),
                         );
                     }
-                    ItemKind::ReasoningText(_) | ItemKind::ProviderItem(_) => {}
                 }
             }
+        }
+    }
+
+    fn print_history_response_item(&self, item: &InferenceResponseItem) {
+        match item {
+            InferenceResponseItem::AssistantMessage { content, .. } => {
+                self.handle.print_output(
+                    "history-message",
+                    message_block("assistant", text_content(content)),
+                );
+            }
+            InferenceResponseItem::ToolCall { name, .. } => {
+                self.handle.print_output(
+                    "history-tool-call",
+                    StyledBlock::new(StyledText::from(vec![
+                        Span::new("tool ", Style::default().fg(Color::DarkMagenta).bold()),
+                        Span::new(
+                            name.as_str().to_owned(),
+                            Style::default().fg(Color::DarkMagenta),
+                        ),
+                    ]))
+                    .margin_left(1),
+                );
+            }
+            InferenceResponseItem::RawReasoning { .. }
+            | InferenceResponseItem::EncryptedReasoning { .. }
+            | InferenceResponseItem::Compaction(_)
+            | InferenceResponseItem::Unknown(_) => {}
         }
     }
 
@@ -433,53 +483,78 @@ impl StreamingRenderer {
         }
     }
 
-    fn handle_inference(&mut self, update: InferenceUpdate) {
-        match update {
-            InferenceUpdate::TextDelta { text, .. } => {
-                self.assistant_text.push_str(&text);
-                self.render_assistant();
-            }
-            InferenceUpdate::ReasoningTextDelta { kind, text, .. } => {
-                if kind == ReasoningTextKind::Summary {
-                    self.thinking_text.push_str(&text);
-                    self.render_thinking();
-                }
-            }
-            InferenceUpdate::ToolCall { call, .. } => self.render_tool_call(&call),
-            InferenceUpdate::OutputItem { item, .. } => {
-                if self.assistant_text.is_empty()
-                    && let ItemKind::Message(message) = item
-                {
-                    self.assistant_text.push_str(&message.text_content());
-                    self.render_assistant();
-                }
-            }
-            InferenceUpdate::CompactionStarted { .. } => self.render_notice("compacting context"),
-            InferenceUpdate::Usage(_) | InferenceUpdate::ResponseId(_) => {}
-            InferenceUpdate::Finished(response) => {
-                let requests_tool_calls = response
+    fn handle_state_kind(&mut self, kind: &AgentStateKind, last_rendered_items: &mut usize) {
+        match kind {
+            AgentStateKind::ApiStreaming {
+                pending_response, ..
+            } => {
+                for (index, slot) in pending_response
                     .items
                     .iter()
-                    .any(|item| matches!(item, ItemKind::ToolCall(_)));
-                if self.assistant_text.is_empty() {
-                    for item in response.items {
-                        if let ItemKind::Message(message) = item {
-                            self.assistant_text.push_str(&message.text_content());
-                        }
+                    .enumerate()
+                    .skip(*last_rendered_items)
+                {
+                    if let StreamingContextItemState::Pending(item)
+                    | StreamingContextItemState::Finished(item) = slot
+                    {
+                        self.render_streaming_item(index, item);
                     }
-                    self.render_assistant();
                 }
-                if self.handle.is_some() && !requests_tool_calls {
+                *last_rendered_items = pending_response.items.len();
+            }
+            AgentStateKind::ToolCalling { results } => {
+                for result in results {
+                    self.render_tool_finished(result);
+                }
+            }
+            AgentStateKind::Error(error) => {
+                self.render_notice(&format!("agent error: {}", error.error))
+            }
+            AgentStateKind::Idle => {
+                if self.handle.is_some() {
                     self.finish_turn();
                 }
             }
         }
     }
 
-    fn handle_agent(&mut self, update: AgentUpdate) {
-        match update {
-            AgentUpdate::ToolCallStarted(call) => self.render_tool_started(&call),
-            AgentUpdate::ToolCallFinished(result) => self.render_tool_finished(&result),
+    fn render_streaming_item(&mut self, _index: usize, item: &StreamingContextItem) {
+        match item {
+            StreamingContextItem::AssistantMessage { content, .. } => {
+                self.assistant_text = content
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("");
+                self.render_assistant();
+            }
+            StreamingContextItem::RawReasoning { content, summary } => {
+                self.thinking_text = if summary.is_empty() {
+                    content.to_string()
+                } else {
+                    summary
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.render_thinking();
+            }
+            StreamingContextItem::ToolCall {
+                id,
+                name,
+                tool_type,
+                arguments,
+            } => {
+                self.render_tool_call(&ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    tool_type: *tool_type,
+                    arguments: arguments.to_string(),
+                });
+            }
+            StreamingContextItem::Compaction(_) => self.render_notice("compacting context"),
+            StreamingContextItem::EncryptedReasoning { .. } | StreamingContextItem::Unknown(_) => {}
         }
     }
 
@@ -533,30 +608,21 @@ impl StreamingRenderer {
     fn render_tool_call(&mut self, call: &ToolCall) {
         let block = StyledBlock::new(StyledText::from(vec![
             Span::new("tool ", Style::default().fg(Color::DarkMagenta).bold()),
-            Span::new(call.name.clone(), Style::default().fg(Color::DarkMagenta)),
+            Span::new(
+                call.name.as_str().to_owned(),
+                Style::default().fg(Color::DarkMagenta),
+            ),
             Span::new(" requested", Style::default().fg(Color::DarkGrey)),
             Span::plain("\n"),
             Span::plain(call.arguments.to_string()),
         ]))
         .margin_left(1);
-        self.set_tool_block(call.id.0.clone(), block);
-    }
-
-    fn render_tool_started(&mut self, call: &ToolCall) {
-        let block = StyledBlock::new(StyledText::from(vec![
-            Span::new("tool ", Style::default().fg(Color::DarkMagenta).bold()),
-            Span::new(call.name.clone(), Style::default().fg(Color::DarkMagenta)),
-            Span::new(" running", Style::default().fg(Color::DarkYellow)),
-            Span::plain("\n"),
-            Span::plain(call.arguments.to_string()),
-        ]))
-        .margin_left(1);
-        self.set_tool_block(call.id.0.clone(), block);
+        self.set_tool_block(call.id.as_str().to_owned(), block);
     }
 
     fn render_tool_finished(&mut self, result: &ToolResult) {
-        let status = tool_status_label(&result.status);
-        let output = truncate_display(&result.rendered_output(), 4_000);
+        let status = tool_status_label(&result.body.status);
+        let output = truncate_display(&result.body.output, 4_000);
         let block = StyledBlock::new(StyledText::from(vec![
             Span::new(
                 "tool result ",
@@ -564,13 +630,13 @@ impl StreamingRenderer {
             ),
             Span::new(
                 status,
-                Style::default().fg(tool_status_color(&result.status)),
+                Style::default().fg(tool_status_color(&result.body.status)),
             ),
             Span::plain("\n"),
             Span::plain(output),
         ]))
         .margin_left(1);
-        self.set_tool_block(result.call_id.0.clone(), block);
+        self.set_tool_block(result.call_id.as_str().to_owned(), block);
     }
 
     fn render_notice(&mut self, text: &str) {
@@ -734,15 +800,6 @@ fn message_block(label: &'static str, text: String) -> StyledBlock {
     .margin_left(1)
 }
 
-fn role_label(role: Role) -> &'static str {
-    match role {
-        Role::System => "system",
-        Role::Developer => "developer",
-        Role::User => "you",
-        Role::Assistant => "assistant",
-    }
-}
-
 fn role_color(label: &str) -> Color {
     match label {
         "you" => Color::DarkCyan,
@@ -752,19 +809,19 @@ fn role_color(label: &str) -> Color {
     }
 }
 
-fn tool_status_label(status: &ToolResultStatus) -> String {
+fn tool_status_label(status: &ToolOutputStatus) -> String {
     match status {
-        ToolResultStatus::Success => "success".to_owned(),
-        ToolResultStatus::Error { message } => format!("error: {message}"),
-        ToolResultStatus::Cancelled { reason } => format!("cancelled: {reason}"),
+        ToolOutputStatus::Success => "success".to_owned(),
+        ToolOutputStatus::Error => "error".to_owned(),
+        ToolOutputStatus::Cancelled => "cancelled".to_owned(),
     }
 }
 
-fn tool_status_color(status: &ToolResultStatus) -> Color {
+fn tool_status_color(status: &ToolOutputStatus) -> Color {
     match status {
-        ToolResultStatus::Success => Color::Green,
-        ToolResultStatus::Error { .. } => Color::DarkRed,
-        ToolResultStatus::Cancelled { .. } => Color::DarkYellow,
+        ToolOutputStatus::Success => Color::Green,
+        ToolOutputStatus::Error => Color::DarkRed,
+        ToolOutputStatus::Cancelled => Color::DarkYellow,
     }
 }
 

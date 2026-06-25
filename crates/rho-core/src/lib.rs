@@ -10,8 +10,10 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod append_string;
 mod util;
 
+pub use crate::append_string::{AStr, AppendString, Diff};
 use crate::util::validated_string_type;
 
 validated_string_type!(
@@ -26,6 +28,11 @@ validated_string_type!(
     crate::util::validate_identifier
 );
 
+validated_string_type!(
+    pub ProviderResponseId,
+    crate::util::validate_identifier
+);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ContextBlock {
     // intentionally limiting to prevent misuse
@@ -36,35 +43,34 @@ pub enum ContextBlock {
         results: Vec<ToolResult>,
     },
     InferenceResponse {
-        items: Vec<ContextItem>,
-        provider_response_id: Option<String>,
+        items: Vec<InferenceResponseItem>,
+        provider_response_id: Option<ProviderResponseId>,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum ContextItem {
-    Message(Message),
-    ToolCall(ToolCall),
-    ToolResult(ToolResult),
-    Reasoning(ReasoningItem),
+pub enum InferenceResponseItem {
+    AssistantMessage {
+        content: Vec<ContentPart>,
+        phase: Option<MessagePhase>,
+    },
+    ToolCall {
+        id: ToolCallId,
+        name: ToolName,
+        tool_type: ToolType,
+        // arbitrary could be json!
+        arguments: String,
+    },
+    EncryptedReasoning {
+        payload: OpaqueProviderData,
+        summary: Vec<String>,
+    },
+    RawReasoning {
+        content: String,
+        summary: Vec<String>,
+    },
     Compaction(OpaqueProviderData),
     Unknown(OpaqueProviderData),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Message {
-    pub role: Role,
-    pub content: Vec<ContentPart>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub phase: Option<MessagePhase>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role {
-    System,
-    Developer,
-    User,
-    Assistant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,12 +103,28 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolOutputStatus {
+    Success,
+    Error,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutput {
+    /// Sent to the model verbatim.
+    pub output: Arc<String>,
+    /// Harness/UI metadata only; not included in the provider wire payload.
+    pub status: ToolOutputStatus,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
+    /// Matches the [`ToolCall`] this result answers.
     pub call_id: ToolCallId,
+    /// Wire shape for replaying this result to the provider.
     pub tool_type: ToolType,
-    pub status: ToolResultStatus,
-    pub output: ToolOutput,
+    pub body: ToolOutput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,34 +150,14 @@ pub enum ToolFormat {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToolResultStatus {
-    Success,
-    Error { message: String },
-    Cancelled { reason: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolOutput {
-    pub content: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReasoningItem {
-    pub kind: ReasoningItemKind,
-    pub summary: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReasoningItemKind {
-    Encrypted(OpaqueProviderData),
-    RawReasoning { content: String },
-}
-
+/// A provider item captured whole so it can be replayed byte-for-byte. It is
+/// never appended to (unlike streamed text), so the fields are `Arc<str>` for
+/// O(1) cloning rather than [`AStr`]; the same value rides along in both
+/// pending items and finalized history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpaqueProviderData {
-    pub tag: String,
-    pub data: String,
+    pub tag: Arc<str>,
+    pub data: Arc<str>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,229 +168,163 @@ pub struct InferenceRequest {
     pub tools: Arc<[ToolSpec]>,
 }
 
-/// Still streaming and pending context item
 #[derive(Clone, Debug, PartialEq)]
-pub enum PendingContextItem {
-    CompactionStarted,
-    Reasoning {
-        content: Option<String>,
-        summary: Vec<String>,
+pub enum StreamingContextItem {
+    AssistantMessage {
+        content: Vec<AStr>,
+        phase: Option<MessagePhase>,
     },
-    ToolCall(ToolCall),
-    Message(Message),
+    ToolCall {
+        id: ToolCallId,
+        name: ToolName,
+        tool_type: ToolType,
+        arguments: AStr,
+    },
+    RawReasoning {
+        content: AStr,
+        summary: Vec<AStr>,
+    },
+    EncryptedReasoning {
+        payload: OpaqueProviderData,
+        summary: Vec<AStr>,
+    },
+    Compaction(Option<OpaqueProviderData>),
+    Unknown(OpaqueProviderData),
+}
+
+impl StreamingContextItem {
+    pub fn to_context_item(&self) -> anyhow::Result<InferenceResponseItem> {
+        Ok(match self {
+            StreamingContextItem::AssistantMessage { content, phase } => {
+                InferenceResponseItem::AssistantMessage {
+                    content: content
+                        .iter()
+                        .map(|text| ContentPart::Text {
+                            text: text.to_string(),
+                        })
+                        .collect(),
+                    phase: *phase,
+                }
+            }
+            StreamingContextItem::ToolCall {
+                id,
+                name,
+                tool_type,
+                arguments,
+            } => InferenceResponseItem::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                tool_type: *tool_type,
+                arguments: arguments.to_string(),
+            },
+            StreamingContextItem::RawReasoning { content, summary } => {
+                InferenceResponseItem::RawReasoning {
+                    content: content.to_string(),
+                    summary: summary.iter().map(AStr::to_string).collect(),
+                }
+            }
+            StreamingContextItem::EncryptedReasoning { payload, summary } => {
+                InferenceResponseItem::EncryptedReasoning {
+                    payload: payload.clone(),
+                    summary: summary.iter().map(AStr::to_string).collect(),
+                }
+            }
+            StreamingContextItem::Compaction(Some(payload)) => {
+                InferenceResponseItem::Compaction(payload.clone())
+            }
+            StreamingContextItem::Unknown(payload) => {
+                InferenceResponseItem::Unknown(payload.clone())
+            }
+            StreamingContextItem::Compaction(None) => {
+                anyhow::bail!("compaction never finished")
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum MaybePendingContextItem {
-    // No item here
-    Absent,
-    Pending(PendingContextItem),
-    Complete(ContextItem),
+pub enum StreamingContextItemState {
+    Empty,
+    Pending(StreamingContextItem),
+    Finished(StreamingContextItem),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PendingInferenceResponse {
-    pub items: Vec<MaybePendingContextItem>,
+    pub items: Vec<StreamingContextItemState>,
 }
 
 impl PendingInferenceResponse {
-    pub fn apply(&mut self, index: usize, event: ContextItemEvent) -> anyhow::Result<()> {
-        if self.items.len() <= index {
-            self.items
-                .resize(index + 1, MaybePendingContextItem::Absent);
-        }
-
-        match (&mut self.items[index], event) {
-            (slot @ MaybePendingContextItem::Absent, ContextItemEvent::Add(item)) => {
-                *slot = MaybePendingContextItem::Pending(item);
+    pub fn apply(&mut self, index: usize, event: ContextItemEvent) {
+        match event {
+            ContextItemEvent::Update(item) => {
+                if self.items.len() <= index {
+                    self.items
+                        .resize(index + 1, StreamingContextItemState::Empty);
+                }
+                self.items[index] = StreamingContextItemState::Pending(item);
             }
-
-            (
-                MaybePendingContextItem::Pending(PendingContextItem::ToolCall(call)),
-                ContextItemEvent::ToolCallArgumentDelta { delta },
-            ) => {
-                call.arguments.push_str(&delta);
-            }
-            (
-                slot @ MaybePendingContextItem::Pending(PendingContextItem::ToolCall(_)),
-                ContextItemEvent::ToolCallFinish {},
-            ) => {
-                let MaybePendingContextItem::Pending(PendingContextItem::ToolCall(call)) =
-                    std::mem::replace(slot, MaybePendingContextItem::Absent)
-                else {
-                    unreachable!();
-                };
-                *slot = MaybePendingContextItem::Complete(ContextItem::ToolCall(call));
-            }
-            (
-                MaybePendingContextItem::Pending(PendingContextItem::Message(message)),
-                ContextItemEvent::MessageDelta {
-                    content_part_index,
-                    delta,
-                },
-            ) => {
-                if content_part_index < message.content.len() {
-                    let ContentPart::Text { text } = &mut message.content[content_part_index];
-                    text.push_str(&delta);
-                } else if content_part_index == message.content.len() {
-                    message.content.push(ContentPart::Text { text: delta });
-                } else {
-                    anyhow::bail!("invalid transition");
+            // The slot already holds the final snapshot from the preceding
+            // `Update`; `Finish` just promotes it to `Finished`.
+            ContextItemEvent::Finish => {
+                if let Some(slot @ StreamingContextItemState::Pending(_)) =
+                    self.items.get_mut(index)
+                {
+                    let StreamingContextItemState::Pending(item) =
+                        std::mem::replace(slot, StreamingContextItemState::Empty)
+                    else {
+                        unreachable!()
+                    };
+                    *slot = StreamingContextItemState::Finished(item);
                 }
             }
-            (
-                slot @ MaybePendingContextItem::Pending(PendingContextItem::Message(_)),
-                ContextItemEvent::MessageFinish {},
-            ) => {
-                let MaybePendingContextItem::Pending(PendingContextItem::Message(message)) =
-                    std::mem::replace(slot, MaybePendingContextItem::Absent)
-                else {
-                    unreachable!();
-                };
-                *slot = MaybePendingContextItem::Complete(ContextItem::Message(message));
-            }
-            (
-                MaybePendingContextItem::Pending(PendingContextItem::Reasoning { summary, .. }),
-                ContextItemEvent::ReasoningItemSummaryDelta {
-                    summary_index,
-                    delta,
-                },
-            ) => {
-                if summary_index < summary.len() {
-                    summary[summary_index].push_str(&delta);
-                } else if summary_index == summary.len() {
-                    summary.push(delta);
-                } else {
-                    anyhow::bail!("invalid transition");
-                }
-            }
-            (
-                MaybePendingContextItem::Pending(PendingContextItem::Reasoning { content, .. }),
-                ContextItemEvent::ReasoningItemContentDelta { delta },
-            ) => {
-                content.get_or_insert_with(String::new).push_str(&delta);
-            }
-            (
-                slot @ MaybePendingContextItem::Pending(PendingContextItem::Reasoning { .. }),
-                ContextItemEvent::ReasoningFinish {},
-            ) => {
-                let MaybePendingContextItem::Pending(PendingContextItem::Reasoning {
-                    content,
-                    summary,
-                }) = std::mem::replace(slot, MaybePendingContextItem::Absent)
-                else {
-                    unreachable!();
-                };
-                *slot = MaybePendingContextItem::Complete(ContextItem::Reasoning(ReasoningItem {
-                    kind: ReasoningItemKind::RawReasoning {
-                        content: content.unwrap_or_default(),
-                    },
-                    summary,
-                }));
-            }
-            (
-                slot @ MaybePendingContextItem::Pending(PendingContextItem::Reasoning { .. }),
-                ContextItemEvent::ReasoningEncryptedFinish { encrypted_content },
-            ) => {
-                let MaybePendingContextItem::Pending(PendingContextItem::Reasoning {
-                    summary, ..
-                }) = std::mem::replace(slot, MaybePendingContextItem::Absent)
-                else {
-                    unreachable!();
-                };
-                *slot = MaybePendingContextItem::Complete(ContextItem::Reasoning(ReasoningItem {
-                    kind: ReasoningItemKind::Encrypted(encrypted_content),
-                    summary,
-                }));
-            }
-            (
-                slot @ MaybePendingContextItem::Pending(PendingContextItem::CompactionStarted),
-                ContextItemEvent::CompactionFinish { payload },
-            ) => {
-                *slot = MaybePendingContextItem::Complete(ContextItem::Compaction(payload));
-            }
-            (
-                slot @ MaybePendingContextItem::Absent,
-                ContextItemEvent::UnknownFinish { payload },
-            ) => {
-                *slot = MaybePendingContextItem::Complete(ContextItem::Unknown(payload));
-            }
-            _ => {
-                anyhow::bail!("invalid transition");
-            }
         }
-
-        Ok(())
     }
 
-    /// Consume the streamed response, asserting it is structurally complete:
-    /// every slot must have been filled and finished. Returns an error if any
-    /// slot is still `Absent` (a gap in the index sequence) or `Pending` (an
-    /// item that never received its `*Finish` event).
-    pub fn finish(self) -> anyhow::Result<Vec<ContextItem>> {
+    pub fn finish(&self) -> anyhow::Result<Vec<InferenceResponseItem>> {
         self.items
-            .into_iter()
+            .iter()
             .enumerate()
             .map(|(index, slot)| match slot {
-                MaybePendingContextItem::Complete(item) => Ok(item),
-                MaybePendingContextItem::Absent => {
+                StreamingContextItemState::Empty => {
                     anyhow::bail!("response is incomplete: gap at index {index}")
                 }
-                MaybePendingContextItem::Pending(pending) => {
-                    anyhow::bail!(
-                        "response is incomplete: item at index {index} never finished: {pending:?}"
-                    )
+                StreamingContextItemState::Pending(_) => {
+                    anyhow::bail!("response is incomplete: item at index {index} never finished")
                 }
+                StreamingContextItemState::Finished(item) => item.to_context_item(),
             })
             .collect()
     }
 }
 
-// we could use bump allocation if we are having performance issues
+/// A change to the pending item at some `output_index`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContextItemEvent {
-    Add(PendingContextItem),
-    ToolCallArgumentDelta {
-        delta: String,
-    },
-    ToolCallFinish {},
-    MessageDelta {
-        content_part_index: usize,
-        delta: String,
-    },
-    MessageFinish {},
-    ReasoningItemSummaryDelta {
-        summary_index: usize,
-        delta: String,
-    },
-    ReasoningItemContentDelta {
-        delta: String,
-    },
-    ReasoningFinish {},
-    ReasoningEncryptedFinish {
-        encrypted_content: OpaqueProviderData,
-    },
-    CompactionFinish {
-        payload: OpaqueProviderData,
-    },
-    UnknownFinish {
-        payload: OpaqueProviderData,
-    },
+    /// The pending item advanced; carries its latest snapshot. The producer
+    /// accumulates into [`AppendString`] buffers and emits the whole refreshed
+    /// snapshot, so a single `Update` covers both first-sight and every
+    /// subsequent delta.
+    Update(StreamingContextItem),
+    /// No more updates will arrive for this index — the value is whatever the
+    /// last `Update` delivered. Lets a consumer act on a finished item (e.g.
+    /// dispatch a tool call) before the whole response completes.
+    Finish,
 }
 
-#[derive(Debug)]
-pub enum InferenceUpdate {
+#[derive(Debug, Clone)]
+pub enum InferenceEvent {
     ContextItem {
         index: usize,
         event: ContextItemEvent,
     },
     Finished {
         usage: Option<TokenUsage>,
-        provider_response_id: Option<String>,
+        provider_response_id: Option<ProviderResponseId>,
     },
     /// You should see RequestSent soon
     TemporaryFailure {
-        error: anyhow::Error,
+        error: Arc<anyhow::Error>,
         retrying_at: Instant,
     },
     /// We have sent the request
@@ -399,7 +335,7 @@ pub enum InferenceUpdate {
     /// you shouldn't retry, that is already done internally
     Failed {
         // TODO: specific error message if needed if future
-        error: anyhow::Error,
+        error: Arc<anyhow::Error>,
     },
 }
 
@@ -422,7 +358,7 @@ pub trait IInferenceSession: Send + 'static {
 
     /// Drive the connection and return the next update for the active request.
     /// Pends (while keeping any warm socket alive) when no request is active.
-    fn run(&mut self) -> BoxFuture<'_, InferenceUpdate>;
+    fn run(&mut self) -> BoxFuture<'_, InferenceEvent>;
 
     /// Abort the active request and drop the now-indeterminate connection, so
     /// the next `request` reconnects from clean state.
@@ -436,64 +372,15 @@ pub struct TokenUsage {
     pub output_tokens: u64,
 }
 
-impl Message {
-    pub fn text_content(&self) -> String {
-        self.content
-            .iter()
-            .map(|part| match part {
-                ContentPart::Text { text } => text.as_str(),
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    }
-}
-
-impl ToolResult {
-    pub fn success(call_id: ToolCallId, content: impl Into<String>) -> Self {
-        Self {
-            call_id,
-            tool_type: ToolType::Function,
-            status: ToolResultStatus::Success,
-            output: ToolOutput {
-                content: content.into(),
-            },
-        }
-    }
-
-    pub fn error(call_id: ToolCallId, message: impl Into<String>) -> Self {
-        let message = message.into();
-        Self {
-            call_id,
-            tool_type: ToolType::Function,
-            status: ToolResultStatus::Error {
-                message: message.clone(),
-            },
-            output: ToolOutput { content: message },
-        }
-    }
-
-    pub fn cancelled(call_id: ToolCallId, reason: impl Into<String>) -> Self {
-        Self {
-            call_id,
-            tool_type: ToolType::Function,
-            status: ToolResultStatus::Cancelled {
-                reason: reason.into(),
-            },
-            output: ToolOutput {
-                content: String::new(),
-            },
-        }
-    }
-
-    pub fn rendered_output(&self) -> String {
-        match &self.status {
-            ToolResultStatus::Success => self.output.content.clone(),
-            ToolResultStatus::Error { message } => {
-                format!("error: {message}\n\n{}", self.output.content)
-            }
-            ToolResultStatus::Cancelled { reason } => format!("cancelled: {reason}"),
-        }
-    }
+/// Concatenate the text parts of a message.
+pub fn text_content(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => text.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 #[cfg(test)]
@@ -532,219 +419,150 @@ mod tests {
         );
     }
 
+    fn pending_message(text: &str) -> StreamingContextItem {
+        StreamingContextItem::AssistantMessage {
+            content: vec![AStr::from(text)],
+            phase: None,
+        }
+    }
+
+    fn message_item(text: &str) -> InferenceResponseItem {
+        InferenceResponseItem::AssistantMessage {
+            content: vec![ContentPart::Text {
+                text: text.to_owned(),
+            }],
+            phase: None,
+        }
+    }
+
     #[test]
-    fn pending_response_accumulates_message_events() {
-        let mut response = PendingInferenceResponse { items: Vec::new() };
+    fn apply_keeps_latest_snapshot_per_index() {
+        let mut response = PendingInferenceResponse::default();
 
-        response
-            .apply(
-                0,
-                ContextItemEvent::Add(PendingContextItem::Message(Message {
-                    role: Role::Assistant,
-                    content: Vec::new(),
-                    phase: None,
-                })),
-            )
-            .unwrap();
-        response
-            .apply(
-                0,
-                ContextItemEvent::MessageDelta {
-                    content_part_index: 0,
-                    delta: "hel".to_owned(),
-                },
-            )
-            .unwrap();
-        response
-            .apply(
-                0,
-                ContextItemEvent::MessageDelta {
-                    content_part_index: 0,
-                    delta: "lo".to_owned(),
-                },
-            )
-            .unwrap();
-        response
-            .apply(0, ContextItemEvent::MessageFinish {})
-            .unwrap();
+        // Each streamed snapshot supersedes the previous one for that index;
+        // there is no accumulation here, the producer already did it.
+        response.apply(0, ContextItemEvent::Update(pending_message("hel")));
+        response.apply(0, ContextItemEvent::Update(pending_message("hello")));
+        response.apply(0, ContextItemEvent::Finish);
 
+        assert_eq!(response.finish().unwrap(), vec![message_item("hello")]);
+    }
+
+    #[test]
+    fn finish_event_marks_slot_without_disturbing_snapshot() {
+        let mut response = PendingInferenceResponse::default();
+
+        response.apply(0, ContextItemEvent::Update(pending_message("done")));
         assert_eq!(
-            response.items,
-            vec![MaybePendingContextItem::Complete(ContextItem::Message(
-                Message {
-                    role: Role::Assistant,
-                    content: vec![ContentPart::Text {
-                        text: "hello".to_owned()
-                    }],
-                    phase: None,
-                }
-            ))]
+            response.items[0],
+            StreamingContextItemState::Pending(pending_message("done"))
         );
+
+        // `Finish` promotes the slot but leaves the snapshot untouched.
+        response.apply(0, ContextItemEvent::Finish);
+        assert_eq!(
+            response.items[0],
+            StreamingContextItemState::Finished(pending_message("done"))
+        );
+
+        assert_eq!(response.finish().unwrap(), vec![message_item("done")]);
     }
 
     #[test]
-    fn pending_response_rejects_out_of_order_message_delta() {
-        let mut response = PendingInferenceResponse { items: Vec::new() };
-
-        response
-            .apply(
-                0,
-                ContextItemEvent::Add(PendingContextItem::Message(Message {
-                    role: Role::Assistant,
-                    content: Vec::new(),
-                    phase: None,
-                })),
-            )
-            .unwrap();
-
-        let error = response
-            .apply(
-                0,
-                ContextItemEvent::MessageDelta {
-                    content_part_index: 1,
-                    delta: "late".to_owned(),
-                },
-            )
-            .unwrap_err();
-
-        assert_eq!(error.to_string(), "invalid transition");
-    }
-
-    #[test]
-    fn pending_response_accumulates_unknown_provider_item() {
+    fn finalizes_unknown_provider_item() {
         let payload = OpaqueProviderData {
-            tag: "provider.event".to_owned(),
-            data: "{}".to_owned(),
+            tag: "provider.event".into(),
+            data: "{}".into(),
         };
-        let mut response = PendingInferenceResponse { items: Vec::new() };
+        let mut response = PendingInferenceResponse::default();
 
-        response
-            .apply(
-                0,
-                ContextItemEvent::UnknownFinish {
-                    payload: payload.clone(),
-                },
-            )
-            .unwrap();
+        response.apply(
+            0,
+            ContextItemEvent::Update(StreamingContextItem::Unknown(payload.clone())),
+        );
+        response.apply(0, ContextItemEvent::Finish);
 
         assert_eq!(
-            response.items,
-            vec![MaybePendingContextItem::Complete(ContextItem::Unknown(
-                payload
-            ))]
+            response.finish().unwrap(),
+            vec![InferenceResponseItem::Unknown(payload)]
         );
     }
 
     #[test]
-    fn finish_collects_completed_items_in_order() {
-        let mut response = PendingInferenceResponse { items: Vec::new() };
+    fn finish_collects_items_in_index_order() {
+        let mut response = PendingInferenceResponse::default();
 
-        response
-            .apply(
-                0,
-                ContextItemEvent::Add(PendingContextItem::Message(Message {
-                    role: Role::Assistant,
-                    content: Vec::new(),
-                    phase: None,
-                })),
-            )
-            .unwrap();
-        response
-            .apply(
-                0,
-                ContextItemEvent::MessageDelta {
-                    content_part_index: 0,
-                    delta: "hi".to_owned(),
-                },
-            )
-            .unwrap();
-        response
-            .apply(0, ContextItemEvent::MessageFinish {})
-            .unwrap();
+        response.apply(0, ContextItemEvent::Update(pending_message("hi")));
+        response.apply(
+            1,
+            ContextItemEvent::Update(StreamingContextItem::ToolCall {
+                id: ToolCallId::try_from("call-1").unwrap(),
+                name: ToolName::try_from("shell").unwrap(),
+                tool_type: ToolType::Function,
+                arguments: AStr::from(r#"{"cmd":"ls"}"#),
+            }),
+        );
+        response.apply(0, ContextItemEvent::Finish);
+        response.apply(1, ContextItemEvent::Finish);
 
-        response
-            .apply(
-                1,
-                ContextItemEvent::Add(PendingContextItem::ToolCall(ToolCall {
-                    id: ToolCallId::try_from("call-1").unwrap(),
-                    name: ToolName::try_from("shell").unwrap(),
-                    tool_type: ToolType::Function,
-                    arguments: String::new(),
-                })),
-            )
-            .unwrap();
-        response
-            .apply(
-                1,
-                ContextItemEvent::ToolCallArgumentDelta {
-                    delta: "{\"cmd\":\"ls\"}".to_owned(),
-                },
-            )
-            .unwrap();
-        response
-            .apply(1, ContextItemEvent::ToolCallFinish {})
-            .unwrap();
-
-        let items = response.finish().unwrap();
         assert_eq!(
-            items,
+            response.finish().unwrap(),
             vec![
-                ContextItem::Message(Message {
-                    role: Role::Assistant,
-                    content: vec![ContentPart::Text {
-                        text: "hi".to_owned()
-                    }],
-                    phase: None,
-                }),
-                ContextItem::ToolCall(ToolCall {
+                message_item("hi"),
+                InferenceResponseItem::ToolCall {
                     id: ToolCallId::try_from("call-1").unwrap(),
                     name: ToolName::try_from("shell").unwrap(),
                     tool_type: ToolType::Function,
-                    arguments: "{\"cmd\":\"ls\"}".to_owned(),
-                }),
+                    arguments: r#"{"cmd":"ls"}"#.to_owned(),
+                },
             ]
         );
     }
 
     #[test]
-    fn finish_rejects_absent_gap() {
-        let payload = OpaqueProviderData {
-            tag: "provider.event".to_owned(),
-            data: "{}".to_owned(),
-        };
-        let mut response = PendingInferenceResponse { items: Vec::new() };
+    fn finish_rejects_item_without_finish() {
+        let mut response = PendingInferenceResponse::default();
 
-        // Only index 1 is filled; index 0 stays `Absent`.
-        response
-            .apply(1, ContextItemEvent::UnknownFinish { payload })
-            .unwrap();
+        // Updated but never signalled finished.
+        response.apply(0, ContextItemEvent::Update(pending_message("partial")));
 
         let error = response.finish().unwrap_err();
-        assert_eq!(error.to_string(), "response is incomplete: gap at index 0");
+        assert_eq!(
+            error.to_string(),
+            "response is incomplete: item at index 0 never finished"
+        );
     }
 
     #[test]
-    fn finish_rejects_unfinished_pending_item() {
-        let mut response = PendingInferenceResponse { items: Vec::new() };
+    fn finish_rejects_payloadless_compaction() {
+        let mut response = PendingInferenceResponse::default();
 
-        response
-            .apply(
-                0,
-                ContextItemEvent::Add(PendingContextItem::Message(Message {
-                    role: Role::Assistant,
-                    content: Vec::new(),
-                    phase: None,
-                })),
-            )
-            .unwrap();
-
-        // No `MessageFinish`, so the slot is still `Pending`.
-        let error = response.finish().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .starts_with("response is incomplete: item at index 0 never finished"),
-            "unexpected error: {error}"
+        // Compaction was marked finished but its payload never arrived.
+        response.apply(
+            0,
+            ContextItemEvent::Update(StreamingContextItem::Compaction(None)),
         );
+        response.apply(0, ContextItemEvent::Finish);
+
+        let error = response.finish().unwrap_err();
+        assert_eq!(error.to_string(), "compaction never finished");
+    }
+
+    #[test]
+    fn finish_rejects_absent_gap() {
+        let payload = OpaqueProviderData {
+            tag: "provider.event".into(),
+            data: "{}".into(),
+        };
+        let mut response = PendingInferenceResponse::default();
+
+        // Only index 1 is filled; index 0 stays a gap.
+        response.apply(
+            1,
+            ContextItemEvent::Update(StreamingContextItem::Unknown(payload)),
+        );
+
+        let error = response.finish().unwrap_err();
+        assert_eq!(error.to_string(), "response is incomplete: gap at index 0");
     }
 }

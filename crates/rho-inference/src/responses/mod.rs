@@ -5,11 +5,8 @@
 //! and HTTP loop are intentionally not copied into this crate; `rho-agent` or a
 //! fork should own those runtime policies.
 
-use std::collections::BTreeMap;
-
-use anyhow::Result;
 use futures::future::BoxFuture;
-use rho_core::{IInferenceSession, InferenceRequest, InferenceUpdate, ToolSpec};
+use rho_core::{IInferenceSession, InferenceEvent, InferenceRequest};
 
 pub(crate) mod oauth;
 mod session;
@@ -43,42 +40,13 @@ impl IInferenceSession for InferenceSession {
         InferenceSession::request(self, request);
     }
 
-    fn run(&mut self) -> BoxFuture<'_, Result<InferenceUpdate>> {
+    fn run(&mut self) -> BoxFuture<'_, InferenceEvent> {
         Box::pin(InferenceSession::run(self))
     }
 
     fn abort(&mut self) {
         InferenceSession::abort(self);
     }
-}
-
-fn tool_name_map(tools: &[ToolSpec]) -> BTreeMap<String, String> {
-    let mut names = BTreeMap::new();
-    for tool in tools {
-        let wire_name = encode_tool_name(&tool.name);
-        match names.get(&wire_name) {
-            Some(existing) if existing != &tool.name => {
-                names.insert(wire_name.clone(), wire_name);
-            }
-            Some(_) => {}
-            None => {
-                names.insert(wire_name, tool.name.clone());
-            }
-        }
-    }
-    names
-}
-
-fn encode_tool_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn is_stale_previous_response_error(error: &anyhow::Error) -> bool {

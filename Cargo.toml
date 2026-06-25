@@ -21,6 +21,7 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
+async-stream = "0.3"
 anyhow = "1"
 base64 = "0.22"
 bon = { version = "3", default-features = false }
@@ -32,6 +33,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = { version = "6", default-features = false }
 futures = "0.3"
 futures-util = "0.3"
+postcard = { version = "1", features = ["use-std"] }
 redb = "4.1.0"
 rand = "0.8"
 rho-core = { path = "crates/rho-core" }

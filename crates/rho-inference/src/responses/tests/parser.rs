@@ -1,156 +1,43 @@
-use anyhow::{Result, bail};
-
 use super::*;
-
-fn parse_response_events(
-    events: impl IntoIterator<Item = impl AsRef<str>>,
-) -> Result<InferenceResponse> {
-    let mut state = ResponseState::default();
-    let mut completed = false;
-    for event in events {
-        if apply_response_event_str(&mut state, event.as_ref())?.0 {
-            completed = true;
-            break;
-        }
-    }
-    if !completed {
-        bail!("response stream ended before response.completed");
-    }
-    Ok(state.finish())
-}
-
-fn collect_response_events_with_updates(
-    events: impl IntoIterator<Item = impl AsRef<str>>,
-) -> Result<(InferenceResponse, Vec<InferenceUpdate>)> {
-    let mut state = ResponseState::default();
-    let mut completed = false;
-    let mut updates = Vec::new();
-    for event in events {
-        let (done, event_updates) = apply_response_event_str(&mut state, event.as_ref())?;
-        updates.extend(event_updates);
-        if done {
-            completed = true;
-            break;
-        }
-    }
-    if !completed {
-        bail!("response stream ended before response.completed");
-    }
-    let response = state.finish();
-    updates.push(InferenceUpdate::Finished(response.clone()));
-    Ok((response, updates))
-}
-
-fn apply_response_event_str(
-    state: &mut ResponseState,
-    data: &str,
-) -> Result<(bool, Vec<InferenceUpdate>)> {
-    let data = data.trim_end();
-    if data == "[DONE]" {
-        return Ok((true, Vec::new()));
-    }
-    let event: Value = match serde_json::from_str(data) {
-        Ok(event) => event,
-        Err(_) => return Ok((false, Vec::new())),
-    };
-    state.apply_event(&event)
-}
-
-#[test]
-fn parser_maps_wire_tool_name_back_to_declared_tool_name() {
-    let tool_names = tool_name_map(&[ToolSpec {
-        name: "shell.run".to_owned(),
-        tool_type: ToolType::Function,
-        description: "run shell".to_owned(),
-        input_schema: json!({"type": "object"}),
-        format: None,
-    }]);
-    let mut state = ResponseState::with_tool_names(tool_names);
-    let (done, updates) = state
-        .apply_event(&json!({
-            "type": "response.output_item.done",
-            "output_index": 0,
-            "item": {
-                "type": "function_call",
-                "call_id": "call-1",
-                "name": "shell_run",
-                "arguments": "{\"command\":\"pwd\"}"
-            }
-        }))
-        .unwrap();
-
-    assert!(!done);
-    let response = state.finish();
-    let call = first_tool_call(&response);
-    assert_eq!(call.name, "shell.run");
-    assert!(updates.iter().any(|update| {
-        matches!(
-            update,
-            InferenceUpdate::ToolCall { call, .. } if call.name == "shell.run"
-        )
-    }));
-}
-
-#[test]
-fn tool_name_map_keeps_wire_name_for_ambiguous_collisions() {
-    let tool_names = tool_name_map(&[
-        ToolSpec {
-            name: "shell.run".to_owned(),
-            tool_type: ToolType::Function,
-            description: String::new(),
-            input_schema: Value::Null,
-            format: None,
-        },
-        ToolSpec {
-            name: "shell_run".to_owned(),
-            tool_type: ToolType::Function,
-            description: String::new(),
-            input_schema: Value::Null,
-            format: None,
-        },
-    ]);
-
-    assert_eq!(
-        tool_names.get("shell_run").map(String::as_str),
-        Some("shell_run")
-    );
-}
 
 #[test]
 fn parses_text_delta_stream() {
-    let response = parse_response_events([
+    let parsed = parse_response_events([
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
         r#"{"type":"response.output_text.delta","delta":"hel","output_index":0}"#,
         r#"{"type":"response.output_text.delta","delta":"lo","output_index":0}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
         r#"{"type":"response.completed","response":{"id":"resp_1"}}"#,
     ])
     .unwrap();
 
-    assert_eq!(
-        first_message(&response),
-        &Message::text(Role::Assistant, "hello")
-    );
+    assert_eq!(assistant_message_text(&parsed.items), "hello");
     assert!(
-        !response
+        !parsed
             .items
             .iter()
-            .any(|item| matches!(item, ItemKind::ToolCall(_)))
+            .any(|item| matches!(item, InferenceResponseItem::ToolCall { .. }))
     );
 }
 
 #[test]
 fn parses_text_deltas_by_output_index() {
-    let response = parse_response_events([
+    let parsed = parse_response_events([
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
         r#"{"type":"response.output_text.delta","delta":"first","output_index":0}"#,
-        r#"{"type":"response.output_text.delta","delta":"second","output_index":2}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_text.delta","delta":"second","output_index":1}"#,
+        r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message"}}"#,
         r#"{"type":"response.completed"}"#,
     ])
     .unwrap();
 
-    let messages = response
+    let messages = parsed
         .items
         .iter()
         .filter_map(|item| match item {
-            ItemKind::Message(message) => Some(message.text_content()),
+            InferenceResponseItem::AssistantMessage { content, .. } => Some(text_content(content)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -159,123 +46,118 @@ fn parses_text_deltas_by_output_index() {
 }
 
 #[test]
-fn preserves_nonzero_text_output_order() {
-    let response = parse_response_events([
-            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"ciphertext","summary":[]}}"#,
-            r#"{"type":"response.output_text.delta","delta":"after reasoning","output_index":2}"#,
+fn preserves_output_item_order() {
+    let parsed = parse_response_events([
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"ciphertext","summary":[]}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_text.delta","delta":"after reasoning","output_index":1}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message"}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
 
     assert!(matches!(
-        &response.items[0],
-        ItemKind::ProviderItem(provider_item)
-            if provider_item.kind == ProviderItemKind::Reasoning
+        &parsed.items[0],
+        InferenceResponseItem::EncryptedReasoning { .. }
     ));
     assert!(matches!(
-        &response.items[1],
-        ItemKind::Message(message) if message.text_content() == "after reasoning"
+        &parsed.items[1],
+        InferenceResponseItem::AssistantMessage { content, .. } if text_content(content) == "after reasoning"
     ));
 }
 
 #[test]
-fn streaming_parser_emits_typed_updates() {
-    let (response, updates) = collect_response_events_with_updates([
+fn streaming_parser_emits_context_item_events() {
+    let parsed = parse_response_events([
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
         r#"{"type":"response.output_text.delta","delta":"hel","output_index":0}"#,
         r#"{"type":"response.output_text.delta","delta":"lo","output_index":0}"#,
-        r#"{"type":"response.reasoning_summary_text.delta","delta":"think","output_index":1}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
         r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":2,"output_tokens":3}}}"#,
     ])
     .unwrap();
 
-    assert_eq!(first_message(&response).text_content(), "hello");
+    assert_eq!(assistant_message_text(&parsed.items), "hello");
     assert!(matches!(
-        &updates[0],
-        InferenceUpdate::TextDelta { output_index: 0, text } if text == "hel"
-    ));
-    assert!(updates.iter().any(|update| {
-        matches!(
-            update,
-            InferenceUpdate::ReasoningTextDelta {
-                output_index: 1,
-                kind: ReasoningTextKind::Summary,
-                text,
-            } if text == "think"
+        &parsed.events[0],
+        (
+            0,
+            ContextItemEvent::Update(StreamingContextItem::AssistantMessage { .. })
         )
+    ));
+    assert!(parsed.events.iter().any(|(index, event)| {
+        *index == 0
+            && matches!(
+                event,
+                ContextItemEvent::Update(StreamingContextItem::AssistantMessage { content, .. })
+                    if content.iter().map(ToString::to_string).collect::<String>() == "hel"
+            )
     }));
-    assert!(
-        updates
-            .iter()
-            .any(|update| matches!(update, InferenceUpdate::ResponseId(id) if id == "resp_1"))
+    assert_eq!(parsed.provider_response_id.as_deref(), Some("resp_1"));
+    assert_eq!(
+        parsed.usage,
+        Some(TokenUsage {
+            input_tokens: 2,
+            cached_input_tokens: 0,
+            output_tokens: 3,
+        })
     );
-    assert!(matches!(updates.last(), Some(InferenceUpdate::Finished(_))));
+    assert!(parsed.saw_finished);
 }
 
 #[test]
 fn parses_function_call_stream() {
-    let response = parse_response_events([
-            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"shell"}}"#,
-            r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"command\":\"p"}"#,
-            r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"wd\"}"}"#,
+    let parsed = parse_response_events([
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"shell"}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"command\":\"p"}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"wd\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"shell"}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
 
-    let call = first_tool_call(&response);
-    assert_eq!(call.id, ToolCallId("call_1".to_owned()));
-    assert_eq!(call.name, "shell");
+    let call = first_tool_call(&parsed.items);
+    assert_eq!(call.id, tool_call_id("call_1"));
+    assert_eq!(call.name, tool_name("shell"));
     assert_eq!(call.tool_type, ToolType::Function);
-    assert_eq!(call.arguments, json!({"command": "pwd"}));
+    assert_eq!(call.arguments, r#"{"command":"pwd"}"#);
 }
 
 #[test]
 fn parses_custom_tool_call_stream() {
-    let response = parse_response_events([
+    let parsed = parse_response_events([
             r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"patch"}}"#,
-            r#"{"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"*** Begin"}"#,
-            r#"{"type":"response.custom_tool_call_input.done","output_index":0,"input":"*** Begin Patch\n*** End Patch"}"#,
+            r#"{"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"*** Begin Patch\n*** End Patch"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"patch"}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
 
-    let call = first_tool_call(&response);
+    let call = first_tool_call(&parsed.items);
     assert_eq!(call.tool_type, ToolType::Custom);
-    assert_eq!(call.name, "patch");
-    assert_eq!(call.arguments, json!("*** Begin Patch\n*** End Patch"));
-    assert!(matches!(
-        &response.items[0],
-        ItemKind::ToolCall(call) if call.tool_type == ToolType::Custom
-    ));
+    assert_eq!(call.name, tool_name("patch"));
+    assert_eq!(call.arguments, "*** Begin Patch\n*** End Patch");
 }
 
 #[test]
-fn parses_final_message_item() {
-    let response = parse_response_events([
-            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"final","annotations":[]}]}}"#,
+fn parses_message_phase_from_added_item() {
+    let parsed = parse_response_events([
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","phase":"commentary"}}"#,
+            r#"{"type":"response.output_text.delta","delta":"draft","output_index":0}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","phase":"commentary"}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
 
-    assert_eq!(first_message(&response).text_content(), "final");
-}
-
-#[test]
-fn parses_message_phase_from_final_message_item() {
-    let response = parse_response_events([
-            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","phase":"commentary","content":[{"type":"output_text","text":"draft","annotations":[]}]}}"#,
-            r#"{"type":"response.completed"}"#,
-        ])
-        .unwrap();
-
-    assert_eq!(
-        first_message(&response).phase,
-        Some(MessagePhase::Commentary)
-    );
+    let (_, phase) = first_assistant_message(&parsed.items);
+    assert_eq!(phase, Some(MessagePhase::Commentary));
 }
 
 #[test]
 fn errors_when_stream_ends_without_terminal_event() {
     let error = parse_response_events([
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
         r#"{"type":"response.output_text.delta","delta":"partial","output_index":0}"#,
     ])
     .unwrap_err();
@@ -285,12 +167,12 @@ fn errors_when_stream_ends_without_terminal_event() {
 
 #[test]
 fn captures_response_id_and_usage() {
-    let response = parse_response_events([r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":4},"output_tokens":7}}}"#])
+    let parsed = parse_response_events([r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":4},"output_tokens":7}}}"#])
             .unwrap();
 
-    assert_eq!(response.provider_response_id.as_deref(), Some("resp_1"));
+    assert_eq!(parsed.provider_response_id.as_deref(), Some("resp_1"));
     assert_eq!(
-        response.usage,
+        parsed.usage,
         Some(TokenUsage {
             input_tokens: 10,
             cached_input_tokens: 4,
@@ -300,50 +182,48 @@ fn captures_response_id_and_usage() {
 }
 
 #[test]
-fn captures_reasoning_summary_and_encrypted_reasoning_item() {
-    let response = parse_response_events([
-            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"thinking"}"#,
-            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"ciphertext","summary":[]}}"#,
+fn unifies_reasoning_summary_and_encrypted_content_into_one_item() {
+    let parsed = parse_response_events([
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"thinking"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"ciphertext","summary":["thinking"]}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
 
-    assert!(response.items.iter().any(|item| {
-        matches!(item, ItemKind::ReasoningText(reasoning) if reasoning.text == "thinking")
-    }));
-    assert!(response.items.iter().any(|item| {
-        matches!(
-            item,
-            ItemKind::ProviderItem(provider_item)
-                if provider_item.kind == ProviderItemKind::Reasoning
-                    && provider_item.payload["encrypted_content"] == "ciphertext"
-        )
-    }));
+    match &parsed.items[0] {
+        InferenceResponseItem::EncryptedReasoning {
+            payload: opaque,
+            summary,
+        } => {
+            assert_eq!(summary, &["thinking".to_owned()]);
+            assert!(opaque.data.contains("ciphertext"));
+        }
+        other => panic!("expected encrypted reasoning, got {other:?}"),
+    }
 }
 
 #[test]
 fn preserves_unknown_completed_provider_items() {
-    let (response, updates) = collect_response_events_with_updates([
+    let parsed = parse_response_events([
         r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"computer_call","id":"cc_1","action":{"type":"screenshot"}}}"#,
         r#"{"type":"response.completed"}"#,
     ])
     .unwrap();
 
-    assert!(matches!(
-        &response.items[0],
-        ItemKind::ProviderItem(provider_item)
-            if provider_item.kind == ProviderItemKind::Unknown
-                && provider_item.payload["type"] == "computer_call"
-    ));
-    assert!(updates.iter().any(|update| {
-        matches!(
-            update,
-            InferenceUpdate::OutputItem {
-                output_index: 0,
-                item: ItemKind::ProviderItem(provider_item),
-            } if provider_item.kind == ProviderItemKind::Unknown
-                && provider_item.payload["id"] == "cc_1"
-        )
+    match &parsed.items[0] {
+        InferenceResponseItem::Unknown(opaque) => {
+            assert_eq!(&*opaque.tag, "computer_call");
+            assert!(opaque.data.contains("cc_1"));
+        }
+        other => panic!("expected unknown provider item, got {other:?}"),
+    }
+    assert!(parsed.events.iter().any(|(index, event)| {
+        *index == 0
+            && matches!(
+                event,
+                ContextItemEvent::Update(StreamingContextItem::Unknown(_))
+            )
     }));
 }
 

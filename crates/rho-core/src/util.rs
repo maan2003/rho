@@ -1,8 +1,8 @@
 /// Defines a newtype around `Arc<str>` whose contents are checked by
 /// `$validate` on every construction. The field is private and there is no
-/// unchecked constructor, so a value of this type is guaranteed valid — including
-/// when it comes off the wire, since `Deserialize` is implemented by hand to run
-/// the same validation rather than deriving a bypass.
+/// unchecked constructor, so a value of this type is guaranteed valid —
+/// including when it comes off the wire, since `Deserialize` is implemented by
+/// hand to run the same validation rather than deriving a bypass.
 macro_rules! validated_string_type {
     ($(#[$meta:meta])* $vis:vis $name:ident, $validate:expr) => {
         $(#[$meta])*

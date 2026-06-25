@@ -1,16 +1,17 @@
-use std::collections::BTreeMap;
+//! Translation between rho-core's provider-neutral types and the OpenAI
+//! Responses API wire format.
 
 use anyhow::{Result, bail};
 use rho_core::{
-    ContextBlock, InferenceRequest, InferenceResponse, InferenceUpdate, ItemKind, Message,
-    MessagePhase, ProviderItem, ProviderItemKind, ReasoningItem, ReasoningTextKind, Role,
-    TokenUsage, ToolCall, ToolCallId, ToolFormat, ToolGrammarSyntax, ToolResult, ToolSpec,
-    ToolType,
+    AppendString, ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
+    InferenceResponseItem, MessagePhase, OpaqueProviderData, ProviderResponseId,
+    StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolFormat, ToolGrammarSyntax,
+    ToolName, ToolResult, ToolSpec, ToolType, text_content,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{Compaction, InferenceSession, encode_tool_name};
+use super::{Compaction, InferenceSession};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ResponsesRequest {
@@ -59,23 +60,21 @@ impl ResponsesRequest {
             let ContextBlock::InferenceResponse {
                 provider_response_id,
                 items,
-            } = block
+            } = &**block
             else {
                 continue;
             };
 
-            let has_compaction = items.iter().any(|item| {
-                matches!(
-                    &item.kind,
-                    ItemKind::ProviderItem(provider_item)
-                        if provider_item.kind == ProviderItemKind::Compaction
-                )
-            });
+            let has_compaction = items
+                .iter()
+                .any(|item| matches!(item, InferenceResponseItem::Compaction(_)));
 
             if has_compaction {
                 previous_response = None;
             } else {
-                previous_response = provider_response_id.clone().map(|id| (id, index + 1));
+                previous_response = provider_response_id
+                    .as_ref()
+                    .map(|id| (id.as_str().to_owned(), index + 1));
             }
         }
 
@@ -94,45 +93,31 @@ impl ResponsesRequest {
         request: InferenceRequest,
         previous_response: Option<(String, usize)>,
     ) -> Self {
-        let instructions = request
-            .input
-            .iter()
-            .flat_map(|block| match block {
-                ContextBlock::Local { items } | ContextBlock::InferenceResponse { items, .. } => {
-                    items
-                }
-            })
-            .filter_map(|item| instruction_text_from_item(&item.kind))
-            .collect::<Vec<_>>();
-        let mut input = Vec::new();
         let input_blocks = if let Some((_, next_block_index)) = previous_response.as_ref() {
             &request.input[*next_block_index..]
         } else {
             request.input.as_slice()
         };
-        let input_items = input_blocks
-            .iter()
-            .flat_map(|block| match block {
-                ContextBlock::Local { items } | ContextBlock::InferenceResponse { items, .. } => {
-                    items
-                }
-            })
-            .map(|item| item.kind.clone())
-            .collect::<Vec<_>>();
-        let input_items = trim_before_latest_compaction(&input_items);
-        let local_tool_wire_names = request
-            .tools
-            .iter()
-            .map(|tool| (tool.name.clone(), encode_tool_name(&tool.name)))
-            .collect::<BTreeMap<_, _>>();
+
+        // Flatten the heterogeneous blocks into a single item timeline, then
+        // drop everything before the most recent compaction marker.
+        let mut timeline = Vec::new();
+        for block in input_blocks {
+            append_block_items(block, &mut timeline);
+        }
+        let timeline = trim_before_latest_compaction(&timeline);
+
         let tools = request
             .tools
-            .into_iter()
+            .iter()
+            .cloned()
             .map(convert_tool_spec)
             .collect::<Vec<_>>();
-        for item in input_items.iter().cloned() {
-            convert_item_kind(&local_tool_wire_names, item, &mut input);
+        let mut input = Vec::new();
+        for item in timeline {
+            convert_timeline_item(item.clone(), &mut input);
         }
+
         let tool_choice = (!tools.is_empty()).then_some("auto");
         let prompt_cache_key = session.prompt_cache_key.clone();
         let previous_response_id = previous_response.map(|(id, _)| id);
@@ -152,7 +137,9 @@ impl ResponsesRequest {
 
         Self {
             model: session.model.clone(),
-            instructions: (!instructions.is_empty()).then(|| instructions.join("\n\n")),
+            // TODO: rho-core's InferenceRequest has no instruction field yet
+            // (see its `// todo: add instruction`); wire it through once it does.
+            instructions: None,
             input,
             store: Some(false),
             tools,
@@ -168,107 +155,129 @@ impl ResponsesRequest {
     }
 }
 
-fn instruction_text_from_item(item: &ItemKind) -> Option<String> {
-    match item {
-        ItemKind::Message(message) if matches!(message.role, Role::System | Role::Developer) => {
-            Some(message.text_content())
+#[derive(Clone)]
+enum WireTimelineItem {
+    UserMessage(Vec<ContentPart>),
+    ToolResult(ToolResult),
+    ResponseItem(InferenceResponseItem),
+}
+
+fn append_block_items(block: &ContextBlock, out: &mut Vec<WireTimelineItem>) {
+    match block {
+        ContextBlock::UserMessage { content } => {
+            out.push(WireTimelineItem::UserMessage(content.clone()));
         }
-        _ => None,
+        ContextBlock::ToolResults { results } => {
+            out.extend(results.iter().cloned().map(WireTimelineItem::ToolResult));
+        }
+        ContextBlock::InferenceResponse { items, .. } => {
+            out.extend(items.iter().cloned().map(WireTimelineItem::ResponseItem))
+        }
     }
 }
 
-fn convert_item_kind(
-    local_tool_wire_names: &BTreeMap<String, String>,
-    item: ItemKind,
+fn convert_timeline_item(item: WireTimelineItem, out: &mut Vec<Value>) {
+    match item {
+        WireTimelineItem::UserMessage(content) => convert_user_message(&content, out),
+        WireTimelineItem::ToolResult(result) => out.push(convert_tool_result(result)),
+        WireTimelineItem::ResponseItem(item) => convert_response_item(item, out),
+    }
+}
+
+fn convert_response_item(item: InferenceResponseItem, out: &mut Vec<Value>) {
+    match item {
+        InferenceResponseItem::AssistantMessage { content, phase } => {
+            convert_assistant_message(&content, phase, out);
+        }
+        InferenceResponseItem::ToolCall {
+            id,
+            name,
+            tool_type,
+            arguments,
+        } => convert_tool_call(
+            ToolCall {
+                id,
+                name,
+                tool_type,
+                arguments,
+            },
+            out,
+        ),
+        InferenceResponseItem::EncryptedReasoning { payload, .. } => push_opaque(payload, out),
+        InferenceResponseItem::RawReasoning { .. } => {}
+        InferenceResponseItem::Compaction(opaque) => push_opaque(opaque, out),
+        InferenceResponseItem::Unknown(_) => {}
+    }
+}
+
+fn push_opaque(opaque: OpaqueProviderData, out: &mut Vec<Value>) {
+    if let Ok(value) = serde_json::from_str::<Value>(&opaque.data) {
+        out.push(value);
+    }
+}
+
+fn convert_tool_call(call: ToolCall, out: &mut Vec<Value>) {
+    let call_id = call.id.as_str();
+    match call.tool_type {
+        ToolType::Function => {
+            let id = if call_id.starts_with("fc_") {
+                call_id.to_owned()
+            } else {
+                format!("fc_{call_id}")
+            };
+            out.push(json!({
+                "type": "function_call",
+                "id": id,
+                "call_id": call_id,
+                "name": call.name.as_str(),
+                "arguments": call.arguments,
+            }));
+        }
+        ToolType::Custom => {
+            let id = if call_id.starts_with("ctc_") {
+                call_id.to_owned()
+            } else {
+                format!("ctc_{call_id}")
+            };
+            out.push(json!({
+                "type": "custom_tool_call",
+                "id": id,
+                "call_id": call_id,
+                "name": call.name.as_str(),
+                "input": call.arguments,
+            }));
+        }
+    }
+}
+
+fn convert_user_message(content: &[ContentPart], out: &mut Vec<Value>) {
+    out.push(json!({
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": text_content(content),
+        }],
+    }));
+}
+
+fn convert_assistant_message(
+    content: &[ContentPart],
+    phase: Option<MessagePhase>,
     out: &mut Vec<Value>,
 ) {
-    match item {
-        ItemKind::Message(message) => convert_message(message, out),
-        ItemKind::ToolCall(call) => {
-            let wire_name = local_tool_wire_names
-                .get(&call.name)
-                .cloned()
-                .unwrap_or_else(|| encode_tool_name(&call.name));
-            let call_id = call.id.0;
-            match call.tool_type {
-                ToolType::Function => {
-                    let id = if call_id.starts_with("fc_") {
-                        call_id.clone()
-                    } else {
-                        format!("fc_{call_id}")
-                    };
-                    out.push(json!({
-                        "type": "function_call",
-                        "id": id,
-                        "call_id": call_id,
-                        "name": wire_name,
-                        "arguments": call.arguments.to_string(),
-                    }));
-                }
-                ToolType::Custom => {
-                    let id = if call_id.starts_with("ctc_") {
-                        call_id.clone()
-                    } else {
-                        format!("ctc_{call_id}")
-                    };
-                    let input = call
-                        .arguments
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| call.arguments.to_string());
-                    out.push(json!({
-                        "type": "custom_tool_call",
-                        "id": id,
-                        "call_id": call_id,
-                        "name": wire_name,
-                        "input": input,
-                    }));
-                }
-            }
-        }
-        ItemKind::ToolResult(result) => out.push(convert_tool_result(result)),
-        ItemKind::ReasoningText(_) => {}
-        ItemKind::ProviderItem(item) if should_replay_provider_item(item.kind) => {
-            out.push(item.payload);
-        }
-        ItemKind::ProviderItem(_) => {}
-    }
-}
-
-fn should_replay_provider_item(kind: ProviderItemKind) -> bool {
-    match kind {
-        ProviderItemKind::Reasoning | ProviderItemKind::Compaction => true,
-        ProviderItemKind::Unknown => false,
-    }
-}
-
-fn convert_message(message: Message, out: &mut Vec<Value>) {
-    let text = message.text_content();
-    match message.role {
-        Role::System | Role::Developer => {}
-        Role::User => out.push(json!({
-            "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": text,
-            }],
-        })),
-        Role::Assistant => {
-            let mut item = json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": text,
-                    "annotations": [],
-                }],
-            });
-            item["phase"] = json!(message_phase_wire(
-                message.phase.unwrap_or(MessagePhase::FinalAnswer)
-            ));
-            out.push(item);
-        }
-    }
+    let mut item = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": text_content(content),
+            "annotations": [],
+        }],
+    });
+    item["phase"] = json!(message_phase_wire(
+        phase.unwrap_or(MessagePhase::FinalAnswer)
+    ));
+    out.push(item);
 }
 
 fn message_phase_wire(phase: MessagePhase) -> &'static str {
@@ -285,8 +294,8 @@ fn convert_tool_result(result: ToolResult) -> Value {
     };
     json!({
         "type": output_type,
-        "call_id": result.call_id.0,
-        "output": result.rendered_output(),
+        "call_id": result.call_id.as_str(),
+        "output": result.body.output.as_ref(),
     })
 }
 
@@ -294,7 +303,7 @@ fn convert_tool_spec(tool: ToolSpec) -> Value {
     let mut wire = match tool.tool_type {
         ToolType::Function => json!({
             "type": "function",
-            "name": encode_tool_name(&tool.name),
+            "name": tool.name.as_str(),
             "strict": Value::Null,
             "description": tool.description,
             "parameters": tool.input_schema,
@@ -302,7 +311,7 @@ fn convert_tool_spec(tool: ToolSpec) -> Value {
         ToolType::Custom => {
             let mut wire = json!({
                 "type": "custom",
-                "name": encode_tool_name(&tool.name),
+                "name": tool.name.as_str(),
                 "description": tool.description,
             });
             if let Some(format) = tool.format {
@@ -337,336 +346,149 @@ fn provider_default_compaction_threshold() -> u64 {
     (super::DEFAULT_CONTEXT_WINDOW * 9 / 10).max(1000)
 }
 
-fn trim_before_latest_compaction(input_items: &[ItemKind]) -> &[ItemKind] {
-    input_items
+fn trim_before_latest_compaction(timeline: &[WireTimelineItem]) -> &[WireTimelineItem] {
+    timeline
         .iter()
         .rposition(|item| {
             matches!(
                 item,
-                ItemKind::ProviderItem(provider_item)
-                    if provider_item.kind == ProviderItemKind::Compaction
+                WireTimelineItem::ResponseItem(InferenceResponseItem::Compaction(_))
             )
         })
-        .map_or(input_items, |index| &input_items[index..])
+        .map_or(timeline, |index| &timeline[index..])
 }
 
+/// Translates the Responses API event stream into provider-neutral
+/// [`InferenceEvent`]s. It owns the streaming accumulators — one
+/// [`AppendString`] per growing field, keyed by the wire's `output_index` — so
+/// a wire delta is pushed into its buffer and re-emitted as a whole
+/// [`StreamingContextItem`] snapshot via [`ContextItemEvent::Update`]; the
+/// matching `output_item.done` emits any terminal-only form, then
+/// [`ContextItemEvent::Finish`].
 #[derive(Default)]
 pub(crate) struct ResponseState {
-    outputs: BTreeMap<usize, OutputAccumulator>,
-    tool_names_by_wire: BTreeMap<String, String>,
-    usage: Option<TokenUsage>,
-    provider_response_id: Option<String>,
+    builders: Vec<Option<ItemBuilder>>,
 }
 
-/// Everything streamed for a single `output_index`, reconciled in `finish`.
-#[derive(Default)]
-struct OutputAccumulator {
-    reasoning_summary: String,
-    /// A finalized item from `response.output_item.done`; when present it wins
-    /// over the streamed `message_text` / `tool_call` fallbacks below.
-    explicit: Option<ItemKind>,
-    message_text: String,
-    tool_call: ToolCallAccumulator,
-}
-
-#[derive(Clone)]
-struct ToolCallAccumulator {
-    id: String,
-    name: String,
-    tool_type: ToolType,
-    arguments_json: String,
-}
-
-impl Default for ToolCallAccumulator {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            name: String::new(),
-            tool_type: ToolType::Function,
-            arguments_json: String::new(),
-        }
-    }
-}
-
-impl ResponseState {
-    pub(crate) fn with_tool_names(tool_names_by_wire: BTreeMap<String, String>) -> Self {
-        Self {
-            tool_names_by_wire,
-            ..Default::default()
-        }
-    }
-
-    fn local_tool_name(&self, wire_name: &str) -> String {
-        self.tool_names_by_wire
-            .get(wire_name)
-            .cloned()
-            .unwrap_or_else(|| wire_name.to_owned())
-    }
-
-    fn output_mut(&mut self, output_index: usize) -> &mut OutputAccumulator {
-        self.outputs.entry(output_index).or_default()
-    }
-
-    fn tool_call_at_mut(
-        &mut self,
-        output_index: usize,
+/// Per-item accumulation mirroring [`StreamingContextItem`], but holding the
+/// growing [`AppendString`] buffers each snapshot is taken from.
+enum ItemBuilder {
+    Message {
+        phase: Option<MessagePhase>,
+        content: Vec<AppendString>,
+    },
+    ToolCall {
+        id: ToolCallId,
+        name: ToolName,
         tool_type: ToolType,
-    ) -> &mut ToolCallAccumulator {
-        let call = &mut self.output_mut(output_index).tool_call;
-        call.tool_type = tool_type;
-        call
-    }
-
-    pub(crate) fn finish(self) -> InferenceResponse {
-        let ResponseState {
-            outputs,
-            tool_names_by_wire: _,
-            usage,
-            provider_response_id,
-        } = self;
-
-        // `outputs` is keyed by `output_index`, so iterating it yields items in
-        // provider order. Within one output, emit the reasoning summary first,
-        // then the finalized item if we have one, otherwise the streamed
-        // message and tool-call fallbacks.
-        let mut items = Vec::new();
-        for output in outputs.into_values() {
-            let OutputAccumulator {
-                reasoning_summary,
-                explicit,
-                message_text,
-                tool_call,
-            } = output;
-
-            if !reasoning_summary.is_empty() {
-                items.push(ItemKind::ReasoningText(ReasoningItem {
-                    kind: ReasoningTextKind::Summary,
-                    text: reasoning_summary,
-                }));
-            }
-
-            if let Some(explicit) = explicit {
-                items.push(explicit);
-            } else {
-                if !message_text.is_empty() {
-                    items.push(ItemKind::Message(Message::text(
-                        Role::Assistant,
-                        message_text,
-                    )));
-                }
-                if let Some(call) = tool_call.finish() {
-                    items.push(ItemKind::ToolCall(call));
-                }
-            }
-        }
-
-        InferenceResponse {
-            items,
-            usage,
-            provider_response_id,
-        }
-    }
+        arguments: AppendString,
+    },
+    Reasoning {
+        content: Option<AppendString>,
+        summary: Vec<AppendString>,
+    },
+    Compaction,
 }
 
-impl ToolCallAccumulator {
-    fn finish(self) -> Option<ToolCall> {
-        if self.name.is_empty() {
-            return None;
+impl ItemBuilder {
+    fn snapshot(&self) -> StreamingContextItem {
+        match self {
+            ItemBuilder::Message { phase, content } => StreamingContextItem::AssistantMessage {
+                content: content.iter().map(AppendString::snapshot).collect(),
+                phase: *phase,
+            },
+            ItemBuilder::ToolCall {
+                id,
+                name,
+                tool_type,
+                arguments,
+            } => StreamingContextItem::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                tool_type: *tool_type,
+                arguments: arguments.snapshot(),
+            },
+            ItemBuilder::Reasoning { content, summary } => StreamingContextItem::RawReasoning {
+                content: content
+                    .as_ref()
+                    .map(AppendString::snapshot)
+                    .unwrap_or_else(|| AppendString::new().snapshot()),
+                summary: summary.iter().map(AppendString::snapshot).collect(),
+            },
+            ItemBuilder::Compaction => StreamingContextItem::Compaction(None),
         }
-        let arguments = match self.tool_type {
-            ToolType::Function => serde_json::from_str(&self.arguments_json)
-                .unwrap_or(Value::String(self.arguments_json)),
-            ToolType::Custom => Value::String(self.arguments_json),
-        };
-        Some(ToolCall {
-            id: ToolCallId(self.id),
-            name: self.name,
-            tool_type: self.tool_type,
-            arguments,
-        })
     }
 }
 
 impl ResponseState {
-    pub(crate) fn apply_event(&mut self, event: &Value) -> Result<(bool, Vec<InferenceUpdate>)> {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn apply_event(&mut self, event: &Value) -> Result<(bool, Vec<InferenceEvent>)> {
         let mut updates = Vec::new();
+        let index = output_index(event);
         match event["type"].as_str().unwrap_or_default() {
+            "response.output_item.added" => {
+                if let Some(item) = event.get("item")
+                    && let Some(builder) = builder_from_added(item)?
+                {
+                    self.set_builder(index, builder);
+                    self.emit_update(index, &mut updates);
+                }
+            }
             "response.output_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
-                    let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                    self.output_mut(output_index).message_text.push_str(delta);
-                    updates.push(InferenceUpdate::TextDelta {
-                        output_index,
-                        text: delta.to_owned(),
-                    });
-                }
-            }
-            "response.output_text.done" => {
-                if let Some(text) = event["text"].as_str() {
-                    let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                    self.output_mut(output_index).message_text = text.to_owned();
-                    updates.push(InferenceUpdate::OutputItem {
-                        output_index,
-                        item: ItemKind::Message(Message::text(Role::Assistant, text)),
-                    });
+                    if let Some(ItemBuilder::Message { content, .. }) = self.builder_mut(index) {
+                        let part = event["content_index"].as_u64().unwrap_or(0) as usize;
+                        push_part(content, part, delta);
+                    }
+                    self.emit_update(index, &mut updates);
                 }
             }
             "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
-                    let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                    self.output_mut(output_index)
-                        .reasoning_summary
-                        .push_str(delta);
-                    updates.push(InferenceUpdate::ReasoningTextDelta {
-                        output_index,
-                        kind: ReasoningTextKind::Summary,
-                        text: delta.to_owned(),
-                    });
+                    if let Some(ItemBuilder::Reasoning { summary, .. }) = self.builder_mut(index) {
+                        let part = event["summary_index"].as_u64().unwrap_or(0) as usize;
+                        push_part(summary, part, delta);
+                    }
+                    self.emit_update(index, &mut updates);
                 }
             }
-            "response.reasoning_summary_part.added" => {
-                let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                let summary = &mut self.output_mut(output_index).reasoning_summary;
-                if !summary.is_empty() {
-                    summary.push_str("\n\n");
-                }
-            }
-            "response.function_call_arguments.delta" => {
-                let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
+            "response.reasoning_text.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
-                    self.tool_call_at_mut(output_index, ToolType::Function)
-                        .arguments_json
-                        .push_str(delta);
+                    if let Some(ItemBuilder::Reasoning { content, .. }) = self.builder_mut(index) {
+                        content
+                            .get_or_insert_with(AppendString::new)
+                            .push_str(delta);
+                    }
+                    self.emit_update(index, &mut updates);
                 }
             }
-            "response.function_call_arguments.done" => {
-                let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                if let Some(arguments) = event["arguments"].as_str() {
-                    self.tool_call_at_mut(output_index, ToolType::Function)
-                        .arguments_json = arguments.to_owned();
-                }
-            }
-            "response.custom_tool_call_input.delta" => {
-                let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
                 if let Some(delta) = event["delta"].as_str() {
-                    self.tool_call_at_mut(output_index, ToolType::Custom)
-                        .arguments_json
-                        .push_str(delta);
+                    if let Some(ItemBuilder::ToolCall { arguments, .. }) = self.builder_mut(index) {
+                        arguments.push_str(delta);
+                    }
+                    self.emit_update(index, &mut updates);
                 }
             }
-            "response.custom_tool_call_input.done" => {
-                let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
-                if let Some(input) = event["input"].as_str() {
-                    self.tool_call_at_mut(output_index, ToolType::Custom)
-                        .arguments_json = input.to_owned();
-                }
-            }
-            "response.output_item.added" | "response.output_item.done" => {
-                let output_index = event["output_index"].as_u64().unwrap_or(0) as usize;
+            "response.output_item.done" => {
                 if let Some(item) = event.get("item") {
-                    let tool_type = match item["type"].as_str() {
-                        Some("function_call") => Some(ToolType::Function),
-                        Some("custom_tool_call") => Some(ToolType::Custom),
-                        _ => None,
-                    };
-                    if let Some(tool_type) = tool_type {
-                        let local_name =
-                            item["name"].as_str().map(|name| self.local_tool_name(name));
-                        let call = self.tool_call_at_mut(output_index, tool_type);
-                        if let Some(id) = item["call_id"].as_str() {
-                            call.id = id.to_owned();
-                        }
-                        if let Some(name) = local_name {
-                            call.name = name;
-                        }
-                        if call.arguments_json.is_empty() {
-                            let final_input = match tool_type {
-                                ToolType::Function => item["arguments"].as_str(),
-                                ToolType::Custom => item["input"].as_str(),
-                            };
-                            if let Some(final_input) = final_input {
-                                call.arguments_json = final_input.to_owned();
-                            }
-                        }
-                        if let Some(call) = call.clone().finish() {
-                            updates.push(InferenceUpdate::ToolCall { output_index, call });
-                        }
-                    }
-
-                    if event["type"].as_str() == Some("response.output_item.done")
-                        && item["type"].as_str() == Some("message")
-                        && let Some(text) = message_text_from_output_item(item)
-                    {
-                        let mut message = Message::text(Role::Assistant, text.clone());
-                        message.phase = message_phase_from_output_item(item);
-                        let output = self.output_mut(output_index);
-                        output.message_text = text;
-                        output.explicit = Some(ItemKind::Message(message.clone()));
-                        updates.push(InferenceUpdate::OutputItem {
-                            output_index,
-                            item: ItemKind::Message(message),
-                        });
-                    }
-                    if event["type"].as_str() == Some("response.output_item.done")
-                        && item["type"].as_str() == Some("reasoning")
-                        && item["encrypted_content"].is_string()
-                    {
-                        let provider_item = ProviderItem {
-                            kind: ProviderItemKind::Reasoning,
-                            payload: item.clone(),
-                        };
-                        self.output_mut(output_index).explicit =
-                            Some(ItemKind::ProviderItem(provider_item.clone()));
-                        updates.push(InferenceUpdate::OutputItem {
-                            output_index,
-                            item: ItemKind::ProviderItem(provider_item),
-                        });
-                    }
-                    if item["type"].as_str() == Some("compaction") {
-                        if event["type"].as_str() == Some("response.output_item.added") {
-                            updates.push(InferenceUpdate::CompactionStarted { output_index });
-                        } else if event["type"].as_str() == Some("response.output_item.done") {
-                            let provider_item = ProviderItem {
-                                kind: ProviderItemKind::Compaction,
-                                payload: item.clone(),
-                            };
-                            self.output_mut(output_index).explicit =
-                                Some(ItemKind::ProviderItem(provider_item.clone()));
-                            updates.push(InferenceUpdate::OutputItem {
-                                output_index,
-                                item: ItemKind::ProviderItem(provider_item),
-                            });
-                        }
-                    }
-                    if event["type"].as_str() == Some("response.output_item.done")
-                        && should_preserve_unknown_provider_item(item)
-                    {
-                        let provider_item = ProviderItem {
-                            kind: ProviderItemKind::Unknown,
-                            payload: item.clone(),
-                        };
-                        self.output_mut(output_index).explicit =
-                            Some(ItemKind::ProviderItem(provider_item.clone()));
-                        updates.push(InferenceUpdate::OutputItem {
-                            output_index,
-                            item: ItemKind::ProviderItem(provider_item),
-                        });
-                    }
+                    self.finish_item(index, item, &mut updates);
                 }
             }
             "response.completed" | "response.done" => {
-                self.usage = usage_from_event(event);
-                if let Some(usage) = self.usage.clone() {
-                    updates.push(InferenceUpdate::Usage(usage));
-                }
-                self.provider_response_id = event
+                let usage = usage_from_event(event);
+                let provider_response_id = event
                     .get("response")
                     .and_then(|response| response["id"].as_str())
                     .or_else(|| event["id"].as_str())
-                    .map(str::to_owned);
-                if let Some(response_id) = self.provider_response_id.clone() {
-                    updates.push(InferenceUpdate::ResponseId(response_id));
-                }
+                    .and_then(|id| ProviderResponseId::try_from(id).ok());
+                updates.push(InferenceEvent::Finished {
+                    usage,
+                    provider_response_id,
+                });
                 return Ok((true, updates));
             }
             "response.incomplete" => {
@@ -707,31 +529,121 @@ impl ResponseState {
         Ok((false, updates))
     }
 }
-fn should_preserve_unknown_provider_item(item: &Value) -> bool {
-    !matches!(
-        item["type"].as_str(),
-        Some("message" | "function_call" | "custom_tool_call" | "reasoning" | "compaction")
-    )
-}
 
-fn message_text_from_output_item(item: &Value) -> Option<String> {
-    let mut text = String::new();
-    for part in item
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let is_text_part = matches!(
-            part.get("type").and_then(Value::as_str),
-            Some("output_text") | Some("text")
-        );
-        if is_text_part && let Some(part_text) = part.get("text").and_then(Value::as_str) {
-            text.push_str(part_text);
+impl ResponseState {
+    fn builder(&self, index: usize) -> Option<&ItemBuilder> {
+        self.builders.get(index).and_then(Option::as_ref)
+    }
+
+    fn builder_mut(&mut self, index: usize) -> Option<&mut ItemBuilder> {
+        self.builders.get_mut(index).and_then(Option::as_mut)
+    }
+
+    fn set_builder(&mut self, index: usize, builder: ItemBuilder) {
+        if self.builders.len() <= index {
+            self.builders.resize_with(index + 1, || None);
+        }
+        self.builders[index] = Some(builder);
+    }
+
+    /// Emit the current snapshot of the builder at `index`, if one exists.
+    fn emit_update(&self, index: usize, updates: &mut Vec<InferenceEvent>) {
+        if let Some(builder) = self.builder(index) {
+            updates.push(InferenceEvent::ContextItem {
+                index,
+                event: ContextItemEvent::Update(builder.snapshot()),
+            });
         }
     }
 
-    if text.is_empty() { None } else { Some(text) }
+    /// Close out the item at `index`. Items whose final form only exists at
+    /// `done` (encrypted reasoning, the compaction payload, unrecognized items)
+    /// get one last `Update` carrying it; then every item gets `Finish`.
+    fn finish_item(&mut self, index: usize, item: &Value, updates: &mut Vec<InferenceEvent>) {
+        let terminal = match item["type"].as_str().unwrap_or_default() {
+            "message" | "function_call" | "custom_tool_call" => None,
+            "reasoning" if item["encrypted_content"].is_string() => {
+                let summary = match self.builder(index) {
+                    Some(ItemBuilder::Reasoning { summary, .. }) => {
+                        summary.iter().map(AppendString::snapshot).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                Some(StreamingContextItem::EncryptedReasoning {
+                    payload: opaque_from_item("reasoning", item),
+                    summary,
+                })
+            }
+            "reasoning" => None,
+            "compaction" => Some(StreamingContextItem::Compaction(Some(opaque_from_item(
+                "compaction",
+                item,
+            )))),
+            other => Some(StreamingContextItem::Unknown(opaque_from_item(other, item))),
+        };
+        if let Some(snapshot) = terminal {
+            updates.push(InferenceEvent::ContextItem {
+                index,
+                event: ContextItemEvent::Update(snapshot),
+            });
+        }
+        updates.push(InferenceEvent::ContextItem {
+            index,
+            event: ContextItemEvent::Finish,
+        });
+    }
+}
+
+fn output_index(event: &Value) -> usize {
+    event["output_index"].as_u64().unwrap_or(0) as usize
+}
+
+/// Appends `delta` to the `part`th buffer, growing the vec with empty buffers
+/// to cover any skipped indices.
+fn push_part(parts: &mut Vec<AppendString>, part: usize, delta: &str) {
+    while parts.len() <= part {
+        parts.push(AppendString::new());
+    }
+    parts[part].push_str(delta);
+}
+
+/// Builds the accumulator for an item we just saw begin streaming. Returns
+/// `None` for item types we don't recognize; those are captured whole when
+/// their `response.output_item.done` arrives (see
+/// [`ResponseState::finish_item`]).
+fn builder_from_added(item: &Value) -> Result<Option<ItemBuilder>> {
+    let builder = match item["type"].as_str().unwrap_or_default() {
+        "message" => ItemBuilder::Message {
+            phase: message_phase_from_output_item(item),
+            content: Vec::new(),
+        },
+        "function_call" => tool_call_builder(item, ToolType::Function)?,
+        "custom_tool_call" => tool_call_builder(item, ToolType::Custom)?,
+        "reasoning" => ItemBuilder::Reasoning {
+            content: None,
+            summary: Vec::new(),
+        },
+        "compaction" => ItemBuilder::Compaction,
+        _ => return Ok(None),
+    };
+    Ok(Some(builder))
+}
+
+fn tool_call_builder(item: &Value, tool_type: ToolType) -> Result<ItemBuilder> {
+    Ok(ItemBuilder::ToolCall {
+        id: ToolCallId::try_from(item["call_id"].as_str().unwrap_or_default())?,
+        name: ToolName::try_from(item["name"].as_str().unwrap_or_default())?,
+        tool_type,
+        arguments: AppendString::new(),
+    })
+}
+
+/// Captures a whole wire item verbatim so it can be replayed byte-for-byte.
+fn opaque_from_item(tag: &str, item: &Value) -> OpaqueProviderData {
+    OpaqueProviderData {
+        tag: tag.into(),
+        data: item.to_string().into(),
+    }
 }
 
 fn message_phase_from_output_item(item: &Value) -> Option<MessagePhase> {

@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
+use std::time::Instant;
 
 use anyhow::Result;
-use rho_core::{InferenceRequest, InferenceUpdate};
+use rho_core::{InferenceEvent, InferenceRequest};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -18,10 +19,12 @@ struct Turn {
     request: InferenceRequest,
     /// The envelope still waiting to be sent; `None` once it is on the wire.
     pending_send: Option<ResponsesRequest>,
-    /// Accumulates streamed events into the final response.
+    /// Translates streamed events into provider-neutral updates.
     response: ResponseState,
     /// Whether we already retried this turn as a full replay.
     replayed: bool,
+    /// Whether we have announced `StreamingStarted` for the current attempt.
+    streaming_started: bool,
 }
 
 pub struct InferenceSession {
@@ -33,7 +36,7 @@ pub struct InferenceSession {
     turn: Option<Turn>,
     /// Updates parsed from a frame but not yet handed out by `run` (one frame
     /// can yield several updates, and `run` returns one at a time).
-    buffered: VecDeque<InferenceUpdate>,
+    buffered: VecDeque<InferenceEvent>,
     pub(crate) base_url: String,
     pub(crate) auth: InferenceAuth,
     pub(crate) compaction: Option<Compaction>,
@@ -78,14 +81,14 @@ impl InferenceSession {
 
     /// Queue a turn. The work happens in `run`.
     pub fn request(&mut self, request: InferenceRequest) {
-        let tool_names = super::tool_name_map(&request.tools);
         let body = ResponsesRequest::from_inference_request(self, request.clone());
         self.buffered.clear();
         self.turn = Some(Turn {
             request,
             pending_send: Some(body),
-            response: ResponseState::with_tool_names(tool_names),
+            response: ResponseState::new(),
             replayed: false,
+            streaming_started: false,
         });
     }
 
@@ -98,11 +101,11 @@ impl InferenceSession {
 
     /// Drive the connection and return the next update for the active request.
     /// Pends, keeping any warm socket alive, when there is no active request.
-    pub async fn run(&mut self) -> Result<InferenceUpdate> {
+    pub async fn run(&mut self) -> InferenceEvent {
         loop {
             // 1. Hand out anything already parsed.
             if let Some(update) = self.buffered.pop_front() {
-                return Ok(update);
+                return update;
             }
 
             // 2. Send a queued envelope (connecting first if needed).
@@ -114,16 +117,18 @@ impl InferenceSession {
                 if let Err(error) = self.ensure_connection().await {
                     self.turn = None;
                     self.connection = None;
-                    return Err(error);
+                    return InferenceEvent::Failed {
+                        error: error.into(),
+                    };
                 }
                 let body = self.turn.as_mut().unwrap().pending_send.take().unwrap();
                 if let Err(error) = self.connection.as_mut().unwrap().send_envelope(body).await {
                     match self.on_socket_failure(error) {
                         ControlFlow::Continue(()) => continue,
-                        ControlFlow::Break(result) => return result,
+                        ControlFlow::Break(update) => return update,
                     }
                 }
-                continue;
+                return InferenceEvent::RequestSent;
             }
 
             // 3. Read the socket. With no connection and nothing to send we are idle with
@@ -146,28 +151,28 @@ impl InferenceSession {
 
             match read {
                 Read::Message(WsMessage::Text(text)) => {
-                    if let ControlFlow::Break(result) = self.apply_text(text.as_ref()) {
-                        return result;
+                    if let ControlFlow::Break(update) = self.apply_text(text.as_ref()) {
+                        return update;
                     }
                 }
                 Read::Message(WsMessage::Ping(payload)) => {
                     if let Err(error) = self.connection.as_mut().unwrap().pong(payload).await
-                        && let ControlFlow::Break(result) = self.on_socket_failure(error)
+                        && let ControlFlow::Break(update) = self.on_socket_failure(error)
                     {
-                        return result;
+                        return update;
                     }
                 }
                 Read::Message(WsMessage::Close(_)) => {
-                    if let ControlFlow::Break(result) = self.on_socket_failure(anyhow::anyhow!(
+                    if let ControlFlow::Break(update) = self.on_socket_failure(anyhow::anyhow!(
                         "stream error: websocket closed mid-stream"
                     )) {
-                        return result;
+                        return update;
                     }
                 }
                 Read::Message(WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_)) => {}
                 Read::Closed(error) | Read::Failed(error) => {
-                    if let ControlFlow::Break(result) = self.on_socket_failure(error) {
-                        return result;
+                    if let ControlFlow::Break(update) = self.on_socket_failure(error) {
+                        return update;
                     }
                 }
             }
@@ -175,8 +180,8 @@ impl InferenceSession {
     }
 
     /// Apply one text frame to the active turn's accumulator, buffering the
-    /// updates it produces. `Break` carries an error to surface from `run`.
-    fn apply_text(&mut self, text: &str) -> ControlFlow<Result<InferenceUpdate>> {
+    /// updates it produces. `Break` carries an update to surface from `run`.
+    fn apply_text(&mut self, text: &str) -> ControlFlow<InferenceEvent> {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(text) else {
             return ControlFlow::Continue(());
         };
@@ -187,28 +192,42 @@ impl InferenceSession {
         let outcome = self.turn.as_mut().unwrap().response.apply_event(&event);
         match outcome {
             Err(error) => match self.on_turn_error(error) {
-                ErrorAction::Retry => ControlFlow::Continue(()),
-                ErrorAction::Fail(error) => ControlFlow::Break(Err(error)),
+                ErrorAction::Retry(error) => ControlFlow::Break(temporary_failure(error)),
+                ErrorAction::Fail(error) => ControlFlow::Break(InferenceEvent::Failed {
+                    error: error.into(),
+                }),
             },
             Ok((done, updates)) => {
+                // Announce the first streamed content of the turn once.
+                let turn = self.turn.as_mut().unwrap();
+                if !turn.streaming_started
+                    && updates
+                        .iter()
+                        .any(|update| matches!(update, InferenceEvent::ContextItem { .. }))
+                {
+                    turn.streaming_started = true;
+                    self.buffered.push_back(InferenceEvent::StreamingStarted);
+                }
+                // The terminal `InferenceUpdate::Finished` is emitted by
+                // `apply_event` itself, so here we just drop the finished turn.
                 self.buffered.extend(updates);
                 if done {
-                    let turn = self.turn.take().unwrap();
-                    self.buffered
-                        .push_back(InferenceUpdate::Finished(turn.response.finish()));
+                    self.turn = None;
                 }
                 ControlFlow::Continue(())
             }
         }
     }
 
-    /// A read/write failure: fail or replay the active turn, or just drop the
-    /// dead socket when idle. `Break` carries the result to return from `run`.
-    fn on_socket_failure(&mut self, error: anyhow::Error) -> ControlFlow<Result<InferenceUpdate>> {
+    /// A read/write failure: replay or fail the active turn, or just drop the
+    /// dead socket when idle. `Break` carries the update to return from `run`.
+    fn on_socket_failure(&mut self, error: anyhow::Error) -> ControlFlow<InferenceEvent> {
         if self.turn.is_some() {
             match self.on_turn_error(error) {
-                ErrorAction::Retry => ControlFlow::Continue(()),
-                ErrorAction::Fail(error) => ControlFlow::Break(Err(error)),
+                ErrorAction::Retry(error) => ControlFlow::Break(temporary_failure(error)),
+                ErrorAction::Fail(error) => ControlFlow::Break(InferenceEvent::Failed {
+                    error: error.into(),
+                }),
             }
         } else {
             self.connection = None;
@@ -226,13 +245,13 @@ impl InferenceSession {
             let request = self.turn.as_ref().unwrap().request.clone();
             let body = ResponsesRequest::from_inference_request_full_replay(self, request);
             let turn = self.turn.as_mut().unwrap();
-            let tool_names = super::tool_name_map(&turn.request.tools);
             turn.pending_send = Some(body);
             turn.replayed = true;
-            turn.response = ResponseState::with_tool_names(tool_names);
+            turn.streaming_started = false;
+            turn.response = ResponseState::new();
             // Replay on a clean socket.
             self.connection = None;
-            ErrorAction::Retry
+            ErrorAction::Retry(error)
         } else {
             self.turn = None;
             self.connection = None;
@@ -279,8 +298,18 @@ enum Read {
 }
 
 enum ErrorAction {
-    Retry,
+    /// The turn is being replayed internally; surface a recoverable failure
+    /// carrying the error that triggered it.
+    Retry(anyhow::Error),
+    /// The turn is dead; surface a terminal failure.
     Fail(anyhow::Error),
+}
+
+fn temporary_failure(error: anyhow::Error) -> InferenceEvent {
+    InferenceEvent::TemporaryFailure {
+        error: error.into(),
+        retrying_at: Instant::now(),
+    }
 }
 
 impl std::fmt::Debug for InferenceSession {
