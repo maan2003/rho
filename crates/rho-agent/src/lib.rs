@@ -114,9 +114,14 @@ impl Agent {
         let notify = Arc::clone(&self.notify);
         stream! {
             loop {
-                notify.notified().await;
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
                 let snapshot = state.read().expect("poison").clone();
                 yield snapshot;
+
+                notified.await;
             }
         }
     }

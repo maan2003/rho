@@ -60,24 +60,19 @@ fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
     );
     let mut renderer = StreamingRenderer::new(handle);
     let call = test_call();
-    let mut rendered = 0;
-
-    renderer.handle_state_kind(
-        &AgentStateKind::ApiStreaming {
-            pending_response: rho_core::PendingInferenceResponse {
-                items: vec![StreamingContextItemState::Pending(
-                    StreamingContextItem::ToolCall {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        tool_type: call.tool_type,
-                        arguments: AStr::from(call.arguments.clone()),
-                    },
-                )],
-            },
-            previous_attempt: None,
+    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
+        pending_response: rho_core::PendingInferenceResponse {
+            items: vec![StreamingContextItemState::Pending(
+                StreamingContextItem::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    tool_type: call.tool_type,
+                    arguments: AStr::from(call.arguments.clone()),
+                },
+            )],
         },
-        &mut rendered,
-    );
+        previous_attempt: None,
+    });
     assert_eq!(renderer.tool_blocks.len(), 1);
 
     renderer.render_tool_finished(&ToolResult {
@@ -104,24 +99,19 @@ fn streaming_text_response_finalizes_on_idle() {
         CursorShape::Bar,
     );
     let mut renderer = StreamingRenderer::new(handle);
-    let mut rendered = 0;
-
-    renderer.handle_state_kind(
-        &AgentStateKind::ApiStreaming {
-            pending_response: rho_core::PendingInferenceResponse {
-                items: vec![StreamingContextItemState::Pending(
-                    StreamingContextItem::AssistantMessage {
-                        content: vec![AStr::from("done")],
-                        phase: None,
-                    },
-                )],
-            },
-            previous_attempt: None,
+    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
+        pending_response: rho_core::PendingInferenceResponse {
+            items: vec![StreamingContextItemState::Pending(
+                StreamingContextItem::AssistantMessage {
+                    content: vec![AStr::from("done")],
+                    phase: None,
+                },
+            )],
         },
-        &mut rendered,
-    );
+        previous_attempt: None,
+    });
     assert!(renderer.assistant_block.is_some());
 
-    renderer.handle_state_kind(&AgentStateKind::Idle, &mut rendered);
+    renderer.handle_state_kind(&AgentStateKind::Idle);
     assert!(renderer.assistant_block.is_none());
 }

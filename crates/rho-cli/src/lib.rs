@@ -77,9 +77,14 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 
     let renderer = PlainRenderer::default();
     let output = renderer.output();
+    let store = if args.no_store {
+        None
+    } else {
+        Some(CborLog::new(args.session_path()?))
+    };
     let agent = build_agent(&args, None).await?;
     agent.send_user_message(prompt);
-    watch_agent(&agent, Some(output), None).await;
+    watch_agent(&agent, Some(output), store).await;
 
     let text = renderer.finish();
     if !text.is_empty() {
@@ -111,26 +116,22 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
         Vec::new()
     };
     let agent = Agent::spawn(inference, blocks);
-    if renderer.is_some() || store.is_some() {
+    if renderer.is_some() {
         let changes = agent.subscribe();
         let mut persisted = agent.blocks().len();
         tokio::spawn(async move {
             futures::pin_mut!(changes);
-            let mut last_rendered_items = 0usize;
             while let Some(state) = changes.next().await {
                 if let Some(renderer) = &renderer
                     && let Ok(mut renderer) = renderer.lock()
                 {
-                    renderer.handle_state_kind(&state.kind, &mut last_rendered_items);
+                    renderer.handle_state_kind(&state.kind);
                 }
                 if let Some(store) = &store {
                     while persisted < state.blocks.len() {
                         let _ = store.append_block(&state.blocks[persisted]).await;
                         persisted += 1;
                     }
-                }
-                if matches!(state.kind, AgentStateKind::Idle | AgentStateKind::Error(_)) {
-                    last_rendered_items = 0;
                 }
             }
         });
@@ -246,8 +247,8 @@ impl ChatApp {
 async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>, store: Option<CborLog>) {
     let changes = agent.subscribe();
     futures::pin_mut!(changes);
-    let mut persisted = agent.blocks().len();
-    let mut last_rendered_items = 0usize;
+    let started_blocks = agent.blocks().len();
+    let mut persisted = started_blocks;
     let mut saw_running = !matches!(agent.state().kind, AgentStateKind::Idle);
     loop {
         let Some(state) = changes.next().await else {
@@ -256,7 +257,7 @@ async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>, store: Opt
         if let Some(renderer) = &renderer
             && let Ok(mut renderer) = renderer.lock()
         {
-            renderer.handle_state_kind(&state.kind, &mut last_rendered_items);
+            renderer.handle_state_kind(&state.kind);
         }
         if let Some(store) = &store {
             while persisted < state.blocks.len() {
@@ -265,7 +266,7 @@ async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>, store: Opt
             }
         }
         if matches!(state.kind, AgentStateKind::Idle | AgentStateKind::Error(_)) {
-            if saw_running {
+            if saw_running || state.blocks.len() > started_blocks {
                 return;
             }
         } else {
@@ -483,24 +484,18 @@ impl StreamingRenderer {
         }
     }
 
-    fn handle_state_kind(&mut self, kind: &AgentStateKind, last_rendered_items: &mut usize) {
+    fn handle_state_kind(&mut self, kind: &AgentStateKind) {
         match kind {
             AgentStateKind::ApiStreaming {
                 pending_response, ..
             } => {
-                for (index, slot) in pending_response
-                    .items
-                    .iter()
-                    .enumerate()
-                    .skip(*last_rendered_items)
-                {
+                for (index, slot) in pending_response.items.iter().enumerate() {
                     if let StreamingContextItemState::Pending(item)
                     | StreamingContextItemState::Finished(item) = slot
                     {
                         self.render_streaming_item(index, item);
                     }
                 }
-                *last_rendered_items = pending_response.items.len();
             }
             AgentStateKind::ToolCalling { results } => {
                 for result in results {
