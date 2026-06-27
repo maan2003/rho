@@ -62,6 +62,19 @@ impl AgentTimelineRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct UnixMillis(pub u64);
 
+impl UnixMillis {
+    pub fn now() -> Self {
+        Self(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_millis()
+                .try_into()
+                .expect("unix millis overflow"),
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,

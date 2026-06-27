@@ -9,8 +9,13 @@ use rho_core::{
     ContentPart, ContextBlock, IInferenceSession, InferenceEvent, InferenceRequest,
     InferenceResponseItem, PendingInferenceResponse, ToolCall, ToolResult, ToolSpec,
 };
+use rho_db::RhoDb;
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use tokio::sync::{Notify, mpsc};
+
+use crate::db::{AgentId, AgentReadTxnExt, AgentTimelineRef, AgentWriteTxnExt, UnixMillis};
+
+pub mod db;
 
 /// Live runtime state of an agent turn.
 #[derive(Clone)]
@@ -66,6 +71,27 @@ impl Agent {
         inference_session: Box<dyn IInferenceSession>,
         blocks: Vec<Arc<ContextBlock>>,
     ) -> Self {
+        Self::spawn_inner(inference_session, blocks, None)
+    }
+
+    pub fn spawn_persisted(
+        inference_session: Box<dyn IInferenceSession>,
+        db: RhoDb,
+        agent_id: AgentId,
+    ) -> Self {
+        let (next_block, blocks) = db.read().agent_blocks(agent_id);
+        Self::spawn_inner(
+            inference_session,
+            blocks,
+            Some(AgentPersistence { db, next_block }),
+        )
+    }
+
+    fn spawn_inner(
+        inference_session: Box<dyn IInferenceSession>,
+        blocks: Vec<Arc<ContextBlock>>,
+        persistence: Option<AgentPersistence>,
+    ) -> Self {
         let shell_tools = ShellTools::new(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS));
         let tool_specs: Arc<[ToolSpec]> = shell_tools.specs().into();
         let state = Arc::new(RwLock::new(AgentState {
@@ -82,6 +108,7 @@ impl Agent {
             notify: Arc::clone(&notify),
             control_rx,
             shell_tools,
+            persistence,
         };
         tokio::spawn(agent_loop.run());
         Self {
@@ -127,6 +154,11 @@ impl Agent {
     }
 }
 
+struct AgentPersistence {
+    db: RhoDb,
+    next_block: AgentTimelineRef,
+}
+
 enum AgentControl {
     UserMessage { content: Vec<ContentPart> },
     Cancel,
@@ -142,6 +174,7 @@ struct AgentLoop {
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<AgentControl>,
     shell_tools: ShellTools,
+    persistence: Option<AgentPersistence>,
 }
 
 impl AgentLoop {
@@ -152,6 +185,20 @@ impl AgentLoop {
     async fn run(mut self) {
         loop {
             let mut state = self.state.read().expect("poison").clone();
+            let mut append_block =
+                async |blocks: &mut Vec<Arc<ContextBlock>>, block: Arc<ContextBlock>| {
+                    if let Some(persistence) = &mut self.persistence {
+                        let mut write = persistence.db.write().await;
+                        persistence.next_block = write.append_agent_block(
+                            persistence.next_block,
+                            UnixMillis::now(),
+                            block.clone(),
+                        );
+                        write.commit();
+                        blocks.push(block);
+                    }
+                };
+
             tokio::select! {
                 biased;
                 control = self.control_rx.recv() => {
@@ -163,9 +210,8 @@ impl AgentLoop {
                             self.inference_session.abort();
                             self.pending_tools.clear();
 
-                            state
-                                .blocks
-                                .push(Arc::new(ContextBlock::UserMessage { content }));
+                            let block = Arc::new(ContextBlock::UserMessage { content });
+                            append_block(&mut state.blocks, block).await;
                             self.inference_session.request(InferenceRequest {
                                 input: state.blocks.clone(),
                                 tools: Arc::clone(&state.tool_specs),
@@ -258,10 +304,11 @@ impl AgentLoop {
                                         _ => None,
                                     })
                                     .collect();
-                                state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
+                                let block = Arc::new(ContextBlock::InferenceResponse {
                                     items,
                                     provider_response_id,
-                                }));
+                                });
+                                append_block(&mut state.blocks, block).await;
                                 if calls.is_empty() {
                                     state.kind = AgentStateKind::Idle;
                                 } else {
@@ -288,7 +335,8 @@ impl AgentLoop {
                     };
                     results.push(result);
                     if self.pending_tools.is_empty() {
-                        state.blocks.push(Arc::new(ContextBlock::ToolResults { results }));
+                        let block = Arc::new(ContextBlock::ToolResults { results });
+                        append_block(&mut state.blocks, block).await;
                         self.inference_session.request(InferenceRequest {
                             input: state.blocks.clone(),
                             tools: Arc::clone(&state.tool_specs),
@@ -307,5 +355,3 @@ impl AgentLoop {
         }
     }
 }
-
-pub mod db;
