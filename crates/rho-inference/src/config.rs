@@ -1,9 +1,10 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use senax_encoder::{Decode, Encode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Decode, Deserialize, Eq, Hash, PartialEq, Encode, Serialize)]
 pub enum Effort {
     Minimal,
     Low,
@@ -13,14 +14,14 @@ pub enum Effort {
     Max,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Decode, Deserialize, Eq, Hash, PartialEq, Encode, Serialize)]
 pub enum ServiceTier {
     Flex,
     Priority,
     Normal,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Decode, Deserialize, Eq, Hash, PartialEq, Encode, Serialize)]
 pub enum TextVerbosity {
     Low,
     Medium,
@@ -28,7 +29,7 @@ pub enum TextVerbosity {
 }
 
 /// How the provider should automatically compact long threads.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Decode, Deserialize, Eq, Hash, PartialEq, Encode, Serialize)]
 pub enum AutoCompaction {
     Threshold(u64),
 }
@@ -38,6 +39,22 @@ pub struct Gpt5Model(pub Cow<'static, str>);
 
 impl Gpt5Model {
     pub const GPT_5_5: Self = Self(Cow::Borrowed("gpt-5.5"));
+}
+
+impl senax_encoder::Encoder for Gpt5Model {
+    fn encode(&self, writer: &mut bytes::BytesMut) -> senax_encoder::Result<()> {
+        self.0.as_ref().to_owned().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl senax_encoder::Decoder for Gpt5Model {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        String::decode(reader).map(|model| Self(Cow::Owned(model)))
+    }
 }
 
 impl Serialize for Gpt5Model {
@@ -60,7 +77,7 @@ impl<'de> Deserialize<'de> for Gpt5Model {
 
 // This is persisted per agent, and some parts can be changed across requests,
 // some not.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Decode, Deserialize, Eq, Hash, PartialEq, Encode, Serialize)]
 pub struct Gpt5Config {
     pub model: Gpt5Model,
     pub auto_compaction: Option<AutoCompaction>,
@@ -69,7 +86,7 @@ pub struct Gpt5Config {
     pub service_tier: ServiceTier,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Decode, Deserialize, Eq, Hash, PartialEq, Encode, Serialize)]
 pub enum InferenceConfig {
     Gpt5(Gpt5Config),
 }
