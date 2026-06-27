@@ -42,11 +42,14 @@ pub struct AgentTimelineRef {
     pub seq: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct UnixMillis(pub u64);
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
+    pub created_at: UnixMillis,
+    pub updated_at: UnixMillis,
     pub current_lineage: AgentLineageId,
     pub parent_agent: Option<AgentId>,
     pub prompt_cache_key: PromptCacheKey,
@@ -55,7 +58,7 @@ pub struct AgentRecord {
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct AgentTimelineEntry {
-    pub created_at_ms: u64,
+    pub created_at: UnixMillis,
     pub context_block: ContextBlock,
 }
 
@@ -80,7 +83,7 @@ mod tests {
                         seq,
                     },
                     Sen(AgentTimelineEntry {
-                        created_at_ms: u64::from(seq),
+                        created_at: UnixMillis(u64::from(seq)),
                         context_block: ContextBlock::UserMessage {
                             content: Vec::new(),
                         },
