@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::BytesMut;
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tokio::fs;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -75,8 +75,7 @@ impl RhoDb {
 
     pub async fn write(&self) -> Result<WriteTxn> {
         let guard = Arc::clone(&self.write_lock).lock_owned().await;
-        let mut inner = self.database.begin_write()?;
-        inner.set_durability(Durability::Immediate)?;
+        let inner = self.database.begin_write()?;
         Ok(WriteTxn {
             inner,
             _guard: guard,
