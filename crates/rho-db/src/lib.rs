@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::ops::{Bound, RangeBounds};
 
 use anyhow::Result;
 use bytes::BytesMut;
@@ -42,6 +43,12 @@ pub struct WriteTxn {
     _guard: OwnedMutexGuard<()>,
 }
 
+/// Decoded double-ended iterator over a rho-db table.
+pub struct Iter<K: Key> {
+    inner: redb::Range<'static, &'static [u8], &'static [u8]>,
+    _marker: std::marker::PhantomData<fn() -> K>,
+}
+
 impl RhoDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -49,7 +56,9 @@ impl RhoDb {
             std::fs::create_dir_all(parent)?;
         }
 
-        let database = Database::builder().set_cache_size(CACHE_SIZE).create(path)?;
+        let database = Database::builder()
+            .set_cache_size(CACHE_SIZE)
+            .create(path)?;
 
         Ok(Self {
             database: Arc::new(database),
@@ -82,14 +91,17 @@ impl ReadTxn {
             .transpose()
     }
 
-    pub fn iter<K: Key>(&self) -> Result<Vec<(K, K::Value)>> {
+    pub fn iter<K: Key>(&self) -> Result<Iter<K>> {
         let table = self.inner.open_table(definition::<K>())?;
-        let mut items = Vec::new();
-        for item in table.iter()? {
-            let (key, value) = item?;
-            items.push((decode(key.value())?, decode(value.value())?));
-        }
-        Ok(items)
+        Ok(Iter::new(table.range::<&[u8]>(..)?))
+    }
+
+    pub fn range<K: Key>(&self, range: impl RangeBounds<K>) -> Result<Iter<K>> {
+        let start = encode_bound(range.start_bound())?;
+        let end = encode_bound(range.end_bound())?;
+        let encoded_range = (bound_as_slice(&start), bound_as_slice(&end));
+        let table = self.inner.open_table(definition::<K>())?;
+        Ok(Iter::new(table.range::<&[u8]>(encoded_range)?))
     }
 }
 
@@ -125,6 +137,39 @@ impl WriteTxn {
     }
 }
 
+impl<K: Key> Iter<K> {
+    fn new(inner: redb::Range<'static, &'static [u8], &'static [u8]>) -> Self {
+        Self {
+            inner,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn decode_item(
+        item: redb::Result<(
+            redb::AccessGuard<'_, &'static [u8]>,
+            redb::AccessGuard<'_, &'static [u8]>,
+        )>,
+    ) -> Result<(K, K::Value)> {
+        let (key, value) = item?;
+        Ok((decode(key.value())?, decode(value.value())?))
+    }
+}
+
+impl<K: Key> Iterator for Iter<K> {
+    type Item = Result<(K, K::Value)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(Self::decode_item)
+    }
+}
+
+impl<K: Key> DoubleEndedIterator for Iter<K> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(Self::decode_item)
+    }
+}
+
 fn definition<K: Key>() -> TableDefinition<'static, &'static [u8], &'static [u8]> {
     TableDefinition::new(K::TABLE)
 }
@@ -136,6 +181,22 @@ where
     let mut bytes = BytesMut::new();
     value.encode(&mut bytes)?;
     Ok(bytes)
+}
+
+fn encode_bound<T: senax_encoder::Encoder>(bound: Bound<&T>) -> Result<Bound<Vec<u8>>> {
+    Ok(match bound {
+        Bound::Included(value) => Bound::Included(encode(value)?.to_vec()),
+        Bound::Excluded(value) => Bound::Excluded(encode(value)?.to_vec()),
+        Bound::Unbounded => Bound::Unbounded,
+    })
+}
+
+fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Included(value) => Bound::Included(value.as_slice()),
+        Bound::Excluded(value) => Bound::Excluded(value.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
 }
 
 fn decode<T>(bytes: &[u8]) -> Result<T>
@@ -224,10 +285,19 @@ mod tests {
         write.commit().unwrap();
 
         let read = db.read().unwrap();
-        let items = read.iter::<TestKey>().unwrap();
+        let items = read
+            .iter::<TestKey>()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(
             items.iter().map(|(key, _)| key.0).collect::<Vec<_>>(),
             [1, 2]
         );
+
+        let mut range = read.range(TestKey(1)..=TestKey(2)).unwrap();
+        assert_eq!(range.next().unwrap().unwrap().0, TestKey(1));
+        assert_eq!(range.next_back().unwrap().unwrap().0, TestKey(2));
+        assert!(range.next().is_none());
     }
 }
