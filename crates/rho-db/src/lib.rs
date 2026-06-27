@@ -12,6 +12,8 @@ use bytes::BytesMut;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+const CACHE_SIZE: usize = 10 * 1024 * 1024;
+
 /// Key encoding for redb tables.
 ///
 /// Implementations own ordering/prefix semantics. For ordered redb ranges, the
@@ -47,7 +49,7 @@ impl RhoDb {
             std::fs::create_dir_all(parent)?;
         }
 
-        let database = Database::create(path)?;
+        let database = Database::builder().set_cache_size(CACHE_SIZE).create(path)?;
 
         Ok(Self {
             database: Arc::new(database),
