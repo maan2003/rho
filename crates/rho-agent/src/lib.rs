@@ -223,8 +223,8 @@ impl AgentLoop {
                             block.clone(),
                         );
                         write.commit();
-                        blocks.push(block);
                     }
+                    blocks.push(block);
                 };
 
             tokio::select! {
