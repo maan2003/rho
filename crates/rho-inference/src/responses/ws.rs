@@ -31,7 +31,7 @@ pub(crate) struct WebSocketConnection {
     socket: WebSocket,
     pub(crate) opened_at: tokio::time::Instant,
     pub(crate) bearer_token: String,
-    pub(crate) client_secret: [u8; 8],
+    pub(crate) client_secret: [u8; 32],
     ping_interval: tokio::time::Interval,
     last_event_at: tokio::time::Instant,
 }

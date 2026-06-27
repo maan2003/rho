@@ -130,7 +130,7 @@ impl ResponsesRequest {
         let tool_choice = (!tools.is_empty()).then_some("auto");
         let prompt_cache_key = session
             .prompt_cache_key
-            .to_wire_string(&session.base_url, [0; 8]);
+            .to_wire_string(&session.base_url, [0; 32]);
         let previous_response_id = previous_response.map(|(id, _)| id);
         let InferenceConfig::Gpt5(config) = session.config().config();
         let context_management = config

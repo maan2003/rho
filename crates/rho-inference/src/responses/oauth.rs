@@ -43,14 +43,14 @@ pub(crate) struct ResponsesOAuthCredentials {
     pub(crate) expires_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) account_id: Option<String>,
-    pub(crate) client_secret: [u8; 8],
+    pub(crate) client_secret: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedAuth {
     pub(crate) bearer_token: String,
     pub(crate) account_id: Option<String>,
-    pub(crate) client_secret: [u8; 8],
+    pub(crate) client_secret: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -284,8 +284,8 @@ pub(crate) fn openai_codex_refresh(refresh_token: &str) -> io::Result<ResponsesO
     parse_openai_token_response(&json)
 }
 
-fn generate_client_secret() -> [u8; 8] {
-    let mut bytes = [0; 8];
+fn generate_client_secret() -> [u8; 32] {
+    let mut bytes = [0; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes
 }

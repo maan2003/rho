@@ -34,7 +34,7 @@ fn oauth_file_saves_loads_and_resolves_credentials() {
         refresh_token: "refresh".to_owned(),
         expires_at_ms: u64::MAX,
         account_id: Some("acct".to_owned()),
-        client_secret: *b"secret00",
+        client_secret: *b"secret00secret00secret00secret00",
     })
     .unwrap();
 
@@ -54,7 +54,7 @@ fn oauth_credentials_remain_the_file_json_format() {
         refresh_token: "refresh".to_owned(),
         expires_at_ms: 123,
         account_id: Some("acct".to_owned()),
-        client_secret: *b"secret00",
+        client_secret: *b"secret00secret00secret00secret00",
     };
 
     let json = serde_json::to_string(&credentials).unwrap();
@@ -90,7 +90,7 @@ fn oauth_file_refreshes_expired_credentials_and_persists_them() {
         refresh_token: "refresh".to_owned(),
         expires_at_ms: 1,
         account_id: Some("old-account".to_owned()),
-        client_secret: *b"oldsecrt",
+        client_secret: *b"oldsecrtoldsecrtoldsecrtoldsecrt",
     })
     .unwrap();
 
@@ -103,7 +103,7 @@ fn oauth_file_refreshes_expired_credentials_and_persists_them() {
                 refresh_token: "new-refresh".to_owned(),
                 expires_at_ms: u64::MAX,
                 account_id: Some("new-account".to_owned()),
-                client_secret: *b"newsecrt",
+                client_secret: *b"newsecrtnewsecrtnewsecrtnewsecrt",
             })
         })
         .unwrap();

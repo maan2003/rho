@@ -31,7 +31,7 @@ impl PromptCacheKey {
         Self(bytes)
     }
 
-    pub(crate) fn to_wire_string(self, api_url: &str, client_secret: [u8; 8]) -> String {
+    pub(crate) fn to_wire_string(self, api_url: &str, client_secret: [u8; 32]) -> String {
         use std::hash::Hasher;
 
         let mut hash = fnv::FnvHasher::default();
