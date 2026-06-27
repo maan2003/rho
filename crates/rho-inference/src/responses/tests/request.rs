@@ -73,7 +73,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     assert_eq!(json["reasoning"]["effort"], "medium");
     assert_eq!(json["text"]["verbosity"], "medium");
     assert_eq!(json["service_tier"], "default");
-    assert_eq!(json["prompt_cache_key"], "63616368656b6579");
+    assert_eq!(json["prompt_cache_key"], "f851ae4cf9b2a753");
     assert_eq!(json["include"][0], "reasoning.encrypted_content");
 }
 
@@ -134,7 +134,7 @@ fn serializes_prompt_cache_key() {
     let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
-    assert_eq!(json["prompt_cache_key"], "63616368656b6579");
+    assert_eq!(json["prompt_cache_key"], "f851ae4cf9b2a753");
 }
 
 #[test]

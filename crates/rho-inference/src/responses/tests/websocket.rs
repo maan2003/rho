@@ -78,6 +78,7 @@ fn websocket_request_uses_oauth_file_credentials() {
         refresh_token: "oauth-refresh".to_owned(),
         expires_at_ms: u64::MAX,
         account_id: Some("acct_file".to_owned()),
+        client_secret: *b"filesecr",
     })
     .unwrap();
     let mut session = test_inference_service_with(

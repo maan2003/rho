@@ -31,14 +31,14 @@ impl PromptCacheKey {
         Self(bytes)
     }
 
-    pub fn to_wire_string(self) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(16);
-        for byte in self.0 {
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        out
+    pub(crate) fn to_wire_string(self, api_url: &str, client_secret: [u8; 8]) -> String {
+        use std::hash::Hasher;
+
+        let mut hash = fnv::FnvHasher::default();
+        hash.write(&self.0);
+        hash.write(api_url.as_bytes());
+        hash.write(&client_secret);
+        format!("{:016x}", hash.finish())
     }
 }
 
@@ -140,7 +140,11 @@ impl InferenceSession {
                         error: error.into(),
                     };
                 }
-                let body = self.turn.as_mut().unwrap().pending_send.take().unwrap();
+                let mut body = self.turn.as_mut().unwrap().pending_send.take().unwrap();
+                let connection = self.connection.as_ref().unwrap();
+                body.prompt_cache_key = self
+                    .prompt_cache_key
+                    .to_wire_string(&self.base_url, connection.client_secret);
                 if let Err(error) = self.connection.as_mut().unwrap().send_envelope(body).await {
                     match self.on_socket_failure(error) {
                         ControlFlow::Continue(()) => continue,

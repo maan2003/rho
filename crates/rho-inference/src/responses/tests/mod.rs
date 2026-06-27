@@ -197,6 +197,7 @@ fn test_oauth_file(
         refresh_token: "refresh".to_owned(),
         expires_at_ms: u64::MAX,
         account_id: account_id.map(str::to_owned),
+        client_secret: *b"secret00",
     })
     .unwrap();
     let auth = InferenceAuth::oauth_file(file.path());

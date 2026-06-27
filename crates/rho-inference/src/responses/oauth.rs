@@ -43,12 +43,14 @@ pub(crate) struct ResponsesOAuthCredentials {
     pub(crate) expires_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) account_id: Option<String>,
+    pub(crate) client_secret: [u8; 8],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedAuth {
     pub(crate) bearer_token: String,
     pub(crate) account_id: Option<String>,
+    pub(crate) client_secret: [u8; 8],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +102,7 @@ impl ResponsesOAuthCredentials {
                 .as_ref()
                 .filter(|account_id| !account_id.trim().is_empty())
                 .cloned(),
+            client_secret: self.client_secret,
         })
     }
 }
@@ -180,6 +183,7 @@ impl OAuthFile {
             if refreshed.account_id.is_none() {
                 refreshed.account_id = current.account_id;
             }
+            refreshed.client_secret = current.client_secret;
             self.write(&refreshed)?;
             refreshed.resolved()
         })
@@ -280,6 +284,12 @@ pub(crate) fn openai_codex_refresh(refresh_token: &str) -> io::Result<ResponsesO
     parse_openai_token_response(&json)
 }
 
+fn generate_client_secret() -> [u8; 8] {
+    let mut bytes = [0; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes
+}
+
 pub(crate) fn oauth_token_should_refresh(access_token: &str, expires_at_ms: u64) -> bool {
     let now_ms = now_ms();
     if let Some(issued_at_ms) = jwt_issued_at_ms(access_token) {
@@ -312,6 +322,7 @@ fn parse_openai_token_response(json: &Value) -> io::Result<ResponsesOAuthCredent
         refresh_token,
         expires_at_ms,
         account_id,
+        client_secret: generate_client_secret(),
     })
 }
 
