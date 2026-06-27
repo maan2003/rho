@@ -63,9 +63,33 @@
           };
         };
 
+        muslToolchains =
+          flakeboxLib.mkStdToolchains { }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            x86_64-musl = flakeboxLib.mkFenixToolchain {
+              defaultTarget = "x86_64-unknown-linux-musl";
+              stdenv = pkgs.pkgsCross.musl64.stdenv;
+              targets = {
+                x86_64-musl = flakeboxLib.mkTarget {
+                  target = "x86_64-unknown-linux-musl";
+                  canUseMold = false;
+                  canUseWild = false;
+                  args = {
+                    nativeBuildInputs = [ pkgs.stdenv.cc ];
+                    CC = "${pkgs.stdenv.cc}/bin/cc";
+                    CXX = "${pkgs.stdenv.cc}/bin/c++";
+                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc";
+                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "";
+                  };
+                };
+              };
+            };
+          };
+
         buildPaths = [
           "Cargo.toml"
           "Cargo.lock"
+          "README.md"
           ".config/nextest.toml"
           "crates"
         ];
@@ -78,7 +102,7 @@
           paths = buildPaths;
         };
 
-        multiBuild = (flakeboxLib.craneMultiBuild { }) (
+        multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
           craneLib':
           let
             craneLib = craneLib'.overrideArgs {

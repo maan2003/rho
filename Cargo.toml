@@ -1,10 +1,10 @@
 [workspace]
 members = [
-  "crates/rho-blocking-notify-channel",
-  "crates/rho-core",
   "crates/rho-agent",
+  "crates/rho-blocking-notify-channel",
   "crates/rho-cli",
   "crates/rho-cli-term-raw",
+  "crates/rho-core",
   "crates/rho-inference",
   "crates/rho-store-cbor",
   "crates/rho-store-redb",
@@ -16,31 +16,32 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/maan2003/rho"
 rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
-async-stream = "0.3"
 anyhow = "1"
+async-stream = "0.3"
 base64 = "0.22"
 bon = { version = "3", default-features = false }
+clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", default-features = false, features = [
   "bracketed-paste",
   "events",
 ] }
-clap = { version = "4", features = ["derive"] }
 dirs = { version = "6", default-features = false }
 futures = "0.3"
 futures-util = "0.3"
 postcard = { version = "1", features = ["use-std"] }
-redb = "4.1.0"
 rand = "0.8"
-rho-core = { path = "crates/rho-core" }
+redb = "4.1.0"
 rho-agent = { path = "crates/rho-agent" }
 rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
 rho-cli = { path = "crates/rho-cli" }
 rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
+rho-core = { path = "crates/rho-core" }
 rho-inference = { path = "crates/rho-inference" }
 rho-store-cbor = { path = "crates/rho-store-cbor" }
 rho-store-redb = { path = "crates/rho-store-redb" }
@@ -62,14 +63,14 @@ tokio = { version = "1", features = [
   "sync",
   "time",
 ] }
-tracing = { version = "0.1", default-features = false, features = [
-  "attributes",
-  "std",
-] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
   "connect",
   "handshake",
   "rustls-tls-native-roots",
+] }
+tracing = { version = "0.1", default-features = false, features = [
+  "attributes",
+  "std",
 ] }
 unicode-segmentation = { version = "1", default-features = false }
 unicode-width = { version = "0.2", default-features = false }
