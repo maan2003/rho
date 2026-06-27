@@ -36,25 +36,12 @@ The senax-encoder pack format is designed for maximum compactness and performanc
 
 ## 2. Format Basics
 
-### 2.1 Magic Numbers
+### 2.1 Format Framing
 
-The senax-encoder library uses magic numbers to distinguish between different serialization formats when using convenience functions:
-
-**Encode Format:** `0xA55A` (2 bytes, little-endian)
-- Used by `encode()` and `encode_to()` functions
-- Supports schema evolution with field IDs and type tags
-- Binary starts with: `[0x5A, 0xA5]`
-
-**Pack Format:** `0xDADA` (2 bytes, little-endian)  
-- Used by `pack()` and `pack_to()` functions
-- Compact format without schema evolution support
-- Binary starts with: `[0xDA, 0xDA]`
-
-**Important Notes:**
-- Magic numbers are **only added by convenience functions** (`pack()`, `encode()`, etc.)
-- Direct trait method calls (`Packer::pack`, `Encoder::encode`) do **not** include magic numbers
-- The `unpack()` and `decode()` functions validate and consume the magic numbers
-- This specification describes the format **after** magic number (raw pack format)
+The senax-encoder convenience functions do not add a format header. `pack()`
+and direct `Packer::pack` calls produce the same pack payload, while `encode()`
+and direct `Encoder::encode` calls produce the same schema-evolution-friendly
+payload.
 
 ### 2.2 Byte Order
 

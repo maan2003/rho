@@ -50,7 +50,6 @@ fn test_f32_backward_compatibility() {
 
     // Create legacy binary format manually (TAG_F32 + 4 bytes)
     let mut writer = BytesMut::new();
-    writer.put_u16_le(0xA55A); // MAGIC_ENCODE (little-endian)
     writer.put_u8(137); // TAG_F32
     writer.put_f32_le(value);
 
@@ -66,7 +65,6 @@ fn test_f64_backward_compatibility() {
 
     // Create legacy binary format manually (TAG_F64 + 8 bytes)
     let mut writer = BytesMut::new();
-    writer.put_u16_le(0xA55A); // MAGIC_ENCODE (little-endian)
     writer.put_u8(138); // TAG_F64
     writer.put_f64_le(value);
 
@@ -186,7 +184,6 @@ fn test_decimal_backward_compatibility() {
 
     // Create legacy binary format manually (TAG_DECIMAL + mantissa + scale)
     let mut writer = BytesMut::new();
-    writer.put_u16_le(0xA55A); // MAGIC_ENCODE (little-endian)
     writer.put_u8(200); // TAG_DECIMAL
 
     // Encode mantissa (i128) and scale (u32)

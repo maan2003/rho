@@ -270,7 +270,7 @@ fn test_primitive_pack_unpack() {
     assert_eq!(bool_val, unpacked_bool);
 
     // Test bool unpack with non-standard values (should work with any non-zero)
-    // Use trait method directly since we're testing raw binary data without magic number
+    // Use trait method directly since we're testing non-standard raw bool data.
     let mut writer = bytes::BytesMut::new();
     writer.put_u8(42); // Non-standard true value
     let mut reader = writer.freeze();
