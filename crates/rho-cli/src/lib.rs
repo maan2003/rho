@@ -35,6 +35,7 @@ const DEFAULT_COMPACTION_THRESHOLD: u64 = 220_000;
 pub fn main() -> Result<()> {
     let args = Args::parse_or_exit(std::env::args().skip(1));
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()?;
     runtime.block_on(run(args.command))
