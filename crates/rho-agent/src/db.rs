@@ -4,6 +4,7 @@ use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
 use rho_core::ContextBlock;
 use rho_db::Sen;
+use rho_inference::config::PromptCacheKey;
 use senax_encoder::{Decode, Encode};
 
 pub const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
@@ -50,9 +51,9 @@ pub struct AgentRecord {
     pub provider_state: AgentProviderState,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentProviderState {
-    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_key: PromptCacheKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]

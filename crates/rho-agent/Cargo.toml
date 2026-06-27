@@ -13,6 +13,7 @@ bytes = "1"
 futures.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
+rho-inference.workspace = true
 rho-tool-shell.workspace = true
 redb.workspace = true
 redb-derive = "0.1"
