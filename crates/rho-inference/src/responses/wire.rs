@@ -34,7 +34,7 @@ pub(crate) struct ResponsesRequest {
     pub service_tier: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<&'static str>,
-    pub prompt_cache_key: String,
+    pub prompt_cache_key: uuid::Uuid,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub context_management: Vec<ContextManagementRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,7 +130,7 @@ impl ResponsesRequest {
         let tool_choice = (!tools.is_empty()).then_some("auto");
         let prompt_cache_key = session
             .prompt_cache_key
-            .to_wire_string(&session.base_url, [0; 32]);
+            .to_wire_uuid(&session.base_url, [0; 32]);
         let previous_response_id = previous_response.map(|(id, _)| id);
         let InferenceConfig::Gpt5(config) = session.config().config();
         let context_management = config

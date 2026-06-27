@@ -109,7 +109,7 @@ fn websocket_envelope_has_response_create_type() {
         reasoning: None,
         service_tier: None,
         include: Vec::new(),
-        prompt_cache_key: "thread-1".to_owned(),
+        prompt_cache_key: uuid::uuid!("b6df7bf9-ec1a-8f8e-bff2-23d552ce5bcf"),
         context_management: Vec::new(),
         previous_response_id: None,
     };

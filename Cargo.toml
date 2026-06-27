@@ -79,7 +79,7 @@ ureq = { version = "3", default-features = false, features = [
   "platform-verifier",
   "rustls",
 ] }
-uuid = "1"
+uuid = { version = "1", features = ["serde"] }
 url = { version = "2", default-features = false }
 vt100 = { version = "0.16", default-features = false }
 

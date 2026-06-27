@@ -31,7 +31,7 @@ impl PromptCacheKey {
         Self(bytes)
     }
 
-    pub(crate) fn to_wire_string(self, api_url: &str, client_secret: [u8; 32]) -> String {
+    pub(crate) fn to_wire_uuid(self, api_url: &str, client_secret: [u8; 32]) -> uuid::Uuid {
         use std::hash::Hasher;
 
         fn fnv64(parts: &[&[u8]]) -> u64 {
@@ -59,7 +59,7 @@ impl PromptCacheKey {
         bytes[8..].copy_from_slice(&lo.to_be_bytes());
         bytes[6] = (bytes[6] & 0x0f) | 0x80;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        uuid::Uuid::from_bytes(bytes).to_string()
+        uuid::Uuid::from_bytes(bytes)
     }
 }
 
@@ -165,7 +165,7 @@ impl InferenceSession {
                 let connection = self.connection.as_ref().unwrap();
                 body.prompt_cache_key = self
                     .prompt_cache_key
-                    .to_wire_string(&self.base_url, connection.client_secret);
+                    .to_wire_uuid(&self.base_url, connection.client_secret);
                 if let Err(error) = self.connection.as_mut().unwrap().send_envelope(body).await {
                     match self.on_socket_failure(error) {
                         ControlFlow::Continue(()) => continue,
@@ -326,7 +326,7 @@ impl InferenceSession {
                 .turn
                 .as_ref()
                 .and_then(|turn| turn.pending_send.as_ref())
-                .map(|body| body.prompt_cache_key.clone());
+                .map(|body| body.prompt_cache_key.to_string());
             let request = ws::build_ws_request(self, thread_id.as_deref(), &resolved)?;
             let (socket, _response) = connect_async(request).await?;
             self.connection = Some(WebSocketConnection::new(socket, &resolved));
