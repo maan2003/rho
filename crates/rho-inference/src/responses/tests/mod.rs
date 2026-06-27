@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,6 +21,9 @@ use super::oauth::{InferenceAuth, OAuthFile, ResponsesOAuthCredentials};
 use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
+use crate::config::{
+    AutoCompaction, Effort, Gpt5Config, Gpt5Model, InferenceConfig, ServiceTier, TextVerbosity,
+};
 
 fn first_assistant_message(
     items: &[InferenceResponseItem],
@@ -201,7 +205,24 @@ fn test_oauth_file(
 
 fn test_inference_service(model: impl Into<String>) -> InferenceSession {
     let (_temp, auth) = test_oauth_file("token", None);
-    InferenceSession::new(model, auth)
+    test_inference_service_with(auth, model, None, None)
+}
+
+fn test_inference_service_with(
+    auth: InferenceAuth,
+    model: impl Into<String>,
+    prompt_cache_key: Option<String>,
+    auto_compaction: Option<AutoCompaction>,
+) -> InferenceSession {
+    let config = InferenceConfig::Gpt5(Gpt5Config {
+        model: Gpt5Model(Cow::Owned(model.into())),
+        auto_compaction,
+        effort: Effort::Medium,
+        text_verbosity: TextVerbosity::Medium,
+        service_tier: ServiceTier::Normal,
+    })
+    .protect();
+    InferenceSession::new(auth, config, prompt_cache_key)
 }
 
 fn test_oauth_file_in(

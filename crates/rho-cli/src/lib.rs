@@ -22,6 +22,7 @@ use rho_core::{
     ContextBlock, InferenceResponseItem, StreamingContextItem, StreamingContextItemState, ToolCall,
     ToolOutputStatus, ToolResult, text_content,
 };
+use rho_inference::config::InferenceConfig;
 use rho_inference::{AuthArgs, InferenceAuth, InferenceSession, run_auth_cli};
 use rho_store_cbor::CborLog;
 use tokio::task::JoinHandle;
@@ -30,7 +31,6 @@ use tokio::task::JoinHandle;
 mod tests;
 
 const DEFAULT_SESSION_NAME: &str = "default";
-const DEFAULT_COMPACTION_THRESHOLD: u64 = 220_000;
 
 pub fn main() -> Result<()> {
     let args = Args::parse_or_exit(std::env::args().skip(1));
@@ -142,12 +142,9 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
 
 fn build_inference_session(args: &ChatArgs) -> Result<InferenceSession> {
     let auth = InferenceAuth::named(&args.auth)?;
-    let mut session = InferenceSession::new(args.model.clone(), auth)
-        .with_compaction_threshold(DEFAULT_COMPACTION_THRESHOLD);
-    if !args.no_store {
-        session = session.with_prompt_cache_key(args.session.clone());
-    }
-    Ok(session)
+    let config = InferenceConfig::deep().protect();
+    let prompt_cache_key = (!args.no_store).then(|| args.session.clone());
+    Ok(InferenceSession::new(auth, config, prompt_cache_key))
 }
 
 struct ChatApp {
@@ -720,8 +717,6 @@ enum CliCommand {
 
 #[derive(Clone, clap::Args)]
 struct ChatArgs {
-    #[arg(long, default_value_t = InferenceSession::DEFAULT_MODEL.to_owned())]
-    model: String,
     #[arg(long = "auth", default_value = "default")]
     auth: String,
     #[arg(long, default_value = DEFAULT_SESSION_NAME)]

@@ -11,7 +11,6 @@ use super::*;
 
 fn chat_args() -> ChatArgs {
     ChatArgs {
-        model: "gpt-test".to_owned(),
         auth: "default".to_owned(),
         session: DEFAULT_SESSION_NAME.to_owned(),
         session_path: None,

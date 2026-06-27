@@ -30,7 +30,7 @@ async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
 #[test]
 fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
     let (_temp, auth) = test_oauth_file("token", Some("acct_1"));
-    let mut session = InferenceSession::new("gpt-test", auth);
+    let mut session = test_inference_service_with(auth, "gpt-test", None, None);
     session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
     let auth = session.auth.resolve().unwrap();
@@ -50,7 +50,7 @@ fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
 #[test]
 fn websocket_request_uses_oauth_bearer_without_account_header() {
     let (_temp, auth) = test_oauth_file("sk-test", None);
-    let session = InferenceSession::new("gpt-test", auth);
+    let session = test_inference_service_with(auth, "gpt-test", None, None);
 
     let auth = session.auth.resolve().unwrap();
     let request = build_ws_request(&session, None, &auth).unwrap();
@@ -70,7 +70,12 @@ fn websocket_request_uses_oauth_file_credentials() {
         account_id: Some("acct_file".to_owned()),
     })
     .unwrap();
-    let mut session = InferenceSession::new("gpt-test", InferenceAuth::oauth_file(file.path()));
+    let mut session = test_inference_service_with(
+        InferenceAuth::oauth_file(file.path()),
+        "gpt-test",
+        None,
+        None,
+    );
     session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
     let auth = session.auth.resolve().unwrap();
@@ -90,6 +95,8 @@ fn websocket_envelope_has_response_create_type() {
         tools: Vec::new(),
         tool_choice: None,
         text: None,
+        reasoning: None,
+        service_tier: None,
         include: Vec::new(),
         prompt_cache_key: Some("thread-1".to_owned()),
         context_management: Vec::new(),

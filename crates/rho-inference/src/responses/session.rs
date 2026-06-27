@@ -7,10 +7,11 @@ use rho_core::{InferenceEvent, InferenceRequest};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use super::DEFAULT_CHATGPT_BASE_URL;
 use super::oauth::InferenceAuth;
 use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{self, WebSocketConnection};
-use super::{Compaction, DEFAULT_CHATGPT_BASE_URL, DEFAULT_MODEL};
+use crate::config::InferenceProtectedConfig;
 
 /// A turn that has been requested and is being driven by `run`.
 struct Turn {
@@ -39,44 +40,33 @@ pub struct InferenceSession {
     buffered: VecDeque<InferenceEvent>,
     pub(crate) base_url: String,
     pub(crate) auth: InferenceAuth,
-    pub(crate) compaction: Option<Compaction>,
-    pub(crate) model: String,
+    pub(crate) config: InferenceProtectedConfig,
     pub(crate) prompt_cache_key: Option<String>,
 }
 
 impl InferenceSession {
-    pub const DEFAULT_MODEL: &'static str = DEFAULT_MODEL;
-
-    pub fn new(model: impl Into<String>, auth: InferenceAuth) -> Self {
+    pub fn new(
+        auth: InferenceAuth,
+        config: InferenceProtectedConfig,
+        prompt_cache_key: Option<String>,
+    ) -> Self {
         Self {
             connection: None,
             turn: None,
             buffered: VecDeque::new(),
             base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
             auth,
-            compaction: None,
-            model: model.into(),
-            prompt_cache_key: None,
+            config,
+            prompt_cache_key,
         }
-    }
-
-    pub fn with_compaction(mut self) -> Self {
-        self.compaction = Some(Compaction::Default);
-        self
-    }
-
-    pub fn with_compaction_threshold(mut self, compact_threshold: u64) -> Self {
-        self.compaction = Some(Compaction::Threshold(compact_threshold));
-        self
-    }
-
-    pub fn with_prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
-        self.prompt_cache_key = Some(prompt_cache_key.into());
-        self
     }
 
     pub fn prompt_cache_key(&self) -> Option<&str> {
         self.prompt_cache_key.as_deref()
+    }
+
+    pub fn config(&self) -> &InferenceProtectedConfig {
+        &self.config
     }
 
     /// Queue a turn. The work happens in `run`.
@@ -317,8 +307,7 @@ impl std::fmt::Debug for InferenceSession {
         f.debug_struct("InferenceSession")
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
-            .field("compaction", &self.compaction)
-            .field("model", &self.model)
+            .field("config", &self.config.config())
             .field("prompt_cache_key", &self.prompt_cache_key)
             .finish()
     }

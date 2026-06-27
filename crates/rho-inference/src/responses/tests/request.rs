@@ -24,7 +24,8 @@ fn opaque(tag: &str, payload: Value) -> OpaqueProviderData {
 
 #[test]
 fn builds_responses_request_with_tools_and_item_timeline() {
-    let session = test_inference_service("gpt-test").with_prompt_cache_key("cache-key");
+    let (_temp, auth) = test_oauth_file("token", None);
+    let session = test_inference_service_with(auth, "gpt-test", Some("cache-key".to_owned()), None);
     let request = inference_request(
         vec![
             user_block("hello"),
@@ -64,9 +65,9 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     assert_eq!(json["tools"][0]["name"], "shell_run");
     assert_eq!(json["tool_choice"], "auto");
     assert_eq!(json["store"], false);
-    assert!(json.get("reasoning").is_none());
+    assert_eq!(json["reasoning"]["effort"], "medium");
     assert_eq!(json["text"]["verbosity"], "medium");
-    assert!(json.get("service_tier").is_none());
+    assert_eq!(json["service_tier"], "default");
     assert_eq!(json["prompt_cache_key"], "cache-key");
     assert_eq!(json["include"][0], "reasoning.encrypted_content");
 }
@@ -104,19 +105,20 @@ fn stamps_phase_on_assistant_messages_when_supported() {
 }
 
 #[test]
-fn omits_empty_reasoning_request_when_no_effort_is_set() {
+fn serializes_configured_reasoning_effort() {
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body =
         ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
     let json = serde_json::to_value(body).unwrap();
 
-    assert!(json.get("reasoning").is_none());
+    assert_eq!(json["reasoning"]["effort"], "medium");
 }
 
 #[test]
 fn serializes_prompt_cache_key() {
-    let session = test_inference_service("gpt-test").with_prompt_cache_key("cache-key");
+    let (_temp, auth) = test_oauth_file("token", None);
+    let session = test_inference_service_with(auth, "gpt-test", Some("cache-key".to_owned()), None);
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(&session, request);
@@ -211,8 +213,8 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
     let (_temp, auth) = test_oauth_file("token", None);
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
-    let body =
-        ResponsesRequest::from_inference_request(&InferenceSession::new("gpt-test", auth), request);
+    let session = test_inference_service_with(auth, "gpt-test", None, None);
+    let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("context_management").is_none());
@@ -222,7 +224,13 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
 
 #[test]
 fn configured_compaction_threshold_overrides_provider_default() {
-    let session = test_inference_service("gpt-test").with_compaction_threshold(42_000);
+    let (_temp, auth) = test_oauth_file("token", None);
+    let session = test_inference_service_with(
+        auth,
+        "gpt-test",
+        None,
+        Some(AutoCompaction::Threshold(42_000)),
+    );
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(&session, request);
@@ -235,9 +243,14 @@ fn configured_compaction_threshold_overrides_provider_default() {
 }
 
 #[test]
-fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
+fn chatgpt_codex_with_compaction_requests_configured_threshold() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = InferenceSession::new("gpt-test", auth).with_compaction();
+    let session = test_inference_service_with(
+        auth,
+        "gpt-test",
+        None,
+        Some(AutoCompaction::Threshold(232_560)),
+    );
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(&session, request);
@@ -245,10 +258,7 @@ fn chatgpt_codex_with_compaction_requests_provider_default_threshold() {
 
     assert_eq!(json["input"][0]["content"][0]["text"], "hello");
     assert_eq!(json["input"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        json["context_management"][0]["compact_threshold"],
-        DEFAULT_CONTEXT_WINDOW * 9 / 10
-    );
+    assert_eq!(json["context_management"][0]["compact_threshold"], 232_560);
 }
 
 #[test]

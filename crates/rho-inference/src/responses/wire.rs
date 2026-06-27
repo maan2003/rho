@@ -11,7 +11,8 @@ use rho_core::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{Compaction, InferenceSession};
+use super::InferenceSession;
+use crate::config::{AutoCompaction, Effort, InferenceConfig, ServiceTier, TextVerbosity};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ResponsesRequest {
@@ -27,6 +28,10 @@ pub(crate) struct ResponsesRequest {
     pub tool_choice: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,6 +45,11 @@ pub(crate) struct ResponsesRequest {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct TextRequest {
     pub verbosity: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ReasoningRequest {
+    pub effort: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -121,12 +131,13 @@ impl ResponsesRequest {
         let tool_choice = (!tools.is_empty()).then_some("auto");
         let prompt_cache_key = session.prompt_cache_key.clone();
         let previous_response_id = previous_response.map(|(id, _)| id);
-        let context_management = session
-            .compaction
+        let InferenceConfig::Gpt5(config) = session.config().config();
+        let context_management = config
+            .auto_compaction
+            .as_ref()
             .map(|compaction| {
                 let compact_threshold = match compaction {
-                    Compaction::Default => provider_default_compaction_threshold(),
-                    Compaction::Threshold(value) => value,
+                    AutoCompaction::Threshold(value) => *value,
                 };
                 vec![ContextManagementRequest {
                     ty: "compaction",
@@ -136,7 +147,7 @@ impl ResponsesRequest {
             .unwrap_or_default();
 
         Self {
-            model: session.model.clone(),
+            model: config.model.0.to_string(),
             // TODO: rho-core's InferenceRequest has no instruction field yet
             // (see its `// todo: add instruction`); wire it through once it does.
             instructions: None,
@@ -145,7 +156,26 @@ impl ResponsesRequest {
             tools,
             tool_choice,
             text: Some(TextRequest {
-                verbosity: "medium",
+                verbosity: match config.text_verbosity {
+                    TextVerbosity::Low => "low",
+                    TextVerbosity::Medium => "medium",
+                    TextVerbosity::High => "high",
+                },
+            }),
+            reasoning: Some(ReasoningRequest {
+                effort: match config.effort {
+                    Effort::Minimal => "minimal",
+                    Effort::Low => "low",
+                    Effort::Medium => "medium",
+                    Effort::High => "high",
+                    Effort::Xhigh => "xhigh",
+                    Effort::Max => "max",
+                },
+            }),
+            service_tier: Some(match config.service_tier {
+                ServiceTier::Flex => "flex",
+                ServiceTier::Priority => "priority",
+                ServiceTier::Normal => "default",
             }),
             include: vec!["reasoning.encrypted_content"],
             prompt_cache_key,
@@ -340,10 +370,6 @@ fn convert_tool_format(format: ToolFormat) -> Value {
             "definition": definition,
         }),
     }
-}
-
-fn provider_default_compaction_threshold() -> u64 {
-    (super::DEFAULT_CONTEXT_WINDOW * 9 / 10).max(1000)
 }
 
 fn trim_before_latest_compaction(timeline: &[WireTimelineItem]) -> &[WireTimelineItem] {
