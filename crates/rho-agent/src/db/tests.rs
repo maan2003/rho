@@ -58,7 +58,7 @@ async fn create_agent_and_append_blocks_with_cursor() {
         UnixMillis(1),
         Some("main".to_owned()),
         PromptCacheKey::generate(),
-        InferenceConfig::deep(),
+        InferenceConfig::deep().protect(),
     );
     let next = write.append_agent_block(
         next,
@@ -107,7 +107,7 @@ async fn agent_blocks_read_lineage_parents() {
         UnixMillis(1),
         Some("main".to_owned()),
         PromptCacheKey::generate(),
-        InferenceConfig::deep(),
+        InferenceConfig::deep().protect(),
     );
     let fork_at = write.append_agent_block(
         next,

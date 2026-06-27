@@ -1348,10 +1348,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dirs",
  "futures",
  "rho-agent",
  "rho-cli-term-raw",
  "rho-core",
+ "rho-db",
  "rho-inference",
  "rho-tool-shell",
  "serde_json",

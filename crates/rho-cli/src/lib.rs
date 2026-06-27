@@ -21,14 +21,13 @@ use rho_core::{
     ContextBlock, InferenceResponseItem, StreamingContextItem, StreamingContextItemState, ToolCall,
     ToolOutputStatus, ToolResult, text_content,
 };
+use rho_db::RhoDb;
 use rho_inference::config::InferenceConfig;
-use rho_inference::{AuthArgs, InferenceAuth, InferenceSession, PromptCacheKey, run_auth_cli};
+use rho_inference::{AuthArgs, InferenceAuth, run_auth_cli};
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
 mod tests;
-
-const DEFAULT_SESSION_NAME: &str = "default";
 
 pub fn main() -> Result<()> {
     let args = Args::parse_or_exit(std::env::args().skip(1));
@@ -93,9 +92,10 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 }
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
-    let inference = Box::new(build_inference_session(args)?);
-    let blocks = Vec::new();
-    let agent = Agent::spawn(inference, blocks);
+    let db = RhoDb::open(rho_db_path()?);
+    let auth = InferenceAuth::named(&args.auth)?;
+    let config = InferenceConfig::deep();
+    let agent = Agent::create_persisted(db, auth, config, None).await;
     if renderer.is_some() {
         let changes = agent.subscribe();
         tokio::spawn(async move {
@@ -112,14 +112,11 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
     Ok(agent)
 }
 
-fn build_inference_session(args: &ChatArgs) -> Result<InferenceSession> {
-    let auth = InferenceAuth::named(&args.auth)?;
-    let config = InferenceConfig::deep().protect();
-    Ok(InferenceSession::new(
-        auth,
-        config,
-        PromptCacheKey::generate(),
-    ))
+fn rho_db_path() -> Result<std::path::PathBuf> {
+    let base = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or(std::env::current_dir()?);
+    Ok(base.join("rho").join("rho.redb"))
 }
 
 struct ChatApp {
@@ -687,8 +684,6 @@ enum CliCommand {
 struct ChatArgs {
     #[arg(long = "auth", default_value = "default")]
     auth: String,
-    #[arg(long, default_value = DEFAULT_SESSION_NAME)]
-    session: String,
     #[arg(long = "prompt-stdin")]
     prompt_stdin: bool,
 }

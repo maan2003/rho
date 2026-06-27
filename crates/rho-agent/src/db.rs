@@ -7,7 +7,7 @@ use redb_derive::{Key, Value as RedbValue};
 use rho_core::ContextBlock;
 use rho_db::{ReadTxn, Sen, WriteTxn};
 use rho_inference::PromptCacheKey;
-use rho_inference::config::InferenceConfig;
+use rho_inference::config::InferenceProtectedConfig;
 use senax_encoder::{Decode, Encode};
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
@@ -83,7 +83,7 @@ pub struct AgentRecord {
     pub current_lineage: AgentLineageId,
     pub parent_agent: Option<AgentId>,
     pub prompt_cache_key: PromptCacheKey,
-    pub config: InferenceConfig,
+    pub config: InferenceProtectedConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -103,7 +103,7 @@ pub trait AgentWriteTxnExt {
         now: UnixMillis,
         display_name: Option<String>,
         prompt_cache_key: PromptCacheKey,
-        config: InferenceConfig,
+        config: InferenceProtectedConfig,
     ) -> (AgentId, AgentTimelineRef);
 
     fn append_agent_block(
@@ -171,7 +171,7 @@ impl AgentWriteTxnExt for WriteTxn {
         now: UnixMillis,
         display_name: Option<String>,
         prompt_cache_key: PromptCacheKey,
-        config: InferenceConfig,
+        config: InferenceProtectedConfig,
     ) -> (AgentId, AgentTimelineRef) {
         let agent_id = AgentId(next_counter(self, CounterKey::LAST_AGENT_ID));
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));

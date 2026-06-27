@@ -115,9 +115,26 @@ struct ProtectiveId(u64);
 /// The protected wrapper gives callers read-only access to the full config
 /// while allowing only request-time tuning knobs to change. Identity-like
 /// fields such as model remain frozen for the life of this wrapper.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct InferenceProtectedConfig {
     id: ProtectiveId,
     config: InferenceConfig,
+}
+
+impl senax_encoder::Encoder for InferenceProtectedConfig {
+    fn encode(&self, writer: &mut bytes::BytesMut) -> senax_encoder::Result<()> {
+        self.config.encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.config.is_default()
+    }
+}
+
+impl senax_encoder::Decoder for InferenceProtectedConfig {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        InferenceConfig::decode(reader).map(InferenceConfig::protect)
+    }
 }
 
 impl Serialize for InferenceProtectedConfig {

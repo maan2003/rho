@@ -10,6 +10,8 @@ use rho_core::{
     InferenceResponseItem, PendingInferenceResponse, ToolCall, ToolResult, ToolSpec,
 };
 use rho_db::RhoDb;
+use rho_inference::config::InferenceConfig;
+use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use tokio::sync::{Notify, mpsc};
 
@@ -74,12 +76,38 @@ impl Agent {
         Self::spawn_inner(inference_session, blocks, None)
     }
 
-    pub fn spawn_persisted(
-        inference_session: Box<dyn IInferenceSession>,
+    pub async fn create_persisted(
         db: RhoDb,
-        agent_id: AgentId,
+        auth: InferenceAuth,
+        config: InferenceConfig,
+        display_name: Option<String>,
     ) -> Self {
+        let prompt_cache_key = PromptCacheKey::generate();
+        let config = config.protect();
+        let mut write = db.write().await;
+        let (_, next_block) = write.create_agent(
+            UnixMillis::now(),
+            display_name,
+            prompt_cache_key,
+            config.clone(),
+        );
+        write.commit();
+        let inference_session = Box::new(InferenceSession::new(auth, config, prompt_cache_key));
+        Self::spawn_inner(
+            inference_session,
+            Vec::new(),
+            Some(AgentPersistence { db, next_block }),
+        )
+    }
+
+    pub fn load_persisted(db: RhoDb, auth: InferenceAuth, agent_id: AgentId) -> Self {
+        let record = db.read().get_agent(agent_id);
         let (next_block, blocks) = db.read().agent_blocks(agent_id);
+        let inference_session = Box::new(InferenceSession::new(
+            auth,
+            record.config,
+            record.prompt_cache_key,
+        ));
         Self::spawn_inner(
             inference_session,
             blocks,

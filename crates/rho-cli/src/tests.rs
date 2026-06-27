@@ -9,22 +9,6 @@ use rho_core::{
 
 use super::*;
 
-fn chat_args() -> ChatArgs {
-    ChatArgs {
-        auth: "default".to_owned(),
-        session: DEFAULT_SESSION_NAME.to_owned(),
-        prompt_stdin: false,
-    }
-}
-
-#[test]
-fn cli_inference_session_has_prompt_cache_key() {
-    let args = chat_args();
-    let service = build_inference_session(&args).unwrap();
-
-    let _ = service.prompt_cache_key();
-}
-
 fn test_call() -> ToolCall {
     ToolCall {
         id: ToolCallId::try_from("call-1").unwrap(),
