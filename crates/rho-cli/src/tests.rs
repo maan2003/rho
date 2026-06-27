@@ -19,6 +19,43 @@ fn test_call() -> ToolCall {
 }
 
 #[test]
+fn slash_completion_lists_matching_commands() {
+    let candidates = completion_candidates("/c", 2);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect::<Vec<_>>(),
+        ["/cancel", "/compact", "/clear"]
+    );
+}
+
+#[test]
+fn completion_includes_relative_paths() {
+    let candidates = completion::completion_candidates("see ./Cargo", "see ./Cargo".len());
+    assert!(candidates.iter().any(|candidate| {
+        candidate.label == "./Cargo.toml" && candidate.replacement == "see ./Cargo.toml"
+    }));
+}
+
+#[test]
+fn slash_command_parse_known_and_unknown() {
+    assert!(matches!(SlashCommand::parse("hello"), None));
+    assert!(matches!(
+        SlashCommand::parse("/quit"),
+        Some(SlashCommand::Quit)
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/model"),
+        Some(SlashCommand::Unsupported(command)) if command == "/model"
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/wat"),
+        Some(SlashCommand::Unknown(command)) if command == "/wat"
+    ));
+}
+
+#[test]
 fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
     let (_term, handle, _input) = Term::new_virtual(
         80,

@@ -26,8 +26,16 @@ use rho_inference::config::InferenceConfig;
 use rho_inference::{AuthArgs, InferenceAuth, run_auth_cli};
 use tokio::task::JoinHandle;
 
+mod completion;
+mod slash_commands;
+mod tool_render;
+
 #[cfg(test)]
 mod tests;
+
+use completion::completion_candidates;
+use slash_commands::SlashCommand;
+use tool_render::{ToolRenderStatus, tool_call_block, tool_result_block, tool_status_label};
 
 pub fn main() -> Result<()> {
     let args = Args::parse_or_exit(std::env::args().skip(1));
@@ -137,6 +145,15 @@ impl ChatApp {
                         self.stop_running_turn(false).await;
                         break;
                     }
+                    if line == "/detach" {
+                        self.stop_running_turn(false).await;
+                        self.term
+                            .print_system("detach is not available in rho; exiting chat");
+                        break;
+                    }
+                    if self.handle_slash_command(&line).await? {
+                        continue;
+                    }
                     if self.turn_is_running() {
                         self.term
                             .print_system("agent is running; press Ctrl-C twice to cancel");
@@ -163,6 +180,34 @@ impl ChatApp {
             }
         }
         Ok(())
+    }
+
+    async fn handle_slash_command(&mut self, line: &str) -> Result<bool> {
+        let Some(command) = SlashCommand::parse(line) else {
+            return Ok(false);
+        };
+        match command {
+            SlashCommand::Quit => unreachable!("handled before slash dispatch"),
+            SlashCommand::Cancel => {
+                self.cancel_running_turn().await;
+            }
+            SlashCommand::Clear => {
+                self.term.clear_output();
+                if let Ok(mut renderer) = self.term.renderer.lock() {
+                    renderer.clear();
+                }
+                self.term.print_system("cleared");
+            }
+            SlashCommand::Help => self.term.print_help(),
+            SlashCommand::Version => self.term.print_system(env!("CARGO_PKG_VERSION")),
+            SlashCommand::Unsupported(command) => self.term.print_system(&format!(
+                "`{command}` is part of Tau's CLI surface but is not available in rho yet"
+            )),
+            SlashCommand::Unknown(command) => self
+                .term
+                .print_system(&format!("unknown command `{command}`; try /help")),
+        }
+        Ok(true)
     }
 
     fn turn_is_running(&self) -> bool {
@@ -267,7 +312,8 @@ struct ChatTerm {
 
 impl ChatTerm {
     fn new() -> io::Result<Self> {
-        let (term, handle) = Term::new(prompt_text(), CursorShape::Bar)?;
+        let (mut term, handle) = Term::new(prompt_text(), CursorShape::Bar)?;
+        term.set_completion_source(Some(Box::new(completion_candidates)));
         handle.set_input_placeholder(dim_text("send a message"));
         handle.set_right_prompt(dim_text("/quit"));
         handle.redraw();
@@ -284,18 +330,35 @@ impl ChatTerm {
     }
 
     fn print_user(&self, text: &str) {
+        self.handle.print_output("user", user_message_block(text));
+    }
+
+    fn print_system(&self, text: &str) {
+        print_system_on_handle(&self.handle, text);
+    }
+
+    fn print_help(&self) {
         self.handle.print_output(
-            "user",
+            "help",
             StyledBlock::new(StyledText::from(vec![
-                Span::new("you\n", Style::default().fg(Color::DarkCyan).bold()),
-                Span::plain(text.to_owned()),
+                Span::new("commands\n", Style::default().fg(Color::DarkGrey).bold()),
+                Span::plain("/quit          exit chat\n"),
+                Span::plain("/cancel        cancel the current in-flight prompt\n"),
+                Span::plain("/detach        exit chat (rho has no daemon detach yet)\n"),
+                Span::plain("/version       show rho version\n"),
+                Span::plain("/help          show this help\n"),
+                Span::plain("/clear         clear rendered output\n"),
+                Span::plain(
+                    "\nTau-compatible commands complete but may report unavailable in rho.\n",
+                ),
             ]))
             .margin_left(1),
         );
     }
 
-    fn print_system(&self, text: &str) {
-        print_system_on_handle(&self.handle, text);
+    fn clear_output(&self) {
+        self.handle.clear_output();
+        self.handle.redraw();
     }
 
     fn print_history(&self, blocks: &[Arc<ContextBlock>]) {
@@ -309,7 +372,7 @@ impl ChatTerm {
                 ContextBlock::UserMessage { content } => {
                     self.handle.print_output(
                         "history-message",
-                        message_block("you", text_content(content)),
+                        user_message_block(&text_content(content)),
                     );
                 }
                 ContextBlock::InferenceResponse { items, .. } => {
@@ -347,17 +410,16 @@ impl ChatTerm {
                     message_block("assistant", text_content(content)),
                 );
             }
-            InferenceResponseItem::ToolCall { name, .. } => {
+            InferenceResponseItem::ToolCall {
+                name, arguments, ..
+            } => {
                 self.handle.print_output(
                     "history-tool-call",
-                    StyledBlock::new(StyledText::from(vec![
-                        Span::new("tool ", Style::default().fg(Color::DarkMagenta).bold()),
-                        Span::new(
-                            name.as_str().to_owned(),
-                            Style::default().fg(Color::DarkMagenta),
-                        ),
-                    ]))
-                    .margin_left(1),
+                    tool_call_block(
+                        name.as_str(),
+                        arguments,
+                        ToolRenderStatus::Done(ToolOutputStatus::Success),
+                    ),
                 );
             }
             InferenceResponseItem::RawReasoning { .. }
@@ -418,6 +480,7 @@ struct StreamingRenderer {
     assistant_block: Option<rho_cli_term_raw::BlockId>,
     thinking_block: Option<rho_cli_term_raw::BlockId>,
     tool_blocks: BTreeMap<String, rho_cli_term_raw::BlockId>,
+    tool_calls: BTreeMap<String, (String, String)>,
     assistant_text: String,
     thinking_text: String,
 }
@@ -429,6 +492,7 @@ impl StreamingRenderer {
             assistant_block: None,
             thinking_block: None,
             tool_blocks: BTreeMap::new(),
+            tool_calls: BTreeMap::new(),
             assistant_text: String::new(),
             thinking_text: String::new(),
         }
@@ -440,6 +504,7 @@ impl StreamingRenderer {
             assistant_block: None,
             thinking_block: None,
             tool_blocks: BTreeMap::new(),
+            tool_calls: BTreeMap::new(),
             assistant_text: String::new(),
             thinking_text: String::new(),
         }
@@ -531,6 +596,7 @@ impl StreamingRenderer {
             handle.remove_above_active(id);
             handle.push_history(id);
         }
+        self.tool_calls.clear();
         handle.redraw();
         self.reset_turn();
     }
@@ -538,6 +604,14 @@ impl StreamingRenderer {
     fn reset_turn(&mut self) {
         self.assistant_text.clear();
         self.thinking_text.clear();
+    }
+
+    fn clear(&mut self) {
+        self.assistant_block = None;
+        self.thinking_block = None;
+        self.tool_blocks.clear();
+        self.tool_calls.clear();
+        self.reset_turn();
     }
 
     fn render_assistant(&mut self) {
@@ -562,36 +636,26 @@ impl StreamingRenderer {
     }
 
     fn render_tool_call(&mut self, call: &ToolCall) {
-        let block = StyledBlock::new(StyledText::from(vec![
-            Span::new("tool ", Style::default().fg(Color::DarkMagenta).bold()),
-            Span::new(
-                call.name.as_str().to_owned(),
-                Style::default().fg(Color::DarkMagenta),
-            ),
-            Span::new(" requested", Style::default().fg(Color::DarkGrey)),
-            Span::plain("\n"),
-            Span::plain(call.arguments.to_string()),
-        ]))
-        .margin_left(1);
+        self.tool_calls.insert(
+            call.id.as_str().to_owned(),
+            (call.name.as_str().to_owned(), call.arguments.clone()),
+        );
+        let block = tool_call_block(
+            call.name.as_str(),
+            &call.arguments,
+            ToolRenderStatus::Running,
+        );
         self.set_tool_block(call.id.as_str().to_owned(), block);
     }
 
     fn render_tool_finished(&mut self, result: &ToolResult) {
-        let status = tool_status_label(&result.body.status);
         let output = truncate_display(&result.body.output, 4_000);
-        let block = StyledBlock::new(StyledText::from(vec![
-            Span::new(
-                "tool result ",
-                Style::default().fg(Color::DarkMagenta).bold(),
-            ),
-            Span::new(
-                status,
-                Style::default().fg(tool_status_color(&result.body.status)),
-            ),
-            Span::plain("\n"),
-            Span::plain(output),
-        ]))
-        .margin_left(1);
+        let (name, arguments) = self
+            .tool_calls
+            .get(result.call_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| ("tool".to_owned(), String::new()));
+        let block = tool_result_block(&name, &arguments, result.body.status, &output);
         self.set_tool_block(result.call_id.as_str().to_owned(), block);
     }
 
@@ -703,9 +767,17 @@ impl Args {
 
 fn prompt_text() -> StyledText {
     StyledText::from(vec![
-        Span::new("rho", Style::default().fg(Color::Green).bold()),
-        Span::plain("> "),
+        Span::new("◯", Style::default().fg(Color::Green).bold()),
+        Span::plain(" "),
     ])
+}
+
+fn user_message_block(text: &str) -> StyledBlock {
+    StyledBlock::new(StyledText::from(vec![
+        Span::new("⬤ ", Style::default().fg(Color::DarkCyan).bold()),
+        Span::plain(text.to_owned()),
+    ]))
+    .margin_left(1)
 }
 
 fn message_block(label: &'static str, text: String) -> StyledBlock {
@@ -725,22 +797,6 @@ fn role_color(label: &str) -> Color {
         "assistant" => Color::Green,
         "system" | "developer" => Color::DarkGrey,
         _ => Color::White,
-    }
-}
-
-fn tool_status_label(status: &ToolOutputStatus) -> String {
-    match status {
-        ToolOutputStatus::Success => "success".to_owned(),
-        ToolOutputStatus::Error => "error".to_owned(),
-        ToolOutputStatus::Cancelled => "cancelled".to_owned(),
-    }
-}
-
-fn tool_status_color(status: &ToolOutputStatus) -> Color {
-    match status {
-        ToolOutputStatus::Success => Color::Green,
-        ToolOutputStatus::Error => Color::DarkRed,
-        ToolOutputStatus::Cancelled => Color::DarkYellow,
     }
 }
 
