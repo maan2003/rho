@@ -1,28 +1,24 @@
-//! redb-backed key/value database boundary for rho.
+//! Thin redb helpers for rho.
 //!
-//! `RhoDb` owns transaction lifecycle and leaves domain records to higher
-//! crates. Opening the database and table operations are synchronous. Acquiring
-//! a write transaction is async because redb permits only one writer.
+//! Callers own table definitions and schema. `rho-db` only provides `Sen<T>`
+//! for senax-backed redb keys/values and small transaction wrappers that treat
+//! local database errors as fatal.
 
+use std::cmp::Ordering;
+use std::fmt::Debug;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
-use std::ops::{Bound, RangeBounds};
 
-use anyhow::Result;
 use bytes::BytesMut;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition, TypeName};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const CACHE_SIZE: usize = 10 * 1024 * 1024;
 
-/// Key encoding for redb tables.
-///
-/// Implementations own ordering/prefix semantics. For ordered redb ranges, the
-/// encoded bytes must preserve the intended sort order.
-pub trait Key: senax_encoder::Encoder + senax_encoder::Decoder {
-    const TABLE: &'static str;
-    type Value: senax_encoder::Encoder + senax_encoder::Decoder;
-}
+/// redb key/value wrapper using senax encoding.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Sen<T>(pub T);
 
 /// redb-backed rho database handle.
 #[derive(Clone, Debug)]
@@ -31,195 +27,156 @@ pub struct RhoDb {
     write_lock: Arc<Mutex<()>>,
 }
 
-/// Read transaction. All operations on an acquired transaction are synchronous.
+/// Read transaction wrapper. Methods panic on local database errors.
 pub struct ReadTxn {
     inner: redb::ReadTransaction,
 }
 
-/// Write transaction. All operations on an acquired transaction are
-/// synchronous.
+/// Write transaction wrapper. Methods panic on local database errors.
 pub struct WriteTxn {
     inner: redb::WriteTransaction,
     _guard: OwnedMutexGuard<()>,
 }
 
-/// Decoded double-ended iterator over a rho-db table.
-pub struct Iter<K: Key> {
-    inner: redb::Range<'static, &'static [u8], &'static [u8]>,
-    _marker: std::marker::PhantomData<fn() -> K>,
+impl<T> Deref for Sen<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for Sen<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> redb::Value for Sen<T>
+where
+    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
+{
+    type SelfType<'a>
+        = Sen<T>
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = BytesMut
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        let mut data = data;
+        Sen(T::decode(&mut data).expect("senax decode rho-db value"))
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'b,
+    {
+        let mut bytes = BytesMut::new();
+        value
+            .0
+            .encode(&mut bytes)
+            .expect("senax encode rho-db value");
+        bytes
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new(&format!("rho-db::Sen<{}>", std::any::type_name::<T>()))
+    }
+}
+
+impl<T> redb::Key for Sen<T>
+where
+    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
+{
+    fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+        data1.cmp(data2)
+    }
 }
 
 impl RhoDb {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).expect("create rho-db parent directory");
         }
 
         let database = Database::builder()
             .set_cache_size(CACHE_SIZE)
-            .create(path)?;
+            .create(path)
+            .expect("open rho-db");
 
-        Ok(Self {
+        Self {
             database: Arc::new(database),
             write_lock: Arc::new(Mutex::new(())),
-        })
+        }
     }
 
-    pub fn read(&self) -> Result<ReadTxn> {
-        Ok(ReadTxn {
-            inner: self.database.begin_read()?,
-        })
+    pub fn read(&self) -> ReadTxn {
+        ReadTxn {
+            inner: self.database.begin_read().expect("begin rho-db read txn"),
+        }
     }
 
-    pub async fn write(&self) -> Result<WriteTxn> {
+    pub async fn write(&self) -> WriteTxn {
         let guard = Arc::clone(&self.write_lock).lock_owned().await;
-        let inner = self.database.begin_write()?;
-        Ok(WriteTxn {
+        let inner = self.database.begin_write().expect("begin rho-db write txn");
+        WriteTxn {
             inner,
             _guard: guard,
-        })
+        }
     }
 }
 
 impl ReadTxn {
-    pub fn get<K: Key>(&self, key: &K) -> Result<Option<K::Value>> {
-        let table = self.inner.open_table(definition::<K>())?;
-        table
-            .get(encode(key)?.as_ref())?
-            .map(|bytes| decode(bytes.value()))
-            .transpose()
-    }
-
-    pub fn iter<K: Key>(&self) -> Result<Iter<K>> {
-        let table = self.inner.open_table(definition::<K>())?;
-        Ok(Iter::new(table.range::<&[u8]>(..)?))
-    }
-
-    pub fn range<K: Key>(&self, range: impl RangeBounds<K>) -> Result<Iter<K>> {
-        let start = encode_bound(range.start_bound())?;
-        let end = encode_bound(range.end_bound())?;
-        let encoded_range = (bound_as_slice(&start), bound_as_slice(&end));
-        let table = self.inner.open_table(definition::<K>())?;
-        Ok(Iter::new(table.range::<&[u8]>(encoded_range)?))
+    pub fn open_table<K, V>(&self, definition: TableDefinition<K, V>) -> redb::ReadOnlyTable<K, V>
+    where
+        K: redb::Key + 'static,
+        V: redb::Value + 'static,
+    {
+        self.inner
+            .open_table(definition)
+            .expect("open rho-db read table")
     }
 }
 
 impl WriteTxn {
-    pub fn get<K: Key>(&self, key: &K) -> Result<Option<K::Value>> {
-        let table = self.inner.open_table(definition::<K>())?;
-        table
-            .get(encode(key)?.as_ref())?
-            .map(|bytes| decode(bytes.value()))
-            .transpose()
-    }
-
-    pub fn put<K: Key>(&mut self, key: &K, value: &K::Value) -> Result<()> {
-        let key = encode(key)?;
-        let value = encode(value)?;
+    pub fn open_table<K, V>(&mut self, definition: TableDefinition<K, V>) -> redb::Table<'_, K, V>
+    where
+        K: redb::Key + 'static,
+        V: redb::Value + 'static,
+    {
         self.inner
-            .open_table(definition::<K>())?
-            .insert(key.as_ref(), value.as_ref())?;
-        Ok(())
+            .open_table(definition)
+            .expect("open rho-db write table")
     }
 
-    pub fn remove<K: Key>(&mut self, key: &K) -> Result<bool> {
-        Ok(self
-            .inner
-            .open_table(definition::<K>())?
-            .remove(encode(key)?.as_ref())?
-            .is_some())
+    pub fn commit(self) {
+        self.inner.commit().expect("commit rho-db write txn");
     }
-
-    pub fn commit(self) -> Result<()> {
-        self.inner.commit()?;
-        Ok(())
-    }
-}
-
-impl<K: Key> Iter<K> {
-    fn new(inner: redb::Range<'static, &'static [u8], &'static [u8]>) -> Self {
-        Self {
-            inner,
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    fn decode_item(
-        item: redb::Result<(
-            redb::AccessGuard<'_, &'static [u8]>,
-            redb::AccessGuard<'_, &'static [u8]>,
-        )>,
-    ) -> Result<(K, K::Value)> {
-        let (key, value) = item?;
-        Ok((decode(key.value())?, decode(value.value())?))
-    }
-}
-
-impl<K: Key> Iterator for Iter<K> {
-    type Item = Result<(K, K::Value)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(Self::decode_item)
-    }
-}
-
-impl<K: Key> DoubleEndedIterator for Iter<K> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(Self::decode_item)
-    }
-}
-
-fn definition<K: Key>() -> TableDefinition<'static, &'static [u8], &'static [u8]> {
-    TableDefinition::new(K::TABLE)
-}
-
-fn encode<T>(value: &T) -> Result<BytesMut>
-where
-    T: senax_encoder::Encoder,
-{
-    let mut bytes = BytesMut::new();
-    value.encode(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn encode_bound<T: senax_encoder::Encoder>(bound: Bound<&T>) -> Result<Bound<Vec<u8>>> {
-    Ok(match bound {
-        Bound::Included(value) => Bound::Included(encode(value)?.to_vec()),
-        Bound::Excluded(value) => Bound::Excluded(encode(value)?.to_vec()),
-        Bound::Unbounded => Bound::Unbounded,
-    })
-}
-
-fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
-    match bound {
-        Bound::Included(value) => Bound::Included(value.as_slice()),
-        Bound::Excluded(value) => Bound::Excluded(value.as_slice()),
-        Bound::Unbounded => Bound::Unbounded,
-    }
-}
-
-fn decode<T>(bytes: &[u8]) -> Result<T>
-where
-    T: senax_encoder::Decoder,
-{
-    let mut bytes = bytes;
-    T::decode(&mut bytes).map_err(anyhow::Error::from)
 }
 
 #[cfg(test)]
 mod tests {
+    use redb::{ReadableTable, TableDefinition};
     use senax_encoder::{Decode, Encode};
 
     use super::*;
 
+    const ITEMS: TableDefinition<Sen<TestKey>, Sen<TestRecord>> = TableDefinition::new("items");
+
     #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
     struct TestKey(u64);
-
-    impl Key for TestKey {
-        const TABLE: &'static str = "items";
-        type Value = TestRecord;
-    }
 
     #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
     struct TestRecord {
@@ -229,75 +186,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_values_survive_reopen() {
+    async fn sen_values_survive_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("rho.redb");
 
-        let db = RhoDb::open(&path).unwrap();
-        let mut write = db.write().await.unwrap();
+        let db = RhoDb::open(&path);
+        let mut write = db.write().await;
         write
-            .put(
-                &TestKey(42),
-                &TestRecord {
+            .open_table(ITEMS)
+            .insert(
+                &Sen(TestKey(42)),
+                Sen(TestRecord {
                     name: "agent".to_owned(),
                     tags: vec!["main".to_owned()],
-                },
+                }),
             )
             .unwrap();
-        write.commit().unwrap();
+        write.commit();
         drop(db);
 
-        let reopened = RhoDb::open(&path).unwrap();
-        let read = reopened.read().unwrap();
+        let reopened = RhoDb::open(&path);
+        let read = reopened.read();
+        let table = read.open_table(ITEMS);
         assert_eq!(
-            read.get(&TestKey(42)).unwrap(),
-            Some(TestRecord {
+            table.get(&Sen(TestKey(42))).unwrap().unwrap().value().0,
+            TestRecord {
                 name: "agent".to_owned(),
                 tags: vec!["main".to_owned()],
-            })
+            }
         );
     }
 
     #[tokio::test]
-    async fn write_transaction_is_sync_after_acquire() {
+    async fn callers_use_redb_iterators_directly() {
         let temp = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(temp.path().join("rho.redb")).unwrap();
+        let db = RhoDb::open(temp.path().join("rho.redb"));
 
-        let mut write = db.write().await.unwrap();
-        write
-            .put(
-                &TestKey(1),
-                &TestRecord {
-                    name: "one".to_owned(),
-                    tags: Vec::new(),
-                },
-            )
-            .unwrap();
-        write
-            .put(
-                &TestKey(2),
-                &TestRecord {
-                    name: "two".to_owned(),
-                    tags: Vec::new(),
-                },
-            )
-            .unwrap();
-        write.commit().unwrap();
+        let mut write = db.write().await;
+        {
+            let mut table = write.open_table(ITEMS);
+            table
+                .insert(
+                    &Sen(TestKey(1)),
+                    Sen(TestRecord {
+                        name: "one".to_owned(),
+                        tags: Vec::new(),
+                    }),
+                )
+                .unwrap();
+            table
+                .insert(
+                    &Sen(TestKey(2)),
+                    Sen(TestRecord {
+                        name: "two".to_owned(),
+                        tags: Vec::new(),
+                    }),
+                )
+                .unwrap();
+        }
+        write.commit();
 
-        let read = db.read().unwrap();
-        let items = read
-            .iter::<TestKey>()
+        let read = db.read();
+        let table = read.open_table(ITEMS);
+        let items = table
+            .iter()
             .unwrap()
-            .collect::<Result<Vec<_>>>()
+            .map(|item| item.map(|(key, _)| key.value().0.0))
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(
-            items.iter().map(|(key, _)| key.0).collect::<Vec<_>>(),
-            [1, 2]
-        );
-
-        let mut range = read.range(TestKey(1)..=TestKey(2)).unwrap();
-        assert_eq!(range.next().unwrap().unwrap().0, TestKey(1));
-        assert_eq!(range.next_back().unwrap().unwrap().0, TestKey(2));
-        assert!(range.next().is_none());
+        assert_eq!(items, [1, 2]);
     }
 }
