@@ -759,15 +759,12 @@ impl Args {
 }
 
 fn prompt_text() -> StyledText {
-    StyledText::from(vec![
-        Span::new("◯\u{fe0e}", Style::default().fg(Color::Green).bold()),
-        Span::plain(" "),
-    ])
+    StyledText::from("> ")
 }
 
 fn user_message_block(text: &str) -> StyledBlock {
     StyledBlock::new(StyledText::from(vec![
-        Span::new("⬤\u{fe0e} ", Style::default().fg(Color::DarkCyan).bold()),
+        Span::new("▌ ", Style::default().bold()),
         Span::plain(text.to_owned()),
     ]))
 }
