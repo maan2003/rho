@@ -760,14 +760,14 @@ impl Args {
 
 fn prompt_text() -> StyledText {
     StyledText::from(vec![
-        Span::new("◯", Style::default().fg(Color::Green).bold()),
+        Span::new("◯\u{fe0e}", Style::default().fg(Color::Green).bold()),
         Span::plain(" "),
     ])
 }
 
 fn user_message_block(text: &str) -> StyledBlock {
     StyledBlock::new(StyledText::from(vec![
-        Span::new("⬤ ", Style::default().fg(Color::DarkCyan).bold()),
+        Span::new("⬤\u{fe0e} ", Style::default().fg(Color::DarkCyan).bold()),
         Span::plain(text.to_owned()),
     ]))
 }
