@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use rho_agent::{Agent, AgentStateKind};
 use rho_cli_term_raw::{
-    Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
+    BlockId, Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
 use rho_core::{
     ContextBlock, InferenceResponseItem, StreamingContextItem, StreamingContextItemState, ToolCall,
@@ -137,7 +137,7 @@ impl ChatApp {
     async fn run(&mut self) -> Result<()> {
         loop {
             self.reap_finished_turn().await;
-            match self.term.term.get_next_event()? {
+            match self.term.get_next_event()? {
                 Event::Line(line) => {
                     let line = line.trim().to_owned();
                     if line.is_empty() {
@@ -310,6 +310,7 @@ struct ChatTerm {
     term: Term,
     handle: TermHandle,
     renderer: UpdateRenderer,
+    completion_menu: Option<BlockId>,
 }
 
 impl ChatTerm {
@@ -324,6 +325,7 @@ impl ChatTerm {
             term,
             handle,
             renderer,
+            completion_menu: None,
         })
     }
 
@@ -357,7 +359,40 @@ impl ChatTerm {
         );
     }
 
-    fn clear_output(&self) {
+    fn get_next_event(&mut self) -> io::Result<Event> {
+        let event = self.term.get_next_event()?;
+        self.sync_completion_menu();
+        self.handle.redraw();
+        Ok(event)
+    }
+
+    fn sync_completion_menu(&mut self) {
+        match self.term.completion_state() {
+            Some(view) => {
+                let (width, height) = self.handle.size();
+                let block = completion::render_menu_block(&view, width, height);
+                let id = match self.completion_menu {
+                    Some(id) => id,
+                    None => {
+                        let id = self.handle.new_block("completion-menu", "");
+                        self.handle.push_suggestions(id);
+                        self.completion_menu = Some(id);
+                        id
+                    }
+                };
+                self.handle.set_block(id, block);
+            }
+            None => {
+                if let Some(id) = self.completion_menu.take() {
+                    self.handle.remove_suggestions(id);
+                    self.handle.remove_block(id);
+                }
+            }
+        }
+    }
+
+    fn clear_output(&mut self) {
+        self.completion_menu = None;
         self.handle.clear_output();
         self.handle.redraw();
     }

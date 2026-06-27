@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rho_cli_term_raw::Candidate;
+use rho_cli_term_raw::{Candidate, Color, CompletionView, Span, Style, StyledBlock, StyledText};
 
 use crate::slash_commands::slash_commands;
 
@@ -299,4 +299,75 @@ fn clamp_to_char_boundary(text: &str, cursor: usize) -> usize {
         cursor -= 1;
     }
     cursor
+}
+
+pub(crate) fn render_menu_block(
+    view: &CompletionView,
+    terminal_width: usize,
+    terminal_height: usize,
+) -> StyledBlock {
+    let max_rows = (terminal_height * 30 / 100).max(1);
+    let visible = visible_candidate_range(view, max_rows);
+    let max_label_width = view.candidates[visible.clone()]
+        .iter()
+        .map(|candidate| candidate.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut spans = Vec::new();
+    for (row, index) in visible.enumerate() {
+        if row > 0 {
+            spans.push(Span::plain("\n"));
+        }
+        let candidate = &view.candidates[index];
+        let is_selected = view.selected == Some(index);
+        let label = truncate_chars(&candidate.label, max_label_width.min(terminal_width));
+        let padding = max_label_width.saturating_sub(label.chars().count()) + 2;
+        let description_budget = terminal_width
+            .saturating_sub(4)
+            .saturating_sub(label.chars().count())
+            .saturating_sub(padding);
+        let description = truncate_chars(&candidate.description, description_budget);
+        if is_selected {
+            spans.push(Span::new(
+                format!("  {label}{:padding$}{description}  ", "", padding = padding),
+                Style::default().bg(Color::DarkGrey),
+            ));
+        } else {
+            spans.push(Span::plain("  "));
+            spans.push(Span::new(label, Style::default().fg(Color::Cyan)));
+            if !description.is_empty() {
+                spans.push(Span::plain(format!("{:padding$}", "", padding = padding)));
+                spans.push(Span::new(description, Style::default().fg(Color::DarkGrey)));
+            }
+            spans.push(Span::plain("  "));
+        }
+    }
+    StyledBlock::new(StyledText::from(spans))
+}
+
+fn visible_candidate_range(view: &CompletionView, max_rows: usize) -> std::ops::Range<usize> {
+    let total = view.candidates.len();
+    let max_rows = max_rows.max(1).min(total.max(1));
+    if total <= max_rows {
+        return 0..total;
+    }
+    let selected = view.selected.unwrap_or(0).min(total - 1);
+    let half = max_rows / 2;
+    let start = selected.saturating_sub(half).min(total - max_rows);
+    start..start + max_rows
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".to_owned();
+    }
+    let mut out = text.chars().take(max_chars - 1).collect::<String>();
+    out.push('…');
+    out
 }
