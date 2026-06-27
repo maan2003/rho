@@ -169,7 +169,7 @@ pub enum EnumDecodeError {
 /// let decoded: MyStruct = decode(&mut buf).unwrap();
 /// assert_eq!(value, decoded);
 /// ```
-pub fn decode<T: Decoder>(reader: &mut Bytes) -> Result<T> {
+pub fn decode<T: Decoder>(reader: &mut impl Buf) -> Result<T> {
     T::decode(reader)
 }
 
@@ -287,7 +287,7 @@ pub trait Decoder: Sized {
     ///
     /// # Arguments
     /// * `reader` - The buffer to read the encoded bytes from.
-    fn decode(reader: &mut Bytes) -> Result<Self>;
+    fn decode(reader: &mut impl Buf) -> Result<Self>;
 }
 
 /// Trait for types that can be unpacked from a compact binary format.
@@ -305,7 +305,7 @@ pub trait Unpacker: Sized {
     ///
     /// # Arguments
     /// * `reader` - The buffer to read the packed bytes from.
-    fn unpack(reader: &mut Bytes) -> Result<Self>;
+    fn unpack(reader: &mut impl Buf) -> Result<Self>;
 }
 
 /// Convenience function to pack a value to bytes.
@@ -390,6 +390,6 @@ pub fn pack_to<T: Packer>(value: &T, writer: &mut BytesMut) -> Result<()> {
 /// let decoded: MyStruct = unpack(&mut buf).unwrap();
 /// assert_eq!(value, decoded);
 /// ```
-pub fn unpack<T: Unpacker>(reader: &mut Bytes) -> Result<T> {
+pub fn unpack<T: Unpacker>(reader: &mut impl Buf) -> Result<T> {
     T::unpack(reader)
 }

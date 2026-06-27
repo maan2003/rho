@@ -797,7 +797,7 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
     if container_attrs.disable_encode {
         return TokenStream::from(quote! {
             impl #impl_generics senax_encoder::Decoder for #name #ty_generics #where_clause {
-                fn decode(_reader: &mut bytes::Bytes) -> senax_encoder::Result<Self> {
+                fn decode(_reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
                     unimplemented!("Decode trait is disabled for {}", stringify!(#name))
                 }
             }
@@ -1207,7 +1207,7 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
     };
 
     let decode_method = quote! {
-        fn decode(reader: &mut bytes::Bytes) -> senax_encoder::Result<Self> {
+        fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
             use bytes::{Buf, BufMut};
             #decode_fields
         }
@@ -1429,7 +1429,7 @@ pub fn derive_unpack(input: TokenStream) -> TokenStream {
     if container_attrs.disable_pack {
         return TokenStream::from(quote! {
             impl #impl_generics senax_encoder::Unpacker for #name #ty_generics #where_clause {
-                fn unpack(_reader: &mut bytes::Bytes) -> senax_encoder::Result<Self> {
+                fn unpack(_reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
                     unimplemented!("Unpack trait is disabled for {}", stringify!(#name))
                 }
             }
@@ -1612,7 +1612,7 @@ pub fn derive_unpack(input: TokenStream) -> TokenStream {
     };
 
     let unpack_method = quote! {
-        fn unpack(reader: &mut bytes::Bytes) -> senax_encoder::Result<Self> {
+        fn unpack(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
             use bytes::{Buf, BufMut};
             #unpack_fields
         }

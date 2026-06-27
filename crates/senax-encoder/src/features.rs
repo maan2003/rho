@@ -45,7 +45,7 @@ impl<T: Encoder + Eq + std::hash::Hash> Encoder for IndexSet<T> {
 }
 #[cfg(feature = "indexmap")]
 impl<T: Decoder + Eq + std::hash::Hash + 'static> Decoder for IndexSet<T> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::decode(reader)?;
         Ok(vec.into_iter().collect())
     }
@@ -62,7 +62,7 @@ impl<T: Packer + Eq + std::hash::Hash> Packer for IndexSet<T> {
 }
 #[cfg(feature = "indexmap")]
 impl<T: Unpacker + Eq + std::hash::Hash + 'static> Unpacker for IndexSet<T> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::unpack(reader)?;
         Ok(vec.into_iter().collect())
     }
@@ -88,7 +88,7 @@ impl<K: Encoder + Eq + std::hash::Hash, V: Encoder> Encoder for IndexMap<K, V> {
 }
 #[cfg(feature = "indexmap")]
 impl<K: Decoder + Eq + std::hash::Hash, V: Decoder> Decoder for IndexMap<K, V> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = IndexMap::with_capacity(len);
         for _ in 0..len {
@@ -114,7 +114,7 @@ impl<K: Packer + Eq + std::hash::Hash, V: Packer> Packer for IndexMap<K, V> {
 }
 #[cfg(feature = "indexmap")]
 impl<K: Unpacker + Eq + std::hash::Hash, V: Unpacker> Unpacker for IndexMap<K, V> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = IndexMap::with_capacity(len);
         for _ in 0..len {
@@ -146,7 +146,7 @@ impl Encoder for DateTime<Utc> {
 /// Decodes a `chrono::DateTime<Utc>` from the senax binary format.
 #[cfg(feature = "chrono")]
 impl Decoder for DateTime<Utc> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -188,7 +188,7 @@ impl Packer for DateTime<Utc> {
 /// Unpacks a `chrono::DateTime<Utc>` from the pack format.
 #[cfg(feature = "chrono")]
 impl Unpacker for DateTime<Utc> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -231,7 +231,7 @@ impl Encoder for DateTime<Local> {
 }
 #[cfg(feature = "chrono")]
 impl Decoder for DateTime<Local> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -275,7 +275,7 @@ impl Packer for DateTime<Local> {
 /// Unpacks a `chrono::DateTime<Local>` from the pack format.
 #[cfg(feature = "chrono")]
 impl Unpacker for DateTime<Local> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -321,7 +321,7 @@ impl Encoder for NaiveDate {
 }
 #[cfg(feature = "chrono")]
 impl Decoder for NaiveDate {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -343,7 +343,7 @@ impl Decoder for NaiveDate {
 }
 #[cfg(feature = "chrono")]
 impl Unpacker for NaiveDate {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -395,7 +395,7 @@ impl Encoder for NaiveTime {
 }
 #[cfg(feature = "chrono")]
 impl Decoder for NaiveTime {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -419,7 +419,7 @@ impl Decoder for NaiveTime {
 }
 #[cfg(feature = "chrono")]
 impl Unpacker for NaiveTime {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -474,7 +474,7 @@ impl Encoder for NaiveDateTime {
 
 #[cfg(feature = "chrono")]
 impl Decoder for NaiveDateTime {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -516,7 +516,7 @@ impl Packer for NaiveDateTime {
 
 #[cfg(feature = "chrono")]
 impl Unpacker for NaiveDateTime {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -572,7 +572,7 @@ impl Decoder for Decimal {
     /// - New string format (TAG_STRING_BASE..TAG_STRING_LONG)
     /// - Legacy binary format (TAG_DECIMAL + mantissa + scale)
     /// - i128 cross-decode (TAG_ZERO..TAG_U128, TAG_NEGATIVE)
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -615,7 +615,7 @@ impl Decoder for Decimal {
 }
 #[cfg(feature = "rust_decimal")]
 impl Unpacker for Decimal {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -646,7 +646,7 @@ impl Decoder for BigDecimal {
     /// This decoder supports:
     /// - String format (TAG_STRING_BASE..TAG_STRING_LONG)
     /// - i128 cross-decode (TAG_ZERO..TAG_U128, TAG_NEGATIVE)
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -668,7 +668,7 @@ impl Decoder for BigDecimal {
 }
 #[cfg(feature = "bigdecimal")]
 impl Unpacker for BigDecimal {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -704,7 +704,7 @@ impl Packer for Uuid {
 }
 #[cfg(feature = "uuid")]
 impl Decoder for Uuid {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -724,7 +724,7 @@ impl Decoder for Uuid {
 }
 #[cfg(feature = "uuid")]
 impl Unpacker for Uuid {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -777,7 +777,7 @@ impl Packer for Ulid {
 }
 #[cfg(feature = "ulid")]
 impl Decoder for Ulid {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -797,7 +797,7 @@ impl Decoder for Ulid {
 }
 #[cfg(feature = "ulid")]
 impl Unpacker for Ulid {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -893,7 +893,7 @@ impl Packer for Value {
 
 #[cfg(feature = "serde_json")]
 impl Decoder for Value {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -965,7 +965,7 @@ impl Decoder for Value {
 
 #[cfg(feature = "serde_json")]
 impl Unpacker for Value {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -1003,7 +1003,7 @@ impl<K: Packer + Eq + std::hash::Hash, V: Packer> Packer for FxHashMap<K, V> {
 }
 #[cfg(feature = "fxhash")]
 impl<K: Decoder + Eq + std::hash::Hash, V: Decoder> Decoder for FxHashMap<K, V> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = FxHashMap::with_capacity_and_hasher(len, Default::default());
         for _ in 0..len {
@@ -1016,7 +1016,7 @@ impl<K: Decoder + Eq + std::hash::Hash, V: Decoder> Decoder for FxHashMap<K, V> 
 }
 #[cfg(feature = "fxhash")]
 impl<K: Unpacker + Eq + std::hash::Hash, V: Unpacker> Unpacker for FxHashMap<K, V> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = FxHashMap::with_capacity_and_hasher(len, Default::default());
         for _ in 0..len {
@@ -1061,7 +1061,7 @@ impl<K: Packer + Eq + std::hash::Hash, V: Packer> Packer for AHashMap<K, V> {
 }
 #[cfg(feature = "ahash")]
 impl<K: Decoder + Eq + std::hash::Hash, V: Decoder> Decoder for AHashMap<K, V> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = AHashMap::with_capacity(len);
         for _ in 0..len {
@@ -1074,7 +1074,7 @@ impl<K: Decoder + Eq + std::hash::Hash, V: Decoder> Decoder for AHashMap<K, V> {
 }
 #[cfg(feature = "ahash")]
 impl<K: Unpacker + Eq + std::hash::Hash, V: Unpacker> Unpacker for AHashMap<K, V> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = AHashMap::with_capacity(len);
         for _ in 0..len {
@@ -1113,14 +1113,14 @@ impl<T: Packer + Eq + std::hash::Hash> Packer for FxHashSet<T> {
 }
 #[cfg(feature = "fxhash")]
 impl<T: Decoder + Eq + std::hash::Hash + 'static> Decoder for FxHashSet<T> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::decode(reader)?;
         Ok(vec.into_iter().collect())
     }
 }
 #[cfg(feature = "fxhash")]
 impl<T: Unpacker + Eq + std::hash::Hash + 'static> Unpacker for FxHashSet<T> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::unpack(reader)?;
         Ok(vec.into_iter().collect())
     }
@@ -1153,14 +1153,14 @@ impl<T: Packer + Eq + std::hash::Hash> Packer for AHashSet<T> {
 }
 #[cfg(feature = "ahash")]
 impl<T: Decoder + Eq + std::hash::Hash + 'static> Decoder for AHashSet<T> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::decode(reader)?;
         Ok(vec.into_iter().collect())
     }
 }
 #[cfg(feature = "ahash")]
 impl<T: Unpacker + Eq + std::hash::Hash + 'static> Unpacker for AHashSet<T> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::unpack(reader)?;
         Ok(vec.into_iter().collect())
     }
@@ -1196,7 +1196,7 @@ impl Packer for SmolStr {
 }
 #[cfg(feature = "smol_str")]
 impl Decoder for SmolStr {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -1224,7 +1224,7 @@ impl Decoder for SmolStr {
 }
 #[cfg(feature = "smol_str")]
 impl Unpacker for SmolStr {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -1260,7 +1260,7 @@ impl Packer for Box<RawValue> {
 
 #[cfg(feature = "raw_value")]
 impl Decoder for Box<RawValue> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -1289,7 +1289,7 @@ impl Decoder for Box<RawValue> {
 
 #[cfg(feature = "raw_value")]
 impl Unpacker for Box<RawValue> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }

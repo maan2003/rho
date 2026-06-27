@@ -97,7 +97,7 @@ impl Packer for bool {
 /// # Errors
 /// Returns an error if the tag is not `TAG_ZERO` or `TAG_ONE`.
 impl Decoder for bool {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -118,7 +118,7 @@ impl Decoder for bool {
 /// 0 is interpreted as `false`, any non-zero value is interpreted as `true`.
 /// No error checking is performed for invalid values.
 impl Unpacker for bool {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -134,7 +134,7 @@ impl Unpacker for bool {
 /// # Errors
 /// Returns an error if the tag is not valid for a `u8`.
 #[inline]
-fn decode_u8_from_tag(tag: u8, reader: &mut Bytes) -> Result<u8> {
+fn decode_u8_from_tag(tag: u8, reader: &mut impl Buf) -> Result<u8> {
     if (TAG_ZERO..=TAG_U8_127).contains(&tag) {
         Ok(tag - TAG_ZERO)
     } else if tag == TAG_U8 {
@@ -154,7 +154,7 @@ fn decode_u8_from_tag(tag: u8, reader: &mut Bytes) -> Result<u8> {
 }
 /// Decodes a `u16` value from a tag and buffer.
 /// Used internally for compact integer decoding.
-fn decode_u16_from_tag(tag: u8, reader: &mut Bytes) -> Result<u16> {
+fn decode_u16_from_tag(tag: u8, reader: &mut impl Buf) -> Result<u16> {
     if (TAG_ZERO..=TAG_U8_127).contains(&tag) {
         Ok((tag - TAG_ZERO) as u16)
     } else if tag == TAG_U8 {
@@ -177,7 +177,7 @@ fn decode_u16_from_tag(tag: u8, reader: &mut Bytes) -> Result<u16> {
 /// Decodes a `u32` value from a tag and buffer.
 /// Used internally for compact integer decoding.
 #[inline]
-fn decode_u32_from_tag(tag: u8, reader: &mut Bytes) -> Result<u32> {
+fn decode_u32_from_tag(tag: u8, reader: &mut impl Buf) -> Result<u32> {
     if (TAG_ZERO..=TAG_U8_127).contains(&tag) {
         Ok((tag - TAG_ZERO) as u32)
     } else if tag == TAG_U8 {
@@ -205,7 +205,7 @@ fn decode_u32_from_tag(tag: u8, reader: &mut Bytes) -> Result<u32> {
 /// Decodes a `u64` value from a tag and buffer.
 /// Used internally for compact integer decoding.
 #[inline]
-fn decode_u64_from_tag(tag: u8, reader: &mut Bytes) -> Result<u64> {
+fn decode_u64_from_tag(tag: u8, reader: &mut impl Buf) -> Result<u64> {
     if (TAG_ZERO..=TAG_U8_127).contains(&tag) {
         Ok((tag - TAG_ZERO) as u64)
     } else if tag == TAG_U8 {
@@ -237,7 +237,7 @@ fn decode_u64_from_tag(tag: u8, reader: &mut Bytes) -> Result<u64> {
 }
 /// Decodes a `u128` value from a tag and buffer.
 /// Used internally for compact integer decoding.
-fn decode_u128_from_tag(tag: u8, reader: &mut Bytes) -> Result<u128> {
+fn decode_u128_from_tag(tag: u8, reader: &mut impl Buf) -> Result<u128> {
     if (TAG_ZERO..=TAG_U8_127).contains(&tag) {
         Ok((tag - TAG_ZERO) as u128)
     } else if tag == TAG_U8 {
@@ -305,7 +305,7 @@ impl Packer for u8 {
 
 /// Decodes a `u8` from the compact format.
 impl Decoder for u8 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -315,7 +315,7 @@ impl Decoder for u8 {
 }
 
 impl Unpacker for u8 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -350,7 +350,7 @@ impl Packer for u16 {
 }
 
 impl Decoder for u16 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -360,7 +360,7 @@ impl Decoder for u16 {
 }
 
 impl Unpacker for u16 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -395,7 +395,7 @@ impl Packer for u32 {
 
 /// Decodes a `u32` from the compact format.
 impl Decoder for u32 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -405,7 +405,7 @@ impl Decoder for u32 {
 }
 
 impl Unpacker for u32 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -444,7 +444,7 @@ impl Packer for u64 {
 
 /// Decodes a `u64` from the compact format.
 impl Decoder for u64 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -454,7 +454,7 @@ impl Decoder for u64 {
 }
 
 impl Unpacker for u64 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -495,7 +495,7 @@ impl Packer for u128 {
 }
 
 impl Decoder for u128 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -505,7 +505,7 @@ impl Decoder for u128 {
 }
 
 impl Unpacker for u128 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -542,7 +542,7 @@ impl Packer for usize {
 }
 
 impl Decoder for usize {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -560,7 +560,7 @@ impl Decoder for usize {
 }
 
 impl Unpacker for usize {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -598,7 +598,7 @@ impl Packer for i8 {
 /// # Errors
 /// Returns an error if the tag is not valid for an `i8`.
 impl Decoder for i8 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -623,7 +623,7 @@ impl Decoder for i8 {
 }
 
 impl Unpacker for i8 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -654,7 +654,7 @@ impl Packer for i16 {
 }
 
 impl Decoder for i16 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -679,7 +679,7 @@ impl Decoder for i16 {
 }
 
 impl Unpacker for i16 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -707,7 +707,7 @@ impl Packer for i32 {
 }
 
 impl Decoder for i32 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -732,7 +732,7 @@ impl Decoder for i32 {
 }
 
 impl Unpacker for i32 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -761,7 +761,7 @@ impl Packer for i64 {
 }
 
 impl Decoder for i64 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -786,7 +786,7 @@ impl Decoder for i64 {
 }
 
 impl Unpacker for i64 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -815,7 +815,7 @@ impl Packer for i128 {
 }
 
 impl Decoder for i128 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -840,7 +840,7 @@ impl Decoder for i128 {
 }
 
 impl Unpacker for i128 {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -875,7 +875,7 @@ impl Packer for isize {
 }
 
 impl Decoder for isize {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -892,7 +892,7 @@ impl Decoder for isize {
 }
 
 impl Unpacker for isize {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -921,7 +921,7 @@ impl Packer for char {
 /// # Errors
 /// Returns an error if the code point is not a valid Unicode scalar value.
 impl Decoder for char {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let code_point = u32::decode(reader)?;
         char::from_u32(code_point).ok_or_else(|| {
             EncoderError::Decode(format!("Invalid Unicode code point: {}", code_point))
@@ -930,7 +930,7 @@ impl Decoder for char {
 }
 
 impl Unpacker for char {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -971,7 +971,7 @@ impl Packer for f32 {
 /// - Legacy binary format (TAG_F32, TAG_F64)
 /// - i128 cross-decode (TAG_ZERO..TAG_U128, TAG_NEGATIVE)
 impl Decoder for f32 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -1020,7 +1020,7 @@ impl Decoder for f32 {
 
 impl Unpacker for f32 {
     /// Unpacks an `f32` from either TAG_NONE (0.0) or TAG_F32 + 4 bytes (little-endian IEEE 754).
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -1078,7 +1078,7 @@ impl Packer for f64 {
 /// - Legacy binary format (TAG_F64)
 /// - i128 cross-decode (TAG_ZERO..TAG_U128, TAG_NEGATIVE)
 impl Decoder for f64 {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -1120,7 +1120,7 @@ impl Decoder for f64 {
 
 impl Unpacker for f64 {
     /// Unpacks an `f64` from either TAG_NONE (0.0) or TAG_F64 + 8 bytes (little-endian IEEE 754).
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -1174,7 +1174,7 @@ impl Packer for String {
 
 /// Decodes a `String` from the senax binary format.
 impl Decoder for String {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -1201,7 +1201,7 @@ impl Decoder for String {
 }
 
 impl Unpacker for String {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Self::decode(reader)
     }
 }
@@ -1244,7 +1244,7 @@ impl<T: Packer> Packer for Option<T> {
 
 /// Decodes an `Option<T>` from the senax binary format.
 impl<T: Decoder> Decoder for Option<T> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData); // Not even a tag
         }
@@ -1261,7 +1261,7 @@ impl<T: Decoder> Decoder for Option<T> {
 }
 
 impl<T: Unpacker> Unpacker for Option<T> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData); // Not even a tag
         }
@@ -1306,7 +1306,7 @@ impl<T: Packer + 'static> Packer for Vec<T> {
 
 /// Decodes a `Vec<T>` from the senax binary format.
 impl<T: Decoder + 'static> Decoder for Vec<T> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let len = decode_vec_length(reader)?;
         let mut vec = Vec::with_capacity(len);
         for _ in 0..len {
@@ -1318,7 +1318,7 @@ impl<T: Decoder + 'static> Decoder for Vec<T> {
 
 impl<T: Unpacker + 'static> Unpacker for Vec<T> {
     /// Unpacks a `Vec<T>` from the compact format.
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let len = decode_vec_length(reader)?;
         let mut vec = Vec::with_capacity(len);
         for _ in 0..len {
@@ -1356,7 +1356,7 @@ impl<T: Packer, const N: usize> Packer for [T; N] {
 
 /// Decodes a fixed-size array from the senax binary format.
 impl<T: Decoder, const N: usize> Decoder for [T; N] {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let len = decode_vec_length(reader)?;
         if len != N {
             return Err(EncoderError::Decode(format!(
@@ -1375,7 +1375,7 @@ impl<T: Decoder, const N: usize> Decoder for [T; N] {
 }
 
 impl<T: Unpacker, const N: usize> Unpacker for [T; N] {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let len = decode_vec_length(reader)?;
         if len != N {
             return Err(EncoderError::Decode(format!(
@@ -1424,7 +1424,7 @@ macro_rules! impl_tuple {
 
         impl Decoder for () {
 
-            fn decode(reader: &mut Bytes) -> Result<Self> {
+            fn decode(reader: &mut impl Buf) -> Result<Self> {
                 if reader.remaining() == 0 {
                     return Err(EncoderError::InsufficientData);
                 }
@@ -1442,7 +1442,7 @@ macro_rules! impl_tuple {
 
         impl Unpacker for () {
 
-            fn unpack(reader: &mut Bytes) -> Result<Self> {
+            fn unpack(reader: &mut impl Buf) -> Result<Self> {
                 if reader.remaining() == 0 {
                     return Err(EncoderError::InsufficientData);
                 }
@@ -1492,7 +1492,7 @@ macro_rules! impl_tuple {
 
         impl<$($T: Decoder),+> Decoder for ($($T,)+) {
 
-            fn decode(reader: &mut Bytes) -> Result<Self> {
+            fn decode(reader: &mut impl Buf) -> Result<Self> {
                 if reader.remaining() == 0 {
                     return Err(EncoderError::InsufficientData);
                 }
@@ -1513,7 +1513,7 @@ macro_rules! impl_tuple {
 
         impl<$($T: Unpacker),+> Unpacker for ($($T,)+) {
 
-            fn unpack(reader: &mut Bytes) -> Result<Self> {
+            fn unpack(reader: &mut impl Buf) -> Result<Self> {
                 if reader.remaining() == 0 {
                     return Err(EncoderError::InsufficientData);
                 }
@@ -1588,7 +1588,7 @@ impl<K: Packer, V: Packer> Packer for HashMap<K, V> {
 
 /// Decodes a map from the senax binary format.
 impl<K: Decoder + Eq + std::hash::Hash, V: Decoder> Decoder for HashMap<K, V> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = HashMap::with_capacity(len);
         for _ in 0..len {
@@ -1601,7 +1601,7 @@ impl<K: Decoder + Eq + std::hash::Hash, V: Decoder> Decoder for HashMap<K, V> {
 }
 
 impl<K: Unpacker + Eq + std::hash::Hash, V: Unpacker> Unpacker for HashMap<K, V> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = HashMap::with_capacity(len);
         for _ in 0..len {
@@ -1624,7 +1624,7 @@ pub fn write_u32_le(writer: &mut BytesMut, value: u32) -> Result<()> {
 /// Reads a `u32` in little-endian format without a tag.
 ///
 /// This is used internally for struct/enum field/variant IDs.
-pub fn read_u32_le(reader: &mut Bytes) -> Result<u32> {
+pub fn read_u32_le(reader: &mut impl Buf) -> Result<u32> {
     if reader.remaining() < 4 {
         return Err(EncoderError::InsufficientData);
     }
@@ -1642,7 +1642,7 @@ pub fn write_u64_le(writer: &mut BytesMut, value: u64) -> Result<()> {
 /// Reads a `u64` in little-endian format without a tag.
 ///
 /// This is used internally for struct/enum field/variant IDs.
-pub fn read_u64_le(reader: &mut Bytes) -> Result<u64> {
+pub fn read_u64_le(reader: &mut impl Buf) -> Result<u64> {
     if reader.remaining() < 8 {
         return Err(EncoderError::InsufficientData);
     }
@@ -1655,7 +1655,7 @@ pub fn read_u64_le(reader: &mut Bytes) -> Result<u64> {
 ///
 /// # Errors
 /// Returns an error if the value cannot be skipped (e.g., insufficient data).
-pub fn skip_value(reader: &mut Bytes) -> Result<()> {
+pub fn skip_value(reader: &mut impl Buf) -> Result<()> {
     if reader.remaining() == 0 {
         return Err(EncoderError::InsufficientData);
     }
@@ -1935,14 +1935,14 @@ impl<T: Packer + Eq + std::hash::Hash> Packer for HashSet<T> {
 
 /// Decodes a set from the senax binary format.
 impl<T: Decoder + Eq + std::hash::Hash + 'static> Decoder for HashSet<T> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::decode(reader)?;
         Ok(vec.into_iter().collect())
     }
 }
 
 impl<T: Unpacker + Eq + std::hash::Hash + 'static> Unpacker for HashSet<T> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::unpack(reader)?;
         Ok(vec.into_iter().collect())
     }
@@ -1973,14 +1973,14 @@ impl<T: Packer + Ord> Packer for BTreeSet<T> {
 }
 
 impl<T: Decoder + Ord + 'static> Decoder for BTreeSet<T> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::decode(reader)?;
         Ok(vec.into_iter().collect())
     }
 }
 
 impl<T: Unpacker + Ord + 'static> Unpacker for BTreeSet<T> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let vec: Vec<T> = Vec::unpack(reader)?;
         Ok(vec.into_iter().collect())
     }
@@ -2017,7 +2017,7 @@ impl<K: Packer + Ord, V: Packer> Packer for BTreeMap<K, V> {
 }
 
 impl<K: Decoder + Ord, V: Decoder> Decoder for BTreeMap<K, V> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = BTreeMap::new();
         for _ in 0..len {
@@ -2030,7 +2030,7 @@ impl<K: Decoder + Ord, V: Decoder> Decoder for BTreeMap<K, V> {
 }
 
 impl<K: Unpacker + Ord, V: Unpacker> Unpacker for BTreeMap<K, V> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         let len = read_map_header(reader)?;
         let mut map = BTreeMap::new();
         for _ in 0..len {
@@ -2068,7 +2068,7 @@ impl Packer for Bytes {
 }
 
 impl Decoder for Bytes {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -2090,12 +2090,12 @@ impl Decoder for Bytes {
             return Err(EncoderError::InsufficientData);
         }
 
-        Ok(reader.split_to(len))
+        Ok(reader.copy_to_bytes(len))
     }
 }
 
 impl Unpacker for Bytes {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
         }
@@ -2117,7 +2117,7 @@ impl Unpacker for Bytes {
             return Err(EncoderError::InsufficientData);
         }
 
-        Ok(reader.split_to(len))
+        Ok(reader.copy_to_bytes(len))
     }
 }
 
@@ -2141,13 +2141,13 @@ impl<T: Packer> Packer for Arc<T> {
 
 /// Decodes an `Arc<T>` by decoding the inner value and wrapping it in an Arc.
 impl<T: Decoder> Decoder for Arc<T> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         Ok(Arc::new(T::decode(reader)?))
     }
 }
 
 impl<T: Unpacker> Unpacker for Arc<T> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Ok(Arc::new(T::unpack(reader)?))
     }
 }
@@ -2173,7 +2173,7 @@ pub fn write_field_id_optimized(writer: &mut BytesMut, field_id: u64) -> Result<
 /// Reads a field ID using optimized encoding.
 ///
 /// Returns Ok(0) for terminator, Ok(field_id) for valid field ID.
-pub fn read_field_id_optimized(reader: &mut Bytes) -> Result<u64> {
+pub fn read_field_id_optimized(reader: &mut impl Buf) -> Result<u64> {
     if reader.remaining() == 0 {
         return Err(EncoderError::InsufficientData);
     }
@@ -2232,13 +2232,13 @@ impl<T: Packer> Packer for Box<T> {
 
 /// Decodes a `Box<T>` by decoding the inner value and wrapping it in a Box.
 impl<T: Decoder> Decoder for Box<T> {
-    fn decode(reader: &mut Bytes) -> Result<Self> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
         Ok(Box::new(T::decode(reader)?))
     }
 }
 
 impl<T: Unpacker> Unpacker for Box<T> {
-    fn unpack(reader: &mut Bytes) -> Result<Self> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
         Ok(Box::new(T::unpack(reader)?))
     }
 }
@@ -2259,7 +2259,7 @@ pub(crate) fn encode_vec_length(len: usize, writer: &mut BytesMut) -> Result<()>
 
 /// Decodes the length for array/vec/set format.
 #[inline(never)]
-pub(crate) fn decode_vec_length(reader: &mut Bytes) -> Result<usize> {
+pub(crate) fn decode_vec_length(reader: &mut impl Buf) -> Result<usize> {
     if reader.remaining() == 0 {
         return Err(EncoderError::InsufficientData);
     }
@@ -2281,7 +2281,7 @@ pub(crate) fn decode_vec_length(reader: &mut Bytes) -> Result<usize> {
 /// This helper function is used by all map-like types (HashMap, BTreeMap, etc.)
 /// to avoid code duplication in decode/unpack implementations.
 #[inline(never)]
-pub(crate) fn read_map_header(reader: &mut Bytes) -> Result<usize> {
+pub(crate) fn read_map_header(reader: &mut impl Buf) -> Result<usize> {
     if reader.remaining() == 0 {
         return Err(EncoderError::InsufficientData);
     }
