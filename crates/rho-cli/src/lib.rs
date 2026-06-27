@@ -27,6 +27,7 @@ use rho_inference::{AuthArgs, InferenceAuth, run_auth_cli};
 use tokio::task::JoinHandle;
 
 mod completion;
+mod markdown;
 mod slash_commands;
 mod tool_render;
 
@@ -34,6 +35,7 @@ mod tool_render;
 mod tests;
 
 use completion::completion_candidates;
+use markdown::markdown_block;
 use slash_commands::SlashCommand;
 use tool_render::{ToolRenderStatus, tool_call_block, tool_result_block, tool_status_label};
 
@@ -351,8 +353,7 @@ impl ChatTerm {
                 Span::plain(
                     "\nTau-compatible commands complete but may report unavailable in rho.\n",
                 ),
-            ]))
-            .margin_left(1),
+            ])),
         );
     }
 
@@ -393,8 +394,7 @@ impl ChatTerm {
                                     tool_status_label(&result.body.status),
                                     Style::default().fg(Color::DarkGrey),
                                 ),
-                            ]))
-                            .margin_left(1),
+                            ])),
                         );
                     }
                 }
@@ -407,7 +407,7 @@ impl ChatTerm {
             InferenceResponseItem::AssistantMessage { content, .. } => {
                 self.handle.print_output(
                     "history-message",
-                    message_block("assistant", text_content(content)),
+                    assistant_message_block(&text_content(content)),
                 );
             }
             InferenceResponseItem::ToolCall {
@@ -440,8 +440,7 @@ fn print_system_on_handle(handle: &TermHandle, text: &str) {
         StyledBlock::new(StyledText::from(Span::new(
             text.to_owned(),
             Style::default().fg(Color::DarkGrey),
-        )))
-        .margin_left(1),
+        ))),
     );
 }
 
@@ -615,11 +614,7 @@ impl StreamingRenderer {
     }
 
     fn render_assistant(&mut self) {
-        let block = StyledBlock::new(StyledText::from(vec![
-            Span::new("assistant\n", Style::default().fg(Color::Green).bold()),
-            Span::plain(self.assistant_text.clone()),
-        ]))
-        .margin_left(1);
+        let block = assistant_message_block(&self.assistant_text);
         self.set_active_block(ActiveBlock::Assistant, "assistant", block);
     }
 
@@ -630,8 +625,7 @@ impl StreamingRenderer {
                 self.thinking_text.clone(),
                 Style::default().fg(Color::DarkGrey),
             ),
-        ]))
-        .margin_left(1);
+        ]));
         self.set_active_block(ActiveBlock::Thinking, "thinking", block);
     }
 
@@ -668,8 +662,7 @@ impl StreamingRenderer {
             StyledBlock::new(StyledText::from(Span::new(
                 text.to_owned(),
                 Style::default().fg(Color::DarkGrey),
-            )))
-            .margin_left(1),
+            ))),
         );
     }
 
@@ -777,27 +770,10 @@ fn user_message_block(text: &str) -> StyledBlock {
         Span::new("⬤ ", Style::default().fg(Color::DarkCyan).bold()),
         Span::plain(text.to_owned()),
     ]))
-    .margin_left(1)
 }
 
-fn message_block(label: &'static str, text: String) -> StyledBlock {
-    StyledBlock::new(StyledText::from(vec![
-        Span::new(
-            format!("{label}\n"),
-            Style::default().fg(role_color(label)).bold(),
-        ),
-        Span::plain(text),
-    ]))
-    .margin_left(1)
-}
-
-fn role_color(label: &str) -> Color {
-    match label {
-        "you" => Color::DarkCyan,
-        "assistant" => Color::Green,
-        "system" | "developer" => Color::DarkGrey,
-        _ => Color::White,
-    }
+fn assistant_message_block(text: &str) -> StyledBlock {
+    markdown_block(text)
 }
 
 fn truncate_display(text: &str, max_chars: usize) -> String {

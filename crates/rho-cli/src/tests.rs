@@ -56,6 +56,26 @@ fn slash_command_parse_known_and_unknown() {
 }
 
 #[test]
+fn markdown_renderer_styles_common_markdown() {
+    let rendered = markdown::markdown_text("# Title\nhello `code` and **bold**");
+    let spans = rendered.spans();
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.text == "Title" && span.style.bold)
+    );
+    assert!(
+        spans.iter().any(|span| span.text == "code"
+            && span.style.fg == Some(rho_cli_term_raw::Color::DarkYellow))
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.text == "bold" && span.style.bold)
+    );
+}
+
+#[test]
 fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
     let (_term, handle, _input) = Term::new_virtual(
         80,

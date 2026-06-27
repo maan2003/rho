@@ -22,15 +22,15 @@ pub(crate) fn tool_call_block(
     }
     match status {
         ToolRenderStatus::Running => spans.push(Span::new(
-            " running",
+            " running 0s",
             Style::default().fg(Color::DarkYellow),
         )),
         ToolRenderStatus::Done(status) => spans.push(Span::new(
-            format!(" {}", tool_status_label(&status)),
+            format!(" {} 0s", tool_status_label(&status)),
             Style::default().fg(tool_status_color(&status)),
         )),
     }
-    StyledBlock::new(StyledText::from(spans)).margin_left(1)
+    StyledBlock::new(StyledText::from(spans))
 }
 
 pub(crate) fn tool_result_block(
