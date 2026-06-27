@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use rho_agent::{Agent, AgentStateKind};
@@ -113,9 +113,7 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
 }
 
 fn rho_db_path() -> Result<std::path::PathBuf> {
-    let base = dirs::state_dir()
-        .or_else(dirs::data_local_dir)
-        .unwrap_or(std::env::current_dir()?);
+    let base = dirs::state_dir().ok_or_else(|| anyhow!("state directory not available"))?;
     Ok(base.join("rho").join("rho.redb"))
 }
 
