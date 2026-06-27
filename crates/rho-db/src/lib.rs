@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use tokio::fs;
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -153,7 +153,7 @@ fn decode<T>(bytes: &[u8]) -> Result<T>
 where
     T: senax_encoder::Encoder + senax_encoder::Decoder,
 {
-    let mut bytes = Bytes::copy_from_slice(bytes);
+    let mut bytes = bytes;
     T::decode(&mut bytes).map_err(anyhow::Error::from)
 }
 
