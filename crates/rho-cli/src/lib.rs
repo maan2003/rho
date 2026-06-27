@@ -22,7 +22,7 @@ use rho_core::{
     ToolOutputStatus, ToolResult, text_content,
 };
 use rho_inference::config::InferenceConfig;
-use rho_inference::{AuthArgs, InferenceAuth, InferenceSession, run_auth_cli};
+use rho_inference::{AuthArgs, InferenceAuth, InferenceSession, PromptCacheKey, run_auth_cli};
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
@@ -115,7 +115,11 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
 fn build_inference_session(args: &ChatArgs) -> Result<InferenceSession> {
     let auth = InferenceAuth::named(&args.auth)?;
     let config = InferenceConfig::deep().protect();
-    Ok(InferenceSession::new(auth, config, None))
+    Ok(InferenceSession::new(
+        auth,
+        config,
+        PromptCacheKey::generate(),
+    ))
 }
 
 struct ChatApp {

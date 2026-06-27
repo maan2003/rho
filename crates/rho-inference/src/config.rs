@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use senax_encoder::{Decode, Encode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -33,10 +32,6 @@ pub enum TextVerbosity {
 pub enum AutoCompaction {
     Threshold(u64),
 }
-
-// Incrementing, it is a property of do two agents share the cache or not.
-#[derive(Clone, Copy, Debug, Decode, Deserialize, Encode, Eq, Hash, PartialEq, Serialize)]
-pub struct PromptCacheKey(pub u64);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Gpt5Model(pub Cow<'static, str>);

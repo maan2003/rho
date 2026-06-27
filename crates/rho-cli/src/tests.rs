@@ -18,11 +18,11 @@ fn chat_args() -> ChatArgs {
 }
 
 #[test]
-fn cli_inference_session_has_no_prompt_cache_key() {
+fn cli_inference_session_has_prompt_cache_key() {
     let args = chat_args();
     let service = build_inference_session(&args).unwrap();
 
-    assert!(service.prompt_cache_key().is_none());
+    let _ = service.prompt_cache_key();
 }
 
 fn test_call() -> ToolCall {

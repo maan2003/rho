@@ -16,7 +16,7 @@ mod wire;
 mod ws;
 
 pub use oauth::InferenceAuth;
-pub use session::InferenceSession;
+pub use session::{InferenceSession, PromptCacheKey};
 
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub(crate) const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";

@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use rho_core::{InferenceEvent, InferenceRequest};
+use senax_encoder::{Decode, Encode};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -12,6 +13,34 @@ use super::oauth::InferenceAuth;
 use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{self, WebSocketConnection};
 use crate::config::InferenceProtectedConfig;
+
+#[derive(
+    Clone, Copy, Debug, Decode, Encode, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
+pub struct PromptCacheKey([u8; 8]);
+
+impl PromptCacheKey {
+    pub fn generate() -> Self {
+        let mut bytes = [0; 8];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+        Self(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_bytes(bytes: [u8; 8]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn to_wire_string(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(16);
+        for byte in self.0 {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+}
 
 /// A turn that has been requested and is being driven by `run`.
 struct Turn {
@@ -41,14 +70,14 @@ pub struct InferenceSession {
     pub(crate) base_url: String,
     pub(crate) auth: InferenceAuth,
     pub(crate) config: InferenceProtectedConfig,
-    pub(crate) prompt_cache_key: Option<String>,
+    pub(crate) prompt_cache_key: PromptCacheKey,
 }
 
 impl InferenceSession {
     pub fn new(
         auth: InferenceAuth,
         config: InferenceProtectedConfig,
-        prompt_cache_key: Option<String>,
+        prompt_cache_key: PromptCacheKey,
     ) -> Self {
         Self {
             connection: None,
@@ -61,8 +90,8 @@ impl InferenceSession {
         }
     }
 
-    pub fn prompt_cache_key(&self) -> Option<&str> {
-        self.prompt_cache_key.as_deref()
+    pub fn prompt_cache_key(&self) -> PromptCacheKey {
+        self.prompt_cache_key
     }
 
     pub fn config(&self) -> &InferenceProtectedConfig {
@@ -272,7 +301,7 @@ impl InferenceSession {
                 .turn
                 .as_ref()
                 .and_then(|turn| turn.pending_send.as_ref())
-                .and_then(|body| body.prompt_cache_key.clone());
+                .map(|body| body.prompt_cache_key.clone());
             let request = ws::build_ws_request(self, thread_id.as_deref(), &resolved)?;
             let (socket, _response) = connect_async(request).await?;
             self.connection = Some(WebSocketConnection::new(socket, &resolved));

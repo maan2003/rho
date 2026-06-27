@@ -25,7 +25,12 @@ fn opaque(tag: &str, payload: Value) -> OpaqueProviderData {
 #[test]
 fn builds_responses_request_with_tools_and_item_timeline() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = test_inference_service_with(auth, "gpt-test", Some("cache-key".to_owned()), None);
+    let session = test_inference_service_with(
+        auth,
+        "gpt-test",
+        PromptCacheKey::from_bytes(*b"cachekey"),
+        None,
+    );
     let request = inference_request(
         vec![
             user_block("hello"),
@@ -68,7 +73,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     assert_eq!(json["reasoning"]["effort"], "medium");
     assert_eq!(json["text"]["verbosity"], "medium");
     assert_eq!(json["service_tier"], "default");
-    assert_eq!(json["prompt_cache_key"], "cache-key");
+    assert_eq!(json["prompt_cache_key"], "63616368656b6579");
     assert_eq!(json["include"][0], "reasoning.encrypted_content");
 }
 
@@ -118,13 +123,18 @@ fn serializes_configured_reasoning_effort() {
 #[test]
 fn serializes_prompt_cache_key() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = test_inference_service_with(auth, "gpt-test", Some("cache-key".to_owned()), None);
+    let session = test_inference_service_with(
+        auth,
+        "gpt-test",
+        PromptCacheKey::from_bytes(*b"cachekey"),
+        None,
+    );
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
-    assert_eq!(json["prompt_cache_key"], "cache-key");
+    assert_eq!(json["prompt_cache_key"], "63616368656b6579");
 }
 
 #[test]
@@ -213,7 +223,12 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
     let (_temp, auth) = test_oauth_file("token", None);
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
-    let session = test_inference_service_with(auth, "gpt-test", None, None);
+    let session = test_inference_service_with(
+        auth,
+        "gpt-test",
+        PromptCacheKey::from_bytes(*b"testkey1"),
+        None,
+    );
     let body = ResponsesRequest::from_inference_request(&session, request);
     let json = serde_json::to_value(body).unwrap();
 
@@ -228,7 +243,7 @@ fn configured_compaction_threshold_overrides_provider_default() {
     let session = test_inference_service_with(
         auth,
         "gpt-test",
-        None,
+        PromptCacheKey::from_bytes(*b"testkey1"),
         Some(AutoCompaction::Threshold(42_000)),
     );
     let request = inference_request(vec![user_block("hello")], Vec::new());
@@ -248,7 +263,7 @@ fn chatgpt_codex_with_compaction_requests_configured_threshold() {
     let session = test_inference_service_with(
         auth,
         "gpt-test",
-        None,
+        PromptCacheKey::from_bytes(*b"testkey1"),
         Some(AutoCompaction::Threshold(232_560)),
     );
     let request = inference_request(vec![user_block("hello")], Vec::new());

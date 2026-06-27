@@ -4,7 +4,7 @@ use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
 use rho_core::ContextBlock;
 use rho_db::Sen;
-use rho_inference::config::PromptCacheKey;
+use rho_inference::PromptCacheKey;
 use senax_encoder::{Decode, Encode};
 
 pub const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");

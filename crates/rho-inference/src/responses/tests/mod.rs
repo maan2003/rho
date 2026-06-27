@@ -205,13 +205,13 @@ fn test_oauth_file(
 
 fn test_inference_service(model: impl Into<String>) -> InferenceSession {
     let (_temp, auth) = test_oauth_file("token", None);
-    test_inference_service_with(auth, model, None, None)
+    test_inference_service_with(auth, model, PromptCacheKey::from_bytes(*b"testkey0"), None)
 }
 
 fn test_inference_service_with(
     auth: InferenceAuth,
     model: impl Into<String>,
-    prompt_cache_key: Option<String>,
+    prompt_cache_key: PromptCacheKey,
     auto_compaction: Option<AutoCompaction>,
 ) -> InferenceSession {
     let config = InferenceConfig::Gpt5(Gpt5Config {
