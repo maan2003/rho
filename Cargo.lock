@@ -1270,6 +1270,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb-derive"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37e3e4a65184277f3fbc05f879a1729b2928845ff7b188739e14457b8e50ae89"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1304,9 +1315,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "bytes",
  "futures",
+ "redb",
+ "redb-derive",
  "rho-core",
+ "rho-db",
  "rho-tool-shell",
+ "senax-encoder",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1354,7 +1370,9 @@ name = "rho-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures",
+ "senax-encoder",
  "serde",
  "serde_json",
 ]

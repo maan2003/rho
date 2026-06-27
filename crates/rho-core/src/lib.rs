@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::future::BoxFuture;
+use senax_encoder::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -33,7 +34,7 @@ validated_string_type!(
     crate::util::validate_identifier
 );
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub enum ContextBlock {
     // intentionally limiting to prevent misuse
     UserMessage {
@@ -48,7 +49,7 @@ pub enum ContextBlock {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub enum InferenceResponseItem {
     AssistantMessage {
         content: Vec<ContentPart>,
@@ -73,12 +74,12 @@ pub enum InferenceResponseItem {
     Unknown(OpaqueProviderData),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub enum ContentPart {
     Text { text: String },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(rename_all = "snake_case")]
 pub enum MessagePhase {
     Commentary,
@@ -94,7 +95,7 @@ pub struct ToolSpec {
     pub format: Option<ToolFormat>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ToolCall {
     pub id: ToolCallId,
     pub name: ToolName,
@@ -103,14 +104,14 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub enum ToolOutputStatus {
     Success,
     Error,
     Cancelled,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct ToolOutput {
     /// Sent to the model verbatim.
     pub output: Arc<String>,
@@ -118,7 +119,7 @@ pub struct ToolOutput {
     pub status: ToolOutputStatus,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ToolResult {
     /// Matches the [`ToolCall`] this result answers.
     pub call_id: ToolCallId,
@@ -127,7 +128,7 @@ pub struct ToolResult {
     pub body: ToolOutput,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub enum ToolType {
     Function,
     Custom,
@@ -158,6 +159,26 @@ pub enum ToolFormat {
 pub struct OpaqueProviderData {
     pub tag: Arc<str>,
     pub data: Arc<str>,
+}
+
+impl senax_encoder::Encoder for OpaqueProviderData {
+    fn encode(&self, writer: &mut bytes::BytesMut) -> senax_encoder::Result<()> {
+        (self.tag.to_string(), self.data.to_string()).encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.tag.is_empty() && self.data.is_empty()
+    }
+}
+
+impl senax_encoder::Decoder for OpaqueProviderData {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        let (tag, data) = <(String, String)>::decode(reader)?;
+        Ok(Self {
+            tag: std::sync::Arc::from(tag),
+            data: std::sync::Arc::from(data),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

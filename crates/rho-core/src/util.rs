@@ -40,6 +40,23 @@ macro_rules! validated_string_type {
             }
         }
 
+        impl senax_encoder::Encoder for $name {
+            fn encode(&self, writer: &mut bytes::BytesMut) -> senax_encoder::Result<()> {
+                self.as_str().to_owned().encode(writer)
+            }
+
+            fn is_default(&self) -> bool {
+                self.as_str().is_empty()
+            }
+        }
+
+        impl senax_encoder::Decoder for $name {
+            fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+                let raw = String::decode(reader)?;
+                <$name>::try_from(raw).map_err(|error| senax_encoder::EncoderError::Decode(error.to_string()))
+            }
+        }
+
         impl AsRef<str> for $name {
             fn as_ref(&self) -> &str {
                 &self.0
