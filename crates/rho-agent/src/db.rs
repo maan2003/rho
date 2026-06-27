@@ -11,7 +11,6 @@ use rho_inference::config::InferenceConfig;
 use senax_encoder::{Decode, Encode};
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
-#[allow(dead_code)]
 const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentTimelineRef> =
     TableDefinition::new("lineage_parents");
 const AGENT_TIMELINE: TableDefinition<AgentTimelineRef, Sen<AgentTimelineEntry>> =
@@ -113,20 +112,42 @@ impl AgentReadTxnExt for ReadTxn {
 
     fn agent_blocks(&self, agent_id: AgentId) -> (AgentTimelineRef, Vec<Arc<ContextBlock>>) {
         let agent = self.get_agent(agent_id);
-        let start = AgentTimelineRef::root(agent.current_lineage);
-        let end = AgentTimelineRef {
-            lineage_id: agent.current_lineage,
-            seq: u32::MAX,
-        };
-        let mut next = start;
-        let blocks = self
-            .open_table(AGENT_TIMELINE)
-            .range(start..=end)
-            .map(|(key, value)| {
-                next = key.value().next();
-                Arc::new(value.value().0.context_block)
-            })
-            .collect();
+        let mut segments = Vec::new();
+        let mut lineage_id = agent.current_lineage;
+        let mut end_seq = u32::MAX;
+        let lineage_parents = self.open_table(LINEAGE_PARENTS);
+        loop {
+            segments.push((lineage_id, end_seq));
+            let Some(parent) = lineage_parents.get(&lineage_id) else {
+                break;
+            };
+            let parent = parent.value();
+            lineage_id = parent.lineage_id;
+            end_seq = parent.seq;
+        }
+        drop(lineage_parents);
+
+        let mut blocks = Vec::new();
+        let mut next = AgentTimelineRef::root(agent.current_lineage);
+        let timeline = self.open_table(AGENT_TIMELINE);
+        for (lineage_id, end_seq) in segments.into_iter().rev() {
+            let is_current_lineage = lineage_id == agent.current_lineage;
+            for (key, value) in timeline.range(
+                AgentTimelineRef::root(lineage_id)..=AgentTimelineRef {
+                    lineage_id,
+                    seq: end_seq,
+                },
+            ) {
+                let key = key.value();
+                if key.seq == end_seq && end_seq != u32::MAX {
+                    break;
+                }
+                if is_current_lineage {
+                    next = key.next();
+                }
+                blocks.push(Arc::new(value.value().0.context_block));
+            }
+        }
         (next, blocks)
     }
 }
@@ -141,6 +162,7 @@ impl AgentWriteTxnExt for WriteTxn {
     ) -> (AgentId, AgentTimelineRef) {
         let agent_id = AgentId(next_counter(self, CounterKey::LAST_AGENT_ID));
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
+        self.open_table(LINEAGE_PARENTS);
         let agent = AgentRecord {
             display_name,
             created_at: now,

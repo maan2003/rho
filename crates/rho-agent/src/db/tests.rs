@@ -96,3 +96,73 @@ async fn create_agent_and_append_blocks_with_cursor() {
         }
     );
 }
+
+#[tokio::test]
+async fn agent_blocks_read_lineage_parents() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    let (agent_id, next) = write.create_agent(
+        UnixMillis(1),
+        Some("main".to_owned()),
+        PromptCacheKey::generate(),
+        InferenceConfig::deep(),
+    );
+    let fork_at = write.append_agent_block(
+        next,
+        UnixMillis(2),
+        Arc::new(ContextBlock::UserMessage {
+            content: vec![ContentPart::Text {
+                text: "parent".to_owned(),
+            }],
+        }),
+    );
+    write.append_agent_block(
+        fork_at,
+        UnixMillis(3),
+        Arc::new(ContextBlock::UserMessage {
+            content: vec![ContentPart::Text {
+                text: "sibling".to_owned(),
+            }],
+        }),
+    );
+
+    let child_lineage = AgentLineageId(99);
+    {
+        write
+            .open_table(LINEAGE_PARENTS)
+            .insert(&child_lineage, &fork_at);
+    }
+    {
+        let mut agents = write.open_table(AGENTS);
+        let mut agent = agents.get(&agent_id).unwrap().value().0;
+        agent.current_lineage = child_lineage;
+        agents.insert(&agent_id, Sen(agent));
+    }
+    write.append_agent_block(
+        AgentTimelineRef::root(child_lineage),
+        UnixMillis(4),
+        Arc::new(ContextBlock::UserMessage {
+            content: vec![ContentPart::Text {
+                text: "child".to_owned(),
+            }],
+        }),
+    );
+    write.commit();
+
+    let read = db.read();
+    let (next, blocks) = read.agent_blocks(agent_id);
+    assert_eq!(next.lineage_id, child_lineage);
+    assert_eq!(next.seq, 1);
+    let texts = blocks
+        .into_iter()
+        .map(|block| match block.as_ref() {
+            ContextBlock::UserMessage { content } => match &content[0] {
+                ContentPart::Text { text } => text.clone(),
+            },
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts, ["parent", "child"]);
+}
