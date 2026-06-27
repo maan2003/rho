@@ -10,6 +10,8 @@ members = [
   "crates/rho-store-redb",
   "crates/rho-term-screen",
   "crates/rho-tool-shell",
+  "crates/senax-encoder",
+  "crates/senax-encoder/derive",
 ]
 resolver = "2"
 
@@ -50,6 +52,8 @@ rho-tool-shell = { path = "crates/rho-tool-shell" }
 serde = { version = "1", features = ["derive"] }
 serde_cbor = "0.11"
 serde_json = "1"
+senax-encoder = { path = "crates/senax-encoder" }
+senax-encoder-derive = { path = "crates/senax-encoder/derive" }
 sha2 = "0.10"
 tempfile = { version = "3", default-features = false }
 tokio = { version = "1", features = [
