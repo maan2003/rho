@@ -39,6 +39,32 @@ fn completion_includes_relative_paths() {
 }
 
 #[test]
+fn slash_command_completion_preserves_suffix() {
+    let candidates = completion_candidates("  /ver now", "  /ver".len());
+    assert!(candidates.iter().any(|candidate| {
+        candidate.label == "/version" && candidate.replacement == "  /version now"
+    }));
+}
+
+#[test]
+fn slash_argument_completion_replaces_current_arg() {
+    let candidates = completion_candidates("/theme tau-p", "/theme tau-p".len());
+    assert!(candidates.iter().any(|candidate| {
+        candidate.label == "tau-plain-dark" && candidate.replacement == "/theme tau-plain-dark"
+    }));
+}
+
+#[test]
+fn non_leading_absolute_path_completion_is_filesystem() {
+    let candidates = completion_candidates("open /t", "open /t".len());
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.label == "/tmp/")
+    );
+}
+
+#[test]
 fn slash_command_parse_known_and_unknown() {
     assert!(matches!(SlashCommand::parse("hello"), None));
     assert!(matches!(

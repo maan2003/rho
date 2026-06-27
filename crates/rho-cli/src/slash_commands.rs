@@ -1,5 +1,3 @@
-use rho_cli_term_raw::Candidate;
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SlashCommand {
     Quit,
@@ -31,55 +29,92 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/quit", "Exit chat"),
-    ("/cancel", "Cancel the current in-flight prompt"),
-    (
-        "/detach",
-        "Leave the UI but keep the harness running for later reattach",
-    ),
-    (
-        "/model",
-        "Switch selected agent model (e.g. /model openai/gpt-5)",
-    ),
-    ("/agent", "Manage visible/suspended agent transcripts"),
-    ("/new", "Alias for /agent new"),
-    ("/suspend", "Alias for /agent suspend on the selected agent"),
-    ("/resume", "Alias for /agent resume on the selected agent"),
-    ("/role", "Switch, create, edit, or delete an agent role"),
-    ("/prompt", "Run a saved prompt template"),
-    ("/skill", "Run a skill command"),
-    ("/set", "Change CLI settings"),
-    ("/theme", "Switch CLI theme"),
-    ("/version", "Show version"),
-    ("/provider-auth", "Manage provider authentication"),
-    ("/fast", "Toggle fast service tier"),
-    ("/tree", "Show agent tree"),
-    ("/compact", "Compact current agent context"),
-    ("/help", "Show commands"),
-    ("/clear", "Clear rendered output"),
-];
+pub(crate) struct SlashCommandSpec {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+}
 
-pub(crate) fn slash_completion(buffer: &str, cursor: usize) -> Vec<Candidate> {
-    if cursor != buffer.len() || !buffer.starts_with('/') || buffer.contains(char::is_whitespace) {
-        return Vec::new();
-    }
-    let needle = buffer.to_lowercase();
-    let mut prefix = Vec::new();
-    let mut contains = Vec::new();
-    for (command, description) in SLASH_COMMANDS {
-        let haystack = command.to_lowercase();
-        let candidate = Candidate {
-            label: (*command).to_owned(),
-            description: (*description).to_owned(),
-            replacement: (*command).to_owned(),
-        };
-        if haystack.starts_with(&needle) {
-            prefix.push(candidate);
-        } else if haystack.contains(&needle) {
-            contains.push(candidate);
-        }
-    }
-    prefix.extend(contains);
-    prefix
+pub(crate) fn slash_commands() -> &'static [SlashCommandSpec] {
+    &[
+        SlashCommandSpec {
+            name: "/quit",
+            description: "Exit chat",
+        },
+        SlashCommandSpec {
+            name: "/cancel",
+            description: "Cancel the current in-flight prompt",
+        },
+        SlashCommandSpec {
+            name: "/detach",
+            description: "Leave the UI but keep the harness running for later reattach",
+        },
+        SlashCommandSpec {
+            name: "/model",
+            description: "Switch selected agent model (e.g. /model openai/gpt-5)",
+        },
+        SlashCommandSpec {
+            name: "/agent",
+            description: "Manage visible/suspended agent transcripts",
+        },
+        SlashCommandSpec {
+            name: "/new",
+            description: "Alias for /agent new",
+        },
+        SlashCommandSpec {
+            name: "/suspend",
+            description: "Alias for /agent suspend on the selected agent",
+        },
+        SlashCommandSpec {
+            name: "/resume",
+            description: "Alias for /agent resume on the selected agent",
+        },
+        SlashCommandSpec {
+            name: "/role",
+            description: "Switch, create, edit, or delete an agent role",
+        },
+        SlashCommandSpec {
+            name: "/prompt",
+            description: "Run a saved prompt template",
+        },
+        SlashCommandSpec {
+            name: "/skill",
+            description: "Run a skill command",
+        },
+        SlashCommandSpec {
+            name: "/set",
+            description: "Change CLI settings",
+        },
+        SlashCommandSpec {
+            name: "/theme",
+            description: "Switch CLI theme",
+        },
+        SlashCommandSpec {
+            name: "/version",
+            description: "Show version",
+        },
+        SlashCommandSpec {
+            name: "/provider-auth",
+            description: "Manage provider authentication",
+        },
+        SlashCommandSpec {
+            name: "/fast",
+            description: "Toggle fast service tier",
+        },
+        SlashCommandSpec {
+            name: "/tree",
+            description: "Show agent tree",
+        },
+        SlashCommandSpec {
+            name: "/compact",
+            description: "Compact current agent context",
+        },
+        SlashCommandSpec {
+            name: "/help",
+            description: "Show commands",
+        },
+        SlashCommandSpec {
+            name: "/clear",
+            description: "Clear rendered output",
+        },
+    ]
 }
