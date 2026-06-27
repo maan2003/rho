@@ -13,30 +13,16 @@ fn chat_args() -> ChatArgs {
     ChatArgs {
         auth: "default".to_owned(),
         session: DEFAULT_SESSION_NAME.to_owned(),
-        session_path: None,
         prompt_stdin: false,
-        no_store: false,
     }
 }
 
 #[test]
-fn no_store_disables_inference_prompt_cache_key() {
-    let mut args = chat_args();
-    args.no_store = true;
-
+fn cli_inference_session_has_no_prompt_cache_key() {
+    let args = chat_args();
     let service = build_inference_session(&args).unwrap();
 
     assert!(service.prompt_cache_key().is_none());
-}
-
-#[test]
-fn stored_sessions_use_session_name_as_inference_prompt_cache_key() {
-    let mut args = chat_args();
-    args.session = "work".to_owned();
-
-    let service = build_inference_session(&args).unwrap();
-
-    assert_eq!(service.prompt_cache_key(), Some("work"));
 }
 
 fn test_call() -> ToolCall {

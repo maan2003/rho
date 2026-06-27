@@ -8,10 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use rho_agent::{Agent, AgentStateKind};
@@ -24,7 +23,6 @@ use rho_core::{
 };
 use rho_inference::config::InferenceConfig;
 use rho_inference::{AuthArgs, InferenceAuth, InferenceSession, run_auth_cli};
-use rho_store_cbor::CborLog;
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
@@ -78,14 +76,9 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 
     let renderer = PlainRenderer::default();
     let output = renderer.output();
-    let store = if args.no_store {
-        None
-    } else {
-        Some(CborLog::new(args.session_path()?))
-    };
     let agent = build_agent(&args, None).await?;
     agent.send_user_message(prompt);
-    watch_agent(&agent, Some(output), store).await;
+    watch_agent(&agent, Some(output)).await;
 
     let text = renderer.finish();
     if !text.is_empty() {
@@ -101,25 +94,10 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
     let inference = Box::new(build_inference_session(args)?);
-    let store = if args.no_store {
-        None
-    } else {
-        Some(CborLog::new(args.session_path()?))
-    };
-    let blocks = if let Some(store) = &store {
-        store
-            .read_blocks()
-            .await?
-            .into_iter()
-            .map(Arc::new)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let blocks = Vec::new();
     let agent = Agent::spawn(inference, blocks);
     if renderer.is_some() {
         let changes = agent.subscribe();
-        let mut persisted = agent.blocks().len();
         tokio::spawn(async move {
             futures::pin_mut!(changes);
             while let Some(state) = changes.next().await {
@@ -127,12 +105,6 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
                     && let Ok(mut renderer) = renderer.lock()
                 {
                     renderer.handle_state_kind(&state.kind);
-                }
-                if let Some(store) = &store {
-                    while persisted < state.blocks.len() {
-                        let _ = store.append_block(&state.blocks[persisted]).await;
-                        persisted += 1;
-                    }
                 }
             }
         });
@@ -143,8 +115,7 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
 fn build_inference_session(args: &ChatArgs) -> Result<InferenceSession> {
     let auth = InferenceAuth::named(&args.auth)?;
     let config = InferenceConfig::deep().protect();
-    let prompt_cache_key = (!args.no_store).then(|| args.session.clone());
-    Ok(InferenceSession::new(auth, config, prompt_cache_key))
+    Ok(InferenceSession::new(auth, config, None))
 }
 
 struct ChatApp {
@@ -242,11 +213,10 @@ impl ChatApp {
     }
 }
 
-async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>, store: Option<CborLog>) {
+async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>) {
     let changes = agent.subscribe();
     futures::pin_mut!(changes);
     let started_blocks = agent.blocks().len();
-    let mut persisted = started_blocks;
     let mut saw_running = !matches!(agent.state().kind, AgentStateKind::Idle);
     loop {
         let Some(state) = changes.next().await else {
@@ -256,12 +226,6 @@ async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>, store: Opt
             && let Ok(mut renderer) = renderer.lock()
         {
             renderer.handle_state_kind(&state.kind);
-        }
-        if let Some(store) = &store {
-            while persisted < state.blocks.len() {
-                let _ = store.append_block(&state.blocks[persisted]).await;
-                persisted += 1;
-            }
         }
         if matches!(state.kind, AgentStateKind::Idle | AgentStateKind::Error(_)) {
             if saw_running || state.blocks.len() > started_blocks {
@@ -274,7 +238,7 @@ async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>, store: Opt
 }
 
 async fn wait_idle(agent: &Agent) {
-    watch_agent(agent, None, None).await;
+    watch_agent(agent, None).await;
 }
 
 /// Watch the already-started turn: when the agent goes idle, flush the
@@ -721,12 +685,8 @@ struct ChatArgs {
     auth: String,
     #[arg(long, default_value = DEFAULT_SESSION_NAME)]
     session: String,
-    #[arg(long = "session-path")]
-    session_path: Option<PathBuf>,
     #[arg(long = "prompt-stdin")]
     prompt_stdin: bool,
-    #[arg(long = "no-store")]
-    no_store: bool,
 }
 
 impl Args {
@@ -740,36 +700,7 @@ impl Args {
             Some(CliCommand::Auth { command }) => Command::Auth(command),
             None => Command::Chat(cli.chat),
         };
-        let args = Self { command };
-        args.validate()?;
-        Ok(args)
-    }
-
-    fn validate(&self) -> std::result::Result<(), clap::Error> {
-        if let Command::Chat(chat) = &self.command {
-            if chat.no_store && chat.session_path.is_some() {
-                return Err(clap::Error::raw(
-                    clap::error::ErrorKind::ArgumentConflict,
-                    "--no-store cannot be used with --session-path",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ChatArgs {
-    fn session_path(&self) -> Result<PathBuf> {
-        if let Some(path) = &self.session_path {
-            return Ok(path.clone());
-        }
-        let state_dir = dirs::state_dir()
-            .or_else(dirs::data_local_dir)
-            .context("cannot determine state directory")?;
-        Ok(state_dir
-            .join("rho")
-            .join("sessions")
-            .join(format!("{}.cbor", self.session)))
+        Ok(Self { command })
     }
 }
 
