@@ -1442,6 +1442,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "redb",
+ "senax-encoder",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rho-inference"
 version = "0.1.0"
 dependencies = [

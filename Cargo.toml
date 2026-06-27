@@ -5,6 +5,7 @@ members = [
   "crates/rho-cli",
   "crates/rho-cli-term-raw",
   "crates/rho-core",
+  "crates/rho-db",
   "crates/rho-inference",
   "crates/rho-store-cbor",
   "crates/rho-store-redb",
@@ -44,6 +45,7 @@ rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
 rho-cli = { path = "crates/rho-cli" }
 rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
 rho-core = { path = "crates/rho-core" }
+rho-db = { path = "crates/rho-db" }
 rho-inference = { path = "crates/rho-inference" }
 rho-store-cbor = { path = "crates/rho-store-cbor" }
 rho-store-redb = { path = "crates/rho-store-redb" }
