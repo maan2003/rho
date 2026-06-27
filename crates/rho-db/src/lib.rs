@@ -4,6 +4,7 @@
 //! for senax-backed redb keys/values and small transaction wrappers that treat
 //! local database errors as fatal.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
@@ -11,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use redb::{Database, ReadableDatabase, TableDefinition, TypeName};
+use redb::{AccessGuard, Database, ReadableDatabase, ReadableTable, TableDefinition, TypeName};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const CACHE_SIZE: usize = 10 * 1024 * 1024;
@@ -36,6 +37,22 @@ pub struct ReadTxn {
 pub struct WriteTxn {
     inner: redb::WriteTransaction,
     _guard: OwnedMutexGuard<()>,
+}
+
+/// Read-only table wrapper. Methods panic on local database errors.
+pub struct ReadTable<K: redb::Key + 'static, V: redb::Value + 'static> {
+    inner: redb::ReadOnlyTable<K, V>,
+}
+
+/// Mutable table wrapper. Methods panic on local database errors.
+pub struct WriteTable<'txn, K: redb::Key + 'static, V: redb::Value + 'static> {
+    inner: redb::Table<'txn, K, V>,
+}
+
+/// Double-ended table iterator wrapper. Iteration panics on local database
+/// errors.
+pub struct Iter<'a, K: redb::Key + 'static, V: redb::Value + 'static> {
+    inner: redb::Range<'a, K, V>,
 }
 
 impl<T> Deref for Sen<T> {
@@ -139,26 +156,32 @@ impl RhoDb {
 }
 
 impl ReadTxn {
-    pub fn open_table<K, V>(&self, definition: TableDefinition<K, V>) -> redb::ReadOnlyTable<K, V>
+    pub fn open_table<K, V>(&self, definition: TableDefinition<K, V>) -> ReadTable<K, V>
     where
         K: redb::Key + 'static,
         V: redb::Value + 'static,
     {
-        self.inner
-            .open_table(definition)
-            .expect("open rho-db read table")
+        ReadTable {
+            inner: self
+                .inner
+                .open_table(definition)
+                .expect("open rho-db read table"),
+        }
     }
 }
 
 impl WriteTxn {
-    pub fn open_table<K, V>(&mut self, definition: TableDefinition<K, V>) -> redb::Table<'_, K, V>
+    pub fn open_table<K, V>(&mut self, definition: TableDefinition<K, V>) -> WriteTable<'_, K, V>
     where
         K: redb::Key + 'static,
         V: redb::Value + 'static,
     {
-        self.inner
-            .open_table(definition)
-            .expect("open rho-db write table")
+        WriteTable {
+            inner: self
+                .inner
+                .open_table(definition)
+                .expect("open rho-db write table"),
+        }
     }
 
     pub fn commit(self) {
@@ -166,9 +189,97 @@ impl WriteTxn {
     }
 }
 
+impl<K, V> ReadTable<K, V>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    pub fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Option<AccessGuard<'_, V>> {
+        self.inner.get(key).expect("get rho-db value")
+    }
+
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            inner: self.inner.iter().expect("iterate rho-db table"),
+        }
+    }
+
+    pub fn range<'a, KR>(&self, range: impl std::ops::RangeBounds<KR> + 'a) -> Iter<'_, K, V>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        Iter {
+            inner: self.inner.range(range).expect("range rho-db table"),
+        }
+    }
+}
+
+impl<'txn, K, V> WriteTable<'txn, K, V>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    pub fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Option<AccessGuard<'_, V>> {
+        self.inner.get(key).expect("get rho-db value")
+    }
+
+    pub fn insert<'k, 'v>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'k>>,
+        value: impl Borrow<V::SelfType<'v>>,
+    ) -> Option<AccessGuard<'_, V>> {
+        self.inner.insert(key, value).expect("insert rho-db value")
+    }
+
+    pub fn remove<'a>(&mut self, key: impl Borrow<K::SelfType<'a>>) -> Option<AccessGuard<'_, V>> {
+        self.inner.remove(key).expect("remove rho-db value")
+    }
+
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            inner: self.inner.iter().expect("iterate rho-db table"),
+        }
+    }
+
+    pub fn range<'a, KR>(&self, range: impl std::ops::RangeBounds<KR> + 'a) -> Iter<'_, K, V>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        Iter {
+            inner: self.inner.range(range).expect("range rho-db table"),
+        }
+    }
+}
+
+impl<'a, K, V> Iterator for Iter<'a, K, V>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    type Item = (AccessGuard<'a, K>, AccessGuard<'a, V>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|item| item.expect("read rho-db iterator item"))
+    }
+}
+
+impl<K, V> DoubleEndedIterator for Iter<'_, K, V>
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next_back()
+            .map(|item| item.expect("read rho-db iterator item"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use redb::{ReadableTable, TableDefinition};
+    use redb::TableDefinition;
     use senax_encoder::{Decode, Encode};
 
     use super::*;
@@ -192,16 +303,13 @@ mod tests {
 
         let db = RhoDb::open(&path);
         let mut write = db.write().await;
-        write
-            .open_table(ITEMS)
-            .insert(
-                &Sen(TestKey(42)),
-                Sen(TestRecord {
-                    name: "agent".to_owned(),
-                    tags: vec!["main".to_owned()],
-                }),
-            )
-            .unwrap();
+        write.open_table(ITEMS).insert(
+            &Sen(TestKey(42)),
+            Sen(TestRecord {
+                name: "agent".to_owned(),
+                tags: vec!["main".to_owned()],
+            }),
+        );
         write.commit();
         drop(db);
 
@@ -209,7 +317,7 @@ mod tests {
         let read = reopened.read();
         let table = read.open_table(ITEMS);
         assert_eq!(
-            table.get(&Sen(TestKey(42))).unwrap().unwrap().value().0,
+            table.get(&Sen(TestKey(42))).unwrap().value().0,
             TestRecord {
                 name: "agent".to_owned(),
                 tags: vec!["main".to_owned()],
@@ -225,24 +333,20 @@ mod tests {
         let mut write = db.write().await;
         {
             let mut table = write.open_table(ITEMS);
-            table
-                .insert(
-                    &Sen(TestKey(1)),
-                    Sen(TestRecord {
-                        name: "one".to_owned(),
-                        tags: Vec::new(),
-                    }),
-                )
-                .unwrap();
-            table
-                .insert(
-                    &Sen(TestKey(2)),
-                    Sen(TestRecord {
-                        name: "two".to_owned(),
-                        tags: Vec::new(),
-                    }),
-                )
-                .unwrap();
+            table.insert(
+                &Sen(TestKey(1)),
+                Sen(TestRecord {
+                    name: "one".to_owned(),
+                    tags: Vec::new(),
+                }),
+            );
+            table.insert(
+                &Sen(TestKey(2)),
+                Sen(TestRecord {
+                    name: "two".to_owned(),
+                    tags: Vec::new(),
+                }),
+            );
         }
         write.commit();
 
@@ -250,10 +354,13 @@ mod tests {
         let table = read.open_table(ITEMS);
         let items = table
             .iter()
-            .unwrap()
-            .map(|item| item.map(|(key, _)| key.value().0.0))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+            .map(|(key, _)| key.value().0.0)
+            .collect::<Vec<_>>();
         assert_eq!(items, [1, 2]);
+
+        let mut range = table.range(Sen(TestKey(1))..=Sen(TestKey(2)));
+        assert_eq!(range.next().unwrap().0.value().0.0, 1);
+        assert_eq!(range.next_back().unwrap().0.value().0.0, 2);
+        assert!(range.next().is_none());
     }
 }
