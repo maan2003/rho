@@ -25,6 +25,7 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 ureq.workspace = true
 url.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

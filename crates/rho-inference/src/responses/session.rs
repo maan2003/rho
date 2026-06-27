@@ -34,11 +34,32 @@ impl PromptCacheKey {
     pub(crate) fn to_wire_string(self, api_url: &str, client_secret: [u8; 32]) -> String {
         use std::hash::Hasher;
 
-        let mut hash = fnv::FnvHasher::default();
-        hash.write(&self.0);
-        hash.write(api_url.as_bytes());
-        hash.write(&client_secret);
-        format!("{:016x}", hash.finish())
+        fn fnv64(parts: &[&[u8]]) -> u64 {
+            let mut hash = fnv::FnvHasher::default();
+            for part in parts {
+                hash.write(part);
+            }
+            hash.finish()
+        }
+
+        let hi = fnv64(&[
+            b"rho-prompt-cache-key:v8:0",
+            &self.0,
+            api_url.as_bytes(),
+            &client_secret,
+        ]);
+        let lo = fnv64(&[
+            b"rho-prompt-cache-key:v8:1",
+            &self.0,
+            api_url.as_bytes(),
+            &client_secret,
+        ]);
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&hi.to_be_bytes());
+        bytes[8..].copy_from_slice(&lo.to_be_bytes());
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        uuid::Uuid::from_bytes(bytes).to_string()
     }
 }
 

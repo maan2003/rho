@@ -1419,6 +1419,7 @@ dependencies = [
  "tokio-tungstenite",
  "ureq",
  "url",
+ "uuid",
 ]
 
 [[package]]
