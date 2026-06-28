@@ -13,14 +13,33 @@ use rho_db::RhoDb;
 use rho_inference::config::InferenceConfig;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
+use senax_encoder::{Decode, Encode};
 use tokio::sync::{Notify, mpsc};
 
-use crate::db::{AgentId, AgentReadTxnExt, AgentTimelineRef, AgentWriteTxnExt, UnixMillis};
+use crate::db::{AgentEventPos, AgentId, AgentReadTxnExt, AgentWriteTxnExt, UnixMillis};
 
 pub mod db;
 
+/// An agent timeline event. Some events fold into model context; future
+/// runtime-only events, like tool output chunks, can live here without becoming
+/// inference input.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum AgentEvent {
+    UserMessage {
+        content: Vec<ContentPart>,
+    },
+    InferenceResponse {
+        items: Vec<InferenceResponseItem>,
+        provider_response_id: Option<rho_core::ProviderResponseId>,
+    },
+    ToolResult {
+        result: ToolResult,
+    },
+}
+
 /// Live runtime state of an agent turn.
 #[derive(Clone)]
+// should be cheap to clone, it is cloned a lot
 pub struct AgentState {
     /// Invariant: append-only. Blocks are only ever pushed — never removed,
     /// replaced, or reordered.
@@ -32,6 +51,7 @@ pub struct AgentState {
 }
 
 #[derive(Clone)]
+// should be cheap to clone, it is cloned a lot
 pub enum AgentStateKind {
     ApiStreaming {
         pending_response: PendingInferenceResponse,
@@ -41,12 +61,19 @@ pub enum AgentStateKind {
     // Note: in future we might add ToolCallingWhileStreaming state for proactive execution while
     // streaming
     ToolCalling {
-        // Results of the calls that have finished so far. The still-running ones
-        // live in `Agent::pending_tools`; the invariant is that it is non-empty
-        // while in this state — once the last future resolves we transition.
-        // communication of tool calls is done out of band! tools maybe even persist the updates in
-        // db for example
+        // Results of the calls that have finished so far.
+        // Communication of tool calls is done out of band; tools may persist
+        // richer execution updates separately.
         results: Vec<ToolResult>,
+    },
+    // Restored from an event log that ended after a tool-calling response.
+    UnfinishedTurn {
+        // Can be empty: the restored turn may have answered every tool call, but
+        // still stopped before rho observed a final assistant response.
+        outstanding_calls: Arc<[ToolCall]>,
+        // Completed tool calls restored for this unfinished turn but not yet
+        // committed into model context.
+        completed_tool_calls: Arc<[ToolResult]>,
     },
     // Permanent error, thread is paused
     Error(FailedInferenceResponse),
@@ -76,7 +103,13 @@ impl Agent {
     ) -> Self {
         let inference_session =
             InferenceSession::new(auth, config.protect(), PromptCacheKey::generate());
-        Self::new(inference_session, blocks, None)
+        let shell_tools = ShellTools::new(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        let state = AgentState {
+            blocks,
+            tool_specs: shell_tools.specs().into(),
+            kind: AgentStateKind::Idle,
+        };
+        Self::new(inference_session, shell_tools, state, None)
     }
 
     pub async fn create(
@@ -88,7 +121,7 @@ impl Agent {
         let prompt_cache_key = PromptCacheKey::generate();
         let config = config.protect();
         let mut write = db.write().await;
-        let (_, next_block) = write.create_agent(
+        let (_, next_event) = write.create_agent(
             UnixMillis::now(),
             display_name,
             prompt_cache_key,
@@ -96,36 +129,122 @@ impl Agent {
         );
         write.commit();
         let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
+        let shell_tools = ShellTools::new(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        let state = AgentState {
+            blocks: Vec::new(),
+            tool_specs: shell_tools.specs().into(),
+            kind: AgentStateKind::Idle,
+        };
         Self::new(
             inference_session,
-            Vec::new(),
-            Some(AgentPersistence { db, next_block }),
+            shell_tools,
+            state,
+            Some(AgentPersistence { db, next_event }),
         )
     }
 
     pub fn load(db: RhoDb, auth: InferenceAuth, agent_id: AgentId) -> Self {
         let record = db.read().get_agent(agent_id);
-        let (next_block, blocks) = db.read().agent_blocks(agent_id);
+        struct RestoreToolTurn {
+            outstanding_calls: Vec<ToolCall>,
+            completed_tool_calls: Vec<ToolResult>,
+        }
+
+        let (next_event, events) = db.read().agent_events(agent_id);
+        let mut blocks = Vec::new();
+        let mut turn: Option<RestoreToolTurn> = None;
+        let commit_finished_turn =
+            |turn: &mut Option<RestoreToolTurn>, blocks: &mut Vec<Arc<ContextBlock>>| {
+                let Some(turn) = turn.take() else {
+                    return;
+                };
+                if !turn.completed_tool_calls.is_empty() {
+                    blocks.push(Arc::new(ContextBlock::ToolResults {
+                        results: turn.completed_tool_calls,
+                    }));
+                }
+            };
+        for event in events {
+            match event {
+                AgentEvent::UserMessage { content } => {
+                    commit_finished_turn(&mut turn, &mut blocks);
+                    blocks.push(Arc::new(ContextBlock::UserMessage { content }));
+                }
+                AgentEvent::InferenceResponse {
+                    items,
+                    provider_response_id,
+                } => {
+                    commit_finished_turn(&mut turn, &mut blocks);
+                    let outstanding_calls = items
+                        .iter()
+                        .filter_map(|item| match item {
+                            InferenceResponseItem::ToolCall {
+                                id,
+                                name,
+                                tool_type,
+                                arguments,
+                            } => Some(ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                tool_type: *tool_type,
+                                arguments: arguments.clone(),
+                            }),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if !outstanding_calls.is_empty() {
+                        turn = Some(RestoreToolTurn {
+                            outstanding_calls,
+                            completed_tool_calls: Vec::new(),
+                        });
+                    }
+                    blocks.push(Arc::new(ContextBlock::InferenceResponse {
+                        items,
+                        provider_response_id,
+                    }));
+                }
+                AgentEvent::ToolResult { result } => {
+                    let Some(turn) = &mut turn else {
+                        unreachable!("tool result restored without a preceding tool call");
+                    };
+                    turn.outstanding_calls
+                        .retain(|call| call.id != result.call_id);
+                    turn.completed_tool_calls.push(result);
+                }
+            }
+        }
+        let kind = match turn {
+            None => AgentStateKind::Idle,
+            Some(RestoreToolTurn {
+                outstanding_calls,
+                completed_tool_calls,
+            }) => AgentStateKind::UnfinishedTurn {
+                outstanding_calls: outstanding_calls.into(),
+                completed_tool_calls: completed_tool_calls.into(),
+            },
+        };
         let inference_session = InferenceSession::new(auth, record.config, record.prompt_cache_key);
+        let shell_tools = ShellTools::new(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        let state = AgentState {
+            blocks,
+            tool_specs: shell_tools.specs().into(),
+            kind,
+        };
         Self::new(
             inference_session,
-            blocks,
-            Some(AgentPersistence { db, next_block }),
+            shell_tools,
+            state,
+            Some(AgentPersistence { db, next_event }),
         )
     }
 
     fn new(
         inference_session: InferenceSession,
-        blocks: Vec<Arc<ContextBlock>>,
+        shell_tools: ShellTools,
+        state: AgentState,
         persistence: Option<AgentPersistence>,
     ) -> Self {
-        let shell_tools = ShellTools::new(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS));
-        let tool_specs: Arc<[ToolSpec]> = shell_tools.specs().into();
-        let state = Arc::new(RwLock::new(AgentState {
-            blocks,
-            tool_specs,
-            kind: AgentStateKind::Idle,
-        }));
+        let state = Arc::new(RwLock::new(state));
         let (control, control_rx) = mpsc::unbounded_channel();
         let notify = Arc::new(Notify::new());
         let agent_loop = AgentLoop {
@@ -183,7 +302,7 @@ impl Agent {
 
 struct AgentPersistence {
     db: RhoDb,
-    next_block: AgentTimelineRef,
+    next_event: AgentEventPos,
 }
 
 enum AgentControl {
@@ -212,19 +331,14 @@ impl AgentLoop {
     async fn run(mut self) {
         loop {
             let mut state = self.state.read().expect("poison").clone();
-            let mut append_block =
-                async |blocks: &mut Vec<Arc<ContextBlock>>, block: Arc<ContextBlock>| {
-                    if let Some(persistence) = &mut self.persistence {
-                        let mut write = persistence.db.write().await;
-                        persistence.next_block = write.append_agent_block(
-                            persistence.next_block,
-                            UnixMillis::now(),
-                            block.clone(),
-                        );
-                        write.commit();
-                    }
-                    blocks.push(block);
-                };
+            let mut persist_event = async |event: AgentEvent| {
+                if let Some(persistence) = &mut self.persistence {
+                    let mut write = persistence.db.write().await;
+                    persistence.next_event =
+                        write.append_agent_event(persistence.next_event, event);
+                    write.commit();
+                }
+            };
 
             tokio::select! {
                 biased;
@@ -237,8 +351,13 @@ impl AgentLoop {
                             self.inference_session.abort();
                             self.pending_tools.clear();
 
-                            let block = Arc::new(ContextBlock::UserMessage { content });
-                            append_block(&mut state.blocks, block).await;
+                            persist_event(AgentEvent::UserMessage {
+                                content: content.clone(),
+                            })
+                            .await;
+                            state
+                                .blocks
+                                .push(Arc::new(ContextBlock::UserMessage { content }));
                             self.inference_session.request(InferenceRequest {
                                 input: state.blocks.clone(),
                                 tools: Arc::clone(&state.tool_specs),
@@ -257,10 +376,11 @@ impl AgentLoop {
                     }
                 }
                 update = self.inference_session.run() => {
+                    let kind = std::mem::replace(&mut state.kind, AgentStateKind::Idle);
                     let AgentStateKind::ApiStreaming {
                         mut pending_response,
                         previous_attempt,
-                    } = state.kind
+                    } = kind
                     else {
                         unreachable!("provider streamed outside ApiStreaming");
                     };
@@ -331,11 +451,15 @@ impl AgentLoop {
                                         _ => None,
                                     })
                                     .collect();
-                                let block = Arc::new(ContextBlock::InferenceResponse {
+                                persist_event(AgentEvent::InferenceResponse {
+                                    items: items.clone(),
+                                    provider_response_id: provider_response_id.clone(),
+                                })
+                                .await;
+                                state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
                                     items,
                                     provider_response_id,
-                                });
-                                append_block(&mut state.blocks, block).await;
+                                }));
                                 if calls.is_empty() {
                                     state.kind = AgentStateKind::Idle;
                                 } else {
@@ -357,13 +481,19 @@ impl AgentLoop {
                     }
                 }
                 Some(result) = self.pending_tools.next() => {
-                    let AgentStateKind::ToolCalling { mut results } = state.kind else {
+                    let kind = std::mem::replace(&mut state.kind, AgentStateKind::Idle);
+                    let AgentStateKind::ToolCalling { mut results } = kind else {
                         unreachable!("tool finished outside ToolCalling");
                     };
                     results.push(result);
                     if self.pending_tools.is_empty() {
-                        let block = Arc::new(ContextBlock::ToolResults { results });
-                        append_block(&mut state.blocks, block).await;
+                        for result in &results {
+                            persist_event(AgentEvent::ToolResult {
+                                result: result.clone(),
+                            })
+                            .await;
+                        }
+                        state.blocks.push(Arc::new(ContextBlock::ToolResults { results }));
                         self.inference_session.request(InferenceRequest {
                             input: state.blocks.clone(),
                             tools: Arc::clone(&state.tool_specs),

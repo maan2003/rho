@@ -263,7 +263,10 @@ async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>) {
     let changes = agent.subscribe();
     futures::pin_mut!(changes);
     let started_blocks = agent.blocks().len();
-    let mut saw_running = !matches!(agent.state().kind, AgentStateKind::Idle);
+    let mut saw_running = !matches!(
+        agent.state().kind,
+        AgentStateKind::Idle | AgentStateKind::UnfinishedTurn { .. }
+    );
     loop {
         let Some(state) = changes.next().await else {
             return;
@@ -273,7 +276,10 @@ async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>) {
         {
             renderer.handle_state_kind(&state.kind);
         }
-        if matches!(state.kind, AgentStateKind::Idle | AgentStateKind::Error(_)) {
+        if matches!(
+            state.kind,
+            AgentStateKind::Idle | AgentStateKind::UnfinishedTurn { .. } | AgentStateKind::Error(_)
+        ) {
             if saw_running || state.blocks.len() > started_blocks {
                 return;
             }
@@ -557,7 +563,7 @@ impl StreamingRenderer {
                     }
                 }
             }
-            AgentStateKind::ToolCalling { results } => {
+            AgentStateKind::ToolCalling { results, .. } => {
                 for result in results {
                     self.render_tool_finished(result);
                 }
@@ -565,7 +571,7 @@ impl StreamingRenderer {
             AgentStateKind::Error(error) => {
                 self.render_notice(&format!("agent error: {}", error.error))
             }
-            AgentStateKind::Idle => {
+            AgentStateKind::Idle | AgentStateKind::UnfinishedTurn { .. } => {
                 if self.handle.is_some() {
                     self.finish_turn();
                 }

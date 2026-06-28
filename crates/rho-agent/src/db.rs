@@ -1,20 +1,19 @@
 //! Raw redb schema for persisted agents.
 
-use std::sync::Arc;
-
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
-use rho_core::ContextBlock;
 use rho_db::{ReadTxn, Sen, WriteTxn};
 use rho_inference::PromptCacheKey;
 use rho_inference::config::InferenceProtectedConfig;
 use senax_encoder::{Decode, Encode};
 
+use crate::AgentEvent;
+
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
-const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentTimelineRef> =
+const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentEventPos> =
     TableDefinition::new("lineage_parents");
-const AGENT_TIMELINE: TableDefinition<AgentTimelineRef, Sen<AgentTimelineEntry>> =
-    TableDefinition::new("agent_timeline");
+const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent>> =
+    TableDefinition::new("agent_events");
 const AGENTS: TableDefinition<AgentId, Sen<AgentRecord>> = TableDefinition::new("agents");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -38,12 +37,12 @@ pub struct AgentLineageId(u64);
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue, Encode, Decode,
 )]
-pub struct AgentTimelineRef {
+pub struct AgentEventPos {
     lineage_id: AgentLineageId,
     seq: u32,
 }
 
-impl AgentTimelineRef {
+impl AgentEventPos {
     fn root(lineage_id: AgentLineageId) -> Self {
         Self { lineage_id, seq: 0 }
     }
@@ -86,15 +85,9 @@ pub struct AgentRecord {
     pub config: InferenceProtectedConfig,
 }
 
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub struct AgentTimelineEntry {
-    pub created_at: UnixMillis,
-    pub context_block: ContextBlock,
-}
-
 pub trait AgentReadTxnExt {
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
-    fn agent_blocks(&self, agent_id: AgentId) -> (AgentTimelineRef, Vec<Arc<ContextBlock>>);
+    fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent>);
 }
 
 pub trait AgentWriteTxnExt {
@@ -104,14 +97,9 @@ pub trait AgentWriteTxnExt {
         display_name: Option<String>,
         prompt_cache_key: PromptCacheKey,
         config: InferenceProtectedConfig,
-    ) -> (AgentId, AgentTimelineRef);
+    ) -> (AgentId, AgentEventPos);
 
-    fn append_agent_block(
-        &mut self,
-        at: AgentTimelineRef,
-        created_at: UnixMillis,
-        context_block: Arc<ContextBlock>,
-    ) -> AgentTimelineRef;
+    fn append_agent_event(&mut self, at: AgentEventPos, event: AgentEvent) -> AgentEventPos;
 }
 
 impl AgentReadTxnExt for ReadTxn {
@@ -123,7 +111,7 @@ impl AgentReadTxnExt for ReadTxn {
             .0
     }
 
-    fn agent_blocks(&self, agent_id: AgentId) -> (AgentTimelineRef, Vec<Arc<ContextBlock>>) {
+    fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent>) {
         let agent = self.get_agent(agent_id);
         let mut segments = Vec::new();
         let mut lineage_id = agent.current_lineage;
@@ -140,13 +128,13 @@ impl AgentReadTxnExt for ReadTxn {
         }
         drop(lineage_parents);
 
-        let mut blocks = Vec::new();
-        let mut next = AgentTimelineRef::root(agent.current_lineage);
-        let timeline = self.open_table(AGENT_TIMELINE);
+        let mut events = Vec::new();
+        let mut next = AgentEventPos::root(agent.current_lineage);
+        let timeline = self.open_table(AGENT_EVENTS);
         for (lineage_id, end_seq) in segments.into_iter().rev() {
             let is_current_lineage = lineage_id == agent.current_lineage;
             for (key, value) in timeline.range(
-                AgentTimelineRef::root(lineage_id)..=AgentTimelineRef {
+                AgentEventPos::root(lineage_id)..=AgentEventPos {
                     lineage_id,
                     seq: end_seq,
                 },
@@ -158,10 +146,10 @@ impl AgentReadTxnExt for ReadTxn {
                 if is_current_lineage {
                     next = key.next();
                 }
-                blocks.push(Arc::new(value.value().0.context_block));
+                events.push(value.value().0);
             }
         }
-        (next, blocks)
+        (next, events)
     }
 }
 
@@ -172,7 +160,7 @@ impl AgentWriteTxnExt for WriteTxn {
         display_name: Option<String>,
         prompt_cache_key: PromptCacheKey,
         config: InferenceProtectedConfig,
-    ) -> (AgentId, AgentTimelineRef) {
+    ) -> (AgentId, AgentEventPos) {
         let agent_id = AgentId(next_counter(self, CounterKey::LAST_AGENT_ID));
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
@@ -186,22 +174,11 @@ impl AgentWriteTxnExt for WriteTxn {
             config,
         };
         self.open_table(AGENTS).insert(&agent_id, Sen(agent));
-        (agent_id, AgentTimelineRef::root(lineage_id))
+        (agent_id, AgentEventPos::root(lineage_id))
     }
 
-    fn append_agent_block(
-        &mut self,
-        at: AgentTimelineRef,
-        created_at: UnixMillis,
-        context_block: Arc<ContextBlock>,
-    ) -> AgentTimelineRef {
-        self.open_table(AGENT_TIMELINE).insert(
-            &at,
-            Sen(AgentTimelineEntry {
-                created_at,
-                context_block: (*context_block).clone(),
-            }),
-        );
+    fn append_agent_event(&mut self, at: AgentEventPos, event: AgentEvent) -> AgentEventPos {
+        self.open_table(AGENT_EVENTS).insert(&at, Sen(event));
         at.next()
     }
 }
