@@ -76,7 +76,7 @@ impl Agent {
         Self::spawn_inner(inference_session, blocks, None)
     }
 
-    pub async fn create_persisted(
+    pub async fn create(
         db: RhoDb,
         auth: InferenceAuth,
         config: InferenceConfig,
@@ -100,7 +100,7 @@ impl Agent {
         )
     }
 
-    pub fn load_persisted(db: RhoDb, auth: InferenceAuth, agent_id: AgentId) -> Self {
+    pub fn load(db: RhoDb, auth: InferenceAuth, agent_id: AgentId) -> Self {
         let record = db.read().get_agent(agent_id);
         let (next_block, blocks) = db.read().agent_blocks(agent_id);
         let inference_session = InferenceSession::new(auth, record.config, record.prompt_cache_key);

@@ -105,7 +105,7 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
     let db = RhoDb::open(rho_db_path()?);
     let auth = InferenceAuth::named(&args.auth)?;
     let config = InferenceConfig::deep();
-    let agent = Agent::create_persisted(db, auth, config, None).await;
+    let agent = Agent::create(db, auth, config, None).await;
     if renderer.is_some() {
         let changes = agent.subscribe();
         tokio::spawn(async move {
