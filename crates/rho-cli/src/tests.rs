@@ -102,6 +102,35 @@ fn markdown_renderer_styles_common_markdown() {
 }
 
 #[test]
+fn ui_io_tracker_reports_rolling_max_rate() {
+    let mut tracker = UiIoTracker::new(rho_ui_proto::IoStats {
+        sent: 10,
+        received: 20,
+    });
+
+    assert_eq!(
+        tracker.sample(rho_ui_proto::IoStats {
+            sent: 110,
+            received: 70,
+        }),
+        UiIoRates {
+            sent_per_sec: 100,
+            received_per_sec: 50,
+        }
+    );
+    assert_eq!(
+        tracker.sample(rho_ui_proto::IoStats {
+            sent: 120,
+            received: 220,
+        }),
+        UiIoRates {
+            sent_per_sec: 100,
+            received_per_sec: 150,
+        }
+    );
+}
+
+#[test]
 fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
     let (_term, handle, _input) = Term::new_virtual(
         80,
@@ -125,7 +154,7 @@ fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
         },
         previous_attempt: None,
     });
-    assert_eq!(renderer.tool_blocks.len(), 1);
+    assert_eq!(renderer.active_blocks.len(), 1);
 
     renderer.render_tool_finished(&ToolResult {
         call_id: call.id,
@@ -135,10 +164,73 @@ fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
             status: ToolOutputStatus::Success,
         },
     });
-    assert_eq!(renderer.tool_blocks.len(), 1);
+    assert_eq!(renderer.active_blocks.len(), 1);
+
+    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
+        pending_response: rho_core::PendingInferenceResponse::default(),
+        previous_attempt: None,
+    });
+    assert_eq!(renderer.active_blocks.len(), 1);
 
     renderer.finish_turn();
-    assert!(renderer.tool_blocks.is_empty());
+    assert!(renderer.active_blocks.is_empty());
+}
+
+#[test]
+fn streaming_blocks_follow_pending_item_order() {
+    let (_term, handle, _input) = Term::new_virtual(
+        80,
+        24,
+        prompt_text(),
+        Box::new(io::sink()),
+        CursorShape::Bar,
+    );
+    let mut renderer = StreamingRenderer::new(handle);
+    let call = test_call();
+    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
+        pending_response: rho_core::PendingInferenceResponse {
+            items: vec![
+                StreamingContextItemState::Pending(StreamingContextItem::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    tool_type: call.tool_type,
+                    arguments: AStr::from(call.arguments.clone()),
+                }),
+                StreamingContextItemState::Pending(StreamingContextItem::AssistantMessage {
+                    content: vec![AStr::from("done")],
+                    phase: None,
+                }),
+            ],
+        },
+        previous_attempt: None,
+    });
+
+    assert_eq!(
+        renderer.active_blocks.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+
+    renderer.handle_state_kind(&AgentStateKind::ToolCalling {
+        results: Vec::new(),
+    });
+    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
+        pending_response: rho_core::PendingInferenceResponse {
+            items: vec![StreamingContextItemState::Pending(
+                StreamingContextItem::AssistantMessage {
+                    content: vec![AStr::from("after tool")],
+                    phase: None,
+                },
+            )],
+        },
+        previous_attempt: None,
+    });
+    assert_eq!(
+        renderer.active_blocks.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    renderer.finish_turn();
+    assert!(renderer.active_blocks.is_empty());
 }
 
 #[test]
@@ -162,8 +254,8 @@ fn streaming_text_response_finalizes_on_idle() {
         },
         previous_attempt: None,
     });
-    assert!(renderer.assistant_block.is_some());
+    assert_eq!(renderer.active_blocks.len(), 1);
 
     renderer.handle_state_kind(&AgentStateKind::Idle);
-    assert!(renderer.assistant_block.is_none());
+    assert!(renderer.active_blocks.is_empty());
 }

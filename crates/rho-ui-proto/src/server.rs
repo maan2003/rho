@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::{ClientMessage, ServerMessage, read_frame, write_frame};
+use crate::{ClientMessage, IoCounters, ServerMessage, read_frame_counted, write_frame_counted};
 
 /// Async Unix-socket listener for the rho UI protocol.
 pub struct Server {
@@ -21,7 +21,7 @@ impl Server {
 
     pub async fn accept(&self) -> anyhow::Result<ServerConnection> {
         let (stream, _) = self.listener.accept().await?;
-        Ok(ServerConnection { stream })
+        Ok(ServerConnection::from_stream(stream))
     }
 
     pub fn local_addr(&self) -> anyhow::Result<tokio::net::unix::SocketAddr> {
@@ -32,19 +32,27 @@ impl Server {
 /// One accepted UI client connection.
 pub struct ServerConnection {
     stream: UnixStream,
+    counters: IoCounters,
 }
 
 impl ServerConnection {
     pub fn from_stream(stream: UnixStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            counters: IoCounters::default(),
+        }
     }
 
     pub async fn recv(&mut self) -> anyhow::Result<ClientMessage> {
-        read_frame(&mut self.stream).await
+        read_frame_counted(&mut self.stream, Some(&self.counters)).await
     }
 
     pub async fn send(&mut self, message: &ServerMessage) -> anyhow::Result<()> {
-        write_frame(&mut self.stream, message).await
+        write_frame_counted(&mut self.stream, message, Some(&self.counters)).await
+    }
+
+    pub fn io_counters(&self) -> IoCounters {
+        self.counters.clone()
     }
 
     pub fn into_stream(self) -> UnixStream {

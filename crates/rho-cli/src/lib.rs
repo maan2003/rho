@@ -6,7 +6,7 @@
 //! `rho-tool-shell` owns the built-in shell/apply_patch tools. Fork this crate
 //! when the desired user experience diverges.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -18,11 +18,12 @@ use rho_cli_term_raw::{
     BlockId, Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
 use rho_core::{
-    ContextBlock, InferenceResponseItem, StreamingContextItem, StreamingContextItemState, ToolCall,
+    ContextBlock, InferenceResponseItem, StreamingContextItem, StreamingContextItemState,
     ToolOutputStatus, ToolResult, text_content,
 };
 use rho_daemon::{DaemonArgs, default_socket_path};
 use rho_inference::{AuthArgs, run_auth_cli};
+use rho_ui_proto::IoCounters;
 use rho_ui_proto::client::{AgentClient, Client as UiClient};
 use tokio::task::JoinHandle;
 
@@ -38,6 +39,10 @@ use completion::completion_candidates;
 use markdown::markdown_block;
 use slash_commands::SlashCommand;
 use tool_render::{ToolRenderStatus, tool_call_block, tool_result_block, tool_status_label};
+
+const UI_IO_BUCKET_SECS: u64 = 1;
+const UI_IO_WINDOW_SECS: u64 = 30;
+const UI_IO_BUCKETS: usize = (UI_IO_WINDOW_SECS / UI_IO_BUCKET_SECS) as usize;
 
 pub fn main() -> Result<()> {
     let args = Args::parse_or_exit(std::env::args().skip(1));
@@ -68,6 +73,7 @@ async fn run(command: Command) -> Result<()> {
 async fn run_interactive(args: ChatArgs) -> Result<()> {
     let term = ChatTerm::new()?;
     let agent = build_agent(&args, Some(term.renderer())).await?;
+    term.start_io_status(agent.io_counters());
     term.print_history(&agent.blocks());
     let mut app = ChatApp {
         agent,
@@ -499,6 +505,77 @@ impl ChatTerm {
     fn set_status(&self, text: &str) {
         set_status_on_handle(&self.handle, text);
     }
+
+    fn start_io_status(&self, counters: IoCounters) {
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let mut tracker = UiIoTracker::new(counters.snapshot());
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(UI_IO_BUCKET_SECS)).await;
+                let rates = tracker.sample(counters.snapshot());
+                if rates.is_zero() {
+                    continue;
+                }
+                set_status_on_handle(
+                    &handle,
+                    &format!(
+                        "io ↑{} ↓{}",
+                        format_io_rate(rates.sent_per_sec),
+                        format_io_rate(rates.received_per_sec)
+                    ),
+                );
+            }
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct UiIoRates {
+    sent_per_sec: u64,
+    received_per_sec: u64,
+}
+
+impl UiIoRates {
+    fn is_zero(self) -> bool {
+        self.sent_per_sec == 0 && self.received_per_sec == 0
+    }
+}
+
+struct UiIoTracker {
+    last: rho_ui_proto::IoStats,
+    buckets: VecDeque<UiIoRates>,
+}
+
+impl UiIoTracker {
+    fn new(initial: rho_ui_proto::IoStats) -> Self {
+        Self {
+            last: initial,
+            buckets: VecDeque::with_capacity(UI_IO_BUCKETS),
+        }
+    }
+
+    fn sample(&mut self, current: rho_ui_proto::IoStats) -> UiIoRates {
+        let rates = UiIoRates {
+            sent_per_sec: current.sent.saturating_sub(self.last.sent) / UI_IO_BUCKET_SECS,
+            received_per_sec: current.received.saturating_sub(self.last.received)
+                / UI_IO_BUCKET_SECS,
+        };
+        self.last = current;
+        if self.buckets.len() == UI_IO_BUCKETS {
+            self.buckets.pop_front();
+        }
+        self.buckets.push_back(rates);
+        self.rolling_max()
+    }
+
+    fn rolling_max(&self) -> UiIoRates {
+        let mut max = UiIoRates::default();
+        for rates in &self.buckets {
+            max.sent_per_sec = max.sent_per_sec.max(rates.sent_per_sec);
+            max.received_per_sec = max.received_per_sec.max(rates.received_per_sec);
+        }
+        max
+    }
 }
 
 fn print_system_on_handle(handle: &TermHandle, text: &str) {
@@ -514,6 +591,29 @@ fn print_system_on_handle(handle: &TermHandle, text: &str) {
 fn set_status_on_handle(handle: &TermHandle, text: &str) {
     handle.set_right_prompt(dim_text(text));
     handle.redraw();
+}
+
+fn format_io_rate(bytes_per_sec: u64) -> String {
+    if bytes_per_sec == 0 {
+        return "0".to_owned();
+    }
+    if bytes_per_sec < 1024 {
+        return format!("{bytes_per_sec}B/s");
+    }
+    if bytes_per_sec < 1024 * 1024 {
+        return format_scaled_io_rate(bytes_per_sec, 1024, "K");
+    }
+    format_scaled_io_rate(bytes_per_sec, 1024 * 1024, "M")
+}
+
+fn format_scaled_io_rate(bytes_per_sec: u64, divisor: u64, suffix: &str) -> String {
+    let whole = bytes_per_sec / divisor;
+    let tenth = bytes_per_sec % divisor * 10 / divisor;
+    if whole < 10 && tenth != 0 {
+        format!("{whole}.{tenth}{suffix}/s")
+    } else {
+        format!("{whole}{suffix}/s")
+    }
 }
 
 #[derive(Default)]
@@ -543,36 +643,33 @@ impl Default for StreamingRenderer {
 
 struct StreamingRenderer {
     handle: Option<TermHandle>,
-    assistant_block: Option<rho_cli_term_raw::BlockId>,
-    thinking_block: Option<rho_cli_term_raw::BlockId>,
-    tool_blocks: BTreeMap<String, rho_cli_term_raw::BlockId>,
+    active_blocks: BTreeMap<usize, rho_cli_term_raw::BlockId>,
     tool_calls: BTreeMap<String, (String, String)>,
+    tool_call_indices: BTreeMap<String, usize>,
     assistant_text: String,
-    thinking_text: String,
+    stream_base_index: usize,
 }
 
 impl StreamingRenderer {
     fn new(handle: TermHandle) -> Self {
         Self {
             handle: Some(handle),
-            assistant_block: None,
-            thinking_block: None,
-            tool_blocks: BTreeMap::new(),
+            active_blocks: BTreeMap::new(),
             tool_calls: BTreeMap::new(),
+            tool_call_indices: BTreeMap::new(),
             assistant_text: String::new(),
-            thinking_text: String::new(),
+            stream_base_index: 0,
         }
     }
 
     fn plain() -> Self {
         Self {
             handle: None,
-            assistant_block: None,
-            thinking_block: None,
-            tool_blocks: BTreeMap::new(),
+            active_blocks: BTreeMap::new(),
             tool_calls: BTreeMap::new(),
+            tool_call_indices: BTreeMap::new(),
             assistant_text: String::new(),
-            thinking_text: String::new(),
+            stream_base_index: 0,
         }
     }
 
@@ -585,14 +682,21 @@ impl StreamingRenderer {
                     if let StreamingContextItemState::Pending(item)
                     | StreamingContextItemState::Finished(item) = slot
                     {
-                        self.render_streaming_item(index, item);
+                        self.render_streaming_item(self.stream_base_index + index, item);
                     }
                 }
+                self.order_active_blocks();
             }
             AgentStateKind::ToolCalling { results, .. } => {
+                self.stream_base_index = self
+                    .active_blocks
+                    .keys()
+                    .next_back()
+                    .map_or(0, |index| index + 1);
                 for result in results {
                     self.render_tool_finished(result);
                 }
+                self.order_active_blocks();
             }
             AgentStateKind::Error(error) => {
                 self.render_notice(&format!("agent error: {}", error.error))
@@ -605,7 +709,7 @@ impl StreamingRenderer {
         }
     }
 
-    fn render_streaming_item(&mut self, _index: usize, item: &StreamingContextItem) {
+    fn render_streaming_item(&mut self, index: usize, item: &StreamingContextItem) {
         match item {
             StreamingContextItem::AssistantMessage { content, .. } => {
                 self.assistant_text = content
@@ -613,10 +717,11 @@ impl StreamingRenderer {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join("");
-                self.render_assistant();
+                let block = assistant_message_block(&self.assistant_text);
+                self.set_index_block(index, "assistant", block);
             }
             StreamingContextItem::RawReasoning { content, summary } => {
-                self.thinking_text = if summary.is_empty() {
+                let thinking_text = if summary.is_empty() {
                     content.to_string()
                 } else {
                     summary
@@ -625,22 +730,33 @@ impl StreamingRenderer {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
-                self.render_thinking();
+                let block = StyledBlock::new(StyledText::from(vec![
+                    Span::new("thinking\n", Style::default().fg(Color::DarkYellow).bold()),
+                    Span::new(thinking_text, Style::default().fg(Color::DarkGrey)),
+                ]));
+                self.set_index_block(index, "thinking", block);
             }
             StreamingContextItem::ToolCall {
                 id,
                 name,
-                tool_type,
+                tool_type: _,
                 arguments,
             } => {
-                self.render_tool_call(&ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    tool_type: *tool_type,
-                    arguments: arguments.to_string(),
-                });
+                self.tool_calls.insert(
+                    id.as_str().to_owned(),
+                    (name.as_str().to_owned(), arguments.to_string()),
+                );
+                self.tool_call_indices.insert(id.as_str().to_owned(), index);
+                let block = tool_call_block(
+                    name.as_str(),
+                    &arguments.to_string(),
+                    ToolRenderStatus::Running,
+                );
+                self.set_index_block(index, "tool", block);
             }
-            StreamingContextItem::Compaction(_) => self.render_notice("compacting context"),
+            StreamingContextItem::Compaction(_) => {
+                self.render_notice("compacting context");
+            }
             StreamingContextItem::EncryptedReasoning { .. } | StreamingContextItem::Unknown(_) => {}
         }
     }
@@ -650,66 +766,32 @@ impl StreamingRenderer {
             self.reset_turn();
             return;
         };
-        if let Some(id) = self.assistant_block.take() {
-            handle.remove_above_active(id);
-            handle.push_history(id);
-        }
-        if let Some(id) = self.thinking_block.take() {
-            handle.remove_above_active(id);
-            handle.push_history(id);
-        }
-        for (_, id) in std::mem::take(&mut self.tool_blocks) {
+        for (_, id) in std::mem::take(&mut self.active_blocks) {
             handle.remove_above_active(id);
             handle.push_history(id);
         }
         self.tool_calls.clear();
+        self.tool_call_indices.clear();
         handle.redraw();
         self.reset_turn();
     }
 
     fn reset_turn(&mut self) {
         self.assistant_text.clear();
-        self.thinking_text.clear();
+        self.stream_base_index = 0;
     }
 
     fn clear(&mut self) {
-        self.assistant_block = None;
-        self.thinking_block = None;
-        self.tool_blocks.clear();
+        self.active_blocks.clear();
         self.tool_calls.clear();
+        self.tool_call_indices.clear();
         self.reset_turn();
     }
 
-    fn render_assistant(&mut self) {
-        let block = assistant_message_block(&self.assistant_text);
-        self.set_active_block(ActiveBlock::Assistant, "assistant", block);
-    }
-
-    fn render_thinking(&mut self) {
-        let block = StyledBlock::new(StyledText::from(vec![
-            Span::new("thinking\n", Style::default().fg(Color::DarkYellow).bold()),
-            Span::new(
-                self.thinking_text.clone(),
-                Style::default().fg(Color::DarkGrey),
-            ),
-        ]));
-        self.set_active_block(ActiveBlock::Thinking, "thinking", block);
-    }
-
-    fn render_tool_call(&mut self, call: &ToolCall) {
-        self.tool_calls.insert(
-            call.id.as_str().to_owned(),
-            (call.name.as_str().to_owned(), call.arguments.clone()),
-        );
-        let block = tool_call_block(
-            call.name.as_str(),
-            &call.arguments,
-            ToolRenderStatus::Running,
-        );
-        self.set_tool_block(call.id.as_str().to_owned(), block);
-    }
-
     fn render_tool_finished(&mut self, result: &ToolResult) {
+        let Some(index) = self.tool_call_indices.get(result.call_id.as_str()).copied() else {
+            return;
+        };
         let output = truncate_display(&result.body.output, 4_000);
         let (name, arguments) = self
             .tool_calls
@@ -717,7 +799,7 @@ impl StreamingRenderer {
             .cloned()
             .unwrap_or_else(|| ("tool".to_owned(), String::new()));
         let block = tool_result_block(&name, &arguments, result.body.status, &output);
-        self.set_tool_block(result.call_id.as_str().to_owned(), block);
+        self.set_index_block(index, "tool", block);
     }
 
     fn render_notice(&mut self, text: &str) {
@@ -733,44 +815,32 @@ impl StreamingRenderer {
         );
     }
 
-    fn set_active_block(&mut self, which: ActiveBlock, debug_id: &'static str, block: StyledBlock) {
+    fn set_index_block(&mut self, index: usize, debug_id: &'static str, block: StyledBlock) {
         let Some(handle) = &self.handle else {
             return;
         };
-        let slot = match which {
-            ActiveBlock::Assistant => &mut self.assistant_block,
-            ActiveBlock::Thinking => &mut self.thinking_block,
-        };
-        match *slot {
+        match self.active_blocks.get(&index).copied() {
             Some(id) => handle.set_block(id, block),
             None => {
                 let id = handle.new_block(debug_id, block);
-                handle.push_above_active(id);
-                *slot = Some(id);
+                self.active_blocks.insert(index, id);
             }
         }
         handle.redraw();
     }
 
-    fn set_tool_block(&mut self, call_id: String, block: StyledBlock) {
+    fn order_active_blocks(&self) {
         let Some(handle) = &self.handle else {
             return;
         };
-        match self.tool_blocks.get(&call_id).copied() {
-            Some(id) => handle.set_block(id, block),
-            None => {
-                let id = handle.new_block("tool", block);
-                handle.push_above_active(id);
-                self.tool_blocks.insert(call_id, id);
-            }
+        for id in self.active_blocks.values().copied() {
+            handle.remove_above_active(id);
+        }
+        for id in self.active_blocks.values().copied() {
+            handle.push_above_active(id);
         }
         handle.redraw();
     }
-}
-
-enum ActiveBlock {
-    Assistant,
-    Thinking,
 }
 
 #[derive(Clone)]

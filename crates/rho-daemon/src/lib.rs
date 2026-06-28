@@ -11,7 +11,7 @@ use rho_inference::InferenceAuth;
 use rho_inference::config::InferenceConfig;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
-use rho_ui_proto::{ClientMessage, ServerMessage, read_frame, write_frame};
+use rho_ui_proto::{ClientMessage, ServerMessage, read_frame_counted, write_frame_counted};
 use tokio::sync::{Notify, mpsc};
 
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
@@ -84,14 +84,19 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 }
 
 async fn serve_connection(agent: Agent, connection: ServerConnection) -> anyhow::Result<()> {
+    let counters = connection.io_counters();
     let stream = connection.into_stream();
     let (reader, writer) = stream.into_split();
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let writer_counters = counters.clone();
     tokio::spawn(async move {
         let mut writer = writer;
         while let Some(message) = outgoing_rx.recv().await {
-            if write_frame(&mut writer, &message).await.is_err() {
+            if write_frame_counted(&mut writer, &message, Some(&writer_counters))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -116,7 +121,7 @@ async fn serve_connection(agent: Agent, connection: ServerConnection) -> anyhow:
 
     let mut reader = reader;
     loop {
-        match read_frame::<_, ClientMessage>(&mut reader).await? {
+        match read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await? {
             ClientMessage::Ping => {
                 let _ = outgoing_tx.send(ServerMessage::Pong);
             }

@@ -6,29 +6,37 @@ use rho_core::{ContentPart, ContextBlock};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
-use crate::{ClientMessage, ServerMessage, read_frame, write_frame};
+use crate::{ClientMessage, IoCounters, ServerMessage, read_frame_counted, write_frame_counted};
 
 /// Raw async client for the rho UI Unix-socket protocol.
 pub struct Client {
     stream: UnixStream,
+    counters: IoCounters,
 }
 
 impl Client {
     pub async fn connect(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let stream = UnixStream::connect(path).await?;
-        Ok(Self { stream })
+        Ok(Self::from_stream(stream))
     }
 
     pub fn from_stream(stream: UnixStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            counters: IoCounters::default(),
+        }
     }
 
     pub async fn send(&mut self, message: &ClientMessage) -> anyhow::Result<()> {
-        write_frame(&mut self.stream, message).await
+        write_frame_counted(&mut self.stream, message, Some(&self.counters)).await
     }
 
     pub async fn recv(&mut self) -> anyhow::Result<ServerMessage> {
-        read_frame(&mut self.stream).await
+        read_frame_counted(&mut self.stream, Some(&self.counters)).await
+    }
+
+    pub fn io_counters(&self) -> IoCounters {
+        self.counters.clone()
     }
 
     pub fn into_stream(self) -> UnixStream {
@@ -42,6 +50,7 @@ impl Client {
 pub struct AgentClient {
     commands: mpsc::UnboundedSender<ClientMessage>,
     state: watch::Receiver<rho_agent::AgentState>,
+    counters: IoCounters,
 }
 
 impl AgentClient {
@@ -50,9 +59,17 @@ impl AgentClient {
     }
 
     pub async fn connect_client(client: Client) -> anyhow::Result<Self> {
+        let client_counters = client.io_counters();
         let mut stream = client.into_stream();
-        write_frame(&mut stream, &ClientMessage::Subscribe).await?;
-        let ServerMessage::Agent(frame) = read_frame(&mut stream).await? else {
+        write_frame_counted(
+            &mut stream,
+            &ClientMessage::Subscribe,
+            Some(&client_counters),
+        )
+        .await?;
+        let ServerMessage::Agent(frame) =
+            read_frame_counted(&mut stream, Some(&client_counters)).await?
+        else {
             anyhow::bail!("rho daemon did not send initial agent state");
         };
         let crate::remote::AgentRemoteFrame::Snapshot(initial_state) = frame else {
@@ -63,11 +80,17 @@ impl AgentClient {
         let (state_tx, state_rx) = watch::channel(initial_state);
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
+        let reader_counters = client_counters.clone();
         tokio::spawn(async move {
             let mut reader = reader;
             let mut state = state_tx.borrow().clone();
             loop {
-                let message = match read_frame::<_, ServerMessage>(&mut reader).await {
+                let message = match read_frame_counted::<_, ServerMessage>(
+                    &mut reader,
+                    Some(&reader_counters),
+                )
+                .await
+                {
                     Ok(message) => message,
                     Err(_) => break,
                 };
@@ -84,10 +107,14 @@ impl AgentClient {
             }
         });
 
+        let writer_counters = client_counters.clone();
         tokio::spawn(async move {
             let mut writer = writer;
             while let Some(message) = command_rx.recv().await {
-                if write_frame(&mut writer, &message).await.is_err() {
+                if write_frame_counted(&mut writer, &message, Some(&writer_counters))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -96,7 +123,12 @@ impl AgentClient {
         Ok(Self {
             commands: command_tx,
             state: state_rx,
+            counters: client_counters,
         })
+    }
+
+    pub fn io_counters(&self) -> IoCounters {
+        self.counters.clone()
     }
 
     pub fn blocks(&self) -> Vec<Arc<ContextBlock>> {
