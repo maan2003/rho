@@ -8,6 +8,8 @@
 //!   types each have their own tag(s).
 //! - Tags are stable and part of the wire format.
 
+use std::num::NonZeroU64;
+
 use crate::*;
 
 ///< 0 for numbers, false for bool
@@ -1158,10 +1160,41 @@ impl Unpacker for f64 {
     }
 }
 
+// --- NonZeroU64 ---
+impl Encoder for NonZeroU64 {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        self.get().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        false
+    }
+}
+
+impl Packer for NonZeroU64 {
+    fn pack(&self, writer: &mut BytesMut) -> Result<()> {
+        self.get().pack(writer)
+    }
+}
+
+impl Decoder for NonZeroU64 {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        NonZeroU64::new(u64::decode(reader)?)
+            .ok_or_else(|| EncoderError::Decode("NonZeroU64 cannot be zero".to_owned()))
+    }
+}
+
+impl Unpacker for NonZeroU64 {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
+        NonZeroU64::new(u64::unpack(reader)?)
+            .ok_or_else(|| EncoderError::Decode("NonZeroU64 cannot be zero".to_owned()))
+    }
+}
+
 // --- String ---
-/// Encodes a `String` as UTF-8 with a length prefix (short strings use a single
+/// Encodes a string as UTF-8 with a length prefix (short strings use a single
 /// tag byte).
-impl Encoder for String {
+impl Encoder for str {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
         let len = self.len();
         let max_short = (TAG_STRING_LONG - TAG_STRING_BASE - 1) as usize;
@@ -1182,9 +1215,25 @@ impl Encoder for String {
     }
 }
 
-impl Packer for String {
+impl Packer for str {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
         self.encode(writer)
+    }
+}
+
+impl Encoder for String {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        self.as_str().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl Packer for String {
+    fn pack(&self, writer: &mut BytesMut) -> Result<()> {
+        self.as_str().pack(writer)
     }
 }
 
@@ -2147,6 +2196,44 @@ impl<T: Encoder> Encoder for Arc<T> {
 
     fn is_default(&self) -> bool {
         T::is_default(self)
+    }
+}
+
+impl<T: Encoder + 'static> Encoder for Arc<[T]> {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        encode_vec_length(self.len(), writer)?;
+        for item in self.iter() {
+            item.encode(writer)?;
+        }
+        Ok(())
+    }
+
+    fn is_default(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl<T: Packer + 'static> Packer for Arc<[T]> {
+    fn pack(&self, writer: &mut BytesMut) -> Result<()> {
+        encode_vec_length(self.len(), writer)?;
+        for item in self.iter() {
+            item.pack(writer)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: Decoder + 'static> Decoder for Arc<[T]> {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        let values = Vec::<T>::decode(reader)?;
+        Ok(values.into())
+    }
+}
+
+impl<T: Unpacker + 'static> Unpacker for Arc<[T]> {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
+        let values = Vec::<T>::unpack(reader)?;
+        Ok(values.into())
     }
 }
 

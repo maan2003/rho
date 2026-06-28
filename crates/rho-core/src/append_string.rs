@@ -1,6 +1,9 @@
 /// Append only string, allowing more efficient cloning
 use std::sync::{Arc, RwLock};
 
+use bytes::{Buf, BytesMut};
+use senax_encoder::{Decoder, Encoder, Packer, Result};
+
 pub struct AppendString {
     shared: Arc<Shared>,
 }
@@ -75,6 +78,28 @@ impl std::fmt::Display for AStr {
 impl std::fmt::Debug for AStr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.with_str(|s| std::fmt::Debug::fmt(s, f))
+    }
+}
+
+impl Encoder for AStr {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        self.with_str(|value| value.encode(writer))
+    }
+
+    fn is_default(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl Packer for AStr {
+    fn pack(&self, writer: &mut BytesMut) -> Result<()> {
+        self.with_str(|value| value.pack(writer))
+    }
+}
+
+impl Decoder for AStr {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        Ok(String::decode(reader)?.into())
     }
 }
 

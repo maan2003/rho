@@ -10,10 +10,10 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use rho_agent::{Agent, AgentStateKind};
+use rho_agent::AgentStateKind;
 use rho_cli_term_raw::{
     BlockId, Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
@@ -21,9 +21,9 @@ use rho_core::{
     ContextBlock, InferenceResponseItem, StreamingContextItem, StreamingContextItemState, ToolCall,
     ToolOutputStatus, ToolResult, text_content,
 };
-use rho_db::RhoDb;
-use rho_inference::config::InferenceConfig;
-use rho_inference::{AuthArgs, InferenceAuth, run_auth_cli};
+use rho_daemon::{DaemonArgs, default_socket_path};
+use rho_inference::{AuthArgs, run_auth_cli};
+use rho_ui_proto::client::{AgentClient, Client as UiClient};
 use tokio::task::JoinHandle;
 
 mod completion;
@@ -61,6 +61,7 @@ async fn run(command: Command) -> Result<()> {
             run_auth_cli(auth)?;
             Ok(())
         }
+        Command::Daemon(args) => rho_daemon::run(args).await,
     }
 }
 
@@ -101,13 +102,12 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
     Ok(())
 }
 
-async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<Agent> {
-    let db = RhoDb::open(rho_db_path()?);
-    let auth = InferenceAuth::named(&args.auth)?;
-    let config = InferenceConfig::deep();
-    let agent = Agent::create(db, auth, config, None).await;
+async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<AgentClient> {
+    let socket_path = default_socket_path()?;
+    let client =
+        AgentClient::connect_client(connect_or_start_daemon(&socket_path, args).await?).await?;
     if renderer.is_some() {
-        let changes = agent.subscribe();
+        let changes = client.subscribe();
         tokio::spawn(async move {
             futures::pin_mut!(changes);
             while let Some(state) = changes.next().await {
@@ -119,16 +119,42 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
             }
         });
     }
-    Ok(agent)
+    Ok(client)
 }
 
-fn rho_db_path() -> Result<std::path::PathBuf> {
-    let base = dirs::state_dir().ok_or_else(|| anyhow!("state directory not available"))?;
-    Ok(base.join("rho").join("rho.redb"))
+async fn connect_or_start_daemon(
+    socket_path: &std::path::Path,
+    args: &ChatArgs,
+) -> Result<UiClient> {
+    if let Ok(client) = UiClient::connect(socket_path).await {
+        return Ok(client);
+    }
+
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .arg("--auth")
+        .arg(&args.auth)
+        .arg("--socket-path")
+        .arg(socket_path)
+        .arg("--die-on-detached")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match UiClient::connect(socket_path).await {
+            Ok(client) => return Ok(client),
+            Err(error) if tokio::time::Instant::now() >= deadline => return Err(error.into()),
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
 }
 
 struct ChatApp {
-    agent: Agent,
+    agent: AgentClient,
     running_turn: Option<JoinHandle<()>>,
     term: ChatTerm,
 }
@@ -259,7 +285,7 @@ impl ChatApp {
     }
 }
 
-async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>) {
+async fn watch_agent(agent: &AgentClient, renderer: Option<UpdateRenderer>) {
     let changes = agent.subscribe();
     futures::pin_mut!(changes);
     let started_blocks = agent.blocks().len();
@@ -289,7 +315,7 @@ async fn watch_agent(agent: &Agent, renderer: Option<UpdateRenderer>) {
     }
 }
 
-async fn wait_idle(agent: &Agent) {
+async fn wait_idle(agent: &AgentClient) {
     watch_agent(agent, None).await;
 }
 
@@ -297,7 +323,7 @@ async fn wait_idle(agent: &Agent) {
 /// renderer and reset the status. The turn's outcome (including any error)
 /// lands in the conversation, so there is nothing to return.
 fn spawn_turn_watcher(
-    agent: Agent,
+    agent: AgentClient,
     renderer: UpdateRenderer,
     handle: TermHandle,
 ) -> JoinHandle<()> {
@@ -756,6 +782,7 @@ struct Args {
 enum Command {
     Chat(ChatArgs),
     Auth(AuthArgs),
+    Daemon(DaemonArgs),
 }
 
 #[derive(Parser)]
@@ -774,6 +801,7 @@ enum CliCommand {
         #[command(subcommand)]
         command: AuthArgs,
     },
+    Daemon(DaemonArgs),
 }
 
 #[derive(Clone, clap::Args)]
@@ -793,6 +821,7 @@ impl Args {
         let cli = Cli::try_parse_from(std::iter::once("rho".to_owned()).chain(args))?;
         let command = match cli.command {
             Some(CliCommand::Auth { command }) => Command::Auth(command),
+            Some(CliCommand::Daemon(args)) => Command::Daemon(args),
             None => Command::Chat(cli.chat),
         };
         Ok(Self { command })

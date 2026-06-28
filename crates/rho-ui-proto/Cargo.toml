@@ -1,0 +1,18 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "rho-ui-proto"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+rho-agent.workspace = true
+rho-core.workspace = true
+senax-encoder.workspace = true
+tokio.workspace = true

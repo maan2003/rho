@@ -39,7 +39,7 @@ pub enum AgentEvent<'a> {
 }
 
 /// Live runtime state of an agent turn.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 // should be cheap to clone, it is cloned a lot
 pub struct AgentState {
     /// Invariant: append-only. Blocks are only ever pushed — never removed,
@@ -51,7 +51,7 @@ pub struct AgentState {
     pub kind: AgentStateKind,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 // should be cheap to clone, it is cloned a lot
 pub enum AgentStateKind {
     ApiStreaming {
@@ -81,11 +81,11 @@ pub enum AgentStateKind {
     Idle,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct FailedInferenceResponse {
     pub partial_response: PendingInferenceResponse,
     pub attempt_count: NonZeroU64,
-    pub error: Arc<anyhow::Error>,
+    pub error: Arc<String>,
 }
 
 /// Cheap handle for observing and controlling the agent loop.
@@ -409,7 +409,7 @@ impl AgentLoop {
                                 previous_attempt: Some(FailedInferenceResponse {
                                     attempt_count,
                                     partial_response: pending_response,
-                                    error,
+                                    error: Arc::new(error.to_string()),
                                 }),
                             };
                         }
@@ -419,7 +419,7 @@ impl AgentLoop {
                             state.kind = AgentStateKind::Error(FailedInferenceResponse {
                                 partial_response: pending_response,
                                 attempt_count,
-                                error,
+                                error: Arc::new(error.to_string()),
                             });
                         }
                         InferenceEvent::Finished {
@@ -432,7 +432,7 @@ impl AgentLoop {
                                 state.kind = AgentStateKind::Error(FailedInferenceResponse {
                                     partial_response: pending_response,
                                     attempt_count,
-                                    error: Arc::new(error),
+                                    error: Arc::new(error.to_string()),
                                 });
                             }
                             Ok(items) => {

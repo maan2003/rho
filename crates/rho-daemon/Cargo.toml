@@ -1,29 +1,20 @@
 [package]
-name = "rho-cli"
-version.workspace = true
 edition.workspace = true
 license.workspace = true
+name = "rho-daemon"
+readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-stream.workspace = true
 clap.workspace = true
 dirs.workspace = true
 futures.workspace = true
-rho-core.workspace = true
-rho-daemon.workspace = true
 rho-agent.workspace = true
-rho-cli-term-raw.workspace = true
+rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
-rho-tool-shell.workspace = true
 rho-ui-proto.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
-tracing.workspace = true
-
-[[bin]]
-name = "rho"
-path = "src/main.rs"

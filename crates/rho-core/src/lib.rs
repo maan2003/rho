@@ -85,7 +85,7 @@ pub enum MessagePhase {
     FinalAnswer,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ToolSpec {
     pub name: ToolName,
     pub tool_type: ToolType,
@@ -133,14 +133,14 @@ pub enum ToolType {
     Custom,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolGrammarSyntax {
     Lark,
     Regex,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolFormat {
     Text,
@@ -188,7 +188,7 @@ pub struct InferenceRequest {
     pub tools: Arc<[ToolSpec]>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum StreamingContextItem {
     AssistantMessage {
         content: Vec<AStr>,
@@ -262,14 +262,14 @@ impl StreamingContextItem {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum StreamingContextItemState {
     Empty,
     Pending(StreamingContextItem),
     Finished(StreamingContextItem),
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Encode, Decode)]
 pub struct PendingInferenceResponse {
     pub items: Vec<StreamingContextItemState>,
 }

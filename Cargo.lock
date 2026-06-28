@@ -1347,15 +1347,18 @@ name = "rho-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "clap",
  "dirs",
  "futures",
  "rho-agent",
  "rho-cli-term-raw",
  "rho-core",
+ "rho-daemon",
  "rho-db",
  "rho-inference",
  "rho-tool-shell",
+ "rho-ui-proto",
  "serde_json",
  "tokio",
  "tracing",
@@ -1383,6 +1386,22 @@ dependencies = [
  "senax-encoder",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rho-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
+ "futures",
+ "rho-agent",
+ "rho-core",
+ "rho-db",
+ "rho-inference",
+ "rho-ui-proto",
+ "tokio",
 ]
 
 [[package]]
@@ -1443,6 +1462,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rho-ui-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "bytes",
+ "futures",
+ "rho-agent",
+ "rho-core",
+ "senax-encoder",
  "tokio",
 ]
 
