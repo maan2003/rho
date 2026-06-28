@@ -379,11 +379,10 @@ impl AgentLoop {
                     }
                 }
                 update = self.inference_session.run() => {
-                    let kind = std::mem::replace(&mut state.kind, AgentStateKind::Idle);
                     let AgentStateKind::ApiStreaming {
                         mut pending_response,
                         previous_attempt,
-                    } = kind
+                    } = state.kind
                     else {
                         unreachable!("provider streamed outside ApiStreaming");
                     };
@@ -484,8 +483,7 @@ impl AgentLoop {
                     }
                 }
                 Some(result) = self.pending_tools.next() => {
-                    let kind = std::mem::replace(&mut state.kind, AgentStateKind::Idle);
-                    let AgentStateKind::ToolCalling { mut results } = kind else {
+                    let AgentStateKind::ToolCalling { mut results } = state.kind else {
                         unreachable!("tool finished outside ToolCalling");
                     };
                     results.push(result);
