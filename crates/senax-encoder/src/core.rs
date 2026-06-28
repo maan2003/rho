@@ -1,9 +1,11 @@
 //! Type tags used in the senax binary format.
 //!
-//! These tags are written as the first byte of each encoded value to identify its type and optimize decoding.
-//! Most users do not need to use these directly.
+//! These tags are written as the first byte of each encoded value to identify
+//! its type and optimize decoding. Most users do not need to use these
+//! directly.
 //!
-//! - Primitives, Option, String, Vec, arrays, maps, structs, enums, and feature types each have their own tag(s).
+//! - Primitives, Option, String, Vec, arrays, maps, structs, enums, and feature
+//!   types each have their own tag(s).
 //! - Tags are stable and part of the wire format.
 
 use crate::*;
@@ -42,9 +44,11 @@ pub const TAG_ENUM: u8 = 185;
 pub const TAG_ENUM_NAMED: u8 = 186;
 ///< Enum with tuple fields
 pub const TAG_ENUM_UNNAMED: u8 = 187;
-///< Short array/vec/set (length in tag) - includes HashSet, BTreeSet, IndexSet, FxHashSet, AHashSet
+///< Short array/vec/set (length in tag) - includes HashSet, BTreeSet,
+/// IndexSet, FxHashSet, AHashSet
 pub const TAG_ARRAY_VEC_SET_BASE: u8 = 188;
-///< Long array/vec/set (length encoded) - includes HashSet, BTreeSet, IndexSet, FxHashSet, AHashSet
+///< Long array/vec/set (length encoded) - includes HashSet, BTreeSet,
+/// IndexSet, FxHashSet, AHashSet
 pub const TAG_ARRAY_VEC_SET_LONG: u8 = 194;
 ///< Tuple
 pub const TAG_TUPLE: u8 = 195;
@@ -70,7 +74,8 @@ pub const TAG_JSON_ARRAY: u8 = 206;
 pub const TAG_JSON_OBJECT: u8 = 207;
 
 // --- bool ---
-/// Encodes a `bool` as a single tag byte: `TAG_ZERO` for `false`, `TAG_ONE` for `true`.
+/// Encodes a `bool` as a single tag byte: `TAG_ZERO` for `false`, `TAG_ONE` for
+/// `true`.
 impl Encoder for bool {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
         let tag = if !*self { TAG_ZERO } else { TAG_ONE }; // 0: false, 1: true
@@ -83,7 +88,8 @@ impl Encoder for bool {
     }
 }
 
-/// Packs a `bool` as a single tag byte: `TAG_ZERO` for `false`, `TAG_ONE` for `true`.
+/// Packs a `bool` as a single tag byte: `TAG_ZERO` for `false`, `TAG_ONE` for
+/// `true`.
 impl Packer for bool {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
         let tag = if !*self { TAG_ZERO } else { TAG_ONE }; // 0: false, 1: true
@@ -278,7 +284,8 @@ fn decode_u128_from_tag(tag: u8, reader: &mut impl Buf) -> Result<u128> {
 ///
 /// - Values 0/1 are encoded as `TAG_ZERO`/`TAG_ONE` (1 byte)
 /// - 2..=127 are encoded as a single tag byte (1 byte)
-/// - Larger values use `TAG_U8`, `TAG_U16`, `TAG_U32`, `TAG_U64`, or `TAG_U128` with the value in little-endian
+/// - Larger values use `TAG_U8`, `TAG_U16`, `TAG_U32`, `TAG_U64`, or `TAG_U128`
+///   with the value in little-endian
 /// - The encoding is stable and compatible across platforms
 impl Encoder for u8 {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
@@ -510,7 +517,8 @@ impl Unpacker for u128 {
     }
 }
 
-/// Encodes `usize` using the platform's pointer width, but always as a portable integer format.
+/// Encodes `usize` using the platform's pointer width, but always as a portable
+/// integer format.
 impl Encoder for usize {
     #[inline]
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
@@ -939,7 +947,8 @@ impl Unpacker for char {
 /// Encodes an `f32` as a scientific notation string.
 ///
 /// Note: Pack/Unpack still uses binary format for efficiency.
-/// The string format provides better compatibility and readability for Encode/Decode.
+/// The string format provides better compatibility and readability for
+/// Encode/Decode.
 impl Encoder for f32 {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
         let s = format!("{:e}", self);
@@ -964,7 +973,8 @@ impl Packer for f32 {
     }
 }
 
-/// Decodes an `f32` from a scientific notation string, legacy binary format, or i128.
+/// Decodes an `f32` from a scientific notation string, legacy binary format, or
+/// i128.
 ///
 /// This decoder supports:
 /// - New string format (TAG_STRING_BASE..TAG_STRING_LONG)
@@ -1019,7 +1029,8 @@ impl Decoder for f32 {
 }
 
 impl Unpacker for f32 {
-    /// Unpacks an `f32` from either TAG_NONE (0.0) or TAG_F32 + 4 bytes (little-endian IEEE 754).
+    /// Unpacks an `f32` from either TAG_NONE (0.0) or TAG_F32 + 4 bytes
+    /// (little-endian IEEE 754).
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
@@ -1046,7 +1057,8 @@ impl Unpacker for f32 {
 /// Encodes an `f64` as a scientific notation string.
 ///
 /// Note: Pack/Unpack still uses binary format for efficiency.
-/// The string format provides better compatibility and readability for Encode/Decode.
+/// The string format provides better compatibility and readability for
+/// Encode/Decode.
 impl Encoder for f64 {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
         let s = format!("{:e}", self);
@@ -1059,7 +1071,8 @@ impl Encoder for f64 {
 }
 
 impl Packer for f64 {
-    /// Packs an `f64` as TAG_NONE (for 0.0) or TAG_F64 + 8 bytes (little-endian IEEE 754).
+    /// Packs an `f64` as TAG_NONE (for 0.0) or TAG_F64 + 8 bytes (little-endian
+    /// IEEE 754).
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
         if *self == 0.0 {
             writer.put_u8(TAG_NONE);
@@ -1071,7 +1084,8 @@ impl Packer for f64 {
     }
 }
 
-/// Decodes an `f64` from a scientific notation string, legacy binary format, or i128.
+/// Decodes an `f64` from a scientific notation string, legacy binary format, or
+/// i128.
 ///
 /// This decoder supports:
 /// - New string format (TAG_STRING_BASE..TAG_STRING_LONG)
@@ -1119,7 +1133,8 @@ impl Decoder for f64 {
 }
 
 impl Unpacker for f64 {
-    /// Unpacks an `f64` from either TAG_NONE (0.0) or TAG_F64 + 8 bytes (little-endian IEEE 754).
+    /// Unpacks an `f64` from either TAG_NONE (0.0) or TAG_F64 + 8 bytes
+    /// (little-endian IEEE 754).
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
         if reader.remaining() == 0 {
             return Err(EncoderError::InsufficientData);
@@ -1144,7 +1159,8 @@ impl Unpacker for f64 {
 }
 
 // --- String ---
-/// Encodes a `String` as UTF-8 with a length prefix (short strings use a single tag byte).
+/// Encodes a `String` as UTF-8 with a length prefix (short strings use a single
+/// tag byte).
 impl Encoder for String {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
         let len = self.len();
@@ -1651,7 +1667,8 @@ pub fn read_u64_le(reader: &mut impl Buf) -> Result<u64> {
 
 /// Skips a value of any type in the senax binary format.
 ///
-/// This is used for forward/backward compatibility when unknown fields/variants are encountered.
+/// This is used for forward/backward compatibility when unknown fields/variants
+/// are encountered.
 ///
 /// # Errors
 /// Returns an error if the value cannot be skipped (e.g., insufficient data).

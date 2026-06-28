@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+
 use rho_core::ContentPart;
-use rho_db::RhoDb;
+use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
 use rho_inference::config::InferenceConfig;
 
@@ -19,8 +21,8 @@ async fn agent_event_positions_sort_by_lineage_then_seq() {
                     lineage_id: AgentLineageId(7),
                     seq,
                 },
-                Sen(AgentEvent::UserMessage {
-                    content: Vec::new(),
+                SenValue::owned(AgentEvent::UserMessage {
+                    content: Cow::Owned(Vec::new()),
                 }),
             );
         }
@@ -59,18 +61,18 @@ async fn create_agent_and_append_events_with_cursor() {
     );
     let next = write.append_agent_event(
         next,
-        AgentEvent::UserMessage {
-            content: vec![ContentPart::Text {
+        &AgentEvent::UserMessage {
+            content: Cow::Owned(vec![ContentPart::Text {
                 text: "hello".to_owned(),
-            }],
+            }]),
         },
     );
     write.append_agent_event(
         next,
-        AgentEvent::UserMessage {
-            content: vec![ContentPart::Text {
+        &AgentEvent::UserMessage {
+            content: Cow::Owned(vec![ContentPart::Text {
                 text: "again".to_owned(),
-            }],
+            }]),
         },
     );
     write.commit();
@@ -85,9 +87,9 @@ async fn create_agent_and_append_events_with_cursor() {
     assert_eq!(
         events[0],
         AgentEvent::UserMessage {
-            content: vec![ContentPart::Text {
+            content: Cow::Owned(vec![ContentPart::Text {
                 text: "hello".to_owned(),
-            }],
+            }]),
         }
     );
 }
@@ -106,18 +108,18 @@ async fn agent_events_read_lineage_parents() {
     );
     let fork_at = write.append_agent_event(
         next,
-        AgentEvent::UserMessage {
-            content: vec![ContentPart::Text {
+        &AgentEvent::UserMessage {
+            content: Cow::Owned(vec![ContentPart::Text {
                 text: "parent".to_owned(),
-            }],
+            }]),
         },
     );
     write.append_agent_event(
         fork_at,
-        AgentEvent::UserMessage {
-            content: vec![ContentPart::Text {
+        &AgentEvent::UserMessage {
+            content: Cow::Owned(vec![ContentPart::Text {
                 text: "sibling".to_owned(),
-            }],
+            }]),
         },
     );
 
@@ -129,16 +131,16 @@ async fn agent_events_read_lineage_parents() {
     }
     {
         let mut agents = write.open_table(AGENTS);
-        let mut agent = agents.get(&agent_id).unwrap().value().0;
+        let mut agent = agents.get(&agent_id).unwrap().value().into_owned();
         agent.current_lineage = child_lineage;
-        agents.insert(&agent_id, Sen(agent));
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
     write.append_agent_event(
         AgentEventPos::root(child_lineage),
-        AgentEvent::UserMessage {
-            content: vec![ContentPart::Text {
+        &AgentEvent::UserMessage {
+            content: Cow::Owned(vec![ContentPart::Text {
                 text: "child".to_owned(),
-            }],
+            }]),
         },
     );
     write.commit();

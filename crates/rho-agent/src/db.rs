@@ -2,7 +2,7 @@
 
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
-use rho_db::{ReadTxn, Sen, WriteTxn};
+use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
 use rho_inference::config::InferenceProtectedConfig;
 use senax_encoder::{Decode, Encode};
@@ -12,7 +12,7 @@ use crate::AgentEvent;
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentEventPos> =
     TableDefinition::new("lineage_parents");
-const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent>> =
+const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
     TableDefinition::new("agent_events");
 const AGENTS: TableDefinition<AgentId, Sen<AgentRecord>> = TableDefinition::new("agents");
 
@@ -87,7 +87,7 @@ pub struct AgentRecord {
 
 pub trait AgentReadTxnExt {
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
-    fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent>);
+    fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
 }
 
 pub trait AgentWriteTxnExt {
@@ -99,7 +99,7 @@ pub trait AgentWriteTxnExt {
         config: InferenceProtectedConfig,
     ) -> (AgentId, AgentEventPos);
 
-    fn append_agent_event(&mut self, at: AgentEventPos, event: AgentEvent) -> AgentEventPos;
+    fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos;
 }
 
 impl AgentReadTxnExt for ReadTxn {
@@ -108,10 +108,10 @@ impl AgentReadTxnExt for ReadTxn {
             .get(&agent_id)
             .expect("agent id missing")
             .value()
-            .0
+            .into_owned()
     }
 
-    fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent>) {
+    fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>) {
         let agent = self.get_agent(agent_id);
         let mut segments = Vec::new();
         let mut lineage_id = agent.current_lineage;
@@ -146,7 +146,7 @@ impl AgentReadTxnExt for ReadTxn {
                 if is_current_lineage {
                     next = key.next();
                 }
-                events.push(value.value().0);
+                events.push(value.value().into_owned());
             }
         }
         (next, events)
@@ -173,12 +173,14 @@ impl AgentWriteTxnExt for WriteTxn {
             prompt_cache_key,
             config,
         };
-        self.open_table(AGENTS).insert(&agent_id, Sen(agent));
+        self.open_table(AGENTS)
+            .insert(&agent_id, SenValue::borrowed(&agent));
         (agent_id, AgentEventPos::root(lineage_id))
     }
 
-    fn append_agent_event(&mut self, at: AgentEventPos, event: AgentEvent) -> AgentEventPos {
-        self.open_table(AGENT_EVENTS).insert(&at, Sen(event));
+    fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos {
+        self.open_table(AGENT_EVENTS)
+            .insert(&at, SenValue::borrowed(event));
         at.next()
     }
 }

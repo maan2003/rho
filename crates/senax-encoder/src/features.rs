@@ -127,7 +127,8 @@ impl<K: Unpacker + Eq + std::hash::Hash, V: Unpacker> Unpacker for IndexMap<K, V
 }
 
 // --- DateTime<Utc> ---
-/// Encodes a `chrono::DateTime<Utc>` as seconds and nanoseconds since the Unix epoch.
+/// Encodes a `chrono::DateTime<Utc>` as seconds and nanoseconds since the Unix
+/// epoch.
 #[cfg(feature = "chrono")]
 impl Encoder for DateTime<Utc> {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
@@ -168,7 +169,8 @@ impl Decoder for DateTime<Utc> {
     }
 }
 
-/// Packs a `chrono::DateTime<Utc>` as seconds and nanoseconds without a type tag.
+/// Packs a `chrono::DateTime<Utc>` as seconds and nanoseconds without a type
+/// tag.
 #[cfg(feature = "chrono")]
 impl Packer for DateTime<Utc> {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
@@ -255,7 +257,8 @@ impl Decoder for DateTime<Local> {
     }
 }
 
-/// Packs a `chrono::DateTime<Local>` as seconds and nanoseconds without a type tag.
+/// Packs a `chrono::DateTime<Local>` as seconds and nanoseconds without a type
+/// tag.
 #[cfg(feature = "chrono")]
 impl Packer for DateTime<Local> {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
@@ -549,7 +552,8 @@ impl Encoder for Decimal {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
         // Convert to string and encode as STRING
         // Note: Pack/Unpack still uses binary format for efficiency.
-        // The string format provides better compatibility and readability for Encode/Decode.
+        // The string format provides better compatibility and readability for
+        // Encode/Decode.
         let s = self.to_string();
         s.encode(writer)
     }
@@ -751,7 +755,7 @@ impl Unpacker for Uuid {
 impl Encoder for Ulid {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
         writer.put_u8(TAG_UUID); // Use same tag as UUID
-                                 // Write ULID as u128 little-endian in fixed 16 bytes
+        // Write ULID as u128 little-endian in fixed 16 bytes
         let ulid_u128 = self.0;
         writer.put_u128_le(ulid_u128);
         Ok(())
@@ -768,7 +772,7 @@ impl Packer for Ulid {
             writer.put_u8(TAG_NONE);
         } else {
             writer.put_u8(TAG_UUID); // Use same tag as UUID
-                                     // Write ULID as u128 little-endian in fixed 16 bytes
+            // Write ULID as u128 little-endian in fixed 16 bytes
             let ulid_u128 = self.0;
             writer.put_u128_le(ulid_u128);
         }

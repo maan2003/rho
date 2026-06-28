@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 
@@ -7,7 +8,7 @@ use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt};
 use rho_core::{
     ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
-    PendingInferenceResponse, ToolCall, ToolResult, ToolSpec,
+    PendingInferenceResponse, ProviderResponseId, ToolCall, ToolResult, ToolSpec,
 };
 use rho_db::RhoDb;
 use rho_inference::config::InferenceConfig;
@@ -24,16 +25,16 @@ pub mod db;
 /// runtime-only events, like tool output chunks, can live here without becoming
 /// inference input.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum AgentEvent {
+pub enum AgentEvent<'a> {
     UserMessage {
-        content: Vec<ContentPart>,
+        content: Cow<'a, [ContentPart]>,
     },
     InferenceResponse {
-        items: Vec<InferenceResponseItem>,
-        provider_response_id: Option<rho_core::ProviderResponseId>,
+        items: Cow<'a, [InferenceResponseItem]>,
+        provider_response_id: Option<ProviderResponseId>,
     },
     ToolResult {
-        result: ToolResult,
+        result: Cow<'a, ToolResult>,
     },
 }
 
@@ -168,7 +169,9 @@ impl Agent {
             match event {
                 AgentEvent::UserMessage { content } => {
                     commit_finished_turn(&mut turn, &mut blocks);
-                    blocks.push(Arc::new(ContextBlock::UserMessage { content }));
+                    blocks.push(Arc::new(ContextBlock::UserMessage {
+                        content: content.into_owned(),
+                    }));
                 }
                 AgentEvent::InferenceResponse {
                     items,
@@ -199,7 +202,7 @@ impl Agent {
                         });
                     }
                     blocks.push(Arc::new(ContextBlock::InferenceResponse {
-                        items,
+                        items: items.into_owned(),
                         provider_response_id,
                     }));
                 }
@@ -209,7 +212,7 @@ impl Agent {
                     };
                     turn.outstanding_calls
                         .retain(|call| call.id != result.call_id);
-                    turn.completed_tool_calls.push(result);
+                    turn.completed_tool_calls.push(result.into_owned());
                 }
             }
         }
@@ -331,11 +334,11 @@ impl AgentLoop {
     async fn run(mut self) {
         loop {
             let mut state = self.state.read().expect("poison").clone();
-            let mut persist_event = async |event: AgentEvent| {
+            let mut persist_event = async |event: AgentEvent<'_>| {
                 if let Some(persistence) = &mut self.persistence {
                     let mut write = persistence.db.write().await;
                     persistence.next_event =
-                        write.append_agent_event(persistence.next_event, event);
+                        write.append_agent_event(persistence.next_event, &event);
                     write.commit();
                 }
             };
@@ -352,7 +355,7 @@ impl AgentLoop {
                             self.pending_tools.clear();
 
                             persist_event(AgentEvent::UserMessage {
-                                content: content.clone(),
+                                content: Cow::Borrowed(&content),
                             })
                             .await;
                             state
@@ -452,7 +455,7 @@ impl AgentLoop {
                                     })
                                     .collect();
                                 persist_event(AgentEvent::InferenceResponse {
-                                    items: items.clone(),
+                                    items: Cow::Borrowed(&items),
                                     provider_response_id: provider_response_id.clone(),
                                 })
                                 .await;
@@ -489,7 +492,7 @@ impl AgentLoop {
                     if self.pending_tools.is_empty() {
                         for result in &results {
                             persist_event(AgentEvent::ToolResult {
-                                result: result.clone(),
+                                result: Cow::Borrowed(result),
                             })
                             .await;
                         }

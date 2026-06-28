@@ -1,9 +1,13 @@
 //! # senax-encoder
 //!
-//! A fast, compact, and schema-evolution-friendly binary serialization library for Rust.
+//! A fast, compact, and schema-evolution-friendly binary serialization library
+//! for Rust.
 //!
-//! - Supports struct/enum encoding with field/variant IDs for forward/backward compatibility
-//! - Efficient encoding for primitives, collections, Option, String, bytes, and popular crates (chrono, uuid, ulid, rust_decimal, bigdecimal, indexmap, fxhash, ahash, smol_str, serde_json)
+//! - Supports struct/enum encoding with field/variant IDs for forward/backward
+//!   compatibility
+//! - Efficient encoding for primitives, collections, Option, String, bytes, and
+//!   popular crates (chrono, uuid, ulid, rust_decimal, bigdecimal, indexmap,
+//!   fxhash, ahash, smol_str, serde_json)
 //! - Custom derive macros for ergonomic usage
 //! - Feature-gated support for optional dependencies
 //!
@@ -17,38 +21,57 @@
 //!
 //! You can control encoding/decoding behavior using the following attributes:
 //!
-//! - `#[senax(id = N)]` — Assigns a custom field or variant ID (u64). Ensures stable wire format across versions.
-//! - `#[senax(default)]` — If a field is missing during decoding, its value is set to `Default::default()` instead of causing an error. For `Option<T>`, this means `None`.
-//! - `#[senax(skip_encode)]` — This field is not written during encoding. On decode, it is set to `Default::default()`.
-//! - `#[senax(skip_decode)]` — This field is ignored during decoding and always set to `Default::default()`. It is still encoded if present.
-//! - `#[senax(skip_default)]` — This field is not written during encoding if its value equals the default value. On decode, missing fields are set to `Default::default()`.
-//! - `#[senax(rename = "name")]` — Use the given string as the logical field/variant name for ID calculation. Useful for renaming fields/variants while keeping the same wire format.
+//! - `#[senax(id = N)]` — Assigns a custom field or variant ID (u64). Ensures
+//!   stable wire format across versions.
+//! - `#[senax(default)]` — If a field is missing during decoding, its value is
+//!   set to `Default::default()` instead of causing an error. For `Option<T>`,
+//!   this means `None`.
+//! - `#[senax(skip_encode)]` — This field is not written during encoding. On
+//!   decode, it is set to `Default::default()`.
+//! - `#[senax(skip_decode)]` — This field is ignored during decoding and always
+//!   set to `Default::default()`. It is still encoded if present.
+//! - `#[senax(skip_default)]` — This field is not written during encoding if
+//!   its value equals the default value. On decode, missing fields are set to
+//!   `Default::default()`.
+//! - `#[senax(rename = "name")]` — Use the given string as the logical
+//!   field/variant name for ID calculation. Useful for renaming fields/variants
+//!   while keeping the same wire format.
 //!
 //! ## Feature Flags
 //!
 //! The following optional features enable support for popular crates and types:
 //!
 //! ### External Crate Support
-//! - `chrono` — Enables encoding/decoding of `chrono::DateTime`, `NaiveDate`, and `NaiveTime` types.
+//! - `chrono` — Enables encoding/decoding of `chrono::DateTime`, `NaiveDate`,
+//!   and `NaiveTime` types.
 //! - `uuid` — Enables encoding/decoding of `uuid::Uuid`.
-//! - `ulid` — Enables encoding/decoding of `ulid::Ulid` (shares the same tag as UUID for binary compatibility).
+//! - `ulid` — Enables encoding/decoding of `ulid::Ulid` (shares the same tag as
+//!   UUID for binary compatibility).
 //! - `rust_decimal` — Enables encoding/decoding of `rust_decimal::Decimal`.
-//! - `bigdecimal` — Enables encoding/decoding of `bigdecimal::BigDecimal` (stored as scientific notation string).
-//! - `indexmap` — Enables encoding/decoding of `IndexMap` and `IndexSet` collections.
-//! - `fxhash` — Enables encoding/decoding of `fxhash::FxHashMap` and `fxhash::FxHashSet` (fast hash collections).
-//! - `ahash` — Enables encoding/decoding of `ahash::AHashMap` and `ahash::AHashSet` (high-performance hash collections).
-//! - `smol_str` — Enables encoding/decoding of `smol_str::SmolStr` (small string optimization).
-//! - `serde_json` — Enables encoding/decoding of `serde_json::Value` (JSON values as dynamic type).
-//! - `raw_value` — Enables encoding/decoding of `Box<serde_json::value::RawValue>` (raw JSON strings). Requires `serde_json` feature.
+//! - `bigdecimal` — Enables encoding/decoding of `bigdecimal::BigDecimal`
+//!   (stored as scientific notation string).
+//! - `indexmap` — Enables encoding/decoding of `IndexMap` and `IndexSet`
+//!   collections.
+//! - `fxhash` — Enables encoding/decoding of `fxhash::FxHashMap` and
+//!   `fxhash::FxHashSet` (fast hash collections).
+//! - `ahash` — Enables encoding/decoding of `ahash::AHashMap` and
+//!   `ahash::AHashSet` (high-performance hash collections).
+//! - `smol_str` — Enables encoding/decoding of `smol_str::SmolStr` (small
+//!   string optimization).
+//! - `serde_json` — Enables encoding/decoding of `serde_json::Value` (JSON
+//!   values as dynamic type).
+//! - `raw_value` — Enables encoding/decoding of
+//!   `Box<serde_json::value::RawValue>` (raw JSON strings). Requires
+//!   `serde_json` feature.
 
 pub mod core;
 mod features;
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 pub use senax_encoder_derive::{Decode, Encode, Pack, Unpack};
-use std::collections::HashMap;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::Arc;
 
 /// Errors that can occur during encoding or decoding operations.
 #[derive(Debug, thiserror::Error)]
@@ -56,7 +79,8 @@ pub enum EncoderError {
     /// The value could not be encoded (e.g., unsupported type or logic error).
     #[error("Encode error: {0}")]
     Encode(String),
-    /// The value could not be decoded (e.g., invalid data, type mismatch, or schema evolution error).
+    /// The value could not be decoded (e.g., invalid data, type mismatch, or
+    /// schema evolution error).
     #[error("Decode error: {0}")]
     Decode(String),
     /// The buffer did not contain enough data to complete the operation.
@@ -91,7 +115,9 @@ pub enum StructDecodeError {
         expected: usize,
         actual: usize,
     },
-    #[error("Structure hash mismatch for {struct_name}: expected 0x{expected:016X}, got 0x{actual:016X}")]
+    #[error(
+        "Structure hash mismatch for {struct_name}: expected 0x{expected:016X}, got 0x{actual:016X}"
+    )]
     StructureHashMismatch {
         struct_name: &'static str,
         expected: u64,
@@ -130,14 +156,18 @@ pub enum EnumDecodeError {
         enum_name: &'static str,
         variant_name: &'static str,
     },
-    #[error("Field count mismatch for variant {enum_name}::{variant_name}: expected {expected}, got {actual}")]
+    #[error(
+        "Field count mismatch for variant {enum_name}::{variant_name}: expected {expected}, got {actual}"
+    )]
     FieldCountMismatch {
         enum_name: &'static str,
         variant_name: &'static str,
         expected: usize,
         actual: usize,
     },
-    #[error("Structure hash mismatch for variant {enum_name}::{variant_name}: expected 0x{expected:016X}, got 0x{actual:016X}")]
+    #[error(
+        "Structure hash mismatch for variant {enum_name}::{variant_name}: expected 0x{expected:016X}, got 0x{actual:016X}"
+    )]
     StructureHashMismatch {
         enum_name: &'static str,
         variant_name: &'static str,
@@ -155,8 +185,8 @@ pub enum EnumDecodeError {
 ///
 /// # Example
 /// ```rust
-/// use senax_encoder::{encode, decode, Encode, Decode};
 /// use bytes::BytesMut;
+/// use senax_encoder::{Decode, Encode, decode, encode};
 ///
 /// #[derive(Encode, Decode, PartialEq, Debug)]
 /// struct MyStruct {
@@ -164,7 +194,10 @@ pub enum EnumDecodeError {
 ///     name: String,
 /// }
 ///
-/// let value = MyStruct { id: 42, name: "hello".to_string() };
+/// let value = MyStruct {
+///     id: 42,
+///     name: "hello".to_string(),
+/// };
 /// let mut buf = encode(&value).unwrap();
 /// let decoded: MyStruct = decode(&mut buf).unwrap();
 /// assert_eq!(value, decoded);
@@ -182,8 +215,8 @@ pub fn decode<T: Decoder>(reader: &mut impl Buf) -> Result<T> {
 ///
 /// # Example
 /// ```rust
-/// use senax_encoder::{encode, decode, Encode, Decode};
 /// use bytes::BytesMut;
+/// use senax_encoder::{Decode, Encode, decode, encode};
 ///
 /// #[derive(Encode, Decode, PartialEq, Debug)]
 /// struct MyStruct {
@@ -191,7 +224,10 @@ pub fn decode<T: Decoder>(reader: &mut impl Buf) -> Result<T> {
 ///     name: String,
 /// }
 ///
-/// let value = MyStruct { id: 42, name: "hello".to_string() };
+/// let value = MyStruct {
+///     id: 42,
+///     name: "hello".to_string(),
+/// };
 /// let mut buf = encode(&value).unwrap();
 /// let decoded: MyStruct = decode(&mut buf).unwrap();
 /// assert_eq!(value, decoded);
@@ -212,8 +248,8 @@ pub fn encode<T: Encoder>(value: &T) -> Result<Bytes> {
 ///
 /// # Example
 /// ```rust
-/// use senax_encoder::{encode_to, decode, Encode, Decode};
-/// use bytes::{BytesMut, Bytes};
+/// use bytes::{Bytes, BytesMut};
+/// use senax_encoder::{Decode, Encode, decode, encode_to};
 ///
 /// #[derive(Encode, Decode, PartialEq, Debug)]
 /// struct MyStruct {
@@ -221,7 +257,10 @@ pub fn encode<T: Encoder>(value: &T) -> Result<Bytes> {
 ///     name: String,
 /// }
 ///
-/// let value = MyStruct { id: 42, name: "hello".to_string() };
+/// let value = MyStruct {
+///     id: 42,
+///     name: "hello".to_string(),
+/// };
 /// let mut buf = BytesMut::new();
 /// encode_to(&value, &mut buf).unwrap();
 /// let mut data = buf.freeze();
@@ -242,30 +281,33 @@ pub fn encode_to<T: Encoder>(value: &T, writer: &mut BytesMut) -> Result<()> {
 pub trait Encoder {
     /// Encode the value into the given buffer with schema evolution support.
     ///
-    /// This method includes field IDs and type tags for forward/backward compatibility.
-    /// Use this when you need schema evolution support.
+    /// This method includes field IDs and type tags for forward/backward
+    /// compatibility. Use this when you need schema evolution support.
     ///
     /// # Arguments
     /// * `writer` - The buffer to write the encoded bytes into.
     fn encode(&self, writer: &mut BytesMut) -> Result<()>;
 
     /// Returns true if this value equals its default value.
-    /// Used by `#[senax(skip_default)]` attribute to skip encoding default values.
+    /// Used by `#[senax(skip_default)]` attribute to skip encoding default
+    /// values.
     fn is_default(&self) -> bool;
 }
 
 /// Trait for types that can be packed into a compact binary format.
 ///
 /// This trait provides compact serialization without schema evolution support.
-/// Use this when you need maximum performance and don't require forward/backward compatibility.
+/// Use this when you need maximum performance and don't require
+/// forward/backward compatibility.
 ///
 /// # Errors
 /// Returns `EncoderError` if the value cannot be packed.
 pub trait Packer {
     /// Pack the value into the given buffer without schema evolution support.
     ///
-    /// This method stores data in a compact format without field IDs or type tags.
-    /// The format is not schema-evolution-friendly but offers better performance.
+    /// This method stores data in a compact format without field IDs or type
+    /// tags. The format is not schema-evolution-friendly but offers better
+    /// performance.
     ///
     /// # Arguments
     /// * `writer` - The buffer to write the packed bytes into.
@@ -278,12 +320,13 @@ pub trait Packer {
 /// Most users should use `#[derive(Decode)]` instead of manual implementation.
 ///
 /// # Errors
-/// Returns `EncoderError` if the value cannot be decoded or the data is invalid.
+/// Returns `EncoderError` if the value cannot be decoded or the data is
+/// invalid.
 pub trait Decoder: Sized {
     /// Decode the value from the given buffer with schema evolution support.
     ///
-    /// This method expects field IDs and type tags for forward/backward compatibility.
-    /// Use this when you need schema evolution support.
+    /// This method expects field IDs and type tags for forward/backward
+    /// compatibility. Use this when you need schema evolution support.
     ///
     /// # Arguments
     /// * `reader` - The buffer to read the encoded bytes from.
@@ -292,16 +335,19 @@ pub trait Decoder: Sized {
 
 /// Trait for types that can be unpacked from a compact binary format.
 ///
-/// This trait provides compact deserialization without schema evolution support.
-/// Use this when you need maximum performance and don't require forward/backward compatibility.
+/// This trait provides compact deserialization without schema evolution
+/// support. Use this when you need maximum performance and don't require
+/// forward/backward compatibility.
 ///
 /// # Errors
-/// Returns `EncoderError` if the value cannot be unpacked or the data is invalid.
+/// Returns `EncoderError` if the value cannot be unpacked or the data is
+/// invalid.
 pub trait Unpacker: Sized {
     /// Unpack the value from the given buffer without schema evolution support.
     ///
-    /// This method reads data from a compact format without field IDs or type tags.
-    /// The format is not schema-evolution-friendly but offers better performance.
+    /// This method reads data from a compact format without field IDs or type
+    /// tags. The format is not schema-evolution-friendly but offers better
+    /// performance.
     ///
     /// # Arguments
     /// * `reader` - The buffer to read the packed bytes from.
@@ -317,8 +363,8 @@ pub trait Unpacker: Sized {
 ///
 /// # Example
 /// ```rust
-/// use senax_encoder::{pack, unpack, Pack, Unpack};
 /// use bytes::BytesMut;
+/// use senax_encoder::{Pack, Unpack, pack, unpack};
 ///
 /// #[derive(Pack, Unpack, PartialEq, Debug)]
 /// struct MyStruct {
@@ -326,7 +372,10 @@ pub trait Unpacker: Sized {
 ///     name: String,
 /// }
 ///
-/// let value = MyStruct { id: 42, name: "hello".to_string() };
+/// let value = MyStruct {
+///     id: 42,
+///     name: "hello".to_string(),
+/// };
 /// let mut buf = pack(&value).unwrap();
 /// let decoded: MyStruct = unpack(&mut buf).unwrap();
 /// assert_eq!(value, decoded);
@@ -347,8 +396,8 @@ pub fn pack<T: Packer>(value: &T) -> Result<Bytes> {
 ///
 /// # Example
 /// ```rust
-/// use senax_encoder::{pack_to, unpack, Pack, Unpack};
-/// use bytes::{BytesMut, Bytes};
+/// use bytes::{Bytes, BytesMut};
+/// use senax_encoder::{Pack, Unpack, pack_to, unpack};
 ///
 /// #[derive(Pack, Unpack, PartialEq, Debug)]
 /// struct MyStruct {
@@ -356,7 +405,10 @@ pub fn pack<T: Packer>(value: &T) -> Result<Bytes> {
 ///     name: String,
 /// }
 ///
-/// let value = MyStruct { id: 42, name: "hello".to_string() };
+/// let value = MyStruct {
+///     id: 42,
+///     name: "hello".to_string(),
+/// };
 /// let mut buf = BytesMut::new();
 /// pack_to(&value, &mut buf).unwrap();
 /// let mut data = buf.freeze();
@@ -376,8 +428,8 @@ pub fn pack_to<T: Packer>(value: &T, writer: &mut BytesMut) -> Result<()> {
 ///
 /// # Example
 /// ```rust
-/// use senax_encoder::{pack, unpack, Pack, Unpack};
 /// use bytes::BytesMut;
+/// use senax_encoder::{Pack, Unpack, pack, unpack};
 ///
 /// #[derive(Pack, Unpack, PartialEq, Debug)]
 /// struct MyStruct {
@@ -385,11 +437,38 @@ pub fn pack_to<T: Packer>(value: &T, writer: &mut BytesMut) -> Result<()> {
 ///     name: String,
 /// }
 ///
-/// let value = MyStruct { id: 42, name: "hello".to_string() };
+/// let value = MyStruct {
+///     id: 42,
+///     name: "hello".to_string(),
+/// };
 /// let mut buf = pack(&value).unwrap();
 /// let decoded: MyStruct = unpack(&mut buf).unwrap();
 /// assert_eq!(value, decoded);
 /// ```
 pub fn unpack<T: Unpacker>(reader: &mut impl Buf) -> Result<T> {
     T::unpack(reader)
+}
+
+impl<'a, B> Encoder for std::borrow::Cow<'a, B>
+where
+    B: ToOwned + ?Sized,
+    B::Owned: Encoder,
+{
+    fn encode(&self, writer: &mut bytes::BytesMut) -> Result<()> {
+        self.as_ref().to_owned().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.as_ref().to_owned().is_default()
+    }
+}
+
+impl<'a, B> Decoder for std::borrow::Cow<'a, B>
+where
+    B: ToOwned + ?Sized,
+    B::Owned: Decoder,
+{
+    fn decode(reader: &mut impl bytes::Buf) -> Result<Self> {
+        Ok(Self::Owned(B::Owned::decode(reader)?))
+    }
 }
