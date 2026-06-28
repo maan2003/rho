@@ -11,15 +11,13 @@ The public surface is intentionally small:
 - `InferenceAuth` selects the named auth credentials required for inference.
 - `InferenceSession` configures inference access, prompt-cache/thread behavior,
   and owns the session's warm WebSocket connection.
-- `InferenceSession::stream` accepts a `rho_core::InferenceRequest` and returns
-  an `InferenceStream` of `rho_core::InferenceUpdate` values ending in
-  `InferenceUpdate::Finished`.
-- `InferenceSession` implements `rho_core::IInferenceSession` so harness crates
-  can depend on `rho-core` instead of this provider crate.
+- `InferenceSession::request` queues a `rho_core::InferenceRequest`;
+  `InferenceSession::run` drives the concrete session and yields
+  `rho_core::InferenceEvent` values ending in `InferenceEvent::Finished`.
 - `auth_cli::AuthArgs` and `run_auth_cli` own the user-facing auth management
   workflow for add/list/remove/path/status/import.
-- `rho_core::InferenceUpdate` is the provider-neutral streaming update contract
-  consumed by `rho-agent` and UIs.
+- `rho_core::InferenceEvent` is the streaming update contract consumed by
+  `rho-agent` and UIs.
 - Raw OAuth helpers, credential DTOs, credential files, token refresh, and
   recorded-event parsers are internal implementation details. CLI and UI crates
   should use `InferenceAuth` for inference and `run_auth_cli` for auth

@@ -5,9 +5,6 @@
 //! and HTTP loop are intentionally not copied into this crate; `rho-agent` or a
 //! fork should own those runtime policies.
 
-use futures::future::BoxFuture;
-use rho_core::{IInferenceSession, InferenceEvent, InferenceRequest};
-
 pub(crate) mod oauth;
 mod session;
 #[cfg(test)]
@@ -23,20 +20,6 @@ pub(crate) const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
 
 fn responses_url(base_url: &str) -> String {
     format!("{}/codex/responses", base_url.trim_end_matches('/'))
-}
-
-impl IInferenceSession for InferenceSession {
-    fn request(&mut self, request: InferenceRequest) {
-        InferenceSession::request(self, request);
-    }
-
-    fn run(&mut self) -> BoxFuture<'_, InferenceEvent> {
-        Box::pin(InferenceSession::run(self))
-    }
-
-    fn abort(&mut self) {
-        InferenceSession::abort(self);
-    }
 }
 
 fn is_stale_previous_response_error(error: &anyhow::Error) -> bool {

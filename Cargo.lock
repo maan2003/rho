@@ -1380,7 +1380,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "futures",
  "senax-encoder",
  "serde",
  "serde_json",

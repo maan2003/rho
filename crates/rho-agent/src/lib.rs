@@ -6,8 +6,8 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt};
 use rho_core::{
-    ContentPart, ContextBlock, IInferenceSession, InferenceEvent, InferenceRequest,
-    InferenceResponseItem, PendingInferenceResponse, ToolCall, ToolResult, ToolSpec,
+    ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
+    PendingInferenceResponse, ToolCall, ToolResult, ToolSpec,
 };
 use rho_db::RhoDb;
 use rho_inference::config::InferenceConfig;
@@ -69,10 +69,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn spawn(
-        inference_session: Box<dyn IInferenceSession>,
-        blocks: Vec<Arc<ContextBlock>>,
-    ) -> Self {
+    pub fn spawn(inference_session: InferenceSession, blocks: Vec<Arc<ContextBlock>>) -> Self {
         Self::spawn_inner(inference_session, blocks, None)
     }
 
@@ -92,7 +89,7 @@ impl Agent {
             config.clone(),
         );
         write.commit();
-        let inference_session = Box::new(InferenceSession::new(auth, config, prompt_cache_key));
+        let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
         Self::spawn_inner(
             inference_session,
             Vec::new(),
@@ -103,11 +100,7 @@ impl Agent {
     pub fn load_persisted(db: RhoDb, auth: InferenceAuth, agent_id: AgentId) -> Self {
         let record = db.read().get_agent(agent_id);
         let (next_block, blocks) = db.read().agent_blocks(agent_id);
-        let inference_session = Box::new(InferenceSession::new(
-            auth,
-            record.config,
-            record.prompt_cache_key,
-        ));
+        let inference_session = InferenceSession::new(auth, record.config, record.prompt_cache_key);
         Self::spawn_inner(
             inference_session,
             blocks,
@@ -116,7 +109,7 @@ impl Agent {
     }
 
     fn spawn_inner(
-        inference_session: Box<dyn IInferenceSession>,
+        inference_session: InferenceSession,
         blocks: Vec<Arc<ContextBlock>>,
         persistence: Option<AgentPersistence>,
     ) -> Self {
@@ -193,7 +186,7 @@ enum AgentControl {
 }
 
 struct AgentLoop {
-    inference_session: Box<dyn IInferenceSession>,
+    inference_session: InferenceSession,
     /// The tool calls from the current `ToolCalling` turn, running
     /// concurrently. Empty in every other state. Driven as a `select!` arm
     /// alongside the provider stream.

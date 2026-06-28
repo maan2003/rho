@@ -6,7 +6,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::future::BoxFuture;
 use senax_encoder::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -358,32 +357,6 @@ pub enum InferenceEvent {
         // TODO: specific error message if needed if future
         error: Arc<anyhow::Error>,
     },
-}
-
-/// A single inference session, driven by one owner at a time as a small
-/// pollable sub-actor — "a sub-actor you fold into your own `select!`".
-///
-/// You `request` a turn (cheap, synchronous) and then poll `run` for its
-/// updates. `run` is the single place the connection is driven: between events
-/// it keeps the socket warm (pongs server pings, sends client pings), and with
-/// no active request it keeps a warm socket alive and otherwise pends. So
-/// keeping `run` in a `select!` arm gives keepalive for free, whether or not a
-/// turn is in flight.
-///
-/// `run` is cancel-safe: its progress lives in `self`, so dropping the future
-/// (because another `select!` arm fired) and calling it again loses nothing.
-pub trait IInferenceSession: Send + 'static {
-    /// Queue a turn, replacing any previously queued/active one. The work
-    /// happens in `run`.
-    fn request(&mut self, request: InferenceRequest);
-
-    /// Drive the connection and return the next update for the active request.
-    /// Pends (while keeping any warm socket alive) when no request is active.
-    fn run(&mut self) -> BoxFuture<'_, InferenceEvent>;
-
-    /// Abort the active request and drop the now-indeterminate connection, so
-    /// the next `request` reconnects from clean state.
-    fn abort(&mut self);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

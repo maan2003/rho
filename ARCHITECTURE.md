@@ -6,16 +6,15 @@ than by running a supervisor, extension protocol, or daemon process graph.
 ## Crate layering
 
 - `rho-core` owns the shared vocabulary: transcript items, inference requests,
-  the `IInferenceSession` streaming trait, inference updates and responses, tool
-  calls/results, usage, roles, message phases, and opaque provider items. It
-  should stay policy-light.
+  inference events and responses, tool calls/results, usage, roles, message
+  phases, and opaque provider items. It should stay policy-light.
 - Inference crates, currently `rho-inference`, translate `rho-core` inference
   requests into provider-specific wire protocols and translate provider events
   back into `rho-core` items and updates.
 - `rho-agent` owns the opinionated harness policy: queueing, retries/tool
   scheduling, streamed transcript handling, inference response block recording,
-  and persistence hooks. It consumes boxed `rho_core::IInferenceSession`
-  implementations instead of depending on concrete provider crates.
+  and persistence hooks. It depends directly on the concrete `rho-inference`
+  session.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
   rendering. They should not own inference protocol details.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
