@@ -73,7 +73,7 @@ impl Agent {
         inference_session: InferenceSession,
         blocks: Vec<Arc<ContextBlock>>,
     ) -> Self {
-        Self::spawn_inner(inference_session, blocks, None)
+        Self::new(inference_session, blocks, None)
     }
 
     pub async fn create(
@@ -93,7 +93,7 @@ impl Agent {
         );
         write.commit();
         let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
-        Self::spawn_inner(
+        Self::new(
             inference_session,
             Vec::new(),
             Some(AgentPersistence { db, next_block }),
@@ -104,14 +104,14 @@ impl Agent {
         let record = db.read().get_agent(agent_id);
         let (next_block, blocks) = db.read().agent_blocks(agent_id);
         let inference_session = InferenceSession::new(auth, record.config, record.prompt_cache_key);
-        Self::spawn_inner(
+        Self::new(
             inference_session,
             blocks,
             Some(AgentPersistence { db, next_block }),
         )
     }
 
-    fn spawn_inner(
+    fn new(
         inference_session: InferenceSession,
         blocks: Vec<Arc<ContextBlock>>,
         persistence: Option<AgentPersistence>,
