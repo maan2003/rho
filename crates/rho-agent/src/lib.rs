@@ -69,7 +69,10 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn spawn(inference_session: InferenceSession, blocks: Vec<Arc<ContextBlock>>) -> Self {
+    pub fn create_ephemeral(
+        inference_session: InferenceSession,
+        blocks: Vec<Arc<ContextBlock>>,
+    ) -> Self {
         Self::spawn_inner(inference_session, blocks, None)
     }
 
