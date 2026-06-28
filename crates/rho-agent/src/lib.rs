@@ -70,9 +70,12 @@ pub struct Agent {
 
 impl Agent {
     pub fn create_ephemeral(
-        inference_session: InferenceSession,
+        auth: InferenceAuth,
+        config: InferenceConfig,
         blocks: Vec<Arc<ContextBlock>>,
     ) -> Self {
+        let inference_session =
+            InferenceSession::new(auth, config.protect(), PromptCacheKey::generate());
         Self::new(inference_session, blocks, None)
     }
 
