@@ -139,10 +139,19 @@ impl Agent {
         config: InferenceConfig,
         display_name: Option<String>,
     ) -> Self {
+        Self::create_with_id(db, auth, config, display_name).await.1
+    }
+
+    pub async fn create_with_id(
+        db: RhoDb,
+        auth: InferenceAuth,
+        config: InferenceConfig,
+        display_name: Option<String>,
+    ) -> (AgentId, Self) {
         let prompt_cache_key = PromptCacheKey::generate();
         let config = config.protect();
         let mut write = db.write().await;
-        let (_, next_event) = write.create_agent(
+        let (agent_id, next_event) = write.create_agent(
             UnixMillis::now(),
             display_name,
             prompt_cache_key,
@@ -157,12 +166,13 @@ impl Agent {
             system_prompt: system_prompt::prompt(),
             kind: AgentStateKind::Idle,
         };
-        Self::new(
+        let agent = Self::new(
             inference_session,
             shell_tools,
             state,
             Some(AgentPersistence { db, next_event }),
-        )
+        );
+        (agent_id, agent)
     }
 
     pub fn load(db: RhoDb, auth: InferenceAuth, agent_id: AgentId) -> Self {

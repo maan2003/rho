@@ -1,5 +1,8 @@
 //! Raw redb schema for persisted agents.
 
+use std::fmt;
+use std::str::FromStr;
+
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
@@ -29,6 +32,21 @@ impl CounterKey {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue, Encode, Decode,
 )]
 pub struct AgentId(u64);
+
+impl fmt::Display for AgentId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "agent-{}", self.0)
+    }
+}
+
+impl FromStr for AgentId {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.strip_prefix("agent-").unwrap_or(value);
+        value.parse().map(Self)
+    }
+}
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue, Encode, Decode,
@@ -74,10 +92,13 @@ pub struct AgentRecord {
 
 pub trait AgentReadTxnExt {
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
+    fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
 }
 
 pub trait AgentWriteTxnExt {
+    fn init_agent_tables(&mut self);
+
     fn create_agent(
         &mut self,
         now: UnixMillis,
@@ -96,6 +117,13 @@ impl AgentReadTxnExt for ReadTxn {
             .expect("agent id missing")
             .value()
             .into_owned()
+    }
+
+    fn list_agents(&self) -> Vec<(AgentId, AgentRecord)> {
+        self.open_table(AGENTS)
+            .iter()
+            .map(|(key, value)| (key.value(), value.value().into_owned()))
+            .collect()
     }
 
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>) {
@@ -141,6 +169,13 @@ impl AgentReadTxnExt for ReadTxn {
 }
 
 impl AgentWriteTxnExt for WriteTxn {
+    fn init_agent_tables(&mut self) {
+        self.open_table(COUNTERS);
+        self.open_table(LINEAGE_PARENTS);
+        self.open_table(AGENT_EVENTS);
+        self.open_table(AGENTS);
+    }
+
     fn create_agent(
         &mut self,
         now: UnixMillis,
