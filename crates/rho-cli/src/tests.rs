@@ -1,11 +1,7 @@
 use std::io;
 
-use rho_agent::AgentStateKind;
 use rho_cli_term_raw::{CursorShape, Term};
-use rho_core::{
-    AStr, StreamingContextItem, StreamingContextItemState, ToolCall, ToolCallId, ToolName,
-    ToolOutput, ToolOutputStatus, ToolResult, ToolType,
-};
+use rho_core::{ToolCall, ToolCallId, ToolName, ToolType};
 
 use super::*;
 
@@ -15,6 +11,22 @@ fn test_call() -> ToolCall {
         name: ToolName::try_from("shell_command").unwrap(),
         tool_type: ToolType::Function,
         arguments: serde_json::json!({"command": "printf hi"}).to_string(),
+    }
+}
+
+fn streaming_state(items: Vec<UiStreamingItem>) -> UiAgentState {
+    UiAgentState {
+        blocks: Vec::new(),
+        status: UiAgentStatus::Streaming,
+        pending_response: items,
+    }
+}
+
+fn status_state(status: UiAgentStatus) -> UiAgentState {
+    UiAgentState {
+        blocks: Vec::new(),
+        status,
+        pending_response: Vec::new(),
     }
 }
 
@@ -141,35 +153,20 @@ fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
     );
     let mut renderer = StreamingRenderer::new(handle);
     let call = test_call();
-    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
-        pending_response: rho_core::PendingInferenceResponse {
-            items: vec![StreamingContextItemState::Pending(
-                StreamingContextItem::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    tool_type: call.tool_type,
-                    arguments: AStr::from(call.arguments.clone()),
-                },
-            )],
-        },
-        previous_attempt: None,
+    renderer.handle_state(&streaming_state(vec![UiStreamingItem::ToolCall {
+        id: call.id.as_str().to_owned(),
+        name: call.name.as_str().to_owned(),
+        arguments: call.arguments.clone(),
+    }]));
+    assert_eq!(renderer.active_blocks.len(), 1);
+
+    renderer.render_tool_finished(&UiToolResult {
+        call_id: call.id.as_str().to_owned(),
+        status: UiToolStatus::Success,
     });
     assert_eq!(renderer.active_blocks.len(), 1);
 
-    renderer.render_tool_finished(&ToolResult {
-        call_id: call.id,
-        tool_type: ToolType::Function,
-        body: ToolOutput {
-            output: Arc::new("hi".to_owned()),
-            status: ToolOutputStatus::Success,
-        },
-    });
-    assert_eq!(renderer.active_blocks.len(), 1);
-
-    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
-        pending_response: rho_core::PendingInferenceResponse::default(),
-        previous_attempt: None,
-    });
+    renderer.handle_state(&streaming_state(Vec::new()));
     assert_eq!(renderer.active_blocks.len(), 1);
 
     renderer.finish_turn();
@@ -187,43 +184,28 @@ fn streaming_blocks_follow_pending_item_order() {
     );
     let mut renderer = StreamingRenderer::new(handle);
     let call = test_call();
-    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
-        pending_response: rho_core::PendingInferenceResponse {
-            items: vec![
-                StreamingContextItemState::Pending(StreamingContextItem::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    tool_type: call.tool_type,
-                    arguments: AStr::from(call.arguments.clone()),
-                }),
-                StreamingContextItemState::Pending(StreamingContextItem::AssistantMessage {
-                    content: vec![AStr::from("done")],
-                    phase: None,
-                }),
-            ],
+    renderer.handle_state(&streaming_state(vec![
+        UiStreamingItem::ToolCall {
+            id: call.id.as_str().to_owned(),
+            name: call.name.as_str().to_owned(),
+            arguments: call.arguments.clone(),
         },
-        previous_attempt: None,
-    });
+        UiStreamingItem::AssistantMessage {
+            text: "done".to_owned(),
+        },
+    ]));
 
     assert_eq!(
         renderer.active_blocks.keys().copied().collect::<Vec<_>>(),
         vec![0, 1]
     );
 
-    renderer.handle_state_kind(&AgentStateKind::ToolCalling {
+    renderer.handle_state(&status_state(UiAgentStatus::ToolCalling {
         results: Vec::new(),
-    });
-    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
-        pending_response: rho_core::PendingInferenceResponse {
-            items: vec![StreamingContextItemState::Pending(
-                StreamingContextItem::AssistantMessage {
-                    content: vec![AStr::from("after tool")],
-                    phase: None,
-                },
-            )],
-        },
-        previous_attempt: None,
-    });
+    }));
+    renderer.handle_state(&streaming_state(vec![UiStreamingItem::AssistantMessage {
+        text: "after tool".to_owned(),
+    }]));
     assert_eq!(
         renderer.active_blocks.keys().copied().collect::<Vec<_>>(),
         vec![0, 1, 2]
@@ -243,19 +225,11 @@ fn streaming_text_response_finalizes_on_idle() {
         CursorShape::Bar,
     );
     let mut renderer = StreamingRenderer::new(handle);
-    renderer.handle_state_kind(&AgentStateKind::ApiStreaming {
-        pending_response: rho_core::PendingInferenceResponse {
-            items: vec![StreamingContextItemState::Pending(
-                StreamingContextItem::AssistantMessage {
-                    content: vec![AStr::from("done")],
-                    phase: None,
-                },
-            )],
-        },
-        previous_attempt: None,
-    });
+    renderer.handle_state(&streaming_state(vec![UiStreamingItem::AssistantMessage {
+        text: "done".to_owned(),
+    }]));
     assert_eq!(renderer.active_blocks.len(), 1);
 
-    renderer.handle_state_kind(&AgentStateKind::Idle);
+    renderer.handle_state(&status_state(UiAgentStatus::Idle));
     assert!(renderer.active_blocks.is_empty());
 }

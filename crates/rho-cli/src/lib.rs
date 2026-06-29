@@ -13,18 +13,17 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use rho_agent::AgentStateKind;
 use rho_cli_term_raw::{
     BlockId, Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
-use rho_core::{
-    ContextBlock, InferenceResponseItem, StreamingContextItem, StreamingContextItemState,
-    ToolOutputStatus, ToolResult, text_content,
-};
+use rho_core::ToolOutputStatus;
 use rho_daemon::{DaemonArgs, default_socket_path};
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::IoCounters;
 use rho_ui_proto::client::{AgentClient, Client as UiClient};
+use rho_ui_proto::remote::{
+    UiAgentState, UiAgentStatus, UiBlock, UiStreamingItem, UiToolResult, UiToolStatus,
+};
 use tokio::task::JoinHandle;
 
 mod completion;
@@ -38,7 +37,7 @@ mod tests;
 use completion::completion_candidates;
 use markdown::markdown_block;
 use slash_commands::SlashCommand;
-use tool_render::{ToolRenderStatus, tool_call_block, tool_result_block, tool_status_label};
+use tool_render::{ToolRenderStatus, tool_call_block};
 
 const UI_IO_BUCKET_SECS: u64 = 1;
 const UI_IO_WINDOW_SECS: u64 = 30;
@@ -120,7 +119,7 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
                 if let Some(renderer) = &renderer
                     && let Ok(mut renderer) = renderer.lock()
                 {
-                    renderer.handle_state_kind(&state.kind);
+                    renderer.handle_state(&state);
                 }
             }
         });
@@ -296,8 +295,8 @@ async fn watch_agent(agent: &AgentClient, renderer: Option<UpdateRenderer>) {
     futures::pin_mut!(changes);
     let started_blocks = agent.blocks().len();
     let mut saw_running = !matches!(
-        agent.state().kind,
-        AgentStateKind::Idle | AgentStateKind::UnfinishedTurn { .. }
+        agent.state().status,
+        UiAgentStatus::Idle | UiAgentStatus::UnfinishedTurn { .. }
     );
     loop {
         let Some(state) = changes.next().await else {
@@ -306,11 +305,13 @@ async fn watch_agent(agent: &AgentClient, renderer: Option<UpdateRenderer>) {
         if let Some(renderer) = &renderer
             && let Ok(mut renderer) = renderer.lock()
         {
-            renderer.handle_state_kind(&state.kind);
+            renderer.handle_state(&state);
         }
         if matches!(
-            state.kind,
-            AgentStateKind::Idle | AgentStateKind::UnfinishedTurn { .. } | AgentStateKind::Error(_)
+            state.status,
+            UiAgentStatus::Idle
+                | UiAgentStatus::UnfinishedTurn { .. }
+                | UiAgentStatus::Error { .. }
         ) {
             if saw_running || state.blocks.len() > started_blocks {
                 return;
@@ -435,70 +436,42 @@ impl ChatTerm {
         self.handle.redraw();
     }
 
-    fn print_history(&self, blocks: &[Arc<ContextBlock>]) {
+    fn print_history(&self, blocks: &[UiBlock]) {
         if blocks.is_empty() {
             self.print_system("rho ready");
             return;
         }
         self.print_system("loaded previous session");
         for block in blocks {
-            match block.as_ref() {
-                ContextBlock::UserMessage { content } => {
+            match block {
+                UiBlock::UserMessage { text } => {
+                    self.handle
+                        .print_output("history-message", user_message_block(text));
+                }
+                UiBlock::AssistantMessage { text } => {
+                    self.handle
+                        .print_output("history-message", assistant_message_block(text));
+                }
+                UiBlock::Reasoning { .. } => {}
+                UiBlock::ToolCall {
+                    name,
+                    arguments,
+                    status,
+                    ..
+                } => {
                     self.handle.print_output(
-                        "history-message",
-                        user_message_block(&text_content(content)),
+                        "history-tool-call",
+                        tool_call_block(
+                            name,
+                            arguments,
+                            ToolRenderStatus::Done(tool_output_status(*status)),
+                        ),
                     );
                 }
-                ContextBlock::InferenceResponse { items, .. } => {
-                    for item in items {
-                        self.print_history_response_item(item);
-                    }
-                }
-                ContextBlock::ToolResults { results } => {
-                    for result in results {
-                        self.handle.print_output(
-                            "history-tool-result",
-                            StyledBlock::new(StyledText::from(vec![
-                                Span::new(
-                                    "tool result ",
-                                    Style::default().fg(Color::DarkMagenta).bold(),
-                                ),
-                                Span::new(
-                                    tool_status_label(&result.body.status),
-                                    Style::default().fg(Color::DarkGrey),
-                                ),
-                            ])),
-                        );
-                    }
+                UiBlock::Notice { text } => {
+                    self.print_system(text);
                 }
             }
-        }
-    }
-
-    fn print_history_response_item(&self, item: &InferenceResponseItem) {
-        match item {
-            InferenceResponseItem::AssistantMessage { content, .. } => {
-                self.handle.print_output(
-                    "history-message",
-                    assistant_message_block(&text_content(content)),
-                );
-            }
-            InferenceResponseItem::ToolCall {
-                name, arguments, ..
-            } => {
-                self.handle.print_output(
-                    "history-tool-call",
-                    tool_call_block(
-                        name.as_str(),
-                        arguments,
-                        ToolRenderStatus::Done(ToolOutputStatus::Success),
-                    ),
-                );
-            }
-            InferenceResponseItem::RawReasoning { .. }
-            | InferenceResponseItem::EncryptedReasoning { .. }
-            | InferenceResponseItem::Compaction(_)
-            | InferenceResponseItem::Unknown(_) => {}
         }
     }
 
@@ -593,6 +566,14 @@ fn set_status_on_handle(handle: &TermHandle, text: &str) {
     handle.redraw();
 }
 
+fn tool_output_status(status: UiToolStatus) -> ToolOutputStatus {
+    match status {
+        UiToolStatus::Running | UiToolStatus::Success => ToolOutputStatus::Success,
+        UiToolStatus::Error => ToolOutputStatus::Error,
+        UiToolStatus::Cancelled => ToolOutputStatus::Cancelled,
+    }
+}
+
 fn format_io_rate(bytes_per_sec: u64) -> String {
     if bytes_per_sec == 0 {
         return "0".to_owned();
@@ -673,21 +654,15 @@ impl StreamingRenderer {
         }
     }
 
-    fn handle_state_kind(&mut self, kind: &AgentStateKind) {
-        match kind {
-            AgentStateKind::ApiStreaming {
-                pending_response, ..
-            } => {
-                for (index, slot) in pending_response.items.iter().enumerate() {
-                    if let StreamingContextItemState::Pending(item)
-                    | StreamingContextItemState::Finished(item) = slot
-                    {
-                        self.render_streaming_item(self.stream_base_index + index, item);
-                    }
+    fn handle_state(&mut self, state: &UiAgentState) {
+        match &state.status {
+            UiAgentStatus::Streaming => {
+                for (index, item) in state.pending_response.iter().enumerate() {
+                    self.render_streaming_item(self.stream_base_index + index, item);
                 }
                 self.order_active_blocks();
             }
-            AgentStateKind::ToolCalling { results, .. } => {
+            UiAgentStatus::ToolCalling { results } => {
                 self.stream_base_index = self
                     .active_blocks
                     .keys()
@@ -698,10 +673,10 @@ impl StreamingRenderer {
                 }
                 self.order_active_blocks();
             }
-            AgentStateKind::Error(error) => {
-                self.render_notice(&format!("agent error: {}", error.error))
+            UiAgentStatus::Error { message } => {
+                self.render_notice(&format!("agent error: {message}"))
             }
-            AgentStateKind::Idle | AgentStateKind::UnfinishedTurn { .. } => {
+            UiAgentStatus::Idle | UiAgentStatus::UnfinishedTurn { .. } => {
                 if self.handle.is_some() {
                     self.finish_turn();
                 }
@@ -709,55 +684,34 @@ impl StreamingRenderer {
         }
     }
 
-    fn render_streaming_item(&mut self, index: usize, item: &StreamingContextItem) {
+    fn render_streaming_item(&mut self, index: usize, item: &UiStreamingItem) {
         match item {
-            StreamingContextItem::AssistantMessage { content, .. } => {
-                self.assistant_text = content
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("");
+            UiStreamingItem::AssistantMessage { text } => {
+                self.assistant_text = text.clone();
                 let block = assistant_message_block(&self.assistant_text);
                 self.set_index_block(index, "assistant", block);
             }
-            StreamingContextItem::RawReasoning { content, summary } => {
-                let thinking_text = if summary.is_empty() {
-                    content.to_string()
-                } else {
-                    summary
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
+            UiStreamingItem::Reasoning { text } => {
                 let block = StyledBlock::new(StyledText::from(vec![
                     Span::new("thinking\n", Style::default().fg(Color::DarkYellow).bold()),
-                    Span::new(thinking_text, Style::default().fg(Color::DarkGrey)),
+                    Span::new(text.clone(), Style::default().fg(Color::DarkGrey)),
                 ]));
                 self.set_index_block(index, "thinking", block);
             }
-            StreamingContextItem::ToolCall {
+            UiStreamingItem::ToolCall {
                 id,
                 name,
-                tool_type: _,
                 arguments,
             } => {
-                self.tool_calls.insert(
-                    id.as_str().to_owned(),
-                    (name.as_str().to_owned(), arguments.to_string()),
-                );
-                self.tool_call_indices.insert(id.as_str().to_owned(), index);
-                let block = tool_call_block(
-                    name.as_str(),
-                    &arguments.to_string(),
-                    ToolRenderStatus::Running,
-                );
+                self.tool_calls
+                    .insert(id.clone(), (name.clone(), arguments.clone()));
+                self.tool_call_indices.insert(id.clone(), index);
+                let block = tool_call_block(name, arguments, ToolRenderStatus::Running);
                 self.set_index_block(index, "tool", block);
             }
-            StreamingContextItem::Compaction(_) => {
-                self.render_notice("compacting context");
+            UiStreamingItem::Notice { text } => {
+                self.render_notice(text);
             }
-            StreamingContextItem::EncryptedReasoning { .. } | StreamingContextItem::Unknown(_) => {}
         }
     }
 
@@ -788,17 +742,20 @@ impl StreamingRenderer {
         self.reset_turn();
     }
 
-    fn render_tool_finished(&mut self, result: &ToolResult) {
-        let Some(index) = self.tool_call_indices.get(result.call_id.as_str()).copied() else {
+    fn render_tool_finished(&mut self, result: &UiToolResult) {
+        let Some(index) = self.tool_call_indices.get(&result.call_id).copied() else {
             return;
         };
-        let output = truncate_display(&result.body.output, 4_000);
         let (name, arguments) = self
             .tool_calls
-            .get(result.call_id.as_str())
+            .get(&result.call_id)
             .cloned()
             .unwrap_or_else(|| ("tool".to_owned(), String::new()));
-        let block = tool_result_block(&name, &arguments, result.body.status, &output);
+        let block = tool_call_block(
+            &name,
+            &arguments,
+            ToolRenderStatus::Done(tool_output_status(result.status)),
+        );
         self.set_index_block(index, "tool", block);
     }
 
@@ -911,15 +868,6 @@ fn user_message_block(text: &str) -> StyledBlock {
 
 fn assistant_message_block(text: &str) -> StyledBlock {
     markdown_block(text)
-}
-
-fn truncate_display(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-    let mut output = text.chars().take(max_chars).collect::<String>();
-    output.push_str("\n... truncated");
-    output
 }
 
 fn dim_text(text: &str) -> StyledText {

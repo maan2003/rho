@@ -33,18 +33,6 @@ pub(crate) fn tool_call_block(
     StyledBlock::new(StyledText::from(spans))
 }
 
-pub(crate) fn tool_result_block(
-    name: &str,
-    arguments: &str,
-    status: ToolOutputStatus,
-    output: &str,
-) -> StyledBlock {
-    let mut block = tool_call_block(name, arguments, ToolRenderStatus::Done(status));
-    block.content.push(Span::plain("\n"));
-    block.content.push(Span::plain(output.to_owned()));
-    block
-}
-
 pub(crate) fn tool_status_label(status: &ToolOutputStatus) -> String {
     match status {
         ToolOutputStatus::Success => "success".to_owned(),

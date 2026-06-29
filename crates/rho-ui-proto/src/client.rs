@@ -1,11 +1,11 @@
 use std::path::Path;
-use std::sync::Arc;
 
 use futures::Stream;
-use rho_core::{ContentPart, ContextBlock};
+use rho_core::ContentPart;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
+use crate::remote::{UiAgentState, UiBlock};
 use crate::{ClientMessage, IoCounters, ServerMessage, read_frame_counted, write_frame_counted};
 
 /// Raw async client for the rho UI Unix-socket protocol.
@@ -49,7 +49,7 @@ impl Client {
 #[derive(Clone)]
 pub struct AgentClient {
     commands: mpsc::UnboundedSender<ClientMessage>,
-    state: watch::Receiver<rho_agent::AgentState>,
+    state: watch::Receiver<UiAgentState>,
     counters: IoCounters,
 }
 
@@ -131,11 +131,11 @@ impl AgentClient {
         self.counters.clone()
     }
 
-    pub fn blocks(&self) -> Vec<Arc<ContextBlock>> {
+    pub fn blocks(&self) -> Vec<UiBlock> {
         self.state.borrow().blocks.clone()
     }
 
-    pub fn state(&self) -> rho_agent::AgentState {
+    pub fn state(&self) -> UiAgentState {
         self.state.borrow().clone()
     }
 
@@ -149,7 +149,7 @@ impl AgentClient {
         let _ = self.commands.send(ClientMessage::CancelTurn);
     }
 
-    pub fn subscribe(&self) -> impl Stream<Item = rho_agent::AgentState> + use<> {
+    pub fn subscribe(&self) -> impl Stream<Item = UiAgentState> + use<> {
         let mut state = self.state.clone();
         async_stream::stream! {
             while state.changed().await.is_ok() {

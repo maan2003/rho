@@ -2,19 +2,21 @@ use std::sync::Arc;
 
 use rho_agent::{AgentState, AgentStateKind};
 use rho_core::{
-    AStr, ContextBlock, Diff as AStrDiffKind, MessagePhase, OpaqueProviderData,
-    PendingInferenceResponse, StreamingContextItem, StreamingContextItemState,
+    AStr, ContextBlock, Diff as AStrDiffKind, InferenceResponseItem, PendingInferenceResponse,
+    StreamingContextItem, StreamingContextItemState, ToolOutputStatus, text_content,
 };
 use senax_encoder::{Decode, Encode};
 
-/// Sender-side remote state encoder.
+/// Sender-side remote UI-state encoder.
 ///
-/// It keeps the last state sent on this connection so the caller can cheaply
-/// send append-only updates when possible, and fall back to a full snapshot
-/// when the shape is not obviously append-only.
+/// This projects runtime agent state into a deliberately smaller UI shape
+/// before diffing, so the wire protocol does not inherit provider replay data,
+/// tool schemas, or full tool outputs. It diffs from the previous runtime state
+/// so append-only history and streaming text updates stay cheap.
 #[derive(Default)]
 pub struct AgentRemoteEncoder {
-    last_sent: Option<AgentState>,
+    last_agent: Option<AgentState>,
+    last_sent: Option<UiAgentState>,
 }
 
 impl AgentRemoteEncoder {
@@ -23,238 +25,313 @@ impl AgentRemoteEncoder {
     }
 
     pub fn encode(&mut self, current: AgentState) -> AgentRemoteFrame {
-        let frame = match &self.last_sent {
-            Some(previous) if same_tool_specs(previous, &current) => {
-                let keep_blocks = common_block_prefix_len(previous, &current);
+        let frame = match (&self.last_agent, &self.last_sent) {
+            (Some(previous_agent), Some(_)) => {
+                let keep_agent_blocks = common_agent_block_prefix_len(previous_agent, &current);
+                let keep_blocks = previous_agent.blocks[..keep_agent_blocks]
+                    .iter()
+                    .map(|block| ui_blocks(block).len())
+                    .sum();
+                let blocks = current.blocks[keep_agent_blocks..]
+                    .iter()
+                    .flat_map(|block| ui_blocks(block))
+                    .collect();
                 AgentRemoteFrame::Diff {
                     keep_blocks,
-                    blocks: current.blocks[keep_blocks..].to_vec(),
-                    kind: diff_state_kind(&previous.kind, &current.kind),
+                    blocks,
+                    status: (ui_status(&previous_agent.kind) != ui_status(&current.kind))
+                        .then(|| ui_status(&current.kind)),
+                    pending_response: diff_pending_response_kind(
+                        &previous_agent.kind,
+                        &current.kind,
+                    ),
                 }
             }
-            _ => AgentRemoteFrame::Snapshot(current.clone()),
+            _ => AgentRemoteFrame::Snapshot(UiAgentState::from_agent_state(&current)),
         };
-        self.last_sent = Some(current);
+
+        let mut sent = self
+            .last_sent
+            .take()
+            .unwrap_or_else(|| UiAgentState::from_agent_state(&current));
+        frame.clone().apply_diff(&mut sent);
+        self.last_agent = Some(current);
+        self.last_sent = Some(sent);
         frame
     }
 
     /// Forget connection-local diff state. The next frame will be a full
     /// snapshot.
     pub fn reset(&mut self) {
+        self.last_agent = None;
         self.last_sent = None;
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum AgentRemoteFrame {
-    Snapshot(AgentState),
+    Snapshot(UiAgentState),
     Diff {
         /// Number of already-rendered blocks the receiver should keep before
         /// appending `blocks`.
         keep_blocks: usize,
-        blocks: Vec<Arc<ContextBlock>>,
-        kind: AgentStateKindDiff,
+        blocks: Vec<UiBlock>,
+        status: Option<UiAgentStatus>,
+        pending_response: UiPendingResponseDiff,
     },
 }
 
 impl AgentRemoteFrame {
-    pub fn apply_diff(self, state: &mut AgentState) {
+    pub fn apply_diff(self, state: &mut UiAgentState) {
         match self {
             Self::Snapshot(snapshot) => *state = snapshot,
             Self::Diff {
                 keep_blocks,
                 blocks,
-                kind,
+                status,
+                pending_response,
             } => {
                 state.blocks.truncate(keep_blocks);
                 state.blocks.extend(blocks);
-                kind.apply_diff(&mut state.kind);
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum AgentStateKindDiff {
-    Replace(AgentStateKind),
-    PendingInference(PendingInferenceResponseDiff),
-}
-
-impl AgentStateKindDiff {
-    pub fn apply_diff(self, kind: &mut AgentStateKind) {
-        match self {
-            Self::Replace(replacement) => *kind = replacement,
-            Self::PendingInference(diff) => {
-                let AgentStateKind::ApiStreaming {
-                    pending_response, ..
-                } = kind
-                else {
-                    panic!("pending inference diff applied outside ApiStreaming");
-                };
-                diff.apply_diff(pending_response);
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum PendingInferenceResponseDiff {
-    Replace(PendingInferenceResponse),
-    Items(Vec<PendingInferenceItemDiff>),
-}
-
-impl PendingInferenceResponseDiff {
-    pub fn apply_diff(self, pending_response: &mut PendingInferenceResponse) {
-        match self {
-            Self::Replace(replacement) => *pending_response = replacement,
-            Self::Items(items) => {
-                for item in items {
-                    if pending_response.items.len() <= item.index {
-                        pending_response
-                            .items
-                            .resize(item.index + 1, StreamingContextItemState::Empty);
-                    }
-                    item.state
-                        .apply_diff(&mut pending_response.items[item.index]);
+                if let Some(status) = status {
+                    state.status = status;
                 }
+                pending_response.apply_diff(&mut state.pending_response);
             }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub struct PendingInferenceItemDiff {
-    pub index: usize,
-    pub state: StreamingContextItemStateDiff,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum StreamingContextItemStateDiff {
-    Empty,
-    Pending(StreamingContextItemDiff),
-    Finished(StreamingContextItemDiff),
-}
-
-impl StreamingContextItemStateDiff {
-    pub fn apply_diff(self, state: &mut StreamingContextItemState) {
-        match self {
-            Self::Empty => *state = StreamingContextItemState::Empty,
-            Self::Pending(diff) => {
-                *state = StreamingContextItemState::Pending(diff.apply_to_state(state));
-            }
-            Self::Finished(diff) => {
-                *state = StreamingContextItemState::Finished(diff.apply_to_state(state));
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum StreamingContextItemDiff {
-    Replace(StreamingContextItem),
-    AssistantMessage {
-        content: Vec<AStrDiff>,
-        phase: Option<MessagePhase>,
-    },
-    ToolCall {
-        arguments: AStrDiff,
-    },
-    RawReasoning {
-        content: AStrDiff,
-        summary: Vec<AStrDiff>,
-    },
-    EncryptedReasoning {
-        payload: OpaqueProviderData,
-        summary: Vec<AStrDiff>,
-    },
-    Compaction(Option<OpaqueProviderData>),
-    Unknown(OpaqueProviderData),
-}
-
-impl StreamingContextItemDiff {
-    fn apply_to_state(self, state: &StreamingContextItemState) -> StreamingContextItem {
-        match state {
-            StreamingContextItemState::Pending(previous)
-            | StreamingContextItemState::Finished(previous) => self.apply_diff(previous),
-            StreamingContextItemState::Empty => match self {
-                Self::Replace(item) => item,
-                _ => panic!("non-replace streaming item diff applied to empty item"),
-            },
-        }
-    }
-
-    pub fn apply_diff(self, previous: &StreamingContextItem) -> StreamingContextItem {
-        match self {
-            Self::Replace(item) => item,
-            Self::AssistantMessage { content, phase } => {
-                let StreamingContextItem::AssistantMessage { .. } = previous else {
-                    panic!("assistant message diff applied to different item kind");
-                };
-                StreamingContextItem::AssistantMessage {
-                    content: content.into_iter().map(AStrDiff::apply_diff).collect(),
-                    phase,
-                }
-            }
-            Self::ToolCall { arguments } => {
-                let StreamingContextItem::ToolCall {
-                    id,
-                    name,
-                    tool_type,
-                    ..
-                } = previous
-                else {
-                    panic!("tool call diff applied to different item kind");
-                };
-                StreamingContextItem::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    tool_type: *tool_type,
-                    arguments: arguments.apply_diff(),
-                }
-            }
-            Self::RawReasoning { content, summary } => {
-                let StreamingContextItem::RawReasoning { .. } = previous else {
-                    panic!("raw reasoning diff applied to different item kind");
-                };
-                StreamingContextItem::RawReasoning {
-                    content: content.apply_diff(),
-                    summary: summary.into_iter().map(AStrDiff::apply_diff).collect(),
-                }
-            }
-            Self::EncryptedReasoning { payload, summary } => {
-                let StreamingContextItem::EncryptedReasoning { .. } = previous else {
-                    panic!("encrypted reasoning diff applied to different item kind");
-                };
-                StreamingContextItem::EncryptedReasoning {
-                    payload,
-                    summary: summary.into_iter().map(AStrDiff::apply_diff).collect(),
-                }
-            }
-            Self::Compaction(payload) => StreamingContextItem::Compaction(payload),
-            Self::Unknown(payload) => StreamingContextItem::Unknown(payload),
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct AStrDiff {
-    /// Number of bytes to keep from the receiver's previous string before
-    /// appending `value[keep_bytes..]`.
-    pub keep_bytes: usize,
-    pub value: AStr,
+pub struct UiAgentState {
+    pub blocks: Vec<UiBlock>,
+    pub status: UiAgentStatus,
+    pub pending_response: Vec<UiStreamingItem>,
 }
 
-impl AStrDiff {
-    pub fn apply_diff(self) -> AStr {
-        self.value
+impl UiAgentState {
+    fn from_agent_state(state: &AgentState) -> Self {
+        Self {
+            blocks: state
+                .blocks
+                .iter()
+                .flat_map(|block| ui_blocks(block))
+                .collect(),
+            status: ui_status(&state.kind),
+            pending_response: ui_pending_response(&state.kind),
+        }
     }
 }
 
-fn same_tool_specs(previous: &AgentState, current: &AgentState) -> bool {
-    Arc::ptr_eq(&previous.tool_specs, &current.tool_specs)
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum UiBlock {
+    UserMessage {
+        text: String,
+    },
+    AssistantMessage {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+        status: UiToolStatus,
+    },
+    Notice {
+        text: String,
+    },
 }
 
-fn common_block_prefix_len(previous: &AgentState, current: &AgentState) -> usize {
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum UiAgentStatus {
+    Idle,
+    Streaming,
+    ToolCalling { results: Vec<UiToolResult> },
+    UnfinishedTurn { outstanding_calls: usize },
+    Error { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum UiPendingResponseDiff {
+    Replace(Vec<UiStreamingItem>),
+    Items(Vec<UiStreamingItemUpdate>),
+}
+
+impl UiPendingResponseDiff {
+    fn apply_diff(self, pending_response: &mut Vec<UiStreamingItem>) {
+        match self {
+            Self::Replace(replacement) => *pending_response = replacement,
+            Self::Items(items) => {
+                for item in items {
+                    item.apply_diff(pending_response);
+                }
+                while pending_response
+                    .last()
+                    .is_some_and(UiStreamingItem::is_empty_placeholder)
+                {
+                    pending_response.pop();
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum UiStreamingItem {
+    AssistantMessage {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    Notice {
+        text: String,
+    },
+}
+
+impl UiStreamingItem {
+    fn empty_placeholder() -> Self {
+        Self::Notice {
+            text: String::new(),
+        }
+    }
+
+    fn is_empty_placeholder(&self) -> bool {
+        matches!(self, Self::Notice { text } if text.is_empty())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct UiStreamingItemUpdate {
+    pub index: usize,
+    pub item: UiStreamingItemDiff,
+}
+
+impl UiStreamingItemUpdate {
+    fn apply_diff(self, items: &mut Vec<UiStreamingItem>) {
+        if items.len() <= self.index {
+            items.resize_with(self.index + 1, UiStreamingItem::empty_placeholder);
+        }
+        self.item.apply_diff(&mut items[self.index]);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum UiStreamingItemDiff {
+    Remove,
+    Replace(UiStreamingItem),
+    AssistantMessage { text: UiTextDiff },
+    Reasoning { text: UiTextDiff },
+    ToolCall { arguments: UiTextDiff },
+}
+
+impl UiStreamingItemDiff {
+    fn apply_diff(self, item: &mut UiStreamingItem) {
+        match self {
+            Self::Remove => *item = UiStreamingItem::empty_placeholder(),
+            Self::Replace(replacement) => *item = replacement,
+            Self::AssistantMessage { text } => {
+                if !matches!(item, UiStreamingItem::AssistantMessage { .. }) {
+                    *item = UiStreamingItem::AssistantMessage {
+                        text: String::new(),
+                    };
+                }
+                let UiStreamingItem::AssistantMessage { text: current } = item else {
+                    unreachable!("assistant item was just installed");
+                };
+                *current = text.apply_to(current);
+            }
+            Self::Reasoning { text } => {
+                if !matches!(item, UiStreamingItem::Reasoning { .. }) {
+                    *item = UiStreamingItem::Reasoning {
+                        text: String::new(),
+                    };
+                }
+                let UiStreamingItem::Reasoning { text: current } = item else {
+                    unreachable!("reasoning item was just installed");
+                };
+                *current = text.apply_to(current);
+            }
+            Self::ToolCall { arguments } => {
+                let UiStreamingItem::ToolCall {
+                    arguments: current, ..
+                } = item
+                else {
+                    *item = UiStreamingItem::ToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    };
+                    let UiStreamingItem::ToolCall {
+                        arguments: current, ..
+                    } = item
+                    else {
+                        unreachable!("tool item was just installed");
+                    };
+                    *current = arguments.apply_to("");
+                    return;
+                };
+                *current = arguments.apply_to(current);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct UiTextDiff {
+    pub keep_bytes: usize,
+    pub value: String,
+}
+
+impl UiTextDiff {
+    fn replace(value: impl ToString) -> Self {
+        Self {
+            keep_bytes: 0,
+            value: value.to_string(),
+        }
+    }
+
+    fn apply_to(self, previous: &str) -> String {
+        let keep_bytes = self.keep_bytes.min(previous.len());
+        let mut output = previous[..keep_bytes].to_owned();
+        output.push_str(&self.value);
+        output
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct UiToolResult {
+    pub call_id: String,
+    pub status: UiToolStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum UiToolStatus {
+    Running,
+    Success,
+    Error,
+    Cancelled,
+}
+
+impl From<ToolOutputStatus> for UiToolStatus {
+    fn from(status: ToolOutputStatus) -> Self {
+        match status {
+            ToolOutputStatus::Success => Self::Success,
+            ToolOutputStatus::Error => Self::Error,
+            ToolOutputStatus::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+fn common_agent_block_prefix_len(previous: &AgentState, current: &AgentState) -> usize {
     previous
         .blocks
         .iter()
@@ -263,7 +340,106 @@ fn common_block_prefix_len(previous: &AgentState, current: &AgentState) -> usize
         .count()
 }
 
-fn diff_state_kind(previous: &AgentStateKind, current: &AgentStateKind) -> AgentStateKindDiff {
+fn ui_blocks(block: &ContextBlock) -> Vec<UiBlock> {
+    match block {
+        ContextBlock::UserMessage { content } => {
+            vec![UiBlock::UserMessage {
+                text: text_content(content),
+            }]
+        }
+        ContextBlock::InferenceResponse { items, .. } => items
+            .iter()
+            .filter_map(ui_block_from_response_item)
+            .collect(),
+        ContextBlock::ToolResults { results } => results
+            .iter()
+            .map(|result| UiBlock::ToolCall {
+                id: result.call_id.as_str().to_owned(),
+                name: "tool".to_owned(),
+                arguments: String::new(),
+                status: result.body.status.into(),
+            })
+            .collect(),
+    }
+}
+
+fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> {
+    match item {
+        InferenceResponseItem::AssistantMessage { content, .. } => {
+            Some(UiBlock::AssistantMessage {
+                text: text_content(content),
+            })
+        }
+        InferenceResponseItem::RawReasoning { content, summary } => Some(UiBlock::Reasoning {
+            text: reasoning_text(content, summary),
+        }),
+        InferenceResponseItem::ToolCall {
+            id,
+            name,
+            arguments,
+            ..
+        } => Some(UiBlock::ToolCall {
+            id: id.as_str().to_owned(),
+            name: name.as_str().to_owned(),
+            arguments: arguments.clone(),
+            status: UiToolStatus::Running,
+        }),
+        InferenceResponseItem::Compaction(_) => Some(UiBlock::Notice {
+            text: "compacting context".to_owned(),
+        }),
+        InferenceResponseItem::EncryptedReasoning { summary, .. } => {
+            (!summary.is_empty()).then(|| UiBlock::Reasoning {
+                text: summary.join("\n"),
+            })
+        }
+        InferenceResponseItem::Unknown(_) => None,
+    }
+}
+
+fn ui_status(kind: &AgentStateKind) -> UiAgentStatus {
+    match kind {
+        AgentStateKind::ApiStreaming { .. } => UiAgentStatus::Streaming,
+        AgentStateKind::ToolCalling { results } => UiAgentStatus::ToolCalling {
+            results: results
+                .iter()
+                .map(|result| UiToolResult {
+                    call_id: result.call_id.as_str().to_owned(),
+                    status: result.body.status.into(),
+                })
+                .collect(),
+        },
+        AgentStateKind::UnfinishedTurn {
+            outstanding_calls, ..
+        } => UiAgentStatus::UnfinishedTurn {
+            outstanding_calls: outstanding_calls.len(),
+        },
+        AgentStateKind::Error(error) => UiAgentStatus::Error {
+            message: error.error.to_string(),
+        },
+        AgentStateKind::Idle => UiAgentStatus::Idle,
+    }
+}
+
+fn ui_pending_response(kind: &AgentStateKind) -> Vec<UiStreamingItem> {
+    match kind {
+        AgentStateKind::ApiStreaming {
+            pending_response, ..
+        } => pending_response
+            .items
+            .iter()
+            .filter_map(ui_streaming_item)
+            .collect(),
+        AgentStateKind::Idle
+        | AgentStateKind::ToolCalling { .. }
+        | AgentStateKind::UnfinishedTurn { .. }
+        | AgentStateKind::Error(_) => Vec::new(),
+    }
+}
+
+fn diff_pending_response_kind(
+    previous: &AgentStateKind,
+    current: &AgentStateKind,
+) -> UiPendingResponseDiff {
     match (previous, current) {
         (
             AgentStateKind::ApiStreaming {
@@ -274,17 +450,17 @@ fn diff_state_kind(previous: &AgentStateKind, current: &AgentStateKind) -> Agent
                 pending_response: current,
                 previous_attempt: None,
             },
-        ) => AgentStateKindDiff::PendingInference(diff_pending_response(previous, current)),
-        _ => AgentStateKindDiff::Replace(current.clone()),
+        ) => UiPendingResponseDiff::Items(diff_pending_response(previous, current)),
+        _ => UiPendingResponseDiff::Replace(ui_pending_response(current)),
     }
 }
 
 fn diff_pending_response(
     previous: &PendingInferenceResponse,
     current: &PendingInferenceResponse,
-) -> PendingInferenceResponseDiff {
+) -> Vec<UiStreamingItemUpdate> {
     let max_len = previous.items.len().max(current.items.len());
-    let items = (0..max_len)
+    (0..max_len)
         .filter_map(|index| {
             let previous = previous
                 .items
@@ -294,48 +470,43 @@ fn diff_pending_response(
                 .items
                 .get(index)
                 .unwrap_or(&StreamingContextItemState::Empty);
-            (previous != current).then(|| PendingInferenceItemDiff {
+            (previous != current).then(|| UiStreamingItemUpdate {
                 index,
-                state: diff_streaming_item_state(previous, current),
+                item: diff_streaming_item_state(previous, current),
             })
         })
-        .collect();
-    PendingInferenceResponseDiff::Items(items)
+        .collect()
 }
 
 fn diff_streaming_item_state(
     previous: &StreamingContextItemState,
     current: &StreamingContextItemState,
-) -> StreamingContextItemStateDiff {
+) -> UiStreamingItemDiff {
     match (previous, current) {
-        (_, StreamingContextItemState::Empty) => StreamingContextItemStateDiff::Empty,
+        (_, StreamingContextItemState::Empty) => UiStreamingItemDiff::Remove,
         (
             StreamingContextItemState::Pending(previous),
             StreamingContextItemState::Pending(current),
-        ) => StreamingContextItemStateDiff::Pending(diff_streaming_item(previous, current)),
-        (
+        )
+        | (
             StreamingContextItemState::Finished(previous),
             StreamingContextItemState::Finished(current),
         )
         | (
             StreamingContextItemState::Pending(previous),
             StreamingContextItemState::Finished(current),
-        ) => StreamingContextItemStateDiff::Finished(diff_streaming_item(previous, current)),
-        (_, StreamingContextItemState::Pending(current)) => StreamingContextItemStateDiff::Pending(
-            StreamingContextItemDiff::Replace(current.clone()),
+        ) => diff_streaming_item(previous, current),
+        (_, StreamingContextItemState::Pending(current))
+        | (_, StreamingContextItemState::Finished(current)) => UiStreamingItemDiff::Replace(
+            ui_streaming_item_from_item(current).unwrap_or_else(UiStreamingItem::empty_placeholder),
         ),
-        (_, StreamingContextItemState::Finished(current)) => {
-            StreamingContextItemStateDiff::Finished(StreamingContextItemDiff::Replace(
-                current.clone(),
-            ))
-        }
     }
 }
 
 fn diff_streaming_item(
     previous: &StreamingContextItem,
     current: &StreamingContextItem,
-) -> StreamingContextItemDiff {
+) -> UiStreamingItemDiff {
     match (previous, current) {
         (
             StreamingContextItem::AssistantMessage {
@@ -346,9 +517,23 @@ fn diff_streaming_item(
                 content: current_content,
                 phase: current_phase,
             },
-        ) if previous_phase == current_phase => StreamingContextItemDiff::AssistantMessage {
-            content: diff_astr_vec(previous_content, current_content),
-            phase: *current_phase,
+        ) if previous_phase == current_phase => UiStreamingItemDiff::AssistantMessage {
+            text: diff_joined_astr(previous_content, current_content),
+        },
+        (
+            StreamingContextItem::RawReasoning {
+                content: previous_content,
+                summary: previous_summary,
+            },
+            StreamingContextItem::RawReasoning {
+                content: current_content,
+                summary: current_summary,
+            },
+        ) => UiStreamingItemDiff::Reasoning {
+            text: diff_text(
+                &reasoning_text(previous_content, previous_summary),
+                &reasoning_text(current_content, current_summary),
+            ),
         },
         (
             StreamingContextItem::ToolCall {
@@ -367,66 +552,174 @@ fn diff_streaming_item(
             && previous_name == current_name
             && previous_tool_type == current_tool_type =>
         {
-            StreamingContextItemDiff::ToolCall {
+            UiStreamingItemDiff::ToolCall {
                 arguments: diff_astr(previous_arguments, current_arguments),
             }
         }
-        (
-            StreamingContextItem::RawReasoning {
-                content: previous_content,
-                summary: previous_summary,
-            },
-            StreamingContextItem::RawReasoning {
-                content: current_content,
-                summary: current_summary,
-            },
-        ) => StreamingContextItemDiff::RawReasoning {
-            content: diff_astr(previous_content, current_content),
-            summary: diff_astr_vec(previous_summary, current_summary),
-        },
-        (
-            StreamingContextItem::EncryptedReasoning { .. },
-            StreamingContextItem::EncryptedReasoning { payload, summary },
-        ) => StreamingContextItemDiff::EncryptedReasoning {
-            payload: payload.clone(),
-            summary: summary.iter().map(replace_astr).collect(),
-        },
-        (_, StreamingContextItem::Compaction(payload)) => {
-            StreamingContextItemDiff::Compaction(payload.clone())
-        }
-        (_, StreamingContextItem::Unknown(payload)) => {
-            StreamingContextItemDiff::Unknown(payload.clone())
-        }
-        _ => StreamingContextItemDiff::Replace(current.clone()),
+        _ => UiStreamingItemDiff::Replace(
+            ui_streaming_item_from_item(current).unwrap_or_else(UiStreamingItem::empty_placeholder),
+        ),
     }
 }
 
-fn diff_astr_vec(previous: &[AStr], current: &[AStr]) -> Vec<AStrDiff> {
-    current
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            previous.get(index).map_or_else(
-                || replace_astr(value),
-                |previous| diff_astr(previous, value),
-            )
-        })
-        .collect()
+fn ui_streaming_item(item: &StreamingContextItemState) -> Option<UiStreamingItem> {
+    match item {
+        StreamingContextItemState::Pending(item) | StreamingContextItemState::Finished(item) => {
+            ui_streaming_item_from_item(item)
+        }
+        StreamingContextItemState::Empty => None,
+    }
 }
 
-fn diff_astr(previous: &AStr, current: &AStr) -> AStrDiff {
+fn ui_streaming_item_from_item(item: &StreamingContextItem) -> Option<UiStreamingItem> {
+    match item {
+        StreamingContextItem::AssistantMessage { content, .. } => {
+            Some(UiStreamingItem::AssistantMessage {
+                text: content.iter().map(ToString::to_string).collect(),
+            })
+        }
+        StreamingContextItem::RawReasoning { content, summary } => {
+            Some(UiStreamingItem::Reasoning {
+                text: reasoning_text(content, summary),
+            })
+        }
+        StreamingContextItem::EncryptedReasoning { summary, .. } => {
+            (!summary.is_empty()).then(|| UiStreamingItem::Reasoning {
+                text: summary
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            })
+        }
+        StreamingContextItem::ToolCall {
+            id,
+            name,
+            arguments,
+            ..
+        } => Some(UiStreamingItem::ToolCall {
+            id: id.as_str().to_owned(),
+            name: name.as_str().to_owned(),
+            arguments: arguments.to_string(),
+        }),
+        StreamingContextItem::Compaction(_) => Some(UiStreamingItem::Notice {
+            text: "compacting context".to_owned(),
+        }),
+        StreamingContextItem::Unknown(_) => None,
+    }
+}
+
+fn reasoning_text(content: &impl ToString, summary: &[impl ToString]) -> String {
+    if summary.is_empty() {
+        content.to_string()
+    } else {
+        summary
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn diff_joined_astr(previous: &[AStr], current: &[AStr]) -> UiTextDiff {
+    diff_text(
+        &previous.iter().map(ToString::to_string).collect::<String>(),
+        &current.iter().map(ToString::to_string).collect::<String>(),
+    )
+}
+
+fn diff_astr(previous: &AStr, current: &AStr) -> UiTextDiff {
     match previous.diff(current) {
-        AStrDiffKind::LeftIsPrefix => AStrDiff {
+        AStrDiffKind::LeftIsPrefix => UiTextDiff {
             keep_bytes: previous.len(),
-            value: current.clone(),
+            value: current.to_string()[previous.len()..].to_owned(),
         },
-        AStrDiffKind::Unrelated | AStrDiffKind::RightIsPrefix => replace_astr(current),
+        AStrDiffKind::Unrelated | AStrDiffKind::RightIsPrefix => UiTextDiff::replace(current),
     }
 }
 
-fn replace_astr(value: &AStr) -> AStrDiff {
-    AStrDiff {
-        keep_bytes: 0,
-        value: value.clone(),
+fn diff_text(previous: &str, current: &str) -> UiTextDiff {
+    if let Some(suffix) = current.strip_prefix(previous) {
+        UiTextDiff {
+            keep_bytes: previous.len(),
+            value: suffix.to_owned(),
+        }
+    } else {
+        UiTextDiff::replace(current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_core::{AStr, PendingInferenceResponse};
+
+    use super::*;
+
+    fn streaming_state(text: &str) -> AgentState {
+        AgentState {
+            blocks: Vec::new(),
+            tool_specs: Arc::from([]),
+            kind: AgentStateKind::ApiStreaming {
+                pending_response: PendingInferenceResponse {
+                    items: vec![StreamingContextItemState::Pending(
+                        StreamingContextItem::AssistantMessage {
+                            content: vec![AStr::from(text)],
+                            phase: None,
+                        },
+                    )],
+                },
+                previous_attempt: None,
+            },
+        }
+    }
+
+    #[test]
+    fn streaming_update_sends_text_suffix_diff() {
+        let mut encoder = AgentRemoteEncoder::new();
+        let AgentRemoteFrame::Snapshot(mut receiver) = encoder.encode(streaming_state("hel"))
+        else {
+            panic!("first frame should be a snapshot");
+        };
+
+        let frame = encoder.encode(streaming_state("hello"));
+        let AgentRemoteFrame::Diff {
+            status,
+            pending_response,
+            ..
+        } = &frame
+        else {
+            panic!("second frame should be a diff");
+        };
+        assert_eq!(*status, None);
+        let UiPendingResponseDiff::Items(items) = pending_response else {
+            panic!("streaming state should use item diff");
+        };
+        assert_eq!(
+            items,
+            &[UiStreamingItemUpdate {
+                index: 0,
+                item: UiStreamingItemDiff::AssistantMessage {
+                    text: UiTextDiff {
+                        keep_bytes: 3,
+                        value: "lo".to_owned(),
+                    },
+                },
+            }]
+        );
+
+        frame.apply_diff(&mut receiver);
+        assert_eq!(
+            receiver,
+            UiAgentState::from_agent_state(&streaming_state("hello"))
+        );
+    }
+
+    #[test]
+    fn tiny_streaming_update_has_small_wire_frame() {
+        let mut encoder = AgentRemoteEncoder::new();
+        let _ = encoder.encode(streaming_state("hel"));
+        let frame = encoder.encode(streaming_state("hello"));
+        let bytes = senax_encoder::encode(&crate::ServerMessage::Agent(frame)).unwrap();
+        assert!(bytes.len() < 160);
     }
 }

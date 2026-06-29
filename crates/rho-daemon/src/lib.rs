@@ -125,10 +125,7 @@ async fn serve_connection(agent: Agent, connection: ServerConnection) -> anyhow:
             ClientMessage::Ping => {
                 let _ = outgoing_tx.send(ServerMessage::Pong);
             }
-            ClientMessage::Subscribe => {
-                let mut encoder = AgentRemoteEncoder::new();
-                let _ = outgoing_tx.send(ServerMessage::Agent(encoder.encode(agent.state())));
-            }
+            ClientMessage::Subscribe => {}
             ClientMessage::SendUserMessage { content } => {
                 agent.send_user_message(text_content(&content));
             }
