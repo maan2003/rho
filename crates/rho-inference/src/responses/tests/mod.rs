@@ -22,7 +22,8 @@ use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 use crate::config::{
-    AutoCompaction, Effort, Gpt5Config, Gpt5Model, InferenceConfig, ServiceTier, TextVerbosity,
+    AutoCompaction, Effort, Gpt5Config, Gpt5Model, InferenceConfig, ReasoningContext, ServiceTier,
+    TextVerbosity,
 };
 
 fn first_assistant_message(
@@ -112,6 +113,7 @@ fn tool_name(name: &str) -> ToolName {
 
 fn inference_request(input: Vec<Arc<ContextBlock>>, tools: Vec<ToolSpec>) -> InferenceRequest {
     InferenceRequest {
+        instructions: Arc::from(""),
         input,
         tools: tools.into(),
     }
@@ -218,6 +220,7 @@ fn test_inference_service_with(
     let config = InferenceConfig::Gpt5(Gpt5Config {
         model: Gpt5Model(Cow::Owned(model.into())),
         auto_compaction,
+        reasoning_context: ReasoningContext::AllTurns,
         effort: Effort::Medium,
         text_verbosity: TextVerbosity::Medium,
         service_tier: ServiceTier::Normal,

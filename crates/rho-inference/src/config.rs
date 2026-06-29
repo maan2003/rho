@@ -28,6 +28,12 @@ pub enum TextVerbosity {
     High,
 }
 
+#[derive(Clone, Debug, Decode, Deserialize, Eq, Hash, PartialEq, Encode, Serialize)]
+pub enum ReasoningContext {
+    CurrentTurn,
+    AllTurns,
+}
+
 /// How the provider should automatically compact long threads.
 #[derive(Clone, Debug, Decode, Deserialize, Eq, Hash, PartialEq, Encode, Serialize)]
 pub enum AutoCompaction {
@@ -81,6 +87,7 @@ impl<'de> Deserialize<'de> for Gpt5Model {
 pub struct Gpt5Config {
     pub model: Gpt5Model,
     pub auto_compaction: Option<AutoCompaction>,
+    pub reasoning_context: ReasoningContext,
     pub effort: Effort,
     pub text_verbosity: TextVerbosity,
     pub service_tier: ServiceTier,
@@ -96,6 +103,7 @@ impl InferenceConfig {
         Self::Gpt5(Gpt5Config {
             model: Gpt5Model::GPT_5_5,
             auto_compaction: Some(AutoCompaction::Threshold(272_000 * 95 / 100 * 90 / 100)),
+            reasoning_context: ReasoningContext::AllTurns,
             effort: Effort::Medium,
             text_verbosity: TextVerbosity::Low,
             service_tier: ServiceTier::Normal,

@@ -362,6 +362,7 @@ impl AgentLoop {
                                 .blocks
                                 .push(Arc::new(ContextBlock::UserMessage { content }));
                             self.inference_session.request(InferenceRequest {
+                                instructions: Arc::from(""),
                                 input: state.blocks.clone(),
                                 tools: Arc::clone(&state.tool_specs),
                             });
@@ -496,6 +497,7 @@ impl AgentLoop {
                         }
                         state.blocks.push(Arc::new(ContextBlock::ToolResults { results }));
                         self.inference_session.request(InferenceRequest {
+                            instructions: Arc::from(""),
                             input: state.blocks.clone(),
                             tools: Arc::clone(&state.tool_specs),
                         });

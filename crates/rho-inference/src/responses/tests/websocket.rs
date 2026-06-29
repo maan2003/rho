@@ -100,7 +100,7 @@ fn websocket_request_uses_oauth_file_credentials() {
 fn websocket_envelope_has_response_create_type() {
     let body = ResponsesRequest {
         model: "gpt-test".to_owned(),
-        instructions: None,
+        instructions: Arc::from(""),
         input: Vec::new(),
         store: Some(false),
         tools: Vec::new(),

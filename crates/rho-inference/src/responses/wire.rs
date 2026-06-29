@@ -1,6 +1,8 @@
 //! Translation between rho-core's provider-neutral types and the OpenAI
 //! Responses API wire format.
 
+use std::sync::Arc;
+
 use anyhow::{Result, bail};
 use rho_core::{
     AppendString, ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
@@ -12,13 +14,14 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::InferenceSession;
-use crate::config::{AutoCompaction, Effort, InferenceConfig, ServiceTier, TextVerbosity};
+use crate::config::{
+    AutoCompaction, Effort, InferenceConfig, ReasoningContext, ServiceTier, TextVerbosity,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ResponsesRequest {
     pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
+    pub instructions: Arc<str>,
     pub input: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
@@ -48,7 +51,9 @@ pub(crate) struct TextRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ReasoningRequest {
+    pub context: &'static str,
     pub effort: &'static str,
+    pub summary: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -149,9 +154,7 @@ impl ResponsesRequest {
 
         Self {
             model: config.model.0.to_string(),
-            // TODO: rho-core's InferenceRequest has no instruction field yet
-            // (see its `// todo: add instruction`); wire it through once it does.
-            instructions: None,
+            instructions: request.instructions,
             input,
             store: Some(false),
             tools,
@@ -164,6 +167,10 @@ impl ResponsesRequest {
                 },
             }),
             reasoning: Some(ReasoningRequest {
+                context: match config.reasoning_context {
+                    ReasoningContext::CurrentTurn => "current_turn",
+                    ReasoningContext::AllTurns => "all_turns",
+                },
                 effort: match config.effort {
                     Effort::Minimal => "minimal",
                     Effort::Low => "low",
@@ -172,6 +179,7 @@ impl ResponsesRequest {
                     Effort::Xhigh => "xhigh",
                     Effort::Max => "max",
                 },
+                summary: "auto",
             }),
             service_tier: Some(match config.service_tier {
                 ServiceTier::Flex => "flex",

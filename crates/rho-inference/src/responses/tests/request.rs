@@ -121,6 +121,47 @@ fn serializes_configured_reasoning_effort() {
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["reasoning"]["effort"], "medium");
+    assert_eq!(json["reasoning"]["context"], "all_turns");
+    assert_eq!(json["reasoning"]["summary"], "auto");
+}
+
+#[test]
+fn serializes_configured_reasoning_context() {
+    let (_temp, auth) = test_oauth_file("token", None);
+    let session = InferenceSession::new(
+        auth,
+        InferenceConfig::Gpt5(Gpt5Config {
+            model: Gpt5Model(Cow::Owned("gpt-test".into())),
+            auto_compaction: None,
+            reasoning_context: ReasoningContext::CurrentTurn,
+            effort: Effort::Medium,
+            text_verbosity: TextVerbosity::Medium,
+            service_tier: ServiceTier::Normal,
+        })
+        .protect(),
+        PromptCacheKey::from_bytes(*b"testkey0"),
+    );
+    let request = inference_request(vec![user_block("hello")], Vec::new());
+
+    let body = ResponsesRequest::from_inference_request(&session, request);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["reasoning"]["context"], "current_turn");
+}
+
+#[test]
+fn serializes_required_instructions() {
+    let request = InferenceRequest {
+        instructions: Arc::from("You are rho."),
+        input: vec![user_block("hello")],
+        tools: Arc::from([]),
+    };
+
+    let body =
+        ResponsesRequest::from_inference_request(&test_inference_service("gpt-test"), request);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["instructions"], "You are rho.");
 }
 
 #[test]

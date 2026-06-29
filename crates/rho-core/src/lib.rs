@@ -182,7 +182,7 @@ impl senax_encoder::Decoder for OpaqueProviderData {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct InferenceRequest {
-    // todo: add instruction
+    pub instructions: Arc<str>,
     // arc is used to avoid cloning context blocks too much between requests
     pub input: Vec<Arc<ContextBlock>>,
     pub tools: Arc<[ToolSpec]>,
