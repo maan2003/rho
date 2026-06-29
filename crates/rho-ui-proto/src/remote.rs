@@ -26,7 +26,7 @@ impl AgentRemoteEncoder {
 
     pub fn encode(&mut self, current: AgentState) -> AgentRemoteFrame {
         let frame = match (&self.last_agent, &self.last_sent) {
-            (Some(previous_agent), Some(_)) => {
+            (Some(previous_agent), Some(previous_sent)) => {
                 let keep_agent_blocks = common_agent_block_prefix_len(previous_agent, &current);
                 let keep_blocks = previous_agent.blocks[..keep_agent_blocks]
                     .iter()
@@ -35,6 +35,7 @@ impl AgentRemoteEncoder {
                 let blocks = current.blocks[keep_agent_blocks..]
                     .iter()
                     .flat_map(|block| ui_blocks(block))
+                    .map(|block| UiBlockAppend::from_previous_pending(block, previous_sent))
                     .collect();
                 AgentRemoteFrame::Diff {
                     keep_blocks,
@@ -75,7 +76,7 @@ pub enum AgentRemoteFrame {
         /// Number of already-rendered blocks the receiver should keep before
         /// appending `blocks`.
         keep_blocks: usize,
-        blocks: Vec<UiBlock>,
+        blocks: Vec<UiBlockAppend>,
         status: Option<UiAgentStatus>,
         pending_response: UiPendingResponseDiff,
     },
@@ -92,7 +93,11 @@ impl AgentRemoteFrame {
                 pending_response,
             } => {
                 state.blocks.truncate(keep_blocks);
-                state.blocks.extend(blocks);
+                state.blocks.extend(
+                    blocks
+                        .into_iter()
+                        .filter_map(|block| block.into_block(&state.pending_response)),
+                );
                 if let Some(status) = status {
                     state.status = status;
                 }
@@ -143,6 +148,30 @@ pub enum UiBlock {
     Notice {
         text: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum UiBlockAppend {
+    Block(UiBlock),
+    Pending { index: usize },
+}
+
+impl UiBlockAppend {
+    fn from_previous_pending(block: UiBlock, previous: &UiAgentState) -> Self {
+        previous
+            .pending_response
+            .iter()
+            .position(|item| ui_block_from_pending(item).as_ref() == Some(&block))
+            .map(|index| Self::Pending { index })
+            .unwrap_or(Self::Block(block))
+    }
+
+    fn into_block(self, pending_response: &[UiStreamingItem]) -> Option<UiBlock> {
+        match self {
+            Self::Block(block) => Some(block),
+            Self::Pending { index } => pending_response.get(index).and_then(ui_block_from_pending),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -609,6 +638,26 @@ fn ui_streaming_item_from_item(item: &StreamingContextItem) -> Option<UiStreamin
     }
 }
 
+fn ui_block_from_pending(item: &UiStreamingItem) -> Option<UiBlock> {
+    match item {
+        UiStreamingItem::AssistantMessage { text } => {
+            Some(UiBlock::AssistantMessage { text: text.clone() })
+        }
+        UiStreamingItem::Reasoning { text } => Some(UiBlock::Reasoning { text: text.clone() }),
+        UiStreamingItem::ToolCall {
+            id,
+            name,
+            arguments,
+        } => Some(UiBlock::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            arguments: arguments.clone(),
+            status: UiToolStatus::Running,
+        }),
+        UiStreamingItem::Notice { text } => Some(UiBlock::Notice { text: text.clone() }),
+    }
+}
+
 fn reasoning_text(content: &impl ToString, summary: &[impl ToString]) -> String {
     if summary.is_empty() {
         content.to_string()
@@ -651,7 +700,7 @@ fn diff_text(previous: &str, current: &str) -> UiTextDiff {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::{AStr, PendingInferenceResponse};
+    use rho_core::{AStr, ContentPart, PendingInferenceResponse};
 
     use super::*;
 
@@ -670,6 +719,22 @@ mod tests {
                 },
                 previous_attempt: None,
             },
+        }
+    }
+
+    fn finished_state(text: &str) -> AgentState {
+        AgentState {
+            blocks: vec![Arc::new(ContextBlock::InferenceResponse {
+                items: vec![InferenceResponseItem::AssistantMessage {
+                    content: vec![ContentPart::Text {
+                        text: text.to_owned(),
+                    }],
+                    phase: None,
+                }],
+                provider_response_id: None,
+            })],
+            tool_specs: Arc::from([]),
+            kind: AgentStateKind::Idle,
         }
     }
 
@@ -721,5 +786,44 @@ mod tests {
         let frame = encoder.encode(streaming_state("hello"));
         let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent(frame)).unwrap();
         assert!(bytes.len() < 40, "tiny frame was {} bytes", bytes.len());
+    }
+
+    #[test]
+    fn finishing_streamed_text_appends_pending_block_by_reference() {
+        let mut encoder = AgentRemoteEncoder::new();
+        let AgentRemoteFrame::Snapshot(mut receiver) = encoder.encode(streaming_state("hello"))
+        else {
+            panic!("first frame should be a snapshot");
+        };
+
+        let frame = encoder.encode(finished_state("hello"));
+        let AgentRemoteFrame::Diff {
+            blocks,
+            pending_response,
+            status,
+            ..
+        } = &frame
+        else {
+            panic!("second frame should be a diff");
+        };
+        assert_eq!(blocks, &[UiBlockAppend::Pending { index: 0 }]);
+        assert_eq!(*status, Some(UiAgentStatus::Idle));
+        assert_eq!(
+            *pending_response,
+            UiPendingResponseDiff::Replace(Vec::new())
+        );
+
+        let bytes =
+            crate::protocol_frame_bytes(&crate::ServerMessage::Agent(frame.clone())).unwrap();
+        assert!(
+            bytes.len() < 20,
+            "finish frame resent too much data: {} bytes",
+            bytes.len()
+        );
+        frame.apply_diff(&mut receiver);
+        assert_eq!(
+            receiver,
+            UiAgentState::from_agent_state(&finished_state("hello"))
+        );
     }
 }
