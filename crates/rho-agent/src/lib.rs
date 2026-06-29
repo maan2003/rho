@@ -20,6 +20,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::db::{AgentEventPos, AgentId, AgentReadTxnExt, AgentWriteTxnExt, UnixMillis};
 
 pub mod db;
+pub mod system_prompt;
 
 /// An agent timeline event. Some events fold into model context; future
 /// runtime-only events, like tool output chunks, can live here without becoming
@@ -39,7 +40,7 @@ pub enum AgentEvent<'a> {
 }
 
 /// Live runtime state of an agent turn.
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq)]
 // should be cheap to clone, it is cloned a lot
 pub struct AgentState {
     /// Invariant: append-only. Blocks are only ever pushed — never removed,
@@ -48,6 +49,8 @@ pub struct AgentState {
     /// Invariant: immutable. Set once at construction and never changed for the
     /// life of the agent. Enforced by exposing no mutator.
     pub tool_specs: Arc<[ToolSpec]>,
+    /// Invariant: immutable
+    pub system_prompt: Arc<str>,
     pub kind: AgentStateKind,
 }
 
@@ -108,6 +111,7 @@ impl Agent {
         let state = AgentState {
             blocks,
             tool_specs: shell_tools.specs().into(),
+            system_prompt: system_prompt::prompt(),
             kind: AgentStateKind::Idle,
         };
         Self::new(inference_session, shell_tools, state, None)
@@ -134,6 +138,7 @@ impl Agent {
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: shell_tools.specs().into(),
+            system_prompt: system_prompt::prompt(),
             kind: AgentStateKind::Idle,
         };
         Self::new(
@@ -231,6 +236,7 @@ impl Agent {
         let state = AgentState {
             blocks,
             tool_specs: shell_tools.specs().into(),
+            system_prompt: system_prompt::prompt(),
             kind,
         };
         Self::new(
@@ -362,7 +368,7 @@ impl AgentLoop {
                                 .blocks
                                 .push(Arc::new(ContextBlock::UserMessage { content }));
                             self.inference_session.request(InferenceRequest {
-                                instructions: Arc::from(""),
+                                instructions: state.system_prompt.clone(),
                                 input: state.blocks.clone(),
                                 tools: Arc::clone(&state.tool_specs),
                             });
@@ -497,7 +503,7 @@ impl AgentLoop {
                         }
                         state.blocks.push(Arc::new(ContextBlock::ToolResults { results }));
                         self.inference_session.request(InferenceRequest {
-                            instructions: Arc::from(""),
+                            instructions: state.system_prompt.clone(),
                             input: state.blocks.clone(),
                             tools: Arc::clone(&state.tool_specs),
                         });
