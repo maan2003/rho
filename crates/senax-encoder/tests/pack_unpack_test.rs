@@ -1,9 +1,9 @@
-use bytes::{BufMut, BytesMut};
-use senax_encoder::encode;
-use senax_encoder::{
-    pack, unpack, Decode, Decoder, Encode, Encoder, Pack, Packer, Unpack, Unpacker,
-};
 use std::collections::HashMap;
+
+use bytes::{BufMut, BytesMut};
+use senax_encoder::{
+    Decode, Decoder, Encode, Encoder, Pack, Packer, Unpack, Unpacker, encode, pack, unpack,
+};
 
 #[derive(Encode, Decode, Pack, Unpack, PartialEq, Debug)]
 struct SimpleStruct {
@@ -230,7 +230,8 @@ fn test_enum_pack_vs_encode_size_difference() {
 
 #[test]
 fn test_enum_field_order_dependency() {
-    // This test demonstrates that pack/unpack is order-dependent for enum fields too
+    // This test demonstrates that pack/unpack is order-dependent for enum fields
+    // too
     #[derive(Encode, Decode, Pack, Unpack, PartialEq, Debug)]
     enum EnumA {
         Named { first: u32, second: String },
@@ -1032,7 +1033,8 @@ fn test_bytes_with_option_pack_unpack() {
 fn test_bytes_vec_u8_pack_behavior() {
     use bytes::Bytes;
 
-    // Test that Bytes and Vec<u8> use different formats
+    // In pack format the type is known by the caller, so Bytes and Vec<u8> can
+    // share the same compact length-prefixed bytes.
     let data = vec![1u8, 2, 3, 4, 5, 255, 0, 128];
     let vec_data = data.clone();
     let bytes_data = Bytes::from(data);
@@ -1044,9 +1046,7 @@ fn test_bytes_vec_u8_pack_behavior() {
     println!("Vec<u8> packed: {:?}", packed_vec.as_ref());
     println!("Bytes packed: {:?}", packed_bytes.as_ref());
 
-    // Vec<u8> and Bytes now use different formats:
-    // Vec<u8> uses TAG_ARRAY_VEC_SET format, Bytes uses TAG_BINARY format
-    assert_ne!(packed_vec, packed_bytes);
+    assert_eq!(packed_vec, packed_bytes);
 
     // Each can be unpacked correctly with its own type
     let mut reader_vec = packed_vec;
@@ -1062,8 +1062,8 @@ fn test_bytes_vec_u8_pack_behavior() {
 fn test_bytes_string_pack_behavior() {
     use bytes::Bytes;
 
-    // Test that Bytes and String with same UTF-8 content use different tags
-    // This demonstrates the difference between the two types in pack format
+    // In pack format the type is known by the caller, so Bytes and String with
+    // identical UTF-8 bytes can share the same compact representation.
     let text = "Hello, World! 🌍";
     let string_data = text.to_string();
     let bytes_data = Bytes::from(text.as_bytes().to_vec());
@@ -1072,10 +1072,9 @@ fn test_bytes_string_pack_behavior() {
     let packed_string = pack(&string_data).unwrap();
     let packed_bytes = pack(&bytes_data).unwrap();
 
-    // They use different tags, so packed data will differ
     println!("String packed: {:?}", packed_string.as_ref());
     println!("Bytes packed: {:?}", packed_bytes.as_ref());
-    assert_ne!(packed_string, packed_bytes);
+    assert_eq!(packed_string, packed_bytes);
 
     // Each can be unpacked correctly with its own type
     let mut reader_string = packed_string;
@@ -1125,6 +1124,13 @@ fn test_all_primitive_types_pack_unpack() {
     let mut reader = packed_usize;
     let unpacked_usize: usize = unpack(&mut reader).unwrap();
     assert_eq!(usize_val, unpacked_usize);
+
+    let medium_usize: usize = 691;
+    let packed_medium_usize = pack(&medium_usize).unwrap();
+    assert_eq!(packed_medium_usize.as_ref(), &[0xb3, 0x05]);
+    let mut reader = packed_medium_usize;
+    let unpacked_medium_usize: usize = unpack(&mut reader).unwrap();
+    assert_eq!(medium_usize, unpacked_medium_usize);
 
     // Test all signed integer types
     let i8_val: i8 = -128;
@@ -1593,6 +1599,7 @@ fn test_char_cross_compatibility() {
 #[cfg(feature = "uuid")]
 fn test_uuid_default_and_non_default_pack_unpack() {
     use std::str::FromStr;
+
     use uuid::Uuid;
 
     // Test default UUID (should use TAG_NONE)

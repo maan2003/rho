@@ -354,7 +354,7 @@ impl Encoder for u16 {
 
 impl Packer for u16 {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
-        self.encode(writer)
+        pack_u128_varint(*self as u128, writer)
     }
 }
 
@@ -370,7 +370,9 @@ impl Decoder for u16 {
 
 impl Unpacker for u16 {
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
-        Self::decode(reader)
+        unpack_u128_varint(reader)?
+            .try_into()
+            .map_err(|_| EncoderError::Decode("packed u16 varint overflow".to_owned()))
     }
 }
 
@@ -398,7 +400,7 @@ impl Encoder for u32 {
 
 impl Packer for u32 {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
-        self.encode(writer)
+        pack_u128_varint(*self as u128, writer)
     }
 }
 
@@ -415,7 +417,9 @@ impl Decoder for u32 {
 
 impl Unpacker for u32 {
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
-        Self::decode(reader)
+        unpack_u128_varint(reader)?
+            .try_into()
+            .map_err(|_| EncoderError::Decode("packed u32 varint overflow".to_owned()))
     }
 }
 
@@ -447,7 +451,7 @@ impl Encoder for u64 {
 
 impl Packer for u64 {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
-        self.encode(writer)
+        pack_u128_varint(*self as u128, writer)
     }
 }
 
@@ -464,7 +468,9 @@ impl Decoder for u64 {
 
 impl Unpacker for u64 {
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
-        Self::decode(reader)
+        unpack_u128_varint(reader)?
+            .try_into()
+            .map_err(|_| EncoderError::Decode("packed u64 varint overflow".to_owned()))
     }
 }
 
@@ -499,7 +505,7 @@ impl Encoder for u128 {
 
 impl Packer for u128 {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
-        self.encode(writer)
+        pack_u128_varint(*self, writer)
     }
 }
 
@@ -515,7 +521,7 @@ impl Decoder for u128 {
 
 impl Unpacker for u128 {
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
-        Self::decode(reader)
+        unpack_u128_varint(reader)
     }
 }
 
@@ -547,7 +553,7 @@ impl Encoder for usize {
 impl Packer for usize {
     #[inline]
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
-        self.encode(writer)
+        pack_u128_varint(*self as u128, writer)
     }
 }
 
@@ -571,7 +577,44 @@ impl Decoder for usize {
 
 impl Unpacker for usize {
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
-        Self::decode(reader)
+        unpack_u128_varint(reader)?
+            .try_into()
+            .map_err(|_| EncoderError::Decode("packed usize varint overflow".to_owned()))
+    }
+}
+
+fn pack_u128_varint(mut value: u128, writer: &mut BytesMut) -> Result<()> {
+    while value >= 0x80 {
+        writer.put_u8((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    writer.put_u8(value as u8);
+    Ok(())
+}
+
+fn unpack_u128_varint(reader: &mut impl Buf) -> Result<u128> {
+    let mut value = 0u128;
+    let mut shift = 0;
+    loop {
+        if reader.remaining() == 0 {
+            return Err(EncoderError::InsufficientData);
+        }
+        let byte = reader.get_u8();
+        if shift == 126 && byte > 0b11 {
+            return Err(EncoderError::Decode(
+                "packed unsigned varint overflow".to_owned(),
+            ));
+        }
+        value |= ((byte & 0x7f) as u128) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift > 126 {
+            return Err(EncoderError::Decode(
+                "packed unsigned varint overflow".to_owned(),
+            ));
+        }
     }
 }
 
@@ -1217,7 +1260,9 @@ impl Encoder for str {
 
 impl Packer for str {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
-        self.encode(writer)
+        self.len().pack(writer)?;
+        writer.put_slice(self.as_bytes());
+        Ok(())
     }
 }
 
@@ -1267,7 +1312,15 @@ impl Decoder for String {
 
 impl Unpacker for String {
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
-        Self::decode(reader)
+        let len = usize::unpack(reader)?;
+        if reader.remaining() < len {
+            return Err(EncoderError::InsufficientData);
+        }
+        let mut bytes = vec![0u8; len];
+        if len > 0 {
+            reader.copy_to_slice(&mut bytes);
+        }
+        String::from_utf8(bytes).map_err(|e| EncoderError::Decode(e.to_string()))
     }
 }
 
@@ -1361,7 +1414,7 @@ impl<T: Encoder + 'static> Encoder for Vec<T> {
 impl<T: Packer + 'static> Packer for Vec<T> {
     /// Packs a `Vec<T>` as a length-prefixed sequence.
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
-        encode_vec_length(self.len(), writer)?;
+        self.len().pack(writer)?;
         for item in self {
             item.pack(writer)?;
         }
@@ -1384,7 +1437,7 @@ impl<T: Decoder + 'static> Decoder for Vec<T> {
 impl<T: Unpacker + 'static> Unpacker for Vec<T> {
     /// Unpacks a `Vec<T>` from the compact format.
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
-        let len = decode_vec_length(reader)?;
+        let len = usize::unpack(reader)?;
         let mut vec = Vec::with_capacity(len);
         for _ in 0..len {
             vec.push(T::unpack(reader)?);
@@ -2125,9 +2178,8 @@ impl Encoder for Bytes {
 
 impl Packer for Bytes {
     fn pack(&self, writer: &mut BytesMut) -> Result<()> {
-        writer.put_u8(TAG_BINARY);
         let len = self.len();
-        len.encode(writer)?;
+        len.pack(writer)?;
         writer.put_slice(self);
         Ok(())
     }
@@ -2162,23 +2214,7 @@ impl Decoder for Bytes {
 
 impl Unpacker for Bytes {
     fn unpack(reader: &mut impl Buf) -> Result<Self> {
-        if reader.remaining() == 0 {
-            return Err(EncoderError::InsufficientData);
-        }
-        let tag = reader.get_u8();
-        let len = if tag == TAG_BINARY {
-            usize::unpack(reader)?
-        } else if (TAG_STRING_BASE..TAG_STRING_LONG).contains(&tag) {
-            (tag - TAG_STRING_BASE) as usize
-        } else if tag == TAG_STRING_LONG {
-            usize::unpack(reader)?
-        } else {
-            return Err(EncoderError::Decode(format!(
-                "Expected Bytes tag ({} or {}..={}), got {}",
-                TAG_BINARY, TAG_STRING_BASE, TAG_STRING_LONG, tag
-            )));
-        };
-
+        let len = usize::unpack(reader)?;
         if reader.remaining() < len {
             return Err(EncoderError::InsufficientData);
         }
