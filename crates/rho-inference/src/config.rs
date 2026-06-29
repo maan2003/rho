@@ -106,7 +106,7 @@ impl InferenceConfig {
             reasoning_context: ReasoningContext::AllTurns,
             effort: Effort::Medium,
             text_verbosity: TextVerbosity::Low,
-            service_tier: ServiceTier::Normal,
+            service_tier: ServiceTier::Priority,
         })
     }
 
