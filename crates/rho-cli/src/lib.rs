@@ -66,6 +66,11 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Daemon(args) => rho_daemon::run(args).await,
+        Command::ProtocolLog(args) => {
+            let mut stdout = io::stdout().lock();
+            rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
+            Ok(())
+        }
     }
 }
 
@@ -810,6 +815,7 @@ enum Command {
     Chat(ChatArgs),
     Auth(AuthArgs),
     Daemon(DaemonArgs),
+    ProtocolLog(ProtocolLogArgs),
 }
 
 #[derive(Parser)]
@@ -829,6 +835,7 @@ enum CliCommand {
         command: AuthArgs,
     },
     Daemon(DaemonArgs),
+    ProtocolLog(ProtocolLogArgs),
 }
 
 #[derive(Clone, clap::Args)]
@@ -837,6 +844,11 @@ struct ChatArgs {
     auth: String,
     #[arg(long = "prompt-stdin")]
     prompt_stdin: bool,
+}
+
+#[derive(Clone, clap::Args)]
+struct ProtocolLogArgs {
+    path: std::path::PathBuf,
 }
 
 impl Args {
@@ -849,6 +861,7 @@ impl Args {
         let command = match cli.command {
             Some(CliCommand::Auth { command }) => Command::Auth(command),
             Some(CliCommand::Daemon(args)) => Command::Daemon(args),
+            Some(CliCommand::ProtocolLog(args)) => Command::ProtocolLog(args),
             None => Command::Chat(cli.chat),
         };
         Ok(Self { command })

@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::Stream;
 use rho_core::ContentPart;
@@ -6,12 +8,16 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
 use crate::remote::{UiAgentState, UiBlock};
-use crate::{ClientMessage, IoCounters, ServerMessage, read_frame_counted, write_frame_counted};
+use crate::{
+    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, append_protocol_log_record,
+    protocol_frame_bytes, read_frame_counted, write_frame_counted,
+};
 
 /// Raw async client for the rho UI Unix-socket protocol.
 pub struct Client {
     stream: UnixStream,
     counters: IoCounters,
+    logger: Option<ProtocolLogger>,
 }
 
 impl Client {
@@ -24,19 +30,32 @@ impl Client {
         Self {
             stream,
             counters: IoCounters::default(),
+            logger: ProtocolLogger::from_env(),
         }
     }
 
     pub async fn send(&mut self, message: &ClientMessage) -> anyhow::Result<()> {
-        write_frame_counted(&mut self.stream, message, Some(&self.counters)).await
+        write_frame_counted(&mut self.stream, message, Some(&self.counters)).await?;
+        if let Some(logger) = &self.logger {
+            logger.log(ProtocolLogDirection::ClientToServer, message);
+        }
+        Ok(())
     }
 
     pub async fn recv(&mut self) -> anyhow::Result<ServerMessage> {
-        read_frame_counted(&mut self.stream, Some(&self.counters)).await
+        let message = read_frame_counted(&mut self.stream, Some(&self.counters)).await?;
+        if let Some(logger) = &self.logger {
+            logger.log(ProtocolLogDirection::ServerToClient, &message);
+        }
+        Ok(message)
     }
 
     pub fn io_counters(&self) -> IoCounters {
         self.counters.clone()
+    }
+
+    fn logger(&self) -> Option<ProtocolLogger> {
+        self.logger.clone()
     }
 
     pub fn into_stream(self) -> UnixStream {
@@ -60,6 +79,7 @@ impl AgentClient {
 
     pub async fn connect_client(client: Client) -> anyhow::Result<Self> {
         let client_counters = client.io_counters();
+        let logger = client.logger();
         let mut stream = client.into_stream();
         write_frame_counted(
             &mut stream,
@@ -67,11 +87,23 @@ impl AgentClient {
             Some(&client_counters),
         )
         .await?;
+        if let Some(logger) = &logger {
+            logger.log(
+                ProtocolLogDirection::ClientToServer,
+                &ClientMessage::Subscribe,
+            );
+        }
         let ServerMessage::Agent(frame) =
             read_frame_counted(&mut stream, Some(&client_counters)).await?
         else {
             anyhow::bail!("rho daemon did not send initial agent state");
         };
+        if let Some(logger) = &logger {
+            logger.log(
+                ProtocolLogDirection::ServerToClient,
+                &ServerMessage::Agent(frame.clone()),
+            );
+        }
         let crate::remote::AgentRemoteFrame::Snapshot(initial_state) = frame else {
             anyhow::bail!("rho daemon sent diff before snapshot");
         };
@@ -81,6 +113,7 @@ impl AgentClient {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
         let reader_counters = client_counters.clone();
+        let reader_logger = logger.clone();
         tokio::spawn(async move {
             let mut reader = reader;
             let mut state = state_tx.borrow().clone();
@@ -94,6 +127,9 @@ impl AgentClient {
                     Ok(message) => message,
                     Err(_) => break,
                 };
+                if let Some(logger) = &reader_logger {
+                    logger.log(ProtocolLogDirection::ServerToClient, &message);
+                }
                 match message {
                     ServerMessage::Agent(frame) => {
                         frame.apply_diff(&mut state);
@@ -101,13 +137,16 @@ impl AgentClient {
                             break;
                         }
                     }
-                    ServerMessage::Error { message } => eprintln!("rho daemon error: {message}"),
+                    ServerMessage::Error { message } => {
+                        eprintln!("rho daemon error: {message}")
+                    }
                     ServerMessage::Pong | ServerMessage::TurnCancelled => {}
                 }
             }
         });
 
         let writer_counters = client_counters.clone();
+        let writer_logger = logger.clone();
         tokio::spawn(async move {
             let mut writer = writer;
             while let Some(message) = command_rx.recv().await {
@@ -116,6 +155,9 @@ impl AgentClient {
                     .is_err()
                 {
                     break;
+                }
+                if let Some(logger) = &writer_logger {
+                    logger.log(ProtocolLogDirection::ClientToServer, &message);
                 }
             }
         });
@@ -157,5 +199,41 @@ impl AgentClient {
                 yield current;
             }
         }
+    }
+}
+
+#[derive(Clone)]
+struct ProtocolLogger {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl ProtocolLogger {
+    fn from_env() -> Option<Self> {
+        let path = std::env::var_os("RHO_UI_PROTO_LOG")?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(Self {
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+
+    fn log<T>(&self, direction: ProtocolLogDirection, message: &T)
+    where
+        T: senax_encoder::Encoder,
+    {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let Ok(frame) = protocol_frame_bytes(message) else {
+            return;
+        };
+        let Ok(mut file) = self.file.lock() else {
+            return;
+        };
+        let _ = append_protocol_log_record(&mut *file, now_ms, direction, &frame);
     }
 }

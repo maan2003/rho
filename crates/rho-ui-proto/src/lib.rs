@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 const FRAME_LEN_BYTES: u64 = size_of::<u32>() as u64;
+const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP1";
 
 /// Shared byte counters for one UI protocol connection.
 ///
@@ -154,6 +155,150 @@ fn frame_wire_len(payload_len: usize) -> u64 {
     FRAME_LEN_BYTES + payload_len as u64
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtocolLogDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+impl ProtocolLogDirection {
+    fn byte(self) -> u8 {
+        match self {
+            Self::ClientToServer => 0,
+            Self::ServerToClient => 1,
+        }
+    }
+
+    fn from_byte(byte: u8) -> anyhow::Result<Self> {
+        match byte {
+            0 => Ok(Self::ClientToServer),
+            1 => Ok(Self::ServerToClient),
+            _ => bail!("invalid protocol log direction {byte}"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ClientToServer => "send",
+            Self::ServerToClient => "recv",
+        }
+    }
+}
+
+pub fn protocol_frame_bytes<T>(message: &T) -> anyhow::Result<Vec<u8>>
+where
+    T: Encoder,
+{
+    let payload = senax_encoder::encode(message).context("encode protocol log frame")?;
+    let len: u32 = payload
+        .len()
+        .try_into()
+        .context("protocol log frame too large")?;
+    let mut frame = Vec::with_capacity(size_of::<u32>() + payload.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+pub fn append_protocol_log_record(
+    writer: &mut impl std::io::Write,
+    unix_ms: u128,
+    direction: ProtocolLogDirection,
+    frame: &[u8],
+) -> anyhow::Result<()> {
+    let unix_ms: u64 = unix_ms
+        .try_into()
+        .context("protocol log timestamp overflow")?;
+    let len: u32 = frame
+        .len()
+        .try_into()
+        .context("protocol log frame too large")?;
+    writer.write_all(PROTOCOL_LOG_MAGIC)?;
+    writer.write_all(&unix_ms.to_le_bytes())?;
+    writer.write_all(&[direction.byte()])?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(frame)?;
+    Ok(())
+}
+
+pub fn print_protocol_log(
+    path: impl AsRef<std::path::Path>,
+    output: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    let mut input = std::fs::File::open(path).context("open protocol log")?;
+    loop {
+        let Some((unix_ms, direction, frame)) = read_protocol_log_record(&mut input)? else {
+            return Ok(());
+        };
+        if frame.len() < size_of::<u32>() {
+            bail!("protocol log frame shorter than length prefix");
+        }
+        let payload_len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
+        let payload = frame
+            .get(4..)
+            .filter(|payload| payload.len() == payload_len)
+            .context("protocol log frame length mismatch")?;
+        match direction {
+            ProtocolLogDirection::ClientToServer => {
+                let mut payload = payload;
+                let message: ClientMessage =
+                    senax_encoder::decode(&mut payload).context("decode client frame")?;
+                writeln!(
+                    output,
+                    "{unix_ms} {} {}B {message:#?}",
+                    direction.label(),
+                    frame.len()
+                )?;
+            }
+            ProtocolLogDirection::ServerToClient => {
+                let mut payload = payload;
+                let message: ServerMessage =
+                    senax_encoder::decode(&mut payload).context("decode server frame")?;
+                writeln!(
+                    output,
+                    "{unix_ms} {} {}B {message:#?}",
+                    direction.label(),
+                    frame.len()
+                )?;
+            }
+        }
+    }
+}
+
+fn read_protocol_log_record(
+    input: &mut impl std::io::Read,
+) -> anyhow::Result<Option<(u64, ProtocolLogDirection, Vec<u8>)>> {
+    let mut magic = [0; 4];
+    match input.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error).context("read protocol log magic"),
+    }
+    if &magic != PROTOCOL_LOG_MAGIC {
+        bail!("invalid protocol log magic");
+    }
+    let mut timestamp = [0; 8];
+    input
+        .read_exact(&mut timestamp)
+        .context("read protocol log timestamp")?;
+    let unix_ms = u64::from_le_bytes(timestamp);
+    let mut direction = [0; 1];
+    input
+        .read_exact(&mut direction)
+        .context("read protocol log direction")?;
+    let direction = ProtocolLogDirection::from_byte(direction[0])?;
+    let mut len = [0; 4];
+    input
+        .read_exact(&mut len)
+        .context("read protocol log frame length")?;
+    let len = u32::from_le_bytes(len) as usize;
+    let mut frame = vec![0; len];
+    input
+        .read_exact(&mut frame)
+        .context("read protocol log frame")?;
+    Ok(Some((unix_ms, direction, frame)))
+}
+
 /// Marker tying this protocol layer to `rho-agent` without putting socket code
 /// in the agent crate.
 pub type Agent = rho_agent::Agent;
@@ -166,5 +311,24 @@ mod tests {
     fn frame_wire_len_includes_length_prefix() {
         assert_eq!(frame_wire_len(0), 4);
         assert_eq!(frame_wire_len(12), 16);
+    }
+
+    #[test]
+    fn protocol_log_records_full_length_prefixed_frame() {
+        let frame = protocol_frame_bytes(&ClientMessage::Ping).unwrap();
+        let mut log = Vec::new();
+        append_protocol_log_record(&mut log, 123, ProtocolLogDirection::ClientToServer, &frame)
+            .unwrap();
+
+        let mut cursor = std::io::Cursor::new(log);
+        let (unix_ms, direction, recorded_frame) =
+            read_protocol_log_record(&mut cursor).unwrap().unwrap();
+        assert_eq!(unix_ms, 123);
+        assert_eq!(direction, ProtocolLogDirection::ClientToServer);
+        assert_eq!(recorded_frame, frame);
+
+        let mut payload = &recorded_frame[4..];
+        let message: ClientMessage = senax_encoder::decode(&mut payload).unwrap();
+        assert_eq!(message, ClientMessage::Ping);
     }
 }
