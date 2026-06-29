@@ -473,11 +473,11 @@ fn diff_pending_response_kind(
         (
             AgentStateKind::ApiStreaming {
                 pending_response: previous,
-                previous_attempt: None,
+                ..
             },
             AgentStateKind::ApiStreaming {
                 pending_response: current,
-                previous_attempt: None,
+                ..
             },
         ) => UiPendingResponseDiff::Items(diff_pending_response(previous, current)),
         _ => UiPendingResponseDiff::Replace(ui_pending_response(current)),
@@ -700,6 +700,9 @@ fn diff_text(previous: &str, current: &str) -> UiTextDiff {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
+    use rho_agent::FailedInferenceResponse;
     use rho_core::{AStr, ContentPart, PendingInferenceResponse};
 
     use super::*;
@@ -720,6 +723,22 @@ mod tests {
                 previous_attempt: None,
             },
         }
+    }
+
+    fn retry_streaming_state(text: &str) -> AgentState {
+        let mut state = streaming_state(text);
+        let AgentStateKind::ApiStreaming {
+            previous_attempt, ..
+        } = &mut state.kind
+        else {
+            unreachable!()
+        };
+        *previous_attempt = Some(FailedInferenceResponse {
+            partial_response: PendingInferenceResponse::default(),
+            attempt_count: NonZeroU64::MIN,
+            error: Arc::new("temporary failure".to_owned()),
+        });
+        state
     }
 
     fn finished_state(text: &str) -> AgentState {
@@ -824,6 +843,31 @@ mod tests {
         assert_eq!(
             receiver,
             UiAgentState::from_agent_state(&finished_state("hello"))
+        );
+    }
+
+    #[test]
+    fn retry_streaming_updates_still_use_item_diffs() {
+        let mut encoder = AgentRemoteEncoder::new();
+        let _ = encoder.encode(retry_streaming_state("hel"));
+        let frame = encoder.encode(retry_streaming_state("hello"));
+        let AgentRemoteFrame::Diff {
+            pending_response, ..
+        } = frame
+        else {
+            panic!("second frame should be a diff");
+        };
+        assert_eq!(
+            pending_response,
+            UiPendingResponseDiff::Items(vec![UiStreamingItemUpdate {
+                index: 0,
+                item: UiStreamingItemDiff::AssistantMessage {
+                    text: UiTextDiff {
+                        keep_bytes: 3,
+                        value: "lo".to_owned(),
+                    },
+                },
+            }])
         );
     }
 }
