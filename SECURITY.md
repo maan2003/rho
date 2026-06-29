@@ -13,6 +13,9 @@ AI APIs.
   must be parsed defensively.
 - Local filesystem state may contain transcripts and OAuth credentials;
   credential files are secrets.
+- Provider debug logs under the rho state directory may contain full inference
+  request bodies, tool results, and raw provider events; treat them like
+  transcripts.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
   explicit user-facing capabilities.
 

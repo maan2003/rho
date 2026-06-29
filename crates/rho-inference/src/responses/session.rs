@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -61,6 +62,15 @@ impl PromptCacheKey {
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         uuid::Uuid::from_bytes(bytes)
     }
+
+    fn debug_file_stem(self) -> String {
+        let mut stem = String::with_capacity(self.0.len() * 2);
+        for byte in self.0 {
+            use std::fmt::Write as _;
+            let _ = write!(&mut stem, "{byte:02x}");
+        }
+        stem
+    }
 }
 
 /// A turn that has been requested and is being driven by `run`.
@@ -76,6 +86,11 @@ struct Turn {
     replayed: bool,
     /// Whether we have announced `StreamingStarted` for the current attempt.
     streaming_started: bool,
+    /// Monotonic debug request/response sequence for the in-flight send
+    /// attempt.
+    debug_sequence: Option<u64>,
+    /// Raw provider text frames observed for the in-flight send attempt.
+    raw_events: Vec<serde_json::Value>,
 }
 
 pub struct InferenceSession {
@@ -92,6 +107,7 @@ pub struct InferenceSession {
     pub(crate) auth: InferenceAuth,
     pub(crate) config: InferenceProtectedConfig,
     pub(crate) prompt_cache_key: PromptCacheKey,
+    debug_counter: u64,
 }
 
 impl InferenceSession {
@@ -108,6 +124,7 @@ impl InferenceSession {
             auth,
             config,
             prompt_cache_key,
+            debug_counter: 0,
         }
     }
 
@@ -129,6 +146,8 @@ impl InferenceSession {
             response: ResponseState::new(),
             replayed: false,
             streaming_started: false,
+            debug_sequence: None,
+            raw_events: Vec::new(),
         });
     }
 
@@ -161,11 +180,18 @@ impl InferenceSession {
                         error: error.into(),
                     };
                 }
-                let mut body = self.turn.as_mut().unwrap().pending_send.take().unwrap();
+                let debug_sequence = self.next_debug_sequence();
+                let mut body = {
+                    let turn = self.turn.as_mut().unwrap();
+                    turn.debug_sequence = Some(debug_sequence);
+                    turn.raw_events.clear();
+                    turn.pending_send.take().unwrap()
+                };
                 let connection = self.connection.as_ref().unwrap();
                 body.prompt_cache_key = self
                     .prompt_cache_key
                     .to_wire_uuid(&self.base_url, connection.client_secret);
+                self.maybe_debug_write_provider_request(debug_sequence, &body);
                 if let Err(error) = self.connection.as_mut().unwrap().send_envelope(body).await {
                     match self.on_socket_failure(error) {
                         ControlFlow::Continue(()) => continue,
@@ -233,7 +259,11 @@ impl InferenceSession {
         if self.turn.is_none() {
             return ControlFlow::Continue(());
         }
-        let outcome = self.turn.as_mut().unwrap().response.apply_event(&event);
+        let outcome = {
+            let turn = self.turn.as_mut().unwrap();
+            turn.raw_events.push(event.clone());
+            turn.response.apply_event(&event)
+        };
         match outcome {
             Err(error) => match self.on_turn_error(error) {
                 ErrorAction::Retry(error) => ControlFlow::Break(temporary_failure(error)),
@@ -256,7 +286,13 @@ impl InferenceSession {
                 // `apply_event` itself, so here we just drop the finished turn.
                 self.buffered.extend(updates);
                 if done {
+                    let debug = turn
+                        .debug_sequence
+                        .map(|sequence| (sequence, turn.raw_events.clone()));
                     self.turn = None;
+                    if let Some((sequence, raw_events)) = debug {
+                        self.maybe_debug_write_provider_response(sequence, &raw_events, None);
+                    }
                 }
                 ControlFlow::Continue(())
             }
@@ -282,6 +318,16 @@ impl InferenceSession {
     /// Decide whether a failed active turn should be replayed in full (a stale
     /// `previous_response_id` we can drop) or surfaced to the caller.
     fn on_turn_error(&mut self, error: anyhow::Error) -> ErrorAction {
+        if let Some(turn) = &self.turn
+            && let Some(sequence) = turn.debug_sequence
+        {
+            let error_message = error.to_string();
+            self.maybe_debug_write_provider_response(
+                sequence,
+                &turn.raw_events,
+                Some(error_message.as_str()),
+            );
+        }
         let replayable = matches!(&self.turn, Some(turn) if !turn.replayed)
             && super::is_stale_previous_response_error(&error)
             && self.turn_has_previous_response_id();
@@ -292,6 +338,8 @@ impl InferenceSession {
             turn.pending_send = Some(body);
             turn.replayed = true;
             turn.streaming_started = false;
+            turn.debug_sequence = None;
+            turn.raw_events.clear();
             turn.response = ResponseState::new();
             // Replay on a clean socket.
             self.connection = None;
@@ -301,6 +349,69 @@ impl InferenceSession {
             self.connection = None;
             ErrorAction::Fail(error)
         }
+    }
+
+    fn next_debug_sequence(&mut self) -> u64 {
+        self.debug_counter = self.debug_counter.saturating_add(1);
+        self.debug_counter
+    }
+
+    fn maybe_debug_write_provider_request(&self, sequence: u64, body: &ResponsesRequest) {
+        let metadata = serde_json::json!({
+            "prompt_cache_key": self.prompt_cache_key.debug_file_stem(),
+            "sequence": sequence,
+            "kind": "request",
+            "backend": "responses",
+            "transport": "websocket",
+            "model": &body.model,
+            "body": body,
+        });
+        if let Err(error) = self.debug_write_json(sequence, "request", &metadata) {
+            tracing::warn!(
+                prompt_cache_key = %self.prompt_cache_key.debug_file_stem(),
+                sequence,
+                "failed to write provider request debug log: {error}",
+            );
+        }
+    }
+
+    fn maybe_debug_write_provider_response(
+        &self,
+        sequence: u64,
+        raw_events: &[serde_json::Value],
+        error: Option<&str>,
+    ) {
+        let metadata = serde_json::json!({
+            "prompt_cache_key": self.prompt_cache_key.debug_file_stem(),
+            "sequence": sequence,
+            "kind": "response",
+            "backend": "responses",
+            "transport": "websocket",
+            "error": error,
+            "raw_events": raw_events,
+        });
+        if let Err(error) = self.debug_write_json(sequence, "response", &metadata) {
+            tracing::warn!(
+                prompt_cache_key = %self.prompt_cache_key.debug_file_stem(),
+                sequence,
+                "failed to write provider response debug log: {error}",
+            );
+        }
+    }
+
+    fn debug_write_json(
+        &self,
+        sequence: u64,
+        kind: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(dir) = provider_debug_dir() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(debug_file_name(self.prompt_cache_key, sequence, kind));
+        std::fs::write(path, serde_json::to_vec_pretty(metadata)?)?;
+        Ok(())
     }
 
     fn turn_has_previous_response_id(&self) -> bool {
@@ -333,6 +444,21 @@ impl InferenceSession {
         }
         Ok(())
     }
+}
+
+fn provider_debug_dir() -> Option<PathBuf> {
+    Some(dirs::state_dir()?.join("debug").join("provider-requests"))
+}
+
+pub(crate) fn debug_file_name(
+    prompt_cache_key: PromptCacheKey,
+    sequence: u64,
+    kind: &str,
+) -> String {
+    format!(
+        "{}-{sequence:04}-{kind}.json",
+        prompt_cache_key.debug_file_stem()
+    )
 }
 
 enum Read {

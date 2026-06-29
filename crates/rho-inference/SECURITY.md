@@ -13,6 +13,10 @@ manages file-backed OAuth credentials.
   semi-trusted inputs.
 - OAuth credential JSON files contain bearer and refresh tokens and must be
   treated as secrets.
+- Provider debug files under the rho state directory can contain full request
+  bodies, tool results, and raw provider events. They must not include auth
+  headers or OAuth tokens, but should still be treated as transcript-sensitive
+  data.
 - Inference event JSON must not be trusted to be well-formed, ordered, complete,
   or bounded in size.
 

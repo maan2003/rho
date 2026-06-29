@@ -1437,6 +1437,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
  "ureq",
  "url",
  "uuid",

@@ -6,6 +6,8 @@ workflows we will deal with later, for now lets just say agents have metadata wh
 
 
 - remote ui
+- fix tool response truncation
+- tool call streaming, show the tool call in ui while it is streaming
 - better thread rendering and more info about running tools
   - for shell: maybe last few lines of output?
   - duration
