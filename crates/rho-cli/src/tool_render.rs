@@ -12,6 +12,14 @@ pub(crate) fn tool_call_block(
     arguments: &str,
     status: ToolRenderStatus,
 ) -> StyledBlock {
+    if name == "apply_patch" {
+        return apply_patch_block();
+    }
+
+    if name == "shell_command" {
+        return shell_command_block(arguments, status);
+    }
+
     let mut spans = vec![
         Span::new("tool ", Style::default().fg(Color::DarkMagenta).bold()),
         Span::new(name.to_owned(), Style::default().fg(Color::DarkMagenta)),
@@ -21,14 +29,44 @@ pub(crate) fn tool_call_block(
         spans.push(Span::plain(summary));
     }
     match status {
-        ToolRenderStatus::Running => spans.push(Span::new(
-            " running 0s",
-            Style::default().fg(Color::DarkYellow),
-        )),
+        ToolRenderStatus::Running => {
+            spans.push(Span::new(" …", Style::default().fg(Color::DarkYellow)))
+        }
+        ToolRenderStatus::Done(ToolOutputStatus::Success) => {}
+        ToolRenderStatus::Done(ToolOutputStatus::Error) => {
+            spans.push(Span::new(" x", Style::default().fg(Color::Red)))
+        }
         ToolRenderStatus::Done(status) => spans.push(Span::new(
-            format!(" {} 0s", tool_status_label(&status)),
+            format!(" {}", tool_status_label(&status)),
             Style::default().fg(tool_status_color(&status)),
         )),
+    }
+    StyledBlock::new(StyledText::from(spans))
+}
+
+fn apply_patch_block() -> StyledBlock {
+    StyledBlock::new(Span::new("edit", Style::default().fg(Color::DarkGreen)))
+}
+
+fn shell_command_block(arguments: &str, status: ToolRenderStatus) -> StyledBlock {
+    let prompt_style = Style::default().fg(Color::DarkGreen);
+    let command_style = Style::default();
+    let mut spans = vec![Span::new("$ ", prompt_style)];
+    if let Some(command) = shell_command_summary(arguments) {
+        spans.push(Span::new(command, command_style));
+    }
+    match status {
+        ToolRenderStatus::Running => spans.push(Span::new(" …", prompt_style)),
+        ToolRenderStatus::Done(ToolOutputStatus::Success) => {}
+        ToolRenderStatus::Done(ToolOutputStatus::Error) => {
+            spans.push(Span::new(" x", Style::default().fg(Color::Red)));
+        }
+        ToolRenderStatus::Done(status) => {
+            spans.push(Span::new(
+                format!(" {}", tool_status_label(&status)),
+                prompt_style,
+            ));
+        }
     }
     StyledBlock::new(StyledText::from(spans))
 }
@@ -50,14 +88,21 @@ pub(crate) fn tool_status_color(status: &ToolOutputStatus) -> Color {
 }
 
 fn tool_argument_summary(name: &str, arguments: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
     match name {
-        "shell_command" => value
-            .get("command")
-            .and_then(|command| command.as_str())
-            .map(|command| truncate_inline(command, 96)),
-        _ => Some(truncate_inline(arguments, 96)),
+        "shell_command" => shell_command_summary(arguments),
+        _ => {
+            serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+            Some(truncate_inline(arguments, 96))
+        }
     }
+}
+
+fn shell_command_summary(arguments: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    value
+        .get("command")
+        .and_then(|command| command.as_str())
+        .map(|command| truncate_inline(command, 96))
 }
 
 fn truncate_inline(text: &str, max_chars: usize) -> String {

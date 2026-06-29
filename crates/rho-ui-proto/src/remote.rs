@@ -380,15 +380,7 @@ fn ui_blocks(block: &ContextBlock) -> Vec<UiBlock> {
             .iter()
             .filter_map(ui_block_from_response_item)
             .collect(),
-        ContextBlock::ToolResults { results } => results
-            .iter()
-            .map(|result| UiBlock::ToolCall {
-                id: result.call_id.as_str().to_owned(),
-                name: "tool".to_owned(),
-                arguments: String::new(),
-                status: result.body.status.into(),
-            })
-            .collect(),
+        ContextBlock::ToolResults { .. } => Vec::new(),
     }
 }
 
@@ -703,7 +695,10 @@ mod tests {
     use std::num::NonZeroU64;
 
     use rho_agent::FailedInferenceResponse;
-    use rho_core::{AStr, ContentPart, PendingInferenceResponse};
+    use rho_core::{
+        AStr, ContentPart, PendingInferenceResponse, ToolCallId, ToolName, ToolOutput, ToolResult,
+        ToolType,
+    };
 
     use super::*;
 
@@ -711,6 +706,7 @@ mod tests {
         AgentState {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
+            system_prompt: Arc::from(""),
             kind: AgentStateKind::ApiStreaming {
                 pending_response: PendingInferenceResponse {
                     items: vec![StreamingContextItemState::Pending(
@@ -753,6 +749,37 @@ mod tests {
                 provider_response_id: None,
             })],
             tool_specs: Arc::from([]),
+            system_prompt: Arc::from(""),
+            kind: AgentStateKind::Idle,
+        }
+    }
+
+    fn finished_tool_state() -> AgentState {
+        let call_id = ToolCallId::try_from("call-1").unwrap();
+        AgentState {
+            blocks: vec![
+                Arc::new(ContextBlock::InferenceResponse {
+                    items: vec![InferenceResponseItem::ToolCall {
+                        id: call_id.clone(),
+                        name: ToolName::try_from("shell_command").unwrap(),
+                        tool_type: ToolType::Function,
+                        arguments: r#"{"command":"printf hi"}"#.to_owned(),
+                    }],
+                    provider_response_id: None,
+                }),
+                Arc::new(ContextBlock::ToolResults {
+                    results: vec![ToolResult {
+                        call_id,
+                        tool_type: ToolType::Function,
+                        body: ToolOutput {
+                            output: Arc::new("hi".to_owned()),
+                            status: ToolOutputStatus::Success,
+                        },
+                    }],
+                }),
+            ],
+            tool_specs: Arc::from([]),
+            system_prompt: Arc::from(""),
             kind: AgentStateKind::Idle,
         }
     }
@@ -844,6 +871,21 @@ mod tests {
             receiver,
             UiAgentState::from_agent_state(&finished_state("hello"))
         );
+    }
+
+    #[test]
+    fn snapshots_do_not_render_tool_result_placeholders() {
+        let state = UiAgentState::from_agent_state(&finished_tool_state());
+        assert_eq!(state.blocks.len(), 1);
+        assert!(matches!(
+            &state.blocks[0],
+            UiBlock::ToolCall {
+                name,
+                arguments,
+                status: UiToolStatus::Running,
+                ..
+            } if name == "shell_command" && arguments.contains("printf hi")
+        ));
     }
 
     #[test]

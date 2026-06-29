@@ -696,13 +696,7 @@ impl StreamingRenderer {
                 let block = assistant_message_block(&self.assistant_text);
                 self.set_index_block(index, "assistant", block);
             }
-            UiStreamingItem::Reasoning { text } => {
-                let block = StyledBlock::new(StyledText::from(vec![
-                    Span::new("thinking\n", Style::default().fg(Color::DarkYellow).bold()),
-                    Span::new(text.clone(), Style::default().fg(Color::DarkGrey)),
-                ]));
-                self.set_index_block(index, "thinking", block);
-            }
+            UiStreamingItem::Reasoning { .. } => {}
             UiStreamingItem::ToolCall {
                 id,
                 name,
@@ -873,9 +867,10 @@ fn prompt_text() -> StyledText {
 }
 
 fn user_message_block(text: &str) -> StyledBlock {
+    let style = Style::default().fg(Color::Green);
     StyledBlock::new(StyledText::from(vec![
-        Span::new("▌ ", Style::default().bold()),
-        Span::plain(text.to_owned()),
+        Span::new("▌ ", style.bold()),
+        Span::new(text.to_owned(), style),
     ]))
 }
 

@@ -114,6 +114,107 @@ fn markdown_renderer_styles_common_markdown() {
 }
 
 #[test]
+fn user_message_renderer_uses_theme_green() {
+    let block = user_message_block("hello");
+    let spans = block.content.spans();
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].style.fg, Some(rho_cli_term_raw::Color::Green));
+    assert!(spans[0].style.bold);
+    assert_eq!(spans[1].style.fg, Some(rho_cli_term_raw::Color::Green));
+}
+
+#[test]
+fn shell_command_tool_call_renders_as_grey_prompt() {
+    let block = tool_call_block(
+        "shell_command",
+        &serde_json::json!({ "command": "printf hi" }).to_string(),
+        ToolRenderStatus::Running,
+    );
+    let spans = block.content.spans();
+
+    assert_eq!(
+        spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>(),
+        ["$ ", "printf hi", " …"]
+    );
+    assert_eq!(spans[0].style.fg, Some(rho_cli_term_raw::Color::DarkGreen));
+    assert_eq!(spans[1].style.fg, None);
+    assert_eq!(spans[2].style.fg, Some(rho_cli_term_raw::Color::DarkGreen));
+    assert!(spans.iter().all(|span| !span.style.bold));
+}
+
+#[test]
+fn apply_patch_tool_call_renders_as_edit_without_status() {
+    let block = tool_call_block(
+        "apply_patch",
+        "*** Begin Patch\n*** End Patch",
+        ToolRenderStatus::Running,
+    );
+    let spans = block.content.spans();
+
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].text, "edit");
+    assert_eq!(spans[0].style.fg, Some(rho_cli_term_raw::Color::DarkGreen));
+    assert!(!spans[0].style.bold);
+}
+
+#[test]
+fn successful_shell_command_omits_subsecond_status() {
+    let block = tool_call_block(
+        "shell_command",
+        &serde_json::json!({ "command": "printf hi" }).to_string(),
+        ToolRenderStatus::Done(ToolOutputStatus::Success),
+    );
+    let spans = block.content.spans();
+
+    assert_eq!(
+        spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>(),
+        ["$ ", "printf hi"]
+    );
+}
+
+#[test]
+fn failed_shell_command_keeps_error_status() {
+    let block = tool_call_block(
+        "shell_command",
+        &serde_json::json!({ "command": "false" }).to_string(),
+        ToolRenderStatus::Done(ToolOutputStatus::Error),
+    );
+    let spans = block.content.spans();
+
+    assert_eq!(
+        spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>(),
+        ["$ ", "false", " x"]
+    );
+    assert_eq!(spans[2].style.fg, Some(rho_cli_term_raw::Color::Red));
+}
+
+#[test]
+fn streaming_reasoning_is_not_rendered() {
+    let (_term, handle, _input) = Term::new_virtual(
+        80,
+        24,
+        prompt_text(),
+        Box::new(io::sink()),
+        CursorShape::Bar,
+    );
+    let mut renderer = StreamingRenderer::new(handle);
+    renderer.handle_state(&streaming_state(vec![UiStreamingItem::Reasoning {
+        text: "internal reasoning".to_owned(),
+    }]));
+
+    assert!(renderer.active_blocks.is_empty());
+}
+
+#[test]
 fn ui_io_tracker_reports_rolling_max_rate() {
     let mut tracker = UiIoTracker::new(rho_ui_proto::IoStats {
         sent: 10,
