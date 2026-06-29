@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use senax_encoder::{Decode, Encode};
+use senax_encoder::{Decode, Encode, Pack, Unpack};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -73,7 +73,7 @@ pub enum InferenceResponseItem {
     Unknown(OpaqueProviderData),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack)]
 pub enum ContentPart {
     Text { text: String },
 }

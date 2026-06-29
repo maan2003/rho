@@ -222,7 +222,7 @@ impl ProtocolLogger {
 
     fn log<T>(&self, direction: ProtocolLogDirection, message: &T)
     where
-        T: senax_encoder::Encoder,
+        T: senax_encoder::Packer,
     {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

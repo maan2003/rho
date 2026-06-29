@@ -5,7 +5,7 @@ use rho_core::{
     AStr, ContextBlock, Diff as AStrDiffKind, InferenceResponseItem, PendingInferenceResponse,
     StreamingContextItem, StreamingContextItemState, ToolOutputStatus, text_content,
 };
-use senax_encoder::{Decode, Encode};
+use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// Sender-side remote UI-state encoder.
 ///
@@ -68,7 +68,7 @@ impl AgentRemoteEncoder {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum AgentRemoteFrame {
     Snapshot(UiAgentState),
     Diff {
@@ -102,7 +102,7 @@ impl AgentRemoteFrame {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiAgentState {
     pub blocks: Vec<UiBlock>,
     pub status: UiAgentStatus,
@@ -123,7 +123,7 @@ impl UiAgentState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum UiBlock {
     UserMessage {
         text: String,
@@ -145,7 +145,7 @@ pub enum UiBlock {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum UiAgentStatus {
     Idle,
     Streaming,
@@ -154,7 +154,7 @@ pub enum UiAgentStatus {
     Error { message: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum UiPendingResponseDiff {
     Replace(Vec<UiStreamingItem>),
     Items(Vec<UiStreamingItemUpdate>),
@@ -179,7 +179,7 @@ impl UiPendingResponseDiff {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum UiStreamingItem {
     AssistantMessage {
         text: String,
@@ -209,7 +209,7 @@ impl UiStreamingItem {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiStreamingItemUpdate {
     pub index: usize,
     pub item: UiStreamingItemDiff,
@@ -224,7 +224,7 @@ impl UiStreamingItemUpdate {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum UiStreamingItemDiff {
     Remove,
     Replace(UiStreamingItem),
@@ -285,7 +285,7 @@ impl UiStreamingItemDiff {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiTextDiff {
     pub keep_bytes: usize,
     pub value: String,
@@ -307,13 +307,13 @@ impl UiTextDiff {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiToolResult {
     pub call_id: String,
     pub status: UiToolStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum UiToolStatus {
     Running,
     Success,
@@ -719,7 +719,7 @@ mod tests {
         let mut encoder = AgentRemoteEncoder::new();
         let _ = encoder.encode(streaming_state("hel"));
         let frame = encoder.encode(streaming_state("hello"));
-        let bytes = senax_encoder::encode(&crate::ServerMessage::Agent(frame)).unwrap();
-        assert!(bytes.len() < 160);
+        let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent(frame)).unwrap();
+        assert!(bytes.len() < 40, "tiny frame was {} bytes", bytes.len());
     }
 }
