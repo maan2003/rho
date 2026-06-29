@@ -420,7 +420,7 @@ fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> 
 fn ui_status(kind: &AgentStateKind) -> UiAgentStatus {
     match kind {
         AgentStateKind::ApiStreaming { .. } => UiAgentStatus::Streaming,
-        AgentStateKind::ToolCalling { results } => UiAgentStatus::ToolCalling {
+        AgentStateKind::ToolCalling { results, .. } => UiAgentStatus::ToolCalling {
             results: results
                 .iter()
                 .map(|result| UiToolResult {
@@ -697,7 +697,7 @@ mod tests {
     use rho_agent::FailedInferenceResponse;
     use rho_core::{
         AStr, ContentPart, PendingInferenceResponse, ToolCallId, ToolName, ToolOutput, ToolResult,
-        ToolType,
+        ToolType, UnixMs,
     };
 
     use super::*;
@@ -775,6 +775,9 @@ mod tests {
                             output: Arc::new("hi".to_owned()),
                             status: ToolOutputStatus::Success,
                         },
+                        started_at: UnixMs(1),
+                        finished_at: UnixMs(2),
+                        metadata: None,
                     }],
                 }),
             ],

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use rho_core::ContentPart;
+use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
 use rho_inference::config::InferenceConfig;
@@ -54,7 +54,7 @@ async fn create_agent_and_append_events_with_cursor() {
 
     let mut write = db.write().await;
     let (agent_id, next) = write.create_agent(
-        UnixMillis(1),
+        UnixMs(1),
         Some("main".to_owned()),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),
@@ -101,7 +101,7 @@ async fn agent_events_read_lineage_parents() {
 
     let mut write = db.write().await;
     let (agent_id, next) = write.create_agent(
-        UnixMillis(1),
+        UnixMs(1),
         Some("main".to_owned()),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),

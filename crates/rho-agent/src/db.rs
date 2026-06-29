@@ -2,6 +2,7 @@
 
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
+use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
 use rho_inference::config::InferenceProtectedConfig;
@@ -58,21 +59,7 @@ impl AgentEventPos {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
-pub struct UnixMillis(pub u64);
-
-impl UnixMillis {
-    pub fn now() -> Self {
-        Self(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time before unix epoch")
-                .as_millis()
-                .try_into()
-                .expect("unix millis overflow"),
-        )
-    }
-}
+pub type UnixMillis = UnixMs;
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {

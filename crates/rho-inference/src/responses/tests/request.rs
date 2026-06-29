@@ -409,6 +409,9 @@ fn serializes_custom_tool_calls_and_results() {
             output: Arc::from("custom output".to_owned()),
             status: rho_core::ToolOutputStatus::Success,
         },
+        started_at: rho_core::UnixMs(1),
+        finished_at: rho_core::UnixMs(2),
+        metadata: None,
     };
     let request = inference_request(
         vec![

@@ -6,7 +6,7 @@
 macro_rules! validated_string_type {
     ($(#[$meta:meta])* $vis:vis $name:ident, $validate:expr) => {
         $(#[$meta])*
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
         #[serde(transparent)]
         $vis struct $name(std::sync::Arc<str>);
 

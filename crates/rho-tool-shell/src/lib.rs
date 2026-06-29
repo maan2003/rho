@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use rho_core::{
-    ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput, ToolOutputStatus, ToolSpec,
-    ToolType,
+    ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
+    ToolOutputStatus, ToolResultMetadata, ToolSpec, ToolType,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,6 +30,12 @@ pub const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 #[derive(Clone, Debug)]
 pub struct ShellTools {
     default_timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShellToolOutput {
+    pub body: ToolOutput,
+    pub metadata: Option<ToolResultMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,20 +119,41 @@ impl ShellTools {
         matches!(name, SHELL_COMMAND_TOOL_NAME | APPLY_PATCH_TOOL_NAME)
     }
 
+    pub fn preview_metadata(&self, call: &ToolCall) -> Option<ToolResultMetadata> {
+        match call.name.as_str() {
+            APPLY_PATCH_TOOL_NAME if call.tool_type == ToolType::Custom => {
+                apply_patch::preview_metadata(&call.arguments)
+                    .ok()
+                    .map(ToolResultMetadata::ApplyPatch)
+            }
+            _ => None,
+        }
+    }
+
     pub async fn call(&self, call: ToolCall) -> ToolOutput {
+        self.call_with_metadata(call).await.body
+    }
+
+    pub async fn call_with_metadata(&self, call: ToolCall) -> ShellToolOutput {
         match self.call_inner(&call).await {
-            Ok(output) => ToolOutput {
-                output: Arc::from(output),
-                status: ToolOutputStatus::Success,
+            Ok((output, metadata)) => ShellToolOutput {
+                body: ToolOutput {
+                    output: Arc::from(output),
+                    status: ToolOutputStatus::Success,
+                },
+                metadata,
             },
-            Err(error) => ToolOutput {
-                output: Arc::from(error.to_string()),
-                status: ToolOutputStatus::Error,
+            Err(error) => ShellToolOutput {
+                body: ToolOutput {
+                    output: Arc::from(error.to_string()),
+                    status: ToolOutputStatus::Error,
+                },
+                metadata: None,
             },
         }
     }
 
-    async fn call_inner(&self, call: &ToolCall) -> Result<String> {
+    async fn call_inner(&self, call: &ToolCall) -> Result<(String, Option<ToolResultMetadata>)> {
         match call.name.as_str() {
             SHELL_COMMAND_TOOL_NAME => self.call_shell(call).await,
             APPLY_PATCH_TOOL_NAME => self.call_apply_patch(call),
@@ -134,7 +161,7 @@ impl ShellTools {
         }
     }
 
-    async fn call_shell(&self, call: &ToolCall) -> Result<String> {
+    async fn call_shell(&self, call: &ToolCall) -> Result<(String, Option<ToolResultMetadata>)> {
         if call.tool_type != ToolType::Function {
             return Err(anyhow!("shell_command expects a function tool call"));
         }
@@ -183,20 +210,23 @@ impl ShellTools {
                 let _ = child.wait().await;
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
-                return Ok(details_json(CommandDetails {
-                    status: None,
-                    signal: None,
-                    timed_out: true,
-                    duration_seconds: Some(timeout.as_secs()),
-                    termination_reason: "timeout",
-                    total_lines: None,
-                    total_bytes: None,
-                    output: String::new(),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    truncated: false,
-                    valid_utf8: true,
-                }));
+                return Ok((
+                    details_json(CommandDetails {
+                        status: None,
+                        signal: None,
+                        timed_out: true,
+                        duration_seconds: Some(timeout.as_secs()),
+                        termination_reason: "timeout",
+                        total_lines: None,
+                        total_bytes: None,
+                        output: String::new(),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        truncated: false,
+                        valid_utf8: true,
+                    }),
+                    None,
+                ));
             }
         };
         let stdout = stdout_task
@@ -222,33 +252,42 @@ impl ShellTools {
 
         let truncated = truncate::truncate_line_oriented(&output);
 
-        Ok(details_json(CommandDetails {
-            status: status_code,
-            signal,
-            timed_out: false,
-            duration_seconds,
-            termination_reason: if output_status_success(status_code, signal) {
-                "exit"
-            } else if signal.is_some() {
-                "signal"
-            } else {
-                "exit"
-            },
-            total_lines: truncated.was_truncated.then_some(truncated.total_lines),
-            total_bytes: truncated.was_truncated.then_some(truncated.total_bytes),
-            output: truncated.content,
-            stdout,
-            stderr,
-            truncated: truncated.was_truncated,
-            valid_utf8: stdout_valid_utf8 && stderr_valid_utf8,
-        }))
+        Ok((
+            details_json(CommandDetails {
+                status: status_code,
+                signal,
+                timed_out: false,
+                duration_seconds,
+                termination_reason: if output_status_success(status_code, signal) {
+                    "exit"
+                } else if signal.is_some() {
+                    "signal"
+                } else {
+                    "exit"
+                },
+                total_lines: truncated.was_truncated.then_some(truncated.total_lines),
+                total_bytes: truncated.was_truncated.then_some(truncated.total_bytes),
+                output: truncated.content,
+                stdout,
+                stderr,
+                truncated: truncated.was_truncated,
+                valid_utf8: stdout_valid_utf8 && stderr_valid_utf8,
+            }),
+            None,
+        ))
     }
 
-    fn call_apply_patch(&self, call: &ToolCall) -> Result<String> {
+    fn call_apply_patch(&self, call: &ToolCall) -> Result<(String, Option<ToolResultMetadata>)> {
         if call.tool_type != ToolType::Custom {
             return Err(anyhow!("apply_patch expects a custom tool call"));
         }
-        apply_patch::apply_patch(&call.arguments)
+        let (output, metadata) = apply_patch::apply_patch_with_metadata(&call.arguments)?;
+        Ok((
+            output,
+            Some(ToolResultMetadata::ApplyPatch(ApplyPatchMetadata {
+                changes: metadata.changes,
+            })),
+        ))
     }
 }
 

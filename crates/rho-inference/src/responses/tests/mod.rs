@@ -11,7 +11,7 @@ use rho_core::{
     InferenceResponseItem, MessagePhase, OpaqueProviderData, PendingInferenceResponse,
     ProviderResponseId, StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolFormat,
     ToolGrammarSyntax, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolType,
-    text_content,
+    UnixMs, text_content,
 };
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
@@ -100,6 +100,9 @@ fn tool_result_success(call_id: ToolCallId, content: impl Into<String>) -> ToolR
             output: Arc::from(content.into()),
             status: ToolOutputStatus::Success,
         },
+        started_at: UnixMs(1),
+        finished_at: UnixMs(2),
+        metadata: None,
     }
 }
 

@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 
@@ -7,8 +8,9 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt};
 use rho_core::{
-    ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
-    PendingInferenceResponse, ProviderResponseId, ToolCall, ToolResult, ToolSpec,
+    ApplyPatchMetadata, ContentPart, ContextBlock, InferenceEvent, InferenceRequest,
+    InferenceResponseItem, PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId,
+    ToolResult, ToolResultMetadata, ToolSpec, UnixMs,
 };
 use rho_db::RhoDb;
 use rho_inference::config::InferenceConfig;
@@ -65,6 +67,7 @@ pub enum AgentStateKind {
     // Note: in future we might add ToolCallingWhileStreaming state for proactive execution while
     // streaming
     ToolCalling {
+        previews: BTreeMap<ToolCallId, ToolPreview>,
         // Results of the calls that have finished so far.
         // Communication of tool calls is done out of band; tools may persist
         // richer execution updates separately.
@@ -82,6 +85,19 @@ pub enum AgentStateKind {
     // Permanent error, thread is paused
     Error(FailedInferenceResponse),
     Idle,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct ToolPreview {
+    pub call: ToolCall,
+    pub started_at: UnixMs,
+    pub metadata: Option<ToolPreviewMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum ToolPreviewMetadata {
+    ShellCommand { output_tail: String },
+    ApplyPatch(ApplyPatchMetadata),
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -472,16 +488,39 @@ impl AgentLoop {
                                 if calls.is_empty() {
                                     state.kind = AgentStateKind::Idle;
                                 } else {
+                                    let mut previews = BTreeMap::new();
                                     for call in calls {
+                                        let started_at = UnixMs::now();
+                                        let preview_metadata = self
+                                            .shell_tools
+                                            .preview_metadata(&call)
+                                            .map(tool_preview_metadata);
+                                        previews.insert(
+                                            call.id.clone(),
+                                            ToolPreview {
+                                                call: call.clone(),
+                                                started_at,
+                                                metadata: preview_metadata,
+                                            },
+                                        );
                                         let shell_tools = self.shell_tools.clone();
                                         self.pending_tools.push(Box::pin(async move {
                                             let call_id = call.id.clone();
                                             let tool_type = call.tool_type;
-                                            let body = shell_tools.call(call).await;
-                                            ToolResult { call_id, tool_type, body }
+                                            let output = shell_tools.call_with_metadata(call).await;
+                                            let finished_at = UnixMs::now();
+                                            ToolResult {
+                                                call_id,
+                                                tool_type,
+                                                body: output.body,
+                                                started_at,
+                                                finished_at,
+                                                metadata: output.metadata,
+                                            }
                                         }));
                                     }
                                     state.kind = AgentStateKind::ToolCalling {
+                                        previews,
                                         results: Vec::new(),
                                     };
                                 }
@@ -490,9 +529,13 @@ impl AgentLoop {
                     }
                 }
                 Some(result) = self.pending_tools.next() => {
-                    let AgentStateKind::ToolCalling { mut results } = state.kind else {
+                    let AgentStateKind::ToolCalling {
+                        mut previews,
+                        mut results,
+                    } = state.kind else {
                         unreachable!("tool finished outside ToolCalling");
                     };
+                    previews.remove(&result.call_id);
                     results.push(result);
                     if self.pending_tools.is_empty() {
                         for result in &results {
@@ -512,12 +555,18 @@ impl AgentLoop {
                             previous_attempt: None,
                         };
                     } else {
-                        state.kind = AgentStateKind::ToolCalling { results };
+                        state.kind = AgentStateKind::ToolCalling { previews, results };
                     }
                 }
             }
             *self.state.write().expect("poison") = state.clone();
             self.notify.notify_waiters();
         }
+    }
+}
+
+fn tool_preview_metadata(metadata: ToolResultMetadata) -> ToolPreviewMetadata {
+    match metadata {
+        ToolResultMetadata::ApplyPatch(metadata) => ToolPreviewMetadata::ApplyPatch(metadata),
     }
 }

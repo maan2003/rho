@@ -125,6 +125,12 @@ pub struct ToolResult {
     /// Wire shape for replaying this result to the provider.
     pub tool_type: ToolType,
     pub body: ToolOutput,
+    /// When tool execution began.
+    pub started_at: UnixMs,
+    /// When tool execution finished.
+    pub finished_at: UnixMs,
+    /// Tool-specific UI/runtime metadata. Not sent to providers.
+    pub metadata: Option<ToolResultMetadata>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
@@ -148,6 +154,65 @@ pub enum ToolFormat {
         syntax: ToolGrammarSyntax,
         definition: String,
     },
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Encode,
+    Decode,
+    Pack,
+    Unpack,
+)]
+pub struct UnixMs(pub u64);
+
+impl UnixMs {
+    pub fn now() -> Self {
+        Self(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_millis()
+                .try_into()
+                .expect("unix millis overflow"),
+        )
+    }
+
+    pub fn saturating_duration_since(self, earlier: Self) -> u64 {
+        self.0.saturating_sub(earlier.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub enum ToolResultMetadata {
+    ApplyPatch(ApplyPatchMetadata),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct ApplyPatchMetadata {
+    pub changes: Vec<ToolFileChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct ToolFileChange {
+    pub path: String,
+    pub status: ToolFileStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub enum ToolFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Moved,
 }
 
 /// A provider item captured whole so it can be replayed byte-for-byte. It is

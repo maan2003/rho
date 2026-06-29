@@ -4,13 +4,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use rho_core::{ApplyPatchMetadata, ToolFileChange, ToolFileStatus};
 
 const SUMMARY_HEADER: &str = "Success. Updated the following files:";
 const MAX_SAFE_FILE_READ_BYTES: u64 = 1024 * 1024;
 
 pub(crate) const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("apply_patch.lark");
 
+#[allow(dead_code)]
 pub(crate) fn apply_patch(patch: &str) -> Result<String> {
+    apply_patch_with_metadata(patch).map(|(output, _)| output)
+}
+
+pub(crate) fn preview_metadata(patch: &str) -> Result<ApplyPatchMetadata> {
+    let hunks = parse_patch(patch).map_err(anyhow::Error::msg)?;
+    Ok(ApplyPatchMetadata {
+        changes: hunks.iter().map(hunk_file_change).collect(),
+    })
+}
+
+pub(crate) fn apply_patch_with_metadata(patch: &str) -> Result<(String, ApplyPatchMetadata)> {
     let hunks = parse_patch(patch).map_err(anyhow::Error::msg)?;
     let changes = match apply_hunks(&hunks) {
         Ok(changes) => changes,
@@ -27,7 +40,12 @@ pub(crate) fn apply_patch(patch: &str) -> Result<String> {
             return Err(anyhow::Error::msg(message));
         }
     };
-    Ok(format_summary(&changes))
+    Ok((
+        format_summary(&changes),
+        ApplyPatchMetadata {
+            changes: changes.iter().map(tool_file_change).collect(),
+        },
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +77,38 @@ enum ChangeStatus {
     Add,
     Modify,
     Delete,
+}
+
+fn tool_file_change(change: &AppliedChange) -> ToolFileChange {
+    ToolFileChange {
+        path: change.display_path.clone(),
+        status: match change.status {
+            ChangeStatus::Add => ToolFileStatus::Added,
+            ChangeStatus::Modify => ToolFileStatus::Modified,
+            ChangeStatus::Delete => ToolFileStatus::Deleted,
+        },
+    }
+}
+
+fn hunk_file_change(hunk: &Hunk) -> ToolFileChange {
+    match hunk {
+        Hunk::Add { path, .. } => ToolFileChange {
+            path: render_path(path),
+            status: ToolFileStatus::Added,
+        },
+        Hunk::Delete { path } => ToolFileChange {
+            path: render_path(path),
+            status: ToolFileStatus::Deleted,
+        },
+        Hunk::Update {
+            path, move_path, ..
+        } => ToolFileChange {
+            path: move_path
+                .as_ref()
+                .map_or_else(|| render_path(path), |path| render_path(path)),
+            status: ToolFileStatus::Modified,
+        },
+    }
 }
 
 impl ChangeStatus {
