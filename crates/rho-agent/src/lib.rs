@@ -148,11 +148,27 @@ impl Agent {
         config: InferenceConfig,
         display_name: Option<String>,
     ) -> (AgentId, Self) {
+        let now = UnixMillis::now();
+        let mut write = db.write().await;
+        let topic_id = write.create_topic(now, None, db::TopicStatus::Normal);
+        write.commit();
+        Self::create_in_topic_with_id(db, auth, config, topic_id, display_name).await
+    }
+
+    pub async fn create_in_topic_with_id(
+        db: RhoDb,
+        auth: InferenceAuth,
+        config: InferenceConfig,
+        topic_id: db::TopicId,
+        display_name: Option<String>,
+    ) -> (AgentId, Self) {
         let prompt_cache_key = PromptCacheKey::generate();
         let config = config.protect();
         let mut write = db.write().await;
+        let now = UnixMillis::now();
         let (agent_id, next_event) = write.create_agent(
-            UnixMillis::now(),
+            now,
+            topic_id,
             display_name,
             prompt_cache_key,
             config.clone(),

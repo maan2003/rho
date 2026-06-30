@@ -53,8 +53,10 @@ async fn create_agent_and_append_events_with_cursor() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
+    let topic_id = write.create_topic(UnixMs(1), None, TopicStatus::Normal);
     let (agent_id, next) = write.create_agent(
         UnixMs(1),
+        topic_id,
         Some("main".to_owned()),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),
@@ -80,6 +82,7 @@ async fn create_agent_and_append_events_with_cursor() {
     let read = db.read();
     let agent = read.get_agent(agent_id);
     assert_eq!(agent.display_name.as_deref(), Some("main"));
+    assert_eq!(read.list_topic_agents(topic_id), [agent_id]);
 
     let (next, events) = read.agent_events(agent_id);
     assert_eq!(next.seq, 2);
@@ -100,8 +103,10 @@ async fn agent_events_read_lineage_parents() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
+    let topic_id = write.create_topic(UnixMs(1), None, TopicStatus::Normal);
     let (agent_id, next) = write.create_agent(
         UnixMs(1),
+        topic_id,
         Some("main".to_owned()),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),
