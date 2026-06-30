@@ -155,6 +155,20 @@ fn parses_message_phase_from_added_item() {
 }
 
 #[test]
+fn parses_message_phase_from_done_item() {
+    let parsed = parse_response_events([
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_text.delta","delta":"draft","output_index":0}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","phase":"final_answer"}}"#,
+            r#"{"type":"response.completed"}"#,
+        ])
+        .unwrap();
+
+    let (_, phase) = first_assistant_message(&parsed.items);
+    assert_eq!(phase, Some(MessagePhase::FinalAnswer));
+}
+
+#[test]
 fn errors_when_stream_ends_without_terminal_event() {
     let error = parse_response_events([
         r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,

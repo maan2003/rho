@@ -595,6 +595,15 @@ impl ResponseState {
     /// `done` (encrypted reasoning, the compaction payload, unrecognized items)
     /// get one last `Update` carrying it; then every item gets `Finish`.
     fn finish_item(&mut self, index: usize, item: &Value, updates: &mut Vec<InferenceEvent>) {
+        if item["type"].as_str() == Some("message")
+            && let Some(done_phase) = message_phase_from_output_item(item)
+            && let Some(ItemBuilder::Message { phase, .. }) = self.builder_mut(index)
+            && *phase != Some(done_phase)
+        {
+            *phase = Some(done_phase);
+            self.emit_update(index, updates);
+        }
+
         let terminal = match item["type"].as_str().unwrap_or_default() {
             "message" | "function_call" | "custom_tool_call" => None,
             "reasoning" if item["encrypted_content"].is_string() => {
