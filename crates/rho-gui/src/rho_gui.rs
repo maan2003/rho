@@ -316,7 +316,7 @@ struct TaskBoardUiState {
 }
 
 struct TaskRowAnchor {
-    task_id: tau_task::TaskId,
+    task_id: task_state::TaskId,
     start: text::Anchor,
     end: text::Anchor,
 }
@@ -636,14 +636,7 @@ impl RhoGui {
     }
 
     #[allow(dead_code)]
-    fn request_task_sync(&self) {
-        let Some(writer) = &self.writer else {
-            return;
-        };
-        if let Err(error) = socket_client::send_message(writer, &task_state::sync_request()) {
-            eprintln!("rho-gui: failed to request task board sync: {error:#}");
-        }
-    }
+    fn request_task_sync(&self) {}
 
     fn show_task_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_task_board(cx);
@@ -689,7 +682,7 @@ impl RhoGui {
         cx.notify();
     }
 
-    fn task_under_task_cursor(&self, cx: &mut Context<Self>) -> Option<tau_task::TaskId> {
+    fn task_under_task_cursor(&self, cx: &mut Context<Self>) -> Option<task_state::TaskId> {
         let cursor = self.task_board.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             snapshot

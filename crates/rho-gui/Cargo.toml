@@ -13,40 +13,39 @@ path = "src/rho_gui.rs"
 
 [dependencies]
 anyhow.workspace = true
-audio = { path = "../../../tau-gui/crates/audio" }
-assets = { path = "../../../tau-gui/crates/assets" }
+audio = { path = "../../../zed/crates/audio" }
+assets = { path = "../../../zed/crates/assets" }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 ciborium = { version = "0.2.2", default-features = false, features = ["std"] }
 clap.workspace = true
-command_palette = { path = "../../../tau-gui/crates/command_palette" }
-editor = { path = "../../../tau-gui/crates/editor" }
+command_palette = { path = "../../../zed/crates/command_palette" }
+editor = { path = "../../../zed/crates/editor" }
 futures.workspace = true
-gpui = { path = "../../../tau-gui/crates/gpui", default-features = false }
-gpui_platform = { path = "../../../tau-gui/crates/gpui_platform", default-features = false, features = ["wayland", "x11"] }
-language = { path = "../../../tau-gui/crates/language" }
-multi_buffer = { path = "../../../tau-gui/crates/multi_buffer" }
-project = { path = "../../../tau-gui/crates/project" }
-release_channel = { path = "../../../tau-gui/crates/release_channel" }
+gpui = { path = "../../../zed/crates/gpui", default-features = false }
+gpui_platform = { path = "../../../zed/crates/gpui_platform", default-features = false, features = ["wayland", "x11"] }
+language = { path = "../../../zed/crates/language" }
+multi_buffer = { path = "../../../zed/crates/multi_buffer" }
+project = { path = "../../../zed/crates/project" }
+release_channel = { path = "../../../zed/crates/release_channel" }
 rho-daemon.workspace = true
 rho-ui-proto.workspace = true
 rustc-hash = "2.1.0"
-search = { path = "../../../tau-gui/crates/search" }
+search = { path = "../../../zed/crates/search" }
 semver = { version = "1.0", features = ["serde"] }
-settings = { path = "../../../tau-gui/crates/settings" }
+settings = { path = "../../../zed/crates/settings" }
 tau-cli-term = { path = "../../../tau/crates/tau-cli-term" }
 tau-config = { path = "../../../tau/crates/tau-config" }
 tau-harness = { path = "../../../tau/crates/tau-harness" }
 tau-proto = { path = "../../../tau/crates/tau-proto" }
 tau-themes = { path = "../../../tau/crates/tau-themes" }
-tau_task = { path = "../../../tau-gui/crates/tau_task" }
-text = { path = "../../../tau-gui/crates/text" }
-theme = { path = "../../../tau-gui/crates/theme" }
-theme_settings = { path = "../../../tau-gui/crates/theme_settings" }
+text = { path = "../../../zed/crates/text" }
+theme = { path = "../../../zed/crates/theme" }
+theme_settings = { path = "../../../zed/crates/theme_settings" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
-ui = { path = "../../../tau-gui/crates/ui" }
-vim = { path = "../../../tau-gui/crates/vim" }
+ui = { path = "../../../zed/crates/ui" }
+vim = { path = "../../../zed/crates/vim" }
 
 [dev-dependencies]
 chrono = { version = "0.4", features = ["serde"] }
-gpui = { path = "../../../tau-gui/crates/gpui", default-features = false, features = ["test-support"] }
+gpui = { path = "../../../zed/crates/gpui", default-features = false, features = ["test-support"] }
