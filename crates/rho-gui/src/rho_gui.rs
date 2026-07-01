@@ -1182,6 +1182,7 @@ impl RhoGui {
         }
         self.elide_rho_working_blocks(state, cx);
 
+        self.sync_rendered_user_message_gutter_ranges(&state.blocks, cx);
         self.rho_state = Some(state.clone());
         self.current_context_percent = None;
         self.current_context_input_tokens = None;
@@ -2393,6 +2394,9 @@ impl RhoGui {
 
     fn show_current_transcript_buffer(&mut self, cx: &mut Context<Self>) {
         self.transcript.refresh_highlights(cx);
+        if let Some(blocks) = self.rho_state.as_ref().map(|state| state.blocks.clone()) {
+            self.sync_rendered_user_message_gutter_ranges(&blocks, cx);
+        }
         self.refresh_user_message_gutter_highlights(cx);
         self.update_prompt_inlay(cx);
         cx.notify();
@@ -2811,16 +2815,45 @@ impl RhoGui {
         inserted: &InsertedTranscript,
         cx: &mut Context<Self>,
     ) {
+        if let Some((highlight_key, range)) = self.user_message_gutter_range(inserted, cx) {
+            self.user_message_gutter_ranges.insert(highlight_key, range);
+            self.refresh_user_message_gutter_highlights(cx);
+        }
+    }
+
+    fn user_message_gutter_range(
+        &self,
+        inserted: &InsertedTranscript,
+        cx: &mut Context<Self>,
+    ) -> Option<(usize, std::ops::Range<text::Anchor>)> {
         let Some(highlight_key) = inserted.highlight_keys.last().copied() else {
-            return;
+            return None;
         };
         let Some(highlight_range) = inserted.highlight_ranges.last() else {
-            return;
+            return None;
         };
         let range = self
             .transcript
             .range_without_trailing_newlines(highlight_range, cx);
-        self.user_message_gutter_ranges.insert(highlight_key, range);
+        Some((highlight_key, range))
+    }
+
+    fn sync_rendered_user_message_gutter_ranges(
+        &mut self,
+        blocks: &[RhoUiBlock],
+        cx: &mut Context<Self>,
+    ) {
+        let ranges = blocks
+            .iter()
+            .zip(&self.rho_inserted_blocks)
+            .filter_map(|(block, inserted)| {
+                matches!(block, RhoUiBlock::UserMessage { .. }).then_some(inserted.as_ref())?
+            })
+            .filter_map(|inserted| self.user_message_gutter_range(inserted, cx))
+            .collect::<Vec<_>>();
+        for (highlight_key, range) in ranges {
+            self.user_message_gutter_ranges.insert(highlight_key, range);
+        }
         self.refresh_user_message_gutter_highlights(cx);
     }
 
@@ -4725,28 +4758,25 @@ mod tests {
         });
 
         let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
+        let state = RhoUiAgentState {
+            blocks: vec![
+                RhoUiBlock::UserMessage {
+                    text: "first".to_owned(),
+                },
+                RhoUiBlock::AssistantMessage {
+                    text: "answer".to_owned(),
+                    phase: Some(RhoUiMessagePhase::FinalAnswer),
+                },
+                RhoUiBlock::UserMessage {
+                    text: "second".to_owned(),
+                },
+            ],
+            status: rho_ui_proto::remote::UiAgentStatus::Streaming,
+            pending_response: Vec::new(),
+        };
         let (text, gutter_highlights) = gui
             .update(cx, |gui, window, cx| {
-                gui.render_rho_state(
-                    &RhoUiAgentState {
-                        blocks: vec![
-                            RhoUiBlock::UserMessage {
-                                text: "first".to_owned(),
-                            },
-                            RhoUiBlock::AssistantMessage {
-                                text: "answer".to_owned(),
-                                phase: Some(RhoUiMessagePhase::FinalAnswer),
-                            },
-                            RhoUiBlock::UserMessage {
-                                text: "second".to_owned(),
-                            },
-                        ],
-                        status: rho_ui_proto::remote::UiAgentStatus::Streaming,
-                        pending_response: Vec::new(),
-                    },
-                    window,
-                    cx,
-                );
+                gui.render_rho_state(&state, window, cx);
                 gui.editor.update(cx, |editor, cx| {
                     (
                         editor.display_text(cx),
@@ -4767,6 +4797,20 @@ mod tests {
         assert!(
             gutter_highlights.len() >= 2,
             "historical user messages should render gutter highlights: {gutter_highlights:?}"
+        );
+
+        let gutter_highlights = gui
+            .update(cx, |gui, window, cx| {
+                gui.user_message_gutter_ranges.clear();
+                gui.refresh_user_message_gutter_highlights(cx);
+                gui.render_rho_state(&state, window, cx);
+                gui.editor
+                    .update(cx, |editor, cx| editor.all_gutter_highlights(window, cx))
+            })
+            .expect("update rho gui");
+        assert!(
+            gutter_highlights.len() >= 2,
+            "rendering unchanged rho state should restore historical user gutter highlights: {gutter_highlights:?}"
         );
     }
 
