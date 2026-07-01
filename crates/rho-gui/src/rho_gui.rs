@@ -358,6 +358,7 @@ struct RhoGui {
     rho_inserted_blocks: Vec<Option<InsertedTranscript>>,
     rho_pending_inserted: Option<InsertedTranscript>,
     rho_working_elisions: Vec<RhoWorkingElision>,
+    rho_tool_duration_tick: u64,
     user_message_gutter_ranges: HashMap<usize, std::ops::Range<text::Anchor>>,
     _poll_task: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -435,7 +436,10 @@ impl RhoGui {
                     .timer(Duration::from_millis(30))
                     .await;
                 if this
-                    .update_in(cx, |this, window, cx| this.drain_socket_events(window, cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.drain_socket_events(window, cx);
+                        this.refresh_running_tool_durations(window, cx);
+                    })
                     .is_err()
                 {
                     break;
@@ -458,6 +462,7 @@ impl RhoGui {
             rho_inserted_blocks: Vec::new(),
             rho_pending_inserted: None,
             rho_working_elisions: Vec::new(),
+            rho_tool_duration_tick: 0,
             user_message_gutter_ranges: HashMap::new(),
             _poll_task: poll_task,
             _subscriptions: ui_subscriptions,
@@ -525,6 +530,7 @@ impl RhoGui {
             rho_inserted_blocks: Vec::new(),
             rho_pending_inserted: None,
             rho_working_elisions: Vec::new(),
+            rho_tool_duration_tick: 0,
             user_message_gutter_ranges: HashMap::new(),
             _poll_task: poll_task,
             _subscriptions: ui_subscriptions,
@@ -1200,6 +1206,21 @@ impl RhoGui {
         self.clear_rho_rendered_blocks(cx);
         self.rho_state = None;
         self.render_rho_state(&state, window, cx);
+    }
+
+    fn refresh_running_tool_durations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = &self.rho_state else {
+            return;
+        };
+        if !rho_state_has_running_timed_tool(state) {
+            return;
+        }
+        let tick = current_unix_ms() / 1_000;
+        if self.rho_tool_duration_tick == tick {
+            return;
+        }
+        self.rho_tool_duration_tick = tick;
+        self.rerender_current_rho_state(window, cx);
     }
 
     fn clear_rho_rendered_blocks(&mut self, cx: &mut Context<Self>) {
@@ -3982,10 +4003,49 @@ fn push_rho_tool_spans(
 }
 
 fn rho_tool_duration(tool: &RhoUiTool) -> Option<Duration> {
+    rho_tool_duration_at(tool, current_unix_ms())
+}
+
+fn rho_tool_duration_at(tool: &RhoUiTool, now_ms: u64) -> Option<Duration> {
+    let started_at = tool.started_at?.0;
+    let finished_at = tool
+        .finished_at
+        .map(|finished_at| finished_at.0)
+        .or_else(|| (tool.status == RhoUiToolStatus::Running).then_some(now_ms))?;
     Some(Duration::from_millis(
-        tool.finished_at?
-            .saturating_duration_since(tool.started_at?),
+        finished_at.saturating_sub(started_at),
     ))
+}
+
+fn rho_state_has_running_timed_tool(state: &RhoUiAgentState) -> bool {
+    state.blocks.iter().any(rho_block_has_running_timed_tool)
+        || state
+            .pending_response
+            .iter()
+            .any(rho_pending_item_has_running_timed_tool)
+}
+
+fn rho_block_has_running_timed_tool(block: &RhoUiBlock) -> bool {
+    matches!(
+        block,
+        RhoUiBlock::Tool(tool)
+            if tool.status == RhoUiToolStatus::Running && tool.started_at.is_some()
+    )
+}
+
+fn rho_pending_item_has_running_timed_tool(item: &RhoUiStreamingItem) -> bool {
+    matches!(
+        item,
+        RhoUiStreamingItem::Tool(tool)
+            if tool.status == RhoUiToolStatus::Running && tool.started_at.is_some()
+    )
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn shell_command_argument_label(arguments: &str) -> String {
@@ -4752,6 +4812,27 @@ mod tests {
             .map(|(text, _)| text.as_str())
             .collect::<String>();
         assert_eq!(text, "$ echo ok ok 2s\n");
+    }
+
+    #[test]
+    fn rho_tool_running_duration_uses_client_now() {
+        let tool = RhoUiTool {
+            id: "tool-1".to_owned(),
+            name: "shell_command".to_owned(),
+            arguments: "echo ok".to_owned(),
+            preview: None,
+            status: RhoUiToolStatus::Running,
+            output: None,
+            error: None,
+            started_at: Some(rho_core::UnixMs(1_000)),
+            finished_at: None,
+            metadata: None,
+        };
+
+        assert_eq!(
+            rho_tool_duration_at(&tool, 3_500),
+            Some(Duration::from_millis(2_500))
+        );
     }
 
     #[test]

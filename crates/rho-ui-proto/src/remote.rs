@@ -90,8 +90,10 @@ pub struct UiAgentState {
 
 impl UiAgentState {
     fn from_agent_state(state: &AgentState) -> Self {
+        let mut blocks = ui_blocks(&state.blocks);
+        merge_active_tool_state(&mut blocks, &state.kind);
         Self {
-            blocks: ui_blocks(&state.blocks),
+            blocks,
             status: ui_status(&state.kind),
             pending_response: ui_pending_response(&state.kind),
         }
@@ -202,16 +204,9 @@ impl UiBlockAppend {
 pub enum UiAgentStatus {
     Idle,
     Streaming,
-    ToolCalling {
-        previews: Vec<UiToolPreview>,
-        results: Vec<UiToolResult>,
-    },
-    UnfinishedTurn {
-        outstanding_calls: usize,
-    },
-    Error {
-        message: String,
-    },
+    ToolCalling { results: Vec<UiToolResult> },
+    UnfinishedTurn { outstanding_calls: usize },
+    Error { message: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -368,21 +363,6 @@ pub struct UiToolResult {
     pub started_at: UnixMs,
     pub finished_at: UnixMs,
     pub metadata: Option<UiToolMetadata>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiToolPreview {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
-    pub started_at: UnixMs,
-    pub metadata: Option<UiToolPreviewMetadata>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum UiToolPreviewMetadata {
-    ShellCommand { output_tail: String },
-    ApplyPatch(UiApplyPatchMetadata),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -553,17 +533,6 @@ impl From<ToolOutputStatus> for UiToolStatus {
     }
 }
 
-fn ui_tool_preview_metadata(metadata: &ToolPreviewMetadata) -> UiToolPreviewMetadata {
-    match metadata {
-        ToolPreviewMetadata::ShellCommand { output_tail } => UiToolPreviewMetadata::ShellCommand {
-            output_tail: output_tail.clone(),
-        },
-        ToolPreviewMetadata::ApplyPatch(metadata) => {
-            UiToolPreviewMetadata::ApplyPatch(ui_apply_patch_metadata(metadata))
-        }
-    }
-}
-
 fn ui_tool_metadata(metadata: &ToolResultMetadata) -> UiToolMetadata {
     match metadata {
         ToolResultMetadata::ApplyPatch(metadata) => {
@@ -657,6 +626,48 @@ fn ui_blocks(blocks: &[Arc<ContextBlock>]) -> Vec<UiBlock> {
     ui_blocks
 }
 
+fn merge_active_tool_state(blocks: &mut [UiBlock], kind: &AgentStateKind) {
+    let AgentStateKind::ToolCalling { previews, results } = kind else {
+        return;
+    };
+
+    for preview in previews.values() {
+        if let Some(tool) = find_tool_block_mut(blocks, preview.call.id.as_str()) {
+            tool.name = preview.call.name.as_str().to_owned();
+            tool.arguments = preview.call.arguments.clone();
+            tool.status = UiToolStatus::Running;
+            tool.started_at = Some(preview.started_at);
+            tool.finished_at = None;
+            tool.preview = preview.metadata.as_ref().and_then(tool_preview_text);
+        }
+    }
+
+    for result in results {
+        if let Some(tool) = find_tool_block_mut(blocks, result.call_id.as_str()) {
+            tool.status = result.body.status.into();
+            tool.started_at = Some(result.started_at);
+            tool.finished_at = Some(result.finished_at);
+            tool.metadata = result.metadata.as_ref().map(ui_tool_metadata);
+        }
+    }
+}
+
+fn find_tool_block_mut<'a>(blocks: &'a mut [UiBlock], id: &str) -> Option<&'a mut UiTool> {
+    blocks.iter_mut().rev().find_map(|block| match block {
+        UiBlock::Tool(tool) if tool.id == id => Some(tool),
+        _ => None,
+    })
+}
+
+fn tool_preview_text(metadata: &ToolPreviewMetadata) -> Option<String> {
+    match metadata {
+        ToolPreviewMetadata::ShellCommand { output_tail } => {
+            (!output_tail.is_empty()).then(|| output_tail.clone())
+        }
+        ToolPreviewMetadata::ApplyPatch(_) => None,
+    }
+}
+
 fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> {
     match item {
         InferenceResponseItem::AssistantMessage { content, phase } => {
@@ -700,17 +711,7 @@ fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> 
 fn ui_status(kind: &AgentStateKind) -> UiAgentStatus {
     match kind {
         AgentStateKind::ApiStreaming { .. } => UiAgentStatus::Streaming,
-        AgentStateKind::ToolCalling { previews, results } => UiAgentStatus::ToolCalling {
-            previews: previews
-                .values()
-                .map(|preview| UiToolPreview {
-                    id: preview.call.id.as_str().to_owned(),
-                    name: preview.call.name.as_str().to_owned(),
-                    arguments: preview.call.arguments.clone(),
-                    started_at: preview.started_at,
-                    metadata: preview.metadata.as_ref().map(ui_tool_preview_metadata),
-                })
-                .collect(),
+        AgentStateKind::ToolCalling { results, .. } => UiAgentStatus::ToolCalling {
             results: results
                 .iter()
                 .map(|result| UiToolResult {
@@ -987,6 +988,7 @@ fn diff_text(previous: &str, current: &str) -> UiTextDiff {
 mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
+    use std::str::FromStr as _;
 
     use rho_agent::{FailedInferenceResponse, ToolPreview};
     use rho_core::{
@@ -1113,6 +1115,24 @@ mod tests {
         }
     }
 
+    fn tool_calling_state_with_call_block() -> AgentState {
+        let mut state = tool_calling_state();
+        let AgentStateKind::ToolCalling { previews, .. } = &state.kind else {
+            unreachable!()
+        };
+        let preview = previews.values().next().unwrap();
+        state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
+            items: vec![InferenceResponseItem::ToolCall {
+                id: preview.call.id.clone(),
+                name: preview.call.name.clone(),
+                tool_type: preview.call.tool_type,
+                arguments: String::new(),
+            }],
+            provider_response_id: None,
+        }));
+        state
+    }
+
     #[test]
     fn streaming_update_sends_text_suffix_diff() {
         let mut encoder = AgentRemoteEncoder::new();
@@ -1160,7 +1180,7 @@ mod tests {
         let _ = encoder.encode(streaming_state("hel"));
         let frame = encoder.encode(streaming_state("hello"));
         let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent {
-            agent_id: "agent-1".to_owned(),
+            agent_id: crate::AgentId::from_str("agent-1").unwrap(),
             frame,
         })
         .unwrap();
@@ -1200,7 +1220,7 @@ mod tests {
         );
 
         let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent {
-            agent_id: "agent-1".to_owned(),
+            agent_id: crate::AgentId::from_str("agent-1").unwrap(),
             frame: frame.clone(),
         })
         .unwrap();
@@ -1237,33 +1257,68 @@ mod tests {
     }
 
     #[test]
-    fn tool_calling_status_includes_live_previews() {
+    fn tool_calling_status_omits_live_previews() {
         let state = UiAgentState::from_agent_state(&tool_calling_state());
         assert!(matches!(
             state.status,
-            UiAgentStatus::ToolCalling {
-                previews,
-                results
-            } if results.is_empty()
-                && matches!(
-                    previews.as_slice(),
-                    [UiToolPreview {
-                        name,
-                        started_at: UnixMs(10),
-                        metadata: Some(UiToolPreviewMetadata::ApplyPatch(UiApplyPatchMetadata {
-                            changes
-                        })),
-                        ..
-                    }] if name == "apply_patch"
-                        && matches!(
-                            changes.as_slice(),
-                            [UiToolFileChange {
-                                path,
-                                status: UiToolFileStatus::Modified,
-                            }] if path == "src/lib.rs"
-                        )
-                )
+            UiAgentStatus::ToolCalling { results } if results.is_empty()
         ));
+    }
+
+    #[test]
+    fn tool_calling_preview_updates_existing_tool_block() {
+        let state = UiAgentState::from_agent_state(&tool_calling_state_with_call_block());
+        assert!(matches!(
+            state.blocks.as_slice(),
+            [UiBlock::Tool(UiTool {
+                name,
+                arguments,
+                status: UiToolStatus::Running,
+                started_at: Some(UnixMs(10)),
+                finished_at: None,
+                ..
+            })] if name == "apply_patch"
+                && arguments == "*** Begin Patch\n*** End Patch\n"
+        ));
+    }
+
+    #[test]
+    fn tool_calling_preview_timing_diffs_existing_tool_block() {
+        let mut encoder = AgentRemoteEncoder::new();
+        let mut initial = tool_calling_state_with_call_block();
+        let AgentStateKind::ToolCalling { previews, .. } = &mut initial.kind else {
+            unreachable!()
+        };
+        previews.clear();
+        let AgentRemoteFrame::Snapshot(mut receiver) = encoder.encode(initial) else {
+            panic!("first frame should be a snapshot");
+        };
+
+        let frame = encoder.encode(tool_calling_state_with_call_block());
+        let AgentRemoteFrame::Diff { blocks, .. } = &frame else {
+            panic!("second frame should be a diff");
+        };
+        assert!(matches!(
+            blocks.updates.as_slice(),
+            [UiBlockUpdate {
+                index: 0,
+                block: UiBlockDiff::Tool(UiToolDiff {
+                    arguments: Some(UiTextDiff {
+                        keep_bytes: 0,
+                        value,
+                    }),
+                    started_at: Some(Some(UnixMs(10))),
+                    finished_at: None,
+                    ..
+                })
+            }] if value == "*** Begin Patch\n*** End Patch\n"
+        ));
+
+        frame.apply_diff(&mut receiver);
+        assert_eq!(
+            receiver,
+            UiAgentState::from_agent_state(&tool_calling_state_with_call_block())
+        );
     }
 
     #[test]
