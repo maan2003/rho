@@ -446,8 +446,13 @@ impl InferenceSession {
     }
 }
 
-fn provider_debug_dir() -> Option<PathBuf> {
-    Some(dirs::state_dir()?.join("debug").join("provider-requests"))
+pub(crate) fn provider_debug_dir() -> Option<PathBuf> {
+    Some(
+        dirs::state_dir()?
+            .join("rho")
+            .join("debug")
+            .join("provider-requests"),
+    )
 }
 
 pub(crate) fn debug_file_name(
