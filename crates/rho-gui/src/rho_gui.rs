@@ -2858,12 +2858,18 @@ impl RhoGui {
     }
 
     fn refresh_user_message_gutter_highlights(&self, cx: &mut Context<Self>) {
-        let ranges = self
+        let mut ranges = self
             .user_message_gutter_ranges
             .values()
             .filter_map(|range| self.transcript.multibuffer_range(range.clone(), cx))
             .collect::<Vec<_>>();
         self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            ranges.sort_by(|a, b| {
+                a.start
+                    .cmp(&b.start, &snapshot)
+                    .then_with(|| a.end.cmp(&b.end, &snapshot))
+            });
             editor.highlight_gutter::<UserMessageGutterHighlight>(
                 ranges,
                 user_prompt_gutter_color,
