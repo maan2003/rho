@@ -408,7 +408,7 @@ struct RhoWorkingElisionCandidate {
     tail_rows: u32,
 }
 
-const RHO_LIMITED_TAIL_ROWS: u32 = 9;
+const RHO_LIMITED_TAIL_ROWS: u32 = 12;
 
 impl RhoGui {
     fn new(attach_target: AttachTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -4513,7 +4513,7 @@ mod tests {
     }
 
     fn long_assistant_text() -> String {
-        "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\n"
+        "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nnovember\noscar\npapa\n"
             .to_owned()
     }
 
@@ -4558,7 +4558,7 @@ mod tests {
             ],
             status: rho_ui_proto::remote::UiAgentStatus::Streaming,
             pending_response: vec![RhoUiStreamingItem::AssistantMessage {
-                text: "pending-six\npending-seven\npending-eight\npending-nine\npending-ten\npending-eleven\n"
+                text: "pending-six\npending-seven\npending-eight\npending-nine\npending-ten\npending-eleven\npending-twelve\npending-thirteen\npending-fourteen\n"
                     .to_owned(),
                 phase: Some(RhoUiMessagePhase::Commentary),
             }],
@@ -5050,7 +5050,7 @@ mod tests {
 
         let text = gui
             .update(cx, |gui, window, cx| {
-                gui.render_rho_state(&pending_tools_state(12), window, cx);
+                gui.render_rho_state(&pending_tools_state(16), window, cx);
                 assert!(has_display_elision(gui, window, cx));
                 gui.editor.update(cx, |editor, cx| editor.display_text(cx))
             })
@@ -5061,7 +5061,7 @@ mod tests {
             "burst of pending tools should elide earliest tools immediately: {text:?}"
         );
         assert!(
-            text.contains("tool_11"),
+            text.contains("tool_15"),
             "burst of pending tools should keep the tail visible: {text:?}"
         );
     }
@@ -5082,7 +5082,7 @@ mod tests {
 
         let text = gui
             .update(cx, |gui, window, cx| {
-                gui.render_rho_state(&pending_tools_state(12), window, cx);
+                gui.render_rho_state(&pending_tools_state(16), window, cx);
                 assert!(has_display_elision(gui, window, cx));
                 gui.editor.update(cx, |editor, cx| editor.display_text(cx))
             })
@@ -5093,7 +5093,7 @@ mod tests {
             "grown pending tools should elide earliest tools after replacement: {text:?}"
         );
         assert!(
-            text.contains("tool_11"),
+            text.contains("tool_15"),
             "grown pending tools should keep the tail visible: {text:?}"
         );
     }
@@ -5109,7 +5109,7 @@ mod tests {
         let text = gui
             .update(cx, |gui, window, cx| {
                 gui.render_rho_state(
-                    &committed_commentary_plus_pending_tools_state(12),
+                    &committed_commentary_plus_pending_tools_state(16),
                     window,
                     cx,
                 );
@@ -5123,7 +5123,7 @@ mod tests {
             "committed commentary before pending tools should be part of the same elision: {text:?}"
         );
         assert!(
-            text.contains("tool_11"),
+            text.contains("tool_15"),
             "pending tool tail should remain visible: {text:?}"
         );
     }
