@@ -102,14 +102,36 @@
           paths = buildPaths;
         };
 
+        guiNativeBuildInputs = [
+          pkgs.clang
+          pkgs.cmake
+          pkgs.pkg-config
+          pkgs.protobuf
+        ];
+        guiBuildInputs = [
+          pkgs.alsa-lib
+          pkgs.fontconfig
+          pkgs.freetype
+          pkgs.glib
+          pkgs.libxkbcommon
+          pkgs.openssl
+          pkgs.wayland
+          pkgs.libx11
+          pkgs.libxcb
+          pkgs.libxcursor
+          pkgs.libxi
+        ];
+
         multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
           craneLib':
           let
             craneLib = craneLib'.overrideArgs {
               pname = projectName;
               src = buildSrc;
-              nativeBuildInputs = [ ];
+              nativeBuildInputs = guiNativeBuildInputs;
+              buildInputs = guiBuildInputs;
               env.RUSTDOCFLAGS = "-D warnings";
+              env.PROTOC = "${pkgs.protobuf}/bin/protoc";
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
             };
@@ -227,9 +249,14 @@
             cargoCrap
             selfciMq
             pkgs.cargo-nextest
+            pkgs.clang
+            pkgs.cmake
+            pkgs.pkg-config
+            pkgs.protobuf
             pkgs.taplo
             selfciPkg
-          ];
+          ] ++ guiBuildInputs;
+          PROTOC = "${pkgs.protobuf}/bin/protoc";
           shellHook = ''
             ${dpc-public-skills.packages.${system}.install}/bin/install-dpc-public-skills
           '';

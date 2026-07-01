@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, bail};
+pub use rho_agent::db::{AgentId, TopicId};
 use rho_core::ContentPart;
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
@@ -62,17 +63,67 @@ pub struct IoStats {
 pub enum ClientMessage {
     Ping,
     Subscribe,
-    SendUserMessage { content: Vec<ContentPart> },
-    CancelTurn,
+    NewTopic {
+        display_name: Option<String>,
+    },
+    NewAgent {
+        topic_id: TopicId,
+        content: Option<Vec<ContentPart>>,
+    },
+    LoadAgent {
+        agent_id: AgentId,
+    },
+    SendUserMessage {
+        agent_id: AgentId,
+        content: Vec<ContentPart>,
+    },
+    CancelTurn {
+        agent_id: AgentId,
+    },
 }
 
 /// Message sent from the rho daemon to a UI client.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum ServerMessage {
     Pong,
-    Error { message: String },
-    Agent(remote::AgentRemoteFrame),
-    TurnCancelled,
+    Ready {
+        topics: Vec<UiTopic>,
+    },
+    Error {
+        message: String,
+    },
+    Agent {
+        agent_id: AgentId,
+        frame: remote::AgentRemoteFrame,
+    },
+    AgentCreated {
+        topic_id: TopicId,
+        agent_id: AgentId,
+    },
+    TopicCreated {
+        topic: UiTopic,
+    },
+    AgentLoaded {
+        agent_id: AgentId,
+    },
+    TurnCancelled {
+        agent_id: AgentId,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiTopic {
+    pub topic_id: TopicId,
+    pub display_name: Option<String>,
+    pub status: UiTopicStatus,
+    pub agent_ids: Vec<AgentId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum UiTopicStatus {
+    Normal,
+    Pinned,
+    Archived,
 }
 
 /// Encode and write one length-prefixed senax frame.

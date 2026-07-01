@@ -1,16 +1,18 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::Stream;
+use rho_agent::db::{AgentId, TopicId};
 use rho_core::ContentPart;
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::remote::{UiAgentState, UiBlock};
+use crate::remote::{AgentRemoteFrame, UiAgentState, UiBlock};
 use crate::{
-    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, append_protocol_log_record,
-    protocol_frame_bytes, read_frame_counted, write_frame_counted,
+    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, UiTopic,
+    append_protocol_log_record, protocol_frame_bytes, read_frame_counted, write_frame_counted,
 };
 
 /// Raw async client for the rho UI Unix-socket protocol.
@@ -68,7 +70,10 @@ impl Client {
 #[derive(Clone)]
 pub struct AgentClient {
     commands: mpsc::UnboundedSender<ClientMessage>,
-    state: watch::Receiver<UiAgentState>,
+    state: watch::Receiver<HashMap<AgentId, UiAgentState>>,
+    topics: watch::Receiver<Vec<UiTopic>>,
+    known_agent_ids: watch::Receiver<Vec<AgentId>>,
+    frames: broadcast::Sender<(AgentId, AgentRemoteFrame)>,
     counters: IoCounters,
 }
 
@@ -93,30 +98,35 @@ impl AgentClient {
                 &ClientMessage::Subscribe,
             );
         }
-        let ServerMessage::Agent(frame) =
+        let ServerMessage::Ready { topics } =
             read_frame_counted(&mut stream, Some(&client_counters)).await?
         else {
-            anyhow::bail!("rho daemon did not send initial agent state");
+            anyhow::bail!("rho daemon did not send ready message");
         };
+        let agent_ids = topic_agent_ids(&topics);
         if let Some(logger) = &logger {
             logger.log(
                 ProtocolLogDirection::ServerToClient,
-                &ServerMessage::Agent(frame.clone()),
+                &ServerMessage::Ready {
+                    topics: topics.clone(),
+                },
             );
         }
-        let crate::remote::AgentRemoteFrame::Snapshot(initial_state) = frame else {
-            anyhow::bail!("rho daemon sent diff before snapshot");
-        };
 
         let (reader, writer) = stream.into_split();
-        let (state_tx, state_rx) = watch::channel(initial_state);
+        let (state_tx, state_rx) = watch::channel(HashMap::new());
+        let (topics_tx, topics_rx) = watch::channel(topics.clone());
+        let (known_agent_ids_tx, known_agent_ids_rx) = watch::channel(agent_ids);
+        let (frame_tx, _) = broadcast::channel::<(AgentId, AgentRemoteFrame)>(256);
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
         let reader_counters = client_counters.clone();
         let reader_logger = logger.clone();
+        let reader_frame_tx = frame_tx.clone();
         tokio::spawn(async move {
             let mut reader = reader;
             let mut state = state_tx.borrow().clone();
+            let mut known_agent_ids = known_agent_ids_tx.borrow().clone();
             loop {
                 let message = match read_frame_counted::<_, ServerMessage>(
                     &mut reader,
@@ -131,16 +141,49 @@ impl AgentClient {
                     logger.log(ProtocolLogDirection::ServerToClient, &message);
                 }
                 match message {
-                    ServerMessage::Agent(frame) => {
-                        frame.apply_diff(&mut state);
+                    ServerMessage::Agent { agent_id, frame } => {
+                        let _ = reader_frame_tx.send((agent_id.clone(), frame.clone()));
+                        let agent_state = state.entry(agent_id).or_insert_with(empty_agent_state);
+                        frame.apply_diff(agent_state);
                         if state_tx.send(state.clone()).is_err() {
+                            break;
+                        }
+                    }
+                    ServerMessage::Ready { topics } => {
+                        known_agent_ids = topic_agent_ids(&topics);
+                        if topics_tx.send(topics).is_err() {
+                            break;
+                        }
+                        if known_agent_ids_tx.send(known_agent_ids.clone()).is_err() {
+                            break;
+                        }
+                    }
+                    ServerMessage::TopicCreated { topic } => {
+                        let mut topics = topics_tx.borrow().clone();
+                        topics.push(topic);
+                        topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
+                        known_agent_ids = topic_agent_ids(&topics);
+                        if topics_tx.send(topics).is_err() {
+                            break;
+                        }
+                        if known_agent_ids_tx.send(known_agent_ids.clone()).is_err() {
                             break;
                         }
                     }
                     ServerMessage::Error { message } => {
                         eprintln!("rho daemon error: {message}")
                     }
-                    ServerMessage::Pong | ServerMessage::TurnCancelled => {}
+                    ServerMessage::AgentCreated { agent_id, .. }
+                    | ServerMessage::AgentLoaded { agent_id } => {
+                        if !known_agent_ids.contains(&agent_id) {
+                            known_agent_ids.push(agent_id);
+                            known_agent_ids.sort();
+                            if known_agent_ids_tx.send(known_agent_ids.clone()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    ServerMessage::Pong | ServerMessage::TurnCancelled { .. } => {}
                 }
             }
         });
@@ -165,6 +208,9 @@ impl AgentClient {
         Ok(Self {
             commands: command_tx,
             state: state_rx,
+            topics: topics_rx,
+            known_agent_ids: known_agent_ids_rx,
+            frames: frame_tx,
             counters: client_counters,
         })
     }
@@ -174,24 +220,68 @@ impl AgentClient {
     }
 
     pub fn blocks(&self) -> Vec<UiBlock> {
-        self.state.borrow().blocks.clone()
+        self.state().map(|state| state.blocks).unwrap_or_default()
     }
 
-    pub fn state(&self) -> UiAgentState {
+    pub fn state(&self) -> Option<UiAgentState> {
+        self.states()
+            .into_iter()
+            .min_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, state)| state)
+    }
+
+    pub fn state_for_agent(&self, agent_id: AgentId) -> Option<UiAgentState> {
+        self.state.borrow().get(&agent_id).cloned()
+    }
+
+    pub fn states(&self) -> HashMap<AgentId, UiAgentState> {
         self.state.borrow().clone()
     }
 
-    pub fn send_user_message(&self, text: String) {
+    pub fn loaded_agent_ids(&self) -> Vec<AgentId> {
+        let mut agent_ids = self.state.borrow().keys().cloned().collect::<Vec<_>>();
+        agent_ids.sort();
+        agent_ids
+    }
+
+    pub fn known_agent_ids(&self) -> Vec<AgentId> {
+        self.known_agent_ids.borrow().clone()
+    }
+
+    pub fn topics(&self) -> Vec<UiTopic> {
+        self.topics.borrow().clone()
+    }
+
+    pub fn new_agent_with_user_message_in_topic(&self, topic_id: TopicId, text: String) {
+        let _ = self.commands.send(ClientMessage::NewAgent {
+            topic_id,
+            content: Some(vec![ContentPart::Text { text }]),
+        });
+    }
+
+    pub fn new_agent_in_topic(&self, topic_id: TopicId) {
+        let _ = self.commands.send(ClientMessage::NewAgent {
+            topic_id,
+            content: None,
+        });
+    }
+
+    pub fn load_agent(&self, agent_id: AgentId) {
+        let _ = self.commands.send(ClientMessage::LoadAgent { agent_id });
+    }
+
+    pub fn send_user_message(&self, agent_id: AgentId, text: String) {
         let _ = self.commands.send(ClientMessage::SendUserMessage {
+            agent_id,
             content: vec![ContentPart::Text { text }],
         });
     }
 
-    pub fn cancel(&self) {
-        let _ = self.commands.send(ClientMessage::CancelTurn);
+    pub fn cancel(&self, agent_id: AgentId) {
+        let _ = self.commands.send(ClientMessage::CancelTurn { agent_id });
     }
 
-    pub fn subscribe(&self) -> impl Stream<Item = UiAgentState> + use<> {
+    pub fn subscribe(&self) -> impl Stream<Item = HashMap<AgentId, UiAgentState>> + use<> {
         let mut state = self.state.clone();
         async_stream::stream! {
             while state.changed().await.is_ok() {
@@ -200,6 +290,37 @@ impl AgentClient {
             }
         }
     }
+
+    pub fn subscribe_frames(&self) -> impl Stream<Item = (AgentId, AgentRemoteFrame)> + use<> {
+        let mut frames = self.frames.subscribe();
+        async_stream::stream! {
+            loop {
+                match frames.recv().await {
+                    Ok(frame) => yield frame,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+fn empty_agent_state() -> UiAgentState {
+    UiAgentState {
+        blocks: Vec::new(),
+        status: crate::remote::UiAgentStatus::Idle,
+        pending_response: Vec::new(),
+    }
+}
+
+fn topic_agent_ids(topics: &[UiTopic]) -> Vec<AgentId> {
+    let mut agent_ids = topics
+        .iter()
+        .flat_map(|topic| topic.agent_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    agent_ids.sort();
+    agent_ids.dedup();
+    agent_ids
 }
 
 #[derive(Clone)]

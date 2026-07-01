@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use rho_agent::{AgentState, AgentStateKind};
+use rho_agent::{AgentState, AgentStateKind, ToolPreviewMetadata};
 use rho_core::{
-    AStr, ContextBlock, Diff as AStrDiffKind, InferenceResponseItem, PendingInferenceResponse,
-    StreamingContextItem, StreamingContextItemState, ToolOutputStatus, text_content,
+    AStr, ApplyPatchMetadata, ContextBlock, Diff as AStrDiffKind, InferenceResponseItem,
+    MessagePhase, PendingInferenceResponse, StreamingContextItem, StreamingContextItemState,
+    ToolFileStatus, ToolOutputStatus, ToolResultMetadata, UnixMs, text_content,
 };
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -25,36 +26,18 @@ impl AgentRemoteEncoder {
     }
 
     pub fn encode(&mut self, current: AgentState) -> AgentRemoteFrame {
+        let current_sent = UiAgentState::from_agent_state(&current);
         let frame = match (&self.last_agent, &self.last_sent) {
-            (Some(previous_agent), Some(previous_sent)) => {
-                let keep_agent_blocks = common_agent_block_prefix_len(previous_agent, &current);
-                let keep_blocks = previous_agent.blocks[..keep_agent_blocks]
-                    .iter()
-                    .map(|block| ui_blocks(block).len())
-                    .sum();
-                let blocks = current.blocks[keep_agent_blocks..]
-                    .iter()
-                    .flat_map(|block| ui_blocks(block))
-                    .map(|block| UiBlockAppend::from_previous_pending(block, previous_sent))
-                    .collect();
-                AgentRemoteFrame::Diff {
-                    keep_blocks,
-                    blocks,
-                    status: (ui_status(&previous_agent.kind) != ui_status(&current.kind))
-                        .then(|| ui_status(&current.kind)),
-                    pending_response: diff_pending_response_kind(
-                        &previous_agent.kind,
-                        &current.kind,
-                    ),
-                }
-            }
+            (Some(previous_agent), Some(previous_sent)) => AgentRemoteFrame::Diff {
+                blocks: diff_blocks(previous_sent, &current_sent),
+                status: (ui_status(&previous_agent.kind) != ui_status(&current.kind))
+                    .then(|| ui_status(&current.kind)),
+                pending_response: diff_pending_response_kind(&previous_agent.kind, &current.kind),
+            },
             _ => AgentRemoteFrame::Snapshot(UiAgentState::from_agent_state(&current)),
         };
 
-        let mut sent = self
-            .last_sent
-            .take()
-            .unwrap_or_else(|| UiAgentState::from_agent_state(&current));
+        let mut sent = self.last_sent.take().unwrap_or(current_sent);
         frame.clone().apply_diff(&mut sent);
         self.last_agent = Some(current);
         self.last_sent = Some(sent);
@@ -73,10 +56,7 @@ impl AgentRemoteEncoder {
 pub enum AgentRemoteFrame {
     Snapshot(UiAgentState),
     Diff {
-        /// Number of already-rendered blocks the receiver should keep before
-        /// appending `blocks`.
-        keep_blocks: usize,
-        blocks: Vec<UiBlockAppend>,
+        blocks: UiBlocksDiff,
         status: Option<UiAgentStatus>,
         pending_response: UiPendingResponseDiff,
     },
@@ -87,17 +67,11 @@ impl AgentRemoteFrame {
         match self {
             Self::Snapshot(snapshot) => *state = snapshot,
             Self::Diff {
-                keep_blocks,
                 blocks,
                 status,
                 pending_response,
             } => {
-                state.blocks.truncate(keep_blocks);
-                state.blocks.extend(
-                    blocks
-                        .into_iter()
-                        .filter_map(|block| block.into_block(&state.pending_response)),
-                );
+                blocks.apply_diff(&mut state.blocks, &state.pending_response);
                 if let Some(status) = status {
                     state.status = status;
                 }
@@ -117,11 +91,7 @@ pub struct UiAgentState {
 impl UiAgentState {
     fn from_agent_state(state: &AgentState) -> Self {
         Self {
-            blocks: state
-                .blocks
-                .iter()
-                .flat_map(|block| ui_blocks(block))
-                .collect(),
+            blocks: ui_blocks(&state.blocks),
             status: ui_status(&state.kind),
             pending_response: ui_pending_response(&state.kind),
         }
@@ -135,16 +105,12 @@ pub enum UiBlock {
     },
     AssistantMessage {
         text: String,
+        phase: Option<UiMessagePhase>,
     },
     Reasoning {
         text: String,
     },
-    ToolCall {
-        id: String,
-        name: String,
-        arguments: String,
-        status: UiToolStatus,
-    },
+    Tool(UiTool),
     Notice {
         text: String,
     },
@@ -154,6 +120,64 @@ pub enum UiBlock {
 pub enum UiBlockAppend {
     Block(UiBlock),
     Pending { index: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiBlocksDiff {
+    pub updates: Vec<UiBlockUpdate>,
+    pub truncate_to: Option<usize>,
+    pub append: Vec<UiBlockAppend>,
+}
+
+impl UiBlocksDiff {
+    fn apply_diff(self, blocks: &mut Vec<UiBlock>, pending_response: &[UiStreamingItem]) {
+        for update in self.updates {
+            update.apply_diff(blocks);
+        }
+        if let Some(truncate_to) = self.truncate_to {
+            blocks.truncate(truncate_to);
+        }
+        blocks.extend(
+            self.append
+                .into_iter()
+                .filter_map(|block| block.into_block(pending_response)),
+        );
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiBlockUpdate {
+    pub index: usize,
+    pub block: UiBlockDiff,
+}
+
+impl UiBlockUpdate {
+    fn apply_diff(self, blocks: &mut [UiBlock]) {
+        if let Some(block) = blocks.get_mut(self.index) {
+            self.block.apply_diff(block);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum UiBlockDiff {
+    Replace(UiBlock),
+    Tool(UiToolDiff),
+}
+
+impl UiBlockDiff {
+    fn apply_diff(self, block: &mut UiBlock) {
+        match self {
+            Self::Replace(replacement) => *block = replacement,
+            Self::Tool(diff) => {
+                if let UiBlock::Tool(tool) = block {
+                    diff.apply_diff(tool);
+                } else {
+                    *block = UiBlock::Tool(diff.into_tool());
+                }
+            }
+        }
+    }
 }
 
 impl UiBlockAppend {
@@ -178,9 +202,16 @@ impl UiBlockAppend {
 pub enum UiAgentStatus {
     Idle,
     Streaming,
-    ToolCalling { results: Vec<UiToolResult> },
-    UnfinishedTurn { outstanding_calls: usize },
-    Error { message: String },
+    ToolCalling {
+        previews: Vec<UiToolPreview>,
+        results: Vec<UiToolResult>,
+    },
+    UnfinishedTurn {
+        outstanding_calls: usize,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -212,15 +243,12 @@ impl UiPendingResponseDiff {
 pub enum UiStreamingItem {
     AssistantMessage {
         text: String,
+        phase: Option<UiMessagePhase>,
     },
     Reasoning {
         text: String,
     },
-    ToolCall {
-        id: String,
-        name: String,
-        arguments: String,
-    },
+    Tool(UiTool),
     Notice {
         text: String,
     },
@@ -259,7 +287,7 @@ pub enum UiStreamingItemDiff {
     Replace(UiStreamingItem),
     AssistantMessage { text: UiTextDiff },
     Reasoning { text: UiTextDiff },
-    ToolCall { arguments: UiTextDiff },
+    Tool { arguments: UiTextDiff },
 }
 
 impl UiStreamingItemDiff {
@@ -271,9 +299,10 @@ impl UiStreamingItemDiff {
                 if !matches!(item, UiStreamingItem::AssistantMessage { .. }) {
                     *item = UiStreamingItem::AssistantMessage {
                         text: String::new(),
+                        phase: None,
                     };
                 }
-                let UiStreamingItem::AssistantMessage { text: current } = item else {
+                let UiStreamingItem::AssistantMessage { text: current, .. } = item else {
                     unreachable!("assistant item was just installed");
                 };
                 *current = text.apply_to(current);
@@ -289,19 +318,15 @@ impl UiStreamingItemDiff {
                 };
                 *current = text.apply_to(current);
             }
-            Self::ToolCall { arguments } => {
-                let UiStreamingItem::ToolCall {
+            Self::Tool { arguments } => {
+                let UiStreamingItem::Tool(UiTool {
                     arguments: current, ..
-                } = item
+                }) = item
                 else {
-                    *item = UiStreamingItem::ToolCall {
-                        id: String::new(),
-                        name: String::new(),
-                        arguments: String::new(),
-                    };
-                    let UiStreamingItem::ToolCall {
+                    *item = UiStreamingItem::Tool(UiTool::empty());
+                    let UiStreamingItem::Tool(UiTool {
                         arguments: current, ..
-                    } = item
+                    }) = item
                     else {
                         unreachable!("tool item was just installed");
                     };
@@ -340,6 +365,159 @@ impl UiTextDiff {
 pub struct UiToolResult {
     pub call_id: String,
     pub status: UiToolStatus,
+    pub started_at: UnixMs,
+    pub finished_at: UnixMs,
+    pub metadata: Option<UiToolMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiToolPreview {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub started_at: UnixMs,
+    pub metadata: Option<UiToolPreviewMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum UiToolPreviewMetadata {
+    ShellCommand { output_tail: String },
+    ApplyPatch(UiApplyPatchMetadata),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum UiToolMetadata {
+    ApplyPatch(UiApplyPatchMetadata),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiApplyPatchMetadata {
+    pub changes: Vec<UiToolFileChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiToolFileChange {
+    pub path: String,
+    pub status: UiToolFileStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum UiToolFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Moved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiTool {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub preview: Option<String>,
+    pub status: UiToolStatus,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub started_at: Option<UnixMs>,
+    pub finished_at: Option<UnixMs>,
+    pub metadata: Option<UiToolMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiToolDiff {
+    pub id: String,
+    pub name: String,
+    pub arguments: Option<UiTextDiff>,
+    pub preview: Option<Option<String>>,
+    pub status: Option<UiToolStatus>,
+    pub output: Option<Option<String>>,
+    pub error: Option<Option<String>>,
+    pub started_at: Option<Option<UnixMs>>,
+    pub finished_at: Option<Option<UnixMs>>,
+    pub metadata: Option<Option<UiToolMetadata>>,
+}
+
+impl UiToolDiff {
+    fn from_changed(previous: &UiTool, current: &UiTool) -> Self {
+        Self {
+            id: current.id.clone(),
+            name: current.name.clone(),
+            arguments: (previous.arguments != current.arguments)
+                .then(|| diff_text(&previous.arguments, &current.arguments)),
+            preview: (previous.preview != current.preview).then(|| current.preview.clone()),
+            status: (previous.status != current.status).then_some(current.status),
+            output: (previous.output != current.output).then(|| current.output.clone()),
+            error: (previous.error != current.error).then(|| current.error.clone()),
+            started_at: (previous.started_at != current.started_at).then_some(current.started_at),
+            finished_at: (previous.finished_at != current.finished_at)
+                .then_some(current.finished_at),
+            metadata: (previous.metadata != current.metadata).then(|| current.metadata.clone()),
+        }
+    }
+
+    fn apply_diff(self, tool: &mut UiTool) {
+        tool.id = self.id;
+        tool.name = self.name;
+        if let Some(arguments) = self.arguments {
+            tool.arguments = arguments.apply_to(&tool.arguments);
+        }
+        if let Some(preview) = self.preview {
+            tool.preview = preview;
+        }
+        if let Some(status) = self.status {
+            tool.status = status;
+        }
+        if let Some(output) = self.output {
+            tool.output = output;
+        }
+        if let Some(error) = self.error {
+            tool.error = error;
+        }
+        if let Some(started_at) = self.started_at {
+            tool.started_at = started_at;
+        }
+        if let Some(finished_at) = self.finished_at {
+            tool.finished_at = finished_at;
+        }
+        if let Some(metadata) = self.metadata {
+            tool.metadata = metadata;
+        }
+    }
+
+    fn into_tool(self) -> UiTool {
+        UiTool {
+            id: self.id,
+            name: self.name,
+            arguments: self
+                .arguments
+                .map(|arguments| arguments.apply_to(""))
+                .unwrap_or_default(),
+            preview: self.preview.flatten(),
+            status: self.status.unwrap_or(UiToolStatus::Running),
+            output: self.output.flatten(),
+            error: self.error.flatten(),
+            started_at: self.started_at.flatten(),
+            finished_at: self.finished_at.flatten(),
+            metadata: self.metadata.flatten(),
+        }
+    }
+}
+
+impl UiTool {
+    fn empty() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+            preview: None,
+            status: UiToolStatus::Running,
+            output: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+            metadata: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -348,6 +526,21 @@ pub enum UiToolStatus {
     Success,
     Error,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum UiMessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+impl From<MessagePhase> for UiMessagePhase {
+    fn from(phase: MessagePhase) -> Self {
+        match phase {
+            MessagePhase::Commentary => Self::Commentary,
+            MessagePhase::FinalAnswer => Self::FinalAnswer,
+        }
+    }
 }
 
 impl From<ToolOutputStatus> for UiToolStatus {
@@ -360,35 +553,116 @@ impl From<ToolOutputStatus> for UiToolStatus {
     }
 }
 
-fn common_agent_block_prefix_len(previous: &AgentState, current: &AgentState) -> usize {
-    previous
-        .blocks
-        .iter()
-        .zip(&current.blocks)
-        .take_while(|(previous, current)| Arc::ptr_eq(previous, current) || previous == current)
-        .count()
+fn ui_tool_preview_metadata(metadata: &ToolPreviewMetadata) -> UiToolPreviewMetadata {
+    match metadata {
+        ToolPreviewMetadata::ShellCommand { output_tail } => UiToolPreviewMetadata::ShellCommand {
+            output_tail: output_tail.clone(),
+        },
+        ToolPreviewMetadata::ApplyPatch(metadata) => {
+            UiToolPreviewMetadata::ApplyPatch(ui_apply_patch_metadata(metadata))
+        }
+    }
 }
 
-fn ui_blocks(block: &ContextBlock) -> Vec<UiBlock> {
-    match block {
-        ContextBlock::UserMessage { content } => {
-            vec![UiBlock::UserMessage {
-                text: text_content(content),
-            }]
+fn ui_tool_metadata(metadata: &ToolResultMetadata) -> UiToolMetadata {
+    match metadata {
+        ToolResultMetadata::ApplyPatch(metadata) => {
+            UiToolMetadata::ApplyPatch(ui_apply_patch_metadata(metadata))
         }
-        ContextBlock::InferenceResponse { items, .. } => items
-            .iter()
-            .filter_map(ui_block_from_response_item)
-            .collect(),
-        ContextBlock::ToolResults { .. } => Vec::new(),
     }
+}
+
+fn ui_apply_patch_metadata(metadata: &ApplyPatchMetadata) -> UiApplyPatchMetadata {
+    UiApplyPatchMetadata {
+        changes: metadata
+            .changes
+            .iter()
+            .map(|change| UiToolFileChange {
+                path: change.path.clone(),
+                status: ui_tool_file_status(change.status),
+            })
+            .collect(),
+    }
+}
+
+fn ui_tool_file_status(status: ToolFileStatus) -> UiToolFileStatus {
+    match status {
+        ToolFileStatus::Added => UiToolFileStatus::Added,
+        ToolFileStatus::Modified => UiToolFileStatus::Modified,
+        ToolFileStatus::Deleted => UiToolFileStatus::Deleted,
+        ToolFileStatus::Moved => UiToolFileStatus::Moved,
+    }
+}
+
+fn diff_blocks(previous: &UiAgentState, current: &UiAgentState) -> UiBlocksDiff {
+    let common_len = previous.blocks.len().min(current.blocks.len());
+    let updates = previous.blocks[..common_len]
+        .iter()
+        .zip(&current.blocks[..common_len])
+        .enumerate()
+        .filter_map(|(index, (previous, current))| {
+            (previous != current).then(|| UiBlockUpdate {
+                index,
+                block: diff_block(previous, current),
+            })
+        })
+        .collect();
+    let append = current.blocks[common_len..]
+        .iter()
+        .cloned()
+        .map(|block| UiBlockAppend::from_previous_pending(block, previous))
+        .collect();
+    UiBlocksDiff {
+        updates,
+        truncate_to: (current.blocks.len() < previous.blocks.len()).then_some(current.blocks.len()),
+        append,
+    }
+}
+
+fn diff_block(previous: &UiBlock, current: &UiBlock) -> UiBlockDiff {
+    match (previous, current) {
+        (UiBlock::Tool(previous), UiBlock::Tool(current))
+            if previous.id == current.id && previous.name == current.name =>
+        {
+            UiBlockDiff::Tool(UiToolDiff::from_changed(previous, current))
+        }
+        _ => UiBlockDiff::Replace(current.clone()),
+    }
+}
+
+fn ui_blocks(blocks: &[Arc<ContextBlock>]) -> Vec<UiBlock> {
+    let mut ui_blocks = Vec::new();
+    for block in blocks {
+        match block.as_ref() {
+            ContextBlock::UserMessage { content } => ui_blocks.push(UiBlock::UserMessage {
+                text: text_content(content),
+            }),
+            ContextBlock::InferenceResponse { items, .. } => {
+                ui_blocks.extend(items.iter().filter_map(ui_block_from_response_item));
+            }
+            ContextBlock::ToolResults { results } => {
+                for result in results {
+                    if let Some(UiBlock::Tool(tool)) = ui_blocks.iter_mut().rev().find(|block| {
+                        matches!(block, UiBlock::Tool(tool) if tool.id == result.call_id.as_str())
+                    }) {
+                        tool.status = result.body.status.into();
+                        tool.started_at = Some(result.started_at);
+                        tool.finished_at = Some(result.finished_at);
+                        tool.metadata = result.metadata.as_ref().map(ui_tool_metadata);
+                    }
+                }
+            }
+        }
+    }
+    ui_blocks
 }
 
 fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> {
     match item {
-        InferenceResponseItem::AssistantMessage { content, .. } => {
+        InferenceResponseItem::AssistantMessage { content, phase } => {
             Some(UiBlock::AssistantMessage {
                 text: text_content(content),
+                phase: phase.map(Into::into),
             })
         }
         InferenceResponseItem::RawReasoning { content, summary } => Some(UiBlock::Reasoning {
@@ -399,12 +673,18 @@ fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> 
             name,
             arguments,
             ..
-        } => Some(UiBlock::ToolCall {
+        } => Some(UiBlock::Tool(UiTool {
             id: id.as_str().to_owned(),
             name: name.as_str().to_owned(),
             arguments: arguments.clone(),
+            preview: None,
             status: UiToolStatus::Running,
-        }),
+            output: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+            metadata: None,
+        })),
         InferenceResponseItem::Compaction(_) => Some(UiBlock::Notice {
             text: "compacting context".to_owned(),
         }),
@@ -420,12 +700,25 @@ fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> 
 fn ui_status(kind: &AgentStateKind) -> UiAgentStatus {
     match kind {
         AgentStateKind::ApiStreaming { .. } => UiAgentStatus::Streaming,
-        AgentStateKind::ToolCalling { results, .. } => UiAgentStatus::ToolCalling {
+        AgentStateKind::ToolCalling { previews, results } => UiAgentStatus::ToolCalling {
+            previews: previews
+                .values()
+                .map(|preview| UiToolPreview {
+                    id: preview.call.id.as_str().to_owned(),
+                    name: preview.call.name.as_str().to_owned(),
+                    arguments: preview.call.arguments.clone(),
+                    started_at: preview.started_at,
+                    metadata: preview.metadata.as_ref().map(ui_tool_preview_metadata),
+                })
+                .collect(),
             results: results
                 .iter()
                 .map(|result| UiToolResult {
                     call_id: result.call_id.as_str().to_owned(),
                     status: result.body.status.into(),
+                    started_at: result.started_at,
+                    finished_at: result.finished_at,
+                    metadata: result.metadata.as_ref().map(ui_tool_metadata),
                 })
                 .collect(),
         },
@@ -573,7 +866,7 @@ fn diff_streaming_item(
             && previous_name == current_name
             && previous_tool_type == current_tool_type =>
         {
-            UiStreamingItemDiff::ToolCall {
+            UiStreamingItemDiff::Tool {
                 arguments: diff_astr(previous_arguments, current_arguments),
             }
         }
@@ -594,9 +887,10 @@ fn ui_streaming_item(item: &StreamingContextItemState) -> Option<UiStreamingItem
 
 fn ui_streaming_item_from_item(item: &StreamingContextItem) -> Option<UiStreamingItem> {
     match item {
-        StreamingContextItem::AssistantMessage { content, .. } => {
+        StreamingContextItem::AssistantMessage { content, phase } => {
             Some(UiStreamingItem::AssistantMessage {
                 text: content.iter().map(ToString::to_string).collect(),
+                phase: phase.map(Into::into),
             })
         }
         StreamingContextItem::RawReasoning { content, summary } => {
@@ -618,11 +912,18 @@ fn ui_streaming_item_from_item(item: &StreamingContextItem) -> Option<UiStreamin
             name,
             arguments,
             ..
-        } => Some(UiStreamingItem::ToolCall {
+        } => Some(UiStreamingItem::Tool(UiTool {
             id: id.as_str().to_owned(),
             name: name.as_str().to_owned(),
             arguments: arguments.to_string(),
-        }),
+            preview: None,
+            status: UiToolStatus::Running,
+            output: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+            metadata: None,
+        })),
         StreamingContextItem::Compaction(_) => Some(UiStreamingItem::Notice {
             text: "compacting context".to_owned(),
         }),
@@ -632,20 +933,12 @@ fn ui_streaming_item_from_item(item: &StreamingContextItem) -> Option<UiStreamin
 
 fn ui_block_from_pending(item: &UiStreamingItem) -> Option<UiBlock> {
     match item {
-        UiStreamingItem::AssistantMessage { text } => {
-            Some(UiBlock::AssistantMessage { text: text.clone() })
-        }
-        UiStreamingItem::Reasoning { text } => Some(UiBlock::Reasoning { text: text.clone() }),
-        UiStreamingItem::ToolCall {
-            id,
-            name,
-            arguments,
-        } => Some(UiBlock::ToolCall {
-            id: id.clone(),
-            name: name.clone(),
-            arguments: arguments.clone(),
-            status: UiToolStatus::Running,
+        UiStreamingItem::AssistantMessage { text, phase } => Some(UiBlock::AssistantMessage {
+            text: text.clone(),
+            phase: *phase,
         }),
+        UiStreamingItem::Reasoning { text } => Some(UiBlock::Reasoning { text: text.clone() }),
+        UiStreamingItem::Tool(tool) => Some(UiBlock::Tool(tool.clone())),
         UiStreamingItem::Notice { text } => Some(UiBlock::Notice { text: text.clone() }),
     }
 }
@@ -692,12 +985,13 @@ fn diff_text(previous: &str, current: &str) -> UiTextDiff {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroU64;
 
-    use rho_agent::FailedInferenceResponse;
+    use rho_agent::{FailedInferenceResponse, ToolPreview};
     use rho_core::{
-        AStr, ContentPart, PendingInferenceResponse, ToolCallId, ToolName, ToolOutput, ToolResult,
-        ToolType, UnixMs,
+        AStr, ApplyPatchMetadata, ContentPart, PendingInferenceResponse, ToolCall, ToolCallId,
+        ToolFileChange, ToolFileStatus, ToolName, ToolOutput, ToolResult, ToolType,
     };
 
     use super::*;
@@ -776,7 +1070,7 @@ mod tests {
                             status: ToolOutputStatus::Success,
                         },
                         started_at: UnixMs(1),
-                        finished_at: UnixMs(2),
+                        finished_at: UnixMs(3),
                         metadata: None,
                     }],
                 }),
@@ -784,6 +1078,38 @@ mod tests {
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
             kind: AgentStateKind::Idle,
+        }
+    }
+
+    fn tool_calling_state() -> AgentState {
+        let call_id = ToolCallId::try_from("call-1").unwrap();
+        let mut previews = BTreeMap::new();
+        previews.insert(
+            call_id.clone(),
+            ToolPreview {
+                call: ToolCall {
+                    id: call_id,
+                    name: ToolName::try_from("apply_patch").unwrap(),
+                    tool_type: ToolType::Function,
+                    arguments: "*** Begin Patch\n*** End Patch\n".to_owned(),
+                },
+                started_at: UnixMs(10),
+                metadata: Some(ToolPreviewMetadata::ApplyPatch(ApplyPatchMetadata {
+                    changes: vec![ToolFileChange {
+                        path: "src/lib.rs".to_owned(),
+                        status: ToolFileStatus::Modified,
+                    }],
+                })),
+            },
+        );
+        AgentState {
+            blocks: Vec::new(),
+            tool_specs: Arc::from([]),
+            system_prompt: Arc::from(""),
+            kind: AgentStateKind::ToolCalling {
+                previews,
+                results: Vec::new(),
+            },
         }
     }
 
@@ -833,8 +1159,12 @@ mod tests {
         let mut encoder = AgentRemoteEncoder::new();
         let _ = encoder.encode(streaming_state("hel"));
         let frame = encoder.encode(streaming_state("hello"));
-        let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent(frame)).unwrap();
-        assert!(bytes.len() < 40, "tiny frame was {} bytes", bytes.len());
+        let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent {
+            agent_id: "agent-1".to_owned(),
+            frame,
+        })
+        .unwrap();
+        assert!(bytes.len() < 56, "tiny frame was {} bytes", bytes.len());
     }
 
     #[test]
@@ -855,17 +1185,27 @@ mod tests {
         else {
             panic!("second frame should be a diff");
         };
-        assert_eq!(blocks, &[UiBlockAppend::Pending { index: 0 }]);
+        assert_eq!(
+            blocks,
+            &UiBlocksDiff {
+                updates: Vec::new(),
+                truncate_to: None,
+                append: vec![UiBlockAppend::Pending { index: 0 }],
+            }
+        );
         assert_eq!(*status, Some(UiAgentStatus::Idle));
         assert_eq!(
             *pending_response,
             UiPendingResponseDiff::Replace(Vec::new())
         );
 
-        let bytes =
-            crate::protocol_frame_bytes(&crate::ServerMessage::Agent(frame.clone())).unwrap();
+        let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent {
+            agent_id: "agent-1".to_owned(),
+            frame: frame.clone(),
+        })
+        .unwrap();
         assert!(
-            bytes.len() < 20,
+            bytes.len() < 36,
             "finish frame resent too much data: {} bytes",
             bytes.len()
         );
@@ -882,13 +1222,86 @@ mod tests {
         assert_eq!(state.blocks.len(), 1);
         assert!(matches!(
             &state.blocks[0],
-            UiBlock::ToolCall {
+            UiBlock::Tool(UiTool {
                 name,
                 arguments,
-                status: UiToolStatus::Running,
+                status: UiToolStatus::Success,
+                output: None,
+                error: None,
+                started_at: Some(UnixMs(1)),
+                finished_at: Some(UnixMs(3)),
+                metadata: None,
                 ..
-            } if name == "shell_command" && arguments.contains("printf hi")
+            }) if name == "shell_command" && arguments.contains("printf hi")
         ));
+    }
+
+    #[test]
+    fn tool_calling_status_includes_live_previews() {
+        let state = UiAgentState::from_agent_state(&tool_calling_state());
+        assert!(matches!(
+            state.status,
+            UiAgentStatus::ToolCalling {
+                previews,
+                results
+            } if results.is_empty()
+                && matches!(
+                    previews.as_slice(),
+                    [UiToolPreview {
+                        name,
+                        started_at: UnixMs(10),
+                        metadata: Some(UiToolPreviewMetadata::ApplyPatch(UiApplyPatchMetadata {
+                            changes
+                        })),
+                        ..
+                    }] if name == "apply_patch"
+                        && matches!(
+                            changes.as_slice(),
+                            [UiToolFileChange {
+                                path,
+                                status: UiToolFileStatus::Modified,
+                            }] if path == "src/lib.rs"
+                        )
+                )
+        ));
+    }
+
+    #[test]
+    fn tool_result_updates_existing_tool_block() {
+        let mut encoder = AgentRemoteEncoder::new();
+        let mut running = finished_tool_state();
+        running.blocks.pop();
+        let AgentRemoteFrame::Snapshot(mut receiver) = encoder.encode(running) else {
+            panic!("first frame should be a snapshot");
+        };
+
+        let frame = encoder.encode(finished_tool_state());
+        let AgentRemoteFrame::Diff { blocks, .. } = &frame else {
+            panic!("second frame should be a diff");
+        };
+        assert_eq!(blocks.append, Vec::new());
+        assert_eq!(blocks.truncate_to, None);
+        assert!(matches!(
+            blocks.updates.as_slice(),
+            [UiBlockUpdate {
+                index: 0,
+                block: UiBlockDiff::Tool(UiToolDiff {
+                    status: Some(UiToolStatus::Success),
+                    output: None,
+                    error: None,
+                    started_at: Some(Some(UnixMs(1))),
+                    finished_at: Some(Some(UnixMs(3))),
+                    metadata: None,
+                    ..
+                })
+            }]
+        ));
+
+        frame.apply_diff(&mut receiver);
+        assert_eq!(
+            receiver,
+            UiAgentState::from_agent_state(&finished_tool_state())
+        );
     }
 
     #[test]
