@@ -50,3 +50,4 @@ vim = { path = "../../../zed/crates/vim" }
 [dev-dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 gpui = { path = "../../../zed/crates/gpui", default-features = false, features = ["test-support"] }
+rho-core.workspace = true

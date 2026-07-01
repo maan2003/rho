@@ -3967,11 +3967,25 @@ fn push_rho_tool_spans(
         status.to_owned(),
         rho_tool_status_highlight_style(status, cx),
     ));
+    if let Some(duration) = rho_tool_duration(tool) {
+        spans.push((" ".to_owned(), rho_tool_args_style(cx)));
+        spans.push((
+            tool_render::format_tool_duration(duration),
+            rho_tool_time_style(cx),
+        ));
+    }
     if let Some(text) = tool.preview.as_deref().or(tool.output.as_deref()) {
         spans.push(("\n".to_owned(), rho_tool_args_style(cx)));
         spans.push((text.to_owned(), rho_tool_args_style(cx)));
     }
     push_rho_spans_trailing_newline(spans);
+}
+
+fn rho_tool_duration(tool: &RhoUiTool) -> Option<Duration> {
+    Some(Duration::from_millis(
+        tool.finished_at?
+            .saturating_duration_since(tool.started_at?),
+    ))
 }
 
 fn shell_command_argument_label(arguments: &str) -> String {
@@ -4004,6 +4018,13 @@ fn rho_tool_name_style(cx: &App) -> HighlightStyle {
 fn rho_tool_args_style(cx: &App) -> HighlightStyle {
     HighlightStyle {
         color: Some(rho_hint_color(cx)),
+        ..HighlightStyle::default()
+    }
+}
+
+fn rho_tool_time_style(cx: &App) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(cx.theme().colors().text_muted),
         ..HighlightStyle::default()
     }
 }
@@ -4703,6 +4724,34 @@ mod tests {
         );
 
         assert_eq!(spans[0].0, "$ echo ok");
+    }
+
+    #[gpui::test]
+    fn rho_tool_renders_finished_duration(cx: &mut App) {
+        init_test_app(cx);
+
+        let spans = render_rho_block_spans(
+            &RhoUiBlock::Tool(RhoUiTool {
+                id: "tool-1".to_owned(),
+                name: "shell_command".to_owned(),
+                arguments: "echo ok".to_owned(),
+                preview: None,
+                status: RhoUiToolStatus::Success,
+                output: None,
+                error: None,
+                started_at: Some(rho_core::UnixMs(1_000)),
+                finished_at: Some(rho_core::UnixMs(3_500)),
+                metadata: None,
+            }),
+            &cli_theme::select_theme(tau_config::settings::CliTheme::default()),
+            cx,
+        );
+
+        let text = spans
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>();
+        assert_eq!(text, "$ echo ok ok 2s\n");
     }
 
     #[test]
