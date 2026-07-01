@@ -195,8 +195,12 @@ fn init_app(cx: &mut App) -> Result<()> {
 }
 
 const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
+const PROMPT_PREFIX_INLAY_ID: usize = 1;
+const PROMPT_DRAFT_HIGHLIGHT_KEY: usize = usize::MAX - 1;
+const PROMPT_PREFIX_HIGHLIGHT_KEY: usize = usize::MAX;
 const USER_MESSAGE_PREFIX_INLAY_ID_BASE: usize = 10_000;
 const USER_MESSAGE_PREFIX: &str = "▎";
+const PROMPT_PREFIX: &str = "|";
 static RHO_MARKDOWN_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 static RHO_MARKDOWN_INLINE_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 const DEFAULT_RHO_GUI_SETTINGS: &str = r#"// Rho GUI user settings. Values here override bundled defaults.
@@ -2641,23 +2645,59 @@ impl RhoGui {
     }
 
     fn update_prompt_inlay(&self, cx: &mut Context<Self>) {
-        let to_insert = if self.draft_is_empty(cx) {
+        let Some(prompt_anchor) = self.anchor_in_excerpt(self.prompt_end, cx) else {
+            eprintln!("rho-gui: failed to map prompt prefix anchor into editor excerpt");
+            return;
+        };
+        let prompt_style = self.highlight_style(TranscriptStyle::UserPrompt, cx);
+        let draft_range = if self.draft_is_empty(cx) {
+            Vec::new()
+        } else {
+            let Some(draft_end) = self.anchor_in_excerpt(self.draft_end, cx) else {
+                eprintln!("rho-gui: failed to map prompt draft anchor into editor excerpt");
+                return;
+            };
+            vec![prompt_anchor.clone()..draft_end]
+        };
+        let mut to_insert = vec![Inlay::custom(
+            PROMPT_PREFIX_INLAY_ID,
+            prompt_anchor.clone(),
+            PROMPT_PREFIX,
+        )];
+        if self.draft_is_empty(cx) {
             let Some(anchor) = self.anchor_in_excerpt(self.draft_end, cx) else {
                 eprintln!("rho-gui: failed to map prompt placeholder anchor into editor excerpt");
                 return;
             };
-            vec![Inlay::custom(
+            to_insert.push(Inlay::custom(
                 PROMPT_PLACEHOLDER_INLAY_ID,
                 anchor,
                 self.prompt_placeholder_text(),
-            )]
-        } else {
-            Vec::new()
-        };
+            ));
+        }
         self.editor.update(cx, |editor, cx| {
             editor.splice_inlays(
-                &[InlayId::Custom(PROMPT_PLACEHOLDER_INLAY_ID)],
+                &[
+                    InlayId::Custom(PROMPT_PLACEHOLDER_INLAY_ID),
+                    InlayId::Custom(PROMPT_PREFIX_INLAY_ID),
+                ],
                 to_insert,
+                cx,
+            );
+            editor.highlight_text(
+                HighlightKey::SyntaxTreeView(PROMPT_DRAFT_HIGHLIGHT_KEY),
+                draft_range,
+                prompt_style,
+                cx,
+            );
+            editor.highlight_inlays(
+                HighlightKey::SyntaxTreeView(PROMPT_PREFIX_HIGHLIGHT_KEY),
+                vec![InlayHighlight {
+                    inlay: InlayId::Custom(PROMPT_PREFIX_INLAY_ID),
+                    inlay_position: prompt_anchor.clone(),
+                    range: 0..PROMPT_PREFIX.len(),
+                }],
+                prompt_style,
                 cx,
             );
         });
@@ -3677,7 +3717,7 @@ fn render_rho_working_elision_block(
     let text_color = if cx.selected {
         text_style.color
     } else {
-        text_style.color.opacity(0.65)
+        rho_hint_color(cx.app)
     };
     div()
         .block_mouse_except_scroll()
@@ -3902,9 +3942,17 @@ fn rho_tool_name_style(cx: &App) -> HighlightStyle {
 
 fn rho_tool_args_style(cx: &App) -> HighlightStyle {
     HighlightStyle {
-        color: Some(cx.theme().colors().text_muted),
+        color: Some(rho_hint_color(cx)),
         ..HighlightStyle::default()
     }
+}
+
+fn rho_hint_color(cx: &App) -> Hsla {
+    cx.theme()
+        .syntax()
+        .style_for_name("hint")
+        .and_then(|style| style.color)
+        .unwrap_or(cx.theme().status().hint)
 }
 
 fn rho_tool_status_highlight_style(status: &str, cx: &App) -> HighlightStyle {
@@ -4548,7 +4596,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn rho_shell_command_tool_uses_editor_grey(cx: &mut App) {
+    fn rho_shell_command_tool_uses_hint_color(cx: &mut App) {
         init_test_app(cx);
 
         let spans = render_rho_block_spans(
@@ -4569,7 +4617,7 @@ mod tests {
         );
 
         assert_eq!(spans[0].0, "$ echo ok");
-        assert_eq!(spans[0].1.color, Some(cx.theme().colors().text_muted));
+        assert_eq!(spans[0].1.color, Some(rho_hint_color(cx)));
     }
 
     #[gpui::test]
@@ -4710,6 +4758,30 @@ mod tests {
         assert!(
             final_answer_text.contains("foxtrot"),
             "final answer pending assistant should render through the end: {final_answer_text:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn rho_prompt_draft_has_prefix_inlay(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            init_test_app(cx);
+        });
+
+        let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
+
+        let text = gui
+            .update(cx, |gui, _window, cx| {
+                gui.replace_draft_text("hello", cx);
+                gui.prompt_buffer.update(cx, |buffer, _| {
+                    assert_eq!(buffer_text(buffer), "hello");
+                });
+                gui.editor.update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("update rho gui");
+
+        assert!(
+            text.contains(&format!("{PROMPT_PREFIX}hello")),
+            "prompt prefix should render as an inlay: {text:?}"
         );
     }
 
