@@ -34,11 +34,7 @@ rustc-hash = "2.1.0"
 search = { path = "../../../zed/crates/search" }
 semver = { version = "1.0", features = ["serde"] }
 settings = { path = "../../../zed/crates/settings" }
-tau-cli-term = { path = "../../../tau/crates/tau-cli-term" }
-tau-config = { path = "../../../tau/crates/tau-config" }
-tau-harness = { path = "../../../tau/crates/tau-harness" }
 tau-proto = { path = "../../../tau/crates/tau-proto" }
-tau-themes = { path = "../../../tau/crates/tau-themes" }
 text = { path = "../../../zed/crates/text" }
 theme = { path = "../../../zed/crates/theme" }
 theme_settings = { path = "../../../zed/crates/theme_settings" }

@@ -19,7 +19,7 @@ use editor::{
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, Focusable as _, FontStyle, FontWeight, HighlightStyle, Hsla, MouseButton,
-    Rgba, Subscription, Task, TextStyle, WeakEntity, Window, WindowOptions, actions, div, px, svg,
+    Subscription, Task, TextStyle, WeakEntity, Window, WindowOptions, actions, div, px, svg,
 };
 use language::{
     Buffer, BufferEvent, Capability, Language, LanguageConfig, LanguageMatcher, LanguageQueries,
@@ -45,7 +45,6 @@ use ui::{Color, Icon, IconName, IconSize};
 
 mod activity_state;
 mod agent_state;
-mod cli_theme;
 mod commands;
 mod completion_state;
 mod prompt_state;
@@ -276,19 +275,6 @@ enum TranscriptStyle {
     SystemDisconnect,
 }
 
-impl TranscriptStyle {
-    fn style_name(self) -> &'static str {
-        match self {
-            Self::UserPrompt => tau_themes::names::USER_PROMPT,
-            Self::UserPromptQueued => tau_themes::names::USER_PROMPT_QUEUED,
-            Self::ToolProgress => tau_themes::names::PROGRESS_INDICATOR,
-            Self::SystemInfo => tau_themes::names::SYSTEM_INFO,
-            Self::SystemImportant => tau_themes::names::SYSTEM_INFO_IMPORTANT,
-            Self::SystemDisconnect => tau_themes::names::SYSTEM_DISCONNECT,
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MainView {
     Agent,
@@ -364,7 +350,6 @@ struct RhoGui {
     _subscriptions: Vec<Subscription>,
     project_root: PathBuf,
     prompt_state: PromptState,
-    cli_theme: tau_themes::Theme,
     tool_state: ToolState,
     shell_state: ShellState,
     current_model: Option<tau_proto::ModelId>,
@@ -468,7 +453,6 @@ impl RhoGui {
             _subscriptions: ui_subscriptions,
             project_root: attach_target.project_root,
             prompt_state: PromptState::default(),
-            cli_theme: cli_theme::select_theme(tau_config::settings::CliTheme::default()),
             tool_state: ToolState::default(),
             shell_state: ShellState::default(),
             current_model: None,
@@ -536,7 +520,6 @@ impl RhoGui {
             _subscriptions: ui_subscriptions,
             project_root: std::env::temp_dir(),
             prompt_state: PromptState::default(),
-            cli_theme: cli_theme::select_theme(tau_config::settings::CliTheme::default()),
             tool_state: ToolState::default(),
             shell_state: ShellState::default(),
             current_model: None,
@@ -1171,14 +1154,14 @@ impl RhoGui {
                     self.insert_user_message(text, TranscriptStyle::UserPrompt, cx)
                 }
                 _ => {
-                    let spans = render_rho_block_spans(block, &self.cli_theme, cx);
+                    let spans = render_rho_block_spans(block, cx);
                     self.insert_rho_spans(spans, cx)
                 }
             };
             self.rho_inserted_blocks.push(inserted);
         }
 
-        let pending_spans = render_rho_pending_spans(&state.pending_response, &self.cli_theme, cx);
+        let pending_spans = render_rho_pending_spans(&state.pending_response, cx);
         if pending_spans.is_empty() {
             self.remove_rho_pending(cx);
         } else if !blocks_changed && let Some(inserted) = self.rho_pending_inserted.take() {
@@ -1613,7 +1596,6 @@ impl RhoGui {
                 for item in &finished.output_items {
                     if matches!(item, ContextItem::Compaction(_)) {
                         let block = tool_render::render_compaction_block(
-                            &self.cli_theme,
                             compaction_success_status(
                                 finished.compaction_original_input_tokens,
                                 finished.compaction_compacted_input_tokens,
@@ -1630,7 +1612,7 @@ impl RhoGui {
                     self.update_status_line(cx);
                 }
                 for call in tool_calls {
-                    let block = render_tool_call_block(&self.cli_theme, &call);
+                    let block = render_tool_call_block(&call);
                     if let Some(inserted) = self.insert_before_draft_block(block, cx) {
                         self.tool_state
                             .insert_pending(call.call_id.to_string(), inserted);
@@ -1661,7 +1643,6 @@ impl RhoGui {
             }
             Event::AgentCompactionTriggered(triggered) if triggered.originator.is_user() => {
                 let block = tool_render::render_compaction_block(
-                    &self.cli_theme,
                     format!("requested #{}", triggered.agent_id),
                     tool_render::CompactionStatus::Progress,
                 );
@@ -1711,7 +1692,7 @@ impl RhoGui {
                         cx,
                     );
                 } else {
-                    let text = tau_harness::format_tool_progress(&progress);
+                    let text = format_tool_progress(&progress);
                     if !text.is_empty() {
                         self.insert_before_draft_styled(
                             &format!("{text}\n"),
@@ -1725,7 +1706,7 @@ impl RhoGui {
                 if result.kind == tau_proto::ToolResultKind::BackgroundPlaceholder {
                     self.record_main_tool_backgrounded(result.call_id.as_str());
                 } else {
-                    let block = render_tool_result_block(&self.cli_theme, &result);
+                    let block = render_tool_result_block(&result);
                     self.finish_tool_call(result.call_id.as_str(), block, cx);
                     self.record_main_tool_completed(result.call_id.as_str());
                 }
@@ -1739,7 +1720,6 @@ impl RhoGui {
                     self.record_main_tool_backgrounded(result.call_id.as_str());
                 } else {
                     let block = render_tool_result_parts_block(
-                        &self.cli_theme,
                         &result.tool_name,
                         &result.result,
                         result.display.as_ref(),
@@ -1757,7 +1737,6 @@ impl RhoGui {
                         .is_backgrounded(result.call_id.as_str()) =>
             {
                 let block = render_tool_result_parts_block(
-                    &self.cli_theme,
                     &result.tool_name,
                     &result.result,
                     result.display.as_ref(),
@@ -1767,7 +1746,7 @@ impl RhoGui {
                 self.update_status_line(cx);
             }
             Event::ToolError(error) if error.originator.is_user() => {
-                let block = render_tool_error_block(&self.cli_theme, &error);
+                let block = render_tool_error_block(&error);
                 self.finish_tool_call(error.call_id.as_str(), block, cx);
                 self.record_main_tool_completed(error.call_id.as_str());
                 self.update_status_line(cx);
@@ -1777,7 +1756,6 @@ impl RhoGui {
                     || self.tool_state.contains_pending(error.call_id.as_str()) =>
             {
                 let block = render_tool_error_parts_block(
-                    &self.cli_theme,
                     &error.tool_name,
                     &error.message,
                     error.display.as_ref(),
@@ -1794,7 +1772,6 @@ impl RhoGui {
                         .is_backgrounded(error.call_id.as_str()) =>
             {
                 let block = render_tool_error_parts_block(
-                    &self.cli_theme,
                     &error.tool_name,
                     &error.message,
                     error.display.as_ref(),
@@ -1804,12 +1781,8 @@ impl RhoGui {
                 self.update_status_line(cx);
             }
             Event::ToolRejected(rejected) if rejected.originator.is_user() => {
-                let block = render_tool_error_parts_block(
-                    &self.cli_theme,
-                    &rejected.tool_name,
-                    &rejected.message,
-                    None,
-                );
+                let block =
+                    render_tool_error_parts_block(&rejected.tool_name, &rejected.message, None);
                 self.finish_tool_call(rejected.call_id.as_str(), block, cx);
                 self.record_main_tool_completed(rejected.call_id.as_str());
                 self.update_status_line(cx);
@@ -1820,12 +1793,8 @@ impl RhoGui {
                         .main_tool_activity
                         .is_backgrounded(cancelled.call_id.as_str())
                 {
-                    let block = render_tool_error_parts_block(
-                        &self.cli_theme,
-                        &cancelled.tool_name,
-                        "cancelled",
-                        None,
-                    );
+                    let block =
+                        render_tool_error_parts_block(&cancelled.tool_name, "cancelled", None);
                     self.finish_tool_call(cancelled.call_id.as_str(), block, cx);
                     self.record_main_tool_completed(cancelled.call_id.as_str());
                     self.update_status_line(cx);
@@ -1833,12 +1802,8 @@ impl RhoGui {
             }
             Event::UiShellCommand(command) => {
                 let label = shell_running_label(command.include_in_context);
-                let block = tool_render::render_shell_block(
-                    &self.cli_theme,
-                    &command.command,
-                    "",
-                    Some(label.as_str()),
-                );
+                let block =
+                    tool_render::render_shell_block(&command.command, "", Some(label.as_str()));
                 if let Some(inserted) = self.insert_before_draft_block(block, cx) {
                     self.shell_state.insert(
                         command.command_id.to_string(),
@@ -1856,7 +1821,6 @@ impl RhoGui {
                     state.output.push_str(&progress.chunk);
                     let label = shell_running_label(state.include_in_context);
                     let block = tool_render::render_shell_block(
-                        &self.cli_theme,
                         &state.command,
                         &state.output,
                         Some(label.as_str()),
@@ -1880,7 +1844,6 @@ impl RhoGui {
                     };
                 let status = shell_finished_suffix(&finished, include_in_context);
                 let block = tool_render::render_shell_block(
-                    &self.cli_theme,
                     &finished.command,
                     &finished.output,
                     Some(status.as_str()),
@@ -1902,15 +1865,12 @@ impl RhoGui {
                         rendered
                     }
                 };
-                let block = tool_render::render_action_output_block(&self.cli_theme, &text);
+                let block = tool_render::render_action_output_block(&text);
                 self.insert_before_draft_block(block, cx);
             }
             Event::ActionError(error) => {
-                let block = tool_render::render_action_error_block(
-                    &self.cli_theme,
-                    &error.action_id,
-                    &error.message,
-                );
+                let block =
+                    tool_render::render_action_error_block(&error.action_id, &error.message);
                 self.insert_before_draft_block(block, cx);
             }
             Event::ActionSchemaPublished(published) => {
@@ -1923,22 +1883,14 @@ impl RhoGui {
                     || "starting".to_owned(),
                     |pid| format!("starting pid {pid}"),
                 );
-                let block = tool_render::extension_status_block(
-                    &self.cli_theme,
-                    &starting.extension_name,
-                    &status,
-                );
+                let block = tool_render::extension_status_block(&starting.extension_name, &status);
                 self.insert_before_draft_block(block, cx);
             }
             Event::ExtensionReady(ready) => {
                 let status = ready
                     .pid
                     .map_or_else(|| "ready".to_owned(), |pid| format!("ready pid {pid}"));
-                let block = tool_render::extension_status_block(
-                    &self.cli_theme,
-                    &ready.extension_name,
-                    &status,
-                );
+                let block = tool_render::extension_status_block(&ready.extension_name, &status);
                 self.insert_before_draft_block(block, cx);
             }
             Event::ExtensionExited(exited) => {
@@ -1950,11 +1902,7 @@ impl RhoGui {
                     (_, Some(signal)) => format!("signal {signal}"),
                     (None, None) => "exited".to_owned(),
                 };
-                let block = tool_render::extension_status_block(
-                    &self.cli_theme,
-                    &exited.extension_name,
-                    &status,
-                );
+                let block = tool_render::extension_status_block(&exited.extension_name, &status);
                 self.insert_before_draft_block(block, cx);
             }
             Event::ExtensionRestarting(restarting) => {
@@ -1962,32 +1910,25 @@ impl RhoGui {
                     || format!("restarting #{}", restarting.attempt),
                     |reason| format!("restarting #{}: {reason}", restarting.attempt),
                 );
-                let block = tool_render::extension_status_block(
-                    &self.cli_theme,
-                    &restarting.extension_name,
-                    &status,
-                );
+                let block =
+                    tool_render::extension_status_block(&restarting.extension_name, &status);
                 self.insert_before_draft_block(block, cx);
             }
             Event::ExtAgentsMdAvailable(agents_md) => {
-                let block = tool_render::system_loaded_block(
-                    &self.cli_theme,
-                    &agents_md.file_path,
-                    &agents_md.content,
-                );
+                let block =
+                    tool_render::system_loaded_block(&agents_md.file_path, &agents_md.content);
                 self.insert_before_draft_block(block, cx);
             }
             Event::ExtensionContextReady(ready) => {
-                let block =
-                    tool_render::agent_context_ready_block(&self.cli_theme, &ready.agent_id);
+                let block = tool_render::agent_context_ready_block(&ready.agent_id);
                 self.insert_before_draft_block(block, cx);
             }
             Event::HarnessUiDir(ui_dir) => {
-                let block = tool_render::ui_dir_block(&self.cli_theme, &ui_dir.path);
+                let block = tool_render::ui_dir_block(&ui_dir.path);
                 self.insert_before_draft_block(block, cx);
             }
             Event::HarnessNotice(notice) => {
-                let block = tool_render::render_harness_notice(&self.cli_theme, &notice);
+                let block = tool_render::render_harness_notice(&notice);
                 self.insert_before_draft_block(block, cx);
             }
             Event::HarnessRolesAvailable(roles) => {
@@ -2987,7 +2928,7 @@ impl RhoGui {
             self.remove_live_compaction(key, cx);
             return;
         };
-        let block = tool_render::render_compaction_block(&self.cli_theme, text, status);
+        let block = tool_render::render_compaction_block(text, status);
         if let Some(inserted) = self.prompt_state.take_live_compaction(key) {
             if let Some(inserted) = self.replace_transcript_block(inserted, block, cx) {
                 self.prompt_state
@@ -3027,7 +2968,7 @@ impl RhoGui {
         cx: &mut Context<Self>,
     ) {
         let display = tool_render::render_delegate_display(display, agent_id, role);
-        let block = tool_render::render_tool_block(&self.cli_theme, &display);
+        let block = tool_render::render_tool_block(&display);
         if let Some(inserted) = self.tool_state.take_pending(call_id) {
             if let Some(inserted) = self.replace_transcript_block(inserted, block, cx) {
                 self.tool_state.insert_pending(call_id.to_owned(), inserted);
@@ -3045,7 +2986,7 @@ impl RhoGui {
         cx: &mut Context<Self>,
     ) {
         let display = tool_render::render_tool_use_state(tool_name, display);
-        let block = tool_render::render_tool_block(&self.cli_theme, &display);
+        let block = tool_render::render_tool_block(&display);
         if let Some(inserted) = self.tool_state.take_pending(call_id) {
             if let Some(inserted) = self.replace_transcript_block(inserted, block, cx) {
                 self.tool_state.insert_pending(call_id.to_owned(), inserted);
@@ -3099,7 +3040,6 @@ impl RhoGui {
             return;
         };
         let block = tool_render::render_turn_stats_block(
-            &self.cli_theme,
             usage,
             self.previous_provider_usage.as_ref(),
             None,
@@ -3112,7 +3052,7 @@ impl RhoGui {
     fn finish_tool_call(
         &mut self,
         call_id: &str,
-        block: tau_cli_term::StyledBlock,
+        block: tool_render::StyledBlock,
         cx: &mut Context<Self>,
     ) {
         if let Some(inserted) = self.tool_state.take_pending(call_id) {
@@ -3124,7 +3064,7 @@ impl RhoGui {
 
     fn insert_before_draft_block(
         &mut self,
-        block: tau_cli_term::StyledBlock,
+        block: tool_render::StyledBlock,
         cx: &mut Context<Self>,
     ) -> Option<InsertedTranscript> {
         let mut spans = Vec::new();
@@ -3141,7 +3081,7 @@ impl RhoGui {
     fn replace_transcript_block(
         &mut self,
         inserted: InsertedTranscript,
-        block: tau_cli_term::StyledBlock,
+        block: tool_render::StyledBlock,
         cx: &mut Context<Self>,
     ) -> Option<InsertedTranscript> {
         self.remove_transcript_highlights(inserted.highlight_keys, cx);
@@ -3226,7 +3166,7 @@ impl RhoGui {
             .read(cx)
             .snapshot(cx)
             .anchor_in_excerpt(self.draft_end)?;
-        let separator_style = self.highlight_style_for_name(tau_themes::names::MODEL_STATUS, cx);
+        let separator_style = status_chip_style_to_highlight(status_line::ChipStyle::Muted, cx);
         let mut spans = Vec::new();
         if let Some(context) = self.context_status_chip() {
             spans.push((format!("#{context}"), self.context_status_style(cx)));
@@ -3263,33 +3203,15 @@ impl RhoGui {
         chips: Vec<status_line::Chip>,
         cx: &App,
     ) -> Vec<(String, HighlightStyle)> {
-        let separator_style = self.highlight_style_for_name(tau_themes::names::MODEL_STATUS, cx);
+        let separator_style = status_chip_style_to_highlight(status_line::ChipStyle::Muted, cx);
         let mut spans = Vec::new();
         for (index, chip) in chips.into_iter().enumerate() {
             if index > 0 {
                 spans.push((" ".to_owned(), separator_style));
             }
-            spans.push((
-                chip.text,
-                self.highlight_style_for_name(chip.style_name, cx),
-            ));
+            spans.push((chip.text, status_chip_style_to_highlight(chip.style, cx)));
         }
         spans
-    }
-
-    fn highlight_style_for_name(&self, style_name: &'static str, cx: &App) -> HighlightStyle {
-        let theme_style = self
-            .cli_theme
-            .resolve_style(&tau_themes::StyleName::new(style_name));
-        HighlightStyle {
-            color: theme_style.fg.map(|color| tau_color_to_hsla(color, cx)),
-            background_color: theme_style.bg.map(|color| tau_color_to_hsla(color, cx)),
-            font_weight: theme_style.bold.then_some(FontWeight::BOLD),
-            font_style: theme_style.italic.then_some(FontStyle::Italic),
-            underline: None,
-            strikethrough: None,
-            fade_out: None,
-        }
     }
 
     fn record_main_tool_backgrounded(&mut self, call_id: &str) {
@@ -3352,33 +3274,7 @@ impl RhoGui {
     }
 
     fn highlight_style(&self, style: TranscriptStyle, cx: &App) -> HighlightStyle {
-        match style {
-            TranscriptStyle::UserPrompt | TranscriptStyle::UserPromptQueued => {
-                return HighlightStyle {
-                    color: Some(cx.theme().colors().text_accent),
-                    background_color: None,
-                    font_weight: None,
-                    font_style: None,
-                    underline: None,
-                    strikethrough: None,
-                    fade_out: None,
-                };
-            }
-            _ => {}
-        }
-
-        let theme_style = self
-            .cli_theme
-            .resolve_style(&tau_themes::StyleName::new(style.style_name()));
-        HighlightStyle {
-            color: theme_style.fg.map(|color| tau_color_to_hsla(color, cx)),
-            background_color: theme_style.bg.map(|color| tau_color_to_hsla(color, cx)),
-            font_weight: theme_style.bold.then_some(FontWeight::BOLD),
-            font_style: theme_style.italic.then_some(FontStyle::Italic),
-            underline: None,
-            strikethrough: None,
-            fade_out: None,
-        }
+        transcript_style_to_highlight(style, cx)
     }
 
     fn render_topic_rail(
@@ -3498,8 +3394,7 @@ impl Render for RhoGui {
         let text_style = self
             .editor
             .update(cx, |editor, cx| editor.style(cx).text.clone());
-        let active_agent_color = self
-            .highlight_style_for_name(tau_themes::names::STATUS_ROLE, cx)
+        let active_agent_color = status_chip_style_to_highlight(status_line::ChipStyle::Role, cx)
             .color
             .unwrap_or(text_style.color);
 
@@ -3567,11 +3462,24 @@ fn startup_pun() -> &'static str {
 
 fn build_label_parts() -> (String, String) {
     let version = format!("rho {}", env!("CARGO_PKG_VERSION"));
-    let build = match tau_harness::version::build_last_modified() {
-        Some(date) => format!("({}, {})", tau_harness::version::build_revision(), date),
-        None => format!("({})", tau_harness::version::build_revision()),
-    };
+    let build = "(unknown build)".to_owned();
     (version, build)
+}
+
+fn format_tool_progress(progress: &tau_proto::ToolProgress) -> String {
+    let mut text = progress.tool_name.to_string();
+    if let Some(message) = &progress.message {
+        text.push_str(": ");
+        text.push_str(message);
+    }
+    if let Some(tau_proto::ProgressUpdate {
+        current: Some(current),
+        total: Some(total),
+    }) = &progress.progress
+    {
+        text.push_str(&format!(" ({current}/{total})"));
+    }
+    text
 }
 
 fn render_rho_banner_block(
@@ -3631,52 +3539,41 @@ fn render_rho_banner_block(
         )
 }
 
-fn render_rho_block_spans(
-    block: &RhoUiBlock,
-    theme: &tau_themes::Theme,
-    cx: &App,
-) -> Vec<(String, HighlightStyle)> {
+fn render_rho_block_spans(block: &RhoUiBlock, cx: &App) -> Vec<(String, HighlightStyle)> {
     let mut spans = Vec::new();
-    push_rho_block_spans(&mut spans, theme, block, cx);
+    push_rho_block_spans(&mut spans, block, cx);
     spans
 }
 
 fn render_rho_pending_spans(
     pending_response: &[RhoUiStreamingItem],
-    theme: &tau_themes::Theme,
     cx: &App,
 ) -> Vec<(String, HighlightStyle)> {
     let mut spans = Vec::new();
     for item in pending_response {
-        push_rho_pending_item_spans(&mut spans, theme, item, cx);
+        push_rho_pending_item_spans(&mut spans, item, cx);
     }
     spans
 }
 
-fn push_rho_block_spans(
-    spans: &mut Vec<(String, HighlightStyle)>,
-    theme: &tau_themes::Theme,
-    block: &RhoUiBlock,
-    cx: &App,
-) {
+fn push_rho_block_spans(spans: &mut Vec<(String, HighlightStyle)>, block: &RhoUiBlock, cx: &App) {
     match block {
         RhoUiBlock::UserMessage { text } => {
-            push_rho_styled_line(spans, text, TranscriptStyle::UserPrompt, theme, cx)
+            push_rho_styled_line(spans, text, TranscriptStyle::UserPrompt, cx)
         }
         RhoUiBlock::AssistantMessage { text, .. } => {
             push_rho_assistant_markdown_spans(spans, text, cx)
         }
         RhoUiBlock::Reasoning { .. } => {}
-        RhoUiBlock::Tool(tool) => push_rho_tool_spans(spans, theme, tool, cx),
+        RhoUiBlock::Tool(tool) => push_rho_tool_spans(spans, tool, cx),
         RhoUiBlock::Notice { text } => {
-            push_rho_styled_line(spans, text, TranscriptStyle::SystemInfo, theme, cx)
+            push_rho_styled_line(spans, text, TranscriptStyle::SystemInfo, cx)
         }
     }
 }
 
 fn push_rho_pending_item_spans(
     spans: &mut Vec<(String, HighlightStyle)>,
-    theme: &tau_themes::Theme,
     item: &RhoUiStreamingItem,
     cx: &App,
 ) {
@@ -3685,9 +3582,9 @@ fn push_rho_pending_item_spans(
             push_rho_assistant_markdown_spans(spans, text, cx)
         }
         RhoUiStreamingItem::Reasoning { .. } => {}
-        RhoUiStreamingItem::Tool(tool) => push_rho_tool_spans(spans, theme, tool, cx),
+        RhoUiStreamingItem::Tool(tool) => push_rho_tool_spans(spans, tool, cx),
         RhoUiStreamingItem::Notice { text } => {
-            push_rho_styled_line(spans, text, TranscriptStyle::SystemInfo, theme, cx)
+            push_rho_styled_line(spans, text, TranscriptStyle::SystemInfo, cx)
         }
     }
 }
@@ -3811,7 +3708,6 @@ fn push_rho_styled_line(
     spans: &mut Vec<(String, HighlightStyle)>,
     text: &str,
     style: TranscriptStyle,
-    theme: &tau_themes::Theme,
     cx: &App,
 ) {
     if text.is_empty() {
@@ -3821,7 +3717,7 @@ fn push_rho_styled_line(
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    spans.push((text, highlight_style_for_theme(theme, style, cx)));
+    spans.push((text, transcript_style_to_highlight(style, cx)));
 }
 
 fn push_rho_assistant_markdown_spans(
@@ -3923,44 +3819,50 @@ fn rho_markdown_inline_language(cx: &App) -> Option<&'static Arc<Language>> {
         .as_ref()
 }
 
-fn highlight_style_for_theme(
-    theme: &tau_themes::Theme,
-    style: TranscriptStyle,
-    cx: &App,
-) -> HighlightStyle {
-    match style {
+fn transcript_style_to_highlight(style: TranscriptStyle, cx: &App) -> HighlightStyle {
+    let colors = cx.theme().colors();
+    let (color, bold) = match style {
         TranscriptStyle::UserPrompt | TranscriptStyle::UserPromptQueued => {
-            return HighlightStyle {
-                color: Some(cx.theme().colors().text_accent),
-                background_color: None,
-                font_weight: None,
-                font_style: None,
-                underline: None,
-                strikethrough: None,
-                fade_out: None,
-            };
+            (colors.text_accent, false)
         }
-        _ => {}
-    }
-
-    let theme_style = theme.resolve_style(&tau_themes::StyleName::new(style.style_name()));
+        TranscriptStyle::ToolProgress => (colors.terminal_ansi_cyan, false),
+        TranscriptStyle::SystemInfo => (colors.text_muted, false),
+        TranscriptStyle::SystemImportant => (colors.terminal_ansi_yellow, true),
+        TranscriptStyle::SystemDisconnect => (colors.terminal_ansi_red, false),
+    };
     HighlightStyle {
-        color: theme_style.fg.map(|color| tau_color_to_hsla(color, cx)),
-        background_color: theme_style.bg.map(|color| tau_color_to_hsla(color, cx)),
-        font_weight: theme_style.bold.then_some(FontWeight::BOLD),
-        font_style: theme_style.italic.then_some(FontStyle::Italic),
+        color: Some(color),
+        background_color: None,
+        font_weight: bold.then_some(FontWeight::BOLD),
+        font_style: None,
         underline: None,
         strikethrough: None,
         fade_out: None,
     }
 }
 
-fn push_rho_tool_spans(
-    spans: &mut Vec<(String, HighlightStyle)>,
-    _theme: &tau_themes::Theme,
-    tool: &RhoUiTool,
-    cx: &App,
-) {
+fn status_chip_style_to_highlight(style: status_line::ChipStyle, cx: &App) -> HighlightStyle {
+    let colors = cx.theme().colors();
+    let (color, bold) = match style {
+        status_line::ChipStyle::Role => (colors.terminal_ansi_magenta, false),
+        status_line::ChipStyle::Model => (colors.terminal_ansi_blue, false),
+        status_line::ChipStyle::Muted => (colors.text_muted, false),
+        status_line::ChipStyle::Effort => (colors.terminal_ansi_cyan, false),
+        status_line::ChipStyle::Verbosity => (colors.terminal_ansi_green, false),
+        status_line::ChipStyle::ServiceTier => (colors.terminal_ansi_yellow, true),
+    };
+    HighlightStyle {
+        color: Some(color),
+        background_color: None,
+        font_weight: bold.then_some(FontWeight::BOLD),
+        font_style: None,
+        underline: None,
+        strikethrough: None,
+        fade_out: None,
+    }
+}
+
+fn push_rho_tool_spans(spans: &mut Vec<(String, HighlightStyle)>, tool: &RhoUiTool, cx: &App) {
     let status = rho_tool_status_label(&tool.status);
     let is_shell_command = matches!(tool.name.as_str(), "shell" | "shell_command");
     let label = if is_shell_command {
@@ -4136,19 +4038,13 @@ fn tool_calls_from_output_items(output_items: &[ContextItem]) -> Vec<ToolCallIte
         .collect()
 }
 
-fn render_tool_call_block(
-    theme: &tau_themes::Theme,
-    call: &ToolCallItem,
-) -> tau_cli_term::StyledBlock {
+fn render_tool_call_block(call: &ToolCallItem) -> tool_render::StyledBlock {
     let display_payload = tool_display_from_call(call);
     let display = tool_render::render_tool_use_state(call.name.as_str(), &display_payload);
-    tool_render::render_tool_block(theme, &display)
+    tool_render::render_tool_block(&display)
 }
 
-fn render_tool_result_block(
-    theme: &tau_themes::Theme,
-    result: &tau_proto::ToolResult,
-) -> tau_cli_term::StyledBlock {
+fn render_tool_result_block(result: &tau_proto::ToolResult) -> tool_render::StyledBlock {
     let display = result
         .display
         .as_ref()
@@ -4168,17 +4064,16 @@ fn render_tool_result_block(
         })
         .or_else(|| tool_render::extract_diff(&result.result));
     match diff.as_ref() {
-        Some(diff) => tool_render::render_diff_tool_block(theme, &display, diff, true),
-        None => tool_render::render_tool_block(theme, &display),
+        Some(diff) => tool_render::render_diff_tool_block(&display, diff, true),
+        None => tool_render::render_tool_block(&display),
     }
 }
 
 fn render_tool_result_parts_block(
-    theme: &tau_themes::Theme,
     tool_name: &str,
     result: &CborValue,
     display: Option<&tau_proto::ToolUseState>,
-) -> tau_cli_term::StyledBlock {
+) -> tool_render::StyledBlock {
     let display = display
         .map(|display| tool_render::render_tool_use_state(tool_name, display))
         .unwrap_or_else(|| {
@@ -4196,17 +4091,16 @@ fn render_tool_result_parts_block(
         })
         .or_else(|| tool_render::extract_diff(result));
     match diff.as_ref() {
-        Some(diff) => tool_render::render_diff_tool_block(theme, &display, diff, true),
-        None => tool_render::render_tool_block(theme, &display),
+        Some(diff) => tool_render::render_diff_tool_block(&display, diff, true),
+        None => tool_render::render_tool_block(&display),
     }
 }
 
 fn render_tool_error_parts_block(
-    theme: &tau_themes::Theme,
     tool_name: &str,
     message: &str,
     display: Option<&tau_proto::ToolUseState>,
-) -> tau_cli_term::StyledBlock {
+) -> tool_render::StyledBlock {
     let display = display
         .map(|display| tool_render::render_tool_use_state(tool_name, display))
         .unwrap_or_else(|| {
@@ -4215,13 +4109,10 @@ fn render_tool_error_parts_block(
                 &tool_render::synthesize_fallback_display(tool_name, Some(message)),
             )
         });
-    tool_render::render_tool_block(theme, &display)
+    tool_render::render_tool_block(&display)
 }
 
-fn render_tool_error_block(
-    theme: &tau_themes::Theme,
-    error: &tau_proto::ToolError,
-) -> tau_cli_term::StyledBlock {
+fn render_tool_error_block(error: &tau_proto::ToolError) -> tool_render::StyledBlock {
     let display = error
         .display
         .as_ref()
@@ -4232,7 +4123,7 @@ fn render_tool_error_block(
                 &tool_render::synthesize_fallback_display(&error.tool_name, Some(&error.message)),
             )
         });
-    tool_render::render_tool_block(theme, &display)
+    tool_render::render_tool_block(&display)
 }
 
 fn tool_display_from_call(call: &ToolCallItem) -> tau_proto::ToolUseState {
@@ -4399,28 +4290,73 @@ fn content_text(part: &ContentPart) -> String {
 }
 
 fn block_spans<'a>(
-    block: &'a tau_cli_term::StyledBlock,
+    block: &'a tool_render::StyledBlock,
     cx: &App,
 ) -> Vec<(&'a str, HighlightStyle)> {
     block
-        .content
         .spans()
         .iter()
         .map(|span| {
             (
                 span.text.as_str(),
-                terminal_style_to_highlight(span.style, cx),
+                tool_block_style_to_highlight(span.style, cx),
             )
         })
         .collect()
 }
 
-fn terminal_style_to_highlight(style: tau_cli_term::Style, cx: &App) -> HighlightStyle {
+fn tool_block_style_to_highlight(style: tool_render::BlockStyle, cx: &App) -> HighlightStyle {
+    use tool_render::BlockStyle;
+
+    let colors = cx.theme().colors();
+    let (color, bold, italic) = match style {
+        BlockStyle::Default | BlockStyle::ToolOutput | BlockStyle::ActionOutput => {
+            (colors.editor_foreground, false, false)
+        }
+        BlockStyle::ToolArgs
+        | BlockStyle::DiffContext
+        | BlockStyle::SystemInfo
+        | BlockStyle::ExtensionLifecycle
+        | BlockStyle::TokenStatsInput
+        | BlockStyle::TokenStatsOutput => (colors.text_muted, false, false),
+        BlockStyle::ToolName | BlockStyle::ActionId | BlockStyle::SystemPath => {
+            (colors.text_accent, true, false)
+        }
+        BlockStyle::ToolMode
+        | BlockStyle::ActionLabel
+        | BlockStyle::StatusContext
+        | BlockStyle::TokenStatsDelta
+        | BlockStyle::TokenStatsSigma => (colors.terminal_ansi_bright_blue, false, false),
+        BlockStyle::ToolStatusSuccess | BlockStyle::DiffAdded | BlockStyle::TokenStatsCacheHit => {
+            (colors.terminal_ansi_green, false, false)
+        }
+        BlockStyle::DiffAddedInline => (colors.terminal_ansi_bright_green, true, false),
+        BlockStyle::ToolStatusError
+        | BlockStyle::ActionError
+        | BlockStyle::DiffRemoved
+        | BlockStyle::SystemImportant
+        | BlockStyle::TokenStatsCacheMiss => (colors.terminal_ansi_red, false, false),
+        BlockStyle::DiffRemovedInline => (colors.terminal_ansi_bright_red, true, false),
+        BlockStyle::ToolStatusInfo
+        | BlockStyle::ToolStatusTime
+        | BlockStyle::ActionValue
+        | BlockStyle::ExtensionStatus
+        | BlockStyle::SystemStatus
+        | BlockStyle::TokenStatsCacheWarn
+        | BlockStyle::TokenStatsLatency => (colors.terminal_ansi_yellow, false, false),
+        BlockStyle::Progress | BlockStyle::StatusTools | BlockStyle::TokenStatsUp => {
+            (colors.terminal_ansi_cyan, false, false)
+        }
+        BlockStyle::StatusRole | BlockStyle::TokenStatsDown => {
+            (colors.terminal_ansi_magenta, false, false)
+        }
+        BlockStyle::DiffHunkHeader => (colors.terminal_ansi_bright_black, false, true),
+    };
     HighlightStyle {
-        color: style.fg.map(|color| terminal_color_to_hsla(color, cx)),
-        background_color: style.bg.map(|color| terminal_color_to_hsla(color, cx)),
-        font_weight: style.bold.then_some(FontWeight::BOLD),
-        font_style: style.italic.then_some(FontStyle::Italic),
+        color: Some(color),
+        background_color: None,
+        font_weight: bold.then_some(FontWeight::BOLD),
+        font_style: italic.then_some(FontStyle::Italic),
         underline: None,
         strikethrough: None,
         fade_out: None,
@@ -4440,125 +4376,6 @@ fn format_whole_token_count(tokens: u64) -> String {
     }
     let rounded = tokens.saturating_add(500_000) / 1_000_000;
     format!("{rounded}m")
-}
-
-fn terminal_color_to_hsla(color: tau_cli_term::Color, cx: &App) -> Hsla {
-    match color {
-        tau_cli_term::Color::Reset => cx.theme().colors().terminal_foreground,
-        tau_cli_term::Color::Black => cx.theme().colors().terminal_ansi_black,
-        tau_cli_term::Color::DarkGrey => cx.theme().colors().terminal_ansi_bright_black,
-        tau_cli_term::Color::Red => cx.theme().colors().terminal_ansi_bright_red,
-        tau_cli_term::Color::DarkRed => cx.theme().colors().terminal_ansi_red,
-        tau_cli_term::Color::Green => cx.theme().colors().terminal_ansi_bright_green,
-        tau_cli_term::Color::DarkGreen => cx.theme().colors().terminal_ansi_green,
-        tau_cli_term::Color::Yellow => cx.theme().colors().terminal_ansi_bright_yellow,
-        tau_cli_term::Color::DarkYellow => cx.theme().colors().terminal_ansi_yellow,
-        tau_cli_term::Color::Blue => cx.theme().colors().terminal_ansi_bright_blue,
-        tau_cli_term::Color::DarkBlue => cx.theme().colors().terminal_ansi_blue,
-        tau_cli_term::Color::Magenta => cx.theme().colors().terminal_ansi_bright_magenta,
-        tau_cli_term::Color::DarkMagenta => cx.theme().colors().terminal_ansi_magenta,
-        tau_cli_term::Color::Cyan => cx.theme().colors().terminal_ansi_bright_cyan,
-        tau_cli_term::Color::DarkCyan => cx.theme().colors().terminal_ansi_cyan,
-        tau_cli_term::Color::White => cx.theme().colors().terminal_ansi_bright_white,
-        tau_cli_term::Color::Grey => cx.theme().colors().terminal_ansi_white,
-        tau_cli_term::Color::Rgb { r, g, b } => Rgba {
-            r: r as f32 / 255.,
-            g: g as f32 / 255.,
-            b: b as f32 / 255.,
-            a: 1.,
-        }
-        .into(),
-        tau_cli_term::Color::AnsiValue(value) => ansi_color_to_hsla(value, cx),
-    }
-}
-
-fn ansi_color_to_hsla(value: u8, cx: &App) -> Hsla {
-    if value < 16 {
-        return ansi_basic_color_to_hsla(value, cx);
-    }
-    ansi_color_to_rgba(value).into()
-}
-
-fn ansi_basic_color_to_hsla(value: u8, cx: &App) -> Hsla {
-    let colors = cx.theme().colors();
-    match value {
-        0 => colors.terminal_ansi_black,
-        1 => colors.terminal_ansi_red,
-        2 => colors.terminal_ansi_green,
-        3 => colors.terminal_ansi_yellow,
-        4 => colors.terminal_ansi_blue,
-        5 => colors.terminal_ansi_magenta,
-        6 => colors.terminal_ansi_cyan,
-        7 => colors.terminal_ansi_white,
-        8 => colors.terminal_ansi_bright_black,
-        9 => colors.terminal_ansi_bright_red,
-        10 => colors.terminal_ansi_bright_green,
-        11 => colors.terminal_ansi_bright_yellow,
-        12 => colors.terminal_ansi_bright_blue,
-        13 => colors.terminal_ansi_bright_magenta,
-        14 => colors.terminal_ansi_bright_cyan,
-        _ => colors.terminal_ansi_bright_white,
-    }
-}
-
-fn ansi_color_to_rgba(value: u8) -> Rgba {
-    if (16..=231).contains(&value) {
-        let value = value - 16;
-        let r = value / 36;
-        let g = (value % 36) / 6;
-        let b = value % 6;
-        return Rgba {
-            r: cube_component(r),
-            g: cube_component(g),
-            b: cube_component(b),
-            a: 1.,
-        };
-    }
-    let level = 8 + (value.saturating_sub(232) as u16).min(23) * 10;
-    let channel = level as f32 / 255.;
-    Rgba {
-        r: channel,
-        g: channel,
-        b: channel,
-        a: 1.,
-    }
-}
-
-fn cube_component(value: u8) -> f32 {
-    if value == 0 {
-        0.
-    } else {
-        (55 + value as u16 * 40) as f32 / 255.
-    }
-}
-
-fn tau_color_to_hsla(color: tau_themes::Color, cx: &App) -> Hsla {
-    let colors = cx.theme().colors();
-    match color {
-        tau_themes::Color::Black => colors.terminal_ansi_black,
-        tau_themes::Color::DarkRed => colors.terminal_ansi_red,
-        tau_themes::Color::DarkGreen => colors.terminal_ansi_green,
-        tau_themes::Color::DarkYellow => colors.terminal_ansi_yellow,
-        tau_themes::Color::DarkBlue => colors.terminal_ansi_blue,
-        tau_themes::Color::DarkMagenta => colors.terminal_ansi_magenta,
-        tau_themes::Color::DarkCyan => colors.terminal_ansi_cyan,
-        tau_themes::Color::DarkGrey => colors.terminal_ansi_bright_black,
-        tau_themes::Color::Red => colors.terminal_ansi_bright_red,
-        tau_themes::Color::Green => colors.terminal_ansi_bright_green,
-        tau_themes::Color::Yellow => colors.terminal_ansi_bright_yellow,
-        tau_themes::Color::Blue => colors.terminal_ansi_bright_blue,
-        tau_themes::Color::Magenta => colors.terminal_ansi_bright_magenta,
-        tau_themes::Color::Cyan => colors.terminal_ansi_bright_cyan,
-        tau_themes::Color::White => colors.terminal_ansi_bright_white,
-        tau_themes::Color::Grey => colors.terminal_ansi_white,
-        tau_themes::Color::Rgb { r, g, b } => Rgba {
-            r: r as f32 / 255.,
-            g: g as f32 / 255.,
-            b: b as f32 / 255.,
-            a: 1.,
-        }
-        .into(),
-    }
 }
 
 #[cfg(test)]
@@ -4753,7 +4570,6 @@ mod tests {
                 finished_at: None,
                 metadata: None,
             }),
-            &cli_theme::select_theme(tau_config::settings::CliTheme::default()),
             cx,
         );
 
@@ -4778,7 +4594,6 @@ mod tests {
                 finished_at: None,
                 metadata: None,
             }),
-            &cli_theme::select_theme(tau_config::settings::CliTheme::default()),
             cx,
         );
 
@@ -4802,7 +4617,6 @@ mod tests {
                 finished_at: Some(rho_core::UnixMs(3_500)),
                 metadata: None,
             }),
-            &cli_theme::select_theme(tau_config::settings::CliTheme::default()),
             cx,
         );
 
@@ -4878,7 +4692,6 @@ mod tests {
             &RhoUiBlock::UserMessage {
                 text: "hello".to_owned(),
             },
-            &cli_theme::select_theme(tau_config::settings::CliTheme::default()),
             cx,
         );
 
@@ -4895,7 +4708,6 @@ mod tests {
                 text: "**bold** `code`".to_owned(),
                 phase: Some(RhoUiMessagePhase::FinalAnswer),
             },
-            &cli_theme::select_theme(tau_config::settings::CliTheme::default()),
             cx,
         );
 

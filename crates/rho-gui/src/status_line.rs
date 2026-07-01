@@ -24,16 +24,26 @@ pub(crate) fn build(input: StatusLineInput<'_>) -> StatusLine {
 
 pub(crate) struct Chip {
     pub(crate) text: String,
-    pub(crate) style_name: &'static str,
+    pub(crate) style: ChipStyle,
 }
 
 impl Chip {
-    fn new(text: impl Into<String>, style_name: &'static str) -> Self {
+    fn new(text: impl Into<String>, style: ChipStyle) -> Self {
         Self {
             text: text.into(),
-            style_name,
+            style,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChipStyle {
+    Role,
+    Model,
+    Muted,
+    Effort,
+    Verbosity,
+    ServiceTier,
 }
 
 enum LeftStatusIdentity<'a> {
@@ -59,33 +69,31 @@ fn prompt_chips(
     role_default_effort: Option<tau_proto::Effort>,
     role_default_verbosity: Option<tau_proto::Verbosity>,
 ) -> Vec<Chip> {
-    use tau_themes::names;
-
     let mut chips = Vec::new();
     match identity {
-        Some(LeftStatusIdentity::Role(role)) => chips.push(Chip::new(role, names::STATUS_ROLE)),
+        Some(LeftStatusIdentity::Role(role)) => chips.push(Chip::new(role, ChipStyle::Role)),
         Some(LeftStatusIdentity::Model(model)) => {
-            chips.push(Chip::new(format!("={model}"), names::STATUS_MODEL))
+            chips.push(Chip::new(format!("={model}"), ChipStyle::Model))
         }
         Some(LeftStatusIdentity::NoRoleSelected) => {
-            chips.push(Chip::new("no role selected", names::MODEL_STATUS))
+            chips.push(Chip::new("no role selected", ChipStyle::Muted))
         }
         None => {}
     }
     if show_effort_status(baseline_params, current_params, role_default_effort) {
         chips.push(Chip::new(
             format!("^{}", current_params.effort.as_str()),
-            names::STATUS_EFFORT,
+            ChipStyle::Effort,
         ));
     }
     if show_verbosity_status(baseline_params, current_params, role_default_verbosity) {
         chips.push(Chip::new(
             format!("~{}", current_params.verbosity.as_str()),
-            names::STATUS_VERBOSITY,
+            ChipStyle::Verbosity,
         ));
     }
     if show_service_tier_status(baseline_params, current_params) {
-        chips.push(Chip::new("⚡", names::STATUS_SERVICE_TIER));
+        chips.push(Chip::new("⚡", ChipStyle::ServiceTier));
     }
     chips
 }
@@ -148,10 +156,7 @@ mod tests {
         let status_line = build(input());
 
         assert_eq!(status_line.prompt_chips[0].text, "senior-engineer");
-        assert_eq!(
-            status_line.prompt_chips[0].style_name,
-            tau_themes::names::STATUS_ROLE
-        );
+        assert_eq!(status_line.prompt_chips[0].style, ChipStyle::Role);
     }
 
     #[test]
@@ -175,6 +180,6 @@ mod tests {
         );
 
         assert_eq!(chips[0].text, "no role selected");
-        assert_eq!(chips[0].style_name, tau_themes::names::MODEL_STATUS);
+        assert_eq!(chips[0].style, ChipStyle::Muted);
     }
 }

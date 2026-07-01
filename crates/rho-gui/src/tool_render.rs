@@ -1,14 +1,89 @@
 #![allow(dead_code)]
 
-//! Theming and block rendering for tool calls and other transcript
-//! elements. Pure functions over [`tau_proto`] payloads — no
-//! [`tau_cli_term`] state lives here.
+//! Block rendering for tool calls and other transcript elements.
+//! Pure functions over protocol payloads; the GUI maps the resulting
+//! rho-local styles to the active Zed theme.
 
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
 use tau_proto::{CborValue, ToolUsePayload, ToolUseState, ToolUseStatus, cbor_field};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BlockStyle {
+    #[default]
+    Default,
+    TokenStatsDelta,
+    TokenStatsCacheHit,
+    TokenStatsCacheWarn,
+    TokenStatsCacheMiss,
+    TokenStatsUp,
+    TokenStatsDown,
+    TokenStatsInput,
+    TokenStatsOutput,
+    TokenStatsLatency,
+    TokenStatsSigma,
+    ToolOutput,
+    ToolName,
+    ToolMode,
+    ToolArgs,
+    ToolStatusSuccess,
+    ToolStatusInfo,
+    ToolStatusError,
+    ToolStatusTime,
+    Progress,
+    DiffAdded,
+    DiffRemoved,
+    DiffAddedInline,
+    DiffRemovedInline,
+    DiffContext,
+    DiffHunkHeader,
+    StatusRole,
+    StatusContext,
+    StatusTools,
+    ActionOutput,
+    ActionLabel,
+    ActionValue,
+    ActionId,
+    ActionError,
+    SystemInfo,
+    SystemImportant,
+    SystemPath,
+    SystemStatus,
+    ExtensionLifecycle,
+    ExtensionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StyledSpan {
+    pub(crate) text: String,
+    pub(crate) style: BlockStyle,
+}
+
+impl StyledSpan {
+    fn new(text: impl Into<String>, style: BlockStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StyledBlock {
+    spans: Vec<StyledSpan>,
+}
+
+impl StyledBlock {
+    fn new(spans: Vec<StyledSpan>) -> Self {
+        Self { spans }
+    }
+
+    pub(crate) fn spans(&self) -> &[StyledSpan] {
+        &self.spans
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn format_turn_stats_line(
@@ -24,24 +99,17 @@ pub(crate) fn format_turn_stats_line(
 }
 
 pub(crate) fn render_turn_stats_block(
-    theme: &tau_themes::Theme,
     usage: &tau_proto::ProviderTokenUsage,
     previous_usage: Option<&tau_proto::ProviderTokenUsage>,
     turn_latency: Option<Duration>,
     total_latency: Option<Duration>,
-) -> tau_cli_term::StyledBlock {
-    use tau_cli_term::resolve::themed_text;
-    use tau_themes::{SpanTree, ThemedText, names};
-
-    let mut themed = ThemedText::new();
-    let root = themed.add_style(names::TOKEN_STATS);
-    let mut children = Vec::new();
-    for part in turn_stats_parts(usage, previous_usage, turn_latency, total_latency) {
-        let style = themed.add_style(part.style_name);
-        children.push(SpanTree::span(style, vec![SpanTree::text(part.text)]));
-    }
-    themed.push_tree(SpanTree::span(root, children));
-    tau_cli_term::StyledBlock::new(themed_text(theme, &themed))
+) -> StyledBlock {
+    StyledBlock::new(
+        turn_stats_parts(usage, previous_usage, turn_latency, total_latency)
+            .into_iter()
+            .map(|part| StyledSpan::new(part.text, part.style))
+            .collect(),
+    )
 }
 
 const CACHE_HIT_WARNING_PERCENT: u8 = 90;
@@ -51,14 +119,14 @@ const CACHE_GRANULARITY_TOKENS: u64 = 512;
 
 struct TurnStatsPart {
     text: String,
-    style_name: &'static str,
+    style: BlockStyle,
 }
 
 impl TurnStatsPart {
-    fn new(text: impl Into<String>, style_name: &'static str) -> Self {
+    fn new(text: impl Into<String>, style: BlockStyle) -> Self {
         Self {
             text: text.into(),
-            style_name,
+            style,
         }
     }
 }
@@ -69,15 +137,13 @@ fn turn_stats_parts(
     turn_latency: Option<Duration>,
     total_latency: Option<Duration>,
 ) -> Vec<TurnStatsPart> {
-    use tau_themes::names;
-
     let previous_sent_tokens = previous_usage.map_or(0, |usage| usage.prompt_sent_tokens);
     let previous_received_tokens = previous_usage.map_or(0, |usage| usage.response_received_tokens);
     let turn_cache_possible = previous_sent_tokens.saturating_add(previous_received_tokens);
     let new_prompt_tokens = usage.prompt_sent_tokens.saturating_sub(turn_cache_possible);
     let mut parts = Vec::new();
 
-    parts.push(TurnStatsPart::new("Δ", names::TOKEN_STATS_DELTA));
+    parts.push(TurnStatsPart::new("Δ", BlockStyle::TokenStatsDelta));
     let turn_cache_hit_percent =
         cache_hit_percent(Some(turn_cache_possible), Some(usage.prompt_cached_tokens)).unwrap_or(0);
     parts.push(TurnStatsPart::new(
@@ -88,42 +154,42 @@ fn turn_stats_parts(
         ),
         cache_hit_style_name(turn_cache_possible, usage.prompt_cached_tokens),
     ));
-    parts.push(TurnStatsPart::new(" ↑", names::TOKEN_STATS_UP));
+    parts.push(TurnStatsPart::new(" ↑", BlockStyle::TokenStatsUp));
     parts.push(TurnStatsPart::new(
         format_token_count(new_prompt_tokens),
-        names::TOKEN_STATS_INPUT,
+        BlockStyle::TokenStatsInput,
     ));
-    parts.push(TurnStatsPart::new(" ↓", names::TOKEN_STATS_DOWN));
+    parts.push(TurnStatsPart::new(" ↓", BlockStyle::TokenStatsDown));
     parts.push(TurnStatsPart::new(
         format_token_count(usage.response_received_tokens),
-        names::TOKEN_STATS_OUTPUT,
+        BlockStyle::TokenStatsOutput,
     ));
     if let Some(latency) = turn_latency {
         parts.push(TurnStatsPart::new(
             format!(" {}", StatusBarDuration(latency)),
-            names::TOKEN_STATS_LATENCY,
+            BlockStyle::TokenStatsLatency,
         ));
     }
 
-    parts.push(TurnStatsPart::new(" Σ", names::TOKEN_STATS_SIGMA));
-    parts.push(TurnStatsPart::new(" ↑", names::TOKEN_STATS_UP));
+    parts.push(TurnStatsPart::new(" Σ", BlockStyle::TokenStatsSigma));
+    parts.push(TurnStatsPart::new(" ↑", BlockStyle::TokenStatsUp));
     parts.push(TurnStatsPart::new(
         format!(
             "{}/{}",
             format_token_count(usage.stats.total.cached_tokens),
             format_token_count(usage.stats.total.sent_tokens),
         ),
-        names::TOKEN_STATS_INPUT,
+        BlockStyle::TokenStatsInput,
     ));
-    parts.push(TurnStatsPart::new(" ↓", names::TOKEN_STATS_DOWN));
+    parts.push(TurnStatsPart::new(" ↓", BlockStyle::TokenStatsDown));
     parts.push(TurnStatsPart::new(
         format_token_count(usage.stats.total.received_tokens),
-        names::TOKEN_STATS_OUTPUT,
+        BlockStyle::TokenStatsOutput,
     ));
     if let Some(latency) = total_latency {
         parts.push(TurnStatsPart::new(
             format!(" {}", StatusBarDuration(latency)),
-            names::TOKEN_STATS_LATENCY,
+            BlockStyle::TokenStatsLatency,
         ));
     }
 
@@ -147,19 +213,17 @@ impl fmt::Display for StatusBarDuration {
     }
 }
 
-fn cache_hit_style_name(possible_cached_tokens: u64, cached_tokens: u64) -> &'static str {
-    use tau_themes::names;
-
+fn cache_hit_style_name(possible_cached_tokens: u64, cached_tokens: u64) -> BlockStyle {
     let cacheable_prefix_floor =
         possible_cached_tokens / CACHE_GRANULARITY_TOKENS * CACHE_GRANULARITY_TOKENS;
     if cacheable_prefix_floor <= cached_tokens {
-        names::TOKEN_STATS_CACHE_HIT
+        BlockStyle::TokenStatsCacheHit
     } else if cache_hit_percent(Some(possible_cached_tokens), Some(cached_tokens))
         .is_some_and(|percent| CACHE_HIT_WARNING_PERCENT < percent)
     {
-        names::TOKEN_STATS_CACHE_WARN
+        BlockStyle::TokenStatsCacheWarn
     } else {
-        names::TOKEN_STATS_CACHE_MISS
+        BlockStyle::TokenStatsCacheMiss
     }
 }
 
@@ -376,49 +440,26 @@ fn info_suffix(text: String) -> ToolSuffixSegment {
 /// the indicator is skipped when the body is empty or already ends in
 /// whitespace, so the `…` doesn't double up whitespace or land one
 /// column off the left margin on a fresh line.
-pub(crate) fn streaming_block(
-    theme: &tau_themes::Theme,
-    body_name: &str,
-    body_text: impl Into<String>,
-) -> tau_cli_term::StyledBlock {
-    use tau_cli_term::resolve::{convert_color, resolve};
-    use tau_cli_term::{Span, Style, StyledBlock, StyledText};
-    use tau_themes::{StyleName, names};
-
+pub(crate) fn streaming_block(body_style: BlockStyle, body_text: impl Into<String>) -> StyledBlock {
     let body_text = body_text.into();
     let needs_space = body_text
         .chars()
         .next_back()
         .is_some_and(|c| !c.is_whitespace());
 
-    let body_ts = theme.resolve_style(&StyleName::new(body_name));
-    let body_span_style = Style {
-        fg: body_ts.fg.map(convert_color),
-        bg: None,
-        bold: body_ts.bold,
-        underline: body_ts.underline,
-        italic: body_ts.italic,
-        strikethrough: body_ts.strikethrough,
-    };
-    let progress_style = resolve(theme, names::PROGRESS_INDICATOR);
-
     let mut spans = Vec::with_capacity(3);
     if !body_text.is_empty() {
-        spans.push(Span::new(body_text, body_span_style));
+        spans.push(StyledSpan::new(body_text, body_style));
     }
     if needs_space {
-        spans.push(Span::new(" ", body_span_style));
+        spans.push(StyledSpan::new(" ", body_style));
     }
-    spans.push(Span::new(
+    spans.push(StyledSpan::new(
         tau_proto::PROGRESS_INDICATOR_TEXT.to_owned(),
-        progress_style,
+        BlockStyle::Progress,
     ));
 
-    let mut block = StyledBlock::new(StyledText::from(spans));
-    if let Some(bg) = body_ts.bg {
-        block = block.bg(convert_color(bg));
-    }
-    block
+    StyledBlock::new(spans)
 }
 
 pub(crate) fn tool_duration_suffix(duration: Duration) -> ToolSuffixSegment {
@@ -795,128 +836,98 @@ pub(crate) fn build_tool_summary_display(summary: &ToolSummaryDisplay) -> ToolCa
 /// paints the small lifecycle line directly instead of fabricating a
 /// `ToolUseState`.
 pub(crate) fn render_compaction_block(
-    theme: &tau_themes::Theme,
     status_text: impl Into<String>,
     status: CompactionStatus,
-) -> tau_cli_term::StyledBlock {
-    use tau_cli_term::resolve::themed_text;
-    use tau_themes::{SpanTree, ThemedText, names};
-
+) -> StyledBlock {
     let status_text = status_text.into();
-    let mut themed = ThemedText::new();
-    let output = themed.add_style(names::TOOL_OUTPUT);
-    let name = themed.add_style(names::TOOL_NAME);
-    let spacer = themed.add_style(names::TOOL_ARGS);
-    let status_style = themed.add_style(match status {
-        CompactionStatus::Success => names::TOOL_STATUS_SUCCESS,
-        CompactionStatus::Progress => names::PROGRESS_INDICATOR,
-    });
-    let context_style = themed.add_style(names::STATUS_CONTEXT);
-    let mut children = vec![
-        SpanTree::span(name, vec![SpanTree::text("compact")]),
-        SpanTree::span(spacer, vec![SpanTree::text(" ")]),
+    let status_style = match status {
+        CompactionStatus::Success => BlockStyle::ToolStatusSuccess,
+        CompactionStatus::Progress => BlockStyle::Progress,
+    };
+    let mut spans = vec![
+        StyledSpan::new("compact", BlockStyle::ToolName),
+        StyledSpan::new(" ", BlockStyle::ToolArgs),
     ];
     for (index, part) in status_text.split(' ').enumerate() {
         if 0 < index {
-            children.push(SpanTree::span(status_style, vec![SpanTree::text(" ")]));
+            spans.push(StyledSpan::new(" ", status_style));
         }
         let style = if part.starts_with('#') {
-            context_style
+            BlockStyle::StatusContext
         } else {
             status_style
         };
-        children.push(SpanTree::span(style, vec![SpanTree::text(part.to_owned())]));
+        spans.push(StyledSpan::new(part.to_owned(), style));
     }
-    themed.push_tree(SpanTree::span(output, children));
-    tau_cli_term::StyledBlock::new(themed_text(theme, &themed))
+    StyledBlock::new(spans)
 }
 
-/// Paints a [`ToolCallDisplay`] onto a themed block.
-pub(crate) fn render_tool_block(
-    theme: &tau_themes::Theme,
-    display: &ToolCallDisplay,
-) -> tau_cli_term::StyledBlock {
-    use tau_cli_term::StyledBlock;
-    use tau_cli_term::resolve::themed_text;
-    use tau_themes::{SpanTree, ThemedText, names};
+fn style_for_tool_status(status: ToolStatus) -> BlockStyle {
+    match status {
+        ToolStatus::Success => BlockStyle::ToolStatusSuccess,
+        ToolStatus::Warning | ToolStatus::Pending | ToolStatus::Info => BlockStyle::ToolStatusInfo,
+        ToolStatus::Error => BlockStyle::ToolStatusError,
+        ToolStatus::Progress => BlockStyle::Progress,
+        ToolStatus::DiffAdded => BlockStyle::DiffAdded,
+        ToolStatus::DiffRemoved => BlockStyle::DiffRemoved,
+        ToolStatus::Role => BlockStyle::StatusRole,
+        ToolStatus::Context => BlockStyle::StatusContext,
+        ToolStatus::Tools => BlockStyle::StatusTools,
+        ToolStatus::Time => BlockStyle::ToolStatusTime,
+    }
+}
 
-    let mut themed = ThemedText::new();
-    let output = themed.add_style(names::TOOL_OUTPUT);
-    let name = themed.add_style(names::TOOL_NAME);
-    let mode = themed.add_style(names::TOOL_MODE);
-    let args = themed.add_style(names::TOOL_ARGS);
-
+/// Paints a [`ToolCallDisplay`] onto a styled block.
+pub(crate) fn render_tool_block(display: &ToolCallDisplay) -> StyledBlock {
     let is_shell_command = matches!(display.tool_name.as_str(), "shell" | "shell_command");
-    let mut children = if is_shell_command {
+    let mut spans = if is_shell_command {
         let mut text = "$".to_owned();
         if !display.args.is_empty() {
             text.push(' ');
             text.push_str(&abbreviate_inline_text(&display.args));
         }
-        vec![SpanTree::span(args, vec![SpanTree::text(text)])]
+        vec![StyledSpan::new(text, BlockStyle::ToolArgs)]
     } else {
-        vec![SpanTree::span(
-            name,
-            vec![SpanTree::text(display.tool_name.clone())],
+        vec![StyledSpan::new(
+            display.tool_name.clone(),
+            BlockStyle::ToolName,
         )]
     };
     if !display.mode.is_empty() {
-        children.push(SpanTree::span(args, vec![SpanTree::text(" ")]));
-        children.push(SpanTree::span(
-            mode,
-            vec![SpanTree::text(abbreviate_inline_text(&display.mode))],
+        spans.push(StyledSpan::new(" ", BlockStyle::ToolArgs));
+        spans.push(StyledSpan::new(
+            abbreviate_inline_text(&display.mode),
+            BlockStyle::ToolMode,
         ));
     }
     if !display.args.is_empty() && !is_shell_command {
-        children.push(SpanTree::span(
-            args,
-            vec![
-                SpanTree::text(" "),
-                SpanTree::text(abbreviate_inline_text(&display.args)),
-            ],
+        spans.push(StyledSpan::new(" ", BlockStyle::ToolArgs));
+        spans.push(StyledSpan::new(
+            abbreviate_inline_text(&display.args),
+            BlockStyle::ToolArgs,
         ));
     }
     if let Some(range) = &display.range {
-        children.push(SpanTree::span(
-            args,
-            vec![
-                SpanTree::text(" "),
-                SpanTree::text(abbreviate_inline_text(range)),
-            ],
+        spans.push(StyledSpan::new(" ", BlockStyle::ToolArgs));
+        spans.push(StyledSpan::new(
+            abbreviate_inline_text(range),
+            BlockStyle::ToolArgs,
         ));
     }
     for suffix in &display.suffixes {
-        let status_name = match suffix.status {
-            ToolStatus::Success => names::TOOL_STATUS_SUCCESS,
-            // Warning/Pending have no dedicated tokens yet — share the info
-            // colour so the chip still reads as "non-error" without a
-            // theme migration.
-            ToolStatus::Warning | ToolStatus::Pending | ToolStatus::Info => names::TOOL_STATUS_INFO,
-            ToolStatus::Error => names::TOOL_STATUS_ERROR,
-            ToolStatus::Progress => names::PROGRESS_INDICATOR,
-            ToolStatus::DiffAdded => names::DIFF_ADDED,
-            ToolStatus::DiffRemoved => names::DIFF_REMOVED,
-            ToolStatus::Role => names::STATUS_ROLE,
-            ToolStatus::Context => names::STATUS_CONTEXT,
-            ToolStatus::Tools => names::STATUS_TOOLS,
-            ToolStatus::Time => names::TOOL_STATUS_TIME,
-        };
-        let status = themed.add_style(status_name);
         if !suffix.no_leading_space && !suffix.text.starts_with(':') {
-            children.push(SpanTree::span(args, vec![SpanTree::text(" ")]));
+            spans.push(StyledSpan::new(" ", BlockStyle::ToolArgs));
         }
-        children.push(SpanTree::span(
-            status,
-            vec![SpanTree::text(abbreviate_inline_text(&suffix.text))],
+        spans.push(StyledSpan::new(
+            abbreviate_inline_text(&suffix.text),
+            style_for_tool_status(suffix.status),
         ));
     }
     if let Some(ToolUsePayload::Text { text }) = &display.payload {
-        children.push(SpanTree::span(args, vec![SpanTree::text("\n")]));
-        children.push(SpanTree::span(args, vec![SpanTree::text(text.clone())]));
+        spans.push(StyledSpan::new("\n", BlockStyle::ToolArgs));
+        spans.push(StyledSpan::new(text.clone(), BlockStyle::ToolArgs));
     }
-    themed.push_tree(SpanTree::span(output, children));
-
-    StyledBlock::new(themed_text(theme, &themed))
+    StyledBlock::new(spans)
 }
 
 /// Like [`render_tool_block`] but appends an expanded unified-diff
@@ -925,100 +936,82 @@ pub(crate) fn render_tool_block(
 /// rendered, comes after a `\n` so `layout_lines` wraps each diff line
 /// independently.
 pub(crate) fn render_diff_tool_block(
-    theme: &tau_themes::Theme,
     display: &ToolCallDisplay,
     diff: &tau_proto::DiffSummary,
     expanded: bool,
-) -> tau_cli_term::StyledBlock {
-    use tau_cli_term::resolve::resolve;
-    use tau_cli_term::{Span, StyledBlock, StyledText};
-    use tau_themes::names;
-
-    // Reuse the header from render_tool_block, then keep its spans so
-    // we can append diff lines below it.
-    let header = render_tool_block(theme, display);
-    let mut spans: Vec<Span> = header.content.spans().to_vec();
+) -> StyledBlock {
+    let mut spans = render_tool_block(display).spans;
 
     if !expanded || diff.hunks.is_empty() {
-        return StyledBlock::new(StyledText::from(spans));
+        return StyledBlock::new(spans);
     }
 
-    let added_style = resolve(theme, names::DIFF_ADDED);
-    let removed_style = resolve(theme, names::DIFF_REMOVED);
-    let context_style = resolve(theme, names::DIFF_CONTEXT);
-    let header_style = resolve(theme, names::DIFF_HUNK_HEADER);
-    let added_inline_style = overlay_style(added_style, resolve(theme, names::DIFF_ADDED_INLINE));
-    let removed_inline_style =
-        overlay_style(removed_style, resolve(theme, names::DIFF_REMOVED_INLINE));
-
     for hunk in &diff.hunks {
-        spans.push(Span::new("\n", context_style));
-        spans.push(Span::new(
+        spans.push(StyledSpan::new("\n", BlockStyle::DiffContext));
+        spans.push(StyledSpan::new(
             format!(
                 "@@ -{},{} +{},{} @@",
                 hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
             ),
-            header_style,
+            BlockStyle::DiffHunkHeader,
         ));
         for line in &hunk.lines {
-            spans.push(Span::new("\n", context_style));
+            spans.push(StyledSpan::new("\n", BlockStyle::DiffContext));
             match line {
                 tau_proto::DiffLine::Equal { text } => {
-                    spans.push(Span::new(format!(" {text}"), context_style));
+                    spans.push(StyledSpan::new(format!(" {text}"), BlockStyle::DiffContext));
                 }
                 tau_proto::DiffLine::Add { text } => {
-                    spans.push(Span::new(format!("+{text}"), added_style));
+                    spans.push(StyledSpan::new(format!("+{text}"), BlockStyle::DiffAdded));
                 }
                 tau_proto::DiffLine::Remove { text } => {
-                    spans.push(Span::new(format!("-{text}"), removed_style));
+                    spans.push(StyledSpan::new(format!("-{text}"), BlockStyle::DiffRemoved));
                 }
                 tau_proto::DiffLine::Modify { old, new } => {
-                    spans.push(Span::new("-".to_owned(), removed_style));
-                    push_segments(&mut spans, old, removed_style, removed_inline_style);
-                    spans.push(Span::new("\n".to_owned(), context_style));
-                    spans.push(Span::new("+".to_owned(), added_style));
-                    push_segments(&mut spans, new, added_style, added_inline_style);
+                    spans.push(StyledSpan::new("-", BlockStyle::DiffRemoved));
+                    push_segments(
+                        &mut spans,
+                        old,
+                        BlockStyle::DiffRemoved,
+                        BlockStyle::DiffRemovedInline,
+                    );
+                    spans.push(StyledSpan::new("\n", BlockStyle::DiffContext));
+                    spans.push(StyledSpan::new("+", BlockStyle::DiffAdded));
+                    push_segments(
+                        &mut spans,
+                        new,
+                        BlockStyle::DiffAdded,
+                        BlockStyle::DiffAddedInline,
+                    );
                 }
             }
         }
     }
-    StyledBlock::new(StyledText::from(spans))
+    StyledBlock::new(spans)
 }
 
 fn push_segments(
-    spans: &mut Vec<tau_cli_term::Span>,
+    spans: &mut Vec<StyledSpan>,
     segments: &[tau_proto::DiffSegment],
-    base: tau_cli_term::Style,
-    inline: tau_cli_term::Style,
+    base: BlockStyle,
+    inline: BlockStyle,
 ) {
-    use tau_cli_term::Span;
     for seg in segments {
         match seg {
             tau_proto::DiffSegment::Equal { text } => {
-                spans.push(Span::new(text.clone(), base));
+                spans.push(StyledSpan::new(text.clone(), base));
             }
             // Within a Modify line, only the *changed* sub-slice on
             // each side is meaningful. Hide the *other* side's slice
             // so we don't double up (e.g. the - line shouldn't show
             // the new tokens, only the old).
             tau_proto::DiffSegment::Remove { text } => {
-                spans.push(Span::new(text.clone(), inline));
+                spans.push(StyledSpan::new(text.clone(), inline));
             }
             tau_proto::DiffSegment::Add { text } => {
-                spans.push(Span::new(text.clone(), inline));
+                spans.push(StyledSpan::new(text.clone(), inline));
             }
         }
-    }
-}
-
-fn overlay_style(base: tau_cli_term::Style, overlay: tau_cli_term::Style) -> tau_cli_term::Style {
-    tau_cli_term::Style {
-        fg: overlay.fg.or(base.fg),
-        bg: overlay.bg.or(base.bg),
-        bold: base.bold || overlay.bold,
-        underline: base.underline || overlay.underline,
-        italic: base.italic || overlay.italic,
-        strikethrough: base.strikethrough || overlay.strikethrough,
     }
 }
 
@@ -1032,88 +1025,69 @@ fn overlay_style(base: tau_cli_term::Style, overlay: tau_cli_term::Style) -> tau
 ///     keyed off exit code),
 ///   - `Some("cancelled")` on cancel (info style).
 pub(crate) fn render_shell_block(
-    theme: &tau_themes::Theme,
     command: &str,
     output: &str,
     status_suffix: Option<&str>,
-) -> tau_cli_term::StyledBlock {
-    use tau_cli_term::resolve::resolve;
-    use tau_cli_term::{Span, StyledBlock, StyledText};
-    use tau_themes::names;
-
-    let args_style = resolve(theme, names::TOOL_ARGS);
-    let status_name = match status_suffix {
-        Some(s) if s.starts_with("[0]") => names::TOOL_STATUS_SUCCESS,
-        Some(s) if s.starts_with('[') => names::TOOL_STATUS_ERROR,
-        _ => names::TOOL_STATUS_INFO,
+) -> StyledBlock {
+    let status_style = match status_suffix {
+        Some(s) if s.starts_with("[0]") => BlockStyle::ToolStatusSuccess,
+        Some(s) if s.starts_with('[') => BlockStyle::ToolStatusError,
+        _ => BlockStyle::ToolStatusInfo,
     };
-    let status_style = resolve(theme, status_name);
 
-    let mut spans = vec![Span::new(
+    let mut spans = vec![StyledSpan::new(
         format!("$ {}", abbreviate_inline_text(command)),
-        args_style,
+        BlockStyle::ToolArgs,
     )];
     if let Some(suffix) = status_suffix {
-        spans.push(Span::new(" ", args_style));
-        spans.push(Span::new(abbreviate_inline_text(suffix), status_style));
+        spans.push(StyledSpan::new(" ", BlockStyle::ToolArgs));
+        spans.push(StyledSpan::new(
+            abbreviate_inline_text(suffix),
+            status_style,
+        ));
     }
     if !output.is_empty() {
-        spans.push(Span::new("\n", args_style));
-        spans.push(Span::new(output.to_owned(), args_style));
+        spans.push(StyledSpan::new("\n", BlockStyle::ToolArgs));
+        spans.push(StyledSpan::new(output.to_owned(), BlockStyle::ToolArgs));
     }
-    StyledBlock::new(StyledText::from(spans))
+    StyledBlock::new(spans)
 }
 
-pub(crate) fn render_action_output_block(
-    theme: &tau_themes::Theme,
-    text: &str,
-) -> tau_cli_term::StyledBlock {
-    use tau_cli_term::resolve::resolve;
-    use tau_cli_term::{Span, StyledBlock, StyledText};
-    use tau_themes::names;
-
+pub(crate) fn render_action_output_block(text: &str) -> StyledBlock {
     let styles = ActionStyles {
-        output: resolve(theme, names::ACTION_OUTPUT),
-        label: resolve(theme, names::ACTION_LABEL),
-        value: resolve(theme, names::ACTION_VALUE),
-        id: resolve(theme, names::ACTION_ID),
+        output: BlockStyle::ActionOutput,
+        label: BlockStyle::ActionLabel,
+        value: BlockStyle::ActionValue,
+        id: BlockStyle::ActionId,
     };
     let mut spans = Vec::new();
     for line in text.split_inclusive('\n') {
         let body = line.strip_suffix('\n').unwrap_or(line);
         push_action_line(&mut spans, body, styles);
         if line.ends_with('\n') {
-            spans.push(Span::new("\n", styles.output));
+            spans.push(StyledSpan::new("\n", styles.output));
         }
     }
-    StyledBlock::new(StyledText::from(spans))
+    StyledBlock::new(spans)
 }
 
-pub(crate) fn render_action_error_block(
-    theme: &tau_themes::Theme,
-    action_id: &str,
-    message: &str,
-) -> tau_cli_term::StyledBlock {
-    use tau_cli_term::resolve::resolve;
-    use tau_cli_term::{Span, StyledBlock, StyledText};
-    use tau_themes::names;
-
-    StyledBlock::new(StyledText::from(vec![
-        Span::new(action_id.to_owned(), resolve(theme, names::ACTION_ID)),
-        Span::new(": ", resolve(theme, names::ACTION_OUTPUT)),
-        Span::new(message.to_owned(), resolve(theme, names::ACTION_ERROR)),
-    ]))
+pub(crate) fn render_action_error_block(action_id: &str, message: &str) -> StyledBlock {
+    StyledBlock::new(vec![
+        StyledSpan::new(action_id.to_owned(), BlockStyle::ActionId),
+        StyledSpan::new(": ", BlockStyle::ActionOutput),
+        StyledSpan::new(message.to_owned(), BlockStyle::ActionError),
+    ])
 }
 
 #[derive(Clone, Copy)]
 struct ActionStyles {
-    output: tau_cli_term::Style,
-    label: tau_cli_term::Style,
-    value: tau_cli_term::Style,
-    id: tau_cli_term::Style,
+    output: BlockStyle,
+    label: BlockStyle,
+    value: BlockStyle,
+    id: BlockStyle,
 }
 
-fn push_action_line(spans: &mut Vec<tau_cli_term::Span>, line: &str, styles: ActionStyles) {
+fn push_action_line(spans: &mut Vec<StyledSpan>, line: &str, styles: ActionStyles) {
     if push_action_approval_heading(spans, line, styles) {
         return;
     }
@@ -1123,14 +1097,14 @@ fn push_action_line(spans: &mut Vec<tau_cli_term::Span>, line: &str, styles: Act
 
     let mut index = 0;
     if let Some(end) = leading_action_id_end(line) {
-        spans.push(tau_cli_term::Span::new(line[..end].to_owned(), styles.id));
+        spans.push(StyledSpan::new(line[..end].to_owned(), styles.id));
         index = end;
     }
     push_action_tokens(spans, &line[index..], styles);
 }
 
 fn push_action_approval_heading(
-    spans: &mut Vec<tau_cli_term::Span>,
+    spans: &mut Vec<StyledSpan>,
     line: &str,
     styles: ActionStyles,
 ) -> bool {
@@ -1140,16 +1114,12 @@ fn push_action_approval_heading(
     if !prefix.to_ascii_lowercase().contains("approval") || !is_action_id_token(id) {
         return false;
     }
-    spans.push(tau_cli_term::Span::new(format!("{prefix} "), styles.output));
-    spans.push(tau_cli_term::Span::new(id.to_owned(), styles.id));
+    spans.push(StyledSpan::new(format!("{prefix} "), styles.output));
+    spans.push(StyledSpan::new(id.to_owned(), styles.id));
     true
 }
 
-fn push_action_label_line(
-    spans: &mut Vec<tau_cli_term::Span>,
-    line: &str,
-    styles: ActionStyles,
-) -> bool {
+fn push_action_label_line(spans: &mut Vec<StyledSpan>, line: &str, styles: ActionStyles) -> bool {
     let Some(colon) = line.find(':') else {
         return false;
     };
@@ -1158,9 +1128,9 @@ fn push_action_label_line(
     }
     let label = &line[..=colon];
     let mut value = &line[colon + 1..];
-    spans.push(tau_cli_term::Span::new(label.to_owned(), styles.label));
+    spans.push(StyledSpan::new(label.to_owned(), styles.label));
     if let Some(stripped) = value.strip_prefix(' ') {
-        spans.push(tau_cli_term::Span::new(" ", styles.output));
+        spans.push(StyledSpan::new(" ", styles.output));
         value = stripped;
     }
     let value_style = if is_action_id_label(&line[..colon]) && is_action_id_token(value) {
@@ -1168,21 +1138,18 @@ fn push_action_label_line(
     } else {
         styles.value
     };
-    spans.push(tau_cli_term::Span::new(value.to_owned(), value_style));
+    spans.push(StyledSpan::new(value.to_owned(), value_style));
     true
 }
 
-fn push_action_tokens(spans: &mut Vec<tau_cli_term::Span>, text: &str, styles: ActionStyles) {
+fn push_action_tokens(spans: &mut Vec<StyledSpan>, text: &str, styles: ActionStyles) {
     let mut rest = text;
     while !rest.is_empty() {
         let split_at = rest
             .find(|c: char| !c.is_whitespace())
             .unwrap_or(rest.len());
         if 0 < split_at {
-            spans.push(tau_cli_term::Span::new(
-                rest[..split_at].to_owned(),
-                styles.output,
-            ));
+            spans.push(StyledSpan::new(rest[..split_at].to_owned(), styles.output));
             rest = &rest[split_at..];
             continue;
         }
@@ -1193,23 +1160,17 @@ fn push_action_tokens(spans: &mut Vec<tau_cli_term::Span>, text: &str, styles: A
     }
 }
 
-fn push_action_token(spans: &mut Vec<tau_cli_term::Span>, token: &str, styles: ActionStyles) {
+fn push_action_token(spans: &mut Vec<StyledSpan>, token: &str, styles: ActionStyles) {
     let Some(eq) = token.find('=') else {
-        spans.push(tau_cli_term::Span::new(token.to_owned(), styles.output));
+        spans.push(StyledSpan::new(token.to_owned(), styles.output));
         return;
     };
     if eq == 0 {
-        spans.push(tau_cli_term::Span::new(token.to_owned(), styles.output));
+        spans.push(StyledSpan::new(token.to_owned(), styles.output));
         return;
     }
-    spans.push(tau_cli_term::Span::new(
-        token[..=eq].to_owned(),
-        styles.label,
-    ));
-    spans.push(tau_cli_term::Span::new(
-        token[eq + 1..].to_owned(),
-        styles.value,
-    ));
+    spans.push(StyledSpan::new(token[..=eq].to_owned(), styles.label));
+    spans.push(StyledSpan::new(token[eq + 1..].to_owned(), styles.value));
 }
 
 fn leading_action_id_end(line: &str) -> Option<usize> {
@@ -1231,13 +1192,7 @@ fn is_action_id_token(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-pub(crate) fn render_harness_notice(
-    theme: &tau_themes::Theme,
-    notice: &tau_proto::HarnessNotice,
-) -> tau_cli_term::StyledBlock {
-    use tau_cli_term::resolve::themed_block;
-    use tau_themes::names;
-
+pub(crate) fn render_harness_notice(notice: &tau_proto::HarnessNotice) -> StyledBlock {
     let important = matches!(
         notice.level,
         tau_proto::NoticeLevel::Critical | tau_proto::NoticeLevel::Warning
@@ -1249,106 +1204,71 @@ pub(crate) fn render_harness_notice(
             .strip_prefix("session dir: ")
             .and_then(|path| path.strip_suffix('/'))
     {
-        return system_path_block(theme, "session dir: ", Path::new(path), "/");
+        return system_path_block("session dir: ", Path::new(path), "/");
     }
 
-    let style_name = if important {
-        names::SYSTEM_INFO_IMPORTANT
+    let style = if important {
+        BlockStyle::SystemImportant
     } else {
-        names::SYSTEM_INFO
+        BlockStyle::SystemInfo
     };
-    themed_block(theme, style_name, &notice.message)
+    StyledBlock::new(vec![StyledSpan::new(notice.message.clone(), style)])
 }
 
-pub(crate) fn ui_dir_block(theme: &tau_themes::Theme, path: &Path) -> tau_cli_term::StyledBlock {
-    system_path_block(theme, "ui dir: ", path, "/")
+pub(crate) fn ui_dir_block(path: &Path) -> StyledBlock {
+    system_path_block("ui dir: ", path, "/")
 }
 
-pub(crate) fn session_status_block(
-    theme: &tau_themes::Theme,
-    path: &Path,
-    suffix: &str,
-    status: &str,
-) -> tau_cli_term::StyledBlock {
-    use tau_themes::{ThemedText, names};
-
-    let mut text = ThemedText::new();
-    let lifecycle = text.add_style(names::EXTENSION_LIFECYCLE);
-    let status_style = text.add_style(names::EXTENSION_STATUS);
-    let path_style = text.add_style(names::SYSTEM_PATH);
-    text.push(lifecycle, "session dir: ");
-    text.push(path_style, format!("{}{}", display_path(path), suffix));
-    text.push(lifecycle, " ");
-    text.push(status_style, status);
-    tau_cli_term::StyledBlock::new(tau_cli_term::resolve::themed_text(theme, &text))
+pub(crate) fn session_status_block(path: &Path, suffix: &str, status: &str) -> StyledBlock {
+    StyledBlock::new(vec![
+        StyledSpan::new("session dir: ", BlockStyle::ExtensionLifecycle),
+        StyledSpan::new(
+            format!("{}{}", display_path(path), suffix),
+            BlockStyle::SystemPath,
+        ),
+        StyledSpan::new(" ", BlockStyle::ExtensionLifecycle),
+        StyledSpan::new(status.to_owned(), BlockStyle::ExtensionStatus),
+    ])
 }
 
-fn system_path_block(
-    theme: &tau_themes::Theme,
-    prefix: &str,
-    path: &Path,
-    suffix: &str,
-) -> tau_cli_term::StyledBlock {
-    use tau_themes::{ThemedText, names};
-
-    let mut text = ThemedText::new();
-    let info = text.add_style(names::SYSTEM_INFO);
-    let path_style = text.add_style(names::SYSTEM_PATH);
-    text.push(info, prefix);
-    text.push(path_style, format!("{}{}", display_path(path), suffix));
-    tau_cli_term::StyledBlock::new(tau_cli_term::resolve::themed_text(theme, &text))
+fn system_path_block(prefix: &str, path: &Path, suffix: &str) -> StyledBlock {
+    StyledBlock::new(vec![
+        StyledSpan::new(prefix.to_owned(), BlockStyle::SystemInfo),
+        StyledSpan::new(
+            format!("{}{}", display_path(path), suffix),
+            BlockStyle::SystemPath,
+        ),
+    ])
 }
 
-pub(crate) fn system_loaded_block(
-    theme: &tau_themes::Theme,
-    path: &Path,
-    content: &str,
-) -> tau_cli_term::StyledBlock {
-    use tau_themes::{ThemedText, names};
-
-    let mut text = ThemedText::new();
-    let info = text.add_style(names::SYSTEM_INFO);
-    let path_style = text.add_style(names::SYSTEM_PATH);
-    let stats_style = text.add_style(names::TOOL_STATUS_INFO);
-    text.push(info, "loaded: ");
-    text.push(path_style, display_path(path));
-    text.push(info, " ");
-    text.push(stats_style, output_stats_suffix(content).text);
-    tau_cli_term::StyledBlock::new(tau_cli_term::resolve::themed_text(theme, &text))
+pub(crate) fn system_loaded_block(path: &Path, content: &str) -> StyledBlock {
+    StyledBlock::new(vec![
+        StyledSpan::new("loaded: ", BlockStyle::SystemInfo),
+        StyledSpan::new(display_path(path), BlockStyle::SystemPath),
+        StyledSpan::new(" ", BlockStyle::SystemInfo),
+        StyledSpan::new(
+            output_stats_suffix(content).text,
+            BlockStyle::ToolStatusInfo,
+        ),
+    ])
 }
 
-pub(crate) fn agent_context_ready_block(
-    theme: &tau_themes::Theme,
-    agent_id: &tau_proto::AgentId,
-) -> tau_cli_term::StyledBlock {
-    use tau_themes::{ThemedText, names};
-
-    let mut text = ThemedText::new();
-    let info = text.add_style(names::SYSTEM_INFO);
-    let agent_style = text.add_style(names::STATUS_ROLE);
-    let status_style = text.add_style(names::SYSTEM_STATUS);
-    text.push(info, "agent ");
-    text.push(agent_style, format!("@{agent_id}"));
-    text.push(info, " context ");
-    text.push(status_style, "ready");
-    tau_cli_term::StyledBlock::new(tau_cli_term::resolve::themed_text(theme, &text))
+pub(crate) fn agent_context_ready_block(agent_id: &tau_proto::AgentId) -> StyledBlock {
+    StyledBlock::new(vec![
+        StyledSpan::new("agent ", BlockStyle::SystemInfo),
+        StyledSpan::new(format!("@{agent_id}"), BlockStyle::StatusRole),
+        StyledSpan::new(" context ", BlockStyle::SystemInfo),
+        StyledSpan::new("ready", BlockStyle::SystemStatus),
+    ])
 }
 
-pub(crate) fn extension_status_block(
-    theme: &tau_themes::Theme,
-    extension_name: &str,
-    status: &str,
-) -> tau_cli_term::StyledBlock {
-    use tau_themes::{ThemedText, names};
-
-    let mut text = ThemedText::new();
-    let lifecycle = text.add_style(names::EXTENSION_LIFECYCLE);
-    let status_style = text.add_style(names::EXTENSION_STATUS);
-    text.push(lifecycle, "extension ");
-    text.push(lifecycle, extension_name);
-    text.push(lifecycle, " ");
-    text.push(status_style, status);
-    tau_cli_term::StyledBlock::new(tau_cli_term::resolve::themed_text(theme, &text))
+pub(crate) fn extension_status_block(extension_name: &str, status: &str) -> StyledBlock {
+    StyledBlock::new(vec![
+        StyledSpan::new("extension ", BlockStyle::ExtensionLifecycle),
+        StyledSpan::new(extension_name.to_owned(), BlockStyle::ExtensionLifecycle),
+        StyledSpan::new(" ", BlockStyle::ExtensionLifecycle),
+        StyledSpan::new(status.to_owned(), BlockStyle::ExtensionStatus),
+    ])
 }
 
 fn display_path(path: &Path) -> String {
