@@ -21,8 +21,8 @@ clap.workspace = true
 command_palette = { path = "../../../zed/crates/command_palette" }
 editor = { path = "../../../zed/crates/editor" }
 futures.workspace = true
-gpui = { path = "../../../zed/crates/gpui", default-features = false }
-gpui_platform = { path = "../../../zed/crates/gpui_platform", default-features = false, features = ["wayland", "x11"] }
+gpui = { path = "../../../zed/crates/gpui", default-features = false, features = ["wayland"] }
+gpui_platform = { path = "../../../zed/crates/gpui_platform", default-features = false, features = ["font-kit", "wayland"] }
 language = { path = "../../../zed/crates/language" }
 multi_buffer = { path = "../../../zed/crates/multi_buffer" }
 project = { path = "../../../zed/crates/project" }

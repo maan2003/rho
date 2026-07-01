@@ -113,13 +113,14 @@
           pkgs.fontconfig
           pkgs.freetype
           pkgs.glib
+          pkgs.libdrm
+          pkgs.libgbm
+          pkgs.libglvnd
+          pkgs.libva
           pkgs.libxkbcommon
           pkgs.openssl
+          pkgs.vulkan-loader
           pkgs.wayland
-          pkgs.libx11
-          pkgs.libxcb
-          pkgs.libxcursor
-          pkgs.libxi
         ];
         guiLibraryPath = pkgs.lib.makeLibraryPath guiBuildInputs;
 
