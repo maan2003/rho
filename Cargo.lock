@@ -5399,6 +5399,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "json-stream"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "json5"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8993,6 +9000,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "json-stream",
  "language",
  "multi_buffer",
  "project",

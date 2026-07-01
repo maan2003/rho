@@ -1,0 +1,11 @@
+[package]
+edition = "2021"
+license.workspace = true
+name = "json-stream"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde_json.workspace = true

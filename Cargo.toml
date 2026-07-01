@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/json-stream",
   "crates/rho-agent",
   "crates/rho-blocking-notify-channel",
   "crates/rho-cli",
@@ -40,6 +41,7 @@ dirs = { version = "6", default-features = false }
 futures = "0.3"
 fnv = "1"
 futures-util = "0.3"
+json-stream = { path = "crates/json-stream" }
 rand = "0.8"
 redb = "4.1.0"
 rho-agent = { path = "crates/rho-agent" }

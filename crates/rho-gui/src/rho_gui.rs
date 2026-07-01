@@ -200,7 +200,7 @@ const PROMPT_DRAFT_HIGHLIGHT_KEY: usize = usize::MAX - 1;
 const PROMPT_PREFIX_HIGHLIGHT_KEY: usize = usize::MAX;
 const USER_MESSAGE_PREFIX_INLAY_ID_BASE: usize = 10_000;
 const USER_MESSAGE_PREFIX: &str = "▎";
-const PROMPT_PREFIX: &str = "|";
+const PROMPT_PREFIX: &str = USER_MESSAGE_PREFIX;
 static RHO_MARKDOWN_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 static RHO_MARKDOWN_INLINE_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 const DEFAULT_RHO_GUI_SETTINGS: &str = r#"// Rho GUI user settings. Values here override bundled defaults.
@@ -3903,10 +3903,11 @@ fn push_rho_tool_spans(
     let status = rho_tool_status_label(&tool.status);
     let is_shell_command = matches!(tool.name.as_str(), "shell" | "shell_command");
     let label = if is_shell_command {
-        if tool.arguments.is_empty() {
+        let command = shell_command_argument_label(&tool.arguments);
+        if command.is_empty() {
             "$".to_owned()
         } else {
-            format!("$ {}", tool.arguments)
+            format!("$ {command}")
         }
     } else if tool.arguments.is_empty() {
         tool.name.clone()
@@ -3931,6 +3932,26 @@ fn push_rho_tool_spans(
         spans.push((text.to_owned(), rho_tool_args_style(cx)));
     }
     push_rho_spans_trailing_newline(spans);
+}
+
+fn shell_command_argument_label(arguments: &str) -> String {
+    streaming_json_text_field(arguments, "command")
+        .or_else(|| (!arguments.trim_start().starts_with('{')).then(|| arguments.to_owned()))
+        .unwrap_or_default()
+}
+
+fn streaming_json_text_field(arguments: &str, key: &str) -> Option<String> {
+    let mut parser = json_stream::JsonStreamParser::new();
+    for character in arguments.chars() {
+        if parser.add_char(character).is_err() {
+            return None;
+        }
+    }
+    parser
+        .get_result()
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
 }
 
 fn rho_tool_name_style(cx: &App) -> HighlightStyle {
@@ -4621,6 +4642,40 @@ mod tests {
     }
 
     #[gpui::test]
+    fn rho_shell_command_tool_extracts_streaming_json_command(cx: &mut App) {
+        init_test_app(cx);
+
+        let spans = render_rho_block_spans(
+            &RhoUiBlock::Tool(RhoUiTool {
+                id: "tool-1".to_owned(),
+                name: "shell_command".to_owned(),
+                arguments: r#"{"command":"echo ok"}"#.to_owned(),
+                preview: None,
+                status: RhoUiToolStatus::Running,
+                output: None,
+                error: None,
+                started_at: None,
+                finished_at: None,
+                metadata: None,
+            }),
+            &cli_theme::select_theme(tau_config::settings::CliTheme::default()),
+            cx,
+        );
+
+        assert_eq!(spans[0].0, "$ echo ok");
+    }
+
+    #[test]
+    fn shell_command_argument_label_suppresses_partial_json_without_command() {
+        assert_eq!(shell_command_argument_label(r#"{"comm"#), "");
+    }
+
+    #[test]
+    fn shell_command_argument_label_streams_partial_command() {
+        assert_eq!(shell_command_argument_label(r#"{"command":"echo"#), "echo");
+    }
+
+    #[gpui::test]
     fn rho_user_messages_use_text_accent(cx: &mut App) {
         init_test_app(cx);
 
@@ -4782,6 +4837,30 @@ mod tests {
         assert!(
             text.contains(&format!("{PROMPT_PREFIX}hello")),
             "prompt prefix should render as an inlay: {text:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn rho_empty_prompt_has_prefix_inlay(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            init_test_app(cx);
+        });
+
+        let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
+
+        let text = gui
+            .update(cx, |gui, _window, cx| {
+                gui.update_prompt_inlay(cx);
+                gui.prompt_buffer.update(cx, |buffer, _| {
+                    assert_eq!(buffer_text(buffer), "");
+                });
+                gui.editor.update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("update rho gui");
+
+        assert!(
+            text.contains(USER_MESSAGE_PREFIX),
+            "empty prompt prefix should render as an inlay: {text:?}"
         );
     }
 
