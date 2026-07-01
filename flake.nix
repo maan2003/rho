@@ -121,6 +121,7 @@
           pkgs.libxcursor
           pkgs.libxi
         ];
+        guiLibraryPath = pkgs.lib.makeLibraryPath guiBuildInputs;
 
         multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
           craneLib':
@@ -257,6 +258,8 @@
             selfciPkg
           ] ++ guiBuildInputs;
           PROTOC = "${pkgs.protobuf}/bin/protoc";
+          LD_LIBRARY_PATH = guiLibraryPath;
+          NIX_LD_LIBRARY_PATH = guiLibraryPath;
           shellHook = ''
             ${dpc-public-skills.packages.${system}.install}/bin/install-dpc-public-skills
           '';
