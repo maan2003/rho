@@ -3465,7 +3465,6 @@ impl Render for RhoGui {
                     .h_full()
                     .flex_grow(1.0)
                     .min_w_0()
-                    .ml(px(6.))
                     .overflow_hidden()
                     .child(editor),
             )
