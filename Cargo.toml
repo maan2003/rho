@@ -9,6 +9,7 @@ members = [
   "crates/rho-daemon",
   "crates/rho-db",
   "crates/rho-gui",
+  "crates/rho-gui2",
   "crates/rho-inference",
   "crates/rho-term-screen",
   "crates/rho-tool-shell",

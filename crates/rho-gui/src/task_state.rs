@@ -1,12 +1,6 @@
 //! Temporary task-board stub.
-//!
-//! The old task board depended on `tau_task`, which no longer exists in the
-//! tau-gui checkout. Keep the UI surface compiling and showing a clear message
-//! until tasks are represented in rho-native protocol/state.
 
 use std::ops::Range;
-
-use tau_proto::Event;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TaskId(pub(crate) u64);
@@ -15,22 +9,13 @@ pub(crate) struct TaskId(pub(crate) u64);
 pub(crate) struct TaskState;
 
 impl TaskState {
-    pub(crate) fn observe_event(&mut self, _event: &Event) -> bool {
-        false
-    }
+    pub(crate) fn task_agent(&self, _id: TaskId) -> Option<String> { None }
 
-    pub(crate) fn task_agent(&self, _id: TaskId) -> Option<String> {
-        None
-    }
-
-    pub(crate) fn topic_groups(&self) -> Vec<TopicGroup> {
-        Vec::new()
-    }
+    pub(crate) fn topic_groups(&self) -> Vec<TopicGroup> { Vec::new() }
 
     pub(crate) fn render_full_board(&self) -> BoardRender {
         BoardRender {
-            text: "Tasks\n\n  Task board is unavailable until rho has native task state.\n"
-                .to_owned(),
+            text: "Tasks\n\n  Task board is unavailable until rho has native task state.\n".to_owned(),
             rows: Vec::new(),
         }
     }

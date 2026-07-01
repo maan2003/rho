@@ -35,37 +35,21 @@ use rho_ui_proto::remote::{
 };
 use rho_ui_proto::{AgentId as RhoAgentId, UiTopic as RhoUiTopic};
 use settings::SettingsStore;
-use tau_proto::{
-    CborValue, ContentPart, ContextItem, ContextRole, Event, HarnessInputMessage, ModelParams,
-    PeerInputMessage, PromptMessageClass, PromptOriginator, ToolCallItem, UiPromptSubmitted,
-};
 use text::ToOffset as _;
 use theme::ActiveTheme as _;
 use ui::{Color, Icon, IconName, IconSize};
 
-mod activity_state;
 mod agent_state;
-mod commands;
 mod completion_state;
 mod prompt_state;
-mod role_state;
-mod shell_state;
-mod socket_client;
 mod status_line;
 mod task_state;
 mod tool_render;
-mod tool_state;
 mod transcript;
-use activity_state::MainToolActivity;
 use agent_state::{AgentContextUsage, AgentState};
-use commands::parse_role_setting_update;
-use completion_state::{CompletionCandidate, TauCompletionProvider, TauCompletionState};
+use completion_state::{TauCompletionProvider, TauCompletionState};
 use prompt_state::{PromptState, QueuedPrompt};
-use role_state::{RoleCycleKind, RoleCycleOutcome, RoleState};
-use shell_state::{ShellCommandState, ShellState};
-use socket_client::{SocketEvent, Writer};
 use task_state::TaskState;
-use tool_state::ToolState;
 #[cfg(test)]
 use transcript::buffer_range_starts_with;
 use transcript::{InsertedTranscript, Transcript};
@@ -128,7 +112,7 @@ struct AttachTarget {
     about = "Attach a native GUI to a running Rho daemon"
 )]
 struct Args {
-    /// Connect directly to this Tau harness Unix socket.
+    /// Connect directly to this rho daemon Unix socket.
     #[arg(long)]
     socket: Option<PathBuf>,
 }
@@ -281,6 +265,12 @@ enum MainView {
     Tasks,
 }
 
+#[derive(Clone, Copy)]
+enum RoleCycleKind {
+    InnerGroup,
+    Group,
+}
+
 enum RhoEvent {
     Connected(RhoAgentClient),
     Topics(Vec<RhoUiTopic>),
@@ -314,10 +304,6 @@ struct AgentUiState {
     draft_end: text::Anchor,
     _subscriptions: Vec<Subscription>,
     prompt_state: PromptState,
-    tool_state: ToolState,
-    shell_state: ShellState,
-    main_tool_activity: MainToolActivity,
-    previous_provider_usage: Option<tau_proto::ProviderTokenUsage>,
     current_context_percent: Option<u8>,
     current_context_input_tokens: Option<u64>,
     current_context_window: Option<u64>,
@@ -335,8 +321,6 @@ struct RhoGui {
     transcript: Transcript,
     prompt_end: text::Anchor,
     draft_end: text::Anchor,
-    writer: Option<Writer>,
-    rx: mpsc::Receiver<SocketEvent>,
     rho_agent: Option<RhoAgentClient>,
     rho_topics: Vec<RhoUiTopic>,
     rho_rx: mpsc::Receiver<RhoEvent>,
@@ -350,18 +334,10 @@ struct RhoGui {
     _subscriptions: Vec<Subscription>,
     project_root: PathBuf,
     prompt_state: PromptState,
-    tool_state: ToolState,
-    shell_state: ShellState,
-    current_model: Option<tau_proto::ModelId>,
     current_role: Option<String>,
-    baseline_params: Option<ModelParams>,
-    role_state: RoleState,
-    current_params: ModelParams,
     current_context_percent: Option<u8>,
     current_context_input_tokens: Option<u64>,
     current_context_window: Option<u64>,
-    main_tool_activity: MainToolActivity,
-    previous_provider_usage: Option<tau_proto::ProviderTokenUsage>,
     agents: AgentState,
     tasks: TaskState,
     task_board: TaskBoardUiState,
@@ -410,8 +386,6 @@ impl RhoGui {
         let draft_end = ui_state.draft_end;
         let ui_subscriptions = ui_state._subscriptions;
 
-        let (_tx, rx) = mpsc::channel();
-        let writer = None;
         let (rho_tx, rho_rx) = mpsc::channel();
         Self::spawn_rho_client(attach_target.socket_path.clone(), rho_tx);
 
@@ -422,7 +396,7 @@ impl RhoGui {
                     .await;
                 if this
                     .update_in(cx, |this, window, cx| {
-                        this.drain_socket_events(window, cx);
+                        this.drain_rho_events(window, cx);
                         this.refresh_running_tool_durations(window, cx);
                     })
                     .is_err()
@@ -438,8 +412,6 @@ impl RhoGui {
             transcript,
             prompt_end,
             draft_end,
-            writer,
-            rx,
             rho_agent: None,
             rho_topics: Vec::new(),
             rho_rx,
@@ -453,18 +425,10 @@ impl RhoGui {
             _subscriptions: ui_subscriptions,
             project_root: attach_target.project_root,
             prompt_state: PromptState::default(),
-            tool_state: ToolState::default(),
-            shell_state: ShellState::default(),
-            current_model: None,
             current_role: None,
-            baseline_params: None,
-            role_state: RoleState::default(),
-            current_params: ModelParams::default(),
             current_context_percent: None,
             current_context_input_tokens: None,
             current_context_window: None,
-            main_tool_activity: MainToolActivity::default(),
-            previous_provider_usage: None,
             agents: AgentState::default(),
             tasks: TaskState::default(),
             task_board,
@@ -494,7 +458,6 @@ impl RhoGui {
         let prompt_end = ui_state.prompt_end;
         let draft_end = ui_state.draft_end;
         let ui_subscriptions = ui_state._subscriptions;
-        let (_tx, rx) = mpsc::channel();
         let (_rho_tx, rho_rx) = mpsc::channel();
         let poll_task = cx.spawn(async move |_, _| {});
 
@@ -505,8 +468,6 @@ impl RhoGui {
             transcript,
             prompt_end,
             draft_end,
-            writer: None,
-            rx,
             rho_agent: None,
             rho_topics: Vec::new(),
             rho_rx,
@@ -520,18 +481,10 @@ impl RhoGui {
             _subscriptions: ui_subscriptions,
             project_root: std::env::temp_dir(),
             prompt_state: PromptState::default(),
-            tool_state: ToolState::default(),
-            shell_state: ShellState::default(),
-            current_model: None,
             current_role: None,
-            baseline_params: None,
-            role_state: RoleState::default(),
-            current_params: ModelParams::default(),
             current_context_percent: None,
             current_context_input_tokens: None,
             current_context_window: None,
-            main_tool_activity: MainToolActivity::default(),
-            previous_provider_usage: None,
             agents: AgentState::default(),
             tasks: TaskState::default(),
             task_board,
@@ -971,8 +924,6 @@ impl RhoGui {
             prompt_state: PromptState::default(),
             tool_state: ToolState::default(),
             shell_state: ShellState::default(),
-            main_tool_activity: MainToolActivity::default(),
-            previous_provider_usage: None,
             current_context_percent: None,
             current_context_input_tokens: None,
             current_context_window: None,
@@ -984,21 +935,9 @@ impl RhoGui {
         }
     }
 
-    fn drain_socket_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn drain_rho_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Ok(event) = self.rho_rx.try_recv() {
             self.handle_rho_event(event, window, cx);
-        }
-        while let Ok(event) = self.rx.try_recv() {
-            match event {
-                SocketEvent::Message(message) => self.handle_message(message, window, cx),
-                SocketEvent::Disconnected(reason) => {
-                    self.insert_before_draft_styled(
-                        &format!("\n[disconnected: {reason}]\n"),
-                        TranscriptStyle::SystemDisconnect,
-                        cx,
-                    );
-                }
-            }
         }
     }
 
@@ -1010,7 +949,6 @@ impl RhoGui {
                 self.clear_rho_rendered_blocks(cx);
                 self.rho_pending_inserted = None;
                 self.current_role = Some("rho".to_owned());
-                self.current_model = None;
                 self.update_status_line(cx);
             }
             RhoEvent::Topics(topics) => {
@@ -1466,515 +1404,9 @@ impl RhoGui {
             })
     }
 
-    fn handle_message(
-        &mut self,
-        message: PeerInputMessage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match message {
-            PeerInputMessage::Deliver(delivery) => {
-                self.handle_event(delivery.into_event(), window, cx)
-            }
-            PeerInputMessage::Disconnect(disconnect) => {
-                self.insert_before_draft_styled(
-                    &format!(
-                        "\n[daemon disconnected: {}]\n",
-                        disconnect.reason.unwrap_or_else(|| "no reason".to_owned())
-                    ),
-                    TranscriptStyle::SystemDisconnect,
-                    cx,
-                );
-            }
-            _ => {}
-        }
-    }
 
-    fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
-        let previous_agent_id = self.agents.current_agent_id_owned();
-        if let Some(agent_id) = self.agents.agent_id_for_event(&event) {
-            self.agents.remember(agent_id);
-        }
-        self.agents.observe_event(&event);
-        if self.tasks.observe_event(&event) {
-            self.refresh_task_board(cx);
-            cx.notify();
-        }
-        self.refresh_agent_completions();
-        if self.agents.current_agent_id() != previous_agent_id.as_deref() {
-            let current_agent_id = self.agents.current_agent_id_owned();
-            if self.displayed_agent_id != current_agent_id {
-                self.show_agent_transcript(current_agent_id, window, cx);
-            }
-            self.apply_selected_agent_context_usage();
-            self.update_status_line(cx);
-            self.update_prompt_inlay(cx);
-            self.focus_editor(window, cx);
-        }
-        match event {
-            Event::TermBell(_) => {
-                Audio::play_sound(Sound::AgentDone, cx);
-            }
-            Event::UiPromptSubmitted(_) => {}
-            Event::AgentPromptSubmitted(prompt)
-                if prompt.originator.is_user() && !prompt.message_class.is_internal() =>
-            {
-                self.handle_submitted_user_prompt(&prompt.text, cx);
-            }
-            Event::AgentPromptQueued(queued) if !queued.message_class.is_internal() => {
-                self.handle_agent_prompt_queued(&queued.text, cx);
-            }
-            Event::AgentMessageSent(message) => {
-                self.insert_before_draft_styled(
-                    &format!(
-                        "{}:\n{}\n",
-                        agent_message_sent_summary(&message),
-                        message.message
-                    ),
-                    TranscriptStyle::SystemInfo,
-                    cx,
-                );
-            }
-            Event::AgentMessageReceived(message) => {
-                self.insert_before_draft_styled(
-                    &format!(
-                        "Message from {} to {}:\n{}\n",
-                        message.sender_id, message.recipient_id, message.message
-                    ),
-                    TranscriptStyle::SystemInfo,
-                    cx,
-                );
-            }
-            Event::ProviderResponseUpdated(update) if update.originator.is_user() => {
-                let key = update.agent_prompt_id.to_string();
-                self.update_live_compaction(
-                    key.as_str(),
-                    provider_update_compaction_status(&update),
-                    cx,
-                );
-                let text = assistant_text_from_update(&update).unwrap_or_default();
-                let text = self
-                    .prompt_state
-                    .append_streamed_response(key.clone(), text);
-                self.upsert_live_response(key, text.as_str(), cx);
-            }
-            Event::ProviderResponseFinished(finished) if finished.originator.is_user() => {
-                let key = finished.agent_prompt_id.to_string();
-                self.remove_live_compaction(key.as_str(), cx);
-                if let Some(text) = assistant_text(&finished.output_items) {
-                    match self.prompt_state.remove_streamed_response(&key) {
-                        Some(_) | None => {
-                            if !text.is_empty() {
-                                self.finalize_live_response(key.as_str(), &text, cx);
-                            }
-                        }
-                    }
-                } else {
-                    self.remove_live_response(key.as_str(), cx);
-                }
-                if finished.output_items.is_empty() {
-                    let text = finished
-                        .error
-                        .as_deref()
-                        .unwrap_or("(provider returned an empty response)");
-                    self.insert_before_draft_styled(
-                        &format!("{text}\n"),
-                        TranscriptStyle::SystemImportant,
-                        cx,
-                    );
-                    self.render_turn_stats(&finished, cx);
-                    self.ensure_transcript_gap(cx);
-                    return;
-                }
-                if let Some(error) = &finished.error {
-                    self.insert_before_draft_styled(
-                        &format!("[provider error: {error}]\n"),
-                        TranscriptStyle::SystemImportant,
-                        cx,
-                    );
-                }
-                for item in &finished.output_items {
-                    if matches!(item, ContextItem::Compaction(_)) {
-                        let block = tool_render::render_compaction_block(
-                            compaction_success_status(
-                                finished.compaction_original_input_tokens,
-                                finished.compaction_compacted_input_tokens,
-                            ),
-                            tool_render::CompactionStatus::Success,
-                        );
-                        self.insert_before_draft_block(block, cx);
-                    }
-                }
-                let tool_calls = tool_calls_from_output_items(&finished.output_items);
-                if !tool_calls.is_empty() {
-                    self.main_tool_activity
-                        .add_requested_tools(tool_calls.len());
-                    self.update_status_line(cx);
-                }
-                for call in tool_calls {
-                    let block = render_tool_call_block(&call);
-                    if let Some(inserted) = self.insert_before_draft_block(block, cx) {
-                        self.tool_state
-                            .insert_pending(call.call_id.to_string(), inserted);
-                    }
-                }
-                self.render_turn_stats(&finished, cx);
-                self.ensure_transcript_gap(cx);
-            }
-            Event::AgentPromptRecalled(recalled) => {
-                if let Some(queued) = self.prompt_state.pop_back_queued_prompt() {
-                    self.remove_queued_prompt(queued, cx);
-                }
-                let agent_id = recalled.agent_id.to_string();
-                self.show_agent_transcript(Some(agent_id.clone()), window, cx);
-                self.agents.select(agent_id);
-                self.replace_draft_text(&recalled.text, cx);
-                self.insert_before_draft_styled(
-                    "> recalled queued prompt for editing\n",
-                    TranscriptStyle::SystemInfo,
-                    cx,
-                );
-            }
-            Event::AgentPromptSteered(steered) if !steered.message_class.is_internal() => {
-                self.handle_agent_prompt_steered(&steered.text, cx);
-            }
-            Event::AgentPromptCreated(_) => {
-                self.promote_next_queued_prompt(cx);
-            }
-            Event::AgentCompactionTriggered(triggered) if triggered.originator.is_user() => {
-                let block = tool_render::render_compaction_block(
-                    format!("requested #{}", triggered.agent_id),
-                    tool_render::CompactionStatus::Progress,
-                );
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::AgentPromptTerminated(terminated) if terminated.originator.is_user() => {
-                let key = terminated.agent_prompt_id.to_string();
-                self.remove_live_response(key.as_str(), cx);
-                self.remove_live_compaction(key.as_str(), cx);
-                self.insert_before_draft_styled(
-                    &format!(
-                        "[prompt {}: {key}]\n",
-                        agent_prompt_termination_reason(terminated.reason)
-                    ),
-                    TranscriptStyle::SystemInfo,
-                    cx,
-                );
-            }
-            Event::ToolDelegateProgress(progress) => {
-                if let Some(agent_id) = &progress.agent_id {
-                    self.agents.mark_live(agent_id.clone());
-                }
-                let display = progress
-                    .display
-                    .clone()
-                    .unwrap_or_else(|| tau_proto::ToolUseState {
-                        args: progress.task_name.clone(),
-                        status: tau_proto::ToolUseStatus::InProgress,
-                        status_text: tau_proto::PROGRESS_INDICATOR_TEXT.to_owned(),
-                        ..Default::default()
-                    });
-                self.upsert_delegate_display(
-                    progress.call_id.as_str(),
-                    &display,
-                    progress.agent_id.as_deref(),
-                    progress.role.as_deref(),
-                    cx,
-                );
-                self.update_status_line(cx);
-            }
-            Event::ToolProgress(progress) => {
-                if let Some(display) = progress.display.as_ref() {
-                    self.upsert_tool_display(
-                        progress.call_id.as_str(),
-                        &progress.tool_name,
-                        display,
-                        cx,
-                    );
-                } else {
-                    let text = format_tool_progress(&progress);
-                    if !text.is_empty() {
-                        self.insert_before_draft_styled(
-                            &format!("{text}\n"),
-                            TranscriptStyle::ToolProgress,
-                            cx,
-                        );
-                    }
-                }
-            }
-            Event::ToolResult(result) if result.originator.is_user() => {
-                if result.kind == tau_proto::ToolResultKind::BackgroundPlaceholder {
-                    self.record_main_tool_backgrounded(result.call_id.as_str());
-                } else {
-                    let block = render_tool_result_block(&result);
-                    self.finish_tool_call(result.call_id.as_str(), block, cx);
-                    self.record_main_tool_completed(result.call_id.as_str());
-                }
-                self.update_status_line(cx);
-            }
-            Event::ProviderToolResult(result)
-                if result.originator.is_user()
-                    || self.tool_state.contains_pending(result.call_id.as_str()) =>
-            {
-                if result.kind == tau_proto::ToolResultKind::BackgroundPlaceholder {
-                    self.record_main_tool_backgrounded(result.call_id.as_str());
-                } else {
-                    let block = render_tool_result_parts_block(
-                        &result.tool_name,
-                        &result.result,
-                        result.display.as_ref(),
-                    );
-                    self.finish_tool_call(result.call_id.as_str(), block, cx);
-                    self.record_main_tool_completed(result.call_id.as_str());
-                }
-                self.update_status_line(cx);
-            }
-            Event::ToolBackgroundResult(result)
-                if result.originator.is_user()
-                    || self.tool_state.contains_pending(result.call_id.as_str())
-                    || self
-                        .main_tool_activity
-                        .is_backgrounded(result.call_id.as_str()) =>
-            {
-                let block = render_tool_result_parts_block(
-                    &result.tool_name,
-                    &result.result,
-                    result.display.as_ref(),
-                );
-                self.finish_tool_call(result.call_id.as_str(), block, cx);
-                self.record_main_tool_completed(result.call_id.as_str());
-                self.update_status_line(cx);
-            }
-            Event::ToolError(error) if error.originator.is_user() => {
-                let block = render_tool_error_block(&error);
-                self.finish_tool_call(error.call_id.as_str(), block, cx);
-                self.record_main_tool_completed(error.call_id.as_str());
-                self.update_status_line(cx);
-            }
-            Event::ProviderToolError(error)
-                if error.originator.is_user()
-                    || self.tool_state.contains_pending(error.call_id.as_str()) =>
-            {
-                let block = render_tool_error_parts_block(
-                    &error.tool_name,
-                    &error.message,
-                    error.display.as_ref(),
-                );
-                self.finish_tool_call(error.call_id.as_str(), block, cx);
-                self.record_main_tool_completed(error.call_id.as_str());
-                self.update_status_line(cx);
-            }
-            Event::ToolBackgroundError(error)
-                if error.originator.is_user()
-                    || self.tool_state.contains_pending(error.call_id.as_str())
-                    || self
-                        .main_tool_activity
-                        .is_backgrounded(error.call_id.as_str()) =>
-            {
-                let block = render_tool_error_parts_block(
-                    &error.tool_name,
-                    &error.message,
-                    error.display.as_ref(),
-                );
-                self.finish_tool_call(error.call_id.as_str(), block, cx);
-                self.record_main_tool_completed(error.call_id.as_str());
-                self.update_status_line(cx);
-            }
-            Event::ToolRejected(rejected) if rejected.originator.is_user() => {
-                let block =
-                    render_tool_error_parts_block(&rejected.tool_name, &rejected.message, None);
-                self.finish_tool_call(rejected.call_id.as_str(), block, cx);
-                self.record_main_tool_completed(rejected.call_id.as_str());
-                self.update_status_line(cx);
-            }
-            Event::ToolCancelled(cancelled) => {
-                if self.tool_state.contains_pending(cancelled.call_id.as_str())
-                    || self
-                        .main_tool_activity
-                        .is_backgrounded(cancelled.call_id.as_str())
-                {
-                    let block =
-                        render_tool_error_parts_block(&cancelled.tool_name, "cancelled", None);
-                    self.finish_tool_call(cancelled.call_id.as_str(), block, cx);
-                    self.record_main_tool_completed(cancelled.call_id.as_str());
-                    self.update_status_line(cx);
-                }
-            }
-            Event::UiShellCommand(command) => {
-                let label = shell_running_label(command.include_in_context);
-                let block =
-                    tool_render::render_shell_block(&command.command, "", Some(label.as_str()));
-                if let Some(inserted) = self.insert_before_draft_block(block, cx) {
-                    self.shell_state.insert(
-                        command.command_id.to_string(),
-                        ShellCommandState {
-                            inserted,
-                            command: command.command,
-                            include_in_context: command.include_in_context,
-                            output: String::new(),
-                        },
-                    );
-                }
-            }
-            Event::ShellCommandProgress(progress) => {
-                if let Some(mut state) = self.shell_state.take(progress.command_id.as_str()) {
-                    state.output.push_str(&progress.chunk);
-                    let label = shell_running_label(state.include_in_context);
-                    let block = tool_render::render_shell_block(
-                        &state.command,
-                        &state.output,
-                        Some(label.as_str()),
-                    );
-                    if let Some(inserted) = self.replace_transcript_block(state.inserted, block, cx)
-                    {
-                        state.inserted = inserted;
-                        self.shell_state
-                            .insert(progress.command_id.to_string(), state);
-                    }
-                }
-            }
-            Event::ShellCommandFinished(finished) => {
-                let include_in_context =
-                    if let Some(state) = self.shell_state.take(finished.command_id.as_str()) {
-                        self.remove_transcript_highlights(state.inserted.highlight_keys, cx);
-                        self.remove_transcript_range(state.inserted.range, cx);
-                        state.include_in_context
-                    } else {
-                        finished.include_in_context
-                    };
-                let status = shell_finished_suffix(&finished, include_in_context);
-                let block = tool_render::render_shell_block(
-                    &finished.command,
-                    &finished.output,
-                    Some(status.as_str()),
-                );
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::ActionResult(result) => {
-                let text = match result.output {
-                    tau_proto::ActionOutput::Text { text } => text,
-                    tau_proto::ActionOutput::EditorBuffer {
-                        title,
-                        text,
-                        editable,
-                    } => {
-                        let mut rendered = format!("{title}\n{text}");
-                        if editable {
-                            rendered.push_str("\n[editable buffer]");
-                        }
-                        rendered
-                    }
-                };
-                let block = tool_render::render_action_output_block(&text);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::ActionError(error) => {
-                let block =
-                    tool_render::render_action_error_block(&error.action_id, &error.message);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::ActionSchemaPublished(published) => {
-                if let Ok(mut state) = self.completion_state.lock() {
-                    state.apply_action_schema(&published);
-                }
-            }
-            Event::ExtensionStarting(starting) => {
-                let status = starting.pid.map_or_else(
-                    || "starting".to_owned(),
-                    |pid| format!("starting pid {pid}"),
-                );
-                let block = tool_render::extension_status_block(&starting.extension_name, &status);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::ExtensionReady(ready) => {
-                let status = ready
-                    .pid
-                    .map_or_else(|| "ready".to_owned(), |pid| format!("ready pid {pid}"));
-                let block = tool_render::extension_status_block(&ready.extension_name, &status);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::ExtensionExited(exited) => {
-                if let Ok(mut state) = self.completion_state.lock() {
-                    state.remove_extension(&exited.extension_name, exited.instance_id);
-                }
-                let status = match (exited.exit_code, exited.signal) {
-                    (Some(code), _) => format!("exited {code}"),
-                    (_, Some(signal)) => format!("signal {signal}"),
-                    (None, None) => "exited".to_owned(),
-                };
-                let block = tool_render::extension_status_block(&exited.extension_name, &status);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::ExtensionRestarting(restarting) => {
-                let status = restarting.reason.as_ref().map_or_else(
-                    || format!("restarting #{}", restarting.attempt),
-                    |reason| format!("restarting #{}: {reason}", restarting.attempt),
-                );
-                let block =
-                    tool_render::extension_status_block(&restarting.extension_name, &status);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::ExtAgentsMdAvailable(agents_md) => {
-                let block =
-                    tool_render::system_loaded_block(&agents_md.file_path, &agents_md.content);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::ExtensionContextReady(ready) => {
-                let block = tool_render::agent_context_ready_block(&ready.agent_id);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::HarnessUiDir(ui_dir) => {
-                let block = tool_render::ui_dir_block(&ui_dir.path);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::HarnessNotice(notice) => {
-                let block = tool_render::render_harness_notice(&notice);
-                self.insert_before_draft_block(block, cx);
-            }
-            Event::HarnessRolesAvailable(roles) => {
-                self.role_state.update_available(&roles);
-                self.refresh_role_completions(&roles);
-                self.update_status_line(cx);
-            }
-            Event::HarnessRoleSelected(selected) => {
-                self.current_model = selected.model.clone();
-                self.current_role = Some(selected.role);
-                self.baseline_params = selected.baseline_params;
-                self.current_params = selected.model_params;
-                self.current_context_window = selected.context_window;
-                self.update_status_line(cx);
-                self.update_prompt_inlay(cx);
-            }
-            Event::HarnessContextUsageChanged(changed) => {
-                self.current_context_input_tokens = changed.input_tokens;
-                self.current_context_percent = changed.percent_used;
-                self.update_status_line(cx);
-            }
-            Event::HarnessAgentContextUsageChanged(changed) => {
-                let agent_id = changed.agent_id.to_string();
-                self.agents.record_context_usage(
-                    agent_id.clone(),
-                    AgentContextUsage {
-                        input_tokens: changed.input_tokens,
-                        percent_used: changed.percent_used,
-                        context_window: changed.context_window,
-                    },
-                );
-                if self.agents.current_agent_id() == Some(agent_id.as_str()) {
-                    self.apply_selected_agent_context_usage();
-                    self.update_status_line(cx);
-                }
-            }
-            Event::HarnessStarted(_) => {
-                self.main_tool_activity.reset();
-                self.previous_provider_usage = None;
-                self.agents.clear_context_usage();
-                self.agents.clear_routing();
-                self.update_status_line(cx);
-            }
-            _ => {}
-        }
-    }
+
+
 
     fn apply_selected_agent_context_usage(&mut self) {
         if let Some(usage) = self.agents.selected_context_usage() {
@@ -1991,39 +1423,11 @@ impl RhoGui {
         self.agents.selected_is_active()
     }
 
-    fn selected_agent_proto_id(&self) -> Option<tau_proto::AgentId> {
-        let agent_id = self.agents.current_agent_id_owned()?;
-        match tau_proto::AgentId::parse(&agent_id) {
-            Ok(agent_id) => Some(agent_id),
-            Err(error) => {
-                eprintln!("rho-gui: invalid selected agent id {agent_id:?}: {error}");
-                None
-            }
-        }
-    }
 
-    fn send_event(&mut self, event: Event, cx: &mut Context<Self>) -> bool {
-        let Some(writer) = &self.writer else {
-            eprintln!("rho-gui: command ignored because socket writer is unavailable");
-            return false;
-        };
-        let message = HarnessInputMessage::emit(event);
-        if let Err(error) = socket_client::send_message(writer, &message) {
-            eprintln!("rho-gui: send failed: {error:#}");
-            self.insert_before_draft_styled(
-                &format!("\n[send failed: {error}]\n"),
-                TranscriptStyle::SystemDisconnect,
-                cx,
-            );
-            return false;
-        }
-        true
-    }
 
-    fn send_command_event(&mut self, event: Event, cx: &mut Context<Self>) -> bool {
-        self.send_event(event, cx);
-        true
-    }
+
+
+
 
     fn is_prompt_command(text: &str) -> bool {
         text == "/cancel"
@@ -2053,55 +1457,13 @@ impl RhoGui {
                         agent.cancel(agent_id);
                     }
                 }
-                return true;
-            }
-            return self.send_command_event(
-                Event::UiCancelPrompt(tau_proto::UiCancelPrompt {
-                    target_agent_id: self.selected_agent_proto_id(),
-                    agent_prompt_id: None,
-                }),
-                cx,
-            );
-        }
-        if text == "/tree" {
-            return self.send_command_event(
-                Event::UiTreeRequest(tau_proto::UiTreeRequest {
-                    target_agent_id: self.selected_agent_proto_id(),
-                }),
-                cx,
-            );
-        }
-        if let Some(node_id) = text.strip_prefix("/tree ") {
-            let Ok(node_id) = node_id.trim().parse::<u64>() else {
+            } else {
                 self.insert_before_draft_styled(
-                    "/tree <id>: id must be a non-negative integer\n",
+                    "/cancel is only available when connected to rho-daemon\n",
                     TranscriptStyle::SystemInfo,
                     cx,
                 );
-                return true;
-            };
-            return self.send_command_event(
-                Event::UiNavigateTree(tau_proto::UiNavigateTree {
-                    target_agent_id: self.selected_agent_proto_id(),
-                    node_id,
-                }),
-                cx,
-            );
-        }
-        if text == "/compact" {
-            return self.send_command_event(
-                Event::UiCompactRequest(tau_proto::UiCompactRequest {
-                    target_agent_id: self.selected_agent_proto_id(),
-                }),
-                cx,
-            );
-        }
-        if text.starts_with("/compact ") {
-            self.insert_before_draft_styled(
-                "/compact forces a compaction pass and takes no arguments\n",
-                TranscriptStyle::SystemInfo,
-                cx,
-            );
+            }
             return true;
         }
         if text == "/new" {
@@ -2111,11 +1473,7 @@ impl RhoGui {
         if let Some(agent_id) = text.strip_prefix("/load ") {
             let agent_id = agent_id.trim();
             if agent_id.is_empty() {
-                self.insert_before_draft_styled(
-                    "/load <agent-id>\n",
-                    TranscriptStyle::SystemInfo,
-                    cx,
-                );
+                self.insert_before_draft_styled("/load <agent-id>\n", TranscriptStyle::SystemInfo, cx);
                 return true;
             }
             if let Some(agent) = &self.rho_agent {
@@ -2143,168 +1501,29 @@ impl RhoGui {
             }
             return true;
         }
-        if let Some(role) = text.strip_prefix("/model ") {
-            let role = role.trim();
-            if !role.is_empty() {
-                return self.select_role(role, cx);
-            }
+        if text.starts_with("/model") || text.starts_with("/role") || text.starts_with("/tree") || text.starts_with("/compact") || text.starts_with('!') {
+            self.insert_before_draft_styled(
+                "command is not available in the rho-ui-proto GUI yet\n",
+                TranscriptStyle::SystemInfo,
+                cx,
+            );
             return true;
-        }
-        if text == "/model" {
-            self.insert_before_draft_styled("/model <role>\n", TranscriptStyle::SystemInfo, cx);
-            return true;
-        }
-        if text == "/role" || text.starts_with("/role ") {
-            self.handle_role_command(text, cx);
-            return true;
-        }
-        if text.starts_with('/') {
-            if let Some(handled) = self.handle_dynamic_action(text, cx) {
-                return handled;
-            }
-        }
-        if let Some(command) = text.strip_prefix("!!") {
-            return self.send_shell_command(command, false, cx);
-        }
-        if let Some(command) = text.strip_prefix('!') {
-            return self.send_shell_command(command, true, cx);
         }
         false
     }
 
-    fn handle_dynamic_action(&mut self, text: &str, cx: &mut Context<Self>) -> Option<bool> {
-        let dispatch = {
-            let state = self.completion_state.lock().ok()?;
-            state.parse_action_line(text)?
-        };
-        let dispatch = match dispatch {
-            Ok(dispatch) => dispatch,
-            Err(error) => {
-                self.insert_before_draft_styled(
-                    &format!("{error}\n"),
-                    TranscriptStyle::SystemInfo,
-                    cx,
-                );
-                return Some(true);
-            }
-        };
-        let parsed = dispatch.parsed;
-        Some(self.send_command_event(
-            Event::ActionInvoke(tau_proto::ActionInvoke {
-                invocation_id: mint_action_invocation_id().into(),
-                extension_name: dispatch.extension_name,
-                instance_id: dispatch.instance_id,
-                action_id: parsed.action_id.clone(),
-                raw_line: text.to_owned(),
-                argv: parsed.argv.clone(),
-                arguments: parsed_action_arguments(&parsed.named_args),
-            }),
-            cx,
-        ))
-    }
 
-    fn handle_role_command(&mut self, text: &str, cx: &mut Context<Self>) {
-        let rest = text.strip_prefix("/role").unwrap_or("").trim();
-        let mut parts = rest.split_whitespace();
-        let role = parts.next();
-        let command = parts.next();
-        let value = parts.next();
-        let extra = parts.next();
-        let Some(role) = role else {
-            self.insert_before_draft_styled(
-                "/role <role> [delete|model|effort|verbosity|thinking-summary|service-tier|compaction-threshold|tools|enable-tools|disable-tools] [value]\n",
-                TranscriptStyle::SystemInfo,
-                cx,
-            );
-            return;
-        };
-        let Some(command) = command else {
-            self.select_role(role, cx);
-            return;
-        };
-        if command == "delete" {
-            if value.is_some() {
-                self.insert_before_draft_styled(
-                    "/role <role> delete takes no value\n",
-                    TranscriptStyle::SystemInfo,
-                    cx,
-                );
-                return;
-            }
-            self.send_command_event(
-                Event::UiRoleUpdate(tau_proto::UiRoleUpdate {
-                    role: role.to_owned(),
-                    action: tau_proto::UiRoleUpdateAction::Delete,
-                }),
-                cx,
-            );
-            return;
-        }
-        let Some(value) = value else {
-            self.insert_before_draft_styled(
-                "/role <role> <setting> <value>\n",
-                TranscriptStyle::SystemInfo,
-                cx,
-            );
-            return;
-        };
-        if extra.is_some() {
-            self.insert_before_draft_styled(
-                "/role: too many arguments\n",
-                TranscriptStyle::SystemInfo,
-                cx,
-            );
-            return;
-        }
-        let action = match parse_role_setting_update(command, value) {
-            Ok(action) => action,
-            Err(error) => {
-                self.insert_before_draft_styled(
-                    &format!("/role: {error}\n"),
-                    TranscriptStyle::SystemInfo,
-                    cx,
-                );
-                return;
-            }
-        };
-        self.send_command_event(
-            Event::UiRoleUpdate(tau_proto::UiRoleUpdate {
-                role: role.to_owned(),
-                action,
-            }),
+
+
+
+
+
+    fn cycle_role(&mut self, _kind: RoleCycleKind, cx: &mut Context<Self>) {
+        self.insert_before_draft_styled(
+            "role cycling is not available in the rho-ui-proto GUI yet\n",
+            TranscriptStyle::SystemInfo,
             cx,
         );
-    }
-
-    fn select_role(&mut self, role: &str, cx: &mut Context<Self>) -> bool {
-        self.send_command_event(
-            Event::UiRoleSelect(tau_proto::UiRoleSelect {
-                role: role.to_owned(),
-            }),
-            cx,
-        )
-    }
-
-    fn cycle_role(&mut self, kind: RoleCycleKind, cx: &mut Context<Self>) {
-        if self.agents.current_agent_id().is_some() {
-            return;
-        }
-        match self
-            .role_state
-            .cycle_role(self.current_role.as_deref(), kind)
-        {
-            RoleCycleOutcome::Selected(role) => {
-                self.select_role(&role, cx);
-            }
-            RoleCycleOutcome::NoRolesAvailable => {
-                self.insert_before_draft_styled(
-                    "cycle-role: no agent roles are available yet\n",
-                    TranscriptStyle::SystemInfo,
-                    cx,
-                );
-            }
-            RoleCycleOutcome::Noop => {}
-        }
     }
 
     fn swap_visible_agent_ui_state(&mut self, state: &mut AgentUiState) {
@@ -2316,13 +1535,6 @@ impl RhoGui {
         std::mem::swap(&mut self.draft_end, &mut state.draft_end);
         std::mem::swap(&mut self._subscriptions, &mut state._subscriptions);
         std::mem::swap(&mut self.prompt_state, &mut state.prompt_state);
-        std::mem::swap(&mut self.tool_state, &mut state.tool_state);
-        std::mem::swap(&mut self.shell_state, &mut state.shell_state);
-        std::mem::swap(&mut self.main_tool_activity, &mut state.main_tool_activity);
-        std::mem::swap(
-            &mut self.previous_provider_usage,
-            &mut state.previous_provider_usage,
-        );
         std::mem::swap(
             &mut self.current_context_percent,
             &mut state.current_context_percent,
@@ -2472,30 +1684,7 @@ impl RhoGui {
         self.focus_editor(window, cx);
     }
 
-    fn send_shell_command(
-        &mut self,
-        command: &str,
-        include_in_context: bool,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let command = command.trim();
-        if command.is_empty() {
-            return true;
-        }
-        let command_id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| format!("ui-sh-{}", duration.as_nanos()))
-            .unwrap_or_else(|_| "ui-sh-0".to_owned());
-        self.send_command_event(
-            Event::UiShellCommand(tau_proto::UiShellCommand {
-                command_id: command_id.into(),
-                command: command.to_owned(),
-                include_in_context,
-                target_agent_id: self.selected_agent_proto_id(),
-            }),
-            cx,
-        )
-    }
+
 
     fn clear_prompt_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prompt_buffer.update(cx, |buffer, cx| {
@@ -2551,50 +1740,12 @@ impl RhoGui {
             return;
         }
 
-        if !self.selected_agent_is_active() {
-            self.insert_before_draft_styled(
-                "selected agent is unavailable; choose a different agent or start a new one\n",
-                TranscriptStyle::SystemImportant,
-                cx,
-            );
-            return;
-        }
-
-        let event = if self.agents.current_agent_id_owned().is_some() {
-            let Some(agent_id) = self.selected_agent_proto_id() else {
-                self.insert_before_draft_styled(
-                    "selected agent id is invalid; choose a different agent or start a new one\n",
-                    TranscriptStyle::SystemImportant,
-                    cx,
-                );
-                return;
-            };
-            Event::UiPromptSubmitted(UiPromptSubmitted {
-                text: text.clone(),
-                agent_id,
-                message_class: PromptMessageClass::User,
-                originator: PromptOriginator::User,
-                ctx_id: None,
-            })
-        } else {
-            Event::UiCreateAgent(tau_proto::UiCreateAgent {
-                role: self
-                    .current_role
-                    .clone()
-                    .unwrap_or_else(|| "engineer".to_owned()),
-                model_override: None,
-                metadata: Vec::new(),
-                initial_prompt: Some(text.clone()),
-                message_class: PromptMessageClass::User,
-                originator: PromptOriginator::User,
-                ctx_id: None,
-                parent_agent: None,
-            })
-        };
-        if !self.send_event(event, cx) {
-            return;
-        }
-        eprintln!("rho-gui: prompt frame sent");
+        self.insert_before_draft_styled(
+            "not connected to rho-daemon\n",
+            TranscriptStyle::SystemImportant,
+            cx,
+        );
+        return;
 
         self.clear_prompt_draft(window, cx);
     }
@@ -2918,27 +2069,7 @@ impl RhoGui {
         }
     }
 
-    fn update_live_compaction(
-        &mut self,
-        key: &str,
-        status: Option<(tool_render::CompactionStatus, String)>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((status, text)) = status else {
-            self.remove_live_compaction(key, cx);
-            return;
-        };
-        let block = tool_render::render_compaction_block(text, status);
-        if let Some(inserted) = self.prompt_state.take_live_compaction(key) {
-            if let Some(inserted) = self.replace_transcript_block(inserted, block, cx) {
-                self.prompt_state
-                    .insert_live_compaction(key.to_owned(), inserted);
-            }
-        } else if let Some(inserted) = self.insert_before_draft_block(block, cx) {
-            self.prompt_state
-                .insert_live_compaction(key.to_owned(), inserted);
-        }
-    }
+
 
     fn remove_live_compaction(&mut self, key: &str, cx: &mut Context<Self>) {
         if let Some(inserted) = self.prompt_state.take_live_compaction(key) {
@@ -2959,42 +2090,9 @@ impl RhoGui {
         }
     }
 
-    fn upsert_delegate_display(
-        &mut self,
-        call_id: &str,
-        display: &tau_proto::ToolUseState,
-        agent_id: Option<&str>,
-        role: Option<&str>,
-        cx: &mut Context<Self>,
-    ) {
-        let display = tool_render::render_delegate_display(display, agent_id, role);
-        let block = tool_render::render_tool_block(&display);
-        if let Some(inserted) = self.tool_state.take_pending(call_id) {
-            if let Some(inserted) = self.replace_transcript_block(inserted, block, cx) {
-                self.tool_state.insert_pending(call_id.to_owned(), inserted);
-            }
-        } else if let Some(inserted) = self.insert_before_draft_block(block, cx) {
-            self.tool_state.insert_pending(call_id.to_owned(), inserted);
-        }
-    }
 
-    fn upsert_tool_display(
-        &mut self,
-        call_id: &str,
-        tool_name: &str,
-        display: &tau_proto::ToolUseState,
-        cx: &mut Context<Self>,
-    ) {
-        let display = tool_render::render_tool_use_state(tool_name, display);
-        let block = tool_render::render_tool_block(&display);
-        if let Some(inserted) = self.tool_state.take_pending(call_id) {
-            if let Some(inserted) = self.replace_transcript_block(inserted, block, cx) {
-                self.tool_state.insert_pending(call_id.to_owned(), inserted);
-            }
-        } else if let Some(inserted) = self.insert_before_draft_block(block, cx) {
-            self.tool_state.insert_pending(call_id.to_owned(), inserted);
-        }
-    }
+
+
 
     fn replace_draft_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.prompt_buffer.update(cx, |buffer, cx| {
@@ -3031,72 +2129,13 @@ impl RhoGui {
         self.transcript.remove_highlights(highlight_keys);
     }
 
-    fn render_turn_stats(
-        &mut self,
-        finished: &tau_proto::ProviderResponseFinished,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(usage) = finished.usage.as_ref() else {
-            return;
-        };
-        let block = tool_render::render_turn_stats_block(
-            usage,
-            self.previous_provider_usage.as_ref(),
-            None,
-            None,
-        );
-        self.insert_before_draft_block(block, cx);
-        self.previous_provider_usage = Some(usage.clone());
-    }
 
-    fn finish_tool_call(
-        &mut self,
-        call_id: &str,
-        block: tool_render::StyledBlock,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(inserted) = self.tool_state.take_pending(call_id) {
-            self.replace_transcript_block(inserted, block, cx);
-        } else {
-            self.insert_before_draft_block(block, cx);
-        }
-    }
 
-    fn insert_before_draft_block(
-        &mut self,
-        block: tool_render::StyledBlock,
-        cx: &mut Context<Self>,
-    ) -> Option<InsertedTranscript> {
-        let mut spans = Vec::new();
-        if self.transcript_trailing_newlines(cx) == 0 {
-            spans.push(("\n", HighlightStyle::default()));
-        }
-        spans.extend(block_spans(&block, cx));
-        if !spans.last().is_some_and(|(text, _)| text.ends_with('\n')) {
-            spans.push(("\n", HighlightStyle::default()));
-        }
-        self.insert_before_draft_spans(spans, cx)
-    }
 
-    fn replace_transcript_block(
-        &mut self,
-        inserted: InsertedTranscript,
-        block: tool_render::StyledBlock,
-        cx: &mut Context<Self>,
-    ) -> Option<InsertedTranscript> {
-        self.remove_transcript_highlights(inserted.highlight_keys, cx);
 
-        let mut spans = Vec::new();
-        let starts_with_newline = self.transcript.range_starts_with(&inserted.range, '\n', cx);
-        if starts_with_newline {
-            spans.push(("\n", HighlightStyle::default()));
-        }
-        spans.extend(block_spans(&block, cx));
-        if !spans.last().is_some_and(|(text, _)| text.ends_with('\n')) {
-            spans.push(("\n", HighlightStyle::default()));
-        }
-        self.replace_transcript_range_with_spans(inserted.range, spans, cx)
-    }
+
+
+
 
     fn ensure_transcript_gap(&mut self, cx: &mut Context<Self>) {
         if self.transcript_trailing_newlines(cx) == 0 {
@@ -3138,16 +2177,7 @@ impl RhoGui {
         }
     }
 
-    fn refresh_role_completions(&mut self, roles: &tau_proto::HarnessRolesAvailable) {
-        let candidates = roles
-            .roles
-            .iter()
-            .map(|role| CompletionCandidate::new(role.name.clone(), role.description.clone()))
-            .collect();
-        if let Ok(mut state) = self.completion_state.lock() {
-            state.set_roles(candidates);
-        }
-    }
+
 
     fn update_status_line(&mut self, cx: &mut Context<Self>) {
         self.update_right_prompt(cx);
@@ -3188,13 +2218,6 @@ impl RhoGui {
     fn status_line(&self) -> status_line::StatusLine {
         status_line::build(status_line::StatusLineInput {
             current_role: self.current_role.as_deref(),
-            current_model: self.current_model.as_ref(),
-            baseline_params: self.baseline_params,
-            current_params: self.current_params,
-            role_default_effort: self.role_state.default_effort(self.current_role.as_deref()),
-            role_default_verbosity: self
-                .role_state
-                .default_verbosity(self.current_role.as_deref()),
         })
     }
 
@@ -3845,11 +2868,7 @@ fn status_chip_style_to_highlight(style: status_line::ChipStyle, cx: &App) -> Hi
     let colors = cx.theme().colors();
     let (color, bold) = match style {
         status_line::ChipStyle::Role => (colors.terminal_ansi_magenta, false),
-        status_line::ChipStyle::Model => (colors.terminal_ansi_blue, false),
         status_line::ChipStyle::Muted => (colors.text_muted, false),
-        status_line::ChipStyle::Effort => (colors.terminal_ansi_cyan, false),
-        status_line::ChipStyle::Verbosity => (colors.terminal_ansi_green, false),
-        status_line::ChipStyle::ServiceTier => (colors.terminal_ansi_yellow, true),
     };
     HighlightStyle {
         color: Some(color),
@@ -4004,7 +3023,7 @@ fn rho_tool_status_highlight_style(status: &str, cx: &App) -> HighlightStyle {
         "ok" => colors.terminal_ansi_green,
         "error" => colors.terminal_ansi_red,
         "cancelled" => colors.terminal_ansi_yellow,
-        tau_proto::PROGRESS_INDICATOR_TEXT => colors.terminal_ansi_cyan,
+        "running" => colors.terminal_ansi_cyan,
         _ => colors.text_muted,
     };
     HighlightStyle {
@@ -4021,7 +3040,7 @@ fn push_rho_spans_trailing_newline(spans: &mut Vec<(String, HighlightStyle)>) {
 
 fn rho_tool_status_label(status: &RhoUiToolStatus) -> &'static str {
     match status {
-        RhoUiToolStatus::Running => tau_proto::PROGRESS_INDICATOR_TEXT,
+        RhoUiToolStatus::Running => "running",
         RhoUiToolStatus::Success => "ok",
         RhoUiToolStatus::Error => "error",
         RhoUiToolStatus::Cancelled => "cancelled",
@@ -4140,7 +3159,7 @@ fn tool_display_from_call(call: &ToolCallItem) -> tau_proto::ToolUseState {
     tau_proto::ToolUseState {
         args,
         status: tau_proto::ToolUseStatus::InProgress,
-        status_text: tau_proto::PROGRESS_INDICATOR_TEXT.to_owned(),
+        status_text: "running".to_owned(),
         ..Default::default()
     }
 }

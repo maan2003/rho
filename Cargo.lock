@@ -8802,7 +8802,39 @@ dependencies = [
  "search",
  "semver",
  "settings",
- "tau-proto",
+ "text",
+ "theme",
+ "theme_settings",
+ "tokio",
+ "tree-sitter-md",
+ "ui",
+ "vim",
+]
+
+[[package]]
+name = "rho-gui2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "clap",
+ "command_palette",
+ "editor",
+ "futures",
+ "gpui",
+ "gpui_platform",
+ "json-stream",
+ "language",
+ "multi_buffer",
+ "project",
+ "release_channel",
+ "rho-core",
+ "rho-daemon",
+ "rho-ui-proto",
+ "rustc-hash 2.1.2",
+ "search",
+ "semver",
+ "settings",
  "text",
  "theme",
  "theme_settings",
@@ -10673,25 +10705,6 @@ dependencies = [
  "shellexpand",
  "util",
  "zed_actions",
-]
-
-[[package]]
-name = "tau-actions"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "tau-proto"
-version = "0.1.0"
-dependencies = [
- "ciborium",
- "indexmap",
- "serde",
- "serde_json",
- "tau-actions",
- "tracing",
 ]
 
 [[package]]

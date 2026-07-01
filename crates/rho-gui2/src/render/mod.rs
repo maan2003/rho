@@ -1,0 +1,405 @@
+//! Pure projection from protocol state to styled text spans.
+//!
+//! Nothing in this module touches editor buffers or entities: given a block
+//! (or the streaming frontier) it produces the exact spans the transcript
+//! should contain. The transcript model applies these as bounded buffer
+//! edits. Keeping this layer pure makes block rendering testable as plain
+//! string assertions.
+
+pub mod elision;
+pub mod markdown;
+
+use std::time::Duration;
+
+use gpui::App;
+use rho_ui_proto::remote::{UiBlock, UiMessagePhase, UiStreamingItem, UiTool, UiToolStatus};
+
+use crate::style::StyleClass;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Span {
+    pub text: String,
+    pub class: StyleClass,
+}
+
+impl Span {
+    pub fn new(text: impl Into<String>, class: StyleClass) -> Self {
+        Self {
+            text: text.into(),
+            class,
+        }
+    }
+}
+
+/// Coarse block classification used for separator and elision decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    User,
+    Response { working: bool },
+}
+
+/// A running tool's live duration span, to be spliced once per second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerSpec {
+    pub span_index: usize,
+    pub started_at_ms: u64,
+}
+
+#[derive(Debug)]
+pub struct RenderedBlock {
+    pub spans: Vec<Span>,
+    pub kind: BlockKind,
+    /// Index of the span that should carry the user-message gutter accent.
+    pub gutter_span: Option<usize>,
+    pub timer: Option<TimerSpec>,
+}
+
+impl RenderedBlock {
+    pub fn visible(&self) -> bool {
+        !self.spans.is_empty()
+    }
+}
+
+pub fn block_kind(block: &UiBlock) -> BlockKind {
+    match block {
+        UiBlock::UserMessage { .. } => BlockKind::User,
+        UiBlock::AssistantMessage { phase, .. } => BlockKind::Response {
+            working: *phase != Some(UiMessagePhase::FinalAnswer),
+        },
+        UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => {
+            BlockKind::Response { working: true }
+        }
+    }
+}
+
+pub fn streaming_item_kind(item: &UiStreamingItem) -> BlockKind {
+    match item {
+        UiStreamingItem::AssistantMessage { phase, .. } => BlockKind::Response {
+            working: *phase != Some(UiMessagePhase::FinalAnswer),
+        },
+        UiStreamingItem::Reasoning { .. } | UiStreamingItem::Tool(_) | UiStreamingItem::Notice { .. } => {
+            BlockKind::Response { working: true }
+        }
+    }
+}
+
+/// Separator inserted before a block, given the previous visible block's kind.
+fn separator(prev: Option<BlockKind>, current: BlockKind) -> Option<Span> {
+    match (prev, current) {
+        // First block: no separator.
+        (None, _) => None,
+        // A new user message starts a new turn; the previous response block
+        // ended with a single newline, so one more makes a blank line.
+        (Some(BlockKind::Response { .. }), BlockKind::User) => {
+            Some(Span::new("\n", StyleClass::Default))
+        }
+        // User messages already end with a blank line.
+        (Some(BlockKind::User), _) => None,
+        // Consecutive response items are separated by their own trailing
+        // newlines.
+        (Some(BlockKind::Response { .. }), BlockKind::Response { .. }) => None,
+    }
+}
+
+pub fn render_block(
+    block: &UiBlock,
+    prev: Option<BlockKind>,
+    now_ms: u64,
+    cx: &App,
+) -> RenderedBlock {
+    let kind = block_kind(block);
+    let mut spans = Vec::new();
+    let mut gutter_span = None;
+    let mut timer = None;
+    match block {
+        UiBlock::UserMessage { text } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            gutter_span = Some(spans.len());
+            spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
+        }
+        UiBlock::AssistantMessage { text, .. } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            spans.extend(markdown::markdown_spans_with_newline(text, cx));
+        }
+        UiBlock::Reasoning { .. } => return invisible(kind),
+        UiBlock::Tool(tool) => {
+            spans.extend(separator(prev, kind));
+            timer = push_tool_spans(&mut spans, tool, now_ms);
+        }
+        UiBlock::Notice { text } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            let mut text = text.clone();
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            spans.push(Span::new(text, StyleClass::SystemInfo));
+        }
+    }
+    RenderedBlock {
+        spans,
+        kind,
+        gutter_span,
+        timer,
+    }
+}
+
+pub fn render_streaming_item(
+    item: &UiStreamingItem,
+    prev: Option<BlockKind>,
+    now_ms: u64,
+    cx: &App,
+) -> RenderedBlock {
+    match item {
+        UiStreamingItem::AssistantMessage { text, phase } => render_block(
+            &UiBlock::AssistantMessage {
+                text: text.clone(),
+                phase: *phase,
+            },
+            prev,
+            now_ms,
+            cx,
+        ),
+        UiStreamingItem::Reasoning { text } => {
+            render_block(&UiBlock::Reasoning { text: text.clone() }, prev, now_ms, cx)
+        }
+        UiStreamingItem::Tool(tool) => {
+            render_block(&UiBlock::Tool(tool.clone()), prev, now_ms, cx)
+        }
+        UiStreamingItem::Notice { text } => {
+            render_block(&UiBlock::Notice { text: text.clone() }, prev, now_ms, cx)
+        }
+    }
+}
+
+fn invisible(kind: BlockKind) -> RenderedBlock {
+    RenderedBlock {
+        spans: Vec::new(),
+        kind,
+        gutter_span: None,
+        timer: None,
+    }
+}
+
+/// Renders one tool call line: `label status [duration]\n[preview]`.
+///
+/// Running tools with a start timestamp always get a duration span (possibly
+/// empty) so the transcript can splice updated durations in place without
+/// re-rendering the block.
+fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<TimerSpec> {
+    let is_shell = matches!(tool.name.as_str(), "shell" | "shell_command");
+    let label = if is_shell {
+        let command = shell_command_argument_label(&tool.arguments);
+        if command.is_empty() {
+            "$".to_owned()
+        } else {
+            format!("$ {command}")
+        }
+    } else if tool.arguments.is_empty() {
+        tool.name.clone()
+    } else {
+        format!("{} {}", tool.name, tool.arguments)
+    };
+    spans.push(Span::new(
+        label,
+        if is_shell {
+            StyleClass::ToolShell
+        } else {
+            StyleClass::ToolName
+        },
+    ));
+    spans.push(Span::new(" ", StyleClass::ToolDetail));
+    let status = tool_status_label(tool.status);
+    spans.push(Span::new(status, tool_status_class(tool.status)));
+
+    let mut timer = None;
+    let duration_text = tool_duration_at(tool, now_ms)
+        .map(|duration| format!(" {}", format_tool_duration(duration)))
+        .unwrap_or_default();
+    if tool.status == UiToolStatus::Running {
+        if let Some(started_at) = tool.started_at {
+            timer = Some(TimerSpec {
+                span_index: spans.len(),
+                started_at_ms: started_at.0,
+            });
+            spans.push(Span::new(duration_text, StyleClass::Time));
+        }
+    } else if !duration_text.is_empty() {
+        spans.push(Span::new(duration_text, StyleClass::Time));
+    }
+
+    if let Some(text) = tool.preview.as_deref().or(tool.output.as_deref()) {
+        spans.push(Span::new("\n", StyleClass::ToolDetail));
+        spans.push(Span::new(text.to_owned(), StyleClass::ToolDetail));
+    }
+    if !spans.last().is_some_and(|span| span.text.ends_with('\n')) {
+        spans.push(Span::new("\n", StyleClass::Default));
+    }
+    timer
+}
+
+fn tool_status_label(status: UiToolStatus) -> &'static str {
+    match status {
+        UiToolStatus::Running => "running",
+        UiToolStatus::Success => "ok",
+        UiToolStatus::Error => "error",
+        UiToolStatus::Cancelled => "cancelled",
+    }
+}
+
+fn tool_status_class(status: UiToolStatus) -> StyleClass {
+    match status {
+        UiToolStatus::Running => StyleClass::StatusRunning,
+        UiToolStatus::Success => StyleClass::StatusOk,
+        UiToolStatus::Error => StyleClass::StatusError,
+        UiToolStatus::Cancelled => StyleClass::StatusCancelled,
+    }
+}
+
+pub fn tool_duration_at(tool: &UiTool, now_ms: u64) -> Option<Duration> {
+    let started_at = tool.started_at?.0;
+    let finished_at = tool
+        .finished_at
+        .map(|finished_at| finished_at.0)
+        .or_else(|| (tool.status == UiToolStatus::Running).then_some(now_ms))?;
+    let duration = Duration::from_millis(finished_at.saturating_sub(started_at));
+    (Duration::from_secs(1) <= duration).then_some(duration)
+}
+
+pub fn format_tool_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    }
+}
+
+pub fn format_running_duration(started_at_ms: u64, now_ms: u64) -> String {
+    let duration = Duration::from_millis(now_ms.saturating_sub(started_at_ms));
+    if duration < Duration::from_secs(1) {
+        String::new()
+    } else {
+        format!(" {}", format_tool_duration(duration))
+    }
+}
+
+fn shell_command_argument_label(arguments: &str) -> String {
+    streaming_json_text_field(arguments, "command")
+        .or_else(|| (!arguments.trim_start().starts_with('{')).then(|| arguments.to_owned()))
+        .unwrap_or_default()
+}
+
+fn streaming_json_text_field(arguments: &str, key: &str) -> Option<String> {
+    let mut parser = json_stream::JsonStreamParser::new();
+    for character in arguments.chars() {
+        if parser.add_char(character).is_err() {
+            return None;
+        }
+    }
+    parser
+        .get_result()
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_core::UnixMs;
+
+    use super::*;
+
+    fn tool(status: UiToolStatus) -> UiTool {
+        UiTool {
+            id: "tool-1".to_owned(),
+            name: "shell_command".to_owned(),
+            arguments: "echo ok".to_owned(),
+            preview: None,
+            status,
+            output: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+            metadata: None,
+        }
+    }
+
+    fn text_of(spans: &[Span]) -> String {
+        spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    #[test]
+    fn shell_command_argument_label_extracts_streaming_json() {
+        assert_eq!(shell_command_argument_label(r#"{"command":"echo"#), "echo");
+        assert_eq!(shell_command_argument_label(r#"{"comm"#), "");
+        assert_eq!(shell_command_argument_label("echo ok"), "echo ok");
+    }
+
+    #[test]
+    fn tool_spans_render_status_and_duration() {
+        let mut finished = tool(UiToolStatus::Success);
+        finished.started_at = Some(UnixMs(1_000));
+        finished.finished_at = Some(UnixMs(3_500));
+        let mut spans = Vec::new();
+        let timer = push_tool_spans(&mut spans, &finished, 10_000);
+        assert_eq!(timer, None);
+        assert_eq!(text_of(&spans), "$ echo ok ok 2s\n");
+    }
+
+    #[test]
+    fn tool_duration_suppresses_subsecond_values() {
+        let mut running = tool(UiToolStatus::Running);
+        running.started_at = Some(UnixMs(1_000));
+        assert_eq!(tool_duration_at(&running, 1_999), None);
+        assert_eq!(
+            tool_duration_at(&running, 2_000),
+            Some(Duration::from_secs(1))
+        );
+
+        let mut finished = tool(UiToolStatus::Success);
+        finished.started_at = Some(UnixMs(1_000));
+        finished.finished_at = Some(UnixMs(1_999));
+        assert_eq!(tool_duration_at(&finished, 10_000), None);
+    }
+
+    #[test]
+    fn running_tool_gets_timer_span_even_below_one_second() {
+        let mut running = tool(UiToolStatus::Running);
+        running.started_at = Some(UnixMs(1_000));
+        let mut spans = Vec::new();
+        let timer = push_tool_spans(&mut spans, &running, 1_500);
+        let timer = timer.expect("running tool with start time should have a timer");
+        assert_eq!(spans[timer.span_index].text, "");
+        assert_eq!(text_of(&spans), "$ echo ok running\n");
+
+        let mut spans = Vec::new();
+        let timer = push_tool_spans(&mut spans, &running, 3_500).unwrap();
+        assert_eq!(spans[timer.span_index].text, " 2s");
+        assert_eq!(text_of(&spans), "$ echo ok running 2s\n");
+    }
+
+    #[test]
+    fn separators_give_user_messages_a_turn_gap() {
+        assert_eq!(separator(None, BlockKind::User), None);
+        assert_eq!(
+            separator(
+                Some(BlockKind::Response { working: false }),
+                BlockKind::User
+            ),
+            Some(Span::new("\n", StyleClass::Default))
+        );
+        assert_eq!(
+            separator(Some(BlockKind::User), BlockKind::Response { working: true }),
+            None
+        );
+    }
+}
