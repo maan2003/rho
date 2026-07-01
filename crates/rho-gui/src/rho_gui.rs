@@ -4012,9 +4012,8 @@ fn rho_tool_duration_at(tool: &RhoUiTool, now_ms: u64) -> Option<Duration> {
         .finished_at
         .map(|finished_at| finished_at.0)
         .or_else(|| (tool.status == RhoUiToolStatus::Running).then_some(now_ms))?;
-    Some(Duration::from_millis(
-        finished_at.saturating_sub(started_at),
-    ))
+    let duration = Duration::from_millis(finished_at.saturating_sub(started_at));
+    (Duration::from_secs(1) <= duration).then_some(duration)
 }
 
 fn rho_state_has_running_timed_tool(state: &RhoUiAgentState) -> bool {
@@ -4833,6 +4832,32 @@ mod tests {
             rho_tool_duration_at(&tool, 3_500),
             Some(Duration::from_millis(2_500))
         );
+    }
+
+    #[test]
+    fn rho_tool_duration_suppresses_subsecond_values() {
+        let mut tool = RhoUiTool {
+            id: "tool-1".to_owned(),
+            name: "shell_command".to_owned(),
+            arguments: "echo ok".to_owned(),
+            preview: None,
+            status: RhoUiToolStatus::Running,
+            output: None,
+            error: None,
+            started_at: Some(rho_core::UnixMs(1_000)),
+            finished_at: None,
+            metadata: None,
+        };
+
+        assert_eq!(rho_tool_duration_at(&tool, 1_999), None);
+        assert_eq!(
+            rho_tool_duration_at(&tool, 2_000),
+            Some(Duration::from_secs(1))
+        );
+
+        tool.status = RhoUiToolStatus::Success;
+        tool.finished_at = Some(rho_core::UnixMs(1_999));
+        assert_eq!(rho_tool_duration_at(&tool, 10_000), None);
     }
 
     #[test]
