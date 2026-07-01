@@ -11,7 +11,6 @@ use anyhow::{Context as _, Result, anyhow};
 use audio::{Audio, Sound};
 use clap::Parser;
 use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle};
-use editor::hover_links::InlayHighlight;
 use editor::scroll::AutoscrollStrategy;
 use editor::{
     DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, EditorRightPrompt,
@@ -195,12 +194,7 @@ fn init_app(cx: &mut App) -> Result<()> {
 }
 
 const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
-const PROMPT_PREFIX_INLAY_ID: usize = 1;
 const PROMPT_DRAFT_HIGHLIGHT_KEY: usize = usize::MAX - 1;
-const PROMPT_PREFIX_HIGHLIGHT_KEY: usize = usize::MAX;
-const USER_MESSAGE_PREFIX_INLAY_ID_BASE: usize = 10_000;
-const USER_MESSAGE_PREFIX: &str = "▎";
-const PROMPT_PREFIX: &str = USER_MESSAGE_PREFIX;
 static RHO_MARKDOWN_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 static RHO_MARKDOWN_INLINE_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 const DEFAULT_RHO_GUI_SETTINGS: &str = r#"// Rho GUI user settings. Values here override bundled defaults.
@@ -345,6 +339,7 @@ struct AgentUiState {
     rho_inserted_blocks: Vec<Option<InsertedTranscript>>,
     rho_pending_inserted: Option<InsertedTranscript>,
     rho_working_elisions: Vec<RhoWorkingElision>,
+    user_message_gutter_ranges: HashMap<usize, std::ops::Range<text::Anchor>>,
 }
 
 struct RhoGui {
@@ -363,6 +358,7 @@ struct RhoGui {
     rho_inserted_blocks: Vec<Option<InsertedTranscript>>,
     rho_pending_inserted: Option<InsertedTranscript>,
     rho_working_elisions: Vec<RhoWorkingElision>,
+    user_message_gutter_ranges: HashMap<usize, std::ops::Range<text::Anchor>>,
     _poll_task: Task<()>,
     _subscriptions: Vec<Subscription>,
     project_root: PathBuf,
@@ -388,6 +384,13 @@ struct RhoGui {
     displayed_agent_id: Option<String>,
     no_agent_ui_state: Option<AgentUiState>,
     agent_ui_states: HashMap<String, AgentUiState>,
+}
+
+struct PromptGutterHighlight;
+struct UserMessageGutterHighlight;
+
+fn user_prompt_gutter_color(cx: &App) -> Hsla {
+    cx.theme().colors().text_accent
 }
 
 #[derive(Clone)]
@@ -455,6 +458,7 @@ impl RhoGui {
             rho_inserted_blocks: Vec::new(),
             rho_pending_inserted: None,
             rho_working_elisions: Vec::new(),
+            user_message_gutter_ranges: HashMap::new(),
             _poll_task: poll_task,
             _subscriptions: ui_subscriptions,
             project_root: attach_target.project_root,
@@ -521,6 +525,7 @@ impl RhoGui {
             rho_inserted_blocks: Vec::new(),
             rho_pending_inserted: None,
             rho_working_elisions: Vec::new(),
+            user_message_gutter_ranges: HashMap::new(),
             _poll_task: poll_task,
             _subscriptions: ui_subscriptions,
             project_root: std::env::temp_dir(),
@@ -846,6 +851,7 @@ impl RhoGui {
                 cx,
             );
             editor.set_show_gutter(false, cx);
+            editor.set_show_compact_gutter(true, cx);
             editor.set_show_line_numbers(false, cx);
             editor.set_show_git_diff_gutter(false, cx);
             editor.set_show_code_actions(false, cx);
@@ -985,6 +991,7 @@ impl RhoGui {
             rho_inserted_blocks: Vec::new(),
             rho_pending_inserted: None,
             rho_working_elisions: Vec::new(),
+            user_message_gutter_ranges: HashMap::new(),
         }
     }
 
@@ -2378,10 +2385,16 @@ impl RhoGui {
             &mut self.rho_working_elisions,
             &mut state.rho_working_elisions,
         );
+        std::mem::swap(
+            &mut self.user_message_gutter_ranges,
+            &mut state.user_message_gutter_ranges,
+        );
     }
 
     fn show_current_transcript_buffer(&mut self, cx: &mut Context<Self>) {
         self.transcript.refresh_highlights(cx);
+        self.refresh_user_message_gutter_highlights(cx);
+        self.update_prompt_inlay(cx);
         cx.notify();
     }
 
@@ -2647,7 +2660,7 @@ impl RhoGui {
 
     fn update_prompt_inlay(&self, cx: &mut Context<Self>) {
         let Some(prompt_anchor) = self.anchor_in_excerpt(self.prompt_end, cx) else {
-            eprintln!("rho-gui: failed to map prompt prefix anchor into editor excerpt");
+            eprintln!("rho-gui: failed to map prompt anchor into editor excerpt");
             return;
         };
         let prompt_style = self.highlight_style(TranscriptStyle::UserPrompt, cx);
@@ -2660,11 +2673,7 @@ impl RhoGui {
             };
             vec![prompt_anchor.clone()..draft_end]
         };
-        let mut to_insert = vec![Inlay::custom(
-            PROMPT_PREFIX_INLAY_ID,
-            prompt_anchor.clone(),
-            PROMPT_PREFIX,
-        )];
+        let mut to_insert = Vec::new();
         if self.draft_is_empty(cx) {
             let Some(anchor) = self.anchor_in_excerpt(self.draft_end, cx) else {
                 eprintln!("rho-gui: failed to map prompt placeholder anchor into editor excerpt");
@@ -2676,12 +2685,13 @@ impl RhoGui {
                 self.prompt_placeholder_text(),
             ));
         }
+        let Some(prompt_end_anchor) = self.anchor_in_excerpt(self.draft_end, cx) else {
+            eprintln!("rho-gui: failed to map prompt gutter end anchor into editor excerpt");
+            return;
+        };
         self.editor.update(cx, |editor, cx| {
             editor.splice_inlays(
-                &[
-                    InlayId::Custom(PROMPT_PLACEHOLDER_INLAY_ID),
-                    InlayId::Custom(PROMPT_PREFIX_INLAY_ID),
-                ],
+                &[InlayId::Custom(PROMPT_PLACEHOLDER_INLAY_ID)],
                 to_insert,
                 cx,
             );
@@ -2691,14 +2701,9 @@ impl RhoGui {
                 prompt_style,
                 cx,
             );
-            editor.highlight_inlays(
-                HighlightKey::SyntaxTreeView(PROMPT_PREFIX_HIGHLIGHT_KEY),
-                vec![InlayHighlight {
-                    inlay: InlayId::Custom(PROMPT_PREFIX_INLAY_ID),
-                    inlay_position: prompt_anchor.clone(),
-                    range: 0..PROMPT_PREFIX.len(),
-                }],
-                prompt_style,
+            editor.highlight_gutter::<PromptGutterHighlight>(
+                vec![prompt_anchor..prompt_end_anchor],
+                user_prompt_gutter_color,
                 cx,
             );
         });
@@ -2779,7 +2784,7 @@ impl RhoGui {
             spans.iter().map(|(text, style)| (text.as_str(), *style)),
             cx,
         )?;
-        self.insert_user_message_prefix_inlay(&inserted, cx);
+        self.insert_user_message_gutter_highlight(&inserted, cx);
         Some(inserted)
     }
 
@@ -2801,7 +2806,7 @@ impl RhoGui {
         spans
     }
 
-    fn insert_user_message_prefix_inlay(
+    fn insert_user_message_gutter_highlight(
         &mut self,
         inserted: &InsertedTranscript,
         cx: &mut Context<Self>,
@@ -2812,29 +2817,23 @@ impl RhoGui {
         let Some(highlight_range) = inserted.highlight_ranges.last() else {
             return;
         };
-        let Some(range) = self
+        let range = self
             .transcript
-            .multibuffer_range(highlight_range.clone(), cx)
-        else {
-            return;
-        };
-        let id = USER_MESSAGE_PREFIX_INLAY_ID_BASE + highlight_key;
-        let style = self.highlight_style(TranscriptStyle::UserPrompt, cx);
-        let inlay_id = InlayId::Custom(id);
+            .range_without_trailing_newlines(highlight_range, cx);
+        self.user_message_gutter_ranges.insert(highlight_key, range);
+        self.refresh_user_message_gutter_highlights(cx);
+    }
+
+    fn refresh_user_message_gutter_highlights(&self, cx: &mut Context<Self>) {
+        let ranges = self
+            .user_message_gutter_ranges
+            .values()
+            .filter_map(|range| self.transcript.multibuffer_range(range.clone(), cx))
+            .collect::<Vec<_>>();
         self.editor.update(cx, |editor, cx| {
-            editor.splice_inlays(
-                &[],
-                vec![Inlay::custom(id, range.start, USER_MESSAGE_PREFIX)],
-                cx,
-            );
-            editor.highlight_inlays(
-                HighlightKey::SyntaxTreeView(highlight_key),
-                vec![InlayHighlight {
-                    inlay: inlay_id,
-                    inlay_position: range.start,
-                    range: 0..USER_MESSAGE_PREFIX.len(),
-                }],
-                style,
+            editor.highlight_gutter::<UserMessageGutterHighlight>(
+                ranges,
+                user_prompt_gutter_color,
                 cx,
             );
         });
@@ -3019,16 +3018,15 @@ impl RhoGui {
     }
 
     fn remove_transcript_highlights(&mut self, highlight_keys: Vec<usize>, cx: &mut Context<Self>) {
-        let inlay_ids = highlight_keys
-            .iter()
-            .map(|key| InlayId::Custom(USER_MESSAGE_PREFIX_INLAY_ID_BASE + *key))
-            .collect::<Vec<_>>();
         self.editor.update(cx, |editor, cx| {
-            editor.splice_inlays(&inlay_ids, Vec::new(), cx);
             for key in &highlight_keys {
                 editor.clear_highlights(HighlightKey::SyntaxTreeView(*key), cx);
             }
         });
+        for key in &highlight_keys {
+            self.user_message_gutter_ranges.remove(key);
+        }
+        self.refresh_user_message_gutter_highlights(cx);
         self.transcript.remove_highlights(highlight_keys);
     }
 
@@ -4728,7 +4726,7 @@ mod tests {
         });
 
         let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
-        let text = gui
+        let (text, gutter_highlights) = gui
             .update(cx, |gui, window, cx| {
                 gui.render_rho_state(
                     &RhoUiAgentState {
@@ -4750,19 +4748,26 @@ mod tests {
                     window,
                     cx,
                 );
-                gui.editor.update(cx, |editor, cx| editor.display_text(cx))
+                gui.editor.update(cx, |editor, cx| {
+                    (
+                        editor.display_text(cx),
+                        editor.all_gutter_highlights(window, cx),
+                    )
+                })
             })
             .expect("update rho gui");
 
         assert!(
-            text.contains(&format!(
-                "{USER_MESSAGE_PREFIX}first\n\nanswer\n\n{USER_MESSAGE_PREFIX}second\n\n"
-            )),
+            text.contains("first\n\nanswer\n\nsecond\n\n"),
             "subsequent user messages should start a new turn with an empty line: {text:?}"
         );
         assert!(
             !text.starts_with('\n'),
             "first user message should not get a leading gap: {text:?}"
+        );
+        assert!(
+            gutter_highlights.len() >= 2,
+            "historical user messages should render gutter highlights: {gutter_highlights:?}"
         );
     }
 
@@ -4778,18 +4783,12 @@ mod tests {
             .update(cx, |gui, window, cx| {
                 gui.render_rho_state(&pending_assistant_state(None), window, cx);
                 assert!(has_display_elision(gui, window, cx));
-                gui.prompt_buffer.update(cx, |buffer, _| {
-                    assert!(
-                        !buffer_text(buffer).contains("> do work"),
-                        "user prompt prefix should be an inlay, not buffer text"
-                    );
-                });
                 gui.editor.update(cx, |editor, cx| editor.display_text(cx))
             })
             .expect("update rho gui");
         assert!(
-            unknown_phase_text.contains(&format!("{USER_MESSAGE_PREFIX}do work")),
-            "user prompt prefix should render as an inlay: {unknown_phase_text:?}"
+            unknown_phase_text.contains("do work"),
+            "user prompt should render: {unknown_phase_text:?}"
         );
         assert!(
             !unknown_phase_text.contains("alpha"),
@@ -4821,74 +4820,93 @@ mod tests {
     }
 
     #[gpui::test]
-    fn rho_prompt_draft_has_prefix_inlay(cx: &mut TestAppContext) {
+    fn rho_prompt_draft_has_gutter_highlight(cx: &mut TestAppContext) {
         cx.update(|cx| {
             init_test_app(cx);
         });
 
         let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
 
-        let text = gui
+        let (text, gutter_highlights) = gui
             .update(cx, |gui, _window, cx| {
                 gui.replace_draft_text("hello", cx);
                 gui.prompt_buffer.update(cx, |buffer, _| {
                     assert_eq!(buffer_text(buffer), "hello");
                 });
-                gui.editor.update(cx, |editor, cx| editor.display_text(cx))
+                gui.editor.update(cx, |editor, cx| {
+                    (
+                        editor.display_text(cx),
+                        editor.all_gutter_highlights(_window, cx),
+                    )
+                })
             })
             .expect("update rho gui");
 
         assert!(
-            text.contains(&format!("{PROMPT_PREFIX}hello")),
-            "prompt prefix should render as an inlay: {text:?}"
+            text.contains("hello"),
+            "prompt draft should render: {text:?}"
+        );
+        assert!(
+            !gutter_highlights.is_empty(),
+            "prompt draft should have a gutter highlight"
         );
     }
 
     #[gpui::test]
-    fn rho_empty_prompt_has_prefix_inlay(cx: &mut TestAppContext) {
+    fn rho_empty_prompt_has_gutter_highlight(cx: &mut TestAppContext) {
         cx.update(|cx| {
             init_test_app(cx);
         });
 
         let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
 
-        let text = gui
+        let (text, gutter_highlights) = gui
             .update(cx, |gui, _window, cx| {
                 gui.update_prompt_inlay(cx);
                 gui.prompt_buffer.update(cx, |buffer, _| {
                     assert_eq!(buffer_text(buffer), "");
                 });
-                gui.editor.update(cx, |editor, cx| editor.display_text(cx))
+                gui.editor.update(cx, |editor, cx| {
+                    (
+                        editor.display_text(cx),
+                        editor.all_gutter_highlights(_window, cx),
+                    )
+                })
             })
             .expect("update rho gui");
 
         assert!(
-            text.contains(USER_MESSAGE_PREFIX),
-            "empty prompt prefix should render as an inlay: {text:?}"
+            text.contains("Write a message…"),
+            "empty prompt placeholder should render: {text:?}"
+        );
+        assert!(
+            !gutter_highlights.is_empty(),
+            "empty prompt should have a gutter highlight"
         );
     }
 
     #[gpui::test]
-    fn rho_empty_prompt_prefix_survives_transcript_insert(cx: &mut TestAppContext) {
+    fn rho_empty_prompt_gutter_survives_transcript_insert(cx: &mut TestAppContext) {
         cx.update(|cx| {
             init_test_app(cx);
         });
 
         let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
 
-        let text = gui
+        let gutter_highlights = gui
             .update(cx, |gui, _window, cx| {
                 gui.insert_before_draft_styled("system message\n", TranscriptStyle::SystemInfo, cx);
                 gui.prompt_buffer.update(cx, |buffer, _| {
                     assert_eq!(buffer_text(buffer), "");
                 });
-                gui.editor.update(cx, |editor, cx| editor.display_text(cx))
+                gui.editor
+                    .update(cx, |editor, cx| editor.all_gutter_highlights(_window, cx))
             })
             .expect("update rho gui");
 
         assert!(
-            text.contains(USER_MESSAGE_PREFIX),
-            "empty prompt prefix should survive transcript inserts: {text:?}"
+            !gutter_highlights.is_empty(),
+            "empty prompt gutter should survive transcript inserts"
         );
     }
 
@@ -4900,19 +4918,20 @@ mod tests {
 
         let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
 
-        let text = gui
+        let gutter_highlights = gui
             .update(cx, |gui, window, cx| {
                 gui.show_agent_transcript(Some("agent-1".to_owned()), window, cx);
                 gui.prompt_buffer.update(cx, |buffer, _| {
                     assert_eq!(buffer_text(buffer), "");
                 });
-                gui.editor.update(cx, |editor, cx| editor.display_text(cx))
+                gui.editor
+                    .update(cx, |editor, cx| editor.all_gutter_highlights(window, cx))
             })
             .expect("update rho gui");
 
         assert!(
-            text.contains(USER_MESSAGE_PREFIX),
-            "empty prompt prefix should render after swapping to a fresh agent: {text:?}"
+            !gutter_highlights.is_empty(),
+            "empty prompt gutter should render after swapping to a fresh agent"
         );
     }
 

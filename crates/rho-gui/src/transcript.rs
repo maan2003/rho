@@ -100,6 +100,19 @@ impl Transcript {
         Some(start..end)
     }
 
+    pub(crate) fn range_without_trailing_newlines<T>(
+        &self,
+        range: &std::ops::Range<Anchor>,
+        cx: &Context<T>,
+    ) -> std::ops::Range<Anchor> {
+        let buffer = self.buffer.read(cx);
+        let start = range.start.to_offset(buffer);
+        let end = range.end.to_offset(buffer);
+        let text = buffer.text_for_range(start..end).collect::<String>();
+        let trimmed_len = text.trim_end_matches('\n').len();
+        range.start..buffer.anchor_before(start + trimmed_len)
+    }
+
     pub(crate) fn trailing_newlines<T>(&self, cx: &Context<T>) -> usize {
         let buffer = self.buffer.read(cx);
         let transcript_end = self.end.to_offset(buffer);
