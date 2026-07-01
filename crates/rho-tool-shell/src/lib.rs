@@ -23,7 +23,6 @@ use tokio::process::Command;
 use tokio::time;
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
-pub const SLOW_COMMAND_EXEC_TIME_THRESHOLD_SECS: u64 = 5;
 pub const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
 pub const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 
@@ -44,22 +43,6 @@ struct ShellArgs {
     command: String,
     cwd: Option<String>,
     timeout: Option<u64>,
-}
-
-#[derive(Debug)]
-struct CommandDetails {
-    status: Option<i32>,
-    signal: Option<i32>,
-    timed_out: bool,
-    duration_seconds: Option<u64>,
-    termination_reason: &'static str,
-    total_lines: Option<usize>,
-    total_bytes: Option<usize>,
-    output: String,
-    stdout: String,
-    stderr: String,
-    truncated: bool,
-    valid_utf8: bool,
 }
 
 impl ShellTools {
@@ -210,23 +193,7 @@ impl ShellTools {
                 let _ = child.wait().await;
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
-                return Ok((
-                    details_json(CommandDetails {
-                        status: None,
-                        signal: None,
-                        timed_out: true,
-                        duration_seconds: Some(timeout.as_secs()),
-                        termination_reason: "timeout",
-                        total_lines: None,
-                        total_bytes: None,
-                        output: String::new(),
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        truncated: false,
-                        valid_utf8: true,
-                    }),
-                    None,
-                ));
+                return Ok((timeout_output_text(timeout), None));
             }
         };
         let stdout = stdout_task
@@ -237,9 +204,6 @@ impl ShellTools {
             .map_err(|error| anyhow!("stderr task failed: {error}"))??;
 
         let elapsed = started.elapsed();
-        let duration_seconds = (Duration::from_secs(SLOW_COMMAND_EXEC_TIME_THRESHOLD_SECS)
-            < elapsed)
-            .then(|| elapsed.as_secs_f64().ceil() as u64);
         let status_code = status.code();
         #[cfg(unix)]
         let signal = std::os::unix::process::ExitStatusExt::signal(&status);
@@ -249,29 +213,17 @@ impl ShellTools {
         let (stdout, stdout_valid_utf8) = decode_output(stdout);
         let (stderr, stderr_valid_utf8) = decode_output(stderr);
         let output = combine_output(&stdout, &stderr);
+        let valid_utf8 = stdout_valid_utf8 && stderr_valid_utf8;
 
-        let truncated = truncate::truncate_line_oriented(&output);
+        let truncated = truncate::formatted_truncate_text(&output);
 
         Ok((
-            details_json(CommandDetails {
+            command_output_text(CommandOutputText {
                 status: status_code,
                 signal,
-                timed_out: false,
-                duration_seconds,
-                termination_reason: if output_status_success(status_code, signal) {
-                    "exit"
-                } else if signal.is_some() {
-                    "signal"
-                } else {
-                    "exit"
-                },
-                total_lines: truncated.was_truncated.then_some(truncated.total_lines),
-                total_bytes: truncated.was_truncated.then_some(truncated.total_bytes),
+                elapsed,
                 output: truncated.content,
-                stdout,
-                stderr,
-                truncated: truncated.was_truncated,
-                valid_utf8: stdout_valid_utf8 && stderr_valid_utf8,
+                valid_utf8,
             }),
             None,
         ))
@@ -291,42 +243,6 @@ impl ShellTools {
     }
 }
 
-fn output_status_success(status: Option<i32>, signal: Option<i32>) -> bool {
-    status == Some(0) && signal.is_none()
-}
-
-fn details_json(details: CommandDetails) -> String {
-    let mut value = json!({
-        "status": details.status,
-        "signal": details.signal,
-        "timed_out": details.timed_out,
-        "termination_reason": details.termination_reason,
-        "output": details.output,
-        "stdout": details.stdout,
-        "stderr": details.stderr,
-        "truncated": details.truncated,
-        "valid_utf8": details.valid_utf8,
-    });
-
-    insert_optional(&mut value, "duration_seconds", details.duration_seconds);
-    insert_optional(&mut value, "total_lines", details.total_lines);
-    insert_optional(&mut value, "total_bytes", details.total_bytes);
-    value.to_string()
-}
-
-fn insert_optional<T: serde::Serialize>(value: &mut Value, key: &str, item: Option<T>) {
-    let Some(item) = item else {
-        return;
-    };
-    let Value::Object(map) = value else {
-        return;
-    };
-    map.insert(
-        key.to_owned(),
-        serde_json::to_value(item).expect("optional field serializes"),
-    );
-}
-
 fn decode_output(bytes: Vec<u8>) -> (String, bool) {
     match String::from_utf8(bytes) {
         Ok(output) => (output, true),
@@ -342,8 +258,41 @@ fn combine_output(stdout: &str, stderr: &str) -> String {
         (true, true) => String::new(),
         (false, true) => stdout.to_owned(),
         (true, false) => stderr.to_owned(),
-        (false, false) => format!("{stdout}\n{stderr}"),
+        (false, false) => format!("{stdout}{stderr}"),
     }
+}
+
+struct CommandOutputText {
+    status: Option<i32>,
+    signal: Option<i32>,
+    elapsed: Duration,
+    output: String,
+    valid_utf8: bool,
+}
+
+fn timeout_output_text(timeout: Duration) -> String {
+    format!(
+        "Command timed out after {} seconds\nOutput:\n",
+        timeout.as_secs()
+    )
+}
+
+fn command_output_text(details: CommandOutputText) -> String {
+    let mut sections = Vec::new();
+    match (details.status, details.signal) {
+        (Some(status), _) => sections.push(format!("Exit code: {status}")),
+        (None, Some(signal)) => sections.push(format!("Signal: {signal}")),
+        (None, None) => sections.push("Exit status: unknown".to_owned()),
+    }
+    sections.push(format!(
+        "Wall time: {:.3} seconds",
+        details.elapsed.as_secs_f64()
+    ));
+    if !details.valid_utf8 {
+        sections.push("Output contained invalid UTF-8 and was decoded lossily".to_owned());
+    }
+    sections.push(format!("Output:\n{}", details.output));
+    sections.join("\n")
 }
 
 #[cfg(test)]

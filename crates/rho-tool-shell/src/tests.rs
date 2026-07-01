@@ -28,11 +28,9 @@ async fn runs_shell_call() {
         .await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
-    let content: Value = serde_json::from_str(result.output.as_ref()).unwrap();
-    assert_eq!(content["output"], "hello");
-    assert_eq!(content["stdout"], "hello");
-    assert_eq!(content["stderr"], "");
-    assert_eq!(content["status"], 0);
+    assert!(serde_json::from_str::<Value>(result.output.as_ref()).is_err());
+    assert!(result.output.as_ref().contains("Exit code: 0"));
+    assert!(result.output.as_ref().contains("Output:\nhello"));
 }
 
 #[tokio::test]
@@ -43,23 +41,39 @@ async fn nonzero_exit_is_structured_result_not_tool_error() {
         .await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
-    let content: Value = serde_json::from_str(result.output.as_ref()).unwrap();
-    assert_eq!(content["status"], 3);
-    assert_eq!(content["output"], "nope");
+    assert!(result.output.as_ref().contains("Exit code: 3"));
+    assert!(result.output.as_ref().contains("Output:\nnope"));
 }
 
 #[tokio::test]
-async fn separates_stdout_and_stderr_while_preserving_combined_output() {
+async fn concatenates_stdout_then_stderr() {
     let tools = ShellTools::new(Duration::from_secs(2));
     let result = tools
         .call(shell_call(json!({"command": "printf out; printf err >&2"})))
         .await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
-    let content: Value = serde_json::from_str(result.output.as_ref()).unwrap();
-    assert_eq!(content["stdout"], "out");
-    assert_eq!(content["stderr"], "err");
-    assert_eq!(content["output"], "out\nerr");
+    assert!(result.output.as_ref().contains("Output:\nouterr"));
+}
+
+#[tokio::test]
+async fn truncates_concatenated_output() {
+    let tools = ShellTools::new(Duration::from_secs(2));
+    let result = tools
+        .call(shell_call(json!({"command": "yes line | head -20000"})))
+        .await;
+
+    assert_eq!(result.status, ToolOutputStatus::Success);
+    assert!(serde_json::from_str::<Value>(result.output.as_ref()).is_err());
+    assert!(
+        result
+            .output
+            .as_ref()
+            .contains("Warning: truncated output (original token count:")
+    );
+    assert!(result.output.as_ref().contains("Total output lines: 20000"));
+    assert!(result.output.as_ref().contains("tokens truncated"));
+    assert!(result.output.len() < truncate::MAX_OUTPUT_BYTES + 2048);
 }
 
 #[tokio::test]
@@ -70,9 +84,12 @@ async fn accepts_timeout_argument_name() {
         .await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
-    let content: Value = serde_json::from_str(result.output.as_ref()).unwrap();
-    assert_eq!(content["timed_out"], true);
-    assert_eq!(content["termination_reason"], "timeout");
+    assert!(
+        result
+            .output
+            .as_ref()
+            .contains("Command timed out after 1 seconds")
+    );
 }
 
 #[tokio::test]
@@ -88,8 +105,12 @@ async fn timeout_kills_shell_process() {
         .await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
-    let content: Value = serde_json::from_str(result.output.as_ref()).unwrap();
-    assert_eq!(content["timed_out"], true);
+    assert!(
+        result
+            .output
+            .as_ref()
+            .contains("Command timed out after 1 seconds")
+    );
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!marker.exists());
 }

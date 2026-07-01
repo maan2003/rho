@@ -1,117 +1,139 @@
-//! Output-truncation helpers adapted from Tau's shell tools.
+//! Output-truncation helpers adapted from Codex's shell tools.
 
-pub(crate) const MAX_OUTPUT_LINES: usize = 2000;
-pub(crate) const TRUNCATED_OUTPUT_HEAD_LINES: usize = MAX_OUTPUT_LINES / 2;
-pub(crate) const TRUNCATED_OUTPUT_TAIL_LINES: usize = MAX_OUTPUT_LINES / 2;
-pub(crate) const MAX_OUTPUT_BYTES: usize = 50 * 1024;
+const APPROX_BYTES_PER_TOKEN: usize = 4;
+
+pub(crate) const MAX_OUTPUT_TOKENS: usize = 10_000;
+pub(crate) const MAX_OUTPUT_BYTES: usize = MAX_OUTPUT_TOKENS * APPROX_BYTES_PER_TOKEN;
 
 pub(crate) struct Truncated {
     pub(crate) content: String,
-    pub(crate) was_truncated: bool,
-    pub(crate) total_lines: usize,
-    pub(crate) total_bytes: usize,
 }
 
-pub(crate) fn truncate_line_oriented(input: &str) -> Truncated {
-    let lines: Vec<&str> = input.lines().collect();
-    truncate_line_oriented_lines(lines.iter().copied(), lines.len(), input.len())
-}
-
-pub(crate) fn truncate_line_oriented_lines<'a>(
-    lines: impl IntoIterator<Item = &'a str>,
-    total_lines: usize,
-    total_bytes: usize,
-) -> Truncated {
-    let all_lines: Vec<&str> = lines.into_iter().collect();
-    let line_count_truncated = MAX_OUTPUT_LINES < total_lines;
-    let selected: Vec<Option<&str>> = if line_count_truncated {
-        all_lines
-            .iter()
-            .take(TRUNCATED_OUTPUT_HEAD_LINES)
-            .copied()
-            .map(Some)
-            .chain(std::iter::once(None))
-            .chain(
-                all_lines
-                    .iter()
-                    .skip(all_lines.len().saturating_sub(TRUNCATED_OUTPUT_TAIL_LINES))
-                    .copied()
-                    .map(Some),
-            )
-            .collect()
+pub(crate) fn formatted_truncate_text(content: &str) -> Truncated {
+    let original_token_count = approx_token_count(content);
+    let total_lines = content.lines().count();
+    let (content, was_truncated) = truncate_middle_with_token_budget(content, MAX_OUTPUT_TOKENS);
+    let content = if was_truncated {
+        format!(
+            "Warning: truncated output (original token count: {original_token_count})\nTotal output lines: {total_lines}\n\n{content}"
+        )
     } else {
-        all_lines.iter().copied().map(Some).collect()
+        content
     };
 
-    let mut rendered = Vec::with_capacity(selected.len());
-    let mut rendered_bytes = 0usize;
-    let mut was_truncated = line_count_truncated || MAX_OUTPUT_BYTES < total_bytes;
-    for line in selected {
-        let line = match line {
-            Some(line) => line,
-            None => {
-                if !push_budgeted_line(&mut rendered, &mut rendered_bytes, "...") {
-                    was_truncated = true;
-                    break;
-                }
-                continue;
-            }
-        };
-        let separator_bytes = usize::from(!rendered.is_empty());
-        if MAX_OUTPUT_BYTES < line.len()
-            || MAX_OUTPUT_BYTES < rendered_bytes.saturating_add(separator_bytes + line.len())
-        {
-            let marker = mark_line(line, "truncated");
-            if !push_budgeted_line(&mut rendered, &mut rendered_bytes, &marker) {
-                break;
-            }
-            was_truncated = true;
-        } else if !push_budgeted_line(&mut rendered, &mut rendered_bytes, line) {
-            was_truncated = true;
-            break;
+    Truncated { content }
+}
+
+fn truncate_middle_with_token_budget(content: &str, max_tokens: usize) -> (String, bool) {
+    if content.is_empty() {
+        return (String::new(), false);
+    }
+
+    let max_bytes = if max_tokens == MAX_OUTPUT_TOKENS {
+        MAX_OUTPUT_BYTES
+    } else {
+        approx_bytes_for_tokens(max_tokens)
+    };
+    if max_tokens > 0 && content.len() <= max_bytes {
+        return (content.to_owned(), false);
+    }
+
+    let truncated = truncate_with_byte_estimate(content, max_bytes);
+    let was_truncated = truncated != content;
+    (truncated, was_truncated)
+}
+
+fn truncate_with_byte_estimate(content: &str, max_bytes: usize) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+
+    if max_bytes == 0 {
+        return truncation_marker(approx_tokens_from_byte_count(content.len()));
+    }
+
+    if content.len() <= max_bytes {
+        return content.to_owned();
+    }
+
+    let (left_budget, right_budget) = split_budget(max_bytes);
+    let (_removed_chars, left, right) = split_string(content, left_budget, right_budget);
+    let removed_bytes = content.len().saturating_sub(max_bytes);
+    let marker = truncation_marker(approx_tokens_from_byte_count(removed_bytes));
+
+    assemble_truncated_output(left, right, &marker)
+}
+
+fn approx_token_count(text: &str) -> usize {
+    text.len()
+        .saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1))
+        / APPROX_BYTES_PER_TOKEN
+}
+
+fn approx_bytes_for_tokens(tokens: usize) -> usize {
+    tokens.saturating_mul(APPROX_BYTES_PER_TOKEN)
+}
+
+fn approx_tokens_from_byte_count(bytes: usize) -> usize {
+    bytes.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1)) / APPROX_BYTES_PER_TOKEN
+}
+
+fn split_budget(budget: usize) -> (usize, usize) {
+    let left = budget / 2;
+    (left, budget - left)
+}
+
+fn split_string(content: &str, beginning_bytes: usize, end_bytes: usize) -> (usize, &str, &str) {
+    if content.is_empty() {
+        return (0, "", "");
+    }
+
+    let len = content.len();
+    let tail_start_target = len.saturating_sub(end_bytes);
+    let mut prefix_end = 0usize;
+    let mut suffix_start = len;
+    let mut removed_chars = 0usize;
+    let mut suffix_started = false;
+
+    for (idx, ch) in content.char_indices() {
+        let char_end = idx + ch.len_utf8();
+        if char_end <= beginning_bytes {
+            prefix_end = char_end;
+            continue;
         }
-    }
 
-    Truncated {
-        content: rendered.join("\n"),
-        was_truncated,
-        total_lines,
-        total_bytes,
-    }
-}
-
-fn can_push_budgeted_line(rendered: &[String], rendered_bytes: usize, line: &str) -> bool {
-    let separator_bytes = usize::from(!rendered.is_empty());
-    rendered_bytes.saturating_add(separator_bytes + line.len()) <= MAX_OUTPUT_BYTES
-}
-
-fn push_budgeted_line(rendered: &mut Vec<String>, rendered_bytes: &mut usize, line: &str) -> bool {
-    if !can_push_budgeted_line(rendered, *rendered_bytes, line) {
-        return false;
-    }
-    let separator_bytes = usize::from(!rendered.is_empty());
-    rendered.push(line.to_owned());
-    *rendered_bytes += separator_bytes + line.len();
-    true
-}
-
-fn mark_line(line: &str, marker: &str) -> String {
-    let prefix = line.split_once(' ').map_or_else(
-        || {
-            if line.chars().all(|ch| ch.is_ascii_digit()) {
-                line
-            } else {
-                ""
+        if idx >= tail_start_target {
+            if !suffix_started {
+                suffix_start = idx;
+                suffix_started = true;
             }
-        },
-        |(prefix, _)| prefix,
-    );
-    if let Some((base, existing)) = prefix.split_once('(')
-        && let Some(existing) = existing.strip_suffix(')')
-    {
-        return format!("{base}({existing},{marker})");
+            continue;
+        }
+
+        removed_chars = removed_chars.saturating_add(1);
     }
-    format!("{prefix}({marker})")
+
+    if suffix_start < prefix_end {
+        suffix_start = prefix_end;
+    }
+
+    (
+        removed_chars,
+        &content[..prefix_end],
+        &content[suffix_start..],
+    )
+}
+
+fn truncation_marker(removed_tokens: usize) -> String {
+    format!("…{removed_tokens} tokens truncated…")
+}
+
+fn assemble_truncated_output(prefix: &str, suffix: &str, marker: &str) -> String {
+    let mut out = String::with_capacity(prefix.len() + marker.len() + suffix.len() + 1);
+    out.push_str(prefix);
+    out.push_str(marker);
+    out.push_str(suffix);
+    out
 }
 
 #[cfg(test)]
