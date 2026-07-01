@@ -2417,6 +2417,7 @@ impl RhoGui {
         }
         self.rerender_current_rho_state(window, cx);
         self.show_current_transcript_buffer(cx);
+        self.update_prompt_inlay(cx);
     }
 
     fn switch_to_agent_tab(
@@ -3013,6 +3014,7 @@ impl RhoGui {
         cx: &mut Context<Self>,
     ) {
         self.transcript.remove_range(range, cx);
+        self.update_prompt_inlay(cx);
         cx.notify();
     }
 
@@ -3114,6 +3116,7 @@ impl RhoGui {
         cx: &mut Context<Self>,
     ) -> Option<InsertedTranscript> {
         let inserted = self.transcript.insert_spans(spans, cx);
+        self.update_prompt_inlay(cx);
         cx.notify();
         inserted
     }
@@ -3125,6 +3128,7 @@ impl RhoGui {
         cx: &mut Context<Self>,
     ) -> Option<InsertedTranscript> {
         let inserted = self.transcript.replace_range_with_spans(range, spans, cx);
+        self.update_prompt_inlay(cx);
         cx.notify();
         inserted
     }
@@ -4861,6 +4865,54 @@ mod tests {
         assert!(
             text.contains(USER_MESSAGE_PREFIX),
             "empty prompt prefix should render as an inlay: {text:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn rho_empty_prompt_prefix_survives_transcript_insert(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            init_test_app(cx);
+        });
+
+        let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
+
+        let text = gui
+            .update(cx, |gui, _window, cx| {
+                gui.insert_before_draft_styled("system message\n", TranscriptStyle::SystemInfo, cx);
+                gui.prompt_buffer.update(cx, |buffer, _| {
+                    assert_eq!(buffer_text(buffer), "");
+                });
+                gui.editor.update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("update rho gui");
+
+        assert!(
+            text.contains(USER_MESSAGE_PREFIX),
+            "empty prompt prefix should survive transcript inserts: {text:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn rho_empty_prompt_prefix_renders_after_agent_swap(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            init_test_app(cx);
+        });
+
+        let gui = cx.add_window(|window, cx| RhoGui::new_for_test(window, cx));
+
+        let text = gui
+            .update(cx, |gui, window, cx| {
+                gui.show_agent_transcript(Some("agent-1".to_owned()), window, cx);
+                gui.prompt_buffer.update(cx, |buffer, _| {
+                    assert_eq!(buffer_text(buffer), "");
+                });
+                gui.editor.update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("update rho gui");
+
+        assert!(
+            text.contains(USER_MESSAGE_PREFIX),
+            "empty prompt prefix should render after swapping to a fresh agent: {text:?}"
         );
     }
 
