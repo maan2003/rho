@@ -217,6 +217,7 @@ async fn topic_and_agent_statuses_are_settable() {
     );
     write.set_topic_status(UnixMs(2), topic_id, Status::Pinned);
     write.set_agent_status(UnixMs(2), agent_id, Status::Archived);
+    write.set_agent_display_name(UnixMs(3), agent_id, "builder".to_owned());
     write.commit();
 
     let read = db.read();
@@ -225,7 +226,8 @@ async fn topic_and_agent_statuses_are_settable() {
     assert_eq!(topic.updated_at, UnixMs(2));
     let agent = read.get_agent(agent_id);
     assert_eq!(agent.status, Status::Archived);
-    assert_eq!(agent.updated_at, UnixMs(2));
+    assert_eq!(agent.display_name.as_deref(), Some("builder"));
+    assert_eq!(agent.updated_at, UnixMs(3));
 }
 
 #[tokio::test]

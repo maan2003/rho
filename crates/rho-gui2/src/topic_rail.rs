@@ -221,6 +221,10 @@ fn render_topic_rows(
         )
         .children(agents.into_iter().map(|summary| {
             let agent_id = &summary.agent_id;
+            let label = summary
+                .display_name
+                .clone()
+                .unwrap_or_else(|| summary.agent_id.to_string());
             let selected = selected_agent == Some(agent_id);
             let is_live = live.contains(agent_id);
             let pinned = summary.status == Status::Pinned;
@@ -271,7 +275,7 @@ fn render_topic_rows(
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_color(text_color)
-                        .child(agent_id.to_string()),
+                        .child(label),
                 )
         }))
 }

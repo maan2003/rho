@@ -327,6 +327,12 @@ impl AgentClient {
             .send(ClientMessage::SetAgentStatus { agent_id, status });
     }
 
+    pub fn rename_agent(&self, agent_id: AgentId, name: String) {
+        let _ = self
+            .commands
+            .send(ClientMessage::RenameAgent { agent_id, name });
+    }
+
     pub fn set_topic_status(&self, topic_id: TopicId, status: crate::Status) {
         let _ = self
             .commands

@@ -29,6 +29,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Cancel the current agent's turn",
     },
     CommandSpec {
+        name: "agent rename",
+        usage: ":agent rename <name>",
+        description: "Rename the current agent",
+    },
+    CommandSpec {
         name: "agent pin",
         usage: ":agent pin",
         description: "Pin/unpin the current agent",
@@ -98,6 +103,7 @@ pub const COMMANDS: &[CommandSpec] = &[
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     AgentNew { working_directory: Option<PathBuf> },
+    AgentRename { name: String },
     AgentCancel,
     AgentPin,
     AgentArchive,
@@ -131,10 +137,14 @@ pub fn parse(line: &str) -> Option<Parsed> {
             Some("new") => Parsed::Command(Command::AgentNew {
                 working_directory: tokens.next().map(PathBuf::from),
             }),
+            Some("rename") => match joined_name(rest) {
+                Some(name) => Parsed::Command(Command::AgentRename { name }),
+                None => Parsed::Invalid(":agent rename <name>".to_owned()),
+            },
             Some("cancel") => Parsed::Command(Command::AgentCancel),
             Some("pin") => Parsed::Command(Command::AgentPin),
             Some("archive") => Parsed::Command(Command::AgentArchive),
-            _ => Parsed::Invalid(":agent new|cancel|pin|archive".to_owned()),
+            _ => Parsed::Invalid(":agent new|rename|cancel|pin|archive".to_owned()),
         },
         "topic" => match tokens.next() {
             Some("new") => match joined_name(rest) {

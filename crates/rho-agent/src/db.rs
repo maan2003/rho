@@ -206,6 +206,8 @@ pub trait AgentWriteTxnExt {
 
     fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status);
 
+    fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
+
     fn create_agent(
         &mut self,
         now: UnixMillis,
@@ -362,6 +364,18 @@ impl AgentWriteTxnExt for WriteTxn {
             .value()
             .into_owned();
         agent.status = status;
+        agent.updated_at = now;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
+    fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.display_name = Some(name);
         agent.updated_at = now;
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }

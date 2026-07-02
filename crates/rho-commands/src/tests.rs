@@ -30,6 +30,16 @@ fn parses_agent_commands() {
         }))
     );
     assert_eq!(parse(":cancel"), Some(Parsed::Command(Command::AgentCancel)));
+    assert_eq!(
+        parse(":agent rename build fixer"),
+        Some(Parsed::Command(Command::AgentRename {
+            name: "build fixer".to_owned()
+        }))
+    );
+    assert_eq!(
+        parse(":agent rename"),
+        Some(Parsed::Invalid(":agent rename <name>".to_owned()))
+    );
 }
 
 #[test]
@@ -145,7 +155,7 @@ fn completes_command_words_stepwise() {
     assert_eq!(values(&first).iter().filter(|v| **v == "agent").count(), 1);
 
     let second = completion_candidates(":agent ", &ctx);
-    assert_eq!(values(&second), ["new", "cancel", "pin", "archive"]);
+    assert_eq!(values(&second), ["new", "cancel", "rename", "pin", "archive"]);
 
     let partial = completion_candidates(":agent ar", &ctx);
     assert_eq!(values(&partial), ["archive"]);

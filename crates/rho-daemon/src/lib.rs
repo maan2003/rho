@@ -280,6 +280,25 @@ impl AgentRegistry {
         Ok(())
     }
 
+    async fn rename_agent(&self, agent_id: AgentId, name: String) -> anyhow::Result<()> {
+        if name.trim().is_empty() {
+            anyhow::bail!("agent name cannot be empty");
+        }
+        if !self
+            .db
+            .read()
+            .list_agents()
+            .into_iter()
+            .any(|(id, _)| id == agent_id)
+        {
+            anyhow::bail!("unknown agent id: {agent_id}");
+        }
+        let mut write = self.db.write().await;
+        write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, name);
+        write.commit();
+        Ok(())
+    }
+
     async fn set_topic_status(&self, topic_id: TopicId, status: Status) -> anyhow::Result<()> {
         if !self
             .db
@@ -475,6 +494,18 @@ async fn serve_connection(
             }
             ClientMessage::SetAgentStatus { agent_id, status } => {
                 match agents.set_agent_status(agent_id, status).await {
+                    Ok(()) => {
+                        let _ = outgoing_tx.send(agents.ready_message());
+                    }
+                    Err(error) => {
+                        let _ = outgoing_tx.send(ServerMessage::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ClientMessage::RenameAgent { agent_id, name } => {
+                match agents.rename_agent(agent_id, name).await {
                     Ok(()) => {
                         let _ = outgoing_tx.send(agents.ready_message());
                     }

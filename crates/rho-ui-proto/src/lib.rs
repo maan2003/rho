@@ -82,6 +82,10 @@ pub enum ClientMessage {
         agent_id: AgentId,
         content: Vec<ContentPart>,
     },
+    RenameAgent {
+        agent_id: AgentId,
+        name: String,
+    },
     CancelTurn {
         agent_id: AgentId,
     },

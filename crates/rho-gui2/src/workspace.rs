@@ -365,6 +365,21 @@ impl Workspace {
                     ),
                 }
             }
+            Command::AgentRename { name } => {
+                let target = source_agent.or_else(|| self.registry.selected().cloned());
+                match target {
+                    Some(agent_id) => {
+                        self.connection
+                            .send(ClientMessage::RenameAgent { agent_id, name });
+                    }
+                    None => self.notice_on(
+                        None,
+                        ":agent rename: no agent selected",
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            }
             Command::TopicNew { name } => {
                 self.connection.send(ClientMessage::NewTopic { name });
             }

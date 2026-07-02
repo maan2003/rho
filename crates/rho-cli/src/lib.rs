@@ -246,6 +246,15 @@ impl ChatApp {
                     .print_system(&format!("new agent in {}", working_directory.display()));
                 self.agent.new_agent_in_topic(topic_id, working_directory);
             }
+            rho_commands::Command::AgentRename { name } => {
+                let Some(agent_id) = primary_agent_id(&self.agent) else {
+                    self.term.print_system(":agent rename: no agent yet");
+                    return Ok(true);
+                };
+                self.term
+                    .print_system(&format!("renamed {agent_id} to `{name}`"));
+                self.agent.rename_agent(agent_id, name);
+            }
             rho_commands::Command::AgentPin => {
                 self.toggle_agent_status(rho_ui_proto::Status::Pinned);
             }
