@@ -86,15 +86,11 @@ fn run() -> Result<()> {
 }
 
 fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
-    let project_root = std::env::current_dir().context("failed to read current directory")?;
     let socket_path = match args.socket {
         Some(socket_path) => socket_path,
         None => rho_daemon::default_socket_path()?,
     };
-    Ok(AttachTarget {
-        socket_path,
-        project_root,
-    })
+    Ok(AttachTarget { socket_path })
 }
 
 fn init_app(cx: &mut App) -> Result<()> {

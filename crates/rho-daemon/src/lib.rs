@@ -474,7 +474,10 @@ fn subscribe_agent(
 
 /// Working directories must be absolute (the daemon's cwd is meaningless by
 /// design) and must exist when an agent is created or a workdir registered.
+/// A leading `~` expands to the daemon's home: clients may run on another
+/// machine, so path interpretation belongs here.
 fn validate_working_directory(path: PathBuf) -> anyhow::Result<PathBuf> {
+    let path = expand_home(&path).unwrap_or(path);
     if !path.is_absolute() {
         anyhow::bail!("working directory must be absolute: {}", path.display());
     }
@@ -482,6 +485,11 @@ fn validate_working_directory(path: PathBuf) -> anyhow::Result<PathBuf> {
         anyhow::bail!("working directory does not exist: {}", path.display());
     }
     Ok(path)
+}
+
+fn expand_home(path: &std::path::Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix("~").ok()?;
+    Some(dirs::home_dir()?.join(rest))
 }
 
 fn ui_topic_status(status: TopicStatus) -> UiTopicStatus {

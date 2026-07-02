@@ -44,7 +44,6 @@ fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     cx.update(init_test_app);
     let target = AttachTarget {
         socket_path: std::env::temp_dir().join("rho-gui2-test-nonexistent.sock"),
-        project_root: std::env::temp_dir(),
     };
     cx.add_window(|window, cx| Workspace::new(target, window, cx))
 }

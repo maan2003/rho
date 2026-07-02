@@ -26,10 +26,13 @@ use crate::{
     AgentNew, AgentNext, AgentPrevious, RoleCycle, RoleCycleGroup, SubmitPrompt, TaskBoard,
 };
 
+/// How to reach the daemon. Deliberately holds no client-local paths: the
+/// socket may be forwarded from another machine, so the GUI's own cwd and
+/// home mean nothing to the daemon and must never leak into agent working
+/// directories.
 #[derive(Clone)]
 pub struct AttachTarget {
     pub socket_path: PathBuf,
-    pub project_root: PathBuf,
 }
 
 pub struct Workspace {
@@ -41,7 +44,6 @@ pub struct Workspace {
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
     draft_view: Entity<DraftView>,
-    project_root: PathBuf,
     /// Registered workdirs from the daemon; selection vocabulary for new
     /// agents.
     workdirs: Vec<rho_ui_proto::UiWorkdir>,
@@ -96,7 +98,6 @@ impl Workspace {
             views: HashMap::new(),
             pending_syncs: HashMap::new(),
             draft_view,
-            project_root: attach_target.project_root,
             workdirs: Vec::new(),
             draft_topic_id: None,
             default_topic_id: None,
@@ -145,7 +146,10 @@ impl Workspace {
                     self.awaiting_draft_agent = false;
                     // The draft became this agent: reset the compose surface
                     // and follow the new agent.
-                    let label = self.workdir_label(&self.draft_default_workdir());
+                    let label = self
+                        .draft_default_workdir()
+                        .map(|path| self.workdir_label(&path))
+                        .unwrap_or_default();
                     self.draft_view.update(cx, |view, cx| {
                         view.set_body_text("", cx);
                         view.set_workdir_text(&label, cx);
@@ -288,8 +292,17 @@ impl Workspace {
         let field = self.draft_view.read(cx).workdir_text(cx).trim().to_owned();
         let working_directory = (!field.is_empty())
             .then(|| self.resolve_workdir_path(PathBuf::from(field)))
-            .or_else(|| self.registry.last_working_directory(topic_id))
-            .unwrap_or_else(|| self.project_root.clone());
+            .or_else(|| self.draft_default_workdir());
+        let Some(working_directory) = working_directory else {
+            self.notice_on(
+                None,
+                "no working directory for the new agent: type one in the \
+                 Workdir field, or register one with :workdirs add <path>",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
         self.awaiting_draft_agent = true;
         self.connection.send(ClientMessage::NewAgent {
             topic_id,
@@ -374,11 +387,21 @@ impl Workspace {
                     .send(ClientMessage::MoveAgent { agent_id, topic });
             }
             Command::WorkdirAdd { path, name } => {
-                let path = path.map_or_else(
-                    || self.project_root.clone(),
-                    |path| self.resolve_workdir_path(path),
-                );
-                self.connection.send(ClientMessage::WorkdirSet { path, name });
+                // Unlike the CLI, the GUI may run on another machine, so
+                // there is no local directory to default to.
+                let Some(path) = path else {
+                    self.notice_on(
+                        source_agent.as_ref(),
+                        "usage: :workdirs add <path> [name]",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                };
+                self.connection.send(ClientMessage::WorkdirSet {
+                    path: self.resolve_workdir_path(path),
+                    name,
+                });
             }
             Command::WorkdirRemove { path } => {
                 match rho_commands::resolve_workdir(&path, &self.workdir_table()) {
@@ -469,21 +492,26 @@ impl Workspace {
         }
     }
 
-    /// (Re)writes the draft scaffold with the derived default workdir.
+    /// (Re)writes the draft scaffold with the derived default workdir; the
+    /// field stays empty when nothing daemon-side suggests one.
     fn seed_draft(&mut self, force_header: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let label = self.workdir_label(&self.draft_default_workdir());
+        let label = self
+            .draft_default_workdir()
+            .map(|path| self.workdir_label(&path))
+            .unwrap_or_default();
         self.draft_view
             .update(cx, |view, cx| view.seed(&label, force_header, window, cx));
     }
 
     /// Where a new agent works when the draft doesn't say: the inherited
-    /// topic's newest agent sets the precedent, else where the GUI was
-    /// launched.
-    fn draft_default_workdir(&self) -> PathBuf {
+    /// topic's newest agent sets the precedent, else the first registered
+    /// workdir. All daemon-side data — the GUI may run on another machine,
+    /// so its own cwd is meaningless here.
+    fn draft_default_workdir(&self) -> Option<PathBuf> {
         self.draft_topic_id
             .or(self.default_topic_id)
             .and_then(|topic_id| self.registry.last_working_directory(topic_id))
-            .unwrap_or_else(|| self.project_root.clone())
+            .or_else(|| self.workdirs.first().map(|workdir| workdir.path.clone()))
     }
 
     /// How a path reads in the draft header: its registered workdir name
@@ -521,24 +549,14 @@ impl Workspace {
             .collect()
     }
 
-    /// A workdir argument may be a registered name, `~`-prefixed, or
-    /// relative to where the GUI was launched.
+    /// A registered workdir name resolves to its path; anything else passes
+    /// through untouched. Paths name directories on the daemon's machine,
+    /// so the GUI never joins its own cwd or expands its own home — the
+    /// daemon expands `~` and validates.
     fn resolve_workdir_path(&self, path: PathBuf) -> PathBuf {
-        let argument = path.display().to_string();
-        if let Some(resolved) = rho_commands::resolve_workdir(&argument, &self.workdir_table()) {
-            return resolved.into();
-        }
-        if argument == "~"
-            && let Some(home) = std::env::home_dir()
-        {
-            return home;
-        }
-        if let Some(rest) = argument.strip_prefix("~/")
-            && let Some(home) = std::env::home_dir()
-        {
-            return home.join(rest);
-        }
-        self.project_root.join(path)
+        rho_commands::resolve_workdir(&path.display().to_string(), &self.workdir_table())
+            .map(PathBuf::from)
+            .unwrap_or(path)
     }
 
     fn notice_on(
@@ -660,13 +678,12 @@ impl Workspace {
         }
     }
 
-    /// Chip label: the agent's own working directory.
+    /// Chip label: the agent's own working directory, when its summary has
+    /// arrived.
     fn working_directory_label(&self, agent_id: &AgentId) -> String {
-        let directory = self
-            .registry
-            .working_directory(*agent_id)
-            .cloned()
-            .unwrap_or_else(|| self.project_root.clone());
+        let Some(directory) = self.registry.working_directory(*agent_id) else {
+            return String::new();
+        };
         directory
             .file_name()
             .and_then(|name| name.to_str())
