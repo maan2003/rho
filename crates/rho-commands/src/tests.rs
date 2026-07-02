@@ -47,12 +47,13 @@ fn parses_topic_new_with_multi_word_name() {
     assert_eq!(
         parse(":topic new fix auth bug"),
         Some(Parsed::Command(Command::TopicNew {
-            name: Some("fix auth bug".to_owned())
+            name: "fix auth bug".to_owned()
         }))
     );
+    // Unnamed topics don't exist; the name is required.
     assert_eq!(
         parse(":topic new"),
-        Some(Parsed::Command(Command::TopicNew { name: None }))
+        Some(Parsed::Invalid(":topic new <name>".to_owned()))
     );
 }
 

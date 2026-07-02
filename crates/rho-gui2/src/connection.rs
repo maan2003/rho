@@ -20,6 +20,7 @@ pub enum ConnEvent {
     Ready {
         topics: Vec<UiTopic>,
         workdirs: Vec<UiWorkdir>,
+        default_topic_id: rho_ui_proto::TopicId,
     },
     TopicCreated(UiTopic),
     /// The daemon created an agent this connection asked for.
@@ -75,11 +76,20 @@ async fn run(
     let mut stream = client.into_stream();
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
-    let ServerMessage::Ready { topics, workdirs } = message else {
+    let ServerMessage::Ready {
+        topics,
+        workdirs,
+        default_topic_id,
+    } = message
+    else {
         anyhow::bail!("rho daemon did not send ready message");
     };
     if events
-        .unbounded_send(ConnEvent::Ready { topics, workdirs })
+        .unbounded_send(ConnEvent::Ready {
+            topics,
+            workdirs,
+            default_topic_id,
+        })
         .is_err()
     {
         return Ok(());
@@ -103,9 +113,15 @@ async fn run(
             }
         };
         let event = match message {
-            ServerMessage::Ready { topics, workdirs } => {
-                Some(ConnEvent::Ready { topics, workdirs })
-            }
+            ServerMessage::Ready {
+                topics,
+                workdirs,
+                default_topic_id,
+            } => Some(ConnEvent::Ready {
+                topics,
+                workdirs,
+                default_topic_id,
+            }),
             ServerMessage::TopicCreated { topic } => Some(ConnEvent::TopicCreated(topic)),
             ServerMessage::AgentCreated { agent_id, .. } => {
                 Some(ConnEvent::AgentCreated(agent_id))

@@ -49,6 +49,9 @@ pub struct Workspace {
     /// was entered. Topics are ad-hoc tab groups — a new agent lands in the
     /// default topic unless created from inside one.
     draft_topic_id: Option<rho_ui_proto::TopicId>,
+    /// Announced by the daemon in `Ready`; where draft submissions land when
+    /// no topic was inherited.
+    default_topic_id: Option<rho_ui_proto::TopicId>,
     /// A NewAgent request from the draft is in flight; the draft buffer is
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
@@ -96,6 +99,7 @@ impl Workspace {
             project_root: attach_target.project_root,
             workdirs: Vec::new(),
             draft_topic_id: None,
+            default_topic_id: None,
             awaiting_draft_agent: false,
             connected: false,
             duration_timer: None,
@@ -113,10 +117,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ConnEvent::Ready { topics, workdirs } => {
+            ConnEvent::Ready {
+                topics,
+                workdirs,
+                default_topic_id,
+            } => {
                 let first_ready = !self.connected;
                 self.registry.set_topics(topics);
                 self.workdirs = workdirs;
+                self.default_topic_id = Some(default_topic_id);
                 self.connected = true;
                 if first_ready && self.registry.selected().is_none() {
                     // The startup scaffold guessed before daemon data existed;
@@ -272,10 +281,7 @@ impl Workspace {
             self.notice_on(None, "not connected to rho-daemon", StyleClass::SystemImportant, cx);
             return;
         }
-        let Some(topic_id) = self
-            .draft_topic_id
-            .or_else(|| self.registry.topics().first().map(|topic| topic.topic_id))
-        else {
+        let Some(topic_id) = self.draft_topic_id.or(self.default_topic_id) else {
             self.notice_on(None, "no rho topic is available", StyleClass::SystemInfo, cx);
             return;
         };
@@ -347,9 +353,7 @@ impl Workspace {
                 self.open_agent(agent_id, window, cx);
             }
             Command::TopicNew { name } => {
-                self.connection.send(ClientMessage::NewTopic {
-                    display_name: name,
-                });
+                self.connection.send(ClientMessage::NewTopic { name });
             }
             Command::TopicMove { name } => {
                 let target = source_agent.or_else(|| self.registry.selected().copied());
@@ -477,7 +481,7 @@ impl Workspace {
     /// launched.
     fn draft_default_workdir(&self) -> PathBuf {
         self.draft_topic_id
-            .or_else(|| self.registry.topics().first().map(|topic| topic.topic_id))
+            .or(self.default_topic_id)
             .and_then(|topic_id| self.registry.last_working_directory(topic_id))
             .unwrap_or_else(|| self.project_root.clone())
     }
@@ -492,21 +496,12 @@ impl Workspace {
             .unwrap_or_else(|| path.display().to_string())
     }
 
-    /// Topics as the `(label, id)` pairs shared resolution expects: display
-    /// name, or the id string for unnamed topics.
+    /// Topics as the `(name, id)` pairs shared resolution expects.
     fn topic_labels(&self) -> Vec<(String, rho_ui_proto::TopicId)> {
         self.registry
             .topics()
             .iter()
-            .map(|topic| {
-                (
-                    topic
-                        .display_name
-                        .clone()
-                        .unwrap_or_else(|| topic.topic_id.to_string()),
-                    topic.topic_id,
-                )
-            })
+            .map(|topic| (topic.name.clone(), topic.topic_id))
             .collect()
     }
 

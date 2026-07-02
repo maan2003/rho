@@ -111,7 +111,7 @@ pub enum TopicStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct TopicRecord {
-    pub display_name: Option<String>,
+    pub name: String,
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
     pub status: TopicStatus,
@@ -196,12 +196,7 @@ pub trait AgentReadTxnExt {
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
 
-    fn create_topic(
-        &mut self,
-        now: UnixMillis,
-        display_name: Option<String>,
-        status: TopicStatus,
-    ) -> TopicId;
+    fn create_topic(&mut self, now: UnixMillis, name: String, status: TopicStatus) -> TopicId;
 
     fn create_agent(
         &mut self,
@@ -326,15 +321,10 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(WORKDIRS);
     }
 
-    fn create_topic(
-        &mut self,
-        now: UnixMillis,
-        display_name: Option<String>,
-        status: TopicStatus,
-    ) -> TopicId {
+    fn create_topic(&mut self, now: UnixMillis, name: String, status: TopicStatus) -> TopicId {
         let topic_id = TopicId(next_counter(self, CounterKey::LAST_TOPIC_ID));
         let topic = TopicRecord {
-            display_name,
+            name,
             created_at: now,
             updated_at: now,
             status,

@@ -235,11 +235,7 @@ impl ChatApp {
                 self.cancel_running_turn().await;
             }
             rho_commands::Command::AgentNew { working_directory } => {
-                let Some(topic_id) = self.agent.topics().first().map(|topic| topic.topic_id)
-                else {
-                    self.term.print_system("no rho topic is available");
-                    return Ok(true);
-                };
+                let topic_id = self.agent.default_topic_id();
                 let Some(working_directory) =
                     resolve_working_directory(working_directory, &workdir_table(&self.agent))
                 else {
@@ -255,8 +251,8 @@ impl ChatApp {
                 self.term.print_system(&format!("loading {agent_id}"));
             }
             rho_commands::Command::TopicNew { name } => {
+                self.term.print_system(&format!("creating topic `{name}`"));
                 self.agent.new_topic(name);
-                self.term.print_system("topic created");
             }
             rho_commands::Command::TopicMove { name } => {
                 let Some(agent_id) = primary_agent_id(&self.agent) else {
@@ -371,13 +367,17 @@ fn primary_state(states: &HashMap<AgentId, UiAgentState>) -> Option<&UiAgentStat
 fn send_prompt(agent: &AgentClient, text: String) {
     if let Some(agent_id) = primary_agent_id(agent) {
         agent.send_user_message(agent_id, text);
-    } else if let Some(topic) = agent.topics().first() {
+    } else {
         // New agents work where the CLI was launched; the daemon's own cwd
         // is meaningless by design.
         let Ok(working_directory) = std::env::current_dir() else {
             return;
         };
-        agent.new_agent_with_user_message_in_topic(topic.topic_id, working_directory, text);
+        agent.new_agent_with_user_message_in_topic(
+            agent.default_topic_id(),
+            working_directory,
+            text,
+        );
     }
 }
 
@@ -391,20 +391,12 @@ fn workdir_table(agent: &AgentClient) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Topics as the `(label, id)` pairs shared completion and resolution
-/// expect: display name, or the id string for unnamed topics.
+/// Topics as the `(name, id)` pairs shared completion and resolution expect.
 fn topic_labels(agent: &AgentClient) -> Vec<(String, rho_ui_proto::TopicId)> {
     agent
         .topics()
         .into_iter()
-        .map(|topic| {
-            (
-                topic
-                    .display_name
-                    .unwrap_or_else(|| topic.topic_id.to_string()),
-                topic.topic_id,
-            )
-        })
+        .map(|topic| (topic.name, topic.topic_id))
         .collect()
 }
 

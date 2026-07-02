@@ -53,7 +53,7 @@ async fn create_agent_and_append_events_with_cursor() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
-    let topic_id = write.create_topic(UnixMs(1), None, TopicStatus::Normal);
+    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), TopicStatus::Normal);
     let (agent_id, next) = write.create_agent(
         UnixMs(1),
         topic_id,
@@ -104,7 +104,7 @@ async fn agent_events_read_lineage_parents() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
-    let topic_id = write.create_topic(UnixMs(1), None, TopicStatus::Normal);
+    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), TopicStatus::Normal);
     let (agent_id, next) = write.create_agent(
         UnixMs(1),
         topic_id,
@@ -175,8 +175,8 @@ async fn move_agent_to_topic_repoints_membership() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let default_topic = write.create_topic(UnixMs(1), None, TopicStatus::Normal);
-    let named_topic = write.create_topic(UnixMs(1), Some("infra".to_owned()), TopicStatus::Normal);
+    let default_topic = write.create_topic(UnixMs(1), "default".to_owned(), TopicStatus::Normal);
+    let named_topic = write.create_topic(UnixMs(1), "infra".to_owned(), TopicStatus::Normal);
     let (agent_id, _) = write.create_agent(
         UnixMs(1),
         default_topic,

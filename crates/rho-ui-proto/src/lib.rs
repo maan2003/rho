@@ -65,7 +65,7 @@ pub enum ClientMessage {
     Ping,
     Subscribe,
     NewTopic {
-        display_name: Option<String>,
+        name: String,
     },
     NewAgent {
         topic_id: TopicId,
@@ -119,6 +119,10 @@ pub enum ServerMessage {
     Ready {
         topics: Vec<UiTopic>,
         workdirs: Vec<UiWorkdir>,
+        /// Where new agents land when the client doesn't say otherwise (the
+        /// daemon-created "default" topic). Identified explicitly so clients
+        /// never have to guess from topic ordering.
+        default_topic_id: TopicId,
     },
     Error {
         message: String,
@@ -145,7 +149,7 @@ pub enum ServerMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiTopic {
     pub topic_id: TopicId,
-    pub display_name: Option<String>,
+    pub name: String,
     pub status: UiTopicStatus,
     pub agents: Vec<UiAgentSummary>,
 }

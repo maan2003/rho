@@ -1,9 +1,10 @@
-//! The left rail listing agents and their topic groups.
+//! The left rail listing agents grouped by topic.
 //!
-//! Topics are ad-hoc tab groups: the default (first, unnamed) topic renders
-//! as a flat list of loose agents with no header, named topics as groups
-//! below it. Clicking an agent opens it (loading it on demand); the `+` row
-//! opens the draft compose view and doubles as its selection indicator.
+//! Topics are ad-hoc tab groups; every topic — including the daemon-created
+//! "default" one that agents are born into — renders uniformly with its
+//! name as the header, which advertises that grouping exists. Clicking an
+//! agent opens it (loading it on demand); the `+` row opens the draft
+//! compose view and doubles as its selection indicator.
 
 use std::collections::BTreeSet;
 
@@ -34,14 +35,9 @@ pub fn render_topic_rail(
     let rows = registry
         .topics()
         .iter()
-        .enumerate()
-        .map(|(index, topic)| {
-            // The default topic is where agents are born; it isn't a group,
-            // its agents just sit loose at the top of the rail.
-            let show_header = !(index == 0 && topic.display_name.is_none());
+        .map(|topic| {
             render_topic_rows(
                 topic,
-                show_header,
                 selected_agent.as_ref(),
                 &live,
                 text_style,
@@ -118,32 +114,26 @@ fn new_agent_row(
 
 fn render_topic_rows(
     topic: &UiTopic,
-    show_header: bool,
     selected_agent: Option<&AgentId>,
     live: &BTreeSet<AgentId>,
     text_style: &TextStyle,
     selected_color: gpui::Hsla,
     cx: &mut Context<Workspace>,
 ) -> Div {
-    let name = topic
-        .display_name
-        .clone()
-        .unwrap_or_else(|| topic.topic_id.to_string());
+    let name = topic.name.clone();
     div()
         .w_full()
         .flex()
         .flex_col()
         .gap_0p5()
-        .when(show_header, |this| {
-            this.child(
-                div()
-                    .w_full()
-                    .pt(px(5.))
-                    .pl(px(4.))
-                    .text_color(text_style.color.opacity(0.65))
-                    .child(name),
-            )
-        })
+        .child(
+            div()
+                .w_full()
+                .pt(px(5.))
+                .pl(px(4.))
+                .text_color(text_style.color.opacity(0.65))
+                .child(name),
+        )
         .children(topic.agents.iter().map(|summary| {
             let agent_id = &summary.agent_id;
             let selected = selected_agent == Some(agent_id);

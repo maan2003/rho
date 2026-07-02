@@ -98,6 +98,9 @@ struct AgentRegistry {
     db: RhoDb,
     auth: InferenceAuth,
     inference_config: InferenceConfig,
+    /// The daemon-created topic agents are born into; announced in `Ready`
+    /// so clients never guess it from topic ordering.
+    default_topic_id: TopicId,
     agents: Mutex<HashMap<AgentId, Agent>>,
 }
 
@@ -106,15 +109,26 @@ impl AgentRegistry {
         let mut write = db.write().await;
         write.init_agent_tables();
         write.commit();
-        if db.read().list_topics().is_empty() {
-            let mut write = db.write().await;
-            write.create_topic(rho_core::UnixMs::now(), None, TopicStatus::Normal);
-            write.commit();
-        }
+        // Topics are ad-hoc tab groups; every agent starts in the default
+        // one (the oldest topic) until it is moved somewhere more specific.
+        let default_topic_id = match db.read().list_topics().first() {
+            Some((topic_id, _)) => *topic_id,
+            None => {
+                let mut write = db.write().await;
+                let topic_id = write.create_topic(
+                    rho_core::UnixMs::now(),
+                    "default".to_owned(),
+                    TopicStatus::Normal,
+                );
+                write.commit();
+                topic_id
+            }
+        };
         Self {
             db,
             auth,
             inference_config,
+            default_topic_id,
             agents: Mutex::new(HashMap::new()),
         }
     }
@@ -126,7 +140,7 @@ impl AgentRegistry {
             .into_iter()
             .map(|(topic_id, topic)| UiTopic {
                 topic_id,
-                display_name: topic.display_name,
+                name: topic.name,
                 status: ui_topic_status(topic.status),
                 agents: read
                     .list_topic_agents(topic_id)
@@ -165,6 +179,7 @@ impl AgentRegistry {
         ServerMessage::Ready {
             topics: self.topics(),
             workdirs: self.workdirs(),
+            default_topic_id: self.default_topic_id,
         }
     }
 
@@ -184,14 +199,13 @@ impl AgentRegistry {
         self.agents.lock().await.get(&agent_id).cloned()
     }
 
-    async fn create_topic(&self, display_name: Option<String>) -> UiTopic {
+    async fn create_topic(&self, name: String) -> UiTopic {
         let mut write = self.db.write().await;
-        let topic_id =
-            write.create_topic(rho_core::UnixMs::now(), display_name, TopicStatus::Normal);
+        let topic_id = write.create_topic(rho_core::UnixMs::now(), name, TopicStatus::Normal);
         write.commit();
         UiTopic {
             topic_id,
-            display_name: self.db.read().get_topic(topic_id).display_name,
+            name: self.db.read().get_topic(topic_id).name,
             status: UiTopicStatus::Normal,
             agents: Vec::new(),
         }
@@ -238,10 +252,10 @@ impl AgentRegistry {
             }
             rho_ui_proto::TopicTarget::Named(name) => topics
                 .iter()
-                .find(|(_, topic)| topic.display_name.as_deref() == Some(&name))
+                .find(|(_, topic)| topic.name == name)
                 .map(|(topic_id, _)| *topic_id)
                 .unwrap_or_else(|| {
-                    write.create_topic(rho_core::UnixMs::now(), Some(name), TopicStatus::Normal)
+                    write.create_topic(rho_core::UnixMs::now(), name, TopicStatus::Normal)
                 }),
         };
         write.move_agent_to_topic(agent_id, topic_id);
@@ -332,8 +346,8 @@ async fn serve_connection(
                 let _ = outgoing_tx.send(ServerMessage::Pong);
             }
             ClientMessage::Subscribe => {}
-            ClientMessage::NewTopic { display_name } => {
-                let topic = agents.create_topic(display_name).await;
+            ClientMessage::NewTopic { name } => {
+                let topic = agents.create_topic(name).await;
                 let _ = outgoing_tx.send(ServerMessage::TopicCreated { topic });
                 let _ = outgoing_tx.send(agents.ready_message());
             }

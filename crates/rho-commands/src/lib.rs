@@ -36,7 +36,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "topic new",
-        usage: ":topic new [name]",
+        usage: ":topic new <name>",
         description: "Create a new topic",
     },
     CommandSpec {
@@ -86,7 +86,7 @@ pub enum Command {
     AgentNew { working_directory: Option<PathBuf> },
     AgentLoad { agent_id: AgentId },
     AgentCancel,
-    TopicNew { name: Option<String> },
+    TopicNew { name: String },
     TopicMove { name: String },
     WorkdirAdd { path: Option<PathBuf>, name: Option<String> },
     WorkdirRemove { path: String },
@@ -128,9 +128,11 @@ pub fn parse(line: &str) -> Option<Parsed> {
                     .skip(2)
                     .collect::<Vec<_>>()
                     .join(" ");
-                Parsed::Command(Command::TopicNew {
-                    name: (!name.is_empty()).then_some(name),
-                })
+                if name.is_empty() {
+                    Parsed::Invalid(":topic new <name>".to_owned())
+                } else {
+                    Parsed::Command(Command::TopicNew { name })
+                }
             }
             Some("move") => {
                 let name = rest

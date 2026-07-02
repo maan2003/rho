@@ -73,6 +73,7 @@ pub struct AgentClient {
     state: watch::Receiver<HashMap<AgentId, UiAgentState>>,
     topics: watch::Receiver<Vec<UiTopic>>,
     workdirs: watch::Receiver<Vec<UiWorkdir>>,
+    default_topic_id: watch::Receiver<TopicId>,
     known_agent_ids: watch::Receiver<Vec<AgentId>>,
     frames: broadcast::Sender<(AgentId, AgentRemoteFrame)>,
     counters: IoCounters,
@@ -99,8 +100,11 @@ impl AgentClient {
                 &ClientMessage::Subscribe,
             );
         }
-        let ServerMessage::Ready { topics, workdirs } =
-            read_frame_counted(&mut stream, Some(&client_counters)).await?
+        let ServerMessage::Ready {
+            topics,
+            workdirs,
+            default_topic_id,
+        } = read_frame_counted(&mut stream, Some(&client_counters)).await?
         else {
             anyhow::bail!("rho daemon did not send ready message");
         };
@@ -111,6 +115,7 @@ impl AgentClient {
                 &ServerMessage::Ready {
                     topics: topics.clone(),
                     workdirs: workdirs.clone(),
+                    default_topic_id,
                 },
             );
         }
@@ -119,6 +124,7 @@ impl AgentClient {
         let (state_tx, state_rx) = watch::channel(HashMap::new());
         let (topics_tx, topics_rx) = watch::channel(topics.clone());
         let (workdirs_tx, workdirs_rx) = watch::channel(workdirs);
+        let (default_topic_tx, default_topic_rx) = watch::channel(default_topic_id);
         let (known_agent_ids_tx, known_agent_ids_rx) = watch::channel(agent_ids);
         let (frame_tx, _) = broadcast::channel::<(AgentId, AgentRemoteFrame)>(256);
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<ClientMessage>();
@@ -152,12 +158,19 @@ impl AgentClient {
                             break;
                         }
                     }
-                    ServerMessage::Ready { topics, workdirs } => {
+                    ServerMessage::Ready {
+                        topics,
+                        workdirs,
+                        default_topic_id,
+                    } => {
                         known_agent_ids = topic_agent_ids(&topics);
                         if topics_tx.send(topics).is_err() {
                             break;
                         }
                         if workdirs_tx.send(workdirs).is_err() {
+                            break;
+                        }
+                        if default_topic_tx.send(default_topic_id).is_err() {
                             break;
                         }
                         if known_agent_ids_tx.send(known_agent_ids.clone()).is_err() {
@@ -216,6 +229,7 @@ impl AgentClient {
             state: state_rx,
             topics: topics_rx,
             workdirs: workdirs_rx,
+            default_topic_id: default_topic_rx,
             known_agent_ids: known_agent_ids_rx,
             frames: frame_tx,
             counters: client_counters,
@@ -263,6 +277,11 @@ impl AgentClient {
         self.workdirs.borrow().clone()
     }
 
+    /// Where new agents land when no topic is chosen.
+    pub fn default_topic_id(&self) -> TopicId {
+        *self.default_topic_id.borrow()
+    }
+
     pub fn new_agent_with_user_message_in_topic(
         &self,
         topic_id: TopicId,
@@ -284,8 +303,8 @@ impl AgentClient {
         });
     }
 
-    pub fn new_topic(&self, display_name: Option<String>) {
-        let _ = self.commands.send(ClientMessage::NewTopic { display_name });
+    pub fn new_topic(&self, name: String) {
+        let _ = self.commands.send(ClientMessage::NewTopic { name });
     }
 
     pub fn set_workdir(&self, path: PathBuf, name: Option<String>) {
