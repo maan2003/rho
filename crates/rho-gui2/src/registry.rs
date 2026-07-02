@@ -6,6 +6,7 @@
 //! cycling operate over live agents only.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use rho_ui_proto::{AgentId, UiTopic};
 
@@ -25,11 +26,31 @@ pub struct AgentRegistry {
 impl AgentRegistry {
     pub fn set_topics(&mut self, topics: Vec<UiTopic>) {
         for topic in &topics {
-            for agent_id in &topic.agent_ids {
-                self.agents.entry(*agent_id).or_insert(AgentLife::Known);
+            for agent_id in topic.agent_ids() {
+                self.agents.entry(agent_id).or_insert(AgentLife::Known);
             }
         }
         self.topics = topics;
+    }
+
+    /// Where a new agent should work: the newest agent in the topic sets the
+    /// precedent, since sibling agents usually share a project.
+    pub fn last_working_directory(&self, topic_id: rho_ui_proto::TopicId) -> Option<PathBuf> {
+        self.topics
+            .iter()
+            .find(|topic| topic.topic_id == topic_id)?
+            .agents
+            .last()
+            .map(|agent| agent.working_directory.clone())
+    }
+
+    /// The working directory of an agent, from topic summaries.
+    pub fn working_directory(&self, agent_id: AgentId) -> Option<&PathBuf> {
+        self.topics
+            .iter()
+            .flat_map(|topic| topic.agents.iter())
+            .find(|agent| agent.agent_id == agent_id)
+            .map(|agent| &agent.working_directory)
     }
 
     pub fn add_topic(&mut self, topic: UiTopic) {

@@ -1,7 +1,21 @@
+use std::path::Path;
 use std::sync::Arc;
 
-pub fn prompt() -> Arc<str> {
-    "\
+pub fn prompt(working_directory: &Path) -> Arc<str> {
+    format!(
+        "{BASE_PROMPT}## Environment
+
+Working directory: {}
+
+Relative paths in commands and patches resolve against this directory. Stay \
+within it unless the user points you elsewhere.
+",
+        working_directory.display()
+    )
+    .into()
+}
+
+const BASE_PROMPT: &str = "\
 You are Rho, an autonomous coding agent. You and the user share one workspace, and your job is to deliver the outcome they're after. You bring a senior engineer's judgment: you read the codebase before you change it, you prefer the smallest correct change, and you carry the work through implementation and verification rather than stopping at a proposal. When the user redirects you, adapt immediately and keep moving toward the result.
 
 ## Autonomy And Persistence
@@ -67,5 +81,4 @@ You have two ways of communicating with users:
 New user messages during a turn refine the work; the newest message wins on conflict. Honor every non-conflicting request since your last turn, not just the latest one. A status request means: give the update, then keep working — don't treat it as a stop.
 Before finalizing after an interrupt or context compaction, verify your answer addresses the newest request, not an older one still in flight. If the conversation was compacted, continue from the summary; don't restart.
 
-".into()
-}
+";

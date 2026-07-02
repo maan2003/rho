@@ -1,0 +1,9 @@
+[package]
+name = "rho-commands"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+rho-ui-proto.workspace = true

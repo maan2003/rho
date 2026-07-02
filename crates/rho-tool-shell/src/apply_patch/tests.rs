@@ -31,10 +31,13 @@ fn add_file_rejects_existing_target() {
     let path = temp.path().join("exists.txt");
     std::fs::write(&path, "original\n").expect("write original");
 
-    let err = apply_hunks(&[Hunk::Add {
-        path: path.clone(),
-        contents: "replacement\n".to_owned(),
-    }])
+    let err = apply_hunks(
+        &[Hunk::Add {
+            path: path.clone(),
+            contents: "replacement\n".to_owned(),
+        }],
+        temp.path(),
+    )
     .expect_err("add file should reject existing target");
 
     assert!(err.message.contains("Add File target already exists"));
@@ -60,7 +63,7 @@ fn applies_add_update_and_delete() {
         update_path.display(),
         delete_path.display()
     );
-    let summary = apply_patch(&patch).expect("patch applies");
+    let summary = apply_patch(&patch, temp.path()).expect("patch applies");
 
     assert!(summary.contains("A "));
     assert!(summary.contains("M "));
@@ -68,6 +71,24 @@ fn applies_add_update_and_delete() {
     assert_eq!(std::fs::read_to_string(add_path).unwrap(), "new\n");
     assert_eq!(std::fs::read_to_string(update_path).unwrap(), "new\n");
     assert!(!delete_path.exists());
+}
+
+#[test]
+fn relative_paths_resolve_against_cwd_not_process_dir() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("update.txt"), "old\n").expect("write update");
+
+    let patch = "*** Begin Patch\n*** Add File: sub/add.txt\n+new\n*** Update File: update.txt\n@@\n-old\n+new\n*** End Patch";
+    apply_patch(patch, temp.path()).expect("patch applies");
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("sub/add.txt")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("update.txt")).unwrap(),
+        "new\n"
+    );
 }
 
 #[test]
@@ -81,7 +102,7 @@ fn failed_patch_reports_partial_changes() {
         add_path.display(),
         missing_path.display(),
     );
-    let error = apply_patch(&patch).expect_err("second hunk should fail");
+    let error = apply_patch(&patch, temp.path()).expect_err("second hunk should fail");
     let message = error.to_string();
 
     assert!(message.contains("Failed to read file to update"));

@@ -4,6 +4,7 @@
 //! and daemon can map these messages onto concrete `rho-agent` handles without
 //! teaching lower crates about sockets or UI policy.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -68,6 +69,10 @@ pub enum ClientMessage {
     },
     NewAgent {
         topic_id: TopicId,
+        /// Absolute directory the agent's tools execute in, fixed for the
+        /// agent's life. Clients choose it (workdirs are the suggested
+        /// vocabulary); the daemon only validates it.
+        working_directory: PathBuf,
         content: Option<Vec<ContentPart>>,
     },
     LoadAgent {
@@ -80,6 +85,15 @@ pub enum ClientMessage {
     CancelTurn {
         agent_id: AgentId,
     },
+    /// Registers a workdir, or renames it if `path` is already registered.
+    /// `name` defaults to the path's basename.
+    WorkdirSet {
+        path: PathBuf,
+        name: Option<String>,
+    },
+    WorkdirRemove {
+        path: PathBuf,
+    },
 }
 
 /// Message sent from the rho daemon to a UI client.
@@ -88,6 +102,7 @@ pub enum ServerMessage {
     Pong,
     Ready {
         topics: Vec<UiTopic>,
+        workdirs: Vec<UiWorkdir>,
     },
     Error {
         message: String,
@@ -116,7 +131,29 @@ pub struct UiTopic {
     pub topic_id: TopicId,
     pub display_name: Option<String>,
     pub status: UiTopicStatus,
-    pub agent_ids: Vec<AgentId>,
+    pub agents: Vec<UiAgentSummary>,
+}
+
+impl UiTopic {
+    pub fn agent_ids(&self) -> impl Iterator<Item = AgentId> + '_ {
+        self.agents.iter().map(|agent| agent.agent_id)
+    }
+}
+
+/// Enough about an agent to list and label it without loading it.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiAgentSummary {
+    pub agent_id: AgentId,
+    pub display_name: Option<String>,
+    pub working_directory: PathBuf,
+}
+
+/// A registered directory agents can be started in; selection vocabulary
+/// only, keyed by path.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiWorkdir {
+    pub path: PathBuf,
+    pub name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

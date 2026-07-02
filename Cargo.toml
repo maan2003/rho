@@ -4,6 +4,7 @@ members = [
   "crates/rho-agent",
   "crates/rho-blocking-notify-channel",
   "crates/rho-cli",
+  "crates/rho-commands",
   "crates/rho-cli-term-raw",
   "crates/rho-core",
   "crates/rho-daemon",
@@ -47,6 +48,7 @@ redb = "4.1.0"
 rho-agent = { path = "crates/rho-agent" }
 rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
 rho-cli = { path = "crates/rho-cli" }
+rho-commands = { path = "crates/rho-commands" }
 rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }

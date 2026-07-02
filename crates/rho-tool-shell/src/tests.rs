@@ -2,6 +2,13 @@ use rho_core::{ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
 
 use super::*;
 
+fn test_tools(timeout_secs: u64) -> ShellTools {
+    ShellTools::new(
+        Duration::from_secs(timeout_secs),
+        std::env::temp_dir(),
+    )
+}
+
 fn shell_call(arguments: serde_json::Value) -> ToolCall {
     ToolCall {
         id: ToolCallId::try_from("call-1").unwrap(),
@@ -22,7 +29,7 @@ fn patch_call(arguments: impl Into<String>) -> ToolCall {
 
 #[tokio::test]
 async fn runs_shell_call() {
-    let tools = ShellTools::new(Duration::from_secs(2));
+    let tools = test_tools(2);
     let result = tools
         .call(shell_call(json!({"command": "printf hello"})))
         .await;
@@ -35,7 +42,7 @@ async fn runs_shell_call() {
 
 #[tokio::test]
 async fn nonzero_exit_is_structured_result_not_tool_error() {
-    let tools = ShellTools::new(Duration::from_secs(2));
+    let tools = test_tools(2);
     let result = tools
         .call(shell_call(json!({"command": "printf nope; exit 3"})))
         .await;
@@ -47,7 +54,7 @@ async fn nonzero_exit_is_structured_result_not_tool_error() {
 
 #[tokio::test]
 async fn concatenates_stdout_then_stderr() {
-    let tools = ShellTools::new(Duration::from_secs(2));
+    let tools = test_tools(2);
     let result = tools
         .call(shell_call(json!({"command": "printf out; printf err >&2"})))
         .await;
@@ -58,7 +65,7 @@ async fn concatenates_stdout_then_stderr() {
 
 #[tokio::test]
 async fn truncates_concatenated_output() {
-    let tools = ShellTools::new(Duration::from_secs(2));
+    let tools = test_tools(2);
     let result = tools
         .call(shell_call(json!({"command": "yes line | head -20000"})))
         .await;
@@ -78,7 +85,7 @@ async fn truncates_concatenated_output() {
 
 #[tokio::test]
 async fn accepts_timeout_argument_name() {
-    let tools = ShellTools::new(Duration::from_secs(30));
+    let tools = test_tools(30);
     let result = tools
         .call(shell_call(json!({"command": "sleep 2", "timeout": 1})))
         .await;
@@ -96,7 +103,7 @@ async fn accepts_timeout_argument_name() {
 async fn timeout_kills_shell_process() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("marker");
-    let tools = ShellTools::new(Duration::from_secs(30));
+    let tools = test_tools(30);
     let result = tools
         .call(shell_call(json!({
             "command": format!("sleep 2; touch {}", marker.display()),
@@ -117,7 +124,7 @@ async fn timeout_kills_shell_process() {
 
 #[test]
 fn specs_expose_only_shell_command_and_apply_patch() {
-    let tools = ShellTools::new(Duration::from_secs(2));
+    let tools = test_tools(2);
     let specs = tools.specs();
 
     assert_eq!(specs.len(), 2);
@@ -135,11 +142,39 @@ async fn apply_patch_custom_tool_applies_patch() {
         "*** Begin Patch\n*** Add File: {}\n+hello\n*** End Patch",
         path.display()
     );
-    let result = ShellTools::new(Duration::from_secs(2))
+    let result = test_tools(2)
         .call(patch_call(patch))
         .await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
     assert!(result.output.as_ref().contains("A "));
     assert_eq!(std::fs::read_to_string(path).unwrap(), "hello\n");
+}
+
+#[tokio::test]
+async fn shell_commands_run_in_the_agents_working_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let tools = ShellTools::new(Duration::from_secs(2), temp.path().to_path_buf());
+    let result = tools.call(shell_call(json!({"command": "pwd"}))).await;
+
+    assert_eq!(result.status, ToolOutputStatus::Success);
+    let expected = temp.path().canonicalize().unwrap();
+    assert!(
+        result.output.as_ref().contains(expected.to_str().unwrap()),
+        "expected pwd under {expected:?}, got: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
+async fn relative_model_cwd_resolves_against_working_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("sub")).unwrap();
+    let tools = ShellTools::new(Duration::from_secs(2), temp.path().to_path_buf());
+    let result = tools
+        .call(shell_call(json!({"command": "pwd", "cwd": "sub"})))
+        .await;
+
+    assert_eq!(result.status, ToolOutputStatus::Success);
+    assert!(result.output.as_ref().contains("/sub"));
 }

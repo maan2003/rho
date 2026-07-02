@@ -8235,6 +8235,7 @@ dependencies = [
  "futures",
  "rho-agent",
  "rho-cli-term-raw",
+ "rho-commands",
  "rho-core",
  "rho-daemon",
  "rho-db",
@@ -8257,6 +8258,13 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "vt100",
+]
+
+[[package]]
+name = "rho-commands"
+version = "0.1.0"
+dependencies = [
+ "rho-ui-proto",
 ]
 
 [[package]]
@@ -8316,6 +8324,7 @@ dependencies = [
  "multi_buffer",
  "project",
  "release_channel",
+ "rho-commands",
  "rho-core",
  "rho-daemon",
  "rho-ui-proto",

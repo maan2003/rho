@@ -15,6 +15,7 @@ futures.workspace = true
 rho-core.workspace = true
 rho-daemon.workspace = true
 rho-agent.workspace = true
+rho-commands.workspace = true
 rho-cli-term-raw.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true

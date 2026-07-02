@@ -17,7 +17,6 @@ use rho_ui_proto::{AgentId, ClientMessage};
 use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentView;
-use crate::commands::{self, ParsedCommand};
 use crate::connection::{ConnEvent, Connection};
 use crate::registry::AgentRegistry;
 use crate::store::{AgentStore, FrameSummary};
@@ -42,6 +41,12 @@ pub struct Workspace {
     pending_syncs: HashMap<AgentId, FrameSummary>,
     draft_view: Entity<AgentView>,
     project_root: PathBuf,
+    /// Registered workdirs from the daemon; selection vocabulary for new
+    /// agents.
+    workdirs: Vec<rho_ui_proto::UiWorkdir>,
+    /// Working directory chosen via `:agent new <path>` for the next agent
+    /// created from the draft view.
+    draft_working_directory: Option<PathBuf>,
     connected: bool,
     duration_timer: Option<Task<()>>,
     _event_task: Task<()>,
@@ -83,6 +88,8 @@ impl Workspace {
             pending_syncs: HashMap::new(),
             draft_view,
             project_root: attach_target.project_root,
+            workdirs: Vec::new(),
+            draft_working_directory: None,
             connected: false,
             duration_timer: None,
             _event_task: event_task,
@@ -98,8 +105,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ConnEvent::Ready { topics } => {
+            ConnEvent::Ready { topics, workdirs } => {
                 self.registry.set_topics(topics);
+                self.workdirs = workdirs;
                 self.connected = true;
                 self.update_statuses(cx);
                 cx.notify();
@@ -184,8 +192,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(command) = commands::parse(&text) {
-            self.handle_command(source_agent, command, window, cx);
+        if let Some(parsed) = rho_commands::parse(&text) {
+            self.handle_command(source_agent, parsed, window, cx);
             return;
         }
         if !self.connected {
@@ -219,8 +227,14 @@ impl Workspace {
                     );
                     return;
                 };
+                let working_directory = self
+                    .draft_working_directory
+                    .take()
+                    .or_else(|| self.registry.last_working_directory(topic_id))
+                    .unwrap_or_else(|| self.project_root.clone());
                 self.connection.send(ClientMessage::NewAgent {
                     topic_id,
+                    working_directory,
                     content: Some(vec![ContentPart::Text { text }]),
                 });
             }
@@ -230,58 +244,139 @@ impl Workspace {
     fn handle_command(
         &mut self,
         source_agent: Option<AgentId>,
-        command: ParsedCommand,
+        parsed: rho_commands::Parsed,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        use rho_commands::Command;
+        let command = match parsed {
+            rho_commands::Parsed::Command(command) => command,
+            rho_commands::Parsed::Invalid(usage) => {
+                let message = format!("usage: {usage}");
+                self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
+                return;
+            }
+            rho_commands::Parsed::Unknown(command) => {
+                let message = format!("unknown command `{command}`; try :help");
+                self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
+                return;
+            }
+        };
+        if !self.connected
+            && !matches!(command, Command::Quit | Command::Help | Command::Version)
+        {
+            self.notice_on(
+                source_agent.as_ref(),
+                "not connected to rho-daemon",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
         match command {
-            ParsedCommand::New => self.select_agent(None, window, cx),
-            ParsedCommand::Cancel => {
+            Command::AgentNew { working_directory } => {
+                self.draft_working_directory =
+                    working_directory.map(|path| self.resolve_workdir_path(path));
+                self.select_agent(None, window, cx);
+            }
+            Command::AgentCancel => {
                 let target = source_agent.or_else(|| self.registry.selected().cloned());
-                match (target, self.connected) {
-                    (Some(agent_id), true) => {
+                match target {
+                    Some(agent_id) => {
                         self.connection.send(ClientMessage::CancelTurn { agent_id });
                     }
-                    (_, false) => self.notice_on(
+                    None => self.notice_on(
                         None,
-                        "/cancel is only available when connected to rho-daemon",
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                    (None, _) => self.notice_on(
-                        None,
-                        "/cancel: no agent selected",
+                        ":cancel: no agent selected",
                         StyleClass::SystemInfo,
                         cx,
                     ),
                 }
             }
-            ParsedCommand::Load(agent_id) => {
-                if !self.connected {
-                    self.notice_on(
-                        source_agent.as_ref(),
-                        "/load is only available when connected to rho-daemon",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                }
+            Command::AgentLoad { agent_id } => {
                 self.connection.send(ClientMessage::LoadAgent { agent_id });
                 self.registry.mark_known(agent_id);
                 self.select_agent(Some(agent_id), window, cx);
             }
-            ParsedCommand::Invalid(message) => {
-                self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
+            Command::TopicNew { name } => {
+                self.connection.send(ClientMessage::NewTopic {
+                    display_name: name,
+                });
             }
-            ParsedCommand::Unsupported => {
+            Command::WorkdirAdd { path, name } => {
+                let path = path.map_or_else(
+                    || self.project_root.clone(),
+                    |path| self.resolve_workdir_path(path),
+                );
+                self.connection.send(ClientMessage::WorkdirSet { path, name });
+            }
+            Command::WorkdirRemove { path } => {
+                match rho_commands::resolve_workdir(&path, &self.workdir_table()) {
+                    Some(path) => {
+                        self.connection
+                            .send(ClientMessage::WorkdirRemove { path: path.into() });
+                    }
+                    None => {
+                        let message = format!("no registered workdir `{path}`");
+                        self.notice_on(
+                            source_agent.as_ref(),
+                            &message,
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                }
+            }
+            Command::Quit => cx.quit(),
+            Command::Help => {
+                let help = rho_commands::COMMANDS
+                    .iter()
+                    .map(|spec| format!("{}  —  {}", spec.usage, spec.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.notice_on(source_agent.as_ref(), &help, StyleClass::SystemInfo, cx);
+            }
+            Command::Version => {
                 self.notice_on(
                     source_agent.as_ref(),
-                    "command is not available in rho-gui2 yet",
+                    env!("CARGO_PKG_VERSION"),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            }
+            Command::Clear => {
+                self.notice_on(
+                    source_agent.as_ref(),
+                    ":clear is not available in rho-gui2",
                     StyleClass::SystemInfo,
                     cx,
                 );
             }
         }
+    }
+
+    /// Registered workdirs as the `(name, path)` table the shared command
+    /// layer expects.
+    pub fn workdir_table(&self) -> Vec<(String, String)> {
+        self.workdirs
+            .iter()
+            .map(|workdir| (workdir.name.clone(), workdir.path.display().to_string()))
+            .collect()
+    }
+
+    /// A workdir argument may be a registered name, `~`-prefixed, or
+    /// relative to where the GUI was launched.
+    fn resolve_workdir_path(&self, path: PathBuf) -> PathBuf {
+        let argument = path.display().to_string();
+        if let Some(resolved) = rho_commands::resolve_workdir(&argument, &self.workdir_table()) {
+            return resolved.into();
+        }
+        if let Some(rest) = argument.strip_prefix("~/")
+            && let Some(home) = std::env::home_dir()
+        {
+            return home.join(rest);
+        }
+        self.project_root.join(path)
     }
 
     fn notice_on(
@@ -358,8 +453,8 @@ impl Workspace {
             });
         }
         let role = self.connected.then_some("rho");
-        let project_label = self.project_label();
-        view.update(cx, |view, cx| view.set_status(role, &project_label, cx));
+        let label = self.working_directory_label(Some(agent_id));
+        view.update(cx, |view, cx| view.set_status(role, &label, cx));
         self.views.insert(*agent_id, view.clone());
         view
     }
@@ -384,10 +479,13 @@ impl Workspace {
 
     fn update_statuses(&self, cx: &mut Context<Self>) {
         let role = self.connected.then_some("rho");
-        let project_label = self.project_label();
-        for view in self.all_views() {
-            view.update(cx, |view, cx| view.set_status(role, &project_label, cx));
+        for (agent_id, view) in &self.views {
+            let label = self.working_directory_label(Some(agent_id));
+            view.update(cx, |view, cx| view.set_status(role, &label, cx));
         }
+        let draft_label = self.working_directory_label(None);
+        self.draft_view
+            .update(cx, |view, cx| view.set_status(role, &draft_label, cx));
     }
 
     /// Every materialized view plus the draft view — the recipients of
@@ -400,12 +498,17 @@ impl Workspace {
             .collect()
     }
 
-    fn project_label(&self) -> String {
-        self.project_root
+    /// Chip label: the agent's own working directory when known; the draft
+    /// view (`None`) shows where a new agent would work.
+    fn working_directory_label(&self, agent_id: Option<&AgentId>) -> String {
+        let directory = agent_id
+            .and_then(|agent_id| self.registry.working_directory(*agent_id))
+            .unwrap_or(&self.project_root);
+        directory
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_owned)
-            .unwrap_or_else(|| self.project_root.display().to_string())
+            .unwrap_or_else(|| directory.display().to_string())
     }
 
     pub fn known_agent_names(&self) -> Vec<String> {

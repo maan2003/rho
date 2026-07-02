@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::remote::{AgentRemoteFrame, UiAgentState, UiBlock};
 use crate::{
-    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, UiTopic,
+    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, UiTopic, UiWorkdir,
     append_protocol_log_record, protocol_frame_bytes, read_frame_counted, write_frame_counted,
 };
 
@@ -72,6 +72,7 @@ pub struct AgentClient {
     commands: mpsc::UnboundedSender<ClientMessage>,
     state: watch::Receiver<HashMap<AgentId, UiAgentState>>,
     topics: watch::Receiver<Vec<UiTopic>>,
+    workdirs: watch::Receiver<Vec<UiWorkdir>>,
     known_agent_ids: watch::Receiver<Vec<AgentId>>,
     frames: broadcast::Sender<(AgentId, AgentRemoteFrame)>,
     counters: IoCounters,
@@ -98,7 +99,7 @@ impl AgentClient {
                 &ClientMessage::Subscribe,
             );
         }
-        let ServerMessage::Ready { topics } =
+        let ServerMessage::Ready { topics, workdirs } =
             read_frame_counted(&mut stream, Some(&client_counters)).await?
         else {
             anyhow::bail!("rho daemon did not send ready message");
@@ -109,6 +110,7 @@ impl AgentClient {
                 ProtocolLogDirection::ServerToClient,
                 &ServerMessage::Ready {
                     topics: topics.clone(),
+                    workdirs: workdirs.clone(),
                 },
             );
         }
@@ -116,6 +118,7 @@ impl AgentClient {
         let (reader, writer) = stream.into_split();
         let (state_tx, state_rx) = watch::channel(HashMap::new());
         let (topics_tx, topics_rx) = watch::channel(topics.clone());
+        let (workdirs_tx, workdirs_rx) = watch::channel(workdirs);
         let (known_agent_ids_tx, known_agent_ids_rx) = watch::channel(agent_ids);
         let (frame_tx, _) = broadcast::channel::<(AgentId, AgentRemoteFrame)>(256);
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<ClientMessage>();
@@ -149,9 +152,12 @@ impl AgentClient {
                             break;
                         }
                     }
-                    ServerMessage::Ready { topics } => {
+                    ServerMessage::Ready { topics, workdirs } => {
                         known_agent_ids = topic_agent_ids(&topics);
                         if topics_tx.send(topics).is_err() {
+                            break;
+                        }
+                        if workdirs_tx.send(workdirs).is_err() {
                             break;
                         }
                         if known_agent_ids_tx.send(known_agent_ids.clone()).is_err() {
@@ -209,6 +215,7 @@ impl AgentClient {
             commands: command_tx,
             state: state_rx,
             topics: topics_rx,
+            workdirs: workdirs_rx,
             known_agent_ids: known_agent_ids_rx,
             frames: frame_tx,
             counters: client_counters,
@@ -252,18 +259,41 @@ impl AgentClient {
         self.topics.borrow().clone()
     }
 
-    pub fn new_agent_with_user_message_in_topic(&self, topic_id: TopicId, text: String) {
+    pub fn workdirs(&self) -> Vec<UiWorkdir> {
+        self.workdirs.borrow().clone()
+    }
+
+    pub fn new_agent_with_user_message_in_topic(
+        &self,
+        topic_id: TopicId,
+        working_directory: PathBuf,
+        text: String,
+    ) {
         let _ = self.commands.send(ClientMessage::NewAgent {
             topic_id,
+            working_directory,
             content: Some(vec![ContentPart::Text { text }]),
         });
     }
 
-    pub fn new_agent_in_topic(&self, topic_id: TopicId) {
+    pub fn new_agent_in_topic(&self, topic_id: TopicId, working_directory: PathBuf) {
         let _ = self.commands.send(ClientMessage::NewAgent {
             topic_id,
+            working_directory,
             content: None,
         });
+    }
+
+    pub fn new_topic(&self, display_name: Option<String>) {
+        let _ = self.commands.send(ClientMessage::NewTopic { display_name });
+    }
+
+    pub fn set_workdir(&self, path: PathBuf, name: Option<String>) {
+        let _ = self.commands.send(ClientMessage::WorkdirSet { path, name });
+    }
+
+    pub fn remove_workdir(&self, path: PathBuf) {
+        let _ = self.commands.send(ClientMessage::WorkdirRemove { path });
     }
 
     pub fn load_agent(&self, agent_id: AgentId) {
@@ -315,7 +345,7 @@ fn empty_agent_state() -> UiAgentState {
 fn topic_agent_ids(topics: &[UiTopic]) -> Vec<AgentId> {
     let mut agent_ids = topics
         .iter()
-        .flat_map(|topic| topic.agent_ids.iter().cloned())
+        .flat_map(UiTopic::agent_ids)
         .collect::<Vec<_>>();
     agent_ids.sort();
     agent_ids.dedup();

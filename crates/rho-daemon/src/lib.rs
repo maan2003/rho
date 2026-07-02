@@ -14,7 +14,8 @@ use rho_inference::config::InferenceConfig;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, ServerMessage, UiTopic, UiTopicStatus, read_frame_counted, write_frame_counted,
+    ClientMessage, ServerMessage, UiAgentSummary, UiTopic, UiTopicStatus, UiWorkdir,
+    read_frame_counted, write_frame_counted,
 };
 use tokio::sync::{Mutex, Notify, mpsc};
 
@@ -42,6 +43,12 @@ pub struct DaemonArgs {
 }
 
 pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
+    // The daemon's own cwd must never matter: agents each carry their own
+    // working directory. Park the process somewhere empty and read-only so
+    // any code still depending on process cwd fails loudly.
+    let _ = std::env::set_current_dir("/var/empty")
+        .or_else(|_| std::env::set_current_dir("/"));
+
     let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).context("create socket directory")?;
@@ -121,11 +128,44 @@ impl AgentRegistry {
                 topic_id,
                 display_name: topic.display_name,
                 status: ui_topic_status(topic.status),
-                agent_ids: read.list_topic_agents(topic_id).into_iter().collect(),
+                agents: read
+                    .list_topic_agents(topic_id)
+                    .into_iter()
+                    .map(|agent_id| {
+                        let agent = read.get_agent(agent_id);
+                        UiAgentSummary {
+                            agent_id,
+                            display_name: agent.display_name,
+                            working_directory: agent.working_directory,
+                        }
+                    })
+                    .collect(),
             })
             .collect::<Vec<_>>();
         topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
         topics
+    }
+
+    fn workdirs(&self) -> Vec<UiWorkdir> {
+        let mut workdirs = self
+            .db
+            .read()
+            .list_workdirs()
+            .into_iter()
+            .map(|(path, record)| UiWorkdir {
+                path,
+                name: record.name,
+            })
+            .collect::<Vec<_>>();
+        workdirs.sort_by(|left, right| left.name.cmp(&right.name));
+        workdirs
+    }
+
+    fn ready_message(&self) -> ServerMessage {
+        ServerMessage::Ready {
+            topics: self.topics(),
+            workdirs: self.workdirs(),
+        }
     }
 
     async fn loaded(&self) -> Vec<(AgentId, Agent)> {
@@ -153,22 +193,57 @@ impl AgentRegistry {
             topic_id,
             display_name: self.db.read().get_topic(topic_id).display_name,
             status: UiTopicStatus::Normal,
-            agent_ids: Vec::new(),
+            agents: Vec::new(),
         }
     }
 
-    async fn create(&self, topic_id: TopicId) -> anyhow::Result<(TopicId, AgentId, Agent)> {
+    async fn create(
+        &self,
+        topic_id: TopicId,
+        working_directory: PathBuf,
+    ) -> anyhow::Result<(TopicId, AgentId, Agent)> {
         self.db.read().get_topic(topic_id);
-        let (agent_id, agent) = Agent::create_in_topic_with_id(
+        let working_directory = validate_working_directory(working_directory)?;
+        let (agent_id, agent) = Agent::create(
             self.db.clone(),
             self.auth.clone(),
             self.inference_config.clone(),
             topic_id,
             None,
+            working_directory,
         )
         .await;
         self.agents.lock().await.insert(agent_id, agent.clone());
         Ok((topic_id, agent_id, agent))
+    }
+
+    async fn set_workdir(&self, path: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+        let path = validate_working_directory(path)?;
+        let name = match name {
+            Some(name) => name,
+            None => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .ok_or_else(|| anyhow::anyhow!("workdir path has no basename: {}", path.display()))?,
+        };
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("workdir path is not valid UTF-8"))?
+            .to_owned();
+        let mut write = self.db.write().await;
+        write.upsert_workdir(rho_core::UnixMs::now(), &path, name);
+        write.commit();
+        Ok(())
+    }
+
+    async fn remove_workdir(&self, path: PathBuf) -> anyhow::Result<()> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("workdir path is not valid UTF-8"))?;
+        let mut write = self.db.write().await;
+        write.remove_workdir(path);
+        write.commit();
+        Ok(())
     }
 
     async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, Agent, bool)> {
@@ -212,9 +287,7 @@ async fn serve_connection(
         }
     });
 
-    let _ = outgoing_tx.send(ServerMessage::Ready {
-        topics: agents.topics(),
-    });
+    let _ = outgoing_tx.send(agents.ready_message());
 
     for (agent_id, agent) in agents.loaded().await {
         subscribe_agent(agent_id, agent, outgoing_tx.clone());
@@ -230,32 +303,55 @@ async fn serve_connection(
             ClientMessage::NewTopic { display_name } => {
                 let topic = agents.create_topic(display_name).await;
                 let _ = outgoing_tx.send(ServerMessage::TopicCreated { topic });
-                let _ = outgoing_tx.send(ServerMessage::Ready {
-                    topics: agents.topics(),
-                });
+                let _ = outgoing_tx.send(agents.ready_message());
             }
-            ClientMessage::NewAgent { topic_id, content } => {
-                let (topic_id, agent_id, agent) = match agents.create(topic_id).await {
-                    Ok(created) => created,
-                    Err(error) => {
-                        let _ = outgoing_tx.send(ServerMessage::Error {
-                            message: error.to_string(),
-                        });
-                        continue;
-                    }
-                };
+            ClientMessage::NewAgent {
+                topic_id,
+                working_directory,
+                content,
+            } => {
+                let (topic_id, agent_id, agent) =
+                    match agents.create(topic_id, working_directory).await {
+                        Ok(created) => created,
+                        Err(error) => {
+                            let _ = outgoing_tx.send(ServerMessage::Error {
+                                message: error.to_string(),
+                            });
+                            continue;
+                        }
+                    };
                 subscribe_agent(agent_id.clone(), agent.clone(), outgoing_tx.clone());
                 let _ = outgoing_tx.send(ServerMessage::AgentCreated {
                     topic_id,
                     agent_id: agent_id.clone(),
                 });
-                let _ = outgoing_tx.send(ServerMessage::Ready {
-                    topics: agents.topics(),
-                });
+                let _ = outgoing_tx.send(agents.ready_message());
                 if let Some(content) = content {
                     agent.send_user_message(text_content(&content));
                 }
             }
+            ClientMessage::WorkdirSet { path, name } => {
+                match agents.set_workdir(path, name).await {
+                    Ok(()) => {
+                        let _ = outgoing_tx.send(agents.ready_message());
+                    }
+                    Err(error) => {
+                        let _ = outgoing_tx.send(ServerMessage::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ClientMessage::WorkdirRemove { path } => match agents.remove_workdir(path).await {
+                Ok(()) => {
+                    let _ = outgoing_tx.send(agents.ready_message());
+                }
+                Err(error) => {
+                    let _ = outgoing_tx.send(ServerMessage::Error {
+                        message: error.to_string(),
+                    });
+                }
+            },
             ClientMessage::LoadAgent { agent_id } => match agents.load(agent_id).await {
                 Ok((agent_id, agent, loaded_now)) => {
                     if loaded_now {
@@ -316,6 +412,18 @@ fn subscribe_agent(
             }
         }
     });
+}
+
+/// Working directories must be absolute (the daemon's cwd is meaningless by
+/// design) and must exist when an agent is created or a workdir registered.
+fn validate_working_directory(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("working directory must be absolute: {}", path.display());
+    }
+    if !path.is_dir() {
+        anyhow::bail!("working directory does not exist: {}", path.display());
+    }
+    Ok(path)
 }
 
 fn ui_topic_status(status: TopicStatus) -> UiTopicStatus {

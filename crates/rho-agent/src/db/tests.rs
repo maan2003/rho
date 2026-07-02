@@ -58,6 +58,7 @@ async fn create_agent_and_append_events_with_cursor() {
         UnixMs(1),
         topic_id,
         Some("main".to_owned()),
+        std::path::PathBuf::from("/tmp"),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),
     );
@@ -108,6 +109,7 @@ async fn agent_events_read_lineage_parents() {
         UnixMs(1),
         topic_id,
         Some("main".to_owned()),
+        std::path::PathBuf::from("/tmp"),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),
     );
@@ -164,4 +166,32 @@ async fn agent_events_read_lineage_parents() {
         })
         .collect::<Vec<_>>();
     assert_eq!(texts, ["parent", "child"]);
+}
+
+#[tokio::test]
+async fn workdirs_upsert_by_path_and_remove() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.upsert_workdir(UnixMs(1), "/home/user/src/rho", "rho".to_owned());
+    write.upsert_workdir(UnixMs(2), "/home/user/src/zed", "zed".to_owned());
+    // Re-adding the same path renames it and keeps created_at.
+    write.upsert_workdir(UnixMs(3), "/home/user/src/rho", "rho-main".to_owned());
+    write.commit();
+
+    let workdirs = db.read().list_workdirs();
+    assert_eq!(workdirs.len(), 2);
+    let rho = workdirs
+        .iter()
+        .find(|(path, _)| path == std::path::Path::new("/home/user/src/rho"))
+        .unwrap();
+    assert_eq!(rho.1.name, "rho-main");
+    assert_eq!(rho.1.created_at, UnixMs(1));
+
+    let mut write = db.write().await;
+    write.remove_workdir("/home/user/src/zed");
+    write.commit();
+    assert_eq!(db.read().list_workdirs().len(), 1);
 }

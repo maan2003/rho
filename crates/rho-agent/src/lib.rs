@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use async_stream::stream;
@@ -116,51 +117,13 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn create_ephemeral(
-        auth: InferenceAuth,
-        config: InferenceConfig,
-        blocks: Vec<Arc<ContextBlock>>,
-    ) -> Self {
-        let inference_session =
-            InferenceSession::new(auth, config.protect(), PromptCacheKey::generate());
-        let shell_tools = ShellTools::new(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS));
-        let state = AgentState {
-            blocks,
-            tool_specs: shell_tools.specs().into(),
-            system_prompt: system_prompt::prompt(),
-            kind: AgentStateKind::Idle,
-        };
-        Self::new(inference_session, shell_tools, state, None)
-    }
-
     pub async fn create(
-        db: RhoDb,
-        auth: InferenceAuth,
-        config: InferenceConfig,
-        display_name: Option<String>,
-    ) -> Self {
-        Self::create_with_id(db, auth, config, display_name).await.1
-    }
-
-    pub async fn create_with_id(
-        db: RhoDb,
-        auth: InferenceAuth,
-        config: InferenceConfig,
-        display_name: Option<String>,
-    ) -> (AgentId, Self) {
-        let now = UnixMillis::now();
-        let mut write = db.write().await;
-        let topic_id = write.create_topic(now, None, db::TopicStatus::Normal);
-        write.commit();
-        Self::create_in_topic_with_id(db, auth, config, topic_id, display_name).await
-    }
-
-    pub async fn create_in_topic_with_id(
         db: RhoDb,
         auth: InferenceAuth,
         config: InferenceConfig,
         topic_id: db::TopicId,
         display_name: Option<String>,
+        working_directory: PathBuf,
     ) -> (AgentId, Self) {
         let prompt_cache_key = PromptCacheKey::generate();
         let config = config.protect();
@@ -170,16 +133,20 @@ impl Agent {
             now,
             topic_id,
             display_name,
+            working_directory.clone(),
             prompt_cache_key,
             config.clone(),
         );
         write.commit();
         let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
-        let shell_tools = ShellTools::new(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        let shell_tools = ShellTools::new(
+            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            working_directory.clone(),
+        );
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: shell_tools.specs().into(),
-            system_prompt: system_prompt::prompt(),
+            system_prompt: system_prompt::prompt(&working_directory),
             kind: AgentStateKind::Idle,
         };
         let agent = Self::new(
@@ -274,11 +241,14 @@ impl Agent {
             },
         };
         let inference_session = InferenceSession::new(auth, record.config, record.prompt_cache_key);
-        let shell_tools = ShellTools::new(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        let shell_tools = ShellTools::new(
+            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            record.working_directory.clone(),
+        );
         let state = AgentState {
             blocks,
             tool_specs: shell_tools.specs().into(),
-            system_prompt: system_prompt::prompt(),
+            system_prompt: system_prompt::prompt(&record.working_directory),
             kind,
         };
         Self::new(

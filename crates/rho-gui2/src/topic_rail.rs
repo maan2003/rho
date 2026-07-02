@@ -93,7 +93,8 @@ fn render_topic_rows(
                 .text_color(text_style.color.opacity(0.65))
                 .child(name),
         )
-        .children(topic.agent_ids.iter().map(|agent_id| {
+        .children(topic.agents.iter().map(|summary| {
+            let agent_id = &summary.agent_id;
             let selected = selected_agent == Some(agent_id);
             let is_live = live.contains(agent_id);
             let text_color = if selected {

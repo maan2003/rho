@@ -12,10 +12,15 @@ use gpui::{App, Task};
 use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
-use rho_ui_proto::{AgentId, ClientMessage, ServerMessage, UiTopic, read_frame, write_frame};
+use rho_ui_proto::{
+    AgentId, ClientMessage, ServerMessage, UiTopic, UiWorkdir, read_frame, write_frame,
+};
 
 pub enum ConnEvent {
-    Ready { topics: Vec<UiTopic> },
+    Ready {
+        topics: Vec<UiTopic>,
+        workdirs: Vec<UiWorkdir>,
+    },
     TopicCreated(UiTopic),
     AgentAnnounced(AgentId),
     Frame { agent_id: AgentId, frame: AgentRemoteFrame },
@@ -68,10 +73,13 @@ async fn run(
     let mut stream = client.into_stream();
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
-    let ServerMessage::Ready { topics } = message else {
+    let ServerMessage::Ready { topics, workdirs } = message else {
         anyhow::bail!("rho daemon did not send ready message");
     };
-    if events.unbounded_send(ConnEvent::Ready { topics }).is_err() {
+    if events
+        .unbounded_send(ConnEvent::Ready { topics, workdirs })
+        .is_err()
+    {
         return Ok(());
     }
 
@@ -93,7 +101,9 @@ async fn run(
             }
         };
         let event = match message {
-            ServerMessage::Ready { topics } => Some(ConnEvent::Ready { topics }),
+            ServerMessage::Ready { topics, workdirs } => {
+                Some(ConnEvent::Ready { topics, workdirs })
+            }
             ServerMessage::TopicCreated { topic } => Some(ConnEvent::TopicCreated(topic)),
             ServerMessage::AgentCreated { agent_id, .. }
             | ServerMessage::AgentLoaded { agent_id } => {

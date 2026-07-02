@@ -1,6 +1,7 @@
 //! Raw redb schema for persisted agents.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use redb::{TableDefinition, Value as _};
@@ -21,6 +22,9 @@ const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
 const AGENTS: TableDefinition<AgentId, Sen<AgentRecord>> = TableDefinition::new("agents");
 const TOPICS: TableDefinition<TopicId, Sen<TopicRecord>> = TableDefinition::new("topics");
 const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("topic_agents");
+/// Keyed by the workdir's absolute path (UTF-8; paths are strings on disk
+/// and on the wire), making paths unique by construction.
+const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -86,6 +90,16 @@ impl FromStr for TopicId {
         let value = value.strip_prefix("topic-").unwrap_or(value);
         value.parse().map(Self)
     }
+}
+
+/// A registered directory agents can be started in, keyed by its absolute
+/// path. Purely selection vocabulary for clients; agents record their own
+/// working directory and the daemon never requires it to match a registered
+/// workdir.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct WorkdirRecord {
+    pub name: String,
+    pub created_at: UnixMillis,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -158,6 +172,9 @@ pub type UnixMillis = UnixMs;
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
+    /// Absolute directory this agent's tools execute in. Fixed at creation:
+    /// the accumulated model context assumes one root for the agent's life.
+    pub working_directory: PathBuf,
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
     pub current_lineage: AgentLineageId,
@@ -172,6 +189,7 @@ pub trait AgentReadTxnExt {
     fn list_topic_agents(&self, topic_id: TopicId) -> Vec<AgentId>;
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
     fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
+    fn list_workdirs(&self) -> Vec<(PathBuf, WorkdirRecord)>;
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
 }
 
@@ -190,9 +208,15 @@ pub trait AgentWriteTxnExt {
         now: UnixMillis,
         topic_id: TopicId,
         display_name: Option<String>,
+        working_directory: PathBuf,
         prompt_cache_key: PromptCacheKey,
         config: InferenceProtectedConfig,
     ) -> (AgentId, AgentEventPos);
+
+    /// Registers `path` or renames it if already registered.
+    fn upsert_workdir(&mut self, now: UnixMillis, path: &str, name: String);
+
+    fn remove_workdir(&mut self, path: &str);
 
     fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos;
 }
@@ -235,6 +259,13 @@ impl AgentReadTxnExt for ReadTxn {
         self.open_table(AGENTS)
             .iter()
             .map(|(key, value)| (key.value(), value.value().into_owned()))
+            .collect()
+    }
+
+    fn list_workdirs(&self) -> Vec<(PathBuf, WorkdirRecord)> {
+        self.open_table(WORKDIRS)
+            .iter()
+            .map(|(key, value)| (PathBuf::from(key.value()), value.value().into_owned()))
             .collect()
     }
 
@@ -288,6 +319,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENTS);
         self.open_table(TOPICS);
         self.open_table(TOPIC_AGENTS);
+        self.open_table(WORKDIRS);
     }
 
     fn create_topic(
@@ -313,6 +345,7 @@ impl AgentWriteTxnExt for WriteTxn {
         now: UnixMillis,
         topic_id: TopicId,
         display_name: Option<String>,
+        working_directory: PathBuf,
         prompt_cache_key: PromptCacheKey,
         config: InferenceProtectedConfig,
     ) -> (AgentId, AgentEventPos) {
@@ -321,6 +354,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(LINEAGE_PARENTS);
         let agent = AgentRecord {
             display_name,
+            working_directory,
             created_at: now,
             updated_at: now,
             current_lineage: lineage_id,
@@ -333,6 +367,22 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(TOPIC_AGENTS)
             .insert(&TopicAgentKey::new(topic_id, agent_id), &());
         (agent_id, AgentEventPos::root(lineage_id))
+    }
+
+    fn upsert_workdir(&mut self, now: UnixMillis, path: &str, name: String) {
+        let mut workdirs = self.open_table(WORKDIRS);
+        let created_at = workdirs
+            .get(&path.to_owned())
+            .map(|record| record.value().into_owned().created_at)
+            .unwrap_or(now);
+        workdirs.insert(
+            &path.to_owned(),
+            SenValue::borrowed(&WorkdirRecord { name, created_at }),
+        );
+    }
+
+    fn remove_workdir(&mut self, path: &str) {
+        self.open_table(WORKDIRS).remove(&path.to_owned());
     }
 
     fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos {

@@ -1324,6 +1324,57 @@ impl Unpacker for String {
     }
 }
 
+// --- Path / PathBuf ---
+/// Paths use the same wire format as strings; non-UTF-8 paths fail to encode.
+impl Encoder for std::path::Path {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        path_str(self)?.encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.as_os_str().is_empty()
+    }
+}
+
+impl Packer for std::path::Path {
+    fn pack(&self, writer: &mut BytesMut) -> Result<()> {
+        path_str(self)?.pack(writer)
+    }
+}
+
+impl Encoder for std::path::PathBuf {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        self.as_path().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.as_os_str().is_empty()
+    }
+}
+
+impl Packer for std::path::PathBuf {
+    fn pack(&self, writer: &mut BytesMut) -> Result<()> {
+        self.as_path().pack(writer)
+    }
+}
+
+impl Decoder for std::path::PathBuf {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        Ok(Self::from(String::decode(reader)?))
+    }
+}
+
+impl Unpacker for std::path::PathBuf {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
+        Ok(Self::from(String::unpack(reader)?))
+    }
+}
+
+fn path_str(path: &std::path::Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| EncoderError::Encode("path is not valid UTF-8".to_owned()))
+}
+
 // --- Option ---
 /// Encodes an `Option<T>` as a tag byte followed by the value if present.
 impl<T: Encoder> Encoder for Option<T> {

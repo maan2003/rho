@@ -82,3 +82,26 @@ fn test_primitive_pack_unpack() {
     let unpacked_string: String = unpack(&mut reader).unwrap();
     assert_eq!(string_val, unpacked_string);
 }
+
+#[test]
+fn test_pack_unpack_pathbuf() {
+    let original = std::path::PathBuf::from("/home/user/src/project");
+
+    let packed_bytes = pack(&original).unwrap();
+    let mut reader = packed_bytes;
+    let unpacked: std::path::PathBuf = unpack(&mut reader).unwrap();
+
+    assert_eq!(original, unpacked);
+}
+
+#[test]
+fn test_pathbuf_shares_string_wire_format() {
+    let path = std::path::PathBuf::from("/tmp/x");
+    let string = "/tmp/x".to_string();
+
+    assert_eq!(pack(&path).unwrap(), pack(&string).unwrap());
+    assert_eq!(
+        senax_encoder::encode(&path).unwrap(),
+        senax_encoder::encode(&string).unwrap()
+    );
+}

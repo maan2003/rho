@@ -45,66 +45,68 @@ fn streaming_state(blocks: Vec<UiBlock>) -> UiAgentState {
     agent_state(blocks, UiAgentStatus::Streaming)
 }
 
+fn completion_candidates(buffer: &str, cursor: usize) -> Vec<rho_cli_term_raw::Candidate> {
+    completion::completion_candidates(buffer, cursor, &[], &[])
+}
+
 #[test]
-fn slash_completion_lists_matching_commands() {
-    let candidates = completion_candidates("/c", 2);
+fn colon_completion_lists_matching_commands() {
+    let candidates = completion_candidates(":c", 2);
     assert_eq!(
         candidates
             .iter()
             .map(|candidate| candidate.label.as_str())
             .collect::<Vec<_>>(),
-        ["/cancel", "/compact", "/clear"]
+        ["cancel", "clear"]
     );
 }
 
 #[test]
 fn completion_includes_relative_paths() {
-    let candidates = completion::completion_candidates("see ./Cargo", "see ./Cargo".len());
+    let candidates = completion_candidates("see ./Cargo", "see ./Cargo".len());
     assert!(candidates.iter().any(|candidate| {
         candidate.label == "./Cargo.toml" && candidate.replacement == "see ./Cargo.toml"
     }));
 }
 
 #[test]
-fn slash_command_completion_preserves_suffix() {
-    let candidates = completion_candidates("  /ver now", "  /ver".len());
+fn command_completion_preserves_suffix() {
+    let candidates = completion_candidates("  :ver now", "  :ver".len());
     assert!(candidates.iter().any(|candidate| {
-        candidate.label == "/version" && candidate.replacement == "  /version now"
+        candidate.label == "version" && candidate.replacement == "  :version now"
     }));
 }
 
 #[test]
-fn slash_argument_completion_replaces_current_arg() {
-    let candidates = completion_candidates("/theme tau-p", "/theme tau-p".len());
+fn argument_completion_uses_live_workdirs() {
+    let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
+    let buffer = ":agent new rh";
+    let candidates = completion::completion_candidates(buffer, buffer.len(), &workdirs, &[]);
     assert!(candidates.iter().any(|candidate| {
-        candidate.label == "tau-plain-dark" && candidate.replacement == "/theme tau-plain-dark"
+        candidate.label == "rho" && candidate.replacement == ":agent new rho"
     }));
 }
 
 #[test]
-fn non_leading_absolute_path_completion_is_filesystem() {
-    let candidates = completion_candidates("open /t", "open /t".len());
-    assert!(
-        candidates
-            .iter()
-            .any(|candidate| candidate.label == "/tmp/")
-    );
+fn command_path_argument_completion_is_filesystem() {
+    let buffer = ":workdirs add /t";
+    let candidates = completion_candidates(buffer, buffer.len());
+    assert!(candidates.iter().any(|candidate| {
+        candidate.label == "/tmp/" && candidate.replacement == ":workdirs add /tmp/"
+    }));
 }
 
 #[test]
-fn slash_command_parse_known_and_unknown() {
-    assert!(matches!(SlashCommand::parse("hello"), None));
+fn command_parse_known_and_unknown() {
+    use rho_commands::{Command, Parsed, parse};
+    assert!(matches!(parse("hello"), None));
     assert!(matches!(
-        SlashCommand::parse("/quit"),
-        Some(SlashCommand::Quit)
+        parse(":quit"),
+        Some(Parsed::Command(Command::Quit))
     ));
     assert!(matches!(
-        SlashCommand::parse("/model"),
-        Some(SlashCommand::Unsupported(command)) if command == "/model"
-    ));
-    assert!(matches!(
-        SlashCommand::parse("/wat"),
-        Some(SlashCommand::Unknown(command)) if command == "/wat"
+        parse(":wat"),
+        Some(Parsed::Unknown(command)) if command == ":wat"
     ));
 }
 

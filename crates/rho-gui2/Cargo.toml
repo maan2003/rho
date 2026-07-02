@@ -26,6 +26,7 @@ language = { path = "../../../zed/crates/language" }
 multi_buffer = { path = "../../../zed/crates/multi_buffer" }
 project = { path = "../../../zed/crates/project" }
 release_channel = { path = "../../../zed/crates/release_channel" }
+rho-commands.workspace = true
 rho-core.workspace = true
 rho-daemon.workspace = true
 rho-ui-proto.workspace = true

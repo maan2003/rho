@@ -8,6 +8,7 @@
 mod apply_patch;
 mod truncate;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,9 @@ pub const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 #[derive(Clone, Debug)]
 pub struct ShellTools {
     default_timeout: Duration,
+    /// Commands run here and relative patch paths resolve against it; the
+    /// owning process's cwd is never consulted.
+    working_directory: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -46,9 +50,10 @@ struct ShellArgs {
 }
 
 impl ShellTools {
-    pub fn new(timeout: Duration) -> Self {
+    pub fn new(timeout: Duration, working_directory: PathBuf) -> Self {
         Self {
             default_timeout: timeout,
+            working_directory,
         }
     }
 
@@ -72,7 +77,7 @@ impl ShellTools {
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Optional working directory"
+                        "description": "Optional working directory; defaults to the agent's working directory"
                     },
                     "timeout": {
                         "type": "integer",
@@ -161,9 +166,13 @@ impl ShellTools {
         let mut command = Command::new("sh");
         command.arg("-c").arg(&args.command);
         command.kill_on_drop(true);
-        if let Some(cwd) = args.cwd {
-            command.current_dir(cwd);
-        }
+        // An absolute model-supplied cwd wins; a relative one resolves
+        // against the agent's working directory (join handles both).
+        let cwd = match args.cwd {
+            Some(cwd) => self.working_directory.join(cwd),
+            None => self.working_directory.clone(),
+        };
+        command.current_dir(cwd);
 
         let started = Instant::now();
         command.stdout(std::process::Stdio::piped());
@@ -233,7 +242,8 @@ impl ShellTools {
         if call.tool_type != ToolType::Custom {
             return Err(anyhow!("apply_patch expects a custom tool call"));
         }
-        let (output, metadata) = apply_patch::apply_patch_with_metadata(&call.arguments)?;
+        let (output, metadata) =
+            apply_patch::apply_patch_with_metadata(&call.arguments, &self.working_directory)?;
         Ok((
             output,
             Some(ToolResultMetadata::ApplyPatch(ApplyPatchMetadata {
