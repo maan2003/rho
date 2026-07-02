@@ -6,7 +6,6 @@ pub(crate) fn completion_candidates(
     buffer: &str,
     cursor: usize,
     workdirs: &[(String, String)],
-    known_agents: &[String],
     topics: &[String],
 ) -> Vec<Candidate> {
     let Some(token) = word_token(buffer, cursor) else {
@@ -19,11 +18,7 @@ pub(crate) fn completion_candidates(
         };
         let command = rho_commands::completion_candidates(
             before_cursor,
-            &rho_commands::CompletionCtx {
-                workdirs,
-                known_agents,
-                topics,
-            },
+            &rho_commands::CompletionCtx { workdirs, topics },
         )
         .into_iter()
         .map(|candidate| {

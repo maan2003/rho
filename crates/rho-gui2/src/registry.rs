@@ -104,13 +104,27 @@ impl AgentRegistry {
         self.selected = agent_id;
     }
 
-    /// Cycles through live agents by `delta`, starting from the current
-    /// selection.
+    /// Hidden from the rail: archived itself, or in an archived topic. Such
+    /// agents stay loadable by id but are skipped by cycling.
+    pub fn agent_hidden(&self, agent_id: AgentId) -> bool {
+        self.topics.iter().any(|topic| {
+            topic.agents.iter().any(|agent| {
+                agent.agent_id == agent_id
+                    && (agent.status == rho_ui_proto::Status::Archived
+                        || topic.status == rho_ui_proto::Status::Archived)
+            })
+        })
+    }
+
+    /// Cycles through live, rail-visible agents by `delta`, starting from
+    /// the current selection.
     pub fn next_live_agent(&self, delta: isize) -> Option<AgentId> {
         let live = self
             .agents
             .iter()
-            .filter(|(_, life)| **life == AgentLife::Live)
+            .filter(|(agent_id, life)| {
+                **life == AgentLife::Live && !self.agent_hidden(**agent_id)
+            })
             .map(|(agent_id, _)| agent_id)
             .collect::<Vec<_>>();
         if live.is_empty() {
@@ -126,14 +140,62 @@ impl AgentRegistry {
         live.get(index).map(|agent_id| *(*agent_id))
     }
 
-    pub fn known_agents(&self) -> impl Iterator<Item = &AgentId> {
-        self.agents.keys()
-    }
-
     pub fn live_agents(&self) -> impl Iterator<Item = &AgentId> {
         self.agents
             .iter()
             .filter(|(_, life)| **life == AgentLife::Live)
             .map(|(agent_id, _)| agent_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr as _;
+
+    use rho_ui_proto::{Status, UiAgentSummary};
+
+    use super::*;
+
+    fn agent(id: u64, status: Status) -> UiAgentSummary {
+        UiAgentSummary {
+            agent_id: AgentId::from_str(&format!("agent-{id}")).unwrap(),
+            display_name: None,
+            working_directory: "/tmp".into(),
+            status,
+        }
+    }
+
+    fn topic(id: u64, status: Status, agents: Vec<UiAgentSummary>) -> UiTopic {
+        UiTopic {
+            topic_id: rho_ui_proto::TopicId::from_str(&format!("topic-{id}")).unwrap(),
+            name: format!("topic-{id}"),
+            status,
+            agents,
+        }
+    }
+
+    #[test]
+    fn cycling_skips_archived_agents_and_archived_topics() {
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![
+            topic(
+                1,
+                Status::Normal,
+                vec![agent(1, Status::Normal), agent(2, Status::Archived)],
+            ),
+            topic(2, Status::Archived, vec![agent(3, Status::Normal)]),
+        ]);
+        for id in 1..=3 {
+            registry.mark_live(AgentId::from_str(&format!("agent-{id}")).unwrap());
+        }
+
+        let visible = AgentId::from_str("agent-1").unwrap();
+        registry.select(Some(visible));
+        // Both forward and backward cycling only ever land on the one
+        // rail-visible agent.
+        assert_eq!(registry.next_live_agent(1), Some(visible));
+        assert_eq!(registry.next_live_agent(-1), Some(visible));
+        assert!(registry.agent_hidden(AgentId::from_str("agent-2").unwrap()));
+        assert!(registry.agent_hidden(AgentId::from_str("agent-3").unwrap()));
     }
 }

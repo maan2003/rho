@@ -58,6 +58,9 @@ pub struct Workspace {
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
     awaiting_draft_agent: bool,
+    /// Rail view mode: browsing archived topics/agents instead of active
+    /// ones.
+    show_archived: bool,
     connected: bool,
     duration_timer: Option<Task<()>>,
     _event_task: Task<()>,
@@ -102,6 +105,7 @@ impl Workspace {
             draft_topic_id: None,
             default_topic_id: None,
             awaiting_draft_agent: false,
+            show_archived: false,
             connected: false,
             duration_timer: None,
             _event_task: event_task,
@@ -285,7 +289,7 @@ impl Workspace {
             self.notice_on(None, "not connected to rho-daemon", StyleClass::SystemImportant, cx);
             return;
         }
-        let Some(topic_id) = self.draft_topic_id.or(self.default_topic_id) else {
+        let Some(topic_id) = self.draft_target_topic() else {
             self.notice_on(None, "no rho topic is available", StyleClass::SystemInfo, cx);
             return;
         };
@@ -360,10 +364,6 @@ impl Workspace {
                         cx,
                     ),
                 }
-            }
-            Command::AgentLoad { agent_id } => {
-                self.registry.mark_known(agent_id);
-                self.open_agent(agent_id, window, cx);
             }
             Command::TopicNew { name } => {
                 self.connection.send(ClientMessage::NewTopic { name });
@@ -491,6 +491,11 @@ impl Workspace {
         self.select_agent(None, window, cx);
     }
 
+    pub fn toggle_show_archived(&mut self, cx: &mut Context<Self>) {
+        self.show_archived = !self.show_archived;
+        cx.notify();
+    }
+
     /// Selects an agent, asking the daemon to load it first when this
     /// connection has never seen frames for it.
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
@@ -592,13 +597,28 @@ impl Workspace {
             .update(cx, |view, cx| view.seed(&label, force_header, window, cx));
     }
 
-    /// Where a new agent works when the draft doesn't say: the inherited
+    /// The topic a draft submission lands in: the inherited topic unless it
+    /// has since been archived (new agents must stay visible), else the
+    /// default topic.
+    fn draft_target_topic(&self) -> Option<rho_ui_proto::TopicId> {
+        self.draft_topic_id
+            .filter(|topic_id| !self.topic_archived(*topic_id))
+            .or(self.default_topic_id)
+    }
+
+    fn topic_archived(&self, topic_id: rho_ui_proto::TopicId) -> bool {
+        self.registry
+            .topics()
+            .iter()
+            .any(|topic| topic.topic_id == topic_id && topic.status == rho_ui_proto::Status::Archived)
+    }
+
+    /// Where a new agent works when the draft doesn't say: the target
     /// topic's newest agent sets the precedent, else the first registered
     /// workdir. All daemon-side data — the GUI may run on another machine,
     /// so its own cwd is meaningless here.
     fn draft_default_workdir(&self) -> Option<PathBuf> {
-        self.draft_topic_id
-            .or(self.default_topic_id)
+        self.draft_target_topic()
             .and_then(|topic_id| self.registry.last_working_directory(topic_id))
             .or_else(|| self.workdirs.first().map(|workdir| workdir.path.clone()))
     }
@@ -780,13 +800,6 @@ impl Workspace {
             .unwrap_or_else(|| directory.display().to_string())
     }
 
-    pub fn known_agent_names(&self) -> Vec<String> {
-        self.registry
-            .known_agents()
-            .map(|agent_id| agent_id.to_string())
-            .collect()
-    }
-
     pub fn live_agent_names(&self) -> Vec<String> {
         self.registry
             .live_agents()
@@ -832,7 +845,12 @@ impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
-        let rail = crate::topic_rail::render_topic_rail(&self.registry, &text_style, cx);
+        let rail = crate::topic_rail::render_topic_rail(
+            &self.registry,
+            self.show_archived,
+            &text_style,
+            cx,
+        );
         div()
             .id("rho-gui2")
             .size_full()

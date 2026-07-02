@@ -3,7 +3,8 @@
 //! Topics are ad-hoc tab groups; every topic — including the daemon-created
 //! "default" one that agents are born into — renders uniformly with its
 //! name as the header, which advertises that grouping exists. Pinned topics
-//! and agents sort first; archived ones are hidden (still loadable by id).
+//! and agents sort first; archived ones are hidden until the "archived"
+//! view mode flips the filter, showing exactly what the normal view hides.
 //! Clicking an agent opens it (loading it on demand); the `+` row opens the
 //! draft compose view and doubles as its selection indicator.
 
@@ -11,7 +12,7 @@ use std::collections::BTreeSet;
 
 use gpui::prelude::*;
 use gpui::{Context, Div, MouseButton, TextStyle, div, px};
-use rho_ui_proto::{AgentId, Status, UiTopic};
+use rho_ui_proto::{AgentId, Status, UiAgentSummary, UiTopic};
 use theme::ActiveTheme as _;
 use ui::{Color, Icon, IconName, IconSize};
 
@@ -20,6 +21,7 @@ use crate::workspace::Workspace;
 
 pub fn render_topic_rail(
     registry: &AgentRegistry,
+    show_archived: bool,
     text_style: &TextStyle,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
@@ -36,14 +38,19 @@ pub fn render_topic_rail(
     let mut visible_topics = registry
         .topics()
         .iter()
-        .filter(|topic| topic.status != Status::Archived)
+        .filter_map(|topic| {
+            let agents = visible_agents(topic, show_archived);
+            (!agents.is_empty() || (topic.status == Status::Archived) == show_archived)
+                .then_some((topic, agents))
+        })
         .collect::<Vec<_>>();
-    visible_topics.sort_by_key(|topic| topic.status != Status::Pinned);
+    visible_topics.sort_by_key(|(topic, _)| topic.status != Status::Pinned);
     let rows = visible_topics
         .into_iter()
-        .map(|topic| {
+        .map(|(topic, agents)| {
             render_topic_rows(
                 topic,
+                agents,
                 selected_agent.as_ref(),
                 &live,
                 text_style,
@@ -77,7 +84,7 @@ pub fn render_topic_rail(
                 .overflow_y_scroll()
                 .children(rows),
         )
-        // Pinned below the scrolling list, so it stays reachable no matter
+        // Pinned below the scrolling list, so they stay reachable no matter
         // how many agents accumulate.
         .child(new_agent_row(
             selected_agent.is_none(),
@@ -85,6 +92,47 @@ pub fn render_topic_rail(
             selected_color,
             cx,
         ))
+        .child(show_archived_row(show_archived, text_style, selected_color, cx))
+}
+
+/// Flips the rail between active and archived views; archived items are
+/// opened (and restored via `:agent archive` / `:topic archive`) from here.
+fn show_archived_row(
+    show_archived: bool,
+    text_style: &TextStyle,
+    selected_color: gpui::Hsla,
+    cx: &mut Context<Workspace>,
+) -> Div {
+    let (text_color, icon_color) = if show_archived {
+        (selected_color, selected_color)
+    } else {
+        (text_style.color.opacity(0.8), text_style.color.opacity(0.5))
+    };
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_1()
+        .pl(px(4.))
+        .pt(px(2.))
+        .pb(px(2.))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _window, cx| {
+                this.toggle_show_archived(cx);
+            }),
+        )
+        .child(
+            Icon::new(IconName::Archive)
+                .size(IconSize::XSmall)
+                .color(Color::Custom(icon_color)),
+        )
+        .child(div().text_color(text_color).child(if show_archived {
+            "back to active"
+        } else {
+            "view archived"
+        }))
 }
 
 fn new_agent_row(
@@ -121,8 +169,26 @@ fn new_agent_row(
         .child(div().text_color(text_color).child("new agent"))
 }
 
+/// Which of a topic's agents the current view mode shows. The archived view
+/// is the exact complement of the normal one: an agent is archived-visible
+/// when it is archived itself or its whole topic is.
+fn visible_agents(topic: &UiTopic, show_archived: bool) -> Vec<&UiAgentSummary> {
+    let mut agents = topic
+        .agents
+        .iter()
+        .filter(|summary| {
+            let hidden =
+                summary.status == Status::Archived || topic.status == Status::Archived;
+            hidden == show_archived
+        })
+        .collect::<Vec<_>>();
+    agents.sort_by_key(|summary| summary.status != Status::Pinned);
+    agents
+}
+
 fn render_topic_rows(
     topic: &UiTopic,
+    agents: Vec<&UiAgentSummary>,
     selected_agent: Option<&AgentId>,
     live: &BTreeSet<AgentId>,
     text_style: &TextStyle,
@@ -130,12 +196,6 @@ fn render_topic_rows(
     cx: &mut Context<Workspace>,
 ) -> Div {
     let name = topic.name.clone();
-    let mut agents = topic
-        .agents
-        .iter()
-        .filter(|summary| summary.status != Status::Archived)
-        .collect::<Vec<_>>();
-    agents.sort_by_key(|summary| summary.status != Status::Pinned);
     div()
         .w_full()
         .flex()
@@ -196,9 +256,7 @@ fn render_topic_rows(
                     }),
                 )
                 .child(
-                    Icon::new(if selected {
-                        IconName::PlayFilled
-                    } else if pinned {
+                    Icon::new(if pinned {
                         IconName::Pin
                     } else {
                         IconName::Circle

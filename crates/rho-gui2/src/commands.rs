@@ -22,7 +22,6 @@ pub struct Candidate {
 pub fn completions_for(
     text_before_cursor: &str,
     workdirs: &[(String, String)],
-    known_agents: &[String],
     live_agents: &[String],
     topics: &[String],
 ) -> Vec<Candidate> {
@@ -47,11 +46,7 @@ pub fn completions_for(
     };
     rho_commands::completion_candidates(
         trimmed,
-        &rho_commands::CompletionCtx {
-            workdirs,
-            known_agents,
-            topics,
-        },
+        &rho_commands::CompletionCtx { workdirs, topics },
     )
     .into_iter()
     .map(|candidate| Candidate {
@@ -130,14 +125,13 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         _window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<anyhow::Result<Vec<CompletionResponse>>> {
-        let (workdirs, known_agents, live_agents, topics) = self
+        let (workdirs, live_agents, topics) = self
             .workspace
             .upgrade()
             .map(|workspace| {
                 let workspace = workspace.read(cx);
                 (
                     workspace.workdir_table(),
-                    workspace.known_agent_names(),
                     workspace.live_agent_names(),
                     workspace.topic_names(),
                 )
@@ -156,13 +150,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         let candidates = if in_workdir_field {
             workdir_field_candidates(&text_before_cursor, &workdirs)
         } else {
-            completions_for(
-                &text_before_cursor,
-                &workdirs,
-                &known_agents,
-                &live_agents,
-                &topics,
-            )
+            completions_for(&text_before_cursor, &workdirs, &live_agents, &topics)
         };
         let completions = candidates
                 .into_iter()
@@ -218,31 +206,18 @@ mod tests {
 
     #[test]
     fn root_commands_complete_by_prefix() {
-        let candidates = completions_for(":", &[], &[], &[], &[]);
+        let candidates = completions_for(":", &[], &[], &[]);
         assert!(candidates.iter().any(|c| c.value == ":agent"));
         assert!(candidates.iter().any(|c| c.value == ":workdirs"));
-        let candidates = completions_for(":agent lo", &[], &[], &[], &[]);
+        let candidates = completions_for(":agent ar", &[], &[], &[]);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "load");
-    }
-
-    #[test]
-    fn load_completes_known_agents() {
-        let known = vec!["agent-1".to_owned(), "agent-2".to_owned()];
-        let candidates = completions_for(":agent load ", &[], &known, &[], &[]);
-        assert_eq!(
-            candidates.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
-            vec!["agent-1", "agent-2"]
-        );
-        let candidates = completions_for(":agent load 2", &[], &known, &[], &[]);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "agent-2");
+        assert_eq!(candidates[0].value, "archive");
     }
 
     #[test]
     fn agent_new_completes_workdirs() {
         let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
-        let candidates = completions_for(":agent new ", &workdirs, &[], &[], &[]);
+        let candidates = completions_for(":agent new ", &workdirs, &[], &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "rho");
         assert_eq!(candidates[0].description, "/home/u/src/rho");
@@ -251,7 +226,7 @@ mod tests {
     #[test]
     fn topic_move_completes_topics() {
         let topics = vec!["infra".to_owned(), "topic-1".to_owned()];
-        let candidates = completions_for(":topic move in", &[], &[], &[], &topics);
+        let candidates = completions_for(":topic move in", &[], &[], &topics);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "infra");
     }
@@ -259,7 +234,7 @@ mod tests {
     #[test]
     fn mentions_complete_live_agents() {
         let live = vec!["helper".to_owned(), "worker".to_owned()];
-        let candidates = completions_for("ask @w", &[], &[], &live, &[]);
+        let candidates = completions_for("ask @w", &[], &live, &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "worker");
     }

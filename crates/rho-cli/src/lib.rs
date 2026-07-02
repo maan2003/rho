@@ -246,10 +246,6 @@ impl ChatApp {
                     .print_system(&format!("new agent in {}", working_directory.display()));
                 self.agent.new_agent_in_topic(topic_id, working_directory);
             }
-            rho_commands::Command::AgentLoad { agent_id } => {
-                self.agent.load_agent(agent_id);
-                self.term.print_system(&format!("loading {agent_id}"));
-            }
             rho_commands::Command::AgentPin => {
                 self.toggle_agent_status(rho_ui_proto::Status::Pinned);
             }
@@ -558,7 +554,7 @@ impl ChatTerm {
     fn new() -> io::Result<Self> {
         let (mut term, handle) = Term::new(prompt_text(), CursorShape::Bar)?;
         term.set_completion_source(Some(Box::new(|buffer: &str, cursor: usize| {
-            completion::completion_candidates(buffer, cursor, &[], &[], &[])
+            completion::completion_candidates(buffer, cursor, &[], &[])
         })));
         handle.set_input_placeholder(dim_text("send a message"));
         handle.set_right_prompt(dim_text(":quit"));
@@ -582,16 +578,11 @@ impl ChatTerm {
         self.term
             .set_completion_source(Some(Box::new(move |buffer: &str, cursor: usize| {
                 let workdirs = workdir_table(&agent);
-                let agents = agent
-                    .known_agent_ids()
-                    .into_iter()
-                    .map(|agent_id| agent_id.to_string())
-                    .collect::<Vec<_>>();
                 let topics = topic_labels(&agent)
                     .into_iter()
                     .map(|(label, _)| label)
                     .collect::<Vec<_>>();
-                completion::completion_candidates(buffer, cursor, &workdirs, &agents, &topics)
+                completion::completion_candidates(buffer, cursor, &workdirs, &topics)
             })));
     }
 

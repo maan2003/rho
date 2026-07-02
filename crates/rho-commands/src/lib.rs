@@ -7,9 +7,8 @@
 //! *are*.
 
 use std::path::PathBuf;
-use std::str::FromStr as _;
 
-use rho_ui_proto::{AgentId, Status, TopicId};
+use rho_ui_proto::{Status, TopicId};
 
 pub struct CommandSpec {
     /// Full command name after the `:`, e.g. `agent new`.
@@ -23,11 +22,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "agent new",
         usage: ":agent new [path]",
         description: "Start a new agent, optionally in the given working directory",
-    },
-    CommandSpec {
-        name: "agent load",
-        usage: ":agent load <agent-id>",
-        description: "Load an agent by id",
     },
     CommandSpec {
         name: "agent cancel",
@@ -104,7 +98,6 @@ pub const COMMANDS: &[CommandSpec] = &[
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     AgentNew { working_directory: Option<PathBuf> },
-    AgentLoad { agent_id: AgentId },
     AgentCancel,
     AgentPin,
     AgentArchive,
@@ -138,14 +131,10 @@ pub fn parse(line: &str) -> Option<Parsed> {
             Some("new") => Parsed::Command(Command::AgentNew {
                 working_directory: tokens.next().map(PathBuf::from),
             }),
-            Some("load") => match tokens.next().map(AgentId::from_str) {
-                Some(Ok(agent_id)) => Parsed::Command(Command::AgentLoad { agent_id }),
-                _ => Parsed::Invalid(":agent load <agent-id>".to_owned()),
-            },
             Some("cancel") => Parsed::Command(Command::AgentCancel),
             Some("pin") => Parsed::Command(Command::AgentPin),
             Some("archive") => Parsed::Command(Command::AgentArchive),
-            _ => Parsed::Invalid(":agent new|load|cancel|pin|archive".to_owned()),
+            _ => Parsed::Invalid(":agent new|cancel|pin|archive".to_owned()),
         },
         "topic" => match tokens.next() {
             Some("new") => match joined_name(rest) {
@@ -212,8 +201,6 @@ pub fn toggle_status(current: Status, target: Status) -> Status {
 pub struct CompletionCtx<'a> {
     /// Registered workdirs as `(name, path)`.
     pub workdirs: &'a [(String, String)],
-    pub known_agents: &'a [String],
-    /// Topic labels: display names, or the id string for unnamed topics.
     pub topics: &'a [String],
 }
 
@@ -289,15 +276,6 @@ fn command_word_candidates(prefix_words: &[&str], partial: &str) -> Vec<Candidat
 
 fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> Vec<Candidate> {
     match command {
-        ["agent", "load"] => ctx
-            .known_agents
-            .iter()
-            .filter(|agent| fuzzy_contains(agent, partial))
-            .map(|agent| Candidate {
-                value: agent.clone(),
-                description: "agent".to_owned(),
-            })
-            .collect(),
         ["topic", "move"] | ["topic", "pin"] | ["topic", "archive"] => ctx
             .topics
             .iter()

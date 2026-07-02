@@ -29,16 +29,6 @@ fn parses_agent_commands() {
             working_directory: Some(PathBuf::from("~/src/rho"))
         }))
     );
-    assert_eq!(
-        parse(":agent load agent-3"),
-        Some(Parsed::Command(Command::AgentLoad {
-            agent_id: AgentId::from_str("agent-3").unwrap()
-        }))
-    );
-    assert_eq!(
-        parse(":agent load"),
-        Some(Parsed::Invalid(":agent load <agent-id>".to_owned()))
-    );
     assert_eq!(parse(":cancel"), Some(Parsed::Command(Command::AgentCancel)));
 }
 
@@ -155,20 +145,18 @@ fn completes_command_words_stepwise() {
     assert_eq!(values(&first).iter().filter(|v| **v == "agent").count(), 1);
 
     let second = completion_candidates(":agent ", &ctx);
-    assert_eq!(values(&second), ["new", "load", "cancel", "pin", "archive"]);
+    assert_eq!(values(&second), ["new", "cancel", "pin", "archive"]);
 
-    let partial = completion_candidates(":agent lo", &ctx);
-    assert_eq!(values(&partial), ["load"]);
+    let partial = completion_candidates(":agent ar", &ctx);
+    assert_eq!(values(&partial), ["archive"]);
 }
 
 #[test]
 fn completes_arguments_from_context() {
     let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
-    let agents = vec!["agent-1".to_owned(), "agent-2".to_owned()];
     let topics = vec!["infra".to_owned(), "topic-1".to_owned()];
     let ctx = CompletionCtx {
         workdirs: &workdirs,
-        known_agents: &agents,
         topics: &topics,
     };
 
@@ -176,10 +164,6 @@ fn completes_arguments_from_context() {
     assert_eq!(
         values(&completion_candidates(":topic move in", &ctx)),
         ["infra"]
-    );
-    assert_eq!(
-        values(&completion_candidates(":agent load 2", &ctx)),
-        ["agent-2"]
     );
     assert_eq!(values(&completion_candidates(":workdirs rm rh", &ctx)), ["rho"]);
     // Paths for `workdirs add` come from the client's filesystem completion.
