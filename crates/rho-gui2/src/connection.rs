@@ -22,7 +22,9 @@ pub enum ConnEvent {
         workdirs: Vec<UiWorkdir>,
     },
     TopicCreated(UiTopic),
-    AgentAnnounced(AgentId),
+    /// The daemon created an agent this connection asked for.
+    AgentCreated(AgentId),
+    AgentLoaded(AgentId),
     Frame { agent_id: AgentId, frame: AgentRemoteFrame },
     TurnCancelled(AgentId),
     ServerError(String),
@@ -105,10 +107,10 @@ async fn run(
                 Some(ConnEvent::Ready { topics, workdirs })
             }
             ServerMessage::TopicCreated { topic } => Some(ConnEvent::TopicCreated(topic)),
-            ServerMessage::AgentCreated { agent_id, .. }
-            | ServerMessage::AgentLoaded { agent_id } => {
-                Some(ConnEvent::AgentAnnounced(agent_id))
+            ServerMessage::AgentCreated { agent_id, .. } => {
+                Some(ConnEvent::AgentCreated(agent_id))
             }
+            ServerMessage::AgentLoaded { agent_id } => Some(ConnEvent::AgentLoaded(agent_id)),
             ServerMessage::Agent { agent_id, frame } => {
                 Some(ConnEvent::Frame { agent_id, frame })
             }

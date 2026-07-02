@@ -1,8 +1,11 @@
 //! rho-gui2: a native GUI attached to a running rho daemon.
 
 mod agent_view;
+mod banner;
 mod commands;
 mod connection;
+mod draft_view;
+mod editor_config;
 mod highlights;
 mod registry;
 mod render;

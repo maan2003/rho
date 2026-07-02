@@ -57,6 +57,31 @@ fn parses_topic_new_with_multi_word_name() {
 }
 
 #[test]
+fn parses_topic_move() {
+    assert_eq!(
+        parse(":topic move fix auth bug"),
+        Some(Parsed::Command(Command::TopicMove {
+            name: "fix auth bug".to_owned()
+        }))
+    );
+    assert_eq!(
+        parse(":topic move"),
+        Some(Parsed::Invalid(":topic move <name>".to_owned()))
+    );
+}
+
+#[test]
+fn resolves_topics_by_label_or_id() {
+    let topics = vec![
+        ("infra".to_owned(), TopicId::from_str("topic-2").unwrap()),
+        ("topic-1".to_owned(), TopicId::from_str("topic-1").unwrap()),
+    ];
+    assert_eq!(resolve_topic("infra", &topics), Some(topics[0].1));
+    assert_eq!(resolve_topic("topic-2", &topics), Some(topics[0].1));
+    assert_eq!(resolve_topic("new-topic", &topics), None);
+}
+
+#[test]
 fn parses_workdir_commands() {
     assert_eq!(
         parse(":workdirs add /home/u/src/rho rho"),
@@ -108,12 +133,18 @@ fn completes_command_words_stepwise() {
 fn completes_arguments_from_context() {
     let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
     let agents = vec!["agent-1".to_owned(), "agent-2".to_owned()];
+    let topics = vec!["infra".to_owned(), "topic-1".to_owned()];
     let ctx = CompletionCtx {
         workdirs: &workdirs,
         known_agents: &agents,
+        topics: &topics,
     };
 
     assert_eq!(values(&completion_candidates(":agent new ", &ctx)), ["rho"]);
+    assert_eq!(
+        values(&completion_candidates(":topic move in", &ctx)),
+        ["infra"]
+    );
     assert_eq!(
         values(&completion_candidates(":agent load 2", &ctx)),
         ["agent-2"]

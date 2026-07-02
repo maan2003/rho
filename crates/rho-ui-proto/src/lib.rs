@@ -85,6 +85,13 @@ pub enum ClientMessage {
     CancelTurn {
         agent_id: AgentId,
     },
+    /// Re-points the agent's topic membership. Topics are ad-hoc tab groups:
+    /// agents start in the default topic and move into a topic once they
+    /// prove worth organizing.
+    MoveAgent {
+        agent_id: AgentId,
+        topic: TopicTarget,
+    },
     /// Registers a workdir, or renames it if `path` is already registered.
     /// `name` defaults to the path's basename.
     WorkdirSet {
@@ -94,6 +101,15 @@ pub enum ClientMessage {
     WorkdirRemove {
         path: PathBuf,
     },
+}
+
+/// Destination of [`ClientMessage::MoveAgent`]. `Named` is resolved by the
+/// daemon against topic display names and creates the topic when no match
+/// exists, so "spin off a topic around this agent" is one message.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum TopicTarget {
+    Existing(TopicId),
+    Named(String),
 }
 
 /// Message sent from the rho daemon to a UI client.

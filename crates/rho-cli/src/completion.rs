@@ -7,6 +7,7 @@ pub(crate) fn completion_candidates(
     cursor: usize,
     workdirs: &[(String, String)],
     known_agents: &[String],
+    topics: &[String],
 ) -> Vec<Candidate> {
     let Some(token) = word_token(buffer, cursor) else {
         return Vec::new();
@@ -21,6 +22,7 @@ pub(crate) fn completion_candidates(
             &rho_commands::CompletionCtx {
                 workdirs,
                 known_agents,
+                topics,
             },
         )
         .into_iter()

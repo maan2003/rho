@@ -24,6 +24,7 @@ pub fn completions_for(
     workdirs: &[(String, String)],
     known_agents: &[String],
     live_agents: &[String],
+    topics: &[String],
 ) -> Vec<Candidate> {
     if let Some(mention) = mention_prefix(text_before_cursor) {
         return live_agents
@@ -49,6 +50,7 @@ pub fn completions_for(
         &rho_commands::CompletionCtx {
             workdirs,
             known_agents,
+            topics,
         },
     )
     .into_iter()
@@ -83,13 +85,39 @@ fn mention_prefix(text: &str) -> Option<&str> {
     text.get(token_start(text)..)?.strip_prefix('@')
 }
 
+/// Completion inside the draft's workdir field buffer: registered workdirs,
+/// filtered by the token being typed.
+pub fn workdir_field_candidates(
+    text_before_cursor: &str,
+    workdirs: &[(String, String)],
+) -> Vec<Candidate> {
+    let needle = last_token(text_before_cursor);
+    workdirs
+        .iter()
+        .filter(|(name, path)| fuzzy_contains(name, needle) || fuzzy_contains(path, needle))
+        .map(|(name, path)| Candidate {
+            value: name.clone(),
+            description: path.clone(),
+        })
+        .collect()
+}
+
 pub struct WorkspaceCompletionProvider {
     workspace: WeakEntity<Workspace>,
+    /// The draft view's workdir field buffer: completions in it come from
+    /// the registered workdirs, not the prompt grammar.
+    workdir_buffer: Option<gpui::EntityId>,
 }
 
 impl WorkspaceCompletionProvider {
-    pub fn new(workspace: WeakEntity<Workspace>) -> Rc<Self> {
-        Rc::new(Self { workspace })
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        workdir_buffer: Option<gpui::EntityId>,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            workspace,
+            workdir_buffer,
+        })
     }
 }
 
@@ -102,7 +130,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         _window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<anyhow::Result<Vec<CompletionResponse>>> {
-        let (workdirs, known_agents, live_agents) = self
+        let (workdirs, known_agents, live_agents, topics) = self
             .workspace
             .upgrade()
             .map(|workspace| {
@@ -111,10 +139,12 @@ impl CompletionProvider for WorkspaceCompletionProvider {
                     workspace.workdir_table(),
                     workspace.known_agent_names(),
                     workspace.live_agent_names(),
+                    workspace.topic_names(),
                 )
             })
             .unwrap_or_default();
 
+        let in_workdir_field = self.workdir_buffer == Some(buffer.entity_id());
         let buffer = buffer.read(cx);
         let cursor_offset = buffer_position.to_offset(buffer);
         let text_before_cursor = buffer
@@ -123,8 +153,18 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         let replace_start = token_start(&text_before_cursor);
         let replace_range =
             buffer.anchor_before(replace_start)..buffer.anchor_before(cursor_offset);
-        let completions =
-            completions_for(&text_before_cursor, &workdirs, &known_agents, &live_agents)
+        let candidates = if in_workdir_field {
+            workdir_field_candidates(&text_before_cursor, &workdirs)
+        } else {
+            completions_for(
+                &text_before_cursor,
+                &workdirs,
+                &known_agents,
+                &live_agents,
+                &topics,
+            )
+        };
+        let completions = candidates
                 .into_iter()
                 .map(|candidate| Completion {
                     replace_range: replace_range.clone(),
@@ -166,10 +206,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         _cx: &mut Context<Editor>,
     ) -> bool {
         text.chars().last().is_some_and(|character| {
-            character == ':'
-                || character == '@'
-                || character == ' '
-                || character == '-'
+            matches!(character, ':' | '@' | ' ' | '-' | '/' | '~' | '_')
                 || character.is_ascii_alphanumeric()
         })
     }
@@ -181,10 +218,10 @@ mod tests {
 
     #[test]
     fn root_commands_complete_by_prefix() {
-        let candidates = completions_for(":", &[], &[], &[]);
+        let candidates = completions_for(":", &[], &[], &[], &[]);
         assert!(candidates.iter().any(|c| c.value == ":agent"));
         assert!(candidates.iter().any(|c| c.value == ":workdirs"));
-        let candidates = completions_for(":agent lo", &[], &[], &[]);
+        let candidates = completions_for(":agent lo", &[], &[], &[], &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "load");
     }
@@ -192,12 +229,12 @@ mod tests {
     #[test]
     fn load_completes_known_agents() {
         let known = vec!["agent-1".to_owned(), "agent-2".to_owned()];
-        let candidates = completions_for(":agent load ", &[], &known, &[]);
+        let candidates = completions_for(":agent load ", &[], &known, &[], &[]);
         assert_eq!(
             candidates.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
             vec!["agent-1", "agent-2"]
         );
-        let candidates = completions_for(":agent load 2", &[], &known, &[]);
+        let candidates = completions_for(":agent load 2", &[], &known, &[], &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "agent-2");
     }
@@ -205,17 +242,39 @@ mod tests {
     #[test]
     fn agent_new_completes_workdirs() {
         let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
-        let candidates = completions_for(":agent new ", &workdirs, &[], &[]);
+        let candidates = completions_for(":agent new ", &workdirs, &[], &[], &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "rho");
         assert_eq!(candidates[0].description, "/home/u/src/rho");
     }
 
     #[test]
+    fn topic_move_completes_topics() {
+        let topics = vec!["infra".to_owned(), "topic-1".to_owned()];
+        let candidates = completions_for(":topic move in", &[], &[], &[], &topics);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].value, "infra");
+    }
+
+    #[test]
     fn mentions_complete_live_agents() {
         let live = vec!["helper".to_owned(), "worker".to_owned()];
-        let candidates = completions_for("ask @w", &[], &[], &live);
+        let candidates = completions_for("ask @w", &[], &[], &live, &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "worker");
+    }
+
+    #[test]
+    fn workdir_field_completes_workdirs() {
+        let workdirs = vec![
+            ("rho".to_owned(), "/home/u/src/rho".to_owned()),
+            ("zed".to_owned(), "/home/u/src/zed".to_owned()),
+        ];
+        let candidates = workdir_field_candidates("rh", &workdirs);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].value, "rho");
+        assert_eq!(candidates[0].description, "/home/u/src/rho");
+        // An empty field offers everything.
+        assert_eq!(workdir_field_candidates("", &workdirs).len(), 2);
     }
 }

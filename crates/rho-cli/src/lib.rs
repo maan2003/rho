@@ -258,6 +258,20 @@ impl ChatApp {
                 self.agent.new_topic(name);
                 self.term.print_system("topic created");
             }
+            rho_commands::Command::TopicMove { name } => {
+                let Some(agent_id) = primary_agent_id(&self.agent) else {
+                    self.term.print_system(":topic move: no agent yet");
+                    return Ok(true);
+                };
+                let topics = topic_labels(&self.agent);
+                let target = match rho_commands::resolve_topic(&name, &topics) {
+                    Some(topic_id) => rho_ui_proto::TopicTarget::Existing(topic_id),
+                    None => rho_ui_proto::TopicTarget::Named(name.clone()),
+                };
+                self.term
+                    .print_system(&format!("moving {agent_id} to topic `{name}`"));
+                self.agent.move_agent(agent_id, target);
+            }
             rho_commands::Command::WorkdirAdd { path, name } => {
                 let Some(path) = resolve_working_directory(path, &[]) else {
                     self.term.print_system("cannot determine a working directory");
@@ -377,6 +391,23 @@ fn workdir_table(agent: &AgentClient) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Topics as the `(label, id)` pairs shared completion and resolution
+/// expect: display name, or the id string for unnamed topics.
+fn topic_labels(agent: &AgentClient) -> Vec<(String, rho_ui_proto::TopicId)> {
+    agent
+        .topics()
+        .into_iter()
+        .map(|topic| {
+            (
+                topic
+                    .display_name
+                    .unwrap_or_else(|| topic.topic_id.to_string()),
+                topic.topic_id,
+            )
+        })
+        .collect()
+}
+
 /// Resolves a command's working-directory argument: a registered workdir
 /// name, `~`-expanded, or relative to where the CLI was launched. `None`
 /// falls back to the CLI's own cwd.
@@ -470,7 +501,7 @@ impl ChatTerm {
     fn new() -> io::Result<Self> {
         let (mut term, handle) = Term::new(prompt_text(), CursorShape::Bar)?;
         term.set_completion_source(Some(Box::new(|buffer: &str, cursor: usize| {
-            completion::completion_candidates(buffer, cursor, &[], &[])
+            completion::completion_candidates(buffer, cursor, &[], &[], &[])
         })));
         handle.set_input_placeholder(dim_text("send a message"));
         handle.set_right_prompt(dim_text(":quit"));
@@ -499,7 +530,11 @@ impl ChatTerm {
                     .into_iter()
                     .map(|agent_id| agent_id.to_string())
                     .collect::<Vec<_>>();
-                completion::completion_candidates(buffer, cursor, &workdirs, &agents)
+                let topics = topic_labels(&agent)
+                    .into_iter()
+                    .map(|(label, _)| label)
+                    .collect::<Vec<_>>();
+                completion::completion_candidates(buffer, cursor, &workdirs, &agents, &topics)
             })));
     }
 

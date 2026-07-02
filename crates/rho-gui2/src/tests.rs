@@ -72,9 +72,7 @@ fn feed_frame(
 
 fn active_editor(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> Entity<Editor> {
     workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.active_view().read(cx).editor().clone()
-        })
+        .update(cx, |workspace, _, cx| workspace.active_editor(cx))
         .expect("read workspace")
 }
 
@@ -347,7 +345,7 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
 
     workspace
         .update(cx, |workspace, _, cx| {
-            let view = workspace.active_view();
+            let view = workspace.active_agent_view().expect("agent view");
             view.update(cx, |view, cx| {
                 assert!(view.has_timers());
                 view.tick_timers(started + 5_000, cx);
@@ -362,7 +360,7 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
 
     workspace
         .update(cx, |workspace, _, cx| {
-            let view = workspace.active_view();
+            let view = workspace.active_agent_view().expect("agent view");
             view.update(cx, |view, cx| view.tick_timers(started + 65_000, cx));
         })
         .expect("tick timers");
@@ -551,14 +549,16 @@ fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContex
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
 
     // Not connected, so the submission surfaces as a system notice — proving
-    // the action reached the workspace handler and the prompt was taken.
+    // the action reached the workspace handler.
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("not connected to rho-daemon"),
         "submit should reach the workspace and report the failed send: {text:?}"
     );
+    // Draft submissions keep the buffer until the daemon confirms creation,
+    // so a failed send never loses the message.
     assert!(
-        !text.contains("hello rho"),
-        "submit should clear the prompt draft: {text:?}"
+        text.contains("hello rho"),
+        "a failed draft submit should keep the message: {text:?}"
     );
 }

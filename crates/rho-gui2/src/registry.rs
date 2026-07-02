@@ -44,6 +44,14 @@ impl AgentRegistry {
             .map(|agent| agent.working_directory.clone())
     }
 
+    /// The topic an agent currently belongs to, from topic summaries.
+    pub fn topic_of(&self, agent_id: AgentId) -> Option<rho_ui_proto::TopicId> {
+        self.topics
+            .iter()
+            .find(|topic| topic.agent_ids().any(|id| id == agent_id))
+            .map(|topic| topic.topic_id)
+    }
+
     /// The working directory of an agent, from topic summaries.
     pub fn working_directory(&self, agent_id: AgentId) -> Option<&PathBuf> {
         self.topics
@@ -71,6 +79,10 @@ impl AgentRegistry {
 
     pub fn mark_live(&mut self, agent_id: AgentId) {
         self.agents.insert(agent_id, AgentLife::Live);
+    }
+
+    pub fn is_live(&self, agent_id: AgentId) -> bool {
+        self.agents.get(&agent_id) == Some(&AgentLife::Live)
     }
 
     pub fn selected(&self) -> Option<&AgentId> {

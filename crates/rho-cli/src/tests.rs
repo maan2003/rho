@@ -46,7 +46,7 @@ fn streaming_state(blocks: Vec<UiBlock>) -> UiAgentState {
 }
 
 fn completion_candidates(buffer: &str, cursor: usize) -> Vec<rho_cli_term_raw::Candidate> {
-    completion::completion_candidates(buffer, cursor, &[], &[])
+    completion::completion_candidates(buffer, cursor, &[], &[], &[])
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn command_completion_preserves_suffix() {
 fn argument_completion_uses_live_workdirs() {
     let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
     let buffer = ":agent new rh";
-    let candidates = completion::completion_candidates(buffer, buffer.len(), &workdirs, &[]);
+    let candidates = completion::completion_candidates(buffer, buffer.len(), &workdirs, &[], &[]);
     assert!(candidates.iter().any(|candidate| {
         candidate.label == "rho" && candidate.replacement == ":agent new rho"
     }));

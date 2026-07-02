@@ -217,6 +217,38 @@ impl AgentRegistry {
         Ok((topic_id, agent_id, agent))
     }
 
+    async fn move_agent(
+        &self,
+        agent_id: AgentId,
+        target: rho_ui_proto::TopicTarget,
+    ) -> anyhow::Result<()> {
+        let read = self.db.read();
+        if !read.list_agents().into_iter().any(|(id, _)| id == agent_id) {
+            anyhow::bail!("unknown agent id: {agent_id}");
+        }
+        let topics = read.list_topics();
+        drop(read);
+        let mut write = self.db.write().await;
+        let topic_id = match target {
+            rho_ui_proto::TopicTarget::Existing(topic_id) => {
+                if !topics.iter().any(|(id, _)| *id == topic_id) {
+                    anyhow::bail!("unknown topic id: {topic_id}");
+                }
+                topic_id
+            }
+            rho_ui_proto::TopicTarget::Named(name) => topics
+                .iter()
+                .find(|(_, topic)| topic.display_name.as_deref() == Some(&name))
+                .map(|(topic_id, _)| *topic_id)
+                .unwrap_or_else(|| {
+                    write.create_topic(rho_core::UnixMs::now(), Some(name), TopicStatus::Normal)
+                }),
+        };
+        write.move_agent_to_topic(agent_id, topic_id);
+        write.commit();
+        Ok(())
+    }
+
     async fn set_workdir(&self, path: PathBuf, name: Option<String>) -> anyhow::Result<()> {
         let path = validate_working_directory(path)?;
         let name = match name {
@@ -376,6 +408,18 @@ async fn serve_connection(
                     }
                 };
                 agent.send_user_message(text_content(&content));
+            }
+            ClientMessage::MoveAgent { agent_id, topic } => {
+                match agents.move_agent(agent_id, topic).await {
+                    Ok(()) => {
+                        let _ = outgoing_tx.send(agents.ready_message());
+                    }
+                    Err(error) => {
+                        let _ = outgoing_tx.send(ServerMessage::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
             }
             ClientMessage::CancelTurn { agent_id } => {
                 if let Some(agent) = agents.get(agent_id).await {

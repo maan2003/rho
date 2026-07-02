@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::str::FromStr as _;
 
-use rho_ui_proto::AgentId;
+use rho_ui_proto::{AgentId, TopicId};
 
 pub struct CommandSpec {
     /// Full command name after the `:`, e.g. `agent new`.
@@ -38,6 +38,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "topic new",
         usage: ":topic new [name]",
         description: "Create a new topic",
+    },
+    CommandSpec {
+        name: "topic move",
+        usage: ":topic move <name>",
+        description: "Move the current agent into a topic (created when unknown)",
     },
     CommandSpec {
         name: "workdirs add",
@@ -82,6 +87,7 @@ pub enum Command {
     AgentLoad { agent_id: AgentId },
     AgentCancel,
     TopicNew { name: Option<String> },
+    TopicMove { name: String },
     WorkdirAdd { path: Option<PathBuf>, name: Option<String> },
     WorkdirRemove { path: String },
     Quit,
@@ -126,7 +132,19 @@ pub fn parse(line: &str) -> Option<Parsed> {
                     name: (!name.is_empty()).then_some(name),
                 })
             }
-            _ => Parsed::Invalid(":topic new [name]".to_owned()),
+            Some("move") => {
+                let name = rest
+                    .split_whitespace()
+                    .skip(2)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if name.is_empty() {
+                    Parsed::Invalid(":topic move <name>".to_owned())
+                } else {
+                    Parsed::Command(Command::TopicMove { name })
+                }
+            }
+            _ => Parsed::Invalid(":topic new|move".to_owned()),
         },
         "workdirs" => match tokens.next() {
             Some("add") => Parsed::Command(Command::WorkdirAdd {
@@ -157,6 +175,8 @@ pub struct CompletionCtx<'a> {
     /// Registered workdirs as `(name, path)`.
     pub workdirs: &'a [(String, String)],
     pub known_agents: &'a [String],
+    /// Topic labels: display names, or the id string for unnamed topics.
+    pub topics: &'a [String],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,6 +260,15 @@ fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> 
                 description: "agent".to_owned(),
             })
             .collect(),
+        ["topic", "move"] => ctx
+            .topics
+            .iter()
+            .filter(|topic| fuzzy_contains(topic, partial))
+            .map(|topic| Candidate {
+                value: topic.clone(),
+                description: "topic".to_owned(),
+            })
+            .collect(),
         ["agent", "new"] | ["workdirs", "rm"] => ctx
             .workdirs
             .iter()
@@ -251,6 +280,19 @@ fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> 
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Resolves a topic argument against `(label, id)` pairs, where the label is
+/// the display name or the id string for unnamed topics. `None` means no
+/// such topic exists yet.
+pub fn resolve_topic(argument: &str, topics: &[(String, TopicId)]) -> Option<TopicId> {
+    if let Some((_, topic_id)) = topics.iter().find(|(label, _)| label == argument) {
+        return Some(*topic_id);
+    }
+    argument
+        .parse::<TopicId>()
+        .ok()
+        .filter(|parsed| topics.iter().any(|(_, topic_id)| topic_id == parsed))
 }
 
 /// Resolves a workdir argument (registered name or path) to its path.

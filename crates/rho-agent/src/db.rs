@@ -213,6 +213,10 @@ pub trait AgentWriteTxnExt {
         config: InferenceProtectedConfig,
     ) -> (AgentId, AgentEventPos);
 
+    /// Re-points the agent's topic membership. Topics are ad-hoc groupings
+    /// agents move into after the fact; nothing else about the agent changes.
+    fn move_agent_to_topic(&mut self, agent_id: AgentId, topic_id: TopicId);
+
     /// Registers `path` or renames it if already registered.
     fn upsert_workdir(&mut self, now: UnixMillis, path: &str, name: String);
 
@@ -367,6 +371,19 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(TOPIC_AGENTS)
             .insert(&TopicAgentKey::new(topic_id, agent_id), &());
         (agent_id, AgentEventPos::root(lineage_id))
+    }
+
+    fn move_agent_to_topic(&mut self, agent_id: AgentId, topic_id: TopicId) {
+        let mut topic_agents = self.open_table(TOPIC_AGENTS);
+        let previous = topic_agents
+            .iter()
+            .map(|(key, _)| key.value())
+            .filter(|key| key.agent_id == agent_id)
+            .collect::<Vec<_>>();
+        for key in previous {
+            topic_agents.remove(&key);
+        }
+        topic_agents.insert(&TopicAgentKey::new(topic_id, agent_id), &());
     }
 
     fn upsert_workdir(&mut self, now: UnixMillis, path: &str, name: String) {

@@ -296,6 +296,12 @@ impl AgentClient {
         let _ = self.commands.send(ClientMessage::WorkdirRemove { path });
     }
 
+    pub fn move_agent(&self, agent_id: AgentId, topic: crate::TopicTarget) {
+        let _ = self
+            .commands
+            .send(ClientMessage::MoveAgent { agent_id, topic });
+    }
+
     pub fn load_agent(&self, agent_id: AgentId) {
         let _ = self.commands.send(ClientMessage::LoadAgent { agent_id });
     }

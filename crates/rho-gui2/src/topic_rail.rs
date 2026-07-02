@@ -1,5 +1,9 @@
-//! The left rail listing topics and their agents; clicking an agent selects
-//! it.
+//! The left rail listing agents and their topic groups.
+//!
+//! Topics are ad-hoc tab groups: the default (first, unnamed) topic renders
+//! as a flat list of loose agents with no header, named topics as groups
+//! below it. Clicking an agent opens it (loading it on demand); the `+` row
+//! opens the draft compose view and doubles as its selection indicator.
 
 use std::collections::BTreeSet;
 
@@ -30,9 +34,14 @@ pub fn render_topic_rail(
     let rows = registry
         .topics()
         .iter()
-        .map(|topic| {
+        .enumerate()
+        .map(|(index, topic)| {
+            // The default topic is where agents are born; it isn't a group,
+            // its agents just sit loose at the top of the rail.
+            let show_header = !(index == 0 && topic.display_name.is_none());
             render_topic_rows(
                 topic,
+                show_header,
                 selected_agent.as_ref(),
                 &live,
                 text_style,
@@ -58,6 +67,12 @@ pub fn render_topic_rail(
         .text_size(text_style.font_size)
         .line_height(text_style.line_height)
         .text_color(text_style.color)
+        .child(new_agent_row(
+            selected_agent.is_none(),
+            text_style,
+            selected_color,
+            cx,
+        ))
         .child(
             div()
                 .id("rho-gui2-topic-list")
@@ -68,8 +83,42 @@ pub fn render_topic_rail(
         )
 }
 
+fn new_agent_row(
+    draft_selected: bool,
+    text_style: &TextStyle,
+    selected_color: gpui::Hsla,
+    cx: &mut Context<Workspace>,
+) -> Div {
+    let (text_color, icon_color) = if draft_selected {
+        (selected_color, selected_color)
+    } else {
+        (text_style.color.opacity(0.8), text_style.color.opacity(0.5))
+    };
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_1()
+        .pl(px(4.))
+        .pt(px(2.))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                this.enter_draft(None, window, cx);
+            }),
+        )
+        .child(
+            Icon::new(IconName::Plus)
+                .size(IconSize::XSmall)
+                .color(Color::Custom(icon_color)),
+        )
+        .child(div().text_color(text_color).child("new agent"))
+}
+
 fn render_topic_rows(
     topic: &UiTopic,
+    show_header: bool,
     selected_agent: Option<&AgentId>,
     live: &BTreeSet<AgentId>,
     text_style: &TextStyle,
@@ -85,14 +134,16 @@ fn render_topic_rows(
         .flex()
         .flex_col()
         .gap_0p5()
-        .child(
-            div()
-                .w_full()
-                .pt(px(5.))
-                .pl(px(4.))
-                .text_color(text_style.color.opacity(0.65))
-                .child(name),
-        )
+        .when(show_header, |this| {
+            this.child(
+                div()
+                    .w_full()
+                    .pt(px(5.))
+                    .pl(px(4.))
+                    .text_color(text_style.color.opacity(0.65))
+                    .child(name),
+            )
+        })
         .children(topic.agents.iter().map(|summary| {
             let agent_id = &summary.agent_id;
             let selected = selected_agent == Some(agent_id);
@@ -124,7 +175,7 @@ fn render_topic_rows(
                     cx.listener({
                         let agent_id = *agent_id;
                         move |this, _, window, cx| {
-                            this.select_agent(Some(agent_id), window, cx);
+                            this.open_agent(agent_id, window, cx);
                         }
                     }),
                 )

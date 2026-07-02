@@ -169,6 +169,37 @@ async fn agent_events_read_lineage_parents() {
 }
 
 #[tokio::test]
+async fn move_agent_to_topic_repoints_membership() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let default_topic = write.create_topic(UnixMs(1), None, TopicStatus::Normal);
+    let named_topic = write.create_topic(UnixMs(1), Some("infra".to_owned()), TopicStatus::Normal);
+    let (agent_id, _) = write.create_agent(
+        UnixMs(1),
+        default_topic,
+        None,
+        std::path::PathBuf::from("/tmp"),
+        PromptCacheKey::generate(),
+        InferenceConfig::deep().protect(),
+    );
+    write.move_agent_to_topic(agent_id, named_topic);
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.list_topic_agents(default_topic), []);
+    assert_eq!(read.list_topic_agents(named_topic), [agent_id]);
+
+    // Moving to the topic it is already in is a no-op, not a duplicate.
+    let mut write = db.write().await;
+    write.move_agent_to_topic(agent_id, named_topic);
+    write.commit();
+    assert_eq!(db.read().list_topic_agents(named_topic), [agent_id]);
+}
+
+#[tokio::test]
 async fn workdirs_upsert_by_path_and_remove() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
