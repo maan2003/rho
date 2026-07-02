@@ -1,18 +1,21 @@
 //! Incremental transcript projection into a read-only buffer.
 //!
-//! The transcript buffer always equals `render(blocks) + render(frontier)`.
-//! A [`FrameSummary`] bounds every update: blocks before `first_changed_block`
-//! are never touched (their anchors, highlights, gutters and folds survive
-//! untouched), and streaming-only frames splice just the frontier region.
+//! The transcript buffer always equals `render(blocks)`, one record per
+//! protocol block. A [`FrameSummary`] bounds every update: blocks before
+//! `first_changed_block` are never touched (their anchors, highlights,
+//! gutters and folds survive untouched); everything after is re-rendered.
 //!
 //! Highlights are bucketed per [`StyleClass`] into two editor highlight keys
-//! each — sealed ranges change only when blocks change; frontier ranges are
-//! small and replaced wholesale per streaming event.
+//! each, split at the start of the live turn (after the last user message) —
+//! history ranges change at most once per turn; live-turn ranges are small,
+//! so per-streaming-event churn stays bounded. The boundary is derived from
+//! the block list itself; moving it re-buckets highlights without touching
+//! the buffer.
 
 mod elisions;
 mod timers;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
 
 use editor::Editor;
@@ -24,8 +27,8 @@ use rho_ui_proto::remote::UiAgentState;
 use text::{Anchor, ToOffset as _};
 
 use crate::highlights::{apply_class_highlights, excerpt_range};
-use crate::render::elision::{ElisionEnd, ElisionPlan};
-use crate::render::{BlockKind, RenderedBlock, render_block, render_streaming_item};
+use crate::render::elision::ElisionPlan;
+use crate::render::{BlockKind, RenderedBlock, render_block};
 use crate::store::FrameSummary;
 use crate::style::{Region, StyleClass};
 use elisions::ElisionSync;
@@ -33,13 +36,13 @@ use timers::TimerRecord;
 
 pub struct TranscriptModel {
     buffer: Entity<Buffer>,
-    buffer_id: text::BufferId,
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
     records: Vec<BlockRecord>,
-    frontier: FrontierRecord,
-    sealed_styles: HashMap<StyleClass, Vec<Range<Anchor>>>,
-    frontier_classes_applied: HashSet<StyleClass>,
+    /// First record of the live turn as of the last sync. Records before it
+    /// carry their highlights in the history region, records from it onward
+    /// in the live-turn region.
+    turn_boundary: usize,
     elisions: ElisionSync,
     // Timer inlay ids share the editor's custom-inlay id space with the
     // prompt placeholder (id 0), so they start at 1.
@@ -52,14 +55,7 @@ struct BlockRecord {
     visible: bool,
     gutter: Option<Range<Anchor>>,
     timer: Option<TimerRecord>,
-    style_counts: Vec<(StyleClass, usize)>,
-}
-
-struct FrontierRecord {
-    start: Anchor,
-    visible: bool,
-    timers: Vec<TimerRecord>,
-    styles: HashMap<StyleClass, Vec<Range<Anchor>>>,
+    styles: Vec<(StyleClass, Range<Anchor>)>,
 }
 
 struct UserMessageGutter;
@@ -69,24 +65,14 @@ impl TranscriptModel {
         buffer: Entity<Buffer>,
         multi_buffer: Entity<MultiBuffer>,
         editor: Entity<Editor>,
-        cx: &Context<V>,
+        _cx: &Context<V>,
     ) -> Self {
-        let frontier_start = buffer.read(cx).anchor_before(0);
-        let buffer_id = buffer.read(cx).remote_id();
         Self {
             buffer,
-            buffer_id,
             multi_buffer,
             editor,
             records: Vec::new(),
-            frontier: FrontierRecord {
-                start: frontier_start,
-                visible: false,
-                timers: Vec::new(),
-                styles: HashMap::new(),
-            },
-            sealed_styles: HashMap::new(),
-            frontier_classes_applied: HashSet::new(),
+            turn_boundary: 0,
             elisions: ElisionSync::default(),
             next_timer_inlay_id: 1,
         }
@@ -100,108 +86,93 @@ impl TranscriptModel {
         now_ms: u64,
         cx: &mut Context<V>,
     ) {
-        if summary.is_noop() {
+        let Some(first_changed) = summary.first_changed_block else {
             return;
-        }
-        let block_start = summary
-            .first_changed_block
-            .map(|index| index.min(self.records.len()));
+        };
+        let start = first_changed.min(self.records.len());
 
-        // Render changed blocks and the frontier before any buffer mutation;
-        // rendering only needs read access to the app (theme, languages).
-        let changed_blocks = block_start.map(|start| {
-            let mut prev_kind = last_visible_kind(&self.records[..start]);
-            let mut rendered = Vec::new();
-            for block in state.blocks.get(start..).unwrap_or(&[]) {
+        // Render changed blocks before any buffer mutation; rendering only
+        // needs read access to the app (theme, languages).
+        let mut prev_kind = last_visible_kind(&self.records[..start]);
+        let rendered_blocks = state
+            .blocks
+            .get(start..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|block| {
                 let block = render_block(block, prev_kind, now_ms, cx);
                 if block.visible() {
                     prev_kind = Some(block.kind);
                 }
-                rendered.push(block);
-            }
-            (start, rendered)
-        });
-        let rendered_frontier = {
-            let mut prev_kind = match &changed_blocks {
-                Some((start, rendered)) => rendered
-                    .iter()
-                    .rev()
-                    .find(|block| block.visible())
-                    .map(|block| block.kind)
-                    .or_else(|| last_visible_kind(&self.records[..*start])),
-                None => last_visible_kind(&self.records),
-            };
-            let mut rendered = Vec::new();
-            for item in &state.pending_response {
-                let item = render_streaming_item(item, prev_kind, now_ms, cx);
-                if item.visible() {
-                    prev_kind = Some(item.kind);
-                }
-                rendered.push(item);
-            }
-            rendered
-        };
+                block
+            })
+            .collect::<Vec<_>>();
 
-        let mut sealed_changed = HashSet::new();
+        let old_boundary = self.turn_boundary;
+        let mut changed_history = HashSet::new();
+        let mut changed_live = HashSet::new();
         let mut stale_inlays = Vec::new();
+        let mut gutters_changed = false;
         self.buffer.clone().update(cx, |buffer, cx| {
-            if let Some((start, rendered_blocks)) = changed_blocks {
-                let removed = self.records.split_off(start);
-                for record in &removed {
-                    for (class, count) in &record.style_counts {
-                        if let Some(ranges) = self.sealed_styles.get_mut(class) {
-                            ranges.truncate(ranges.len().saturating_sub(*count));
-                        }
-                        sealed_changed.insert(*class);
-                    }
-                    stale_inlays.extend(record.timer.as_ref().and_then(TimerRecord::inlay_id));
+            let removed = self.records.split_off(start);
+            for (offset, record) in removed.iter().enumerate() {
+                let changed = if start + offset < old_boundary {
+                    &mut changed_history
+                } else {
+                    &mut changed_live
+                };
+                for (class, _) in &record.styles {
+                    changed.insert(*class);
                 }
-                let start_offset = removed
-                    .first()
-                    .map(|record| record.range.start.to_offset(buffer))
-                    .unwrap_or_else(|| self.frontier.start.to_offset(buffer));
-                if start_offset < buffer.len() {
-                    buffer.edit([(start_offset..buffer.len(), "")], None, cx);
-                }
-
-                for rendered in rendered_blocks {
-                    let record = append_block(
-                        buffer,
-                        cx,
-                        rendered,
-                        &mut self.sealed_styles,
-                        &mut sealed_changed,
-                    );
-                    self.records.push(record);
-                }
-                self.frontier.start = buffer.anchor_before(buffer.len());
-            } else {
-                let start_offset = self.frontier.start.to_offset(buffer);
-                if start_offset < buffer.len() {
-                    buffer.edit([(start_offset..buffer.len(), "")], None, cx);
-                }
+                stale_inlays.extend(record.timer.as_ref().and_then(TimerRecord::inlay_id));
+                gutters_changed |= record.gutter.is_some();
             }
-            self.frontier.styles.clear();
-            stale_inlays.extend(
-                self.frontier
-                    .timers
-                    .drain(..)
-                    .filter_map(|timer| timer.inlay_id()),
-            );
-            self.frontier.visible = false;
+            let start_offset = removed
+                .first()
+                .map(|record| record.range.start.to_offset(buffer))
+                .unwrap_or_else(|| buffer.len());
+            if start_offset < buffer.len() {
+                buffer.edit([(start_offset..buffer.len(), "")], None, cx);
+            }
 
-            for rendered in rendered_frontier {
-                append_frontier_item(buffer, cx, rendered, &mut self.frontier);
+            for rendered in rendered_blocks {
+                let record = append_block(buffer, cx, rendered);
+                gutters_changed |= record.gutter.is_some();
+                self.records.push(record);
             }
         });
 
-        self.apply_sealed_styles(&sealed_changed, cx);
-        self.apply_frontier_styles(cx);
+        let new_boundary = turn_boundary(&self.records);
+        for (index, record) in self.records.iter().enumerate().skip(start) {
+            let changed = if index < new_boundary {
+                &mut changed_history
+            } else {
+                &mut changed_live
+            };
+            for (class, _) in &record.styles {
+                changed.insert(*class);
+            }
+        }
+        // Records the boundary moved across keep their text and anchors but
+        // switch highlight regions; re-bucket both sides. Records at or past
+        // `start` were re-rendered and are already counted above.
+        let migrated_end = old_boundary.max(new_boundary).min(start);
+        let migrated_start = old_boundary.min(new_boundary).min(migrated_end);
+        for record in &self.records[migrated_start..migrated_end] {
+            for (class, _) in &record.styles {
+                changed_history.insert(*class);
+                changed_live.insert(*class);
+            }
+        }
+        self.turn_boundary = new_boundary;
+
+        self.apply_region_styles(Region::History, &changed_history, cx);
+        self.apply_region_styles(Region::LiveTurn, &changed_live, cx);
         self.refresh_timer_inlays(now_ms, stale_inlays, cx);
-        if block_start.is_some() {
+        if gutters_changed {
             self.refresh_gutters(cx);
         }
-        self.refresh_elisions(state, block_start, cx);
+        self.refresh_elisions(state, start, cx);
         cx.notify();
     }
 
@@ -222,7 +193,6 @@ impl TranscriptModel {
     ) {
         let Self {
             records,
-            frontier,
             multi_buffer,
             editor,
             next_timer_inlay_id,
@@ -231,8 +201,7 @@ impl TranscriptModel {
         timers::refresh_timer_inlays(
             records
                 .iter_mut()
-                .filter_map(|record| record.timer.as_mut())
-                .chain(frontier.timers.iter_mut()),
+                .filter_map(|record| record.timer.as_mut()),
             now_ms,
             stale,
             next_timer_inlay_id,
@@ -243,51 +212,45 @@ impl TranscriptModel {
     }
 
     pub fn has_timers(&self) -> bool {
-        !self.frontier.timers.is_empty()
-            || self.records.iter().any(|record| record.timer.is_some())
+        self.records.iter().any(|record| record.timer.is_some())
     }
 
-    fn apply_sealed_styles<V: 'static>(
+    fn apply_region_styles<V: 'static>(
         &self,
+        region: Region,
         changed: &HashSet<StyleClass>,
         cx: &mut Context<V>,
     ) {
         if changed.is_empty() {
             return;
         }
-        let empty: &[Range<Anchor>] = &[];
-        let styles = changed.iter().map(|class| {
-            (
-                *class,
-                self.sealed_styles
-                    .get(class)
-                    .map(Vec::as_slice)
-                    .unwrap_or(empty),
-            )
-        });
-        apply_class_highlights(&self.editor, &self.multi_buffer, Region::Sealed, styles, cx);
-    }
-
-    fn apply_frontier_styles<V: 'static>(&mut self, cx: &mut Context<V>) {
-        let stale = self
-            .frontier_classes_applied
+        let records = match region {
+            Region::LiveTurn => &self.records[self.turn_boundary..],
+            _ => &self.records[..self.turn_boundary],
+        };
+        let by_class = changed
             .iter()
-            .filter(|class| !self.frontier.styles.contains_key(class))
-            .copied()
+            .map(|class| {
+                let ranges = records
+                    .iter()
+                    .flat_map(|record| {
+                        record
+                            .styles
+                            .iter()
+                            .filter(|(range_class, _)| range_class == class)
+                            .map(|(_, range)| range.clone())
+                    })
+                    .collect::<Vec<_>>();
+                (*class, ranges)
+            })
             .collect::<Vec<_>>();
-        self.frontier_classes_applied = self.frontier.styles.keys().copied().collect();
-        let empty: &[Range<Anchor>] = &[];
-        let styles = stale.iter().map(|class| (*class, empty)).chain(
-            self.frontier
-                .styles
-                .iter()
-                .map(|(class, ranges)| (*class, ranges.as_slice())),
-        );
         apply_class_highlights(
             &self.editor,
             &self.multi_buffer,
-            Region::Frontier,
-            styles,
+            region,
+            by_class
+                .iter()
+                .map(|(class, ranges)| (*class, ranges.as_slice())),
             cx,
         );
     }
@@ -312,7 +275,7 @@ impl TranscriptModel {
     fn refresh_elisions<V: 'static>(
         &mut self,
         state: &UiAgentState,
-        first_changed_block: Option<usize>,
+        first_changed_block: usize,
         cx: &mut Context<V>,
     ) {
         let visible = self
@@ -322,24 +285,29 @@ impl TranscriptModel {
             .collect::<Vec<_>>();
         let Self {
             records,
-            frontier,
-            buffer_id,
             elisions,
             multi_buffer,
             editor,
             ..
         } = self;
         elisions.refresh(
-            state,
+            &state.blocks,
             first_changed_block,
             &visible,
-            frontier.visible,
-            |plan| plan_anchor_range(records, frontier.start, *buffer_id, plan),
+            |plan| plan_anchor_range(records, plan),
             multi_buffer,
             editor,
             cx,
         );
     }
+}
+
+/// First record of the live turn: everything after the last user message.
+fn turn_boundary(records: &[BlockRecord]) -> usize {
+    records
+        .iter()
+        .rposition(|record| matches!(record.kind, BlockKind::User))
+        .map_or(0, |index| index + 1)
 }
 
 fn last_visible_kind(records: &[BlockRecord]) -> Option<BlockKind> {
@@ -350,20 +318,9 @@ fn last_visible_kind(records: &[BlockRecord]) -> Option<BlockKind> {
         .map(|record| record.kind)
 }
 
-fn plan_anchor_range(
-    records: &[BlockRecord],
-    frontier_start: Anchor,
-    buffer_id: text::BufferId,
-    plan: &ElisionPlan,
-) -> Option<Range<Anchor>> {
-    let start = match records.get(plan.start_block) {
-        Some(record) => record.range.start,
-        None => frontier_start,
-    };
-    let end = match plan.end {
-        ElisionEnd::Block(index) => records.get(index)?.range.end,
-        ElisionEnd::Frontier => Anchor::max_for_buffer(buffer_id),
-    };
+fn plan_anchor_range(records: &[BlockRecord], plan: &ElisionPlan) -> Option<Range<Anchor>> {
+    let start = records.get(plan.start_block)?.range.start;
+    let end = records.get(plan.end_block)?.range.end;
     Some(start..end)
 }
 
@@ -371,57 +328,24 @@ fn append_block(
     buffer: &mut Buffer,
     cx: &mut Context<Buffer>,
     rendered: RenderedBlock,
-    sealed_styles: &mut HashMap<StyleClass, Vec<Range<Anchor>>>,
-    sealed_changed: &mut HashSet<StyleClass>,
 ) -> BlockRecord {
     let start = buffer.len();
     let (span_ranges, timer, gutter) = append_spans(buffer, cx, &rendered);
-    let mut style_counts: Vec<(StyleClass, usize)> = Vec::new();
-    for (span, range) in rendered.spans.iter().zip(&span_ranges) {
-        if span.class == StyleClass::Default || span.text.is_empty() {
-            continue;
-        }
-        sealed_styles
-            .entry(span.class)
-            .or_default()
-            .push(range.clone());
-        sealed_changed.insert(span.class);
-        match style_counts.iter_mut().find(|(class, _)| *class == span.class) {
-            Some((_, count)) => *count += 1,
-            None => style_counts.push((span.class, 1)),
-        }
-    }
+    let styles = rendered
+        .spans
+        .iter()
+        .zip(&span_ranges)
+        .filter(|(span, _)| span.class != StyleClass::Default && !span.text.is_empty())
+        .map(|(span, range)| (span.class, range.clone()))
+        .collect();
     BlockRecord {
         range: buffer.anchor_before(start)..buffer.anchor_before(buffer.len()),
         kind: rendered.kind,
         visible: rendered.visible(),
         gutter,
         timer,
-        style_counts,
+        styles,
     }
-}
-
-fn append_frontier_item(
-    buffer: &mut Buffer,
-    cx: &mut Context<Buffer>,
-    rendered: RenderedBlock,
-    frontier: &mut FrontierRecord,
-) {
-    if rendered.visible() {
-        frontier.visible = true;
-    }
-    let (span_ranges, timer, _) = append_spans(buffer, cx, &rendered);
-    for (span, range) in rendered.spans.iter().zip(&span_ranges) {
-        if span.class == StyleClass::Default || span.text.is_empty() {
-            continue;
-        }
-        frontier
-            .styles
-            .entry(span.class)
-            .or_default()
-            .push(range.clone());
-    }
-    frontier.timers.extend(timer);
 }
 
 /// Appends a rendered block's text at the end of the buffer and returns the

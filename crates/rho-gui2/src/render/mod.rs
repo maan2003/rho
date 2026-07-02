@@ -1,10 +1,9 @@
 //! Pure projection from protocol state to styled text spans.
 //!
 //! Nothing in this module touches editor buffers or entities: given a block
-//! (or the streaming frontier) it produces the exact spans the transcript
-//! should contain. The transcript model applies these as bounded buffer
-//! edits. Keeping this layer pure makes block rendering testable as plain
-//! string assertions.
+//! it produces the exact spans the transcript should contain. The transcript
+//! model applies these as bounded buffer edits. Keeping this layer pure makes
+//! block rendering testable as plain string assertions.
 
 pub mod elision;
 pub mod markdown;
@@ -12,7 +11,7 @@ pub mod markdown;
 use std::time::Duration;
 
 use gpui::App;
-use rho_ui_proto::remote::{UiBlock, UiMessagePhase, UiStreamingItem, UiTool, UiToolStatus};
+use rho_ui_proto::remote::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 
 use crate::style::StyleClass;
 
@@ -68,17 +67,6 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
             working: *phase != Some(UiMessagePhase::FinalAnswer),
         },
         UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => {
-            BlockKind::Response { working: true }
-        }
-    }
-}
-
-pub fn streaming_item_kind(item: &UiStreamingItem) -> BlockKind {
-    match item {
-        UiStreamingItem::AssistantMessage { phase, .. } => BlockKind::Response {
-            working: *phase != Some(UiMessagePhase::FinalAnswer),
-        },
-        UiStreamingItem::Reasoning { .. } | UiStreamingItem::Tool(_) | UiStreamingItem::Notice { .. } => {
             BlockKind::Response { working: true }
         }
     }
@@ -150,34 +138,6 @@ pub fn render_block(
         kind,
         gutter_span,
         timer,
-    }
-}
-
-pub fn render_streaming_item(
-    item: &UiStreamingItem,
-    prev: Option<BlockKind>,
-    now_ms: u64,
-    cx: &App,
-) -> RenderedBlock {
-    match item {
-        UiStreamingItem::AssistantMessage { text, phase } => render_block(
-            &UiBlock::AssistantMessage {
-                text: text.clone(),
-                phase: *phase,
-            },
-            prev,
-            now_ms,
-            cx,
-        ),
-        UiStreamingItem::Reasoning { text } => {
-            render_block(&UiBlock::Reasoning { text: text.clone() }, prev, now_ms, cx)
-        }
-        UiStreamingItem::Tool(tool) => {
-            render_block(&UiBlock::Tool(tool.clone()), prev, now_ms, cx)
-        }
-        UiStreamingItem::Notice { text } => {
-            render_block(&UiBlock::Notice { text: text.clone() }, prev, now_ms, cx)
-        }
     }
 }
 

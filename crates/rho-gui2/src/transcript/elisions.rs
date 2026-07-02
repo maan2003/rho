@@ -1,9 +1,8 @@
 //! Applies elision plans to the editor as display elisions.
 //!
 //! Plans are cached per turn: a refresh recomputes only from the changed
-//! turn (or the active turn, whose plans depend on pending state) onward,
-//! then diffs the resulting specs positionally against the editor's live
-//! display elisions.
+//! turn onward, then diffs the resulting specs positionally against the
+//! editor's live display elisions.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -13,14 +12,12 @@ use editor::{DisplayElisionId, DisplayElisionProperties, Editor};
 use gpui::prelude::*;
 use gpui::{Context, Entity};
 use multi_buffer::{MultiBuffer, MultiBufferSnapshot};
-use rho_ui_proto::remote::UiAgentState;
+use rho_ui_proto::remote::UiBlock;
 use text::Anchor;
 use ui::{Icon, IconName, IconSize, div};
 
 use crate::highlights::excerpt_range;
-use crate::render::elision::{
-    ElisionEnd, ElisionPlan, elision_label, elision_plans_from, turn_start_index,
-};
+use crate::render::elision::{ElisionPlan, elision_label, elision_plans_from, turn_start_index};
 
 /// What one fold looks like, independent of its editor identity.
 #[derive(Clone, PartialEq)]
@@ -38,7 +35,6 @@ struct ActiveElision {
 #[derive(Default)]
 pub struct ElisionSync {
     plans: Vec<ElisionPlan>,
-    plans_active_turn_start: usize,
     active: Vec<ActiveElision>,
 }
 
@@ -46,19 +42,17 @@ impl ElisionSync {
     /// Recomputes plans from the changed turn onward and reconciles the
     /// editor's display elisions with them. `plan_range` resolves a plan to
     /// its buffer anchor range.
-    #[allow(clippy::too_many_arguments)]
     pub fn refresh<V: 'static>(
         &mut self,
-        state: &UiAgentState,
-        first_changed_block: Option<usize>,
+        blocks: &[UiBlock],
+        first_changed_block: usize,
         visible: &[bool],
-        frontier_visible: bool,
         plan_range: impl Fn(&ElisionPlan) -> Option<Range<Anchor>>,
         multi_buffer: &Entity<MultiBuffer>,
         editor: &Entity<Editor>,
         cx: &mut Context<V>,
     ) {
-        self.rebuild_plans(state, first_changed_block, visible, frontier_visible);
+        self.rebuild_plans(blocks, first_changed_block, visible);
         let specs = self
             .plans
             .iter()
@@ -73,36 +67,19 @@ impl ElisionSync {
         self.apply(specs, multi_buffer, editor, cx);
     }
 
-    /// Plans for turns before the change never move; recompute only from the
-    /// changed turn onward. The active turn is always recomputed: its plans
-    /// depend on pending state, which any non-noop frame may change.
-    fn rebuild_plans(
-        &mut self,
-        state: &UiAgentState,
-        first_changed_block: Option<usize>,
-        visible: &[bool],
-        frontier_visible: bool,
-    ) {
-        let active_turn_start = turn_start_index(state, state.blocks.len());
-        let mut from_block = match first_changed_block {
-            Some(index) => turn_start_index(state, index),
-            None => active_turn_start,
-        }
-        .min(self.plans_active_turn_start);
+    /// Plans depend only on their own turn's blocks, so plans for turns
+    /// before the change never move; recompute only from the changed turn
+    /// onward.
+    fn rebuild_plans(&mut self, blocks: &[UiBlock], first_changed_block: usize, visible: &[bool]) {
+        let mut from_block = turn_start_index(blocks, first_changed_block);
         // A cached plan straddles a turn boundary only when a user message
         // rendered invisible; recompute from the straddling plan's start.
         loop {
-            from_block = turn_start_index(state, from_block);
+            from_block = turn_start_index(blocks, from_block);
             let straddle = self
                 .plans
                 .iter()
-                .find(|plan| {
-                    plan.start_block < from_block
-                        && match plan.end {
-                            ElisionEnd::Block(end) => end >= from_block,
-                            ElisionEnd::Frontier => true,
-                        }
-                })
+                .find(|plan| plan.start_block < from_block && plan.end_block >= from_block)
                 .map(|plan| plan.start_block);
             match straddle {
                 Some(start) if start < from_block => from_block = start,
@@ -113,24 +90,18 @@ impl ElisionSync {
         let kept = self
             .plans
             .iter()
-            .take_while(|plan| matches!(plan.end, ElisionEnd::Block(end) if end < from_block))
+            .take_while(|plan| plan.end_block < from_block)
             .count();
         self.plans.truncate(kept);
         let last_visible = visible[..from_block.min(visible.len())]
             .iter()
             .rposition(|&visible| visible);
         let carry = match (self.plans.last(), last_visible) {
-            (Some(plan), Some(index)) if plan.end == ElisionEnd::Block(index) => self.plans.pop(),
+            (Some(plan), Some(index)) if plan.end_block == index => self.plans.pop(),
             _ => None,
         };
-        self.plans.extend(elision_plans_from(
-            state,
-            visible,
-            frontier_visible,
-            from_block,
-            carry,
-        ));
-        self.plans_active_turn_start = active_turn_start;
+        self.plans
+            .extend(elision_plans_from(blocks, visible, from_block, carry));
     }
 
     fn apply<V: 'static>(

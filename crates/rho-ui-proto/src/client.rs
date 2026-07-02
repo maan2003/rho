@@ -309,7 +309,6 @@ fn empty_agent_state() -> UiAgentState {
     UiAgentState {
         blocks: Vec::new(),
         status: crate::remote::UiAgentStatus::Idle,
-        pending_response: Vec::new(),
     }
 }
 

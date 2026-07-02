@@ -8,9 +8,8 @@ use gpui::{App, Entity, Focusable as _, TestAppContext, WindowHandle};
 use rho_core::UnixMs;
 use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::{
-    AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlock, UiBlocksDiff, UiMessagePhase,
-    UiPendingResponseDiff, UiStreamingItem, UiStreamingItemDiff, UiStreamingItemUpdate,
-    UiTextDiff, UiTool, UiToolStatus,
+    AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlock, UiBlockDiff, UiBlockUpdate,
+    UiBlocksDiff, UiMessagePhase, UiTextDiff, UiTool, UiToolStatus,
 };
 use settings::SettingsStore;
 
@@ -130,11 +129,12 @@ fn tool(id: &str, status: UiToolStatus, started_at: Option<u64>, finished_at: Op
     }
 }
 
-fn state(blocks: Vec<UiBlock>, pending: Vec<UiStreamingItem>) -> UiAgentState {
+fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
+    let mut blocks = history;
+    blocks.extend(live);
     UiAgentState {
         blocks,
         status: UiAgentStatus::Streaming,
-        pending_response: pending,
     }
 }
 
@@ -193,10 +193,7 @@ fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
         agent(1),
         snapshot_frame(state(
             vec![user("go")],
-            vec![UiStreamingItem::AssistantMessage {
-                text: "hel".to_owned(),
-                phase: Some(UiMessagePhase::FinalAnswer),
-            }],
+            vec![assistant("hel", Some(UiMessagePhase::FinalAnswer))],
         )),
     );
     assert!(display_text(&workspace, cx).contains("hel"));
@@ -207,20 +204,16 @@ fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
         agent(1),
         AgentRemoteFrame::Diff {
             blocks: UiBlocksDiff {
-                updates: Vec::new(),
                 truncate_to: None,
-                append: Vec::new(),
-            },
-            status: None,
-            pending_response: UiPendingResponseDiff::Items(vec![UiStreamingItemUpdate {
-                index: 0,
-                item: UiStreamingItemDiff::AssistantMessage {
-                    text: UiTextDiff {
+                updates: vec![UiBlockUpdate {
+                    index: 1,
+                    block: UiBlockDiff::AssistantText(UiTextDiff {
                         keep_bytes: 3,
                         value: "lo world".to_owned(),
-                    },
-                },
-            }]),
+                    }),
+                }],
+            },
+            status: None,
         },
     );
     let text = display_text(&workspace, cx);
@@ -239,10 +232,7 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
         agent(1),
         snapshot_frame(state(
             vec![user("do work")],
-            vec![UiStreamingItem::AssistantMessage {
-                text: long_working_text(),
-                phase: None,
-            }],
+            vec![assistant(&long_working_text(), None)],
         )),
     );
     assert!(has_display_elision(&workspace, cx));
@@ -263,10 +253,7 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
         agent(1),
         snapshot_frame(state(
             vec![user("do work")],
-            vec![UiStreamingItem::AssistantMessage {
-                text: long_working_text(),
-                phase: Some(UiMessagePhase::FinalAnswer),
-            }],
+            vec![assistant(&long_working_text(), Some(UiMessagePhase::FinalAnswer))],
         )),
     );
     let text = display_text(&workspace, cx);
@@ -281,7 +268,7 @@ fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let pending = (0..16)
         .map(|ix| {
-            UiStreamingItem::Tool(UiTool {
+            UiBlock::Tool(UiTool {
                 id: format!("tool-{ix}"),
                 name: format!("tool_{ix}"),
                 arguments: format!("arg-{ix}"),
@@ -516,10 +503,7 @@ fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
         agent(1),
         snapshot_frame(state(
             vec![user("do work")],
-            vec![UiStreamingItem::AssistantMessage {
-                text: long_working_text(),
-                phase: None,
-            }],
+            vec![assistant(&long_working_text(), None)],
         )),
     );
     let collapsed = display_text(&workspace, cx);

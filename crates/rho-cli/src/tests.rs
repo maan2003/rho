@@ -14,20 +14,35 @@ fn test_call() -> ToolCall {
     }
 }
 
-fn streaming_state(items: Vec<UiStreamingItem>) -> UiAgentState {
-    UiAgentState {
-        blocks: Vec::new(),
-        status: UiAgentStatus::Streaming,
-        pending_response: items,
+fn tool_block(status: UiToolStatus) -> UiBlock {
+    let call = test_call();
+    UiBlock::Tool(UiTool {
+        id: call.id.as_str().to_owned(),
+        name: call.name.as_str().to_owned(),
+        arguments: call.arguments.clone(),
+        preview: None,
+        status,
+        output: None,
+        error: None,
+        started_at: None,
+        finished_at: None,
+        metadata: None,
+    })
+}
+
+fn assistant(text: &str) -> UiBlock {
+    UiBlock::AssistantMessage {
+        text: text.to_owned(),
+        phase: None,
     }
 }
 
-fn status_state(status: UiAgentStatus) -> UiAgentState {
-    UiAgentState {
-        blocks: Vec::new(),
-        status,
-        pending_response: Vec::new(),
-    }
+fn agent_state(blocks: Vec<UiBlock>, status: UiAgentStatus) -> UiAgentState {
+    UiAgentState { blocks, status }
+}
+
+fn streaming_state(blocks: Vec<UiBlock>) -> UiAgentState {
+    agent_state(blocks, UiAgentStatus::Streaming)
 }
 
 #[test]
@@ -207,7 +222,7 @@ fn streaming_reasoning_is_not_rendered() {
         CursorShape::Bar,
     );
     let mut renderer = StreamingRenderer::new(handle);
-    renderer.handle_state(&streaming_state(vec![UiStreamingItem::Reasoning {
+    renderer.handle_state(&streaming_state(vec![UiBlock::Reasoning {
         text: "internal reasoning".to_owned(),
     }]));
 
@@ -253,21 +268,20 @@ fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
         CursorShape::Bar,
     );
     let mut renderer = StreamingRenderer::new(handle);
-    let call = test_call();
-    renderer.handle_state(&streaming_state(vec![UiStreamingItem::ToolCall {
-        id: call.id.as_str().to_owned(),
-        name: call.name.as_str().to_owned(),
-        arguments: call.arguments.clone(),
-    }]));
+    renderer.handle_state(&streaming_state(vec![tool_block(UiToolStatus::Running)]));
     assert_eq!(renderer.active_blocks.len(), 1);
 
-    renderer.render_tool_finished(&UiToolResult {
-        call_id: call.id.as_str().to_owned(),
-        status: UiToolStatus::Success,
-    });
+    // The tool call seals and finishes; the same index updates in place.
+    renderer.handle_state(&agent_state(
+        vec![tool_block(UiToolStatus::Success)],
+        UiAgentStatus::ToolCalling,
+    ));
     assert_eq!(renderer.active_blocks.len(), 1);
 
-    renderer.handle_state(&streaming_state(Vec::new()));
+    renderer.handle_state(&agent_state(
+        vec![tool_block(UiToolStatus::Success)],
+        UiAgentStatus::Streaming,
+    ));
     assert_eq!(renderer.active_blocks.len(), 1);
 
     renderer.finish_turn();
@@ -275,7 +289,7 @@ fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
 }
 
 #[test]
-fn streaming_blocks_follow_pending_item_order() {
+fn turn_blocks_stay_live_across_tool_call_legs() {
     let (_term, handle, _input) = Term::new_virtual(
         80,
         24,
@@ -284,16 +298,9 @@ fn streaming_blocks_follow_pending_item_order() {
         CursorShape::Bar,
     );
     let mut renderer = StreamingRenderer::new(handle);
-    let call = test_call();
     renderer.handle_state(&streaming_state(vec![
-        UiStreamingItem::ToolCall {
-            id: call.id.as_str().to_owned(),
-            name: call.name.as_str().to_owned(),
-            arguments: call.arguments.clone(),
-        },
-        UiStreamingItem::AssistantMessage {
-            text: "done".to_owned(),
-        },
+        tool_block(UiToolStatus::Running),
+        assistant("done"),
     ]));
 
     assert_eq!(
@@ -301,12 +308,18 @@ fn streaming_blocks_follow_pending_item_order() {
         vec![0, 1]
     );
 
-    renderer.handle_state(&status_state(UiAgentStatus::ToolCalling {
-        results: Vec::new(),
-    }));
-    renderer.handle_state(&streaming_state(vec![UiStreamingItem::AssistantMessage {
-        text: "after tool".to_owned(),
-    }]));
+    renderer.handle_state(&agent_state(
+        vec![tool_block(UiToolStatus::Success), assistant("done")],
+        UiAgentStatus::ToolCalling,
+    ));
+    renderer.handle_state(&agent_state(
+        vec![
+            tool_block(UiToolStatus::Success),
+            assistant("done"),
+            assistant("after tool"),
+        ],
+        UiAgentStatus::Streaming,
+    ));
     assert_eq!(
         renderer.active_blocks.keys().copied().collect::<Vec<_>>(),
         vec![0, 1, 2]
@@ -326,11 +339,12 @@ fn streaming_text_response_finalizes_on_idle() {
         CursorShape::Bar,
     );
     let mut renderer = StreamingRenderer::new(handle);
-    renderer.handle_state(&streaming_state(vec![UiStreamingItem::AssistantMessage {
-        text: "done".to_owned(),
-    }]));
+    renderer.handle_state(&streaming_state(vec![assistant("done")]));
     assert_eq!(renderer.active_blocks.len(), 1);
 
-    renderer.handle_state(&status_state(UiAgentStatus::Idle));
+    renderer.handle_state(&agent_state(
+        vec![assistant("done")],
+        UiAgentStatus::Idle,
+    ));
     assert!(renderer.active_blocks.is_empty());
 }

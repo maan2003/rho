@@ -3,8 +3,8 @@
 //!
 //! Every rendered span carries a [`StyleClass`]; colors are resolved only at
 //! application time so themes stay client-side. Each class maps to two stable
-//! editor highlight keys: one for sealed transcript content (updated only when
-//! blocks change) and one for the frontier (updated per streaming event).
+//! editor highlight keys: one for settled transcript history (updated once
+//! per turn) and one for the live turn (updated per streaming event).
 
 use editor::HighlightKey;
 use gpui::{App, FontWeight, HighlightStyle, Hsla};
@@ -33,8 +33,8 @@ pub enum StyleClass {
 /// Which highlight-key space a style range lives in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {
-    Sealed,
-    Frontier,
+    History,
+    LiveTurn,
     /// Local system notices, kept apart from the transcript projection.
     System,
 }
@@ -62,8 +62,8 @@ impl StyleClass {
             Self::Syntax(id) => SYNTAX_KEY_BASE + id as usize,
         };
         let region_bit = match region {
-            Region::Sealed => 0,
-            Region::Frontier => 1,
+            Region::History => 0,
+            Region::LiveTurn => 1,
             Region::System => 2,
         };
         HighlightKey::SyntaxTreeView(SEMANTIC_KEY_BASE + slot * 3 + region_bit)
