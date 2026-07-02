@@ -112,6 +112,7 @@ impl DraftView {
         };
         crate::banner::insert(&this.editor, &this.multi_buffer, cx);
         this.insert_workdir_label(cx);
+        this.insert_body_gap(cx);
         this.pin_autoscroll(cx);
         this.update_body_chrome(cx);
         this.focus_body(window, cx);
@@ -262,6 +263,30 @@ impl DraftView {
                     field_start,
                     "Workdir: ",
                 )],
+                cx,
+            );
+        });
+    }
+
+    /// A blank line's worth of breathing room between the workdir field and
+    /// the message body.
+    fn insert_body_gap(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(body_start) =
+            snapshot.anchor_in_excerpt(self.body_buffer.read(cx).anchor_before(0))
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.insert_blocks(
+                [editor::display_map::BlockProperties {
+                    placement: editor::display_map::BlockPlacement::Above(body_start),
+                    height: Some(1),
+                    style: editor::display_map::BlockStyle::Fixed,
+                    render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
+                    priority: 0,
+                }],
+                None,
                 cx,
             );
         });
