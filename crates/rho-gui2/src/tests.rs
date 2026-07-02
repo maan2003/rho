@@ -386,6 +386,65 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn hidden_views_defer_rendering_until_selected(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("one")], Vec::new())),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(Some(agent(2)), window, cx);
+        })
+        .expect("select agent 2");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(Some(agent(1)), window, cx);
+        })
+        .expect("select agent 1");
+
+    // Agent 2 is materialized but hidden; its frames must not render yet.
+    feed_frame(
+        &workspace,
+        cx,
+        agent(2),
+        snapshot_frame(state(
+            vec![user("two"), assistant("done", Some(UiMessagePhase::FinalAnswer))],
+            Vec::new(),
+        )),
+    );
+    let hidden_view = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.agent_view(&agent(2)).expect("agent 2 view exists")
+        })
+        .expect("read workspace");
+    let hidden_text = workspace
+        .update(cx, |_, _, cx| {
+            hidden_view.update(cx, |view, cx| {
+                view.editor().update(cx, |editor, cx| editor.display_text(cx))
+            })
+        })
+        .expect("read hidden view");
+    assert!(
+        !hidden_text.contains("done"),
+        "hidden views should not render frames eagerly: {hidden_text:?}"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(Some(agent(2)), window, cx);
+        })
+        .expect("select agent 2");
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("two") && text.contains("done"),
+        "selecting a hidden agent should flush its deferred frames: {text:?}"
+    );
+}
+
+#[gpui::test]
 fn empty_prompt_shows_placeholder_and_gutter(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let text = display_text(&workspace, cx);

@@ -26,18 +26,28 @@ pub struct ElisionPlan {
     pub tail_rows: u32,
 }
 
-/// Computes the working-output elisions for the current state.
+/// Computes the working-output elisions for blocks at `from_block` onward
+/// plus the streaming frontier, in one pass over that region.
 ///
 /// `visible` marks blocks that rendered any text (reasoning blocks, for
 /// example, render nothing and cannot bound a fold). `frontier_visible` is
 /// whether the streaming frontier rendered any text.
-pub fn elision_plans(
+///
+/// `from_block` must be a turn start (a user-message index, or 0) at or
+/// before the active turn's start; plans for earlier turns depend only on
+/// their own turn and can be cached by the caller. `carry` is a plan from
+/// before `from_block` still open at the boundary (its end is the last
+/// visible block before `from_block`); it is extended or flushed exactly as
+/// a full recomputation would.
+pub fn elision_plans_from(
     state: &UiAgentState,
     visible: &[bool],
     frontier_visible: bool,
+    from_block: usize,
+    carry: Option<ElisionPlan>,
 ) -> Vec<ElisionPlan> {
     let mut plans = Vec::new();
-    let mut current: Option<ElisionPlan> = None;
+    let mut current: Option<ElisionPlan> = carry;
     let active_turn_has_pending_non_working = state
         .pending_response
         .iter()
@@ -48,47 +58,65 @@ pub fn elision_plans(
         .filter(|item| matches!(item, UiStreamingItem::Tool(_)))
         .count();
 
-    for (index, block) in state.blocks.iter().enumerate() {
-        if !visible.get(index).copied().unwrap_or(false) {
-            continue;
-        }
-        let mut tool_count = turn_tool_count(state, index);
-        if block_is_in_active_turn(state, index) {
+    let mut active_tool_count = pending_tool_count;
+    let mut turn_start = from_block;
+    while turn_start < state.blocks.len() {
+        let turn_end = state.blocks[turn_start + 1..]
+            .iter()
+            .position(is_user)
+            .map(|offset| turn_start + 1 + offset)
+            .unwrap_or(state.blocks.len());
+        let turn = &state.blocks[turn_start..turn_end];
+        let is_active = turn_end == state.blocks.len();
+        let mut tool_count = turn
+            .iter()
+            .filter(|block| matches!(block, UiBlock::Tool(_)))
+            .count();
+        let has_non_working = turn
+            .iter()
+            .any(|block| !is_user(block) && !block_is_working(block));
+        if is_active {
             tool_count += pending_tool_count;
+            active_tool_count = tool_count;
         }
-        let tail_rows = if turn_has_non_working_response(state, index)
-            || (active_turn_has_pending_non_working && block_is_in_active_turn(state, index))
-        {
+        let tail_rows = if has_non_working || (is_active && active_turn_has_pending_non_working) {
             0
         } else {
             LIMITED_TAIL_ROWS
         };
 
-        if block_is_working(block) {
-            match current.as_mut() {
-                Some(plan) if plan.tool_count == tool_count && plan.tail_rows == tail_rows => {
-                    plan.end = ElisionEnd::Block(index);
-                }
-                _ => {
-                    plans.extend(current.take());
-                    current = Some(ElisionPlan {
-                        start_block: index,
-                        end: ElisionEnd::Block(index),
-                        tool_count,
-                        tail_rows,
-                    });
-                }
+        for (offset, block) in turn.iter().enumerate() {
+            let index = turn_start + offset;
+            if !visible.get(index).copied().unwrap_or(false) {
+                continue;
             }
-        } else {
-            plans.extend(current.take());
+            if block_is_working(block) {
+                match current.as_mut() {
+                    Some(plan) if plan.tool_count == tool_count && plan.tail_rows == tail_rows => {
+                        plan.end = ElisionEnd::Block(index);
+                    }
+                    _ => {
+                        plans.extend(current.take());
+                        current = Some(ElisionPlan {
+                            start_block: index,
+                            end: ElisionEnd::Block(index),
+                            tool_count,
+                            tail_rows,
+                        });
+                    }
+                }
+            } else {
+                plans.extend(current.take());
+            }
         }
+        turn_start = turn_end;
     }
 
     if frontier_visible
         && !state.pending_response.is_empty()
         && state.pending_response.iter().all(streaming_item_is_working)
     {
-        let tool_count = active_turn_tool_count(state) + pending_tool_count;
+        let tool_count = active_tool_count;
         match current.as_mut() {
             Some(plan)
                 if plan.tool_count == tool_count && plan.tail_rows == LIMITED_TAIL_ROWS =>
@@ -111,6 +139,16 @@ pub fn elision_plans(
     plans
 }
 
+/// Start of the turn containing `block_index` (clamped to the last turn).
+pub fn turn_start_index(state: &UiAgentState, block_index: usize) -> usize {
+    let end = block_index.saturating_add(1).min(state.blocks.len());
+    state.blocks[..end].iter().rposition(is_user).unwrap_or(0)
+}
+
+fn is_user(block: &UiBlock) -> bool {
+    matches!(block, UiBlock::UserMessage { .. })
+}
+
 pub fn elision_label(tool_count: usize) -> String {
     match tool_count {
         0 => "working".to_owned(),
@@ -125,52 +163,6 @@ fn block_is_working(block: &UiBlock) -> bool {
 
 fn streaming_item_is_working(item: &UiStreamingItem) -> bool {
     matches!(streaming_item_kind(item), BlockKind::Response { working: true })
-}
-
-fn turn_range(state: &UiAgentState, block_index: usize) -> std::ops::Range<usize> {
-    let turn_start = state.blocks[..=block_index]
-        .iter()
-        .rposition(|block| matches!(block, UiBlock::UserMessage { .. }))
-        .unwrap_or(0);
-    let turn_end = state.blocks[block_index + 1..]
-        .iter()
-        .position(|block| matches!(block, UiBlock::UserMessage { .. }))
-        .map(|offset| block_index + 1 + offset)
-        .unwrap_or(state.blocks.len());
-    turn_start..turn_end
-}
-
-fn turn_tool_count(state: &UiAgentState, block_index: usize) -> usize {
-    state.blocks[turn_range(state, block_index)]
-        .iter()
-        .filter(|block| matches!(block, UiBlock::Tool(_)))
-        .count()
-}
-
-fn turn_has_non_working_response(state: &UiAgentState, block_index: usize) -> bool {
-    state.blocks[turn_range(state, block_index)].iter().any(|block| {
-        !matches!(block, UiBlock::UserMessage { .. }) && !block_is_working(block)
-    })
-}
-
-fn block_is_in_active_turn(state: &UiAgentState, block_index: usize) -> bool {
-    state
-        .blocks
-        .iter()
-        .rposition(|block| matches!(block, UiBlock::UserMessage { .. }))
-        .is_none_or(|turn_start| block_index >= turn_start)
-}
-
-fn active_turn_tool_count(state: &UiAgentState) -> usize {
-    let turn_start = state
-        .blocks
-        .iter()
-        .rposition(|block| matches!(block, UiBlock::UserMessage { .. }))
-        .unwrap_or(0);
-    state.blocks[turn_start..]
-        .iter()
-        .filter(|block| matches!(block, UiBlock::Tool(_)))
-        .count()
 }
 
 #[cfg(test)]
@@ -224,6 +216,14 @@ mod tests {
 
     fn all_visible(state: &UiAgentState) -> Vec<bool> {
         vec![true; state.blocks.len()]
+    }
+
+    fn elision_plans(
+        state: &UiAgentState,
+        visible: &[bool],
+        frontier_visible: bool,
+    ) -> Vec<ElisionPlan> {
+        elision_plans_from(state, visible, frontier_visible, 0, None)
     }
 
     #[test]
@@ -302,6 +302,69 @@ mod tests {
                 tail_rows: LIMITED_TAIL_ROWS,
             }]
         );
+    }
+
+    #[test]
+    fn plans_from_a_turn_start_match_the_full_recompute_suffix() {
+        let state = state(
+            vec![
+                user("one"),
+                commentary("a"),
+                tool("t1"),
+                final_answer("done"),
+                user("two"),
+                commentary("b"),
+                tool("t2"),
+            ],
+            vec![UiStreamingItem::AssistantMessage {
+                text: "more".to_owned(),
+                phase: Some(UiMessagePhase::Commentary),
+            }],
+        );
+        let visible = all_visible(&state);
+        let full = elision_plans(&state, &visible, true);
+        let boundary = 4;
+        assert_eq!(turn_start_index(&state, 5), boundary);
+        assert_eq!(turn_start_index(&state, state.blocks.len()), boundary);
+        let cached = full
+            .iter()
+            .copied()
+            .filter(|plan| matches!(plan.end, ElisionEnd::Block(end) if end < boundary))
+            .collect::<Vec<_>>();
+        let tail = elision_plans_from(&state, &visible, true, boundary, None);
+        let mut recombined = cached;
+        recombined.extend(tail);
+        assert_eq!(recombined, full);
+    }
+
+    #[test]
+    fn carry_merges_a_run_across_the_recompute_boundary() {
+        // An invisible user message is the only way a working run can cross a
+        // turn boundary; the carried plan must extend exactly as a full
+        // recompute would.
+        let state = state(
+            vec![commentary("a"), user(""), commentary("b")],
+            Vec::new(),
+        );
+        let visible = vec![true, false, true];
+        let full = elision_plans(&state, &visible, false);
+        assert_eq!(
+            full,
+            vec![ElisionPlan {
+                start_block: 0,
+                end: ElisionEnd::Block(2),
+                tool_count: 0,
+                tail_rows: LIMITED_TAIL_ROWS,
+            }]
+        );
+        let carry = Some(ElisionPlan {
+            start_block: 0,
+            end: ElisionEnd::Block(0),
+            tool_count: 0,
+            tail_rows: LIMITED_TAIL_ROWS,
+        });
+        let tail = elision_plans_from(&state, &visible, false, 1, carry);
+        assert_eq!(tail, full);
     }
 
     #[test]

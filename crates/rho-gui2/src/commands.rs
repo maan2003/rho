@@ -37,8 +37,10 @@ pub const COMMANDS: &[CommandSpec] = &[
 
 pub enum ParsedCommand {
     New,
-    Load(Result<AgentId, String>),
+    Load(AgentId),
     Cancel,
+    /// A recognized command with a bad argument; carries the usage message.
+    Invalid(String),
     Unsupported,
 }
 
@@ -53,12 +55,12 @@ pub fn parse(text: &str) -> Option<ParsedCommand> {
     if let Some(argument) = text.strip_prefix("/load") {
         let argument = argument.trim();
         if argument.is_empty() {
-            return Some(ParsedCommand::Load(Err("/load <agent-id>".to_owned())));
+            return Some(ParsedCommand::Invalid("/load <agent-id>".to_owned()));
         }
-        return Some(ParsedCommand::Load(
-            AgentId::from_str(argument)
-                .map_err(|_| format!("/load: invalid agent id `{argument}`")),
-        ));
+        return Some(match AgentId::from_str(argument) {
+            Ok(agent_id) => ParsedCommand::Load(agent_id),
+            Err(_) => ParsedCommand::Invalid(format!("/load: invalid agent id `{argument}`")),
+        });
     }
     if text.starts_with('/') || text.starts_with('!') {
         return Some(ParsedCommand::Unsupported);
@@ -81,7 +83,7 @@ pub fn completions_for(
     if let Some(mention) = mention_prefix(text_before_cursor) {
         return live_agents
             .iter()
-            .filter(|agent| matches(agent, mention))
+            .filter(|agent| fuzzy_contains(agent, mention))
             .map(|agent| Candidate {
                 value: agent.clone(),
                 description: "agent".to_owned(),
@@ -97,7 +99,7 @@ pub fn completions_for(
     if complete_command {
         return COMMANDS
             .iter()
-            .filter(|spec| matches(spec.name, command))
+            .filter(|spec| fuzzy_contains(spec.name, command))
             .map(|spec| Candidate {
                 value: spec.name.to_owned(),
                 description: spec.description.to_owned(),
@@ -112,7 +114,7 @@ pub fn completions_for(
             }
             known_agents
                 .iter()
-                .filter(|agent| matches(agent, argument))
+                .filter(|agent| fuzzy_contains(agent, argument))
                 .map(|agent| Candidate {
                     value: agent.clone(),
                     description: "agent".to_owned(),
@@ -123,7 +125,7 @@ pub fn completions_for(
     }
 }
 
-fn matches(value: &str, needle: &str) -> bool {
+fn fuzzy_contains(value: &str, needle: &str) -> bool {
     needle.is_empty() || value.to_lowercase().contains(&needle.to_lowercase())
 }
 
@@ -179,7 +181,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             .unwrap_or_default();
 
         let buffer = buffer.read(cx);
-        let cursor_offset = buffer_position.to_offset(&buffer);
+        let cursor_offset = buffer_position.to_offset(buffer);
         let text_before_cursor = buffer
             .text_for_range(0..cursor_offset)
             .collect::<String>();

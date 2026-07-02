@@ -3,12 +3,14 @@
 mod agent_view;
 mod commands;
 mod connection;
+mod highlights;
 mod registry;
 mod render;
 mod store;
 mod style;
 #[cfg(test)]
 mod tests;
+mod topic_rail;
 mod transcript;
 mod workspace;
 

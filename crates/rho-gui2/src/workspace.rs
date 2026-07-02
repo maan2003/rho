@@ -11,11 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
-use gpui::{Context, Entity, Focusable as _, MouseButton, Task, Window, div, px};
+use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
-use rho_ui_proto::{AgentId, ClientMessage, UiTopic};
+use rho_ui_proto::{AgentId, ClientMessage};
 use theme::ActiveTheme as _;
-use ui::{Color, Icon, IconName, IconSize};
 
 use crate::agent_view::AgentView;
 use crate::commands::{self, ParsedCommand};
@@ -35,6 +34,9 @@ pub struct Workspace {
     store: AgentStore,
     registry: AgentRegistry,
     views: HashMap<AgentId, Entity<AgentView>>,
+    /// Accumulated change summaries for materialized but hidden views; they
+    /// render once, with the merged summary, when next selected.
+    pending_syncs: HashMap<AgentId, FrameSummary>,
     draft_view: Entity<AgentView>,
     project_root: PathBuf,
     connected: bool,
@@ -74,6 +76,7 @@ impl Workspace {
             store: AgentStore::default(),
             registry: AgentRegistry::default(),
             views: HashMap::new(),
+            pending_syncs: HashMap::new(),
             draft_view,
             project_root: attach_target.project_root,
             connected: false,
@@ -106,16 +109,22 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::Frame { agent_id, frame } => {
-                let summary = self.store.apply(agent_id.clone(), frame);
-                self.registry.mark_live(agent_id.clone());
+                let summary = self.store.apply(agent_id, frame);
+                self.registry.mark_live(agent_id);
                 if self.registry.selected().is_none() {
                     // First live agent: show it. Materialization renders the
                     // full state, so the per-frame sync below is unnecessary.
-                    self.select_agent(Some(agent_id.clone()), window, cx);
-                } else if let Some(view) = self.views.get(&agent_id).cloned() {
-                    if let Some(state) = self.store.get(&agent_id) {
-                        view.update(cx, |view, cx| view.sync(state, summary, now_ms(), cx));
-                    }
+                    self.select_agent(Some(agent_id), window, cx);
+                } else if self.registry.selected() == Some(&agent_id) {
+                    if let Some(view) = self.views.get(&agent_id).cloned()
+                        && let Some(state) = self.store.get(&agent_id) {
+                            view.update(cx, |view, cx| view.sync(state, summary, now_ms(), cx));
+                        }
+                } else if self.views.contains_key(&agent_id) {
+                    self.pending_syncs
+                        .entry(agent_id)
+                        .and_modify(|pending| *pending = pending.merge(summary))
+                        .or_insert(summary);
                 }
                 self.ensure_duration_timer(cx);
                 cx.notify();
@@ -138,13 +147,7 @@ impl Workspace {
             }
             ConnEvent::Disconnected(reason) => {
                 self.connected = false;
-                let views = self
-                    .views
-                    .values()
-                    .cloned()
-                    .chain([self.draft_view.clone()])
-                    .collect::<Vec<_>>();
-                for view in views {
+                for view in self.all_views() {
                     view.update(cx, |view, cx| {
                         view.system_notice(
                             &format!("[disconnected from rho daemon: {reason}]"),
@@ -191,7 +194,7 @@ impl Workspace {
                     .registry
                     .topics()
                     .first()
-                    .map(|topic| topic.topic_id.clone())
+                    .map(|topic| topic.topic_id)
                 else {
                     self.notice_on(
                         None,
@@ -238,7 +241,7 @@ impl Workspace {
                     ),
                 }
             }
-            ParsedCommand::Load(Ok(agent_id)) => {
+            ParsedCommand::Load(agent_id) => {
                 if !self.connected {
                     self.notice_on(
                         source_agent.as_ref(),
@@ -248,13 +251,11 @@ impl Workspace {
                     );
                     return;
                 }
-                self.connection.send(ClientMessage::LoadAgent {
-                    agent_id: agent_id.clone(),
-                });
-                self.registry.mark_known(agent_id.clone());
+                self.connection.send(ClientMessage::LoadAgent { agent_id });
+                self.registry.mark_known(agent_id);
                 self.select_agent(Some(agent_id), window, cx);
             }
-            ParsedCommand::Load(Err(message)) => {
+            ParsedCommand::Invalid(message) => {
                 self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
             }
             ParsedCommand::Unsupported => {
@@ -325,11 +326,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<AgentView> {
-        if let Some(view) = self.views.get(agent_id) {
-            return view.clone();
+        let deferred = self.pending_syncs.remove(agent_id);
+        if let Some(view) = self.views.get(agent_id).cloned() {
+            if let (Some(summary), Some(state)) = (deferred, self.store.get(agent_id)) {
+                view.update(cx, |view, cx| view.sync(state, summary, now_ms(), cx));
+            }
+            return view;
         }
+        // A freshly created view renders the full state below, which
+        // subsumes any deferred summary.
         let workspace = cx.entity().downgrade();
-        let id = Some(agent_id.clone());
+        let id = Some(*agent_id);
         let view = cx.new(|cx| AgentView::new(id, workspace, window, cx));
         if let Some(state) = self.store.get(agent_id) {
             view.update(cx, |view, cx| {
@@ -339,8 +346,13 @@ impl Workspace {
         let role = self.connected.then_some("rho");
         let project_label = self.project_label();
         view.update(cx, |view, cx| view.set_status(role, &project_label, cx));
-        self.views.insert(agent_id.clone(), view.clone());
+        self.views.insert(*agent_id, view.clone());
         view
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_view(&self, agent_id: &AgentId) -> Option<Entity<AgentView>> {
+        self.views.get(agent_id).cloned()
     }
 
     pub(crate) fn active_view(&self) -> Entity<AgentView> {
@@ -359,15 +371,19 @@ impl Workspace {
     fn update_statuses(&self, cx: &mut Context<Self>) {
         let role = self.connected.then_some("rho");
         let project_label = self.project_label();
-        let views = self
-            .views
+        for view in self.all_views() {
+            view.update(cx, |view, cx| view.set_status(role, &project_label, cx));
+        }
+    }
+
+    /// Every materialized view plus the draft view — the recipients of
+    /// broadcasts like status updates and disconnect notices.
+    fn all_views(&self) -> Vec<Entity<AgentView>> {
+        self.views
             .values()
             .cloned()
             .chain([self.draft_view.clone()])
-            .collect::<Vec<_>>();
-        for view in views {
-            view.update(cx, |view, cx| view.set_status(role, &project_label, cx));
-        }
+            .collect()
     }
 
     fn project_label(&self) -> String {
@@ -419,152 +435,13 @@ impl Workspace {
         }));
     }
 
-    fn render_topic_rail(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let active_view = self.active_view();
-        let text_style = active_view.update(cx, |view, cx| {
-            view.editor().update(cx, |editor, cx| editor.style(cx).text.clone())
-        });
-        let (selected_color, border_color) = {
-            let colors = cx.theme().colors();
-            (
-                colors.terminal_ansi_magenta,
-                colors.border_variant.opacity(0.6),
-            )
-        };
-        let selected_agent = self.registry.selected().cloned();
-        let live = self
-            .registry
-            .live_agents()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-
-        let rows = self
-            .registry
-            .topics()
-            .iter()
-            .map(|topic| {
-                render_topic_rows(
-                    topic,
-                    selected_agent.as_ref(),
-                    &live,
-                    &text_style,
-                    selected_color,
-                    cx,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        div()
-            .id("rho-gui2-topic-rail")
-            .h_full()
-            .w(px(224.))
-            .flex_none()
-            .border_r_1()
-            .border_color(border_color)
-            .pr(px(6.))
-            .py(px(2.))
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .font_family(text_style.font_family.clone())
-            .text_size(text_style.font_size)
-            .line_height(text_style.line_height)
-            .text_color(text_style.color)
-            .child(
-                div()
-                    .id("rho-gui2-topic-list")
-                    .w_full()
-                    .flex_grow(1.0)
-                    .overflow_y_scroll()
-                    .children(rows),
-            )
-    }
-}
-
-fn render_topic_rows(
-    topic: &UiTopic,
-    selected_agent: Option<&AgentId>,
-    live: &std::collections::BTreeSet<AgentId>,
-    text_style: &gpui::TextStyle,
-    selected_color: gpui::Hsla,
-    cx: &mut Context<Workspace>,
-) -> gpui::Div {
-    let name = topic
-        .display_name
-        .clone()
-        .unwrap_or_else(|| topic.topic_id.to_string());
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .child(
-            div()
-                .w_full()
-                .pt(px(5.))
-                .pl(px(4.))
-                .text_color(text_style.color.opacity(0.65))
-                .child(name),
-        )
-        .children(topic.agent_ids.iter().map(|agent_id| {
-            let selected = selected_agent == Some(agent_id);
-            let is_live = live.contains(agent_id);
-            let text_color = if selected {
-                selected_color
-            } else {
-                text_style.color
-            };
-            let icon_color = if selected {
-                selected_color
-            } else if is_live {
-                text_style.color.opacity(0.9)
-            } else {
-                text_style.color.opacity(0.5)
-            };
-            div()
-                .relative()
-                .w_full()
-                .flex()
-                .items_center()
-                .gap_1()
-                .pl(px(12.))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener({
-                        let agent_id = agent_id.clone();
-                        move |this, _, window, cx| {
-                            this.select_agent(Some(agent_id.clone()), window, cx);
-                        }
-                    }),
-                )
-                .child(
-                    Icon::new(if selected {
-                        IconName::PlayFilled
-                    } else {
-                        IconName::Circle
-                    })
-                    .size(IconSize::XSmall)
-                    .color(Color::Custom(icon_color)),
-                )
-                .child(
-                    div()
-                        .flex_grow(1.0)
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_color(text_color)
-                        .child(agent_id.to_string()),
-                )
-        }))
 }
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_view().read(cx).editor().clone();
-        let rail = self.render_topic_rail(cx);
+        let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
+        let rail = crate::topic_rail::render_topic_rail(&self.registry, &text_style, cx);
         div()
             .id("rho-gui2")
             .size_full()

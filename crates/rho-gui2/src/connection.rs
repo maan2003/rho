@@ -6,11 +6,11 @@
 use std::path::PathBuf;
 
 use anyhow::Context as _;
+use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{AgentId, ClientMessage, ServerMessage, UiTopic, read_frame, write_frame};
-use tokio::sync::mpsc as tokio_mpsc;
 
 pub enum ConnEvent {
     Ready { topics: Vec<UiTopic> },
@@ -23,18 +23,18 @@ pub enum ConnEvent {
 }
 
 pub struct Connection {
-    commands: tokio_mpsc::UnboundedSender<ClientMessage>,
+    commands: futures_mpsc::UnboundedSender<ClientMessage>,
 }
 
 impl Connection {
     pub fn send(&self, message: ClientMessage) {
-        let _ = self.commands.send(message);
+        let _ = self.commands.unbounded_send(message);
     }
 }
 
 pub fn spawn(socket_path: PathBuf) -> (Connection, futures_mpsc::UnboundedReceiver<ConnEvent>) {
     let (event_tx, event_rx) = futures_mpsc::unbounded();
-    let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
+    let (command_tx, command_rx) = futures_mpsc::unbounded();
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -63,7 +63,7 @@ pub fn spawn(socket_path: PathBuf) -> (Connection, futures_mpsc::UnboundedReceiv
 async fn run(
     socket_path: PathBuf,
     events: &futures_mpsc::UnboundedSender<ConnEvent>,
-    mut commands: tokio_mpsc::UnboundedReceiver<ClientMessage>,
+    mut commands: futures_mpsc::UnboundedReceiver<ClientMessage>,
 ) -> anyhow::Result<()> {
     let client = Client::connect(&socket_path)
         .await
@@ -80,7 +80,7 @@ async fn run(
 
     let (mut reader, mut writer) = stream.into_split();
     let writer_task = tokio::spawn(async move {
-        while let Some(message) = commands.recv().await {
+        while let Some(message) = commands.next().await {
             if write_frame(&mut writer, &message).await.is_err() {
                 break;
             }

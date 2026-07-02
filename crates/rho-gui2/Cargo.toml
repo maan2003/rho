@@ -35,7 +35,7 @@ settings = { path = "../../../zed/crates/settings" }
 text = { path = "../../../zed/crates/text" }
 theme = { path = "../../../zed/crates/theme" }
 theme_settings = { path = "../../../zed/crates/theme_settings" }
-tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util"] }
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 ui = { path = "../../../zed/crates/ui" }
 vim = { path = "../../../zed/crates/vim" }

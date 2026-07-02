@@ -38,7 +38,8 @@ pub enum BlockKind {
     Response { working: bool },
 }
 
-/// A running tool's live duration span, to be spliced once per second.
+/// A running tool's live duration position: an empty span marking where the
+/// transcript places the duration inlay it refreshes once per second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimerSpec {
     pub span_index: usize,
@@ -191,9 +192,9 @@ fn invisible(kind: BlockKind) -> RenderedBlock {
 
 /// Renders one tool call line: `label status [duration]\n[preview]`.
 ///
-/// Running tools with a start timestamp always get a duration span (possibly
-/// empty) so the transcript can splice updated durations in place without
-/// re-rendering the block.
+/// Finished tools render their duration as text. Running tools with a start
+/// timestamp get an empty position span instead: the live duration renders
+/// as an inlay there, so per-second ticks never edit the buffer.
 fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<TimerSpec> {
     let is_shell = matches!(tool.name.as_str(), "shell" | "shell_command");
     let label = if is_shell {
@@ -221,19 +222,19 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
     spans.push(Span::new(status, tool_status_class(tool.status)));
 
     let mut timer = None;
-    let duration_text = tool_duration_at(tool, now_ms)
-        .map(|duration| format!(" {}", format_tool_duration(duration)))
-        .unwrap_or_default();
     if tool.status == UiToolStatus::Running {
         if let Some(started_at) = tool.started_at {
             timer = Some(TimerSpec {
                 span_index: spans.len(),
                 started_at_ms: started_at.0,
             });
-            spans.push(Span::new(duration_text, StyleClass::Time));
+            spans.push(Span::new("", StyleClass::Time));
         }
-    } else if !duration_text.is_empty() {
-        spans.push(Span::new(duration_text, StyleClass::Time));
+    } else if let Some(duration) = tool_duration_at(tool, now_ms) {
+        spans.push(Span::new(
+            format!(" {}", format_tool_duration(duration)),
+            StyleClass::Time,
+        ));
     }
 
     if let Some(text) = tool.preview.as_deref().or(tool.output.as_deref()) {
@@ -372,19 +373,14 @@ mod tests {
     }
 
     #[test]
-    fn running_tool_gets_timer_span_even_below_one_second() {
+    fn running_tool_gets_a_timer_position_marker_not_text() {
         let mut running = tool(UiToolStatus::Running);
         running.started_at = Some(UnixMs(1_000));
         let mut spans = Vec::new();
-        let timer = push_tool_spans(&mut spans, &running, 1_500);
+        let timer = push_tool_spans(&mut spans, &running, 3_500);
         let timer = timer.expect("running tool with start time should have a timer");
         assert_eq!(spans[timer.span_index].text, "");
         assert_eq!(text_of(&spans), "$ echo ok running\n");
-
-        let mut spans = Vec::new();
-        let timer = push_tool_spans(&mut spans, &running, 3_500).unwrap();
-        assert_eq!(spans[timer.span_index].text, " 2s");
-        assert_eq!(text_of(&spans), "$ echo ok running 2s\n");
     }
 
     #[test]

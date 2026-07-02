@@ -25,6 +25,7 @@ use rho_ui_proto::remote::UiAgentState;
 use theme::ActiveTheme as _;
 
 use crate::commands::WorkspaceCompletionProvider;
+use crate::highlights::apply_class_highlights;
 use crate::store::FrameSummary;
 use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, Region, StyleClass};
 use crate::transcript::TranscriptModel;
@@ -134,7 +135,7 @@ impl AgentView {
         }));
         subscriptions.extend(register_actions(
             &editor,
-            agent_id.clone(),
+            agent_id,
             cx.entity().downgrade(),
             workspace,
             cx,
@@ -247,30 +248,22 @@ impl AgentView {
     }
 
     fn apply_system_styles(&self, cx: &mut Context<Self>) {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let mut by_class: Vec<(StyleClass, Vec<Range<multi_buffer::Anchor>>)> = Vec::new();
+        let mut by_class: Vec<(StyleClass, Vec<Range<text::Anchor>>)> = Vec::new();
         for (class, range) in &self.system_styles {
-            let Some(start) = snapshot.anchor_in_excerpt(range.start) else {
-                continue;
-            };
-            let Some(end) = snapshot.anchor_in_excerpt(range.end) else {
-                continue;
-            };
             match by_class.iter_mut().find(|(existing, _)| existing == class) {
-                Some((_, ranges)) => ranges.push(start..end),
-                None => by_class.push((*class, vec![start..end])),
+                Some((_, ranges)) => ranges.push(range.clone()),
+                None => by_class.push((*class, vec![range.clone()])),
             }
         }
-        self.editor.update(cx, |editor, cx| {
-            for (class, ranges) in by_class {
-                editor.highlight_text(
-                    class.highlight_key(Region::System),
-                    ranges,
-                    class.resolve(cx),
-                    cx,
-                );
-            }
-        });
+        apply_class_highlights(
+            &self.editor,
+            &self.multi_buffer,
+            Region::System,
+            by_class
+                .iter()
+                .map(|(class, ranges)| (*class, ranges.as_slice())),
+            cx,
+        );
     }
 
     pub fn set_status(
@@ -310,7 +303,7 @@ impl AgentView {
 
     fn update_prompt_chrome(&mut self, cx: &mut Context<Self>) {
         let buffer = self.prompt_buffer.read(cx);
-        let draft_empty = buffer.len() == 0;
+        let draft_empty = buffer.is_empty();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(prompt_start) =
             snapshot.anchor_in_excerpt(self.prompt_buffer.read(cx).anchor_before(0))
@@ -385,11 +378,9 @@ fn register_actions(
     workspace: WeakEntity<Workspace>,
     cx: &mut Context<AgentView>,
 ) -> Vec<Subscription> {
-    let mut subscriptions = Vec::new();
-    subscriptions.push(editor.update(cx, |editor, _cx| {
+    let submit = editor.update(cx, |editor, _cx| {
         let view = view.clone();
         let workspace = workspace.clone();
-        let agent_id = agent_id.clone();
         editor.register_action(move |_: &SubmitPrompt, window, cx| {
             let Some(view) = view.upgrade() else {
                 return;
@@ -397,73 +388,55 @@ fn register_actions(
             let Some(text) = view.update(cx, |view, cx| view.take_prompt(cx)) else {
                 return;
             };
-            let agent_id = agent_id.clone();
+            let agent_id = agent_id;
             let _ = workspace.update(cx, |workspace, cx| {
                 workspace.handle_submit(agent_id, text, window, cx);
             });
         })
-    }));
-    subscriptions.push(editor.update(cx, |editor, _cx| {
-        let workspace = workspace.clone();
-        editor.register_action(move |_: &AgentPrevious, window, cx| {
-            let _ = workspace.update(cx, |workspace, cx| {
-                workspace.switch_agent_by_delta(-1, window, cx);
-            });
+    });
+    vec![
+        submit,
+        workspace_action::<AgentPrevious>(editor, workspace.clone(), cx, |workspace, window, cx| {
+            workspace.switch_agent_by_delta(-1, window, cx);
+        }),
+        workspace_action::<AgentNext>(editor, workspace.clone(), cx, |workspace, window, cx| {
+            workspace.switch_agent_by_delta(1, window, cx);
+        }),
+        workspace_action::<AgentNew>(editor, workspace, cx, |workspace, window, cx| {
+            workspace.select_agent(None, window, cx);
+        }),
+        notice_action::<TaskBoard>(editor, view.clone(), "task board is not available yet", cx),
+        notice_action::<RoleCycle>(editor, view.clone(), "role cycling is not available yet", cx),
+        notice_action::<RoleCycleGroup>(editor, view, "role cycling is not available yet", cx),
+    ]
+}
+
+fn workspace_action<A: gpui::Action>(
+    editor: &Entity<Editor>,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut Context<AgentView>,
+    handler: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+) -> Subscription {
+    editor.update(cx, |editor, _cx| {
+        editor.register_action(move |_: &A, window, cx| {
+            let _ = workspace.update(cx, |workspace, cx| handler(workspace, window, cx));
         })
-    }));
-    subscriptions.push(editor.update(cx, |editor, _cx| {
-        let workspace = workspace.clone();
-        editor.register_action(move |_: &AgentNext, window, cx| {
-            let _ = workspace.update(cx, |workspace, cx| {
-                workspace.switch_agent_by_delta(1, window, cx);
-            });
-        })
-    }));
-    subscriptions.push(editor.update(cx, |editor, _cx| {
-        let workspace = workspace.clone();
-        editor.register_action(move |_: &AgentNew, window, cx| {
-            let _ = workspace.update(cx, |workspace, cx| {
-                workspace.select_agent(None, window, cx);
-            });
-        })
-    }));
-    subscriptions.push(editor.update(cx, |editor, _cx| {
-        let view = view.clone();
-        editor.register_action(move |_: &TaskBoard, _window, cx| {
+    })
+}
+
+fn notice_action<A: gpui::Action>(
+    editor: &Entity<Editor>,
+    view: WeakEntity<AgentView>,
+    text: &'static str,
+    cx: &mut Context<AgentView>,
+) -> Subscription {
+    editor.update(cx, |editor, _cx| {
+        editor.register_action(move |_: &A, _window, cx| {
             let _ = view.update(cx, |view, cx| {
-                view.system_notice(
-                    "task board is not available yet",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
+                view.system_notice(text, StyleClass::SystemInfo, cx);
             });
         })
-    }));
-    subscriptions.push(editor.update(cx, |editor, _cx| {
-        let view = view.clone();
-        editor.register_action(move |_: &RoleCycle, _window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.system_notice(
-                    "role cycling is not available yet",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-            });
-        })
-    }));
-    subscriptions.push(editor.update(cx, |editor, _cx| {
-        let view = view.clone();
-        editor.register_action(move |_: &RoleCycleGroup, _window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.system_notice(
-                    "role cycling is not available yet",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-            });
-        })
-    }));
-    subscriptions
+    })
 }
 
 const STARTUP_PUNS: &[&str] = &[

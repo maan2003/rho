@@ -31,6 +31,18 @@ impl FrameSummary {
     pub fn is_noop(&self) -> bool {
         self.first_changed_block.is_none() && !self.pending_changed
     }
+
+    /// Combines two summaries into one covering both changes, so hidden
+    /// views can accumulate frames and render once when shown.
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            first_changed_block: match (self.first_changed_block, other.first_changed_block) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            pending_changed: self.pending_changed || other.pending_changed,
+        }
+    }
 }
 
 #[derive(Default)]

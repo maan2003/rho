@@ -26,7 +26,7 @@ impl AgentRegistry {
     pub fn set_topics(&mut self, topics: Vec<UiTopic>) {
         for topic in &topics {
             for agent_id in &topic.agent_ids {
-                self.agents.entry(agent_id.clone()).or_insert(AgentLife::Known);
+                self.agents.entry(*agent_id).or_insert(AgentLife::Known);
             }
         }
         self.topics = topics;
@@ -36,7 +36,7 @@ impl AgentRegistry {
         let mut topics = std::mem::take(&mut self.topics);
         topics.retain(|existing| existing.topic_id != topic.topic_id);
         topics.push(topic);
-        topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
+        topics.sort_by_key(|left| left.topic_id);
         self.set_topics(topics);
     }
 
@@ -79,7 +79,7 @@ impl AgentRegistry {
             .and_then(|selected| live.iter().position(|agent_id| *agent_id == selected))
             .map(|index| (index as isize + delta).rem_euclid(len) as usize)
             .unwrap_or_else(|| if delta < 0 { live.len() - 1 } else { 0 });
-        live.get(index).map(|agent_id| (*agent_id).clone())
+        live.get(index).map(|agent_id| *(*agent_id))
     }
 
     pub fn known_agents(&self) -> impl Iterator<Item = &AgentId> {
