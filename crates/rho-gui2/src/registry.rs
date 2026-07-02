@@ -54,11 +54,22 @@ impl AgentRegistry {
 
     /// The working directory of an agent, from topic summaries.
     pub fn working_directory(&self, agent_id: AgentId) -> Option<&PathBuf> {
+        self.agent_summary(agent_id)
+            .map(|agent| &agent.working_directory)
+    }
+
+    /// The pin/archive status of an agent, from topic summaries.
+    pub fn agent_status(&self, agent_id: AgentId) -> rho_ui_proto::Status {
+        self.agent_summary(agent_id)
+            .map(|agent| agent.status)
+            .unwrap_or(rho_ui_proto::Status::Normal)
+    }
+
+    fn agent_summary(&self, agent_id: AgentId) -> Option<&rho_ui_proto::UiAgentSummary> {
         self.topics
             .iter()
             .flat_map(|topic| topic.agents.iter())
             .find(|agent| agent.agent_id == agent_id)
-            .map(|agent| &agent.working_directory)
     }
 
     pub fn add_topic(&mut self, topic: UiTopic) {

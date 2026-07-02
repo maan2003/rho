@@ -250,9 +250,21 @@ impl ChatApp {
                 self.agent.load_agent(agent_id);
                 self.term.print_system(&format!("loading {agent_id}"));
             }
+            rho_commands::Command::AgentPin => {
+                self.toggle_agent_status(rho_ui_proto::Status::Pinned);
+            }
+            rho_commands::Command::AgentArchive => {
+                self.toggle_agent_status(rho_ui_proto::Status::Archived);
+            }
             rho_commands::Command::TopicNew { name } => {
                 self.term.print_system(&format!("creating topic `{name}`"));
                 self.agent.new_topic(name);
+            }
+            rho_commands::Command::TopicPin { name } => {
+                self.toggle_topic_status(name, rho_ui_proto::Status::Pinned);
+            }
+            rho_commands::Command::TopicArchive { name } => {
+                self.toggle_topic_status(name, rho_ui_proto::Status::Archived);
             }
             rho_commands::Command::TopicMove { name } => {
                 let Some(agent_id) = primary_agent_id(&self.agent) else {
@@ -306,6 +318,59 @@ impl ChatApp {
         self.running_turn
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
+    }
+
+    /// Pin/archive toggles for the chat's agent.
+    fn toggle_agent_status(&mut self, target: rho_ui_proto::Status) {
+        let Some(agent_id) = primary_agent_id(&self.agent) else {
+            self.term.print_system("no agent yet");
+            return;
+        };
+        let current = self
+            .agent
+            .topics()
+            .iter()
+            .flat_map(|topic| &topic.agents)
+            .find(|summary| summary.agent_id == agent_id)
+            .map(|summary| summary.status)
+            .unwrap_or(rho_ui_proto::Status::Normal);
+        let status = rho_commands::toggle_status(current, target);
+        self.term
+            .print_system(&format!("{agent_id} is now {status:?}"));
+        self.agent.set_agent_status(agent_id, status);
+    }
+
+    /// Pin/archive toggles for a topic named by argument, defaulting to the
+    /// chat agent's own topic.
+    fn toggle_topic_status(&mut self, name: Option<String>, target: rho_ui_proto::Status) {
+        let topics = self.agent.topics();
+        let topic_id = match &name {
+            Some(name) => {
+                let Some(topic_id) = rho_commands::resolve_topic(name, &topic_labels(&self.agent))
+                else {
+                    self.term.print_system(&format!("no topic named `{name}`"));
+                    return;
+                };
+                topic_id
+            }
+            None => primary_agent_id(&self.agent)
+                .and_then(|agent_id| {
+                    topics
+                        .iter()
+                        .find(|topic| topic.agents.iter().any(|a| a.agent_id == agent_id))
+                        .map(|topic| topic.topic_id)
+                })
+                .unwrap_or_else(|| self.agent.default_topic_id()),
+        };
+        let current = topics
+            .iter()
+            .find(|topic| topic.topic_id == topic_id)
+            .map(|topic| topic.status)
+            .unwrap_or(rho_ui_proto::Status::Normal);
+        let status = rho_commands::toggle_status(current, target);
+        self.term
+            .print_system(&format!("{topic_id} is now {status:?}"));
+        self.agent.set_topic_status(topic_id, status);
     }
 
     async fn reap_finished_turn(&mut self) {

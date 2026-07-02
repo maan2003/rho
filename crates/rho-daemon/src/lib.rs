@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use rho_agent::Agent;
-use rho_agent::db::{AgentId, AgentReadTxnExt as _, AgentWriteTxnExt as _, TopicId, TopicStatus};
+use rho_agent::db::{AgentId, AgentReadTxnExt as _, AgentWriteTxnExt as _, Status, TopicId};
 use rho_core::text_content;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
@@ -14,7 +14,7 @@ use rho_inference::config::InferenceConfig;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, ServerMessage, UiAgentSummary, UiTopic, UiTopicStatus, UiWorkdir,
+    ClientMessage, ServerMessage, UiAgentSummary, UiTopic, UiWorkdir,
     read_frame_counted, write_frame_counted,
 };
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -118,7 +118,7 @@ impl AgentRegistry {
                 let topic_id = write.create_topic(
                     rho_core::UnixMs::now(),
                     "default".to_owned(),
-                    TopicStatus::Normal,
+                    Status::Normal,
                 );
                 write.commit();
                 topic_id
@@ -141,7 +141,7 @@ impl AgentRegistry {
             .map(|(topic_id, topic)| UiTopic {
                 topic_id,
                 name: topic.name,
-                status: ui_topic_status(topic.status),
+                status: topic.status,
                 agents: read
                     .list_topic_agents(topic_id)
                     .into_iter()
@@ -151,6 +151,7 @@ impl AgentRegistry {
                             agent_id,
                             display_name: agent.display_name,
                             working_directory: agent.working_directory,
+                            status: agent.status,
                         }
                     })
                     .collect(),
@@ -201,12 +202,12 @@ impl AgentRegistry {
 
     async fn create_topic(&self, name: String) -> UiTopic {
         let mut write = self.db.write().await;
-        let topic_id = write.create_topic(rho_core::UnixMs::now(), name, TopicStatus::Normal);
+        let topic_id = write.create_topic(rho_core::UnixMs::now(), name, Status::Normal);
         write.commit();
         UiTopic {
             topic_id,
             name: self.db.read().get_topic(topic_id).name,
-            status: UiTopicStatus::Normal,
+            status: Status::Normal,
             agents: Vec::new(),
         }
     }
@@ -255,10 +256,47 @@ impl AgentRegistry {
                 .find(|(_, topic)| topic.name == name)
                 .map(|(topic_id, _)| *topic_id)
                 .unwrap_or_else(|| {
-                    write.create_topic(rho_core::UnixMs::now(), name, TopicStatus::Normal)
+                    write.create_topic(rho_core::UnixMs::now(), name, Status::Normal)
                 }),
         };
         write.move_agent_to_topic(agent_id, topic_id);
+        write.commit();
+        Ok(())
+    }
+
+    async fn set_agent_status(&self, agent_id: AgentId, status: Status) -> anyhow::Result<()> {
+        if !self
+            .db
+            .read()
+            .list_agents()
+            .into_iter()
+            .any(|(id, _)| id == agent_id)
+        {
+            anyhow::bail!("unknown agent id: {agent_id}");
+        }
+        let mut write = self.db.write().await;
+        write.set_agent_status(rho_core::UnixMs::now(), agent_id, status);
+        write.commit();
+        Ok(())
+    }
+
+    async fn set_topic_status(&self, topic_id: TopicId, status: Status) -> anyhow::Result<()> {
+        if !self
+            .db
+            .read()
+            .list_topics()
+            .into_iter()
+            .any(|(id, _)| id == topic_id)
+        {
+            anyhow::bail!("unknown topic id: {topic_id}");
+        }
+        // New agents land in the default topic; archiving it would hide them
+        // as they are created.
+        if topic_id == self.default_topic_id && status == Status::Archived {
+            anyhow::bail!("cannot archive the default topic");
+        }
+        let mut write = self.db.write().await;
+        write.set_topic_status(rho_core::UnixMs::now(), topic_id, status);
         write.commit();
         Ok(())
     }
@@ -435,6 +473,30 @@ async fn serve_connection(
                     }
                 }
             }
+            ClientMessage::SetAgentStatus { agent_id, status } => {
+                match agents.set_agent_status(agent_id, status).await {
+                    Ok(()) => {
+                        let _ = outgoing_tx.send(agents.ready_message());
+                    }
+                    Err(error) => {
+                        let _ = outgoing_tx.send(ServerMessage::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ClientMessage::SetTopicStatus { topic_id, status } => {
+                match agents.set_topic_status(topic_id, status).await {
+                    Ok(()) => {
+                        let _ = outgoing_tx.send(agents.ready_message());
+                    }
+                    Err(error) => {
+                        let _ = outgoing_tx.send(ServerMessage::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
             ClientMessage::CancelTurn { agent_id } => {
                 if let Some(agent) = agents.get(agent_id).await {
                     agent.cancel();
@@ -490,12 +552,4 @@ fn validate_working_directory(path: PathBuf) -> anyhow::Result<PathBuf> {
 fn expand_home(path: &std::path::Path) -> Option<PathBuf> {
     let rest = path.strip_prefix("~").ok()?;
     Some(dirs::home_dir()?.join(rest))
-}
-
-fn ui_topic_status(status: TopicStatus) -> UiTopicStatus {
-    match status {
-        TopicStatus::Normal => UiTopicStatus::Normal,
-        TopicStatus::Pinned => UiTopicStatus::Pinned,
-        TopicStatus::Archived => UiTopicStatus::Archived,
-    }
 }

@@ -368,6 +368,23 @@ impl Workspace {
             Command::TopicNew { name } => {
                 self.connection.send(ClientMessage::NewTopic { name });
             }
+            Command::AgentPin => {
+                self.toggle_agent_status(source_agent, rho_ui_proto::Status::Pinned, window, cx);
+            }
+            Command::AgentArchive => {
+                self.toggle_agent_status(
+                    source_agent,
+                    rho_ui_proto::Status::Archived,
+                    window,
+                    cx,
+                );
+            }
+            Command::TopicPin { name } => {
+                self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
+            }
+            Command::TopicArchive { name } => {
+                self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Archived, cx);
+            }
             Command::TopicMove { name } => {
                 let target = source_agent.or_else(|| self.registry.selected().copied());
                 let Some(agent_id) = target else {
@@ -481,6 +498,78 @@ impl Workspace {
             self.connection.send(ClientMessage::LoadAgent { agent_id });
         }
         self.select_agent(Some(agent_id), window, cx);
+    }
+
+    /// Pin/archive toggle for the addressed (else selected) agent. Archiving
+    /// the selected agent closes its tab: the view returns to the draft.
+    fn toggle_agent_status(
+        &mut self,
+        source_agent: Option<AgentId>,
+        target: rho_ui_proto::Status,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = source_agent.or_else(|| self.registry.selected().copied()) else {
+            self.notice_on(None, "no agent selected", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let status = rho_commands::toggle_status(self.registry.agent_status(agent_id), target);
+        self.connection
+            .send(ClientMessage::SetAgentStatus { agent_id, status });
+        if status == rho_ui_proto::Status::Archived
+            && self.registry.selected() == Some(&agent_id)
+        {
+            self.select_agent(None, window, cx);
+        }
+    }
+
+    /// Pin/archive toggle for a topic named by argument, defaulting to the
+    /// focused agent's topic (else the default topic).
+    fn toggle_topic_status(
+        &mut self,
+        source_agent: Option<AgentId>,
+        name: Option<String>,
+        target: rho_ui_proto::Status,
+        cx: &mut Context<Self>,
+    ) {
+        let topic_id = match &name {
+            Some(name) => {
+                let Some(topic_id) = rho_commands::resolve_topic(name, &self.topic_labels())
+                else {
+                    let message = format!("no topic named `{name}`");
+                    self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
+                    return;
+                };
+                topic_id
+            }
+            None => {
+                let focused = source_agent
+                    .or_else(|| self.registry.selected().copied())
+                    .and_then(|agent_id| self.registry.topic_of(agent_id));
+                match focused.or(self.draft_topic_id).or(self.default_topic_id) {
+                    Some(topic_id) => topic_id,
+                    None => {
+                        self.notice_on(
+                            None,
+                            "no topic in focus",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        let current = self
+            .registry
+            .topics()
+            .iter()
+            .find(|topic| topic.topic_id == topic_id)
+            .map(|topic| topic.status)
+            .unwrap_or(rho_ui_proto::Status::Normal);
+        let status = rho_commands::toggle_status(current, target);
+        self.connection
+            .send(ClientMessage::SetTopicStatus { topic_id, status });
     }
 
     /// Tab in the draft jumps between the `Workdir:` header and the body;

@@ -2,15 +2,16 @@
 //!
 //! Topics are ad-hoc tab groups; every topic — including the daemon-created
 //! "default" one that agents are born into — renders uniformly with its
-//! name as the header, which advertises that grouping exists. Clicking an
-//! agent opens it (loading it on demand); the `+` row opens the draft
-//! compose view and doubles as its selection indicator.
+//! name as the header, which advertises that grouping exists. Pinned topics
+//! and agents sort first; archived ones are hidden (still loadable by id).
+//! Clicking an agent opens it (loading it on demand); the `+` row opens the
+//! draft compose view and doubles as its selection indicator.
 
 use std::collections::BTreeSet;
 
 use gpui::prelude::*;
 use gpui::{Context, Div, MouseButton, TextStyle, div, px};
-use rho_ui_proto::{AgentId, UiTopic};
+use rho_ui_proto::{AgentId, Status, UiTopic};
 use theme::ActiveTheme as _;
 use ui::{Color, Icon, IconName, IconSize};
 
@@ -32,9 +33,14 @@ pub fn render_topic_rail(
     let selected_agent = registry.selected().cloned();
     let live = registry.live_agents().cloned().collect::<BTreeSet<_>>();
 
-    let rows = registry
+    let mut visible_topics = registry
         .topics()
         .iter()
+        .filter(|topic| topic.status != Status::Archived)
+        .collect::<Vec<_>>();
+    visible_topics.sort_by_key(|topic| topic.status != Status::Pinned);
+    let rows = visible_topics
+        .into_iter()
         .map(|topic| {
             render_topic_rows(
                 topic,
@@ -124,6 +130,12 @@ fn render_topic_rows(
     cx: &mut Context<Workspace>,
 ) -> Div {
     let name = topic.name.clone();
+    let mut agents = topic
+        .agents
+        .iter()
+        .filter(|summary| summary.status != Status::Archived)
+        .collect::<Vec<_>>();
+    agents.sort_by_key(|summary| summary.status != Status::Pinned);
     div()
         .w_full()
         .flex()
@@ -132,15 +144,26 @@ fn render_topic_rows(
         .child(
             div()
                 .w_full()
+                .flex()
+                .items_center()
+                .gap_1()
                 .pt(px(5.))
                 .pl(px(4.))
                 .text_color(text_style.color.opacity(0.65))
-                .child(name),
+                .child(name)
+                .when(topic.status == Status::Pinned, |this| {
+                    this.child(
+                        Icon::new(IconName::Pin)
+                            .size(IconSize::XSmall)
+                            .color(Color::Custom(text_style.color.opacity(0.65))),
+                    )
+                }),
         )
-        .children(topic.agents.iter().map(|summary| {
+        .children(agents.into_iter().map(|summary| {
             let agent_id = &summary.agent_id;
             let selected = selected_agent == Some(agent_id);
             let is_live = live.contains(agent_id);
+            let pinned = summary.status == Status::Pinned;
             let text_color = if selected {
                 selected_color
             } else {
@@ -148,7 +171,7 @@ fn render_topic_rows(
             };
             let icon_color = if selected {
                 selected_color
-            } else if is_live {
+            } else if is_live || pinned {
                 text_style.color.opacity(0.9)
             } else {
                 text_style.color.opacity(0.5)
@@ -175,6 +198,8 @@ fn render_topic_rows(
                 .child(
                     Icon::new(if selected {
                         IconName::PlayFilled
+                    } else if pinned {
+                        IconName::Pin
                     } else {
                         IconName::Circle
                     })

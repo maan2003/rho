@@ -53,7 +53,7 @@ async fn create_agent_and_append_events_with_cursor() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
-    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), TopicStatus::Normal);
+    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
     let (agent_id, next) = write.create_agent(
         UnixMs(1),
         topic_id,
@@ -104,7 +104,7 @@ async fn agent_events_read_lineage_parents() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
-    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), TopicStatus::Normal);
+    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
     let (agent_id, next) = write.create_agent(
         UnixMs(1),
         topic_id,
@@ -175,8 +175,8 @@ async fn move_agent_to_topic_repoints_membership() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let default_topic = write.create_topic(UnixMs(1), "default".to_owned(), TopicStatus::Normal);
-    let named_topic = write.create_topic(UnixMs(1), "infra".to_owned(), TopicStatus::Normal);
+    let default_topic = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
+    let named_topic = write.create_topic(UnixMs(1), "infra".to_owned(), Status::Normal);
     let (agent_id, _) = write.create_agent(
         UnixMs(1),
         default_topic,
@@ -197,6 +197,35 @@ async fn move_agent_to_topic_repoints_membership() {
     write.move_agent_to_topic(agent_id, named_topic);
     write.commit();
     assert_eq!(db.read().list_topic_agents(named_topic), [agent_id]);
+}
+
+#[tokio::test]
+async fn topic_and_agent_statuses_are_settable() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let topic_id = write.create_topic(UnixMs(1), "infra".to_owned(), Status::Normal);
+    let (agent_id, _) = write.create_agent(
+        UnixMs(1),
+        topic_id,
+        None,
+        std::path::PathBuf::from("/tmp"),
+        PromptCacheKey::generate(),
+        InferenceConfig::deep().protect(),
+    );
+    write.set_topic_status(UnixMs(2), topic_id, Status::Pinned);
+    write.set_agent_status(UnixMs(2), agent_id, Status::Archived);
+    write.commit();
+
+    let read = db.read();
+    let topic = read.get_topic(topic_id);
+    assert_eq!(topic.status, Status::Pinned);
+    assert_eq!(topic.updated_at, UnixMs(2));
+    let agent = read.get_agent(agent_id);
+    assert_eq!(agent.status, Status::Archived);
+    assert_eq!(agent.updated_at, UnixMs(2));
 }
 
 #[tokio::test]

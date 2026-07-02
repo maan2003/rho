@@ -83,6 +83,37 @@ fn resolves_topics_by_label_or_id() {
 }
 
 #[test]
+fn parses_status_commands() {
+    assert_eq!(parse(":agent pin"), Some(Parsed::Command(Command::AgentPin)));
+    assert_eq!(
+        parse(":agent archive"),
+        Some(Parsed::Command(Command::AgentArchive))
+    );
+    assert_eq!(
+        parse(":topic pin"),
+        Some(Parsed::Command(Command::TopicPin { name: None }))
+    );
+    assert_eq!(
+        parse(":topic archive old work"),
+        Some(Parsed::Command(Command::TopicArchive {
+            name: Some("old work".to_owned())
+        }))
+    );
+}
+
+#[test]
+fn toggle_status_round_trips() {
+    assert_eq!(toggle_status(Status::Normal, Status::Pinned), Status::Pinned);
+    assert_eq!(toggle_status(Status::Pinned, Status::Pinned), Status::Normal);
+    // Pinning an archived item surfaces it.
+    assert_eq!(toggle_status(Status::Archived, Status::Pinned), Status::Pinned);
+    assert_eq!(
+        toggle_status(Status::Archived, Status::Archived),
+        Status::Normal
+    );
+}
+
+#[test]
 fn parses_workdir_commands() {
     assert_eq!(
         parse(":workdirs add /home/u/src/rho rho"),
@@ -124,7 +155,7 @@ fn completes_command_words_stepwise() {
     assert_eq!(values(&first).iter().filter(|v| **v == "agent").count(), 1);
 
     let second = completion_candidates(":agent ", &ctx);
-    assert_eq!(values(&second), ["new", "load", "cancel"]);
+    assert_eq!(values(&second), ["new", "load", "cancel", "pin", "archive"]);
 
     let partial = completion_candidates(":agent lo", &ctx);
     assert_eq!(values(&partial), ["load"]);

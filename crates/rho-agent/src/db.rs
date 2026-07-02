@@ -102,8 +102,11 @@ pub struct WorkdirRecord {
     pub created_at: UnixMillis,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum TopicStatus {
+/// Pin/archive state, shared by topics and agents. Pinned items sort first
+/// in client rails; archived items are hidden (never deleted — the event
+/// history stays loadable).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum Status {
     Normal,
     Pinned,
     Archived,
@@ -114,7 +117,7 @@ pub struct TopicRecord {
     pub name: String,
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
-    pub status: TopicStatus,
+    pub status: Status,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue)]
@@ -175,6 +178,7 @@ pub struct AgentRecord {
     /// Absolute directory this agent's tools execute in. Fixed at creation:
     /// the accumulated model context assumes one root for the agent's life.
     pub working_directory: PathBuf,
+    pub status: Status,
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
     pub current_lineage: AgentLineageId,
@@ -196,7 +200,11 @@ pub trait AgentReadTxnExt {
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
 
-    fn create_topic(&mut self, now: UnixMillis, name: String, status: TopicStatus) -> TopicId;
+    fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId;
+
+    fn set_topic_status(&mut self, now: UnixMillis, topic_id: TopicId, status: Status);
+
+    fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status);
 
     fn create_agent(
         &mut self,
@@ -321,7 +329,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(WORKDIRS);
     }
 
-    fn create_topic(&mut self, now: UnixMillis, name: String, status: TopicStatus) -> TopicId {
+    fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId {
         let topic_id = TopicId(next_counter(self, CounterKey::LAST_TOPIC_ID));
         let topic = TopicRecord {
             name,
@@ -332,6 +340,30 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(TOPICS)
             .insert(&topic_id, SenValue::borrowed(&topic));
         topic_id
+    }
+
+    fn set_topic_status(&mut self, now: UnixMillis, topic_id: TopicId, status: Status) {
+        let mut topics = self.open_table(TOPICS);
+        let mut topic = topics
+            .get(&topic_id)
+            .expect("topic id missing")
+            .value()
+            .into_owned();
+        topic.status = status;
+        topic.updated_at = now;
+        topics.insert(&topic_id, SenValue::borrowed(&topic));
+    }
+
+    fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.status = status;
+        agent.updated_at = now;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
     fn create_agent(
@@ -349,6 +381,7 @@ impl AgentWriteTxnExt for WriteTxn {
         let agent = AgentRecord {
             display_name,
             working_directory,
+            status: Status::Normal,
             created_at: now,
             updated_at: now,
             current_lineage: lineage_id,

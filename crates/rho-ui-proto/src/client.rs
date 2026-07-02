@@ -321,6 +321,18 @@ impl AgentClient {
             .send(ClientMessage::MoveAgent { agent_id, topic });
     }
 
+    pub fn set_agent_status(&self, agent_id: AgentId, status: crate::Status) {
+        let _ = self
+            .commands
+            .send(ClientMessage::SetAgentStatus { agent_id, status });
+    }
+
+    pub fn set_topic_status(&self, topic_id: TopicId, status: crate::Status) {
+        let _ = self
+            .commands
+            .send(ClientMessage::SetTopicStatus { topic_id, status });
+    }
+
     pub fn load_agent(&self, agent_id: AgentId) {
         let _ = self.commands.send(ClientMessage::LoadAgent { agent_id });
     }

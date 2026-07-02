@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, bail};
-pub use rho_agent::db::{AgentId, TopicId};
+pub use rho_agent::db::{AgentId, Status, TopicId};
 use rho_core::ContentPart;
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
@@ -92,6 +92,16 @@ pub enum ClientMessage {
         agent_id: AgentId,
         topic: TopicTarget,
     },
+    /// Pin or archive an agent (or return it to normal). Archiving hides;
+    /// it never deletes, and the agent stays loadable by id.
+    SetAgentStatus {
+        agent_id: AgentId,
+        status: Status,
+    },
+    SetTopicStatus {
+        topic_id: TopicId,
+        status: Status,
+    },
     /// Registers a workdir, or renames it if `path` is already registered.
     /// `name` defaults to the path's basename.
     WorkdirSet {
@@ -150,7 +160,7 @@ pub enum ServerMessage {
 pub struct UiTopic {
     pub topic_id: TopicId,
     pub name: String,
-    pub status: UiTopicStatus,
+    pub status: Status,
     pub agents: Vec<UiAgentSummary>,
 }
 
@@ -166,6 +176,7 @@ pub struct UiAgentSummary {
     pub agent_id: AgentId,
     pub display_name: Option<String>,
     pub working_directory: PathBuf,
+    pub status: Status,
 }
 
 /// A registered directory agents can be started in; selection vocabulary
@@ -174,13 +185,6 @@ pub struct UiAgentSummary {
 pub struct UiWorkdir {
     pub path: PathBuf,
     pub name: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum UiTopicStatus {
-    Normal,
-    Pinned,
-    Archived,
 }
 
 /// Encode and write one length-prefixed senax frame.

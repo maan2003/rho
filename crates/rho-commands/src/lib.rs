@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::str::FromStr as _;
 
-use rho_ui_proto::{AgentId, TopicId};
+use rho_ui_proto::{AgentId, Status, TopicId};
 
 pub struct CommandSpec {
     /// Full command name after the `:`, e.g. `agent new`.
@@ -35,6 +35,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Cancel the current agent's turn",
     },
     CommandSpec {
+        name: "agent pin",
+        usage: ":agent pin",
+        description: "Pin/unpin the current agent",
+    },
+    CommandSpec {
+        name: "agent archive",
+        usage: ":agent archive",
+        description: "Archive/restore the current agent (hidden, not deleted)",
+    },
+    CommandSpec {
         name: "topic new",
         usage: ":topic new <name>",
         description: "Create a new topic",
@@ -43,6 +53,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "topic move",
         usage: ":topic move <name>",
         description: "Move the current agent into a topic (created when unknown)",
+    },
+    CommandSpec {
+        name: "topic pin",
+        usage: ":topic pin [name]",
+        description: "Pin/unpin a topic (default: the current one)",
+    },
+    CommandSpec {
+        name: "topic archive",
+        usage: ":topic archive [name]",
+        description: "Archive/restore a topic (default: the current one)",
     },
     CommandSpec {
         name: "workdirs add",
@@ -86,8 +106,12 @@ pub enum Command {
     AgentNew { working_directory: Option<PathBuf> },
     AgentLoad { agent_id: AgentId },
     AgentCancel,
+    AgentPin,
+    AgentArchive,
     TopicNew { name: String },
     TopicMove { name: String },
+    TopicPin { name: Option<String> },
+    TopicArchive { name: Option<String> },
     WorkdirAdd { path: Option<PathBuf>, name: Option<String> },
     WorkdirRemove { path: String },
     Quit,
@@ -119,34 +143,26 @@ pub fn parse(line: &str) -> Option<Parsed> {
                 _ => Parsed::Invalid(":agent load <agent-id>".to_owned()),
             },
             Some("cancel") => Parsed::Command(Command::AgentCancel),
-            _ => Parsed::Invalid(":agent new|load|cancel".to_owned()),
+            Some("pin") => Parsed::Command(Command::AgentPin),
+            Some("archive") => Parsed::Command(Command::AgentArchive),
+            _ => Parsed::Invalid(":agent new|load|cancel|pin|archive".to_owned()),
         },
         "topic" => match tokens.next() {
-            Some("new") => {
-                let name = rest
-                    .split_whitespace()
-                    .skip(2)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if name.is_empty() {
-                    Parsed::Invalid(":topic new <name>".to_owned())
-                } else {
-                    Parsed::Command(Command::TopicNew { name })
-                }
-            }
-            Some("move") => {
-                let name = rest
-                    .split_whitespace()
-                    .skip(2)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if name.is_empty() {
-                    Parsed::Invalid(":topic move <name>".to_owned())
-                } else {
-                    Parsed::Command(Command::TopicMove { name })
-                }
-            }
-            _ => Parsed::Invalid(":topic new|move".to_owned()),
+            Some("new") => match joined_name(rest) {
+                Some(name) => Parsed::Command(Command::TopicNew { name }),
+                None => Parsed::Invalid(":topic new <name>".to_owned()),
+            },
+            Some("move") => match joined_name(rest) {
+                Some(name) => Parsed::Command(Command::TopicMove { name }),
+                None => Parsed::Invalid(":topic move <name>".to_owned()),
+            },
+            Some("pin") => Parsed::Command(Command::TopicPin {
+                name: joined_name(rest),
+            }),
+            Some("archive") => Parsed::Command(Command::TopicArchive {
+                name: joined_name(rest),
+            }),
+            _ => Parsed::Invalid(":topic new|move|pin|archive".to_owned()),
         },
         "workdirs" => match tokens.next() {
             Some("add") => Parsed::Command(Command::WorkdirAdd {
@@ -169,6 +185,26 @@ pub fn parse(line: &str) -> Option<Parsed> {
         other => Parsed::Unknown(format!(":{other}")),
     };
     Some(parsed)
+}
+
+/// The words after `:topic <sub>` as one name, `None` when absent.
+fn joined_name(rest: &str) -> Option<String> {
+    let name = rest
+        .split_whitespace()
+        .skip(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!name.is_empty()).then_some(name)
+}
+
+/// Toggle semantics for pin/archive commands: applying the state an item is
+/// already in returns it to normal.
+pub fn toggle_status(current: Status, target: Status) -> Status {
+    if current == target {
+        Status::Normal
+    } else {
+        target
+    }
 }
 
 /// Client-held data commands complete against.
@@ -262,7 +298,7 @@ fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> 
                 description: "agent".to_owned(),
             })
             .collect(),
-        ["topic", "move"] => ctx
+        ["topic", "move"] | ["topic", "pin"] | ["topic", "archive"] => ctx
             .topics
             .iter()
             .filter(|topic| fuzzy_contains(topic, partial))
