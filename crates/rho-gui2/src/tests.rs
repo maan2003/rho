@@ -111,7 +111,12 @@ fn assistant(text: &str, phase: Option<UiMessagePhase>) -> UiBlock {
     }
 }
 
-fn tool(id: &str, status: UiToolStatus, started_at: Option<u64>, finished_at: Option<u64>) -> UiTool {
+fn tool(
+    id: &str,
+    status: UiToolStatus,
+    started_at: Option<u64>,
+    finished_at: Option<u64>,
+) -> UiTool {
     UiTool {
         id: id.to_owned(),
         name: "shell_command".to_owned(),
@@ -234,7 +239,10 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
     );
     assert!(has_display_elision(&workspace, cx));
     let text = display_text(&workspace, cx);
-    assert!(text.contains("do work"), "user prompt should render: {text:?}");
+    assert!(
+        text.contains("do work"),
+        "user prompt should render: {text:?}"
+    );
     assert!(
         !text.contains("alpha"),
         "unknown-phase pending assistant should be elided: {text:?}"
@@ -250,7 +258,10 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
         agent(1),
         snapshot_frame(state(
             vec![user("do work")],
-            vec![assistant(&long_working_text(), Some(UiMessagePhase::FinalAnswer))],
+            vec![assistant(
+                &long_working_text(),
+                Some(UiMessagePhase::FinalAnswer),
+            )],
         )),
     );
     let text = display_text(&workspace, cx);
@@ -338,7 +349,7 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
     );
     let text = display_text(&workspace, cx);
     assert!(
-        text.contains("$ echo ok running"),
+        text.contains("$ echo ok …"),
         "running tool should render without a duration initially: {text:?}"
     );
 
@@ -353,7 +364,7 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
         .expect("tick timers");
     let text = display_text(&workspace, cx);
     assert!(
-        text.contains("$ echo ok running 5s"),
+        text.contains("$ echo ok … 5s"),
         "ticking should splice the duration in place: {text:?}"
     );
 
@@ -365,7 +376,7 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
         .expect("tick timers");
     let text = display_text(&workspace, cx);
     assert!(
-        text.contains("$ echo ok running 1m5s"),
+        text.contains("$ echo ok … 1m5s"),
         "ticking should replace the previous duration: {text:?}"
     );
 }
@@ -396,19 +407,25 @@ fn hidden_views_defer_rendering_until_selected(cx: &mut TestAppContext) {
         cx,
         agent(2),
         snapshot_frame(state(
-            vec![user("two"), assistant("done", Some(UiMessagePhase::FinalAnswer))],
+            vec![
+                user("two"),
+                assistant("done", Some(UiMessagePhase::FinalAnswer)),
+            ],
             Vec::new(),
         )),
     );
     let hidden_view = workspace
         .update(cx, |workspace, _, _| {
-            workspace.agent_view(&agent(2)).expect("agent 2 view exists")
+            workspace
+                .agent_view(&agent(2))
+                .expect("agent 2 view exists")
         })
         .expect("read workspace");
     let hidden_text = workspace
         .update(cx, |_, _, cx| {
             hidden_view.update(cx, |view, cx| {
-                view.editor().update(cx, |editor, cx| editor.display_text(cx))
+                view.editor()
+                    .update(cx, |editor, cx| editor.display_text(cx))
             })
         })
         .expect("read hidden view");
@@ -451,6 +468,80 @@ fn empty_prompt_shows_placeholder_and_gutter(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn previous_agent_frames_do_not_leave_intentional_draft(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("previous agent")], Vec::new())),
+    );
+    assert!(display_text(&workspace, cx).contains("previous agent"));
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.enter_draft(None, window, cx);
+        })
+        .expect("enter draft");
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("new draft", window, cx));
+        })
+        .expect("type draft");
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![
+                user("previous agent"),
+                assistant("background update", Some(UiMessagePhase::FinalAnswer)),
+            ],
+            Vec::new(),
+        )),
+    );
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("new draft"),
+        "incoming frames should keep the intentional draft focused: {text:?}"
+    );
+    assert!(
+        !text.contains("background update"),
+        "previous-agent updates should not become the active editor: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn editing_startup_draft_prevents_first_frame_auto_selection(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("startup draft", window, cx));
+        })
+        .expect("type startup draft");
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("background agent")], Vec::new())),
+    );
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("startup draft"),
+        "editing startup draft should make it intentional: {text:?}"
+    );
+    assert!(
+        !text.contains("background agent"),
+        "first background frame should not steal an edited startup draft: {text:?}"
+    );
+}
+
+#[gpui::test]
 fn system_notices_survive_transcript_rerenders(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
@@ -461,11 +552,7 @@ fn system_notices_survive_transcript_rerenders(cx: &mut TestAppContext) {
     );
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                ConnEvent::ServerError("boom".to_owned()),
-                window,
-                cx,
-            );
+            workspace.handle_event(ConnEvent::ServerError("boom".to_owned()), window, cx);
         })
         .expect("post notice");
     assert!(display_text(&workspace, cx).contains("[rho daemon error: boom]"));
@@ -477,7 +564,10 @@ fn system_notices_survive_transcript_rerenders(cx: &mut TestAppContext) {
         cx,
         agent(1),
         snapshot_frame(state(
-            vec![user("first"), assistant("answer", Some(UiMessagePhase::FinalAnswer))],
+            vec![
+                user("first"),
+                assistant("answer", Some(UiMessagePhase::FinalAnswer)),
+            ],
             Vec::new(),
         )),
     );

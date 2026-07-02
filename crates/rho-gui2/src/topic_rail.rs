@@ -32,7 +32,7 @@ pub fn render_topic_rail(
             colors.border_variant.opacity(0.6),
         )
     };
-    let selected_agent = registry.selected().cloned();
+    let selected_agent = registry.selected_agent().cloned();
     let live = registry.live_agents().cloned().collect::<BTreeSet<_>>();
 
     let mut visible_topics = registry
@@ -92,7 +92,12 @@ pub fn render_topic_rail(
             selected_color,
             cx,
         ))
-        .child(show_archived_row(show_archived, text_style, selected_color, cx))
+        .child(show_archived_row(
+            show_archived,
+            text_style,
+            selected_color,
+            cx,
+        ))
 }
 
 /// Flips the rail between active and archived views; archived items are
@@ -177,8 +182,7 @@ fn visible_agents(topic: &UiTopic, show_archived: bool) -> Vec<&UiAgentSummary> 
         .agents
         .iter()
         .filter(|summary| {
-            let hidden =
-                summary.status == Status::Archived || topic.status == Status::Archived;
+            let hidden = summary.status == Status::Archived || topic.status == Status::Archived;
             hidden == show_archived
         })
         .collect::<Vec<_>>();

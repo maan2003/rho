@@ -19,7 +19,7 @@ use theme::ActiveTheme as _;
 use crate::agent_view::AgentView;
 use crate::connection::{ConnEvent, Connection};
 use crate::draft_view::DraftView;
-use crate::registry::AgentRegistry;
+use crate::registry::{ActivePane, AgentRegistry};
 use crate::store::{AgentStore, FrameSummary};
 use crate::style::StyleClass;
 use crate::{
@@ -67,13 +67,8 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(
-        attach_target: AttachTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let (connection, events) =
-            crate::connection::spawn(attach_target.socket_path.clone(), cx);
+    pub fn new(attach_target: AttachTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (connection, events) = crate::connection::spawn(attach_target.socket_path.clone(), cx);
         let workspace = cx.entity().downgrade();
         let draft_view = cx.new(|cx| DraftView::new(workspace, window, cx));
         let event_task = cx.spawn(async move |this, cx| {
@@ -132,7 +127,7 @@ impl Workspace {
                 self.workdirs = workdirs;
                 self.default_topic_id = Some(default_topic_id);
                 self.connected = true;
-                if first_ready && self.registry.selected().is_none() {
+                if first_ready && matches!(self.registry.active_pane(), ActivePane::Startup) {
                     // The startup scaffold guessed before daemon data existed;
                     // refresh it now that workdir names and topics are known.
                     self.seed_draft(false, window, cx);
@@ -169,15 +164,16 @@ impl Workspace {
             ConnEvent::Frame { agent_id, frame } => {
                 let summary = self.store.apply(agent_id, frame);
                 self.registry.mark_live(agent_id);
-                if self.registry.selected().is_none() {
+                if matches!(self.registry.active_pane(), ActivePane::Startup) {
                     // First live agent: show it. Materialization renders the
                     // full state, so the per-frame sync below is unnecessary.
                     self.select_agent(Some(agent_id), window, cx);
-                } else if self.registry.selected() == Some(&agent_id) {
+                } else if self.registry.selected_agent() == Some(&agent_id) {
                     if let Some(view) = self.views.get(&agent_id).cloned()
-                        && let Some(state) = self.store.get(&agent_id) {
-                            view.update(cx, |view, cx| view.sync(state, summary, now_ms(), cx));
-                        }
+                        && let Some(state) = self.store.get(&agent_id)
+                    {
+                        view.update(cx, |view, cx| view.sync(state, summary, now_ms(), cx));
+                    }
                 } else if self.views.contains_key(&agent_id) {
                     self.pending_syncs
                         .entry(agent_id)
@@ -224,7 +220,7 @@ impl Workspace {
     }
 
     fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
-        match self.registry.selected().copied() {
+        match self.registry.selected_agent().copied() {
             Some(agent_id) => {
                 let Some(view) = self.views.get(&agent_id).cloned() else {
                     return;
@@ -286,11 +282,21 @@ impl Workspace {
             return;
         }
         if !self.connected {
-            self.notice_on(None, "not connected to rho-daemon", StyleClass::SystemImportant, cx);
+            self.notice_on(
+                None,
+                "not connected to rho-daemon",
+                StyleClass::SystemImportant,
+                cx,
+            );
             return;
         }
         let Some(topic_id) = self.draft_target_topic() else {
-            self.notice_on(None, "no rho topic is available", StyleClass::SystemInfo, cx);
+            self.notice_on(
+                None,
+                "no rho topic is available",
+                StyleClass::SystemInfo,
+                cx,
+            );
             return;
         };
         let field = self.draft_view.read(cx).workdir_text(cx).trim().to_owned();
@@ -336,9 +342,7 @@ impl Workspace {
                 return;
             }
         };
-        if !self.connected
-            && !matches!(command, Command::Quit | Command::Help | Command::Version)
-        {
+        if !self.connected && !matches!(command, Command::Quit | Command::Help | Command::Version) {
             self.notice_on(
                 source_agent.as_ref(),
                 "not connected to rho-daemon",
@@ -352,7 +356,7 @@ impl Workspace {
                 self.enter_draft(working_directory, window, cx);
             }
             Command::AgentCancel => {
-                let target = source_agent.or_else(|| self.registry.selected().cloned());
+                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
                 match target {
                     Some(agent_id) => {
                         self.connection.send(ClientMessage::CancelTurn { agent_id });
@@ -366,7 +370,7 @@ impl Workspace {
                 }
             }
             Command::AgentRename { name } => {
-                let target = source_agent.or_else(|| self.registry.selected().cloned());
+                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
                 match target {
                     Some(agent_id) => {
                         self.connection
@@ -387,12 +391,7 @@ impl Workspace {
                 self.toggle_agent_status(source_agent, rho_ui_proto::Status::Pinned, window, cx);
             }
             Command::AgentArchive => {
-                self.toggle_agent_status(
-                    source_agent,
-                    rho_ui_proto::Status::Archived,
-                    window,
-                    cx,
-                );
+                self.toggle_agent_status(source_agent, rho_ui_proto::Status::Archived, window, cx);
             }
             Command::TopicPin { name } => {
                 self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
@@ -401,7 +400,7 @@ impl Workspace {
                 self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Archived, cx);
             }
             Command::TopicMove { name } => {
-                let target = source_agent.or_else(|| self.registry.selected().copied());
+                let target = source_agent.or_else(|| self.registry.selected_agent().copied());
                 let Some(agent_id) = target else {
                     self.notice_on(
                         None,
@@ -443,12 +442,7 @@ impl Workspace {
                     }
                     None => {
                         let message = format!("no registered workdir `{path}`");
-                        self.notice_on(
-                            source_agent.as_ref(),
-                            &message,
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
+                        self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
                     }
                 }
             }
@@ -489,7 +483,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(selected) = self.registry.selected().copied()
+        if let Some(selected) = self.registry.selected_agent().copied()
             && let Some(topic_id) = self.registry.topic_of(selected)
         {
             self.draft_topic_id = Some(topic_id);
@@ -504,6 +498,13 @@ impl Workspace {
             None => self.seed_draft(false, window, cx),
         }
         self.select_agent(None, window, cx);
+    }
+
+    pub(crate) fn mark_draft_active_from_edit(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.registry.active_pane(), ActivePane::Startup) {
+            self.registry.enter_draft();
+            cx.notify();
+        }
     }
 
     pub fn toggle_show_archived(&mut self, cx: &mut Context<Self>) {
@@ -529,7 +530,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_id) = source_agent.or_else(|| self.registry.selected().copied()) else {
+        let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
+        else {
             self.notice_on(None, "no agent selected", StyleClass::SystemInfo, cx);
             return;
         };
@@ -537,7 +539,7 @@ impl Workspace {
         self.connection
             .send(ClientMessage::SetAgentStatus { agent_id, status });
         if status == rho_ui_proto::Status::Archived
-            && self.registry.selected() == Some(&agent_id)
+            && self.registry.selected_agent() == Some(&agent_id)
         {
             self.select_agent(None, window, cx);
         }
@@ -554,8 +556,7 @@ impl Workspace {
     ) {
         let topic_id = match &name {
             Some(name) => {
-                let Some(topic_id) = rho_commands::resolve_topic(name, &self.topic_labels())
-                else {
+                let Some(topic_id) = rho_commands::resolve_topic(name, &self.topic_labels()) else {
                     let message = format!("no topic named `{name}`");
                     self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
                     return;
@@ -564,17 +565,12 @@ impl Workspace {
             }
             None => {
                 let focused = source_agent
-                    .or_else(|| self.registry.selected().copied())
+                    .or_else(|| self.registry.selected_agent().copied())
                     .and_then(|agent_id| self.registry.topic_of(agent_id));
                 match focused.or(self.draft_topic_id).or(self.default_topic_id) {
                     Some(topic_id) => topic_id,
                     None => {
-                        self.notice_on(
-                            None,
-                            "no topic in focus",
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
+                        self.notice_on(None, "no topic in focus", StyleClass::SystemInfo, cx);
                         return;
                     }
                 }
@@ -595,7 +591,7 @@ impl Workspace {
     /// Tab in the draft jumps between the `Workdir:` header and the body;
     /// on agent views it does nothing (yet).
     fn cycle_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.registry.selected().is_none() {
+        if self.registry.selected_agent().is_none() {
             self.draft_view
                 .update(cx, |view, cx| view.toggle_field(window, cx));
         }
@@ -622,10 +618,9 @@ impl Workspace {
     }
 
     fn topic_archived(&self, topic_id: rho_ui_proto::TopicId) -> bool {
-        self.registry
-            .topics()
-            .iter()
-            .any(|topic| topic.topic_id == topic_id && topic.status == rho_ui_proto::Status::Archived)
+        self.registry.topics().iter().any(|topic| {
+            topic.topic_id == topic_id && topic.status == rho_ui_proto::Status::Archived
+        })
     }
 
     /// Where a new agent works when the draft doesn't say: the target
@@ -691,7 +686,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let view = agent_id
-            .or_else(|| self.registry.selected())
+            .or_else(|| self.registry.selected_agent())
             .and_then(|agent_id| self.views.get(agent_id))
             .cloned();
         match view {
@@ -712,7 +707,10 @@ impl Workspace {
             let view = self.materialize_view(agent_id, window, cx);
             view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         }
-        self.registry.select(agent_id);
+        match agent_id {
+            Some(agent_id) => self.registry.select_agent(agent_id),
+            None => self.registry.enter_draft(),
+        }
         self.focus_active_editor(window, cx);
         self.ensure_duration_timer(cx);
         cx.notify();
@@ -733,7 +731,7 @@ impl Workspace {
             );
             return;
         };
-        if self.registry.selected() == Some(&agent_id) {
+        if self.registry.selected_agent() == Some(&agent_id) {
             return;
         }
         self.select_agent(Some(agent_id), window, cx);
@@ -775,7 +773,7 @@ impl Workspace {
 
     pub(crate) fn active_agent_view(&self) -> Option<Entity<AgentView>> {
         self.registry
-            .selected()
+            .selected_agent()
             .and_then(|agent_id| self.views.get(agent_id))
             .cloned()
     }
@@ -834,9 +832,7 @@ impl Workspace {
         }
         self.duration_timer = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(1))
-                    .await;
+                cx.background_executor().timer(Duration::from_secs(1)).await;
                 let keep_going = this.update(cx, |this, cx| {
                     let Some(view) = this.active_agent_view() else {
                         return false;
@@ -853,7 +849,6 @@ impl Workspace {
             let _ = this.update(cx, |this, _| this.duration_timer = None);
         }));
     }
-
 }
 
 impl Render for Workspace {

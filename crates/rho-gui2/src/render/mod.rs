@@ -209,7 +209,7 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
 
 fn tool_status_label(status: UiToolStatus) -> &'static str {
     match status {
-        UiToolStatus::Running => "running",
+        UiToolStatus::Running => "…",
         UiToolStatus::Success => "ok",
         UiToolStatus::Error => "error",
         UiToolStatus::Cancelled => "cancelled",
@@ -340,7 +340,7 @@ mod tests {
         let timer = push_tool_spans(&mut spans, &running, 3_500);
         let timer = timer.expect("running tool with start time should have a timer");
         assert_eq!(spans[timer.span_index].text, "");
-        assert_eq!(text_of(&spans), "$ echo ok running\n");
+        assert_eq!(text_of(&spans), "$ echo ok …\n");
     }
 
     #[test]

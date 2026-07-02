@@ -16,11 +16,22 @@ pub enum AgentLife {
     Live,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActivePane {
+    /// Initial bootstrapping state: the draft surface is visible, but the
+    /// first live agent may claim the view once daemon frames arrive.
+    #[default]
+    Startup,
+    /// The user intentionally opened the new-agent compose surface.
+    Draft,
+    Agent(AgentId),
+}
+
 #[derive(Default)]
 pub struct AgentRegistry {
     agents: BTreeMap<AgentId, AgentLife>,
     topics: Vec<UiTopic>,
-    selected: Option<AgentId>,
+    active: ActivePane,
 }
 
 impl AgentRegistry {
@@ -96,12 +107,23 @@ impl AgentRegistry {
         self.agents.get(&agent_id) == Some(&AgentLife::Live)
     }
 
-    pub fn selected(&self) -> Option<&AgentId> {
-        self.selected.as_ref()
+    pub fn active_pane(&self) -> ActivePane {
+        self.active
     }
 
-    pub fn select(&mut self, agent_id: Option<AgentId>) {
-        self.selected = agent_id;
+    pub fn selected_agent(&self) -> Option<&AgentId> {
+        match &self.active {
+            ActivePane::Agent(agent_id) => Some(agent_id),
+            ActivePane::Startup | ActivePane::Draft => None,
+        }
+    }
+
+    pub fn select_agent(&mut self, agent_id: AgentId) {
+        self.active = ActivePane::Agent(agent_id);
+    }
+
+    pub fn enter_draft(&mut self) {
+        self.active = ActivePane::Draft;
     }
 
     /// Hidden from the rail: archived itself, or in an archived topic. Such
@@ -122,9 +144,7 @@ impl AgentRegistry {
         let live = self
             .agents
             .iter()
-            .filter(|(agent_id, life)| {
-                **life == AgentLife::Live && !self.agent_hidden(**agent_id)
-            })
+            .filter(|(agent_id, life)| **life == AgentLife::Live && !self.agent_hidden(**agent_id))
             .map(|(agent_id, _)| agent_id)
             .collect::<Vec<_>>();
         if live.is_empty() {
@@ -132,8 +152,7 @@ impl AgentRegistry {
         }
         let len = live.len() as isize;
         let index = self
-            .selected
-            .as_ref()
+            .selected_agent()
             .and_then(|selected| live.iter().position(|agent_id| *agent_id == selected))
             .map(|index| (index as isize + delta).rem_euclid(len) as usize)
             .unwrap_or_else(|| if delta < 0 { live.len() - 1 } else { 0 });
@@ -190,7 +209,7 @@ mod tests {
         }
 
         let visible = AgentId::from_str("agent-1").unwrap();
-        registry.select(Some(visible));
+        registry.select_agent(visible);
         // Both forward and backward cycling only ever land on the one
         // rail-visible agent.
         assert_eq!(registry.next_live_agent(1), Some(visible));

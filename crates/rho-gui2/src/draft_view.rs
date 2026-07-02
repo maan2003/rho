@@ -10,9 +10,7 @@
 use std::ops::Range;
 
 use editor::scroll::AutoscrollStrategy;
-use editor::{
-    Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior,
-};
+use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{Context, Entity, Subscription, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, Point};
@@ -30,6 +28,7 @@ const WORKDIR_LABEL_INLAY_ID: usize = 1;
 pub struct DraftGutter;
 
 pub struct DraftView {
+    workspace: WeakEntity<Workspace>,
     editor: Entity<Editor>,
     multi_buffer: Entity<MultiBuffer>,
     system_buffer: Entity<Buffer>,
@@ -37,6 +36,7 @@ pub struct DraftView {
     workdir_buffer: Entity<Buffer>,
     body_buffer: Entity<Buffer>,
     body_end: text::Anchor,
+    suppress_draft_activation: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -56,11 +56,7 @@ impl DraftView {
         let body_end = body_buffer.read(cx).anchor_after(0);
         let multi_buffer = cx.new(|cx| {
             let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
-            for (key, buffer) in [
-                (0, &system_buffer),
-                (1, &workdir_buffer),
-                (2, &body_buffer),
-            ] {
+            for (key, buffer) in [(0, &system_buffer), (1, &workdir_buffer), (2, &body_buffer)] {
                 multi_buffer.set_excerpts_for_path(
                     PathKey::sorted(key),
                     buffer.clone(),
@@ -88,19 +84,28 @@ impl DraftView {
                 editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
             }
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
-                workspace,
+                workspace.clone(),
                 Some(workdir_buffer.entity_id()),
             )));
             editor
         });
 
-        let subscriptions = vec![cx.subscribe(&body_buffer, |this, _, event, cx| {
-            if matches!(event, BufferEvent::Edited { .. }) {
-                this.update_body_chrome(cx);
-            }
-        })];
+        let subscriptions = vec![
+            cx.subscribe(&body_buffer, |this, _, event, cx| {
+                if matches!(event, BufferEvent::Edited { .. }) {
+                    this.note_draft_edit(cx);
+                    this.update_body_chrome(cx);
+                }
+            }),
+            cx.subscribe(&workdir_buffer, |this, _, event, cx| {
+                if matches!(event, BufferEvent::Edited { .. }) {
+                    this.note_draft_edit(cx);
+                }
+            }),
+        ];
 
         let mut this = Self {
+            workspace,
             editor,
             multi_buffer,
             system_buffer,
@@ -108,6 +113,7 @@ impl DraftView {
             workdir_buffer,
             body_buffer,
             body_end,
+            suppress_draft_activation: false,
             _subscriptions: subscriptions,
         };
         crate::banner::insert(&this.editor, &this.multi_buffer, cx);
@@ -129,10 +135,12 @@ impl DraftView {
     }
 
     pub fn set_workdir_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.suppress_draft_activation = true;
         self.workdir_buffer.update(cx, |buffer, cx| {
             let len = buffer.len();
             buffer.edit([(0..len, text)], None, cx);
         });
+        self.suppress_draft_activation = false;
     }
 
     /// The message body, without clearing it. Submissions read instead of
@@ -143,10 +151,12 @@ impl DraftView {
     }
 
     pub fn set_body_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.suppress_draft_activation = true;
         self.body_buffer.update(cx, |buffer, cx| {
             let len = buffer.len();
             buffer.edit([(0..len, text)], None, cx);
         });
+        self.suppress_draft_activation = false;
     }
 
     /// (Re)writes the workdir field with the given label. With an empty body
@@ -154,7 +164,13 @@ impl DraftView {
     /// typing composes the message immediately (Tab jumps into the field to
     /// change it). A non-empty body keeps its field unless `force` (an
     /// explicit choice, e.g. `:agent new <path>`) asks for the rewrite.
-    pub fn seed(&mut self, workdir: &str, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn seed(
+        &mut self,
+        workdir: &str,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.body_text(cx).trim().is_empty() {
             self.set_workdir_text(workdir, cx);
             self.focus_body(window, cx);
@@ -182,8 +198,8 @@ impl DraftView {
             .newest_anchor()
             .head()
             .to_offset(&snapshot);
-        let in_field = cursor >= field_start.to_offset(&snapshot)
-            && cursor <= field_end.to_offset(&snapshot);
+        let in_field =
+            cursor >= field_start.to_offset(&snapshot) && cursor <= field_end.to_offset(&snapshot);
         if in_field {
             self.focus_body(window, cx);
         } else {
@@ -343,5 +359,16 @@ impl DraftView {
             );
         });
         cx.notify();
+    }
+
+    fn note_draft_edit(&mut self, cx: &mut Context<Self>) {
+        if self.suppress_draft_activation {
+            return;
+        }
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.mark_draft_active_from_edit(cx);
+            });
+        }
     }
 }
