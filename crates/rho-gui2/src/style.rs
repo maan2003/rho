@@ -113,20 +113,6 @@ pub fn user_prompt_gutter_color(cx: &App) -> Hsla {
     cx.theme().colors().text_accent
 }
 
-pub fn role_chip_style(cx: &App) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(cx.theme().colors().terminal_ansi_magenta),
-        ..HighlightStyle::default()
-    }
-}
-
-pub fn muted_style(cx: &App) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(cx.theme().colors().text_muted),
-        ..HighlightStyle::default()
-    }
-}
-
 pub fn cwd_chip_style(cx: &App) -> HighlightStyle {
     HighlightStyle {
         color: Some(cx.theme().colors().terminal_foreground),

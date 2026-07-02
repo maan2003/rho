@@ -1,7 +1,5 @@
 //! End-to-end tests: synthetic protocol frames in, rendered editor state out.
 
-use std::str::FromStr as _;
-
 use editor::Editor;
 use editor::display_map::{Block, DisplayRow};
 use gpui::{App, Entity, Focusable as _, TestAppContext, WindowHandle};
@@ -49,7 +47,7 @@ fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
 }
 
 fn agent(id: u64) -> AgentId {
-    AgentId::from_str(&format!("agent-{id}")).expect("valid agent id")
+    AgentId::from_counter(id)
 }
 
 fn snapshot_frame(state: UiAgentState) -> AgentRemoteFrame {

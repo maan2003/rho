@@ -54,7 +54,11 @@ pub fn elision_plans_from(
         let has_non_working = turn
             .iter()
             .any(|block| !is_user(block) && !block_is_working(block));
-        let tail_rows = if has_non_working { 0 } else { LIMITED_TAIL_ROWS };
+        let tail_rows = if has_non_working {
+            0
+        } else {
+            LIMITED_TAIL_ROWS
+        };
 
         for (offset, block) in turn.iter().enumerate() {
             let index = turn_start + offset;
@@ -192,7 +196,11 @@ mod tests {
     fn streaming_final_answer_collapses_committed_commentary() {
         // The unsealed final answer is just the turn's last block; its
         // presence zeroes the turn's fold tail.
-        let blocks = vec![user("go"), commentary("working"), final_answer("final begins")];
+        let blocks = vec![
+            user("go"),
+            commentary("working"),
+            final_answer("final begins"),
+        ];
         let plans = elision_plans(&blocks, &all_visible(&blocks));
         assert_eq!(
             plans,
@@ -207,7 +215,11 @@ mod tests {
 
     #[test]
     fn all_working_turn_keeps_a_limited_tail() {
-        let blocks = vec![user("go"), commentary("working"), commentary("more working")];
+        let blocks = vec![
+            user("go"),
+            commentary("working"),
+            commentary("more working"),
+        ];
         let plans = elision_plans(&blocks, &all_visible(&blocks));
         assert_eq!(
             plans,

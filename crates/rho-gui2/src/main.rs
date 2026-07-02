@@ -145,8 +145,9 @@ fn load_or_create_settings(path: &Path) -> Result<String> {
                     format!("failed to create settings directory {}", parent.display())
                 })?;
             }
-            fs::write(path, DEFAULT_SETTINGS)
-                .with_context(|| format!("failed to write default settings to {}", path.display()))?;
+            fs::write(path, DEFAULT_SETTINGS).with_context(|| {
+                format!("failed to write default settings to {}", path.display())
+            })?;
             Ok(DEFAULT_SETTINGS.to_owned())
         }
         Err(error) => {

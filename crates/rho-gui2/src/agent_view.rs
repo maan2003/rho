@@ -96,9 +96,7 @@ impl AgentView {
             editor.disable_header_for_buffer(transcript_buffer.read(cx).remote_id(), cx);
             editor.disable_header_for_buffer(system_buffer.read(cx).remote_id(), cx);
             editor.disable_header_for_buffer(prompt_buffer.read(cx).remote_id(), cx);
-            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
-                workspace, None,
-            )));
+            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(workspace, None)));
             editor
         });
 
@@ -181,12 +179,7 @@ impl AgentView {
     }
 
     /// Appends a local system notice that survives transcript re-renders.
-    pub fn system_notice(
-        &mut self,
-        text: &str,
-        class: StyleClass,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn system_notice(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
         let range = self.system_buffer.update(cx, |buffer, cx| {
             let start = buffer.len();
             let mut line = text.to_owned();
@@ -233,18 +226,8 @@ impl AgentView {
         );
     }
 
-    pub fn set_status(
-        &mut self,
-        role: Option<&str>,
-        project_label: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let separator = style::muted_style(cx);
+    pub fn set_status(&mut self, project_label: &str, cx: &mut Context<Self>) {
         let mut spans = Vec::new();
-        if let Some(role) = role {
-            spans.push((role.to_owned(), style::role_chip_style(cx)));
-            spans.push((" ".to_owned(), separator));
-        }
         spans.push((project_label.to_owned(), style::cwd_chip_style(cx)));
         self.status_spans = spans;
         self.apply_status(cx);
@@ -311,7 +294,4 @@ impl AgentView {
         });
         cx.notify();
     }
-
-
-
 }

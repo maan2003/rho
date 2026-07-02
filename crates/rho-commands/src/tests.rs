@@ -74,11 +74,11 @@ fn parses_topic_move() {
 #[test]
 fn resolves_topics_by_label_or_id() {
     let topics = vec![
-        ("infra".to_owned(), TopicId::from_str("topic-2").unwrap()),
-        ("topic-1".to_owned(), TopicId::from_str("topic-1").unwrap()),
+        ("infra".to_owned(), TopicId::from_str("2").unwrap()),
+        ("1".to_owned(), TopicId::from_str("1").unwrap()),
     ];
     assert_eq!(resolve_topic("infra", &topics), Some(topics[0].1));
-    assert_eq!(resolve_topic("topic-2", &topics), Some(topics[0].1));
+    assert_eq!(resolve_topic("2", &topics), Some(topics[0].1));
     assert_eq!(resolve_topic("new-topic", &topics), None);
 }
 
@@ -164,7 +164,7 @@ fn completes_command_words_stepwise() {
 #[test]
 fn completes_arguments_from_context() {
     let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
-    let topics = vec!["infra".to_owned(), "topic-1".to_owned()];
+    let topics = vec!["infra".to_owned(), "1".to_owned()];
     let ctx = CompletionCtx {
         workdirs: &workdirs,
         topics: &topics,

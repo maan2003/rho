@@ -24,7 +24,11 @@ pub(crate) fn completion_candidates(
         .map(|candidate| {
             // The current token may carry the `:` prefix; the candidate
             // value replaces only the word after it.
-            let colon = if token.prefix.starts_with(':') { ":" } else { "" };
+            let colon = if token.prefix.starts_with(':') {
+                ":"
+            } else {
+                ""
+            };
             Candidate {
                 label: candidate.value.clone(),
                 description: candidate.description,

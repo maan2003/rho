@@ -228,7 +228,7 @@ fn render_topic_rows(
             let label = summary
                 .display_name
                 .clone()
-                .unwrap_or_else(|| summary.agent_id.to_string());
+                .unwrap_or_else(|| summary.agent_id.prefix_id().encoded());
             let selected = selected_agent == Some(agent_id);
             let is_live = live.contains(agent_id);
             let pinned = summary.status == Status::Pinned;

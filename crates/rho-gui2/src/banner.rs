@@ -55,7 +55,11 @@ fn startup_pun() -> &'static str {
     STARTUP_PUNS[nanos % STARTUP_PUNS.len()]
 }
 
-fn render_banner_block(version: &str, pun: &str, cx: &mut BlockContext<'_, '_>) -> impl IntoElement {
+fn render_banner_block(
+    version: &str,
+    pun: &str,
+    cx: &mut BlockContext<'_, '_>,
+) -> impl IntoElement {
     let colors = cx.theme().colors();
     let text_style = cx.editor_style.text.clone();
     div()

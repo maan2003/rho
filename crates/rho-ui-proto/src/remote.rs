@@ -210,7 +210,9 @@ pub enum UiAgentStatus {
     Idle,
     Streaming,
     ToolCalling,
-    UnfinishedTurn { outstanding_calls: usize },
+    UnfinishedTurn {
+        outstanding_calls: usize,
+    },
     /// The turn failed permanently; the error text is the trailing unsealed
     /// [`UiBlock::Notice`].
     Error,
@@ -708,7 +710,6 @@ fn diff_text(previous: &str, current: &str) -> UiTextDiff {
 mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
-    use std::str::FromStr as _;
 
     use rho_agent::{FailedInferenceResponse, ToolPreview};
     use rho_core::{
@@ -910,7 +911,7 @@ mod tests {
         let _ = encoder.encode(streaming_state("hel"));
         let frame = encoder.encode(streaming_state("hello"));
         let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent {
-            agent_id: crate::AgentId::from_str("agent-1").unwrap(),
+            agent_id: crate::AgentId::from_counter(1),
             frame,
         })
         .unwrap();
@@ -939,7 +940,7 @@ mod tests {
         assert_eq!(*status, Some(UiAgentStatus::Idle));
 
         let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent {
-            agent_id: crate::AgentId::from_str("agent-1").unwrap(),
+            agent_id: crate::AgentId::from_counter(1),
             frame: frame.clone(),
         })
         .unwrap();

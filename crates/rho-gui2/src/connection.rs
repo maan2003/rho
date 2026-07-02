@@ -26,7 +26,10 @@ pub enum ConnEvent {
     /// The daemon created an agent this connection asked for.
     AgentCreated(AgentId),
     AgentLoaded(AgentId),
-    Frame { agent_id: AgentId, frame: AgentRemoteFrame },
+    Frame {
+        agent_id: AgentId,
+        frame: AgentRemoteFrame,
+    },
     TurnCancelled(AgentId),
     ServerError(String),
     Disconnected(String),
@@ -123,13 +126,9 @@ async fn run(
                 default_topic_id,
             }),
             ServerMessage::TopicCreated { topic } => Some(ConnEvent::TopicCreated(topic)),
-            ServerMessage::AgentCreated { agent_id, .. } => {
-                Some(ConnEvent::AgentCreated(agent_id))
-            }
+            ServerMessage::AgentCreated { agent_id, .. } => Some(ConnEvent::AgentCreated(agent_id)),
             ServerMessage::AgentLoaded { agent_id } => Some(ConnEvent::AgentLoaded(agent_id)),
-            ServerMessage::Agent { agent_id, frame } => {
-                Some(ConnEvent::Frame { agent_id, frame })
-            }
+            ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame { agent_id, frame }),
             ServerMessage::TurnCancelled { agent_id } => Some(ConnEvent::TurnCancelled(agent_id)),
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
             ServerMessage::Pong => None,

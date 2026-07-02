@@ -19,9 +19,9 @@ use rho_cli_term_raw::{
 use rho_core::ToolOutputStatus;
 use rho_daemon::{DaemonArgs, default_socket_path};
 use rho_inference::{AuthArgs, run_auth_cli};
-use rho_ui_proto::{AgentId, IoCounters};
 use rho_ui_proto::client::{AgentClient, Client as UiClient};
 use rho_ui_proto::remote::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
+use rho_ui_proto::{AgentId, IoCounters};
 use tokio::task::JoinHandle;
 
 mod completion;
@@ -239,7 +239,8 @@ impl ChatApp {
                 let Some(working_directory) =
                     resolve_working_directory(working_directory, &workdir_table(&self.agent))
                 else {
-                    self.term.print_system("cannot determine a working directory");
+                    self.term
+                        .print_system("cannot determine a working directory");
                     return Ok(true);
                 };
                 self.term
@@ -252,7 +253,7 @@ impl ChatApp {
                     return Ok(true);
                 };
                 self.term
-                    .print_system(&format!("renamed {agent_id} to `{name}`"));
+                    .print_system(&format!("renamed {agent_id:?} to `{name}`"));
                 self.agent.rename_agent(agent_id, name);
             }
             rho_commands::Command::AgentPin => {
@@ -282,12 +283,13 @@ impl ChatApp {
                     None => rho_ui_proto::TopicTarget::Named(name.clone()),
                 };
                 self.term
-                    .print_system(&format!("moving {agent_id} to topic `{name}`"));
+                    .print_system(&format!("moving {agent_id:?} to topic `{name}`"));
                 self.agent.move_agent(agent_id, target);
             }
             rho_commands::Command::WorkdirAdd { path, name } => {
                 let Some(path) = resolve_working_directory(path, &[]) else {
-                    self.term.print_system("cannot determine a working directory");
+                    self.term
+                        .print_system("cannot determine a working directory");
                     return Ok(true);
                 };
                 self.term
@@ -341,7 +343,7 @@ impl ChatApp {
             .unwrap_or(rho_ui_proto::Status::Normal);
         let status = rho_commands::toggle_status(current, target);
         self.term
-            .print_system(&format!("{agent_id} is now {status:?}"));
+            .print_system(&format!("{agent_id:?} is now {status:?}"));
         self.agent.set_agent_status(agent_id, status);
     }
 
@@ -374,7 +376,7 @@ impl ChatApp {
             .unwrap_or(rho_ui_proto::Status::Normal);
         let status = rho_commands::toggle_status(current, target);
         self.term
-            .print_system(&format!("{topic_id} is now {status:?}"));
+            .print_system(&format!("{topic_id:?} is now {status:?}"));
         self.agent.set_topic_status(topic_id, status);
     }
 
@@ -909,8 +911,7 @@ impl StreamingRenderer {
             }
             UiBlock::Reasoning { .. } => {}
             UiBlock::Tool(tool) => {
-                let block =
-                    tool_call_block(&tool.name, &tool.arguments, tool_render_status(tool));
+                let block = tool_call_block(&tool.name, &tool.arguments, tool_render_status(tool));
                 self.set_index_block(index, "tool", block);
             }
             UiBlock::Notice { text } => {

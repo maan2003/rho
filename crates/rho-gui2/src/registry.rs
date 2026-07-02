@@ -177,7 +177,7 @@ mod tests {
 
     fn agent(id: u64, status: Status) -> UiAgentSummary {
         UiAgentSummary {
-            agent_id: AgentId::from_str(&format!("agent-{id}")).unwrap(),
+            agent_id: AgentId::from_counter(id),
             display_name: None,
             working_directory: "/tmp".into(),
             status,
@@ -186,8 +186,8 @@ mod tests {
 
     fn topic(id: u64, status: Status, agents: Vec<UiAgentSummary>) -> UiTopic {
         UiTopic {
-            topic_id: rho_ui_proto::TopicId::from_str(&format!("topic-{id}")).unwrap(),
-            name: format!("topic-{id}"),
+            topic_id: rho_ui_proto::TopicId::from_str(&id.to_string()).unwrap(),
+            name: id.to_string(),
             status,
             agents,
         }
@@ -205,16 +205,16 @@ mod tests {
             topic(2, Status::Archived, vec![agent(3, Status::Normal)]),
         ]);
         for id in 1..=3 {
-            registry.mark_live(AgentId::from_str(&format!("agent-{id}")).unwrap());
+            registry.mark_live(AgentId::from_counter(id));
         }
 
-        let visible = AgentId::from_str("agent-1").unwrap();
+        let visible = AgentId::from_counter(1);
         registry.select_agent(visible);
         // Both forward and backward cycling only ever land on the one
         // rail-visible agent.
         assert_eq!(registry.next_live_agent(1), Some(visible));
         assert_eq!(registry.next_live_agent(-1), Some(visible));
-        assert!(registry.agent_hidden(AgentId::from_str("agent-2").unwrap()));
-        assert!(registry.agent_hidden(AgentId::from_str("agent-3").unwrap()));
+        assert!(registry.agent_hidden(AgentId::from_counter(2)));
+        assert!(registry.agent_hidden(AgentId::from_counter(3)));
     }
 }

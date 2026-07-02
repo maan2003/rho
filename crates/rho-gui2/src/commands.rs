@@ -44,16 +44,13 @@ pub fn completions_for(
     } else {
         ""
     };
-    rho_commands::completion_candidates(
-        trimmed,
-        &rho_commands::CompletionCtx { workdirs, topics },
-    )
-    .into_iter()
-    .map(|candidate| Candidate {
-        value: format!("{colon}{}", candidate.value),
-        description: candidate.description,
-    })
-    .collect()
+    rho_commands::completion_candidates(trimmed, &rho_commands::CompletionCtx { workdirs, topics })
+        .into_iter()
+        .map(|candidate| Candidate {
+            value: format!("{colon}{}", candidate.value),
+            description: candidate.description,
+        })
+        .collect()
 }
 
 fn fuzzy_contains(value: &str, needle: &str) -> bool {
@@ -141,9 +138,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         let in_workdir_field = self.workdir_buffer == Some(buffer.entity_id());
         let buffer = buffer.read(cx);
         let cursor_offset = buffer_position.to_offset(buffer);
-        let text_before_cursor = buffer
-            .text_for_range(0..cursor_offset)
-            .collect::<String>();
+        let text_before_cursor = buffer.text_for_range(0..cursor_offset).collect::<String>();
         let replace_start = token_start(&text_before_cursor);
         let replace_range =
             buffer.anchor_before(replace_start)..buffer.anchor_before(cursor_offset);
@@ -153,28 +148,28 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             completions_for(&text_before_cursor, &workdirs, &live_agents, &topics)
         };
         let completions = candidates
-                .into_iter()
-                .map(|candidate| Completion {
-                    replace_range: replace_range.clone(),
-                    new_text: candidate.value.clone(),
-                    label: CodeLabel::plain(candidate.value, None),
-                    documentation: if candidate.description.is_empty() {
-                        None
-                    } else {
-                        Some(project::lsp_store::CompletionDocumentation::SingleLine(
-                            candidate.description.into(),
-                        ))
-                    },
-                    source: CompletionSource::Custom,
-                    icon_path: None,
-                    icon_color: None,
-                    match_start: None,
-                    snippet_deduplication_key: None,
-                    insert_text_mode: None,
-                    confirm: None,
-                    group: None,
-                })
-                .collect();
+            .into_iter()
+            .map(|candidate| Completion {
+                replace_range: replace_range.clone(),
+                new_text: candidate.value.clone(),
+                label: CodeLabel::plain(candidate.value, None),
+                documentation: if candidate.description.is_empty() {
+                    None
+                } else {
+                    Some(project::lsp_store::CompletionDocumentation::SingleLine(
+                        candidate.description.into(),
+                    ))
+                },
+                source: CompletionSource::Custom,
+                icon_path: None,
+                icon_color: None,
+                match_start: None,
+                snippet_deduplication_key: None,
+                insert_text_mode: None,
+                confirm: None,
+                group: None,
+            })
+            .collect();
 
         Task::ready(Ok(vec![CompletionResponse {
             completions,
@@ -225,7 +220,7 @@ mod tests {
 
     #[test]
     fn topic_move_completes_topics() {
-        let topics = vec!["infra".to_owned(), "topic-1".to_owned()];
+        let topics = vec!["infra".to_owned(), "1".to_owned()];
         let candidates = completions_for(":topic move in", &[], &[], &topics);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "infra");

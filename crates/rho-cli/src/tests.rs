@@ -344,9 +344,6 @@ fn streaming_text_response_finalizes_on_idle() {
     renderer.handle_state(&streaming_state(vec![assistant("done")]));
     assert_eq!(renderer.active_blocks.len(), 1);
 
-    renderer.handle_state(&agent_state(
-        vec![assistant("done")],
-        UiAgentStatus::Idle,
-    ));
+    renderer.handle_state(&agent_state(vec![assistant("done")], UiAgentStatus::Idle));
     assert!(renderer.active_blocks.is_empty());
 }

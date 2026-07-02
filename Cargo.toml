@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/json-stream",
+  "crates/prefix-id",
   "crates/rho-agent",
   "crates/rho-blocking-notify-channel",
   "crates/rho-cli",
@@ -54,6 +55,7 @@ rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
 rho-inference = { path = "crates/rho-inference" }
+prefix-id = { path = "crates/prefix-id" }
 rho-term-screen = { path = "crates/rho-term-screen" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }

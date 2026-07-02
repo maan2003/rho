@@ -11,9 +11,8 @@ use gpui::App;
 use language::{Language, LanguageConfig, LanguageMatcher, LanguageQueries, Rope};
 use theme::ActiveTheme as _;
 
-use crate::style::StyleClass;
-
 use super::Span;
+use crate::style::StyleClass;
 
 static MARKDOWN_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 static MARKDOWN_INLINE_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
@@ -76,7 +75,9 @@ fn markdown_language(cx: &App) -> Option<&'static Arc<Language>> {
                 Some(tree_sitter_md::LANGUAGE.into()),
             )
             .with_queries(LanguageQueries {
-                highlights: Some(Cow::from(include_str!("../grammars/markdown/highlights.scm"))),
+                highlights: Some(Cow::from(include_str!(
+                    "../grammars/markdown/highlights.scm"
+                ))),
                 ..LanguageQueries::default()
             })
             .ok()?;

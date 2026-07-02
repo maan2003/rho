@@ -1,9 +1,9 @@
 //! Raw redb schema for persisted agents.
 
-use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use prefix_id::{PrefixId, PrefixIdDomain};
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
@@ -51,11 +51,22 @@ impl CounterKey {
     Pack,
     Unpack,
 )]
-pub struct AgentId(u64);
+pub struct AgentId(PrefixId<AgentIdDomain>);
 
-impl fmt::Display for AgentId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "agent-{}", self.0)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentIdDomain;
+
+impl PrefixIdDomain for AgentIdDomain {
+    const HASH_DOMAIN: &'static str = "agent-id";
+}
+
+impl AgentId {
+    pub fn from_counter(counter: u64) -> Self {
+        Self(PrefixId::from_counter(counter).expect("agent id counter exceeds prefix-id capacity"))
+    }
+
+    pub fn prefix_id(&self) -> &PrefixId<AgentIdDomain> {
+        &self.0
     }
 }
 
@@ -76,12 +87,6 @@ impl fmt::Display for AgentId {
     Unpack,
 )]
 pub struct TopicId(u64);
-
-impl fmt::Display for TopicId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "topic-{}", self.0)
-    }
-}
 
 impl FromStr for TopicId {
     type Err = std::num::ParseIntError;
@@ -129,15 +134,6 @@ pub struct TopicAgentKey {
 impl TopicAgentKey {
     pub fn new(topic_id: TopicId, agent_id: AgentId) -> Self {
         Self { topic_id, agent_id }
-    }
-}
-
-impl FromStr for AgentId {
-    type Err = std::num::ParseIntError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.strip_prefix("agent-").unwrap_or(value);
-        value.parse().map(Self)
     }
 }
 
@@ -249,8 +245,8 @@ impl AgentReadTxnExt for ReadTxn {
     fn list_topic_agents(&self, topic_id: TopicId) -> Vec<AgentId> {
         self.open_table(TOPIC_AGENTS)
             .range(
-                TopicAgentKey::new(topic_id, AgentId(u64::MIN))
-                    ..=TopicAgentKey::new(topic_id, AgentId(u64::MAX)),
+                TopicAgentKey::new(topic_id, AgentId(PrefixId::MIN))
+                    ..=TopicAgentKey::new(topic_id, AgentId(PrefixId::MAX)),
             )
             .map(|(key, _)| key.value().agent_id)
             .collect()
@@ -389,7 +385,7 @@ impl AgentWriteTxnExt for WriteTxn {
         prompt_cache_key: PromptCacheKey,
         config: InferenceProtectedConfig,
     ) -> (AgentId, AgentEventPos) {
-        let agent_id = AgentId(next_counter(self, CounterKey::LAST_AGENT_ID));
+        let agent_id = AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID));
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
         let agent = AgentRecord {

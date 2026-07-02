@@ -759,9 +759,8 @@ impl Workspace {
                 view.sync(state, FrameSummary::everything(), now_ms(), cx);
             });
         }
-        let role = self.connected.then_some("rho");
         let label = self.working_directory_label(agent_id);
-        view.update(cx, |view, cx| view.set_status(role, &label, cx));
+        view.update(cx, |view, cx| view.set_status(&label, cx));
         self.views.insert(*agent_id, view.clone());
         view
     }
@@ -793,10 +792,9 @@ impl Workspace {
     }
 
     fn update_statuses(&self, cx: &mut Context<Self>) {
-        let role = self.connected.then_some("rho");
         for (agent_id, view) in &self.views {
             let label = self.working_directory_label(agent_id);
-            view.update(cx, |view, cx| view.set_status(role, &label, cx));
+            view.update(cx, |view, cx| view.set_status(&label, cx));
         }
     }
 
@@ -816,7 +814,7 @@ impl Workspace {
     pub fn live_agent_names(&self) -> Vec<String> {
         self.registry
             .live_agents()
-            .map(|agent_id| agent_id.to_string())
+            .map(|agent_id| agent_id.prefix_id().encoded())
             .collect()
     }
 

@@ -14,8 +14,8 @@ use rho_inference::config::InferenceConfig;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, ServerMessage, UiAgentSummary, UiTopic, UiWorkdir,
-    read_frame_counted, write_frame_counted,
+    ClientMessage, ServerMessage, UiAgentSummary, UiTopic, UiWorkdir, read_frame_counted,
+    write_frame_counted,
 };
 use tokio::sync::{Mutex, Notify, mpsc};
 
@@ -46,8 +46,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // The daemon's own cwd must never matter: agents each carry their own
     // working directory. Park the process somewhere empty and read-only so
     // any code still depending on process cwd fails loudly.
-    let _ = std::env::set_current_dir("/var/empty")
-        .or_else(|_| std::env::set_current_dir("/"));
+    let _ = std::env::set_current_dir("/var/empty").or_else(|_| std::env::set_current_dir("/"));
 
     let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
     if let Some(parent) = socket_path.parent() {
@@ -239,7 +238,7 @@ impl AgentRegistry {
     ) -> anyhow::Result<()> {
         let read = self.db.read();
         if !read.list_agents().into_iter().any(|(id, _)| id == agent_id) {
-            anyhow::bail!("unknown agent id: {agent_id}");
+            anyhow::bail!("unknown agent id: {agent_id:?}");
         }
         let topics = read.list_topics();
         drop(read);
@@ -247,7 +246,7 @@ impl AgentRegistry {
         let topic_id = match target {
             rho_ui_proto::TopicTarget::Existing(topic_id) => {
                 if !topics.iter().any(|(id, _)| *id == topic_id) {
-                    anyhow::bail!("unknown topic id: {topic_id}");
+                    anyhow::bail!("unknown topic id: {topic_id:?}");
                 }
                 topic_id
             }
@@ -272,7 +271,7 @@ impl AgentRegistry {
             .into_iter()
             .any(|(id, _)| id == agent_id)
         {
-            anyhow::bail!("unknown agent id: {agent_id}");
+            anyhow::bail!("unknown agent id: {agent_id:?}");
         }
         let mut write = self.db.write().await;
         write.set_agent_status(rho_core::UnixMs::now(), agent_id, status);
@@ -291,7 +290,7 @@ impl AgentRegistry {
             .into_iter()
             .any(|(id, _)| id == agent_id)
         {
-            anyhow::bail!("unknown agent id: {agent_id}");
+            anyhow::bail!("unknown agent id: {agent_id:?}");
         }
         let mut write = self.db.write().await;
         write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, name);
@@ -307,7 +306,7 @@ impl AgentRegistry {
             .into_iter()
             .any(|(id, _)| id == topic_id)
         {
-            anyhow::bail!("unknown topic id: {topic_id}");
+            anyhow::bail!("unknown topic id: {topic_id:?}");
         }
         // New agents land in the default topic; archiving it would hide them
         // as they are created.
@@ -327,7 +326,9 @@ impl AgentRegistry {
             None => path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
-                .ok_or_else(|| anyhow::anyhow!("workdir path has no basename: {}", path.display()))?,
+                .ok_or_else(|| {
+                    anyhow::anyhow!("workdir path has no basename: {}", path.display())
+                })?,
         };
         let path = path
             .to_str()
@@ -360,7 +361,7 @@ impl AgentRegistry {
             .into_iter()
             .any(|(id, _)| id == agent_id)
         {
-            anyhow::bail!("unknown agent id: {agent_id}");
+            anyhow::bail!("unknown agent id: {agent_id:?}");
         }
         let agent = Agent::load(self.db.clone(), self.auth.clone(), agent_id);
         self.agents.lock().await.insert(agent_id, agent.clone());
@@ -473,7 +474,7 @@ async fn serve_connection(
                     Some(agent) => agent,
                     None => {
                         let _ = outgoing_tx.send(ServerMessage::Error {
-                            message: format!("agent is not loaded: {agent_id}"),
+                            message: format!("agent is not loaded: {agent_id:?}"),
                         });
                         continue;
                     }

@@ -19,20 +19,20 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 use editor::Editor;
+use elisions::ElisionSync;
 use gpui::{Context, Entity};
 use language::Buffer;
 use multi_buffer::MultiBuffer;
 use project::InlayId;
 use rho_ui_proto::remote::UiAgentState;
 use text::{Anchor, ToOffset as _};
+use timers::TimerRecord;
 
 use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::render::elision::ElisionPlan;
 use crate::render::{BlockKind, RenderedBlock, render_block};
 use crate::store::FrameSummary;
 use crate::style::{Region, StyleClass};
-use elisions::ElisionSync;
-use timers::TimerRecord;
 
 pub struct TranscriptModel {
     buffer: Entity<Buffer>,
@@ -355,7 +355,11 @@ fn append_spans(
     buffer: &mut Buffer,
     cx: &mut Context<Buffer>,
     rendered: &RenderedBlock,
-) -> (Vec<Range<Anchor>>, Option<TimerRecord>, Option<Range<Anchor>>) {
+) -> (
+    Vec<Range<Anchor>>,
+    Option<TimerRecord>,
+    Option<Range<Anchor>>,
+) {
     let start = buffer.len();
     let text = rendered
         .spans
