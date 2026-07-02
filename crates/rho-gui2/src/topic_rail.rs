@@ -53,6 +53,7 @@ pub fn render_topic_rail(
                 agents,
                 selected_agent.as_ref(),
                 &live,
+                registry,
                 text_style,
                 selected_color,
                 cx,
@@ -195,6 +196,7 @@ fn render_topic_rows(
     agents: Vec<&UiAgentSummary>,
     selected_agent: Option<&AgentId>,
     live: &BTreeSet<AgentId>,
+    registry: &AgentRegistry,
     text_style: &TextStyle,
     selected_color: gpui::Hsla,
     cx: &mut Context<Workspace>,
@@ -228,7 +230,7 @@ fn render_topic_rows(
             let label = summary
                 .display_name
                 .clone()
-                .unwrap_or_else(|| summary.agent_id.prefix_id().encoded());
+                .unwrap_or_else(|| registry.agent_id_label(summary.agent_id));
             let selected = selected_agent == Some(agent_id);
             let is_live = live.contains(agent_id);
             let pinned = summary.status == Status::Pinned;

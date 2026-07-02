@@ -64,6 +64,28 @@ impl AgentRegistry {
     }
 
     /// The working directory of an agent, from topic summaries.
+    pub fn agent_id_label(&self, agent_id: AgentId) -> String {
+        let total_generated = self.rounded_total_generated_for(agent_id);
+        let prefix_id = agent_id.prefix_id();
+        let prefix_len = prefix_id.unique_prefix_len(total_generated).max(2);
+        let encoded = prefix_id.encoded();
+        format!("ag{}", &encoded[..prefix_len])
+    }
+
+    fn rounded_total_generated_for(&self, agent_id: AgentId) -> u64 {
+        let max_counter = self
+            .topics
+            .iter()
+            .flat_map(UiTopic::agent_ids)
+            .chain(self.agents.keys().copied())
+            .chain(std::iter::once(agent_id))
+            .map(|id| id.prefix_id().to_counter())
+            .max()
+            .unwrap_or(0);
+
+        (max_counter + 1).next_power_of_two()
+    }
+
     pub fn working_directory(&self, agent_id: AgentId) -> Option<&PathBuf> {
         self.agent_summary(agent_id)
             .map(|agent| &agent.working_directory)

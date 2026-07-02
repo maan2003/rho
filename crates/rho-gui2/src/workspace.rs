@@ -814,7 +814,7 @@ impl Workspace {
     pub fn live_agent_names(&self) -> Vec<String> {
         self.registry
             .live_agents()
-            .map(|agent_id| agent_id.prefix_id().encoded())
+            .map(|agent_id| self.registry.agent_id_label(*agent_id))
             .collect()
     }
 
