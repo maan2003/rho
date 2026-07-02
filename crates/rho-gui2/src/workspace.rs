@@ -528,6 +528,11 @@ impl Workspace {
         if let Some(resolved) = rho_commands::resolve_workdir(&argument, &self.workdir_table()) {
             return resolved.into();
         }
+        if argument == "~"
+            && let Some(home) = std::env::home_dir()
+        {
+            return home;
+        }
         if let Some(rest) = argument.strip_prefix("~/")
             && let Some(home) = std::env::home_dir()
         {

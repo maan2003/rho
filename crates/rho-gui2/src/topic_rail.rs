@@ -63,12 +63,6 @@ pub fn render_topic_rail(
         .text_size(text_style.font_size)
         .line_height(text_style.line_height)
         .text_color(text_style.color)
-        .child(new_agent_row(
-            selected_agent.is_none(),
-            text_style,
-            selected_color,
-            cx,
-        ))
         .child(
             div()
                 .id("rho-gui2-topic-list")
@@ -77,6 +71,14 @@ pub fn render_topic_rail(
                 .overflow_y_scroll()
                 .children(rows),
         )
+        // Pinned below the scrolling list, so it stays reachable no matter
+        // how many agents accumulate.
+        .child(new_agent_row(
+            selected_agent.is_none(),
+            text_style,
+            selected_color,
+            cx,
+        ))
 }
 
 fn new_agent_row(
@@ -96,7 +98,8 @@ fn new_agent_row(
         .items_center()
         .gap_1()
         .pl(px(4.))
-        .pt(px(2.))
+        .pt(px(4.))
+        .pb(px(2.))
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
