@@ -20,6 +20,7 @@ editor = { path = "../../../zed/crates/editor" }
 futures.workspace = true
 gpui = { path = "../../../zed/crates/gpui", default-features = false, features = ["wayland"] }
 gpui_platform = { path = "../../../zed/crates/gpui_platform", default-features = false, features = ["font-kit", "wayland"] }
+gpui_tokio = { path = "../../../zed/crates/gpui_tokio" }
 json-stream.workspace = true
 language = { path = "../../../zed/crates/language" }
 multi_buffer = { path = "../../../zed/crates/multi_buffer" }

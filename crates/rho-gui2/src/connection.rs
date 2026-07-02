@@ -1,13 +1,15 @@
-//! Daemon connection: a dedicated thread running a tokio reactor, bridged to
-//! the GUI through channels. Inbound server messages become [`ConnEvent`]s on
-//! a futures channel the workspace awaits (no polling); outbound commands are
-//! fire-and-forget.
+//! Daemon connection: an IO task on the shared tokio runtime ([`gpui_tokio`]),
+//! bridged to the GUI through channels. Inbound server messages become
+//! [`ConnEvent`]s on a futures channel the workspace awaits (no polling);
+//! outbound commands are fire-and-forget.
 
 use std::path::PathBuf;
 
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
+use gpui::{App, Task};
+use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{AgentId, ClientMessage, ServerMessage, UiTopic, read_frame, write_frame};
@@ -24,6 +26,9 @@ pub enum ConnEvent {
 
 pub struct Connection {
     commands: futures_mpsc::UnboundedSender<ClientMessage>,
+    /// Dropping this aborts the IO task, tearing the connection down with the
+    /// workspace.
+    _io_task: Task<Result<(), gpui_tokio::JoinError>>,
 }
 
 impl Connection {
@@ -32,29 +37,21 @@ impl Connection {
     }
 }
 
-pub fn spawn(socket_path: PathBuf) -> (Connection, futures_mpsc::UnboundedReceiver<ConnEvent>) {
+pub fn spawn(
+    socket_path: PathBuf,
+    cx: &App,
+) -> (Connection, futures_mpsc::UnboundedReceiver<ConnEvent>) {
     let (event_tx, event_rx) = futures_mpsc::unbounded();
     let (command_tx, command_rx) = futures_mpsc::unbounded();
-    std::thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = event_tx.unbounded_send(ConnEvent::Disconnected(format!(
-                    "failed to start async runtime: {error:#}"
-                )));
-                return;
-            }
-        };
-        if let Err(error) = runtime.block_on(run(socket_path, &event_tx, command_rx)) {
+    let io_task = Tokio::spawn(cx, async move {
+        if let Err(error) = run(socket_path, &event_tx, command_rx).await {
             let _ = event_tx.unbounded_send(ConnEvent::Disconnected(format!("{error:#}")));
         }
     });
     (
         Connection {
             commands: command_tx,
+            _io_task: io_task,
         },
         event_rx,
     )

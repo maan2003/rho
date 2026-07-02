@@ -18,6 +18,7 @@ use crate::connection::ConnEvent;
 use crate::workspace::{AttachTarget, Workspace};
 
 fn init_test_app(cx: &mut App) {
+    gpui_tokio::init(cx);
     assets::Assets.load_test_fonts(cx);
     let store = SettingsStore::new(cx, settings::default_settings().as_ref());
     cx.set_global(store);
@@ -550,5 +551,30 @@ fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
     assert!(
         !recollapsed.contains("alpha"),
         "z c should collapse the working elision again: {recollapsed:?}"
+    );
+}
+
+#[gpui::test]
+fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("hello rho", window, cx));
+        })
+        .expect("type into prompt");
+
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+
+    // Not connected, so the submission surfaces as a system notice — proving
+    // the action reached the workspace handler and the prompt was taken.
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("not connected to rho-daemon"),
+        "submit should reach the workspace and report the failed send: {text:?}"
+    );
+    assert!(
+        !text.contains("hello rho"),
+        "submit should clear the prompt draft: {text:?}"
     );
 }

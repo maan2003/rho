@@ -95,6 +95,7 @@ fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
 }
 
 fn init_app(cx: &mut App) -> Result<()> {
+    gpui_tokio::init(cx);
     assets::Assets.load_fonts(cx)?;
     let settings_path = settings_path()?;
     let user_settings = load_or_create_settings(&settings_path)?;

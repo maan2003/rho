@@ -20,7 +20,6 @@ use gpui::{Context, Entity, FontWeight, Subscription, WeakEntity, Window, div, p
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
-use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::UiAgentState;
 use theme::ActiveTheme as _;
 
@@ -30,9 +29,6 @@ use crate::store::FrameSummary;
 use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, Region, StyleClass};
 use crate::transcript::TranscriptModel;
 use crate::workspace::Workspace;
-use crate::{
-    AgentNew, AgentNext, AgentPrevious, RoleCycle, RoleCycleGroup, SubmitPrompt, TaskBoard,
-};
 
 const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
 
@@ -53,7 +49,6 @@ pub struct AgentView {
 
 impl AgentView {
     pub fn new(
-        agent_id: Option<AgentId>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -121,25 +116,15 @@ impl AgentView {
             editor.disable_header_for_buffer(system_buffer.read(cx).remote_id(), cx);
             editor.disable_header_for_buffer(prompt_buffer.read(cx).remote_id(), cx);
             editor.disable_expand_excerpt_buttons(cx);
-            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
-                workspace.clone(),
-            )));
+            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(workspace)));
             editor
         });
 
-        let mut subscriptions = Vec::new();
-        subscriptions.push(cx.subscribe(&prompt_buffer, |this, _, event, cx| {
+        let subscriptions = vec![cx.subscribe(&prompt_buffer, |this, _, event, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
                 this.update_prompt_chrome(cx);
             }
-        }));
-        subscriptions.extend(register_actions(
-            &editor,
-            agent_id,
-            cx.entity().downgrade(),
-            workspace,
-            cx,
-        ));
+        })];
 
         if let Some(draft_anchor) = multi_buffer
             .read(cx)
@@ -369,74 +354,6 @@ impl AgentView {
             );
         });
     }
-}
-
-fn register_actions(
-    editor: &Entity<Editor>,
-    agent_id: Option<AgentId>,
-    view: WeakEntity<AgentView>,
-    workspace: WeakEntity<Workspace>,
-    cx: &mut Context<AgentView>,
-) -> Vec<Subscription> {
-    let submit = editor.update(cx, |editor, _cx| {
-        let view = view.clone();
-        let workspace = workspace.clone();
-        editor.register_action(move |_: &SubmitPrompt, window, cx| {
-            let Some(view) = view.upgrade() else {
-                return;
-            };
-            let Some(text) = view.update(cx, |view, cx| view.take_prompt(cx)) else {
-                return;
-            };
-            let agent_id = agent_id;
-            let _ = workspace.update(cx, |workspace, cx| {
-                workspace.handle_submit(agent_id, text, window, cx);
-            });
-        })
-    });
-    vec![
-        submit,
-        workspace_action::<AgentPrevious>(editor, workspace.clone(), cx, |workspace, window, cx| {
-            workspace.switch_agent_by_delta(-1, window, cx);
-        }),
-        workspace_action::<AgentNext>(editor, workspace.clone(), cx, |workspace, window, cx| {
-            workspace.switch_agent_by_delta(1, window, cx);
-        }),
-        workspace_action::<AgentNew>(editor, workspace, cx, |workspace, window, cx| {
-            workspace.select_agent(None, window, cx);
-        }),
-        notice_action::<TaskBoard>(editor, view.clone(), "task board is not available yet", cx),
-        notice_action::<RoleCycle>(editor, view.clone(), "role cycling is not available yet", cx),
-        notice_action::<RoleCycleGroup>(editor, view, "role cycling is not available yet", cx),
-    ]
-}
-
-fn workspace_action<A: gpui::Action>(
-    editor: &Entity<Editor>,
-    workspace: WeakEntity<Workspace>,
-    cx: &mut Context<AgentView>,
-    handler: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
-) -> Subscription {
-    editor.update(cx, |editor, _cx| {
-        editor.register_action(move |_: &A, window, cx| {
-            let _ = workspace.update(cx, |workspace, cx| handler(workspace, window, cx));
-        })
-    })
-}
-
-fn notice_action<A: gpui::Action>(
-    editor: &Entity<Editor>,
-    view: WeakEntity<AgentView>,
-    text: &'static str,
-    cx: &mut Context<AgentView>,
-) -> Subscription {
-    editor.update(cx, |editor, _cx| {
-        editor.register_action(move |_: &A, _window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.system_notice(text, StyleClass::SystemInfo, cx);
-            });
-        })
-    })
 }
 
 const STARTUP_PUNS: &[&str] = &[

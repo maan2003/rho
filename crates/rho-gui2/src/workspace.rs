@@ -22,6 +22,9 @@ use crate::connection::{ConnEvent, Connection};
 use crate::registry::AgentRegistry;
 use crate::store::{AgentStore, FrameSummary};
 use crate::style::StyleClass;
+use crate::{
+    AgentNew, AgentNext, AgentPrevious, RoleCycle, RoleCycleGroup, SubmitPrompt, TaskBoard,
+};
 
 #[derive(Clone)]
 pub struct AttachTarget {
@@ -50,9 +53,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (connection, events) = crate::connection::spawn(attach_target.socket_path.clone());
+        let (connection, events) =
+            crate::connection::spawn(attach_target.socket_path.clone(), cx);
         let workspace = cx.entity().downgrade();
-        let draft_view = cx.new(|cx| AgentView::new(None, workspace, window, cx));
+        let draft_view = cx.new(|cx| AgentView::new(workspace, window, cx));
         let event_task = cx.spawn(async move |this, cx| {
             let mut events: UnboundedReceiver<ConnEvent> = events;
             while let Some(event) = events.next().await {
@@ -162,7 +166,18 @@ impl Workspace {
         }
     }
 
-    pub fn handle_submit(
+    fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .active_view()
+            .update(cx, |view, cx| view.take_prompt(cx))
+        else {
+            return;
+        };
+        let source_agent = self.registry.selected().copied();
+        self.handle_submit(source_agent, text, window, cx);
+    }
+
+    fn handle_submit(
         &mut self,
         source_agent: Option<AgentId>,
         text: String,
@@ -336,8 +351,7 @@ impl Workspace {
         // A freshly created view renders the full state below, which
         // subsumes any deferred summary.
         let workspace = cx.entity().downgrade();
-        let id = Some(*agent_id);
-        let view = cx.new(|cx| AgentView::new(id, workspace, window, cx));
+        let view = cx.new(|cx| AgentView::new(workspace, window, cx));
         if let Some(state) = self.store.get(agent_id) {
             view.update(cx, |view, cx| {
                 view.sync(state, FrameSummary::everything(), now_ms(), cx);
@@ -450,6 +464,40 @@ impl Render for Workspace {
             .p(px(2.))
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
+            .on_action(cx.listener(Self::submit_prompt))
+            .on_action(cx.listener(|this, _: &AgentPrevious, window, cx| {
+                this.switch_agent_by_delta(-1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AgentNext, window, cx| {
+                this.switch_agent_by_delta(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AgentNew, window, cx| {
+                this.select_agent(None, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
+                this.notice_on(
+                    None,
+                    "task board is not available yet",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &RoleCycle, _window, cx| {
+                this.notice_on(
+                    None,
+                    "role cycling is not available yet",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &RoleCycleGroup, _window, cx| {
+                this.notice_on(
+                    None,
+                    "role cycling is not available yet",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            }))
             .child(rail)
             .child(
                 div()

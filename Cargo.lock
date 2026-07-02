@@ -8823,6 +8823,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "gpui_tokio",
  "json-stream",
  "language",
  "multi_buffer",
