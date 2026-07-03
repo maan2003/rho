@@ -10,8 +10,9 @@ use std::fmt;
 use std::hash::Hasher;
 use std::marker::PhantomData;
 
+/// Shuffled so that consecutive digits do not encode to adjacent characters.
 const ALPHABET: &[u8; BASE as usize] =
-    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    b"o5JUmOcarzsHMRGSPkV6Cq7t0Ai4I8udWXxf13bNFv2ghjDQYTlZwBpy9enLKE";
 const BASE: u64 = 62;
 
 /// Fixed ID length.
@@ -60,13 +61,15 @@ impl<D: PrefixIdDomain> PrefixId<D> {
     pub fn encoded(&self) -> String {
         let mut bytes = [0; LEN];
         let mut remaining = self.counter;
+        let mut hasher = domain_hasher::<D>();
 
         for pos in 0..LEN {
             let digit = (remaining % BASE) as u8;
             remaining /= BASE;
 
-            let encoded = (digit + hash_prefix::<D>(&bytes[..pos])) % BASE as u8;
+            let encoded = (digit + prefix_shift(&hasher)) % BASE as u8;
             bytes[pos] = ALPHABET[encoded as usize];
+            hasher.write(&bytes[pos..=pos]);
         }
 
         String::from_utf8(bytes.to_vec()).expect("PrefixId contains only ASCII bytes")
@@ -121,20 +124,19 @@ impl<D: PrefixIdDomain> PrefixId<D> {
 
         let mut residue = 0u64;
         let mut place = 1u64;
-        let mut encoded_prefix = [0; LEN];
+        let mut hasher = domain_hasher::<D>();
 
-        for (pos, byte) in prefix.bytes().enumerate() {
+        for byte in prefix.bytes() {
             let encoded = ALPHABET
                 .iter()
                 .position(|candidate| *candidate == byte)
                 .ok_or(ParsePrefixIdError::InvalidCharacter(byte as char))?
                 as u8;
-            let digit =
-                (encoded + BASE as u8 - hash_prefix::<D>(&encoded_prefix[..pos])) % BASE as u8;
+            let digit = (encoded + BASE as u8 - prefix_shift(&hasher)) % BASE as u8;
 
             residue += digit as u64 * place;
-            encoded_prefix[pos] = byte;
             place *= BASE;
+            hasher.write(&[byte]);
         }
 
         let modulus = BASE.pow(prefix.len() as u32);
@@ -274,10 +276,15 @@ impl fmt::Display for ParsePrefixIdError {
 
 impl std::error::Error for ParsePrefixIdError {}
 
-fn hash_prefix<D: PrefixIdDomain>(prefix: &[u8]) -> u8 {
+/// A hasher fed the domain and then each emitted character, so the digit shift
+/// at each position depends on the characters before it.
+fn domain_hasher<D: PrefixIdDomain>() -> fnv::FnvHasher {
     let mut hasher = fnv::FnvHasher::default();
     hasher.write(D::HASH_DOMAIN.as_bytes());
-    hasher.write(prefix);
+    hasher
+}
+
+fn prefix_shift(hasher: &fnv::FnvHasher) -> u8 {
     (hasher.finish() % BASE) as u8
 }
 
@@ -321,6 +328,25 @@ mod tests {
                 PrefixResolution::Unique(id)
             );
         }
+    }
+
+    #[test]
+    fn consecutive_counters_do_not_look_sequential() {
+        const CANONICAL: &[u8; BASE as usize] =
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let canonical_index = |counter: u64| {
+            let first = Id::from_counter(counter).unwrap().encoded().into_bytes()[0];
+            CANONICAL.iter().position(|byte| *byte == first).unwrap()
+        };
+
+        let adjacent = (0..100)
+            .filter(|counter| {
+                (canonical_index(counter + 1) + BASE as usize - canonical_index(*counter))
+                    % BASE as usize
+                    == 1
+            })
+            .count();
+        assert!(adjacent < 10, "first characters walk the alphabet");
     }
 
     #[test]
