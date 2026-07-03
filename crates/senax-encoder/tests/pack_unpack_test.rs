@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bytes::{BufMut, BytesMut};
 use senax_encoder::{
-    Decode, Decoder, Encode, Encoder, Pack, Packer, Unpack, Unpacker, encode, pack, unpack,
+    encode, pack, unpack, Decode, Decoder, Encode, Encoder, Pack, Packer, Unpack, Unpacker,
 };
 
 #[derive(Encode, Decode, Pack, Unpack, PartialEq, Debug)]
@@ -257,7 +257,8 @@ fn test_enum_field_order_dependency() {
     // This should fail or produce incorrect results because field order matters
     if let Ok(unpacked) = result {
         let EnumB::Named { first, .. } = unpacked;
-        assert_ne!(first, 42); // Field order mismatch should cause incorrect values
+        assert_ne!(first, 42); // Field order mismatch should cause incorrect
+                               // values
     }
 }
 

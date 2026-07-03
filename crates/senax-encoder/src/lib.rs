@@ -186,7 +186,7 @@ pub enum EnumDecodeError {
 /// # Example
 /// ```rust
 /// use bytes::BytesMut;
-/// use senax_encoder::{Decode, Encode, decode, encode};
+/// use senax_encoder::{decode, encode, Decode, Encode};
 ///
 /// #[derive(Encode, Decode, PartialEq, Debug)]
 /// struct MyStruct {
@@ -216,7 +216,7 @@ pub fn decode<T: Decoder>(reader: &mut impl Buf) -> Result<T> {
 /// # Example
 /// ```rust
 /// use bytes::BytesMut;
-/// use senax_encoder::{Decode, Encode, decode, encode};
+/// use senax_encoder::{decode, encode, Decode, Encode};
 ///
 /// #[derive(Encode, Decode, PartialEq, Debug)]
 /// struct MyStruct {
@@ -249,7 +249,7 @@ pub fn encode<T: Encoder>(value: &T) -> Result<Bytes> {
 /// # Example
 /// ```rust
 /// use bytes::{Bytes, BytesMut};
-/// use senax_encoder::{Decode, Encode, decode, encode_to};
+/// use senax_encoder::{decode, encode_to, Decode, Encode};
 ///
 /// #[derive(Encode, Decode, PartialEq, Debug)]
 /// struct MyStruct {
@@ -364,7 +364,7 @@ pub trait Unpacker: Sized {
 /// # Example
 /// ```rust
 /// use bytes::BytesMut;
-/// use senax_encoder::{Pack, Unpack, pack, unpack};
+/// use senax_encoder::{pack, unpack, Pack, Unpack};
 ///
 /// #[derive(Pack, Unpack, PartialEq, Debug)]
 /// struct MyStruct {
@@ -397,7 +397,7 @@ pub fn pack<T: Packer>(value: &T) -> Result<Bytes> {
 /// # Example
 /// ```rust
 /// use bytes::{Bytes, BytesMut};
-/// use senax_encoder::{Pack, Unpack, pack_to, unpack};
+/// use senax_encoder::{pack_to, unpack, Pack, Unpack};
 ///
 /// #[derive(Pack, Unpack, PartialEq, Debug)]
 /// struct MyStruct {
@@ -429,7 +429,7 @@ pub fn pack_to<T: Packer>(value: &T, writer: &mut BytesMut) -> Result<()> {
 /// # Example
 /// ```rust
 /// use bytes::BytesMut;
-/// use senax_encoder::{Pack, Unpack, pack, unpack};
+/// use senax_encoder::{pack, unpack, Pack, Unpack};
 ///
 /// #[derive(Pack, Unpack, PartialEq, Debug)]
 /// struct MyStruct {

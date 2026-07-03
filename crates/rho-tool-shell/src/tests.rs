@@ -3,10 +3,7 @@ use rho_core::{ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
 use super::*;
 
 fn test_tools(timeout_secs: u64) -> ShellTools {
-    ShellTools::new(
-        Duration::from_secs(timeout_secs),
-        std::env::temp_dir(),
-    )
+    ShellTools::new(Duration::from_secs(timeout_secs), std::env::temp_dir())
 }
 
 fn shell_call(arguments: serde_json::Value) -> ToolCall {
@@ -142,9 +139,7 @@ async fn apply_patch_custom_tool_applies_patch() {
         "*** Begin Patch\n*** Add File: {}\n+hello\n*** End Patch",
         path.display()
     );
-    let result = test_tools(2)
-        .call(patch_call(patch))
-        .await;
+    let result = test_tools(2).call(patch_call(patch)).await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
     assert!(result.output.as_ref().contains("A "));

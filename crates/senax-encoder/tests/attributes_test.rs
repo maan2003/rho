@@ -1,9 +1,9 @@
-use bytes::BytesMut;
-use senax_encoder::Decoder;
-use senax_encoder::Encoder;
-use senax_encoder_derive::{Decode, Encode};
 #[allow(unused_imports)]
 use std::collections::HashMap;
+
+use bytes::BytesMut;
+use senax_encoder::{Decoder, Encoder};
+use senax_encoder_derive::{Decode, Encode};
 
 // =============================================================================
 // Basic attribute feature tests
@@ -51,7 +51,8 @@ fn test_default_attribute_backward_compatibility() {
     assert_eq!(extended.old_field, 42);
     assert_eq!(extended.another_field, "hello");
     assert_eq!(extended.new_field, 0); // Default::default() for i32
-    assert_eq!(extended.new_optional_field, None); // Default::default() for Option<String>
+    assert_eq!(extended.new_optional_field, None); // Default::default() for
+                                                   // Option<String>
 }
 
 #[test]
@@ -504,7 +505,8 @@ fn test_rename_attribute_compatibility() {
 fn test_rename_with_explicit_id() {
     // Test that explicit ID takes precedence over rename-based ID calculation
 
-    // Create a struct that would have a different ID if CRC32("different_name") was used
+    // Create a struct that would have a different ID if CRC32("different_name") was
+    // used
     #[derive(Encode, Decode, Debug, PartialEq)]
     struct DifferentNameStruct {
         #[senax(id = 1)] // Same explicit ID as CompatibleWithOldName
@@ -647,7 +649,8 @@ fn test_rename_only_behavior() {
         other_field: String,
     }
 
-    // Simulate the original struct that had "original_field" as the actual field name
+    // Simulate the original struct that had "original_field" as the actual field
+    // name
     #[derive(Encode, Decode, Debug, PartialEq)]
     struct OriginalFieldStruct {
         original_field: i32, // CRC32("original_field") ID - same as rename calculation

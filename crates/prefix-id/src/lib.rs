@@ -15,11 +15,11 @@
 //!   order) is a stable but meaningless storage order — order by creation
 //!   timestamps instead.
 //! - **Cross-machine uniqueness**: every character is scrambled keyed by the
-//!   domain's machine seed, so IDs from machines with different seeds
-//!   collide with probability ~`36^-12` per ID pair, and nothing about an ID
-//!   is readable or linkable by outsiders. Resolution self-scopes: a foreign
-//!   full ID decodes under the wrong seed to a pseudorandom counter, which
-//!   almost surely exceeds `total_generated` and resolves to `NotFound`.
+//!   domain's machine seed, so IDs from machines with different seeds collide
+//!   with probability ~`36^-12` per ID pair, and nothing about an ID is
+//!   readable or linkable by outsiders. Resolution self-scopes: a foreign full
+//!   ID decodes under the wrong seed to a pseudorandom counter, which almost
+//!   surely exceeds `total_generated` and resolves to `NotFound`.
 //! - **Domain separation**: encoding is keyed by [`PrefixIdDomain::KIND`], so
 //!   the same counter encodes differently across ID families.
 //! - **Stateless**: counter and ID convert in both directions with no lookup
@@ -477,8 +477,7 @@ mod tests {
         let test_cycle = first_char_cycle(&TestDomain);
         let other_cycle = first_char_cycle(&OtherDomain);
         let is_rotation = (0..BASE as usize).any(|offset| {
-            (0..BASE as usize)
-                .all(|i| test_cycle[i] == other_cycle[(i + offset) % BASE as usize])
+            (0..BASE as usize).all(|i| test_cycle[i] == other_cycle[(i + offset) % BASE as usize])
         });
         assert!(!is_rotation, "domains share a first-character order");
     }

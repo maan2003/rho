@@ -152,8 +152,9 @@ fn test_f64_extreme_values() {
 #[cfg(feature = "rust_decimal")]
 #[test]
 fn test_decimal_scientific_notation_format() {
-    use rust_decimal::Decimal;
     use std::str::FromStr;
+
+    use rust_decimal::Decimal;
 
     // Test that Decimal is encoded as scientific notation string
     let value = Decimal::from_str("123.456").unwrap();
@@ -177,8 +178,9 @@ fn test_decimal_scientific_notation_format() {
 #[cfg(feature = "rust_decimal")]
 #[test]
 fn test_decimal_backward_compatibility() {
-    use rust_decimal::Decimal;
     use std::str::FromStr;
+
+    use rust_decimal::Decimal;
 
     let value = Decimal::from_str("123.456").unwrap();
 

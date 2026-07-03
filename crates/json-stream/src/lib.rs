@@ -38,10 +38,12 @@ enum ObjectStatus {
     },
     // A nested object/array being parsed inside an array
     ArrayValueNested,
-    // We just started a property, likely because we just received an opening brace or a comma in case of an existing object.
+    // We just started a property, likely because we just received an opening brace or a comma in
+    // case of an existing object.
     StartProperty,
-    // We are in the beginning of a key, likely because we just received a quote. We need to store the key_so_far because
-    // unlike the value, we cannot add the key to the object until it is complete.
+    // We are in the beginning of a key, likely because we just received a quote. We need to store
+    // the key_so_far because unlike the value, we cannot add the key to the object until it
+    // is complete.
     KeyQuoteOpen {
         key_so_far: Vec<char>,
     },
@@ -56,7 +58,8 @@ enum ObjectStatus {
     // We are in the beginning of a value, likely because we just received a quote.
     ValueQuoteOpen {
         key: Vec<char>,
-        // We don't need to store the valueSoFar because we can add the value to the object immediately.
+        // We don't need to store the valueSoFar because we can add the value to the object
+        // immediately.
     },
     ValueQuoteClose,
 
@@ -76,8 +79,9 @@ enum ObjectStatus {
     Closed,
 }
 
-// this function takes and existing object that we are building along with a single character as we as an address
-// to the current position in the object that we are in and returns the object with that character added along with
+// this function takes and existing object that we are building along with a
+// single character as we as an address to the current position in the object
+// that we are in and returns the object with that character added along with
 // the new address.
 fn process_char(
     object: &mut Value,
@@ -886,8 +890,9 @@ param_test! {
 
 #[cfg(test)]
 mod array_tests {
-    use super::{parse_stream, JsonStreamParser};
     use serde_json::json;
+
+    use super::{parse_stream, JsonStreamParser};
 
     #[test]
     fn empty_array() {

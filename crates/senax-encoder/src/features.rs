@@ -755,7 +755,7 @@ impl Unpacker for Uuid {
 impl Encoder for Ulid {
     fn encode(&self, writer: &mut BytesMut) -> Result<()> {
         writer.put_u8(TAG_UUID); // Use same tag as UUID
-        // Write ULID as u128 little-endian in fixed 16 bytes
+                                 // Write ULID as u128 little-endian in fixed 16 bytes
         let ulid_u128 = self.0;
         writer.put_u128_le(ulid_u128);
         Ok(())
@@ -772,7 +772,7 @@ impl Packer for Ulid {
             writer.put_u8(TAG_NONE);
         } else {
             writer.put_u8(TAG_UUID); // Use same tag as UUID
-            // Write ULID as u128 little-endian in fixed 16 bytes
+                                     // Write ULID as u128 little-endian in fixed 16 bytes
             let ulid_u128 = self.0;
             writer.put_u128_le(ulid_u128);
         }

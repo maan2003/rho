@@ -1,3 +1,8 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+#[cfg(any(feature = "rust_decimal", feature = "uuid"))]
+use std::str::FromStr;
+use std::sync::Arc;
+
 use bytes::{Bytes, BytesMut};
 #[cfg(feature = "chrono")]
 use chrono::{DateTime, Local, NaiveDate, NaiveTime, Utc};
@@ -5,15 +10,10 @@ use chrono::{DateTime, Local, NaiveDate, NaiveTime, Utc};
 use indexmap::{IndexMap, IndexSet};
 #[cfg(feature = "rust_decimal")]
 use rust_decimal::Decimal;
-use senax_encoder::Decoder;
-use senax_encoder::Encoder;
+use senax_encoder::{Decoder, Encoder};
 use senax_encoder_derive::{Decode, Encode};
 #[cfg(feature = "serde_json")]
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-#[cfg(any(feature = "rust_decimal", feature = "uuid"))]
-use std::str::FromStr;
-use std::sync::Arc;
 #[cfg(feature = "ulid")]
 use ulid::Ulid;
 #[cfg(feature = "uuid")]
@@ -288,7 +288,8 @@ fn test_optional_field_with_custom_id() {
     let mut buffer_without = BytesMut::new();
     without_optional.encode(&mut buffer_without).unwrap();
 
-    // Compare buffer sizes (None case should be smaller as neither field ID nor value is written)
+    // Compare buffer sizes (None case should be smaller as neither field ID nor
+    // value is written)
     assert!(buffer_with.len() > buffer_without.len());
 
     // Deserialize
@@ -1258,7 +1259,8 @@ fn test_decimal_encode() {
         Decimal::new(-67890, 3),                                              // -67.890
         Decimal::from_str("3.14159").unwrap(),                                // π approximation
         Decimal::from_str("999999999999999999999999999.999999999").unwrap(),  // Large value
-        Decimal::from_str("-999999999999999999999999999.999999999").unwrap(), // Large negative value
+        Decimal::from_str("-999999999999999999999999999.999999999").unwrap(), /* Large negative
+                                                                               * value */
     ];
 
     for &original in &test_values {
@@ -1646,7 +1648,8 @@ fn test_uuid_ulid_compatibility() {
     let uuid = Uuid::from_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
     let ulid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
 
-    // Encode UUID as bytes and then decode as ULID (should not error, binary compatible)
+    // Encode UUID as bytes and then decode as ULID (should not error, binary
+    // compatible)
     let mut buffer_uuid = BytesMut::new();
     uuid.encode(&mut buffer_uuid).unwrap();
     let mut reader_uuid = buffer_uuid.freeze();
@@ -2057,8 +2060,8 @@ fn test_skip_default_attribute() {
     let decoded2 = TestSkipDefault::decode(&mut reader2).unwrap();
     assert_eq!(test_non_default, decoded2);
 
-    // Buffer with default values should be smaller than buffer with non-default values
-    // (since default fields are skipped)
+    // Buffer with default values should be smaller than buffer with non-default
+    // values (since default fields are skipped)
     assert!(buffer1_len < buffer2_len);
 }
 
@@ -2406,8 +2409,8 @@ fn test_enum_field_skip_default() {
     let decoded2 = TestEnumSkipDefault::decode(&mut reader2).unwrap();
     assert_eq!(test_non_default, decoded2);
 
-    // Buffer with default values should be smaller than buffer with non-default values
-    // (since default fields are skipped)
+    // Buffer with default values should be smaller than buffer with non-default
+    // values (since default fields are skipped)
     assert!(buffer1_len < buffer2_len);
 }
 
@@ -2651,8 +2654,9 @@ fn test_smolstr_in_struct() {
 #[cfg(feature = "smol_str")]
 #[test]
 fn test_smolstr_in_collections() {
-    use smol_str::SmolStr;
     use std::collections::HashMap;
+
+    use smol_str::SmolStr;
 
     // Test Vec<SmolStr>
     let smolstr_vec = vec![
@@ -2835,7 +2839,8 @@ fn test_box_is_default_behavior() {
 
 #[test]
 fn test_box_vs_arc_compatibility() {
-    // Test that Box<T> and Arc<T> encode the same way (since they both encode the inner value)
+    // Test that Box<T> and Arc<T> encode the same way (since they both encode the
+    // inner value)
     let box_value = Box::new("test".to_string());
     let arc_value = Arc::new("test".to_string());
 

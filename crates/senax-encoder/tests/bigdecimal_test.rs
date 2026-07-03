@@ -1,8 +1,9 @@
 #![cfg(feature = "bigdecimal")]
 
+use std::str::FromStr;
+
 use bigdecimal::BigDecimal;
 use senax_encoder::{decode, encode, pack, unpack, Encoder};
-use std::str::FromStr;
 
 #[test]
 fn test_bigdecimal_encode_decode() {
