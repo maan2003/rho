@@ -1,4 +1,4 @@
-//! rho-gui2: a native GUI attached to a running rho daemon.
+//! rho-gui: a native GUI attached to a running rho daemon.
 
 mod agent_view;
 mod banner;
@@ -44,7 +44,7 @@ actions!(
 
 #[derive(Parser)]
 #[command(
-    name = "rho-gui2",
+    name = "rho-gui",
     about = "Attach a native GUI to a running Rho daemon"
 )]
 struct Args {
@@ -55,7 +55,7 @@ struct Args {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("rho-gui2: {error:#}");
+        eprintln!("rho-gui: {error:#}");
         std::process::exit(1);
     }
 }
@@ -67,7 +67,7 @@ fn run() -> Result<()> {
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
             if let Err(error) = init_app(cx) {
-                eprintln!("rho-gui2: {error:#}");
+                eprintln!("rho-gui: {error:#}");
                 cx.quit();
                 return;
             }
@@ -77,7 +77,7 @@ fn run() -> Result<()> {
             if let Err(error) = cx.open_window(WindowOptions::default(), move |window, cx| {
                 cx.new(|cx| Workspace::new(attach_target.clone(), window, cx))
             }) {
-                eprintln!("rho-gui2: failed to open window: {error:#}");
+                eprintln!("rho-gui: failed to open window: {error:#}");
                 cx.quit();
             }
         });

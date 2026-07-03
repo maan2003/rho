@@ -8319,7 +8319,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-gui2"
+name = "rho-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",

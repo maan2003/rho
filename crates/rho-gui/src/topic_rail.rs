@@ -62,7 +62,7 @@ pub fn render_topic_rail(
         .collect::<Vec<_>>();
 
     div()
-        .id("rho-gui2-topic-rail")
+        .id("rho-gui-topic-rail")
         .h_full()
         .w(px(224.))
         .flex_none()
@@ -79,7 +79,7 @@ pub fn render_topic_rail(
         .text_color(text_style.color)
         .child(
             div()
-                .id("rho-gui2-topic-list")
+                .id("rho-gui-topic-list")
                 .w_full()
                 .flex_grow(1.0)
                 .overflow_y_scroll()

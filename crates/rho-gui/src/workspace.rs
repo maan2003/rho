@@ -476,7 +476,7 @@ impl Workspace {
             Command::Clear => {
                 self.notice_on(
                     source_agent.as_ref(),
-                    ":clear is not available in rho-gui2",
+                    ":clear is not available in rho-gui",
                     StyleClass::SystemInfo,
                     cx,
                 );
@@ -873,7 +873,7 @@ impl Render for Workspace {
             cx,
         );
         div()
-            .id("rho-gui2")
+            .id("rho-gui")
             .size_full()
             .flex()
             .flex_row()
@@ -907,7 +907,7 @@ impl Render for Workspace {
             .child(rail)
             .child(
                 div()
-                    .id("rho-gui2-editor")
+                    .id("rho-gui-editor")
                     .h_full()
                     .flex_grow(1.0)
                     .min_w_0()
