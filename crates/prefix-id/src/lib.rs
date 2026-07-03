@@ -8,12 +8,12 @@
 //!   first `k` characters (36 IDs by 1 character, ~1.3k by 2, ~47k by 3).
 //!   Prefixes are not stored in the ID; [`PrefixId::from_prefix`] resolves one
 //!   arithmetically against the first `total_generated` IDs.
-//! - **No visible ordering**: each digit is shifted by a hash of the preceding
-//!   characters and scrambled through exponentiation in `GF(37)`, so
-//!   consecutive counters produce unrelated-looking IDs. The mapping is still
-//!   deterministic — the first character cycles through a fixed (scrambled)
-//!   order with period 36, which is unavoidable given the prefix-uniqueness
-//!   guarantee.
+//! - **No visible ordering**: each digit passes through a pseudorandom
+//!   permutation seeded by a hash of the preceding characters, so consecutive
+//!   counters produce unrelated-looking IDs. The mapping is still
+//!   deterministic — the first character cycles through a fixed,
+//!   domain-specific order with period 36, which is unavoidable given the
+//!   prefix-uniqueness guarantee.
 //! - **Domain separation**: encoding is keyed by [`PrefixIdDomain`], so the
 //!   same counter encodes differently across ID families.
 //! - **Stateless**: counter and ID convert in both directions with no lookup
@@ -26,34 +26,6 @@ use std::marker::PhantomData;
 const ALPHABET: &[u8; BASE as usize] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 const BASE: u64 = 36;
 
-/// A primitive root modulo 37, so its powers visit every nonzero residue.
-const GENERATOR: u64 = 5;
-
-/// `EXP[e] = 5^(e+1) mod 37 - 1`: a bijection on base36 digits that maps
-/// consecutive digits to unrelated characters, so encoded IDs do not look
-/// sequential even though the alphabet is in canonical order.
-const EXP: [u8; BASE as usize] = {
-    let mut table = [0; BASE as usize];
-    let mut power = 1u64;
-    let mut exponent = 0;
-    while exponent < BASE as usize {
-        power = power * GENERATOR % (BASE + 1);
-        table[exponent] = (power - 1) as u8;
-        exponent += 1;
-    }
-    table
-};
-
-/// Discrete logarithm: the inverse of [`EXP`].
-const LOG: [u8; BASE as usize] = {
-    let mut table = [0; BASE as usize];
-    let mut exponent = 0;
-    while exponent < BASE as usize {
-        table[EXP[exponent] as usize] = exponent as u8;
-        exponent += 1;
-    }
-    table
-};
 
 /// Fixed ID length.
 pub const LEN: usize = 8;
@@ -107,7 +79,7 @@ impl<D: PrefixIdDomain> PrefixId<D> {
             let digit = (remaining % BASE) as u8;
             remaining /= BASE;
 
-            let encoded = EXP[((digit + prefix_shift(&hasher)) % BASE as u8) as usize];
+            let encoded = permute_digit(&hasher, digit);
             bytes[pos] = ALPHABET[encoded as usize];
             hasher.write(&bytes[pos..=pos]);
         }
@@ -172,7 +144,7 @@ impl<D: PrefixIdDomain> PrefixId<D> {
                 .position(|candidate| *candidate == byte)
                 .ok_or(ParsePrefixIdError::InvalidCharacter(byte as char))?
                 as u8;
-            let digit = (LOG[encoded as usize] + BASE as u8 - prefix_shift(&hasher)) % BASE as u8;
+            let digit = unpermute_digit(&hasher, encoded);
 
             residue += digit as u64 * place;
             place *= BASE;
@@ -324,8 +296,55 @@ fn domain_hasher<D: PrefixIdDomain>() -> fnv::FnvHasher {
     hasher
 }
 
-fn prefix_shift(hasher: &fnv::FnvHasher) -> u8 {
-    (hasher.finish() % BASE) as u8
+/// Pointwise keyed bijection on base36 digits, seeded by the hash of the
+/// domain and preceding characters: a Feistel network over 6-bit values with
+/// cycle walking to stay in `0..36`. Evaluates a single digit in either
+/// direction without materializing the permutation.
+fn permute_digit(hasher: &fnv::FnvHasher, digit: u8) -> u8 {
+    let seed = hasher.finish();
+    let mut value = digit;
+    loop {
+        value = feistel(seed, value, 0..FEISTEL_ROUNDS);
+        if value < BASE as u8 {
+            return value;
+        }
+    }
+}
+
+/// The inverse of [`permute_digit`].
+fn unpermute_digit(hasher: &fnv::FnvHasher, digit: u8) -> u8 {
+    let seed = hasher.finish();
+    let mut value = digit;
+    loop {
+        value = feistel(seed, value, (0..FEISTEL_ROUNDS).rev());
+        if value < BASE as u8 {
+            return value;
+        }
+    }
+}
+
+const FEISTEL_ROUNDS: u8 = 4;
+
+/// A balanced Feistel cipher on 3+3 bit halves. The output swaps the halves,
+/// which makes running the same rounds in reverse order the exact inverse.
+fn feistel(seed: u64, value: u8, rounds: impl Iterator<Item = u8>) -> u8 {
+    let (mut left, mut right) = (value >> 3, value & 7);
+    for round in rounds {
+        let mixed = left ^ round_bits(seed, round, right);
+        (left, right) = (right, mixed);
+    }
+    right << 3 | left
+}
+
+fn round_bits(seed: u64, round: u8, half: u8) -> u8 {
+    (splitmix64(seed ^ (round << 3 | half) as u64) & 7) as u8
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4B9F9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
 }
 
 #[cfg(test)]
@@ -371,14 +390,37 @@ mod tests {
     }
 
     #[test]
-    fn exp_table_is_a_bijection() {
-        let mut digits: HashSet<u8> = EXP.iter().copied().collect();
-        assert_eq!(digits.len(), BASE as usize);
-        for (digit, log) in LOG.iter().enumerate() {
-            assert_eq!(EXP[*log as usize] as usize, digit);
-            digits.remove(&(digit as u8));
+    fn digit_permutation_round_trips_for_many_seeds() {
+        for seed in 0..1_000u64 {
+            let mut hasher = fnv::FnvHasher::default();
+            hasher.write(&seed.to_le_bytes());
+            let mut images = HashSet::new();
+            for digit in 0..BASE as u8 {
+                let permuted = permute_digit(&hasher, digit);
+                assert!(permuted < BASE as u8);
+                assert!(images.insert(permuted));
+                assert_eq!(unpermute_digit(&hasher, permuted), digit);
+            }
         }
-        assert!(digits.is_empty());
+    }
+
+    #[test]
+    fn domains_use_different_first_character_orders() {
+        fn first_char_cycle<D: PrefixIdDomain>() -> Vec<u8> {
+            (0..BASE)
+                .map(|counter| {
+                    PrefixId::<D>::from_counter(counter).unwrap().encoded().into_bytes()[0]
+                })
+                .collect()
+        }
+
+        let test_cycle = first_char_cycle::<TestDomain>();
+        let other_cycle = first_char_cycle::<OtherDomain>();
+        let is_rotation = (0..BASE as usize).any(|offset| {
+            (0..BASE as usize)
+                .all(|i| test_cycle[i] == other_cycle[(i + offset) % BASE as usize])
+        });
+        assert!(!is_rotation, "domains share a first-character order");
     }
 
     #[test]
