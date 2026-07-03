@@ -1,11 +1,23 @@
 //! Fixed-length counter IDs with short dynamic prefixes.
 //!
 //! `PrefixId` maps a monotonically increasing counter to an 8-character
-//! lowercase alphanumeric ID. The low-order base36 counter digits are emitted
-//! first, so the first `36^k` generated IDs are all distinguishable by `k`
-//! characters.
-//! Prefixes are not part of the ID itself; [`PrefixId::from_prefix`] resolves a
-//! prefix against the first `total_generated` IDs.
+//! lowercase alphanumeric (`a-z0-9`) ID. Properties:
+//!
+//! - **Short unique prefixes**: the low-order base36 counter digits are emitted
+//!   first, so the first `36^k` generated IDs are all distinguishable by their
+//!   first `k` characters (36 IDs by 1 character, ~1.3k by 2, ~47k by 3).
+//!   Prefixes are not stored in the ID; [`PrefixId::from_prefix`] resolves one
+//!   arithmetically against the first `total_generated` IDs.
+//! - **No visible ordering**: each digit is shifted by a hash of the preceding
+//!   characters and scrambled through exponentiation in `GF(37)`, so
+//!   consecutive counters produce unrelated-looking IDs. The mapping is still
+//!   deterministic — the first character cycles through a fixed (scrambled)
+//!   order with period 36, which is unavoidable given the prefix-uniqueness
+//!   guarantee.
+//! - **Domain separation**: encoding is keyed by [`PrefixIdDomain`], so the
+//!   same counter encodes differently across ID families.
+//! - **Stateless**: counter and ID convert in both directions with no lookup
+//!   table; only the raw counter is stored (fixed-width `u64` in redb).
 
 use std::fmt;
 use std::hash::Hasher;
