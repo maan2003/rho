@@ -70,27 +70,23 @@ impl AgentRegistry {
             .map(|topic| topic.topic_id)
     }
 
-    /// The working directory of an agent, from topic summaries.
+    /// The short display label of an agent: a prefix of its encoded ID,
+    /// unique among all generated IDs.
     pub fn agent_id_label(&self, agent_id: AgentId) -> String {
-        let total_generated = self.rounded_total_generated_for(agent_id);
-        let prefix_id = agent_id.prefix_id();
-        let prefix_len = prefix_id.unique_prefix_len(total_generated).max(2);
-        let encoded = agent_id.encoded(&AgentIdDomain(self.machine_seed));
-        format!("ag{}", &encoded[..prefix_len])
+        let prefix_len = prefix_id::uniform_prefix_len(self.max_counter(agent_id), LABEL_HEADROOM);
+        format!("ag{}", &agent_id.encoded()[..prefix_len])
     }
 
-    fn rounded_total_generated_for(&self, agent_id: AgentId) -> u64 {
-        let max_counter = self
-            .topics
+    fn max_counter(&self, agent_id: AgentId) -> u64 {
+        let domain = AgentIdDomain(self.machine_seed);
+        self.topics
             .iter()
             .flat_map(UiTopic::agent_ids)
             .chain(self.agents.keys().copied())
             .chain(std::iter::once(agent_id))
-            .map(|id| id.prefix_id().to_counter())
+            .map(|id| id.to_counter(&domain))
             .max()
-            .unwrap_or(0);
-
-        (max_counter + 1).next_power_of_two()
+            .unwrap_or(0)
     }
 
     pub fn working_directory(&self, agent_id: AgentId) -> Option<&PathBuf> {
@@ -113,10 +109,11 @@ impl AgentRegistry {
     }
 
     pub fn add_topic(&mut self, topic: UiTopic) {
+        // Topics stay in the daemon's creation order; a new topic is the
+        // newest, so it belongs at the end.
         let mut topics = std::mem::take(&mut self.topics);
         topics.retain(|existing| existing.topic_id != topic.topic_id);
         topics.push(topic);
-        topics.sort_by_key(|left| left.topic_id);
         self.set_topics(topics);
     }
 
@@ -168,13 +165,24 @@ impl AgentRegistry {
     }
 
     /// Cycles through live, rail-visible agents by `delta`, starting from
-    /// the current selection.
+    /// the current selection. Cycling follows rail order (topics, then
+    /// agents within each topic); agent id order is meaningless.
     pub fn next_live_agent(&self, delta: isize) -> Option<AgentId> {
-        let live = self
-            .agents
+        let mut candidates = self
+            .topics
             .iter()
-            .filter(|(agent_id, life)| **life == AgentLife::Live && !self.agent_hidden(**agent_id))
-            .map(|(agent_id, _)| agent_id)
+            .flat_map(UiTopic::agent_ids)
+            .collect::<Vec<_>>();
+        for agent_id in self.agents.keys() {
+            if !candidates.contains(agent_id) {
+                candidates.push(*agent_id);
+            }
+        }
+        let live = candidates
+            .into_iter()
+            .filter(|agent_id| {
+                self.agents.get(agent_id) == Some(&AgentLife::Live) && !self.agent_hidden(*agent_id)
+            })
             .collect::<Vec<_>>();
         if live.is_empty() {
             return None;
@@ -182,10 +190,10 @@ impl AgentRegistry {
         let len = live.len() as isize;
         let index = self
             .selected_agent()
-            .and_then(|selected| live.iter().position(|agent_id| *agent_id == selected))
+            .and_then(|selected| live.iter().position(|agent_id| agent_id == selected))
             .map(|index| (index as isize + delta).rem_euclid(len) as usize)
             .unwrap_or_else(|| if delta < 0 { live.len() - 1 } else { 0 });
-        live.get(index).map(|agent_id| *(*agent_id))
+        live.get(index).copied()
     }
 
     pub fn live_agents(&self) -> impl Iterator<Item = &AgentId> {
@@ -196,17 +204,22 @@ impl AgentRegistry {
     }
 }
 
+/// New agents guaranteed between two label-length changes.
+const LABEL_HEADROOM: u64 = 200;
+
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr as _;
-
-    use rho_ui_proto::{Status, UiAgentSummary};
+    use rho_ui_proto::{Status, TopicIdDomain, UiAgentSummary};
 
     use super::*;
 
+    fn agent_id(id: u64) -> AgentId {
+        AgentId::from_counter(id, &AgentIdDomain(0)).unwrap()
+    }
+
     fn agent(id: u64, status: Status) -> UiAgentSummary {
         UiAgentSummary {
-            agent_id: AgentId::from_counter(id),
+            agent_id: agent_id(id),
             display_name: None,
             working_directory: "/tmp".into(),
             status,
@@ -215,7 +228,7 @@ mod tests {
 
     fn topic(id: u64, status: Status, agents: Vec<UiAgentSummary>) -> UiTopic {
         UiTopic {
-            topic_id: rho_ui_proto::TopicId::from_str(&id.to_string()).unwrap(),
+            topic_id: rho_ui_proto::TopicId::from_counter(id, &TopicIdDomain(0)).unwrap(),
             name: id.to_string(),
             status,
             agents,
@@ -234,16 +247,16 @@ mod tests {
             topic(2, Status::Archived, vec![agent(3, Status::Normal)]),
         ]);
         for id in 1..=3 {
-            registry.mark_live(AgentId::from_counter(id));
+            registry.mark_live(agent_id(id));
         }
 
-        let visible = AgentId::from_counter(1);
+        let visible = agent_id(1);
         registry.select_agent(visible);
         // Both forward and backward cycling only ever land on the one
         // rail-visible agent.
         assert_eq!(registry.next_live_agent(1), Some(visible));
         assert_eq!(registry.next_live_agent(-1), Some(visible));
-        assert!(registry.agent_hidden(AgentId::from_counter(2)));
-        assert!(registry.agent_hidden(AgentId::from_counter(3)));
+        assert!(registry.agent_hidden(agent_id(2)));
+        assert!(registry.agent_hidden(agent_id(3)));
     }
 }

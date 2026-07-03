@@ -29,6 +29,7 @@ release_channel = { path = "../../../zed/crates/release_channel" }
 rho-commands.workspace = true
 rho-core.workspace = true
 rho-daemon.workspace = true
+prefix-id.workspace = true
 rho-ui-proto.workspace = true
 rustc-hash = "2.1.0"
 search = { path = "../../../zed/crates/search" }

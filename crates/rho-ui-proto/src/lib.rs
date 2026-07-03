@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, bail};
-pub use rho_agent::db::{AgentId, AgentIdDomain, Status, TopicId};
+pub use rho_agent::db::{AgentId, AgentIdDomain, Status, TopicId, TopicIdDomain};
 use rho_core::ContentPart;
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 

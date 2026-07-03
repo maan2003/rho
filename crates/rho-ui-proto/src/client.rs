@@ -183,8 +183,9 @@ impl AgentClient {
                     }
                     ServerMessage::TopicCreated { topic } => {
                         let mut topics = topics_tx.borrow().clone();
+                        // Topics stay in the daemon's creation order; a new
+                        // topic is the newest, so it belongs at the end.
                         topics.push(topic);
-                        topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
                         known_agent_ids = topic_agent_ids(&topics);
                         if topics_tx.send(topics).is_err() {
                             break;

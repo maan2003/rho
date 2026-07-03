@@ -53,6 +53,7 @@ async fn create_agent_and_append_events_with_cursor() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
+    write.init_agent_tables();
     let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
     let (agent_id, next) = write.create_agent(
         UnixMs(1),
@@ -104,6 +105,7 @@ async fn agent_events_read_lineage_parents() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
+    write.init_agent_tables();
     let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
     let (agent_id, next) = write.create_agent(
         UnixMs(1),

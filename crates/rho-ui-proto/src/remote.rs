@@ -911,7 +911,7 @@ mod tests {
         let _ = encoder.encode(streaming_state("hel"));
         let frame = encoder.encode(streaming_state("hello"));
         let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent {
-            agent_id: crate::AgentId::from_counter(1),
+            agent_id: crate::AgentId::from_counter(1, &crate::AgentIdDomain(0)).unwrap(),
             frame,
         })
         .unwrap();
@@ -940,7 +940,7 @@ mod tests {
         assert_eq!(*status, Some(UiAgentStatus::Idle));
 
         let bytes = crate::protocol_frame_bytes(&crate::ServerMessage::Agent {
-            agent_id: crate::AgentId::from_counter(1),
+            agent_id: crate::AgentId::from_counter(1, &crate::AgentIdDomain(0)).unwrap(),
             frame: frame.clone(),
         })
         .unwrap();

@@ -114,8 +114,13 @@ impl AgentRegistry {
         let machine_seed = db.read().machine_seed();
         // Topics are ad-hoc tab groups; every agent starts in the default
         // one (the oldest topic) until it is moved somewhere more specific.
-        let default_topic_id = match db.read().list_topics().first() {
-            Some((topic_id, _)) => *topic_id,
+        let oldest_topic = db
+            .read()
+            .list_topics()
+            .into_iter()
+            .min_by_key(|(_, topic)| topic.created_at);
+        let default_topic_id = match oldest_topic {
+            Some((topic_id, _)) => topic_id,
             None => {
                 let mut write = db.write().await;
                 let topic_id = write.create_topic(
@@ -139,30 +144,35 @@ impl AgentRegistry {
 
     fn topics(&self) -> Vec<UiTopic> {
         let read = self.db.read();
-        let mut topics = read
-            .list_topics()
+        // Key order over ids is meaningless (scrambled characters); creation
+        // order comes from the timestamps.
+        let mut records = read.list_topics();
+        records.sort_by_key(|(_, topic)| topic.created_at);
+        records
             .into_iter()
-            .map(|(topic_id, topic)| UiTopic {
-                topic_id,
-                name: topic.name,
-                status: topic.status,
-                agents: read
+            .map(|(topic_id, topic)| {
+                let mut agents = read
                     .list_topic_agents(topic_id)
                     .into_iter()
-                    .map(|agent_id| {
-                        let agent = read.get_agent(agent_id);
-                        UiAgentSummary {
+                    .map(|agent_id| (agent_id, read.get_agent(agent_id)))
+                    .collect::<Vec<_>>();
+                agents.sort_by_key(|(_, agent)| agent.created_at);
+                UiTopic {
+                    topic_id,
+                    name: topic.name,
+                    status: topic.status,
+                    agents: agents
+                        .into_iter()
+                        .map(|(agent_id, agent)| UiAgentSummary {
                             agent_id,
                             display_name: agent.display_name,
                             working_directory: agent.working_directory,
                             status: agent.status,
-                        }
-                    })
-                    .collect(),
+                        })
+                        .collect(),
+                }
             })
-            .collect::<Vec<_>>();
-        topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
-        topics
+            .collect()
     }
 
     fn workdirs(&self) -> Vec<UiWorkdir> {

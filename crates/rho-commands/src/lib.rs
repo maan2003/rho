@@ -312,13 +312,10 @@ fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> 
 /// the display name or the id string for unnamed topics. `None` means no
 /// such topic exists yet.
 pub fn resolve_topic(argument: &str, topics: &[(String, TopicId)]) -> Option<TopicId> {
-    if let Some((_, topic_id)) = topics.iter().find(|(label, _)| label == argument) {
-        return Some(*topic_id);
-    }
-    argument
-        .parse::<TopicId>()
-        .ok()
-        .filter(|parsed| topics.iter().any(|(_, topic_id)| topic_id == parsed))
+    topics
+        .iter()
+        .find(|(label, _)| label == argument)
+        .map(|(_, topic_id)| *topic_id)
 }
 
 /// Resolves a workdir argument (registered name or path) to its path.

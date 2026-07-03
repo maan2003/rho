@@ -1,4 +1,3 @@
-use std::str::FromStr as _;
 
 use super::*;
 
@@ -72,13 +71,14 @@ fn parses_topic_move() {
 }
 
 #[test]
-fn resolves_topics_by_label_or_id() {
+fn resolves_topics_by_label() {
+    let domain = rho_ui_proto::TopicIdDomain(0);
     let topics = vec![
-        ("infra".to_owned(), TopicId::from_str("2").unwrap()),
-        ("1".to_owned(), TopicId::from_str("1").unwrap()),
+        ("infra".to_owned(), TopicId::from_counter(2, &domain).unwrap()),
+        ("1".to_owned(), TopicId::from_counter(1, &domain).unwrap()),
     ];
     assert_eq!(resolve_topic("infra", &topics), Some(topics[0].1));
-    assert_eq!(resolve_topic("2", &topics), Some(topics[0].1));
+    assert_eq!(resolve_topic("1", &topics), Some(topics[1].1));
     assert_eq!(resolve_topic("new-topic", &topics), None);
 }
 

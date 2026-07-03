@@ -8334,6 +8334,7 @@ dependencies = [
  "json-stream",
  "language",
  "multi_buffer",
+ "prefix-id",
  "project",
  "release_channel",
  "rho-commands",

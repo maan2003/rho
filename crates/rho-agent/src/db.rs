@@ -1,7 +1,6 @@
 //! Raw redb schema for persisted agents.
 
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use prefix_id::{PrefixId, PrefixIdDomain};
 use redb::{TableDefinition, Value as _};
@@ -39,23 +38,7 @@ impl CounterKey {
     pub const LAST_TOPIC_ID: Self = Self(3);
 }
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Key,
-    RedbValue,
-    Encode,
-    Decode,
-    Pack,
-    Unpack,
-)]
-pub struct AgentId(PrefixId<AgentIdDomain>);
+pub type AgentId = PrefixId<AgentIdDomain>;
 
 /// Keys agent-id encoding with this database's persisted machine seed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -69,44 +52,17 @@ impl PrefixIdDomain for AgentIdDomain {
     }
 }
 
-impl AgentId {
-    pub fn from_counter(counter: u64) -> Self {
-        Self(PrefixId::from_counter(counter).expect("agent id counter exceeds prefix-id capacity"))
-    }
+pub type TopicId = PrefixId<TopicIdDomain>;
 
-    pub fn prefix_id(&self) -> &PrefixId<AgentIdDomain> {
-        &self.0
-    }
+/// Keys topic-id encoding with this database's persisted machine seed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TopicIdDomain(pub u64);
 
-    pub fn encoded(&self, domain: &AgentIdDomain) -> String {
-        self.0.encoded(domain)
-    }
-}
+impl PrefixIdDomain for TopicIdDomain {
+    const KIND: &'static str = "topic-id";
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Key,
-    RedbValue,
-    Encode,
-    Decode,
-    Pack,
-    Unpack,
-)]
-pub struct TopicId(u64);
-
-impl FromStr for TopicId {
-    type Err = std::num::ParseIntError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.strip_prefix("topic-").unwrap_or(value);
-        value.parse().map(Self)
+    fn machine_seed(&self) -> u64 {
+        self.0
     }
 }
 
@@ -268,8 +224,8 @@ impl AgentReadTxnExt for ReadTxn {
     fn list_topic_agents(&self, topic_id: TopicId) -> Vec<AgentId> {
         self.open_table(TOPIC_AGENTS)
             .range(
-                TopicAgentKey::new(topic_id, AgentId(PrefixId::MIN))
-                    ..=TopicAgentKey::new(topic_id, AgentId(PrefixId::MAX)),
+                TopicAgentKey::new(topic_id, AgentId::MIN)
+                    ..=TopicAgentKey::new(topic_id, AgentId::MAX),
             )
             .map(|(key, _)| key.value().agent_id)
             .collect()
@@ -355,7 +311,9 @@ impl AgentWriteTxnExt for WriteTxn {
     }
 
     fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId {
-        let topic_id = TopicId(next_counter(self, CounterKey::LAST_TOPIC_ID));
+        let domain = TopicIdDomain(machine_seed(self));
+        let topic_id = TopicId::from_counter(next_counter(self, CounterKey::LAST_TOPIC_ID), &domain)
+            .expect("topic id counter exceeds prefix-id capacity");
         let topic = TopicRecord {
             name,
             created_at: now,
@@ -412,7 +370,9 @@ impl AgentWriteTxnExt for WriteTxn {
         prompt_cache_key: PromptCacheKey,
         config: InferenceProtectedConfig,
     ) -> (AgentId, AgentEventPos) {
-        let agent_id = AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID));
+        let domain = AgentIdDomain(machine_seed(self));
+        let agent_id = AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
+            .expect("agent id counter exceeds prefix-id capacity");
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
         let agent = AgentRecord {
@@ -474,6 +434,14 @@ fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
     let next = counters.get(&key).map(|value| value.value()).unwrap_or(0) + 1;
     counters.insert(&key, &next);
     next
+}
+
+fn machine_seed(write: &mut WriteTxn) -> u64 {
+    write
+        .open_table(MACHINE)
+        .get(&MACHINE_SEED_KEY)
+        .expect("machine seed missing; init_agent_tables must run first")
+        .value()
 }
 
 #[cfg(test)]

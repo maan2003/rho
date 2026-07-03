@@ -1,7 +1,8 @@
 //! Fixed-length counter IDs with short dynamic prefixes.
 //!
 //! `PrefixId` maps a monotonically increasing counter to a 12-character
-//! lowercase alphanumeric (`a-z0-9`) ID. Properties:
+//! lowercase alphanumeric (`a-z0-9`) ID, and holds the encoded characters —
+//! the counter is derived via [`PrefixId::to_counter`]. Properties:
 //!
 //! - **Short unique prefixes**: the low-order base36 counter digits are emitted
 //!   first, so the first `36^k` generated IDs are all distinguishable by their
@@ -10,10 +11,9 @@
 //!   arithmetically against the first `total_generated` IDs.
 //! - **No visible ordering**: each digit passes through a pseudorandom
 //!   permutation seeded by a hash of the preceding characters, so consecutive
-//!   counters produce unrelated-looking IDs. The mapping is still
-//!   deterministic — the first character cycles through a fixed,
-//!   domain-specific order with period 36, which is unavoidable given the
-//!   prefix-uniqueness guarantee.
+//!   counters produce unrelated-looking IDs. Consequently `Ord` (and redb key
+//!   order) is a stable but meaningless storage order — order by creation
+//!   timestamps instead.
 //! - **Cross-machine uniqueness**: every character is scrambled keyed by the
 //!   domain's machine seed, so IDs from machines with different seeds
 //!   collide with probability ~`36^-12` per ID pair, and nothing about an ID
@@ -23,7 +23,7 @@
 //! - **Domain separation**: encoding is keyed by [`PrefixIdDomain::KIND`], so
 //!   the same counter encodes differently across ID families.
 //! - **Stateless**: counter and ID convert in both directions with no lookup
-//!   table; only the raw counter is stored (fixed-width `u64` in redb).
+//!   table; the encoded bytes are what is stored and sent.
 
 use std::fmt;
 use std::hash::Hasher;
@@ -31,7 +31,6 @@ use std::marker::PhantomData;
 
 const ALPHABET: &[u8; BASE as usize] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 const BASE: u64 = 36;
-
 
 /// Fixed ID length: the largest for which `36^LEN` still fits in a `u64`.
 pub const LEN: usize = 12;
@@ -42,7 +41,7 @@ pub const CAPACITY: u64 = BASE.pow(LEN as u32);
 /// A fixed-length alphanumeric ID optimized for short dynamic prefixes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PrefixId<D: PrefixIdDomain> {
-    counter: u64,
+    bytes: [u8; LEN],
     _domain: PhantomData<fn() -> D>,
 }
 
@@ -58,34 +57,28 @@ pub trait PrefixIdDomain {
 }
 
 impl<D: PrefixIdDomain> PrefixId<D> {
+    /// Smallest value in storage order. Not a valid encoding; range bound
+    /// only.
     pub const MIN: Self = Self {
-        counter: 0,
+        bytes: [0; LEN],
         _domain: PhantomData,
     };
 
+    /// Largest value in storage order. Not a valid encoding; range bound
+    /// only.
     pub const MAX: Self = Self {
-        counter: CAPACITY - 1,
+        bytes: [u8::MAX; LEN],
         _domain: PhantomData,
     };
 
-    /// Creates an ID from a counter, returning `None` once `36^8` is exceeded.
-    pub fn from_counter(counter: u64) -> Option<Self> {
-        (counter < CAPACITY).then_some(Self {
-            counter,
-            _domain: PhantomData,
-        })
-    }
+    /// Encodes a counter, returning `None` once `36^12` is exceeded.
+    pub fn from_counter(counter: u64, domain: &D) -> Option<Self> {
+        if counter >= CAPACITY {
+            return None;
+        }
 
-    /// Returns the original counter.
-    pub fn to_counter(self) -> u64 {
-        self.counter
-    }
-
-    /// Returns the encoded fixed-length ID, scrambled keyed by the domain's
-    /// kind and machine seed.
-    pub fn encoded(&self, domain: &D) -> String {
         let mut bytes = [0; LEN];
-        let mut remaining = self.counter;
+        let mut remaining = counter;
         let mut hasher = machine_hasher(domain);
 
         for pos in 0..LEN {
@@ -96,33 +89,39 @@ impl<D: PrefixIdDomain> PrefixId<D> {
             hasher.write(&bytes[pos..=pos]);
         }
 
-        String::from_utf8(bytes.to_vec()).expect("PrefixId contains only ASCII bytes")
+        Some(Self {
+            bytes,
+            _domain: PhantomData,
+        })
     }
 
-    /// Returns the shortest prefix length that uniquely identifies this ID
-    /// among the first `total_generated` IDs.
+    /// Decodes the original counter. Decoding under a foreign machine's
+    /// domain yields a pseudorandom counter instead.
     ///
-    /// Panics if this ID is not in the generated range.
-    pub fn unique_prefix_len(&self, total_generated: u64) -> usize {
-        assert!(
-            self.counter < total_generated,
-            "PrefixId must be within the generated range"
-        );
-        assert!(
-            total_generated <= CAPACITY,
-            "total_generated must not exceed PrefixId capacity"
-        );
+    /// Panics on values that are not valid encodings ([`Self::MIN`],
+    /// [`Self::MAX`], or corrupt storage).
+    pub fn to_counter(&self, domain: &D) -> u64 {
+        let mut counter = 0u64;
+        let mut place = 1u64;
+        let mut hasher = machine_hasher(domain);
 
-        for len in 1..=LEN {
-            let modulus = BASE.pow(len as u32);
-            let residue = self.counter % modulus;
-            let matches = 1 + (total_generated - 1 - residue) / modulus;
-            if matches == 1 {
-                return len;
-            }
+        for byte in self.bytes {
+            let encoded = ALPHABET
+                .iter()
+                .position(|candidate| *candidate == byte)
+                .expect("PrefixId bytes are not a valid encoding") as u8;
+
+            counter += unpermute_digit(&hasher, encoded) as u64 * place;
+            place *= BASE;
+            hasher.write(&[byte]);
         }
 
-        LEN
+        counter
+    }
+
+    /// The ID string.
+    pub fn encoded(&self) -> String {
+        String::from_utf8(self.bytes.to_vec()).expect("PrefixId contains only ASCII bytes")
     }
 
     /// Resolves a prefix against the first `total_generated` IDs.
@@ -134,16 +133,14 @@ impl<D: PrefixIdDomain> PrefixId<D> {
         total_generated: u64,
         domain: &D,
     ) -> Result<PrefixResolution<D>, ParsePrefixIdError> {
+        assert!(
+            total_generated <= CAPACITY,
+            "total_generated must not exceed PrefixId capacity"
+        );
         if prefix.len() > LEN {
             return Err(ParsePrefixIdError::PrefixTooLong {
                 max: LEN,
                 actual: prefix.len(),
-            });
-        }
-        if total_generated > CAPACITY {
-            return Err(ParsePrefixIdError::TooManyGenerated {
-                capacity: CAPACITY,
-                actual: total_generated,
             });
         }
 
@@ -173,10 +170,9 @@ impl<D: PrefixIdDomain> PrefixId<D> {
 
         Ok(match matches {
             0 => PrefixResolution::NotFound,
-            1 => PrefixResolution::Unique(PrefixId {
-                counter: residue,
-                _domain: PhantomData,
-            }),
+            1 => PrefixResolution::Unique(
+                Self::from_counter(residue, domain).expect("resolved residue is below capacity"),
+            ),
             _ => PrefixResolution::Ambiguous { matches },
         })
     }
@@ -184,44 +180,56 @@ impl<D: PrefixIdDomain> PrefixId<D> {
 
 impl<D: PrefixIdDomain> fmt::Debug for PrefixId<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("PrefixId").field(&self.counter).finish()
+        f.debug_tuple("PrefixId")
+            .field(&String::from_utf8_lossy(&self.bytes))
+            .finish()
     }
 }
 
 impl<D: PrefixIdDomain> senax_encoder::Encoder for PrefixId<D> {
     fn encode(&self, writer: &mut bytes::BytesMut) -> senax_encoder::Result<()> {
-        senax_encoder::Encoder::encode(&self.counter, writer)
+        senax_encoder::Encoder::encode(&bytes::Bytes::copy_from_slice(&self.bytes), writer)
     }
 
     fn is_default(&self) -> bool {
-        self.counter == 0
+        false
     }
 }
 
 impl<D: PrefixIdDomain> senax_encoder::Packer for PrefixId<D> {
     fn pack(&self, writer: &mut bytes::BytesMut) -> senax_encoder::Result<()> {
-        senax_encoder::Packer::pack(&self.counter, writer)
+        senax_encoder::Packer::pack(&bytes::Bytes::copy_from_slice(&self.bytes), writer)
     }
 }
 
 impl<D: PrefixIdDomain> senax_encoder::Decoder for PrefixId<D> {
     fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
-        let counter = <u64 as senax_encoder::Decoder>::decode(reader)?;
-        Self::from_counter(counter).ok_or_else(|| {
-            senax_encoder::EncoderError::Decode(format!(
-                "prefix id counter exceeds capacity: {counter}"
-            ))
-        })
+        Self::from_wire(<bytes::Bytes as senax_encoder::Decoder>::decode(reader)?)
     }
 }
 
 impl<D: PrefixIdDomain> senax_encoder::Unpacker for PrefixId<D> {
     fn unpack(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
-        let counter = <u64 as senax_encoder::Unpacker>::unpack(reader)?;
-        Self::from_counter(counter).ok_or_else(|| {
+        Self::from_wire(<bytes::Bytes as senax_encoder::Unpacker>::unpack(reader)?)
+    }
+}
+
+impl<D: PrefixIdDomain> PrefixId<D> {
+    fn from_wire(raw: bytes::Bytes) -> senax_encoder::Result<Self> {
+        let bytes: [u8; LEN] = raw.as_ref().try_into().map_err(|_| {
             senax_encoder::EncoderError::Decode(format!(
-                "prefix id counter exceeds capacity: {counter}"
+                "prefix id must be {LEN} bytes, got {}",
+                raw.len()
             ))
+        })?;
+        if !bytes.iter().all(|byte| ALPHABET.contains(byte)) {
+            return Err(senax_encoder::EncoderError::Decode(
+                "prefix id contains bytes outside its alphabet".to_owned(),
+            ));
+        }
+        Ok(Self {
+            bytes,
+            _domain: PhantomData,
         })
     }
 }
@@ -232,27 +240,29 @@ impl<D: PrefixIdDomain> redb::Value for PrefixId<D> {
     where
         Self: 'a;
     type AsBytes<'a>
-        = [u8; size_of::<u64>()]
+        = [u8; LEN]
     where
         Self: 'a;
 
     fn fixed_width() -> Option<usize> {
-        Some(size_of::<u64>())
+        Some(LEN)
     }
 
     fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
     where
         Self: 'a,
     {
-        let counter = u64::from_le_bytes(data.try_into().expect("redb stored invalid PrefixId"));
-        Self::from_counter(counter).expect("redb stored PrefixId counter above capacity")
+        Self {
+            bytes: data.try_into().expect("redb stored invalid PrefixId"),
+            _domain: PhantomData,
+        }
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
     where
         Self: 'b,
     {
-        value.counter.to_le_bytes()
+        value.bytes
     }
 
     fn type_name() -> redb::TypeName {
@@ -264,10 +274,10 @@ impl<D: PrefixIdDomain> redb::Value for PrefixId<D> {
 }
 
 impl<D: PrefixIdDomain> redb::Key for PrefixId<D> {
+    /// Storage order over the scrambled characters — stable, but unrelated
+    /// to creation order.
     fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
-        u64::from_le_bytes(data1.try_into().expect("redb stored invalid PrefixId")).cmp(
-            &u64::from_le_bytes(data2.try_into().expect("redb stored invalid PrefixId")),
-        )
+        data1.cmp(data2)
     }
 }
 
@@ -284,7 +294,6 @@ pub enum PrefixResolution<D: PrefixIdDomain> {
 pub enum ParsePrefixIdError {
     PrefixTooLong { max: usize, actual: usize },
     InvalidCharacter(char),
-    TooManyGenerated { capacity: u64, actual: u64 },
 }
 
 impl fmt::Display for ParsePrefixIdError {
@@ -294,15 +303,28 @@ impl fmt::Display for ParsePrefixIdError {
                 write!(f, "prefix is too long: max {max}, got {actual}")
             }
             Self::InvalidCharacter(char) => write!(f, "invalid prefix id character: {char:?}"),
-            Self::TooManyGenerated { capacity, actual } => write!(
-                f,
-                "too many generated ids: capacity {capacity}, got {actual}"
-            ),
         }
     }
 }
 
 impl std::error::Error for ParsePrefixIdError {}
+
+/// Uniform display-prefix length for a population of IDs with counters up to
+/// `max_counter`: the smallest `len` such that the first `36^len` IDs cover
+/// the population plus `headroom` future ones. Because `36^len` is a power of
+/// the base, every ID's shortest unique prefix within that range is exactly
+/// `len` characters — labels are uniform, and lengthen together only when the
+/// population crosses `36^len - headroom` (at least `headroom` creations
+/// apart, in practice far more).
+pub fn uniform_prefix_len(max_counter: u64, headroom: u64) -> usize {
+    let mut len = 2;
+    let mut covered = BASE.pow(2);
+    while covered < max_counter.saturating_add(1 + headroom) && len < LEN {
+        len += 1;
+        covered *= BASE;
+    }
+    len
+}
 
 /// Keys all character scrambling for one machine's IDs.
 fn machine_hasher<D: PrefixIdDomain>(domain: &D) -> fnv::FnvHasher {
@@ -394,13 +416,17 @@ mod tests {
 
     type Id = PrefixId<TestDomain>;
 
+    fn id(counter: u64) -> Id {
+        Id::from_counter(counter, &TestDomain).unwrap()
+    }
+
     #[test]
     fn ids_are_fixed_length_and_lowercase_alphanumeric() {
         for counter in 0..1_000 {
-            let id = Id::from_counter(counter).unwrap();
-            assert_eq!(id.encoded(&TestDomain).len(), LEN);
+            assert_eq!(id(counter).encoded().len(), LEN);
             assert!(
-                id.encoded(&TestDomain)
+                id(counter)
+                    .encoded()
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
             );
@@ -412,11 +438,10 @@ mod tests {
         let counters = [0, 1, 35, 36, 37, 1_000, 1_000_000, CAPACITY - 1];
 
         for counter in counters {
-            let id = Id::from_counter(counter).unwrap();
-            assert_eq!(id.to_counter(), counter);
+            assert_eq!(id(counter).to_counter(&TestDomain), counter);
             assert_eq!(
-                Id::from_prefix(&id.encoded(&TestDomain), CAPACITY, &TestDomain).unwrap(),
-                PrefixResolution::Unique(id)
+                Id::from_prefix(&id(counter).encoded(), CAPACITY, &TestDomain).unwrap(),
+                PrefixResolution::Unique(id(counter))
             );
         }
     }
@@ -441,9 +466,9 @@ mod tests {
         fn first_char_cycle<D: PrefixIdDomain>(domain: &D) -> Vec<u8> {
             (0..BASE)
                 .map(|counter| {
-                    PrefixId::<D>::from_counter(counter)
+                    PrefixId::<D>::from_counter(counter, domain)
                         .unwrap()
-                        .encoded(domain)
+                        .encoded()
                         .into_bytes()[0]
                 })
                 .collect()
@@ -461,10 +486,7 @@ mod tests {
     #[test]
     fn consecutive_counters_do_not_look_sequential() {
         let canonical_index = |counter: u64| {
-            let first = Id::from_counter(counter)
-                .unwrap()
-                .encoded(&TestDomain)
-                .into_bytes()[0];
+            let first = id(counter).encoded().into_bytes()[0];
             ALPHABET.iter().position(|byte| *byte == first).unwrap()
         };
 
@@ -480,8 +502,8 @@ mod tests {
 
     #[test]
     fn rejects_counters_at_capacity() {
-        assert!(Id::from_counter(CAPACITY - 1).is_some());
-        assert!(Id::from_counter(CAPACITY).is_none());
+        assert!(Id::from_counter(CAPACITY - 1, &TestDomain).is_some());
+        assert!(Id::from_counter(CAPACITY, &TestDomain).is_none());
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -499,19 +521,19 @@ mod tests {
     fn machine_seed_changes_encoding_and_scopes_resolution() {
         let (machine_a, machine_b) = (TestMachine(1), TestMachine(2));
 
-        let id = PrefixId::<TestMachine>::from_counter(42).unwrap();
-        let encoded_a = id.encoded(&machine_a);
-        assert_ne!(encoded_a, id.encoded(&machine_b));
+        let id_a = PrefixId::<TestMachine>::from_counter(42, &machine_a).unwrap();
+        let id_b = PrefixId::<TestMachine>::from_counter(42, &machine_b).unwrap();
+        assert_ne!(id_a, id_b);
 
         // A full ID resolves on its own machine; under a foreign seed it
         // decodes to a pseudorandom counter far beyond any realistic
         // `total_generated`, so resolution self-scopes.
         assert_eq!(
-            PrefixId::from_prefix(&encoded_a, 100, &machine_a).unwrap(),
-            PrefixResolution::Unique(id)
+            PrefixId::from_prefix(&id_a.encoded(), 100, &machine_a).unwrap(),
+            PrefixResolution::Unique(id_a)
         );
         assert_eq!(
-            PrefixId::from_prefix(&encoded_a, 100, &machine_b).unwrap(),
+            PrefixId::from_prefix(&id_a.encoded(), 100, &machine_b).unwrap(),
             PrefixResolution::NotFound
         );
     }
@@ -520,25 +542,21 @@ mod tests {
     fn ids_from_different_machines_do_not_collide() {
         let (machine_a, machine_b) = (TestMachine(1), TestMachine(2));
         for counter_a in 0..100u64 {
-            let encoded_a = PrefixId::<TestMachine>::from_counter(counter_a)
-                .unwrap()
-                .encoded(&machine_a);
+            let id_a = PrefixId::<TestMachine>::from_counter(counter_a, &machine_a).unwrap();
             for counter_b in 0..100u64 {
-                let encoded_b = PrefixId::<TestMachine>::from_counter(counter_b)
-                    .unwrap()
-                    .encoded(&machine_b);
-                assert_ne!(encoded_a, encoded_b);
+                let id_b = PrefixId::<TestMachine>::from_counter(counter_b, &machine_b).unwrap();
+                assert_ne!(id_a, id_b);
             }
         }
     }
 
     #[test]
     fn hash_domain_changes_encoding() {
-        let test_id = Id::from_counter(42).unwrap();
-        let other_id = PrefixId::<OtherDomain>::from_counter(42).unwrap();
+        let test_id = id(42);
+        let other_id = PrefixId::<OtherDomain>::from_counter(42, &OtherDomain).unwrap();
 
-        assert_ne!(test_id.encoded(&TestDomain), other_id.encoded(&OtherDomain));
-        assert_eq!(other_id.to_counter(), 42);
+        assert_ne!(test_id.encoded(), other_id.encoded());
+        assert_eq!(other_id.to_counter(&OtherDomain), 42);
     }
 
     #[test]
@@ -550,54 +568,64 @@ mod tests {
 
     #[test]
     fn resolves_unique_prefixes() {
-        let id = Id::from_counter(20).unwrap();
         assert_eq!(
-            Id::from_prefix(&id.encoded(&TestDomain)[..1], 36, &TestDomain).unwrap(),
-            PrefixResolution::Unique(id)
+            Id::from_prefix(&id(20).encoded()[..1], 36, &TestDomain).unwrap(),
+            PrefixResolution::Unique(id(20))
         );
         assert_eq!(
-            Id::from_prefix(&id.encoded(&TestDomain)[..2], 36 * 36, &TestDomain).unwrap(),
-            PrefixResolution::Unique(id)
+            Id::from_prefix(&id(20).encoded()[..2], 36 * 36, &TestDomain).unwrap(),
+            PrefixResolution::Unique(id(20))
         );
     }
 
     #[test]
     fn resolves_ambiguous_prefixes() {
-        let id = Id::from_counter(20).unwrap();
         assert_eq!(
-            Id::from_prefix(&id.encoded(&TestDomain)[..1], 36 + 21, &TestDomain).unwrap(),
+            Id::from_prefix(&id(20).encoded()[..1], 36 + 21, &TestDomain).unwrap(),
             PrefixResolution::Ambiguous { matches: 2 }
         );
     }
 
     #[test]
     fn resolves_missing_prefixes() {
-        let id = Id::from_counter(20).unwrap();
         assert_eq!(
-            Id::from_prefix(&id.encoded(&TestDomain)[..1], 20, &TestDomain).unwrap(),
+            Id::from_prefix(&id(20).encoded()[..1], 20, &TestDomain).unwrap(),
             PrefixResolution::NotFound
         );
-    }
-
-    #[test]
-    fn reports_unique_prefix_len() {
-        let id = Id::from_counter(20).unwrap();
-        assert_eq!(id.unique_prefix_len(21), 1);
-        assert_eq!(id.unique_prefix_len(36 + 21), 2);
-    }
-
-    #[test]
-    #[should_panic(expected = "PrefixId must be within the generated range")]
-    fn unique_prefix_len_requires_generated_id() {
-        let id = Id::from_counter(20).unwrap();
-        let _ = id.unique_prefix_len(20);
     }
 
     fn assert_unique_prefixes(count: usize, prefix_len: usize) {
         let mut prefixes = HashSet::new();
         for counter in 0..count as u64 {
-            let id = Id::from_counter(counter).unwrap();
-            assert!(prefixes.insert(id.encoded(&TestDomain)[..prefix_len].to_owned()));
+            assert!(prefixes.insert(id(counter).encoded()[..prefix_len].to_owned()));
         }
+    }
+
+    #[test]
+    fn uniform_prefix_lens_leave_headroom_between_changes() {
+        const HEADROOM: u64 = 200;
+        assert_eq!(uniform_prefix_len(0, HEADROOM), 2);
+        let mut last_change = 0u64;
+        let mut last_len = uniform_prefix_len(0, HEADROOM);
+        for max_counter in 1..100_000u64 {
+            let len = uniform_prefix_len(max_counter, HEADROOM);
+            assert!(len >= last_len, "prefix lengths must be monotonic");
+            if len != last_len {
+                assert!(
+                    max_counter - last_change >= HEADROOM,
+                    "prefix length changed after only {} ids",
+                    max_counter - last_change
+                );
+                last_change = max_counter;
+                last_len = len;
+            }
+        }
+        assert_eq!(last_len, 4, "expected the 3- and 4-character thresholds");
+    }
+
+    #[test]
+    fn uniform_prefix_len_is_unique_within_covered_range() {
+        let len = uniform_prefix_len(999, 200);
+        assert_unique_prefixes(36usize.pow(len as u32), len);
     }
 }

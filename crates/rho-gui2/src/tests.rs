@@ -47,7 +47,7 @@ fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
 }
 
 fn agent(id: u64) -> AgentId {
-    AgentId::from_counter(id)
+    AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap()
 }
 
 fn snapshot_frame(state: UiAgentState) -> AgentRemoteFrame {
