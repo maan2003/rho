@@ -59,7 +59,7 @@ impl AgentRegistry {
             .find(|topic| topic.topic_id == topic_id)?
             .agents
             .last()
-            .map(|agent| agent.working_directory.clone())
+            .map(|agent| agent.repo.clone())
     }
 
     /// The topic an agent currently belongs to, from topic summaries.
@@ -90,8 +90,7 @@ impl AgentRegistry {
     }
 
     pub fn working_directory(&self, agent_id: AgentId) -> Option<&PathBuf> {
-        self.agent_summary(agent_id)
-            .map(|agent| &agent.working_directory)
+        self.agent_summary(agent_id).map(|agent| &agent.repo)
     }
 
     /// The pin/archive status of an agent, from topic summaries.
@@ -221,7 +220,7 @@ mod tests {
         UiAgentSummary {
             agent_id: agent_id(id),
             display_name: None,
-            working_directory: "/tmp".into(),
+            repo: "/tmp".into(),
             status,
         }
     }

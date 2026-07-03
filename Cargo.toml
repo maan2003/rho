@@ -15,6 +15,7 @@ members = [
   "crates/rho-term-screen",
   "crates/rho-tool-shell",
   "crates/rho-ui-proto",
+  "crates/rho-workspaces",
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
 ]
@@ -59,6 +60,7 @@ prefix-id = { path = "crates/prefix-id" }
 rho-term-screen = { path = "crates/rho-term-screen" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
+rho-workspaces = { path = "crates/rho-workspaces" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 senax-encoder = { path = "crates/senax-encoder" }

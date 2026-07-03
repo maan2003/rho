@@ -69,10 +69,12 @@ pub enum ClientMessage {
     },
     NewAgent {
         topic_id: TopicId,
-        /// Absolute directory the agent's tools execute in, fixed for the
-        /// agent's life. Clients choose it (workdirs are the suggested
-        /// vocabulary); the daemon only validates it.
-        working_directory: PathBuf,
+        /// jj repo root the agent works on. Clients choose it (workdirs are
+        /// the suggested vocabulary); the daemon creates a dedicated jj
+        /// workspace checkout in it for the agent's life.
+        repo: PathBuf,
+        /// Where the agent's working copy starts.
+        start: StartMode,
         content: Option<Vec<ContentPart>>,
     },
     LoadAgent {
@@ -119,6 +121,36 @@ pub enum ClientMessage {
     WorkdirRemove {
         path: PathBuf,
     },
+}
+
+/// Where a new agent works, relative to a target checkout.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum StartMode {
+    /// A fresh workspace with a new change on top of the target.
+    NewOn(StartTarget),
+    /// The SAME workspace as the target: no new checkout — agents share the
+    /// directory (and namespace), seeing each other's edits instantly.
+    /// Joining the user means working directly in the user's checkout.
+    Join(JoinTarget),
+}
+
+/// What [`StartMode::NewOn`] stacks on; resolved by the daemon.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum StartTarget {
+    /// Another agent's working copy.
+    Agent(AgentId),
+    /// The user's own checkout of the repo (`@` in the repo's default
+    /// workspace).
+    User,
+    /// An arbitrary revset evaluated in the repo.
+    Revset(String),
+}
+
+/// Whose workspace [`StartMode::Join`] joins.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum JoinTarget {
+    Agent(AgentId),
+    User,
 }
 
 /// Destination of [`ClientMessage::MoveAgent`]. `Named` is resolved by the
@@ -186,7 +218,9 @@ impl UiTopic {
 pub struct UiAgentSummary {
     pub agent_id: AgentId,
     pub display_name: Option<String>,
-    pub working_directory: PathBuf,
+    /// The jj repo root the agent's workspace belongs to — repo vocabulary
+    /// for labels and defaults, not the checkout path.
+    pub repo: PathBuf,
     pub status: Status,
 }
 

@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use async_stream::stream;
@@ -17,6 +16,7 @@ use rho_db::RhoDb;
 use rho_inference::config::InferenceConfig;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
+use rho_workspaces::{Repo, Workspace};
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{Notify, mpsc};
 
@@ -116,6 +116,19 @@ pub struct Agent {
     notify: Arc<Notify>,
 }
 
+/// Where a new agent's workspace comes from.
+pub enum StartWorkspace {
+    /// Create a jj workspace named after the agent's id, on top of the
+    /// revset.
+    Create {
+        repo: Arc<Repo>,
+        parent_revset: String,
+    },
+    /// Work in an existing workspace (joining another agent, or the user's
+    /// checkout).
+    Existing(Arc<Workspace>),
+}
+
 impl Agent {
     pub async fn create(
         db: RhoDb,
@@ -123,17 +136,33 @@ impl Agent {
         config: InferenceConfig,
         topic_id: db::TopicId,
         display_name: Option<String>,
-        working_directory: PathBuf,
-    ) -> (AgentId, Self) {
+        start: StartWorkspace,
+    ) -> anyhow::Result<(AgentId, Self)> {
         let prompt_cache_key = PromptCacheKey::generate();
         let config = config.protect();
+        // One transaction spans id allocation, the jj workspace creation
+        // (the workspace is named after the id), and the record write:
+        // failure anywhere drops the transaction, leaving nothing behind —
+        // not even the id counter bump.
         let mut write = db.write().await;
+        let agent_id = write.alloc_agent_id();
+        let workspace = match start {
+            StartWorkspace::Create {
+                repo,
+                parent_revset,
+            } => {
+                repo.create_workspace(&agent_id.encoded(), &parent_revset)
+                    .await?
+            }
+            StartWorkspace::Existing(workspace) => workspace,
+        };
         let now = UnixMillis::now();
-        let (agent_id, next_event) = write.create_agent(
+        let next_event = write.create_agent(
             now,
+            agent_id,
             topic_id,
             display_name,
-            working_directory.clone(),
+            workspace.info().clone(),
             prompt_cache_key,
             config.clone(),
         );
@@ -141,24 +170,30 @@ impl Agent {
         let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            working_directory.clone(),
+            Arc::clone(&workspace),
         );
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: shell_tools.specs().into(),
-            system_prompt: system_prompt::prompt(&working_directory),
+            system_prompt: system_prompt::prompt(workspace.repo()),
             kind: AgentStateKind::Idle,
         };
         let agent = Self::new(
             inference_session,
             shell_tools,
+            Some(workspace),
             state,
             Some(AgentPersistence { db, next_event }),
         );
-        (agent_id, agent)
+        Ok((agent_id, agent))
     }
 
-    pub fn load(db: RhoDb, auth: InferenceAuth, agent_id: AgentId) -> Self {
+    pub fn load(
+        db: RhoDb,
+        auth: InferenceAuth,
+        agent_id: AgentId,
+        workspace: Arc<Workspace>,
+    ) -> Self {
         let record = db.read().get_agent(agent_id);
         struct RestoreToolTurn {
             outstanding_calls: Vec<ToolCall>,
@@ -243,17 +278,18 @@ impl Agent {
         let inference_session = InferenceSession::new(auth, record.config, record.prompt_cache_key);
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            record.working_directory.clone(),
+            Arc::clone(&workspace),
         );
         let state = AgentState {
             blocks,
             tool_specs: shell_tools.specs().into(),
-            system_prompt: system_prompt::prompt(&record.working_directory),
+            system_prompt: system_prompt::prompt(workspace.repo()),
             kind,
         };
         Self::new(
             inference_session,
             shell_tools,
+            Some(workspace),
             state,
             Some(AgentPersistence { db, next_event }),
         )
@@ -262,6 +298,7 @@ impl Agent {
     fn new(
         inference_session: InferenceSession,
         shell_tools: ShellTools,
+        workspace: Option<Arc<Workspace>>,
         state: AgentState,
         persistence: Option<AgentPersistence>,
     ) -> Self {
@@ -275,6 +312,7 @@ impl Agent {
             notify: Arc::clone(&notify),
             control_rx,
             shell_tools,
+            workspace,
             persistence,
         };
         tokio::spawn(agent_loop.run());
@@ -341,6 +379,7 @@ struct AgentLoop {
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<AgentControl>,
     shell_tools: ShellTools,
+    workspace: Option<Arc<Workspace>>,
     persistence: Option<AgentPersistence>,
 }
 
@@ -482,6 +521,17 @@ impl AgentLoop {
                                     provider_response_id,
                                 }));
                                 if calls.is_empty() {
+                                    // Turn complete: commit the checkout's
+                                    // state so the user's jj view follows the
+                                    // agent's work (fire-and-forget).
+                                    if let Some(workspace) = &self.workspace {
+                                        let workspace = Arc::clone(workspace);
+                                        tokio::spawn(async move {
+                                            if let Err(error) = workspace.snapshot().await {
+                                                eprintln!("rho-agent: snapshot failed: {error:#}");
+                                            }
+                                        });
+                                    }
                                     state.kind = AgentStateKind::Idle;
                                 } else {
                                     let mut previews = BTreeMap::new();

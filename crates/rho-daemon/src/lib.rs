@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,9 +14,10 @@ use rho_inference::config::InferenceConfig;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, ServerMessage, UiAgentSummary, UiTopic, UiWorkdir, read_frame_counted,
-    write_frame_counted,
+    ClientMessage, JoinTarget, ServerMessage, StartMode, StartTarget, UiAgentSummary, UiTopic,
+    UiWorkdir, read_frame_counted, write_frame_counted,
 };
+use rho_workspaces::{Repo, WorkspaceInfo};
 use tokio::sync::{Mutex, Notify, mpsc};
 
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
@@ -30,6 +31,11 @@ pub fn default_db_path() -> anyhow::Result<PathBuf> {
     let base = dirs::state_dir().ok_or_else(|| anyhow::anyhow!("state directory not available"))?;
     Ok(base.join("rho").join("rho.redb"))
 }
+
+/// Re-exported so daemon entry points can set up the user+mount namespace
+/// before the async runtime starts (see
+/// [`rho_workspaces::init_daemon_namespace`]).
+pub use rho_workspaces::init_daemon_namespace;
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct DaemonArgs {
@@ -104,6 +110,9 @@ struct AgentRegistry {
     /// encode agent IDs.
     machine_seed: u64,
     agents: Mutex<HashMap<AgentId, Agent>>,
+    /// One shared handle per repo root: live-workspace sharing (joined
+    /// agents get one checkout + namespace) only holds within one instance.
+    repos: Mutex<HashMap<PathBuf, Arc<Repo>>>,
 }
 
 impl AgentRegistry {
@@ -139,6 +148,7 @@ impl AgentRegistry {
             default_topic_id,
             machine_seed,
             agents: Mutex::new(HashMap::new()),
+            repos: Mutex::new(HashMap::new()),
         }
     }
 
@@ -166,7 +176,7 @@ impl AgentRegistry {
                         .map(|(agent_id, agent)| UiAgentSummary {
                             agent_id,
                             display_name: agent.display_name,
-                            working_directory: agent.working_directory,
+                            repo: PathBuf::from(agent.workspace.repo()),
                             status: agent.status,
                         })
                         .collect(),
@@ -230,21 +240,94 @@ impl AgentRegistry {
     async fn create(
         &self,
         topic_id: TopicId,
-        working_directory: PathBuf,
+        repo: PathBuf,
+        start: StartMode,
     ) -> anyhow::Result<(TopicId, AgentId, Agent)> {
         self.db.read().get_topic(topic_id);
-        let working_directory = validate_working_directory(working_directory)?;
+        let start = match start {
+            StartMode::NewOn(target) => {
+                let repo = validate_repo_root(repo)?;
+                let revset = self.resolve_target(target)?;
+                rho_agent::StartWorkspace::Create {
+                    repo: self.repo(&repo).await?,
+                    parent_revset: revset,
+                }
+            }
+            // Joining an agent means its workspace, wherever it is — the
+            // repo field only matters for User (no agent to inherit from).
+            StartMode::Join(JoinTarget::Agent(join_id)) => {
+                let info = self.agent_record(join_id)?.workspace;
+                rho_agent::StartWorkspace::Existing(self.open_workspace(&info).await?)
+            }
+            StartMode::Join(JoinTarget::User) => {
+                let repo = validate_repo_root(repo)?;
+                rho_agent::StartWorkspace::Existing(self.repo(&repo).await?.user_checkout().await?)
+            }
+        };
         let (agent_id, agent) = Agent::create(
             self.db.clone(),
             self.auth.clone(),
             self.inference_config.clone(),
             topic_id,
             None,
-            working_directory,
+            start,
         )
-        .await;
+        .await?;
         self.agents.lock().await.insert(agent_id, agent.clone());
         Ok((topic_id, agent_id, agent))
+    }
+
+    /// Turns a start target into the revset a new workspace stacks on. An
+    /// agent target resolves through its workspace name — the durable handle
+    /// that follows the agent's change across operations.
+    fn resolve_target(&self, target: StartTarget) -> anyhow::Result<String> {
+        Ok(match target {
+            StartTarget::User => "@".to_owned(),
+            StartTarget::Revset(revset) => revset,
+            StartTarget::Agent(agent_id) => {
+                match self.agent_record(agent_id)?.workspace {
+                    WorkspaceInfo::Workspace { name, .. } => format!("{name}@"),
+                    // An agent in the user's checkout works on the user's
+                    // own change.
+                    WorkspaceInfo::UserCheckout { .. } => "@".to_owned(),
+                }
+            }
+        })
+    }
+
+    /// The shared handle for the repo rooted at (or containing) `path`.
+    async fn repo(&self, path: &Path) -> anyhow::Result<Arc<Repo>> {
+        let repo = Repo::open(path)?;
+        let mut repos = self.repos.lock().await;
+        Ok(match repos.entry(repo.root().to_owned()) {
+            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                Arc::clone(entry.insert(Arc::new(repo)))
+            }
+        })
+    }
+
+    async fn open_workspace(
+        &self,
+        info: &WorkspaceInfo,
+    ) -> anyhow::Result<Arc<rho_workspaces::Workspace>> {
+        let repo = self.repo(Path::new(info.repo())).await?;
+        match info {
+            WorkspaceInfo::UserCheckout { .. } => repo.user_checkout().await,
+            WorkspaceInfo::Workspace { name, .. } => repo.open_workspace(name).await,
+        }
+    }
+
+    fn agent_record(&self, agent_id: AgentId) -> anyhow::Result<rho_agent::db::AgentRecord> {
+        let read = self.db.read();
+        let Some((_, agent)) = read
+            .list_agents()
+            .into_iter()
+            .find(|(id, _)| *id == agent_id)
+        else {
+            anyhow::bail!("unknown agent id: {agent_id:?}");
+        };
+        Ok(agent)
     }
 
     async fn move_agent(
@@ -355,7 +438,7 @@ impl AgentRegistry {
     }
 
     async fn set_workdir(&self, path: PathBuf, name: Option<String>) -> anyhow::Result<()> {
-        let path = validate_working_directory(path)?;
+        let path = validate_repo_root(path)?;
         let name = match name {
             Some(name) => name,
             None => path
@@ -398,7 +481,9 @@ impl AgentRegistry {
         {
             anyhow::bail!("unknown agent id: {agent_id:?}");
         }
-        let agent = Agent::load(self.db.clone(), self.auth.clone(), agent_id);
+        let info = self.db.read().get_agent(agent_id).workspace;
+        let workspace = self.open_workspace(&info).await?;
+        let agent = Agent::load(self.db.clone(), self.auth.clone(), agent_id, workspace);
         self.agents.lock().await.insert(agent_id, agent.clone());
         Ok((agent_id, agent, true))
     }
@@ -446,11 +531,12 @@ async fn serve_connection(
             }
             ClientMessage::NewAgent {
                 topic_id,
-                working_directory,
+                repo,
+                start,
                 content,
             } => {
                 let (topic_id, agent_id, agent) =
-                    match agents.create(topic_id, working_directory).await {
+                    match agents.create(topic_id, repo, start).await {
                         Ok(created) => created,
                         Err(error) => {
                             let _ = outgoing_tx.send(ServerMessage::Error {
@@ -613,19 +699,14 @@ fn subscribe_agent(
     });
 }
 
-/// Working directories must be absolute (the daemon's cwd is meaningless by
-/// design) and must exist when an agent is created or a workdir registered.
-/// A leading `~` expands to the daemon's home: clients may run on another
-/// machine, so path interpretation belongs here.
-fn validate_working_directory(path: PathBuf) -> anyhow::Result<PathBuf> {
+/// Repo roots must be absolute (the daemon's cwd is meaningless by design)
+/// jj repo roots: agents work in daemon-created jj workspaces, so both
+/// workdir registration and agent creation take repos. A leading `~` expands
+/// to the daemon's home: clients may run on another machine, so path
+/// interpretation belongs here.
+fn validate_repo_root(path: PathBuf) -> anyhow::Result<PathBuf> {
     let path = expand_home(&path).unwrap_or(path);
-    if !path.is_absolute() {
-        anyhow::bail!("working directory must be absolute: {}", path.display());
-    }
-    if !path.is_dir() {
-        anyhow::bail!("working directory does not exist: {}", path.display());
-    }
-    Ok(path)
+    rho_workspaces::resolve_repo_root(&path)
 }
 
 fn expand_home(path: &std::path::Path) -> Option<PathBuf> {

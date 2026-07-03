@@ -11,7 +11,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::remote::{AgentRemoteFrame, UiAgentState, UiBlock};
 use crate::{
-    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, UiTopic, UiWorkdir,
+    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, StartMode, StartTarget,
+    UiTopic, UiWorkdir,
     append_protocol_log_record, protocol_frame_bytes, read_frame_counted, write_frame_counted,
 };
 
@@ -296,20 +297,22 @@ impl AgentClient {
     pub fn new_agent_with_user_message_in_topic(
         &self,
         topic_id: TopicId,
-        working_directory: PathBuf,
+        repo: PathBuf,
         text: String,
     ) {
         let _ = self.commands.send(ClientMessage::NewAgent {
             topic_id,
-            working_directory,
+            repo,
+            start: default_start(),
             content: Some(vec![ContentPart::Text { text }]),
         });
     }
 
-    pub fn new_agent_in_topic(&self, topic_id: TopicId, working_directory: PathBuf) {
+    pub fn new_agent_in_topic(&self, topic_id: TopicId, repo: PathBuf) {
         let _ = self.commands.send(ClientMessage::NewAgent {
             topic_id,
-            working_directory,
+            repo,
+            start: default_start(),
             content: None,
         });
     }
@@ -446,4 +449,10 @@ impl ProtocolLogger {
         };
         let _ = append_protocol_log_record(&mut *file, now_ms, direction, &frame);
     }
+}
+
+/// Until clients grow a start-point picker, new agents begin on a fresh
+/// change on top of the user's own checkout.
+fn default_start() -> StartMode {
+    StartMode::NewOn(StartTarget::User)
 }

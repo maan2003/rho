@@ -318,7 +318,10 @@ impl Workspace {
         self.awaiting_draft_agent = true;
         self.connection.send(ClientMessage::NewAgent {
             topic_id,
-            working_directory,
+            repo: working_directory,
+            // Start-point picking lands with the draft's cycling field; for
+            // now every agent starts on a fresh change on the user's @.
+            start: rho_ui_proto::StartMode::NewOn(rho_ui_proto::StartTarget::User),
             content: Some(vec![ContentPart::Text { text: body }]),
         });
     }

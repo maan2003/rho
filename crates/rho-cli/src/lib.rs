@@ -40,6 +40,11 @@ const UI_IO_BUCKETS: usize = (UI_IO_WINDOW_SECS / UI_IO_BUCKET_SECS) as usize;
 
 pub fn main() -> Result<()> {
     let args = Args::parse_or_exit(std::env::args().skip(1));
+    if matches!(args.command, Command::Daemon(_)) {
+        // SAFETY: top of main, before the runtime — no threads exist yet and
+        // nothing has captured pre-namespace state.
+        unsafe { rho_daemon::init_daemon_namespace() }.expect("set up daemon namespace");
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

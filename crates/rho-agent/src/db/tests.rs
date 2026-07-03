@@ -4,8 +4,17 @@ use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
 use rho_inference::config::InferenceConfig;
+use rho_workspaces::WorkspaceInfo;
 
 use super::*;
+
+/// Tests exercise agent records only; any workspace info will do.
+fn test_workspace() -> WorkspaceInfo {
+    WorkspaceInfo::Workspace {
+        repo: "/home/user/src/rho".to_owned(),
+        name: "test-agent".to_owned(),
+    }
+}
 
 #[tokio::test]
 async fn agent_event_positions_sort_by_lineage_then_seq() {
@@ -55,11 +64,13 @@ async fn create_agent_and_append_events_with_cursor() {
     let mut write = db.write().await;
     write.init_agent_tables();
     let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
-    let (agent_id, next) = write.create_agent(
+    let agent_id = write.alloc_agent_id();
+    let next = write.create_agent(
         UnixMs(1),
+        agent_id,
         topic_id,
         Some("main".to_owned()),
-        std::path::PathBuf::from("/tmp"),
+        test_workspace(),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),
     );
@@ -107,11 +118,13 @@ async fn agent_events_read_lineage_parents() {
     let mut write = db.write().await;
     write.init_agent_tables();
     let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
-    let (agent_id, next) = write.create_agent(
+    let agent_id = write.alloc_agent_id();
+    let next = write.create_agent(
         UnixMs(1),
+        agent_id,
         topic_id,
         Some("main".to_owned()),
-        std::path::PathBuf::from("/tmp"),
+        test_workspace(),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),
     );
@@ -179,11 +192,13 @@ async fn move_agent_to_topic_repoints_membership() {
     write.init_agent_tables();
     let default_topic = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
     let named_topic = write.create_topic(UnixMs(1), "infra".to_owned(), Status::Normal);
-    let (agent_id, _) = write.create_agent(
+    let agent_id = write.alloc_agent_id();
+    write.create_agent(
         UnixMs(1),
+        agent_id,
         default_topic,
         None,
-        std::path::PathBuf::from("/tmp"),
+        test_workspace(),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),
     );
@@ -209,11 +224,13 @@ async fn topic_and_agent_statuses_are_settable() {
     let mut write = db.write().await;
     write.init_agent_tables();
     let topic_id = write.create_topic(UnixMs(1), "infra".to_owned(), Status::Normal);
-    let (agent_id, _) = write.create_agent(
+    let agent_id = write.alloc_agent_id();
+    write.create_agent(
         UnixMs(1),
+        agent_id,
         topic_id,
         None,
-        std::path::PathBuf::from("/tmp"),
+        test_workspace(),
         PromptCacheKey::generate(),
         InferenceConfig::deep().protect(),
     );
@@ -260,4 +277,33 @@ async fn workdirs_upsert_by_path_and_remove() {
     write.remove_workdir("/home/user/src/zed");
     write.commit();
     assert_eq!(db.read().list_workdirs().len(), 1);
+}
+
+#[tokio::test]
+async fn agent_ids_allocate_before_records_exist() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    // Only the second allocation gets a record, as when the first jj
+    // checkout fails.
+    let leaked_id = write.alloc_agent_id();
+    let agent_id = write.alloc_agent_id();
+    assert_ne!(leaked_id, agent_id);
+    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
+    write.create_agent(
+        UnixMs(2),
+        agent_id,
+        topic_id,
+        None,
+        test_workspace(),
+        PromptCacheKey::generate(),
+        InferenceConfig::deep().protect(),
+    );
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.get_agent(agent_id).workspace, test_workspace());
+    assert_eq!(read.list_agents().len(), 1);
 }

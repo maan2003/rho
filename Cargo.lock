@@ -8223,6 +8223,7 @@ dependencies = [
  "rho-db",
  "rho-inference",
  "rho-tool-shell",
+ "rho-workspaces",
  "senax-encoder",
  "serde_json",
  "tempfile",
@@ -8303,6 +8304,7 @@ dependencies = [
  "rho-db",
  "rho-inference",
  "rho-ui-proto",
+ "rho-workspaces",
  "tokio",
 ]
 
@@ -8398,6 +8400,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rho-core",
+ "rho-db",
+ "rho-workspaces",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",
@@ -8415,6 +8420,18 @@ dependencies = [
  "rho-agent",
  "rho-core",
  "senax-encoder",
+ "tokio",
+]
+
+[[package]]
+name = "rho-workspaces"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "rustix 1.1.4",
+ "senax-encoder",
+ "tempfile",
  "tokio",
 ]
 

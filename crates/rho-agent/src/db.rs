@@ -9,6 +9,7 @@ use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
 use rho_inference::config::InferenceProtectedConfig;
+use rho_workspaces::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::AgentEvent;
@@ -140,9 +141,11 @@ pub type UnixMillis = UnixMs;
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
-    /// Absolute directory this agent's tools execute in. Fixed at creation:
-    /// the accumulated model context assumes one root for the agent's life.
-    pub working_directory: PathBuf,
+    /// Where this agent works. Fixed at creation: the accumulated model
+    /// context assumes one root for the agent's life (the workspace's repo
+    /// path). For pool workspaces the jj workspace name is this agent's own
+    /// id (or the joined agent's, for agents sharing a workspace).
+    pub workspace: WorkspaceInfo,
     pub status: Status,
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
@@ -178,15 +181,21 @@ pub trait AgentWriteTxnExt {
 
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
 
+    /// Reserves an agent id without writing a record, so the id can name the
+    /// agent's jj workspace before the (fallible) checkout exists; a leaked
+    /// counter bump on failure is harmless.
+    fn alloc_agent_id(&mut self) -> AgentId;
+
     fn create_agent(
         &mut self,
         now: UnixMillis,
+        agent_id: AgentId,
         topic_id: TopicId,
         display_name: Option<String>,
-        working_directory: PathBuf,
+        workspace: WorkspaceInfo,
         prompt_cache_key: PromptCacheKey,
         config: InferenceProtectedConfig,
-    ) -> (AgentId, AgentEventPos);
+    ) -> AgentEventPos;
 
     /// Re-points the agent's topic membership. Topics are ad-hoc groupings
     /// agents move into after the fact; nothing else about the agent changes.
@@ -376,24 +385,27 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
+    fn alloc_agent_id(&mut self) -> AgentId {
+        let domain = AgentIdDomain(machine_seed(self));
+        AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
+            .expect("agent id counter exceeds prefix-id capacity")
+    }
+
     fn create_agent(
         &mut self,
         now: UnixMillis,
+        agent_id: AgentId,
         topic_id: TopicId,
         display_name: Option<String>,
-        working_directory: PathBuf,
+        workspace: WorkspaceInfo,
         prompt_cache_key: PromptCacheKey,
         config: InferenceProtectedConfig,
-    ) -> (AgentId, AgentEventPos) {
-        let domain = AgentIdDomain(machine_seed(self));
-        let agent_id =
-            AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
-                .expect("agent id counter exceeds prefix-id capacity");
+    ) -> AgentEventPos {
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
         let agent = AgentRecord {
             display_name,
-            working_directory,
+            workspace,
             status: Status::Normal,
             created_at: now,
             updated_at: now,
@@ -406,7 +418,7 @@ impl AgentWriteTxnExt for WriteTxn {
             .insert(&agent_id, SenValue::borrowed(&agent));
         self.open_table(TOPIC_AGENTS)
             .insert(&TopicAgentKey::new(topic_id, agent_id), &());
-        (agent_id, AgentEventPos::root(lineage_id))
+        AgentEventPos::root(lineage_id)
     }
 
     fn move_agent_to_topic(&mut self, agent_id: AgentId, topic_id: TopicId) {
