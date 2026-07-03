@@ -1,8 +1,9 @@
 //! Fixed-length counter IDs with short dynamic prefixes.
 //!
 //! `PrefixId` maps a monotonically increasing counter to an 8-character
-//! alphanumeric ID. The low-order base62 counter digits are emitted first, so
-//! the first `62^k` generated IDs are all distinguishable by `k` characters.
+//! lowercase alphanumeric ID. The low-order base36 counter digits are emitted
+//! first, so the first `36^k` generated IDs are all distinguishable by `k`
+//! characters.
 //! Prefixes are not part of the ID itself; [`PrefixId::from_prefix`] resolves a
 //! prefix against the first `total_generated` IDs.
 
@@ -10,15 +11,42 @@ use std::fmt;
 use std::hash::Hasher;
 use std::marker::PhantomData;
 
-/// Shuffled so that consecutive digits do not encode to adjacent characters.
-const ALPHABET: &[u8; BASE as usize] =
-    b"o5JUmOcarzsHMRGSPkV6Cq7t0Ai4I8udWXxf13bNFv2ghjDQYTlZwBpy9enLKE";
-const BASE: u64 = 62;
+const ALPHABET: &[u8; BASE as usize] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+const BASE: u64 = 36;
+
+/// A primitive root modulo 37, so its powers visit every nonzero residue.
+const GENERATOR: u64 = 5;
+
+/// `EXP[e] = 5^(e+1) mod 37 - 1`: a bijection on base36 digits that maps
+/// consecutive digits to unrelated characters, so encoded IDs do not look
+/// sequential even though the alphabet is in canonical order.
+const EXP: [u8; BASE as usize] = {
+    let mut table = [0; BASE as usize];
+    let mut power = 1u64;
+    let mut exponent = 0;
+    while exponent < BASE as usize {
+        power = power * GENERATOR % (BASE + 1);
+        table[exponent] = (power - 1) as u8;
+        exponent += 1;
+    }
+    table
+};
+
+/// Discrete logarithm: the inverse of [`EXP`].
+const LOG: [u8; BASE as usize] = {
+    let mut table = [0; BASE as usize];
+    let mut exponent = 0;
+    while exponent < BASE as usize {
+        table[EXP[exponent] as usize] = exponent as u8;
+        exponent += 1;
+    }
+    table
+};
 
 /// Fixed ID length.
 pub const LEN: usize = 8;
 
-/// Number of distinct IDs representable by this crate: `62^8`.
+/// Number of distinct IDs representable by this crate: `36^8`.
 pub const CAPACITY: u64 = BASE.pow(LEN as u32);
 
 /// A fixed-length alphanumeric ID optimized for short dynamic prefixes.
@@ -44,7 +72,7 @@ impl<D: PrefixIdDomain> PrefixId<D> {
         _domain: PhantomData,
     };
 
-    /// Creates an ID from a counter, returning `None` once `62^8` is exceeded.
+    /// Creates an ID from a counter, returning `None` once `36^8` is exceeded.
     pub fn from_counter(counter: u64) -> Option<Self> {
         (counter < CAPACITY).then_some(Self {
             counter,
@@ -67,7 +95,7 @@ impl<D: PrefixIdDomain> PrefixId<D> {
             let digit = (remaining % BASE) as u8;
             remaining /= BASE;
 
-            let encoded = (digit + prefix_shift(&hasher)) % BASE as u8;
+            let encoded = EXP[((digit + prefix_shift(&hasher)) % BASE as u8) as usize];
             bytes[pos] = ALPHABET[encoded as usize];
             hasher.write(&bytes[pos..=pos]);
         }
@@ -132,7 +160,7 @@ impl<D: PrefixIdDomain> PrefixId<D> {
                 .position(|candidate| *candidate == byte)
                 .ok_or(ParsePrefixIdError::InvalidCharacter(byte as char))?
                 as u8;
-            let digit = (encoded + BASE as u8 - prefix_shift(&hasher)) % BASE as u8;
+            let digit = (LOG[encoded as usize] + BASE as u8 - prefix_shift(&hasher)) % BASE as u8;
 
             residue += digit as u64 * place;
             place *= BASE;
@@ -304,21 +332,21 @@ mod tests {
     type Id = PrefixId<TestDomain>;
 
     #[test]
-    fn ids_are_fixed_length_and_alphanumeric() {
+    fn ids_are_fixed_length_and_lowercase_alphanumeric() {
         for counter in 0..1_000 {
             let id = Id::from_counter(counter).unwrap();
             assert_eq!(id.encoded().len(), LEN);
             assert!(
                 id.encoded()
                     .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric())
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
             );
         }
     }
 
     #[test]
     fn round_trips_counters_through_full_prefix() {
-        let counters = [0, 1, 61, 62, 63, 1_000, 1_000_000, CAPACITY - 1];
+        let counters = [0, 1, 35, 36, 37, 1_000, 1_000_000, CAPACITY - 1];
 
         for counter in counters {
             let id = Id::from_counter(counter).unwrap();
@@ -331,12 +359,21 @@ mod tests {
     }
 
     #[test]
+    fn exp_table_is_a_bijection() {
+        let mut digits: HashSet<u8> = EXP.iter().copied().collect();
+        assert_eq!(digits.len(), BASE as usize);
+        for (digit, log) in LOG.iter().enumerate() {
+            assert_eq!(EXP[*log as usize] as usize, digit);
+            digits.remove(&(digit as u8));
+        }
+        assert!(digits.is_empty());
+    }
+
+    #[test]
     fn consecutive_counters_do_not_look_sequential() {
-        const CANONICAL: &[u8; BASE as usize] =
-            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let canonical_index = |counter: u64| {
             let first = Id::from_counter(counter).unwrap().encoded().into_bytes()[0];
-            CANONICAL.iter().position(|byte| *byte == first).unwrap()
+            ALPHABET.iter().position(|byte| *byte == first).unwrap()
         };
 
         let adjacent = (0..100)
@@ -373,54 +410,54 @@ mod tests {
 
     #[test]
     fn first_base_to_k_ids_are_unique_by_k_char_prefix() {
-        assert_unique_prefixes(62, 1);
-        assert_unique_prefixes(62 * 62, 2);
-        assert_unique_prefixes(62 * 62 * 62, 3);
+        assert_unique_prefixes(36, 1);
+        assert_unique_prefixes(36 * 36, 2);
+        assert_unique_prefixes(36 * 36 * 36, 3);
     }
 
     #[test]
     fn resolves_unique_prefixes() {
-        let id = Id::from_counter(42).unwrap();
+        let id = Id::from_counter(20).unwrap();
         assert_eq!(
-            Id::from_prefix(&id.encoded()[..1], 62).unwrap(),
+            Id::from_prefix(&id.encoded()[..1], 36).unwrap(),
             PrefixResolution::Unique(id)
         );
         assert_eq!(
-            Id::from_prefix(&id.encoded()[..2], 62 * 62).unwrap(),
+            Id::from_prefix(&id.encoded()[..2], 36 * 36).unwrap(),
             PrefixResolution::Unique(id)
         );
     }
 
     #[test]
     fn resolves_ambiguous_prefixes() {
-        let id = Id::from_counter(42).unwrap();
+        let id = Id::from_counter(20).unwrap();
         assert_eq!(
-            Id::from_prefix(&id.encoded()[..1], 62 + 43).unwrap(),
+            Id::from_prefix(&id.encoded()[..1], 36 + 21).unwrap(),
             PrefixResolution::Ambiguous { matches: 2 }
         );
     }
 
     #[test]
     fn resolves_missing_prefixes() {
-        let id = Id::from_counter(42).unwrap();
+        let id = Id::from_counter(20).unwrap();
         assert_eq!(
-            Id::from_prefix(&id.encoded()[..1], 42).unwrap(),
+            Id::from_prefix(&id.encoded()[..1], 20).unwrap(),
             PrefixResolution::NotFound
         );
     }
 
     #[test]
     fn reports_unique_prefix_len() {
-        let id = Id::from_counter(42).unwrap();
-        assert_eq!(id.unique_prefix_len(43), 1);
-        assert_eq!(id.unique_prefix_len(62 + 43), 2);
+        let id = Id::from_counter(20).unwrap();
+        assert_eq!(id.unique_prefix_len(21), 1);
+        assert_eq!(id.unique_prefix_len(36 + 21), 2);
     }
 
     #[test]
     #[should_panic(expected = "PrefixId must be within the generated range")]
     fn unique_prefix_len_requires_generated_id() {
-        let id = Id::from_counter(42).unwrap();
-        let _ = id.unique_prefix_len(42);
+        let id = Id::from_counter(20).unwrap();
+        let _ = id.unique_prefix_len(20);
     }
 
     fn assert_unique_prefixes(count: usize, prefix_len: usize) {
