@@ -314,6 +314,25 @@ impl AgentRegistry {
         Ok(())
     }
 
+    async fn rename_topic(&self, topic_id: TopicId, name: String) -> anyhow::Result<()> {
+        if name.trim().is_empty() {
+            anyhow::bail!("topic name cannot be empty");
+        }
+        if !self
+            .db
+            .read()
+            .list_topics()
+            .into_iter()
+            .any(|(id, _)| id == topic_id)
+        {
+            anyhow::bail!("unknown topic id: {topic_id:?}");
+        }
+        let mut write = self.db.write().await;
+        write.set_topic_name(rho_core::UnixMs::now(), topic_id, name);
+        write.commit();
+        Ok(())
+    }
+
     async fn set_topic_status(&self, topic_id: TopicId, status: Status) -> anyhow::Result<()> {
         if !self
             .db
@@ -523,6 +542,18 @@ async fn serve_connection(
             }
             ClientMessage::RenameAgent { agent_id, name } => {
                 match agents.rename_agent(agent_id, name).await {
+                    Ok(()) => {
+                        let _ = outgoing_tx.send(agents.ready_message());
+                    }
+                    Err(error) => {
+                        let _ = outgoing_tx.send(ServerMessage::Error {
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ClientMessage::RenameTopic { topic_id, name } => {
+                match agents.rename_topic(topic_id, name).await {
                     Ok(()) => {
                         let _ = outgoing_tx.send(agents.ready_message());
                     }

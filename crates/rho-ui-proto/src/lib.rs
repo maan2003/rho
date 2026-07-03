@@ -86,6 +86,10 @@ pub enum ClientMessage {
         agent_id: AgentId,
         name: String,
     },
+    RenameTopic {
+        topic_id: TopicId,
+        name: String,
+    },
     CancelTurn {
         agent_id: AgentId,
     },

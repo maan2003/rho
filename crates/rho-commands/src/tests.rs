@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn values(candidates: &[Candidate]) -> Vec<&str> {
@@ -28,7 +27,10 @@ fn parses_agent_commands() {
             working_directory: Some(PathBuf::from("~/src/rho"))
         }))
     );
-    assert_eq!(parse(":cancel"), Some(Parsed::Command(Command::AgentCancel)));
+    assert_eq!(
+        parse(":cancel"),
+        Some(Parsed::Command(Command::AgentCancel))
+    );
     assert_eq!(
         parse(":agent rename build fixer"),
         Some(Parsed::Command(Command::AgentRename {
@@ -71,10 +73,27 @@ fn parses_topic_move() {
 }
 
 #[test]
+fn parses_topic_rename() {
+    assert_eq!(
+        parse(":topic rename fix auth bug"),
+        Some(Parsed::Command(Command::TopicRename {
+            name: "fix auth bug".to_owned()
+        }))
+    );
+    assert_eq!(
+        parse(":topic rename"),
+        Some(Parsed::Invalid(":topic rename <name>".to_owned()))
+    );
+}
+
+#[test]
 fn resolves_topics_by_label() {
     let domain = rho_ui_proto::TopicIdDomain(0);
     let topics = vec![
-        ("infra".to_owned(), TopicId::from_counter(2, &domain).unwrap()),
+        (
+            "infra".to_owned(),
+            TopicId::from_counter(2, &domain).unwrap(),
+        ),
         ("1".to_owned(), TopicId::from_counter(1, &domain).unwrap()),
     ];
     assert_eq!(resolve_topic("infra", &topics), Some(topics[0].1));
@@ -84,7 +103,10 @@ fn resolves_topics_by_label() {
 
 #[test]
 fn parses_status_commands() {
-    assert_eq!(parse(":agent pin"), Some(Parsed::Command(Command::AgentPin)));
+    assert_eq!(
+        parse(":agent pin"),
+        Some(Parsed::Command(Command::AgentPin))
+    );
     assert_eq!(
         parse(":agent archive"),
         Some(Parsed::Command(Command::AgentArchive))
@@ -103,10 +125,19 @@ fn parses_status_commands() {
 
 #[test]
 fn toggle_status_round_trips() {
-    assert_eq!(toggle_status(Status::Normal, Status::Pinned), Status::Pinned);
-    assert_eq!(toggle_status(Status::Pinned, Status::Pinned), Status::Normal);
+    assert_eq!(
+        toggle_status(Status::Normal, Status::Pinned),
+        Status::Pinned
+    );
+    assert_eq!(
+        toggle_status(Status::Pinned, Status::Pinned),
+        Status::Normal
+    );
     // Pinning an archived item surfaces it.
-    assert_eq!(toggle_status(Status::Archived, Status::Pinned), Status::Pinned);
+    assert_eq!(
+        toggle_status(Status::Archived, Status::Pinned),
+        Status::Pinned
+    );
     assert_eq!(
         toggle_status(Status::Archived, Status::Archived),
         Status::Normal
@@ -139,10 +170,7 @@ fn parses_workdir_commands() {
 
 #[test]
 fn unknown_commands_are_reported() {
-    assert_eq!(
-        parse(":wat"),
-        Some(Parsed::Unknown(":wat".to_owned()))
-    );
+    assert_eq!(parse(":wat"), Some(Parsed::Unknown(":wat".to_owned())));
 }
 
 #[test]
@@ -155,7 +183,10 @@ fn completes_command_words_stepwise() {
     assert_eq!(values(&first).iter().filter(|v| **v == "agent").count(), 1);
 
     let second = completion_candidates(":agent ", &ctx);
-    assert_eq!(values(&second), ["new", "cancel", "rename", "pin", "archive"]);
+    assert_eq!(
+        values(&second),
+        ["new", "cancel", "rename", "pin", "archive"]
+    );
 
     let partial = completion_candidates(":agent ar", &ctx);
     assert_eq!(values(&partial), ["archive"]);
@@ -175,7 +206,10 @@ fn completes_arguments_from_context() {
         values(&completion_candidates(":topic move in", &ctx)),
         ["infra"]
     );
-    assert_eq!(values(&completion_candidates(":workdirs rm rh", &ctx)), ["rho"]);
+    assert_eq!(
+        values(&completion_candidates(":workdirs rm rh", &ctx)),
+        ["rho"]
+    );
     // Paths for `workdirs add` come from the client's filesystem completion.
     assert_eq!(completion_candidates(":workdirs add ", &ctx), Vec::new());
 }

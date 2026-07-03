@@ -389,6 +389,14 @@ impl Workspace {
             Command::TopicNew { name } => {
                 self.connection.send(ClientMessage::NewTopic { name });
             }
+            Command::TopicRename { name } => {
+                let Some(topic_id) = self.focused_topic_id(source_agent) else {
+                    self.notice_on(None, "no topic in focus", StyleClass::SystemInfo, cx);
+                    return;
+                };
+                self.connection
+                    .send(ClientMessage::RenameTopic { topic_id, name });
+            }
             Command::AgentPin => {
                 self.toggle_agent_status(source_agent, rho_ui_proto::Status::Pinned, window, cx);
             }
@@ -565,18 +573,13 @@ impl Workspace {
                 };
                 topic_id
             }
-            None => {
-                let focused = source_agent
-                    .or_else(|| self.registry.selected_agent().copied())
-                    .and_then(|agent_id| self.registry.topic_of(agent_id));
-                match focused.or(self.draft_topic_id).or(self.default_topic_id) {
-                    Some(topic_id) => topic_id,
-                    None => {
-                        self.notice_on(None, "no topic in focus", StyleClass::SystemInfo, cx);
-                        return;
-                    }
+            None => match self.focused_topic_id(source_agent) {
+                Some(topic_id) => topic_id,
+                None => {
+                    self.notice_on(None, "no topic in focus", StyleClass::SystemInfo, cx);
+                    return;
                 }
-            }
+            },
         };
         let current = self
             .registry
@@ -588,6 +591,14 @@ impl Workspace {
         let status = rho_commands::toggle_status(current, target);
         self.connection
             .send(ClientMessage::SetTopicStatus { topic_id, status });
+    }
+
+    fn focused_topic_id(&self, source_agent: Option<AgentId>) -> Option<rho_ui_proto::TopicId> {
+        source_agent
+            .or_else(|| self.registry.selected_agent().copied())
+            .and_then(|agent_id| self.registry.topic_of(agent_id))
+            .or(self.draft_topic_id)
+            .or(self.default_topic_id)
     }
 
     /// Tab in the draft jumps between the `Workdir:` header and the body;

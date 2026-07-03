@@ -54,6 +54,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Move the current agent into a topic (created when unknown)",
     },
     CommandSpec {
+        name: "topic rename",
+        usage: ":topic rename <name>",
+        description: "Rename the focused topic",
+    },
+    CommandSpec {
         name: "topic pin",
         usage: ":topic pin [name]",
         description: "Pin/unpin a topic (default: the current one)",
@@ -102,17 +107,37 @@ pub const COMMANDS: &[CommandSpec] = &[
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
-    AgentNew { working_directory: Option<PathBuf> },
-    AgentRename { name: String },
+    AgentNew {
+        working_directory: Option<PathBuf>,
+    },
+    AgentRename {
+        name: String,
+    },
     AgentCancel,
     AgentPin,
     AgentArchive,
-    TopicNew { name: String },
-    TopicMove { name: String },
-    TopicPin { name: Option<String> },
-    TopicArchive { name: Option<String> },
-    WorkdirAdd { path: Option<PathBuf>, name: Option<String> },
-    WorkdirRemove { path: String },
+    TopicNew {
+        name: String,
+    },
+    TopicMove {
+        name: String,
+    },
+    TopicRename {
+        name: String,
+    },
+    TopicPin {
+        name: Option<String>,
+    },
+    TopicArchive {
+        name: Option<String>,
+    },
+    WorkdirAdd {
+        path: Option<PathBuf>,
+        name: Option<String>,
+    },
+    WorkdirRemove {
+        path: String,
+    },
     Quit,
     Clear,
     Help,
@@ -155,13 +180,17 @@ pub fn parse(line: &str) -> Option<Parsed> {
                 Some(name) => Parsed::Command(Command::TopicMove { name }),
                 None => Parsed::Invalid(":topic move <name>".to_owned()),
             },
+            Some("rename") => match joined_name(rest) {
+                Some(name) => Parsed::Command(Command::TopicRename { name }),
+                None => Parsed::Invalid(":topic rename <name>".to_owned()),
+            },
             Some("pin") => Parsed::Command(Command::TopicPin {
                 name: joined_name(rest),
             }),
             Some("archive") => Parsed::Command(Command::TopicArchive {
                 name: joined_name(rest),
             }),
-            _ => Parsed::Invalid(":topic new|move|pin|archive".to_owned()),
+            _ => Parsed::Invalid(":topic new|move|rename|pin|archive".to_owned()),
         },
         "workdirs" => match tokens.next() {
             Some("add") => Parsed::Command(Command::WorkdirAdd {

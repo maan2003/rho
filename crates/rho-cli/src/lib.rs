@@ -266,6 +266,14 @@ impl ChatApp {
                 self.term.print_system(&format!("creating topic `{name}`"));
                 self.agent.new_topic(name);
             }
+            rho_commands::Command::TopicRename { name } => {
+                let topic_id = primary_agent_id(&self.agent)
+                    .and_then(|agent_id| topic_of(&self.agent, agent_id))
+                    .unwrap_or_else(|| self.agent.default_topic_id());
+                self.term
+                    .print_system(&format!("renamed topic to `{name}`"));
+                self.agent.rename_topic(topic_id, name);
+            }
             rho_commands::Command::TopicPin { name } => {
                 self.toggle_topic_status(name, rho_ui_proto::Status::Pinned);
             }
@@ -427,6 +435,19 @@ impl ChatApp {
 /// [`AgentClient::state`].
 fn primary_agent_id(agent: &AgentClient) -> Option<AgentId> {
     agent.known_agent_ids().into_iter().next()
+}
+
+fn topic_of(agent: &AgentClient, agent_id: AgentId) -> Option<rho_ui_proto::TopicId> {
+    agent
+        .topics()
+        .into_iter()
+        .find(|topic| {
+            topic
+                .agents
+                .iter()
+                .any(|summary| summary.agent_id == agent_id)
+        })
+        .map(|topic| topic.topic_id)
 }
 
 fn primary_state(states: &HashMap<AgentId, UiAgentState>) -> Option<&UiAgentState> {

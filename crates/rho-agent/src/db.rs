@@ -170,6 +170,8 @@ pub trait AgentWriteTxnExt {
 
     fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId;
 
+    fn set_topic_name(&mut self, now: UnixMillis, topic_id: TopicId, name: String);
+
     fn set_topic_status(&mut self, now: UnixMillis, topic_id: TopicId, status: Status);
 
     fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status);
@@ -312,8 +314,9 @@ impl AgentWriteTxnExt for WriteTxn {
 
     fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId {
         let domain = TopicIdDomain(machine_seed(self));
-        let topic_id = TopicId::from_counter(next_counter(self, CounterKey::LAST_TOPIC_ID), &domain)
-            .expect("topic id counter exceeds prefix-id capacity");
+        let topic_id =
+            TopicId::from_counter(next_counter(self, CounterKey::LAST_TOPIC_ID), &domain)
+                .expect("topic id counter exceeds prefix-id capacity");
         let topic = TopicRecord {
             name,
             created_at: now,
@@ -323,6 +326,18 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(TOPICS)
             .insert(&topic_id, SenValue::borrowed(&topic));
         topic_id
+    }
+
+    fn set_topic_name(&mut self, now: UnixMillis, topic_id: TopicId, name: String) {
+        let mut topics = self.open_table(TOPICS);
+        let mut topic = topics
+            .get(&topic_id)
+            .expect("topic id missing")
+            .value()
+            .into_owned();
+        topic.name = name;
+        topic.updated_at = now;
+        topics.insert(&topic_id, SenValue::borrowed(&topic));
     }
 
     fn set_topic_status(&mut self, now: UnixMillis, topic_id: TopicId, status: Status) {
@@ -371,8 +386,9 @@ impl AgentWriteTxnExt for WriteTxn {
         config: InferenceProtectedConfig,
     ) -> (AgentId, AgentEventPos) {
         let domain = AgentIdDomain(machine_seed(self));
-        let agent_id = AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
-            .expect("agent id counter exceeds prefix-id capacity");
+        let agent_id =
+            AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
+                .expect("agent id counter exceeds prefix-id capacity");
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
         let agent = AgentRecord {

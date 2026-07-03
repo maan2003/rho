@@ -344,6 +344,12 @@ impl AgentClient {
             .send(ClientMessage::RenameAgent { agent_id, name });
     }
 
+    pub fn rename_topic(&self, topic_id: TopicId, name: String) {
+        let _ = self
+            .commands
+            .send(ClientMessage::RenameTopic { topic_id, name });
+    }
+
     pub fn set_topic_status(&self, topic_id: TopicId, status: crate::Status) {
         let _ = self
             .commands
