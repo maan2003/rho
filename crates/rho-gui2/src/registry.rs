@@ -74,7 +74,7 @@ impl AgentRegistry {
     /// unique among all generated IDs.
     pub fn agent_id_label(&self, agent_id: AgentId) -> String {
         let prefix_len = prefix_id::uniform_prefix_len(self.max_counter(agent_id), LABEL_HEADROOM);
-        format!("ag{}", &agent_id.encoded()[..prefix_len])
+        format!("a{}", &agent_id.encoded()[..prefix_len])
     }
 
     fn max_counter(&self, agent_id: AgentId) -> u64 {
