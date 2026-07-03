@@ -14,7 +14,7 @@ use rho_inference::config::InferenceConfig;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, JoinTarget, ServerMessage, StartMode, StartTarget, UiAgentSummary, UiTopic,
+    ClientMessage, JoinTarget, ServerMessage, StartMode, UiAgentSummary, UiTopic,
     UiWorkdir, read_frame_counted, write_frame_counted,
 };
 use rho_workspaces::{Repo, WorkspaceInfo};
@@ -176,7 +176,7 @@ impl AgentRegistry {
                         .map(|(agent_id, agent)| UiAgentSummary {
                             agent_id,
                             display_name: agent.display_name,
-                            repo: PathBuf::from(agent.workspace.repo()),
+                            workspace: agent.workspace,
                             status: agent.status,
                         })
                         .collect(),
@@ -245,18 +245,16 @@ impl AgentRegistry {
     ) -> anyhow::Result<(TopicId, AgentId, Agent)> {
         self.db.read().get_topic(topic_id);
         let start = match start {
-            StartMode::NewOn(target) => {
+            StartMode::NewOn(revset) => {
                 let repo = validate_repo_root(repo)?;
-                let revset = self.resolve_target(target)?;
                 rho_agent::StartWorkspace::Create {
                     repo: self.repo(&repo).await?,
                     parent_revset: revset,
                 }
             }
-            // Joining an agent means its workspace, wherever it is — the
-            // repo field only matters for User (no agent to inherit from).
-            StartMode::Join(JoinTarget::Agent(join_id)) => {
-                let info = self.agent_record(join_id)?.workspace;
+            // Joining a workspace means working wherever it is — the repo
+            // field only matters for User (no workspace to inherit from).
+            StartMode::Join(JoinTarget::Workspace(info)) => {
                 rho_agent::StartWorkspace::Existing(self.open_workspace(&info).await?)
             }
             StartMode::Join(JoinTarget::User) => {
@@ -275,24 +273,6 @@ impl AgentRegistry {
         .await?;
         self.agents.lock().await.insert(agent_id, agent.clone());
         Ok((topic_id, agent_id, agent))
-    }
-
-    /// Turns a start target into the revset a new workspace stacks on. An
-    /// agent target resolves through its workspace name — the durable handle
-    /// that follows the agent's change across operations.
-    fn resolve_target(&self, target: StartTarget) -> anyhow::Result<String> {
-        Ok(match target {
-            StartTarget::User => "@".to_owned(),
-            StartTarget::Revset(revset) => revset,
-            StartTarget::Agent(agent_id) => {
-                match self.agent_record(agent_id)?.workspace {
-                    WorkspaceInfo::Workspace { name, .. } => format!("{name}@"),
-                    // An agent in the user's checkout works on the user's
-                    // own change.
-                    WorkspaceInfo::UserCheckout { .. } => "@".to_owned(),
-                }
-            }
-        })
     }
 
     /// The shared handle for the repo rooted at (or containing) `path`.

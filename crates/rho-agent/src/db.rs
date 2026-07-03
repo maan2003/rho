@@ -37,6 +37,7 @@ impl CounterKey {
     pub const LAST_AGENT_ID: Self = Self(1);
     pub const LAST_LINEAGE_ID: Self = Self(2);
     pub const LAST_TOPIC_ID: Self = Self(3);
+    pub const LAST_WORKSPACE_ID: Self = Self(4);
 }
 
 pub type AgentId = PrefixId<AgentIdDomain>;
@@ -47,6 +48,23 @@ pub struct AgentIdDomain(pub u64);
 
 impl PrefixIdDomain for AgentIdDomain {
     const KIND: &'static str = "agent-id";
+
+    fn machine_seed(&self) -> u64 {
+        self.0
+    }
+}
+
+pub type WorkspaceId = PrefixId<WorkspaceIdDomain>;
+
+/// Keys workspace-id encoding with this database's persisted machine seed.
+/// Workspace ids only exist to NAME jj workspaces (there is no workspace
+/// table — [`rho_workspaces::WorkspaceInfo`] on the agent record is
+/// self-contained); a separate id space keeps them from aliasing agent ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkspaceIdDomain(pub u64);
+
+impl PrefixIdDomain for WorkspaceIdDomain {
+    const KIND: &'static str = "workspace-id";
 
     fn machine_seed(&self) -> u64 {
         self.0
@@ -181,10 +199,11 @@ pub trait AgentWriteTxnExt {
 
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
 
-    /// Reserves an agent id without writing a record, so the id can name the
-    /// agent's jj workspace before the (fallible) checkout exists; a leaked
-    /// counter bump on failure is harmless.
     fn alloc_agent_id(&mut self) -> AgentId;
+
+    /// Reserves a fresh jj workspace name. Ids never repeat, so recreated
+    /// workspaces can't collide with forgotten names in the repo view.
+    fn alloc_workspace_id(&mut self) -> WorkspaceId;
 
     fn create_agent(
         &mut self,
@@ -389,6 +408,12 @@ impl AgentWriteTxnExt for WriteTxn {
         let domain = AgentIdDomain(machine_seed(self));
         AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
             .expect("agent id counter exceeds prefix-id capacity")
+    }
+
+    fn alloc_workspace_id(&mut self) -> WorkspaceId {
+        let domain = WorkspaceIdDomain(machine_seed(self));
+        WorkspaceId::from_counter(next_counter(self, CounterKey::LAST_WORKSPACE_ID), &domain)
+            .expect("workspace id counter exceeds prefix-id capacity")
     }
 
     fn create_agent(

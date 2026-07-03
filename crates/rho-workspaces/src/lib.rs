@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use senax_encoder::{Decode, Encode};
+use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Mutex, OnceCell};
 
 mod ns;
@@ -29,7 +29,7 @@ pub use ns::init_daemon_namespace;
 
 /// Where an agent works, stored inline on the agent record. Self-contained:
 /// there is no separate workspace table.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub enum WorkspaceInfo {
     /// The user's own checkout: the agent works directly at the repo path,
     /// no separate checkout and no namespace.

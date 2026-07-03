@@ -77,6 +77,22 @@ fn mention_prefix(text: &str) -> Option<&str> {
     text.get(token_start(text)..)?.strip_prefix('@')
 }
 
+/// Completion inside the draft's start field buffer: `user` plus the live
+/// agent labels, filtered by the token being typed.
+pub fn start_field_candidates(text_before_cursor: &str, live_agents: &[String]) -> Vec<Candidate> {
+    let needle = last_token(text_before_cursor);
+    std::iter::once(Candidate {
+        value: "user".to_owned(),
+        description: "your checkout (Join mode)".to_owned(),
+    })
+    .chain(live_agents.iter().map(|agent| Candidate {
+        value: agent.clone(),
+        description: "agent".to_owned(),
+    }))
+    .filter(|candidate| fuzzy_contains(&candidate.value, needle))
+    .collect()
+}
+
 /// Completion inside the draft's workdir field buffer: registered workdirs,
 /// filtered by the token being typed.
 pub fn workdir_field_candidates(
@@ -99,16 +115,21 @@ pub struct WorkspaceCompletionProvider {
     /// The draft view's workdir field buffer: completions in it come from
     /// the registered workdirs, not the prompt grammar.
     workdir_buffer: Option<gpui::EntityId>,
+    /// The draft view's start field buffer: completions are `user` and the
+    /// live agent labels.
+    start_buffer: Option<gpui::EntityId>,
 }
 
 impl WorkspaceCompletionProvider {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         workdir_buffer: Option<gpui::EntityId>,
+        start_buffer: Option<gpui::EntityId>,
     ) -> Rc<Self> {
         Rc::new(Self {
             workspace,
             workdir_buffer,
+            start_buffer,
         })
     }
 }
@@ -136,6 +157,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             .unwrap_or_default();
 
         let in_workdir_field = self.workdir_buffer == Some(buffer.entity_id());
+        let in_start_field = self.start_buffer == Some(buffer.entity_id());
         let buffer = buffer.read(cx);
         let cursor_offset = buffer_position.to_offset(buffer);
         let text_before_cursor = buffer.text_for_range(0..cursor_offset).collect::<String>();
@@ -144,6 +166,8 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             buffer.anchor_before(replace_start)..buffer.anchor_before(cursor_offset);
         let candidates = if in_workdir_field {
             workdir_field_candidates(&text_before_cursor, &workdirs)
+        } else if in_start_field {
+            start_field_candidates(&text_before_cursor, &live_agents)
         } else {
             completions_for(&text_before_cursor, &workdirs, &live_agents, &topics)
         };
@@ -198,6 +222,17 @@ impl CompletionProvider for WorkspaceCompletionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_field_offers_user_and_agents() {
+        let agents = vec!["a3f".to_owned(), "a41".to_owned()];
+        let candidates = start_field_candidates("", &agents);
+        assert_eq!(candidates[0].value, "user");
+        assert!(candidates.iter().any(|c| c.value == "a3f"));
+        let candidates = start_field_candidates("a4", &agents);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].value, "a41");
+    }
 
     #[test]
     fn root_commands_complete_by_prefix() {

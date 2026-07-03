@@ -24,6 +24,30 @@ use crate::workspace::Workspace;
 
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
 const WORKDIR_LABEL_INLAY_ID: usize = 1;
+const START_LABEL_INLAY_ID: usize = 2;
+
+/// The start field's default base: the parents of the user's working copy —
+/// visible and editable rather than an empty field with implicit meaning.
+pub const DEFAULT_START: &str = "@-";
+
+/// How the start field's target is interpreted; toggled with Shift-Tab while
+/// the cursor is in the field. The field label shows the current mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartFieldMode {
+    /// A fresh workspace with a new change on top of the target.
+    NewOn,
+    /// The same workspace as the target: shared checkout and namespace.
+    Join,
+}
+
+impl StartFieldMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NewOn => "On top of: ",
+            Self::Join => "Join: ",
+        }
+    }
+}
 
 pub struct DraftGutter;
 
@@ -34,6 +58,8 @@ pub struct DraftView {
     system_buffer: Entity<Buffer>,
     system_styles: Vec<(StyleClass, Range<text::Anchor>)>,
     workdir_buffer: Entity<Buffer>,
+    start_buffer: Entity<Buffer>,
+    start_mode: StartFieldMode,
     body_buffer: Entity<Buffer>,
     body_end: text::Anchor,
     suppress_draft_activation: bool,
@@ -52,11 +78,17 @@ impl DraftView {
             buffer
         });
         let workdir_buffer = cx.new(|cx| Buffer::local("", cx));
+        let start_buffer = cx.new(|cx| Buffer::local(DEFAULT_START, cx));
         let body_buffer = cx.new(|cx| Buffer::local("", cx));
         let body_end = body_buffer.read(cx).anchor_after(0);
         let multi_buffer = cx.new(|cx| {
             let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
-            for (key, buffer) in [(0, &system_buffer), (1, &workdir_buffer), (2, &body_buffer)] {
+            for (key, buffer) in [
+                (0, &system_buffer),
+                (1, &workdir_buffer),
+                (2, &start_buffer),
+                (3, &body_buffer),
+            ] {
                 multi_buffer.set_excerpts_for_path(
                     PathKey::sorted(key),
                     buffer.clone(),
@@ -80,12 +112,13 @@ impl DraftView {
                 cx,
             );
             crate::editor_config::configure(&mut editor, window, cx);
-            for buffer in [&system_buffer, &workdir_buffer, &body_buffer] {
+            for buffer in [&system_buffer, &workdir_buffer, &start_buffer, &body_buffer] {
                 editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
             }
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
                 workspace.clone(),
                 Some(workdir_buffer.entity_id()),
+                Some(start_buffer.entity_id()),
             )));
             editor
         });
@@ -102,6 +135,11 @@ impl DraftView {
                     this.note_draft_edit(cx);
                 }
             }),
+            cx.subscribe(&start_buffer, |this, _, event, cx| {
+                if matches!(event, BufferEvent::Edited { .. }) {
+                    this.note_draft_edit(cx);
+                }
+            }),
         ];
 
         let mut this = Self {
@@ -111,6 +149,8 @@ impl DraftView {
             system_buffer,
             system_styles: Vec::new(),
             workdir_buffer,
+            start_buffer,
+            start_mode: StartFieldMode::NewOn,
             body_buffer,
             body_end,
             suppress_draft_activation: false,
@@ -118,6 +158,7 @@ impl DraftView {
         };
         crate::banner::insert(&this.editor, &this.multi_buffer, cx);
         this.insert_workdir_label(cx);
+        this.insert_start_label(cx);
         this.insert_body_gap(cx);
         this.pin_autoscroll(cx);
         this.update_body_chrome(cx);
@@ -141,6 +182,59 @@ impl DraftView {
             buffer.edit([(0..len, text)], None, cx);
         });
         self.suppress_draft_activation = false;
+    }
+
+    pub fn start_mode(&self) -> StartFieldMode {
+        self.start_mode
+    }
+
+    pub fn start_text(&self, cx: &gpui::App) -> String {
+        let buffer = self.start_buffer.read(cx);
+        buffer.text_for_range(0..buffer.len()).collect()
+    }
+
+    pub fn set_start_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.suppress_draft_activation = true;
+        self.start_buffer.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, text)], None, cx);
+        });
+        self.suppress_draft_activation = false;
+    }
+
+    /// Shift-Tab while the cursor is in the start field: flip how the
+    /// target is interpreted (the field label shows the mode).
+    pub fn cycle_start_mode(&mut self, cx: &mut Context<Self>) {
+        self.start_mode = match self.start_mode {
+            StartFieldMode::NewOn => StartFieldMode::Join,
+            StartFieldMode::Join => StartFieldMode::NewOn,
+        };
+        self.insert_start_label(cx);
+        cx.notify();
+    }
+
+    pub fn cursor_in_start_field(&self, cx: &gpui::App) -> bool {
+        self.cursor_in(&self.start_buffer, cx)
+    }
+
+    fn cursor_in(&self, buffer: &Entity<Buffer>, cx: &gpui::App) -> bool {
+        let field = buffer.read(cx);
+        let range = field.anchor_before(0)..field.anchor_after(field.len());
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let (Some(start), Some(end)) = (
+            snapshot.anchor_in_excerpt(range.start),
+            snapshot.anchor_in_excerpt(range.end),
+        ) else {
+            return false;
+        };
+        let cursor = self
+            .editor
+            .read(cx)
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot);
+        cursor >= start.to_offset(&snapshot) && cursor <= end.to_offset(&snapshot)
     }
 
     /// The message body, without clearing it. Submissions read instead of
@@ -179,32 +273,20 @@ impl DraftView {
         }
     }
 
-    /// Tab: jumps between the workdir field (value selected, so typing
-    /// replaces it) and the message body.
+    /// Tab: cycles workdir field → start field → message body (field values
+    /// arrive selected, so typing replaces them).
     pub fn toggle_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let field = self.workdir_buffer.read(cx);
-        let field_range = field.anchor_before(0)..field.anchor_after(field.len());
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let (Some(field_start), Some(field_end)) = (
-            snapshot.anchor_in_excerpt(field_range.start),
-            snapshot.anchor_in_excerpt(field_range.end),
-        ) else {
-            return;
-        };
-        let cursor = self
-            .editor
-            .read(cx)
-            .selections
-            .newest_anchor()
-            .head()
-            .to_offset(&snapshot);
-        let in_field =
-            cursor >= field_start.to_offset(&snapshot) && cursor <= field_end.to_offset(&snapshot);
-        if in_field {
+        let target = if self.cursor_in(&self.workdir_buffer, cx) {
+            &self.start_buffer
+        } else if self.cursor_in(&self.start_buffer, cx) {
             self.focus_body(window, cx);
+            return;
         } else {
-            self.select_range(field_range, window, cx);
-        }
+            &self.workdir_buffer
+        };
+        let field = target.read(cx);
+        let range = field.anchor_before(0)..field.anchor_after(field.len());
+        self.select_range(range, window, cx);
     }
 
     /// Puts the cursor at the end of the message body.
@@ -278,6 +360,26 @@ impl DraftView {
                     WORKDIR_LABEL_INLAY_ID,
                     field_start,
                     "Workdir: ",
+                )],
+                cx,
+            );
+        });
+    }
+
+    fn insert_start_label(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(field_start) =
+            snapshot.anchor_in_excerpt(self.start_buffer.read(cx).anchor_before(0))
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(
+                &[InlayId::Custom(START_LABEL_INLAY_ID)],
+                vec![Inlay::custom(
+                    START_LABEL_INLAY_ID,
+                    field_start,
+                    self.start_mode.label(),
                 )],
                 cx,
             );

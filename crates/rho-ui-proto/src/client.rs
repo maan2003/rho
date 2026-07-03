@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::remote::{AgentRemoteFrame, UiAgentState, UiBlock};
 use crate::{
-    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, StartMode, StartTarget,
+    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, StartMode,
     UiTopic, UiWorkdir,
     append_protocol_log_record, protocol_frame_bytes, read_frame_counted, write_frame_counted,
 };
@@ -451,8 +451,8 @@ impl ProtocolLogger {
     }
 }
 
-/// Until clients grow a start-point picker, new agents begin on a fresh
-/// change on top of the user's own checkout.
+/// Without an explicit start point, new agents begin on the parents of the
+/// user's working copy — a sibling of it.
 fn default_start() -> StartMode {
-    StartMode::NewOn(StartTarget::User)
+    StartMode::NewOn("@-".to_owned())
 }

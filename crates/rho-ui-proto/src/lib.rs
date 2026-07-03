@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context as _, bail};
 pub use rho_agent::db::{AgentId, AgentIdDomain, Status, TopicId, TopicIdDomain};
 use rho_core::ContentPart;
+pub use rho_workspaces::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 pub mod client;
@@ -126,30 +127,22 @@ pub enum ClientMessage {
 /// Where a new agent works, relative to a target checkout.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum StartMode {
-    /// A fresh workspace with a new change on top of the target.
-    NewOn(StartTarget),
+    /// A fresh workspace with a new change on top of the revset. Clients
+    /// resolve agent targets to `<workspace name>@` themselves (workspace
+    /// names arrive on [`UiAgentSummary`]).
+    NewOn(String),
     /// The SAME workspace as the target: no new checkout — agents share the
     /// directory (and namespace), seeing each other's edits instantly.
     /// Joining the user means working directly in the user's checkout.
     Join(JoinTarget),
 }
 
-/// What [`StartMode::NewOn`] stacks on; resolved by the daemon.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum StartTarget {
-    /// Another agent's working copy.
-    Agent(AgentId),
-    /// The user's own checkout of the repo (`@` in the repo's default
-    /// workspace).
-    User,
-    /// An arbitrary revset evaluated in the repo.
-    Revset(String),
-}
-
 /// Whose workspace [`StartMode::Join`] joins.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum JoinTarget {
-    Agent(AgentId),
+    /// A known workspace, sent back verbatim from [`UiAgentSummary`].
+    Workspace(WorkspaceInfo),
+    /// The user's own checkout of the draft's repo.
     User,
 }
 
@@ -218,9 +211,10 @@ impl UiTopic {
 pub struct UiAgentSummary {
     pub agent_id: AgentId,
     pub display_name: Option<String>,
-    /// The jj repo root the agent's workspace belongs to — repo vocabulary
-    /// for labels and defaults, not the checkout path.
-    pub repo: PathBuf,
+    /// Where the agent works. Clients resolve start targets against this
+    /// themselves: "on top of agent" is the revset `<workspace name>@`, and
+    /// joining sends the info back verbatim.
+    pub workspace: WorkspaceInfo,
     pub status: Status,
 }
 

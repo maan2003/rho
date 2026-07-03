@@ -118,8 +118,7 @@ pub struct Agent {
 
 /// Where a new agent's workspace comes from.
 pub enum StartWorkspace {
-    /// Create a jj workspace named after the agent's id, on top of the
-    /// revset.
+    /// Create a jj workspace on a new change on top of the revset.
     Create {
         repo: Arc<Repo>,
         parent_revset: String,
@@ -151,7 +150,8 @@ impl Agent {
                 repo,
                 parent_revset,
             } => {
-                repo.create_workspace(&agent_id.encoded(), &parent_revset)
+                let workspace_id = write.alloc_workspace_id();
+                repo.create_workspace(&workspace_id.encoded(), &parent_revset)
                     .await?
             }
             StartWorkspace::Existing(workspace) => workspace,

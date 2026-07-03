@@ -8419,6 +8419,7 @@ dependencies = [
  "futures",
  "rho-agent",
  "rho-core",
+ "rho-workspaces",
  "senax-encoder",
  "tokio",
 ]

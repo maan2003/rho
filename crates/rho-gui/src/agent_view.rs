@@ -96,7 +96,7 @@ impl AgentView {
             editor.disable_header_for_buffer(transcript_buffer.read(cx).remote_id(), cx);
             editor.disable_header_for_buffer(system_buffer.read(cx).remote_id(), cx);
             editor.disable_header_for_buffer(prompt_buffer.read(cx).remote_id(), cx);
-            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(workspace, None)));
+            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(workspace, None, None)));
             editor
         });
 

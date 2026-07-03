@@ -59,7 +59,7 @@ impl AgentRegistry {
             .find(|topic| topic.topic_id == topic_id)?
             .agents
             .last()
-            .map(|agent| agent.repo.clone())
+            .map(|agent| PathBuf::from(agent.workspace.repo()))
     }
 
     /// The topic an agent currently belongs to, from topic summaries.
@@ -89,8 +89,13 @@ impl AgentRegistry {
             .unwrap_or(0)
     }
 
-    pub fn working_directory(&self, agent_id: AgentId) -> Option<&PathBuf> {
-        self.agent_summary(agent_id).map(|agent| &agent.repo)
+    pub fn working_directory(&self, agent_id: AgentId) -> Option<PathBuf> {
+        self.agent_summary(agent_id)
+            .map(|agent| PathBuf::from(agent.workspace.repo()))
+    }
+
+    pub fn agent_workspace(&self, agent_id: AgentId) -> Option<&rho_ui_proto::WorkspaceInfo> {
+        self.agent_summary(agent_id).map(|agent| &agent.workspace)
     }
 
     /// The pin/archive status of an agent, from topic summaries.
@@ -195,6 +200,16 @@ impl AgentRegistry {
         live.get(index).copied()
     }
 
+    /// Resolves an agent label (as produced by [`Self::agent_id_label`],
+    /// with or without a leading `@`) back to the agent id.
+    pub fn agent_by_label(&self, label: &str) -> Option<AgentId> {
+        let label = label.strip_prefix('@').unwrap_or(label);
+        self.agents
+            .keys()
+            .copied()
+            .find(|agent_id| self.agent_id_label(*agent_id) == label)
+    }
+
     pub fn live_agents(&self) -> impl Iterator<Item = &AgentId> {
         self.agents
             .iter()
@@ -220,7 +235,9 @@ mod tests {
         UiAgentSummary {
             agent_id: agent_id(id),
             display_name: None,
-            repo: "/tmp".into(),
+            workspace: rho_ui_proto::WorkspaceInfo::UserCheckout {
+                repo: "/tmp".to_owned(),
+            },
             status,
         }
     }

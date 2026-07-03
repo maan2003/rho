@@ -154,6 +154,7 @@ impl Workspace {
                     self.draft_view.update(cx, |view, cx| {
                         view.set_body_text("", cx);
                         view.set_workdir_text(&label, cx);
+                        view.set_start_text(crate::draft_view::DEFAULT_START, cx);
                     });
                     self.select_agent(Some(agent_id), window, cx);
                 }
@@ -315,15 +316,79 @@ impl Workspace {
             );
             return;
         };
+        let start = {
+            let draft = self.draft_view.read(cx);
+            let mode = draft.start_mode();
+            let target = draft.start_text(cx).trim().to_owned();
+            match self.parse_start(mode, &target) {
+                Ok(start) => start,
+                Err(message) => {
+                    self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                    return;
+                }
+            }
+        };
         self.awaiting_draft_agent = true;
         self.connection.send(ClientMessage::NewAgent {
             topic_id,
             repo: working_directory,
-            // Start-point picking lands with the draft's cycling field; for
-            // now every agent starts on a fresh change on the user's @.
-            start: rho_ui_proto::StartMode::NewOn(rho_ui_proto::StartTarget::User),
+            start,
             content: Some(vec![ContentPart::Text { text: body }]),
         });
+    }
+
+    /// Interprets the draft's start field (seeded with `@-`, the parents of
+    /// your working copy). An agent label resolves to the agent's workspace
+    /// — `<name>@` as a stacking base, or the workspace itself for Join;
+    /// anything else is a revset (stacking only). `user` is only meaningful
+    /// for Join — your own checkout.
+    fn parse_start(
+        &self,
+        mode: crate::draft_view::StartFieldMode,
+        target: &str,
+    ) -> Result<rho_ui_proto::StartMode, String> {
+        use crate::draft_view::StartFieldMode;
+        use rho_ui_proto::{JoinTarget, StartMode, WorkspaceInfo};
+        let workspace = self
+            .registry
+            .agent_by_label(target)
+            .and_then(|agent_id| self.registry.agent_workspace(agent_id))
+            .cloned();
+        Ok(match (mode, target, workspace) {
+            (StartFieldMode::NewOn, "", _) => {
+                return Err("pick a base: a revset like `@-` or an agent label".to_owned());
+            }
+            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workspace { name, .. })) => {
+                StartMode::NewOn(format!("{name}@"))
+            }
+            // An agent in the user's checkout works on the user's own change.
+            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::UserCheckout { .. })) => {
+                StartMode::NewOn("@".to_owned())
+            }
+            (StartFieldMode::NewOn, _, None) => {
+                if target.eq_ignore_ascii_case("user") {
+                    return Err("`user` is a join target; base on a revset like `@-`, \
+                         or Shift-Tab to Join mode"
+                        .to_owned());
+                }
+                if target.starts_with('@') && target.len() > 1 {
+                    return Err(format!("no agent named `{target}`"));
+                }
+                StartMode::NewOn(target.to_owned())
+            }
+            (StartFieldMode::Join, _, Some(workspace)) => {
+                StartMode::Join(JoinTarget::Workspace(workspace))
+            }
+            (StartFieldMode::Join, target, None) => {
+                if target.is_empty() || target.eq_ignore_ascii_case("user") {
+                    StartMode::Join(JoinTarget::User)
+                } else {
+                    return Err(format!(
+                        "join target must be `user` or an agent label, not `{target}`"
+                    ));
+                }
+            }
+        })
     }
 
     fn handle_command(
@@ -604,12 +669,26 @@ impl Workspace {
             .or(self.default_topic_id)
     }
 
-    /// Tab in the draft jumps between the `Workdir:` header and the body;
-    /// on agent views it does nothing (yet).
+    /// Tab in the draft cycles the `Workdir:` field, the start field, and
+    /// the body; on agent views it does nothing (yet).
     fn cycle_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.registry.selected_agent().is_none() {
             self.draft_view
                 .update(cx, |view, cx| view.toggle_field(window, cx));
+        }
+    }
+
+    /// Shift-Tab in the draft: with the cursor in the start field, flip its
+    /// mode (on top of ↔ join); anywhere else, cycle fields like Tab.
+    fn cycle_draft_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.registry.selected_agent().is_none() {
+            self.draft_view.update(cx, |view, cx| {
+                if view.cursor_in_start_field(cx) {
+                    view.cycle_start_mode(cx);
+                } else {
+                    view.toggle_field(window, cx);
+                }
+            });
         }
     }
 
@@ -905,7 +984,7 @@ impl Render for Workspace {
                 this.cycle_draft_field(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RoleCycleGroup, window, cx| {
-                this.cycle_draft_field(window, cx);
+                this.cycle_draft_group(window, cx);
             }))
             .child(rail)
             .child(
