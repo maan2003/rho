@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, bail};
-pub use rho_agent::db::{AgentId, Status, TopicId};
+pub use rho_agent::db::{AgentId, AgentIdDomain, Status, TopicId};
 use rho_core::ContentPart;
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
@@ -137,6 +137,9 @@ pub enum ServerMessage {
         /// daemon-created "default" topic). Identified explicitly so clients
         /// never have to guess from topic ordering.
         default_topic_id: TopicId,
+        /// The daemon database's machine seed; clients need it to encode
+        /// agent IDs (see [`AgentIdDomain`]).
+        machine_seed: u64,
     },
     Error {
         message: String,

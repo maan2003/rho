@@ -15,6 +15,7 @@ rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
 prefix-id.workspace = true
+rand.workspace = true
 rho-tool-shell.workspace = true
 redb.workspace = true
 redb-derive = "0.1"

@@ -121,8 +121,10 @@ impl Workspace {
                 topics,
                 workdirs,
                 default_topic_id,
+                machine_seed,
             } => {
                 let first_ready = !self.connected;
+                self.registry.set_machine_seed(machine_seed);
                 self.registry.set_topics(topics);
                 self.workdirs = workdirs;
                 self.default_topic_id = Some(default_topic_id);

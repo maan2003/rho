@@ -21,6 +21,7 @@ pub enum ConnEvent {
         topics: Vec<UiTopic>,
         workdirs: Vec<UiWorkdir>,
         default_topic_id: rho_ui_proto::TopicId,
+        machine_seed: u64,
     },
     TopicCreated(UiTopic),
     /// The daemon created an agent this connection asked for.
@@ -83,6 +84,7 @@ async fn run(
         topics,
         workdirs,
         default_topic_id,
+        machine_seed,
     } = message
     else {
         anyhow::bail!("rho daemon did not send ready message");
@@ -92,6 +94,7 @@ async fn run(
             topics,
             workdirs,
             default_topic_id,
+            machine_seed,
         })
         .is_err()
     {
@@ -120,10 +123,12 @@ async fn run(
                 topics,
                 workdirs,
                 default_topic_id,
+                machine_seed,
             } => Some(ConnEvent::Ready {
                 topics,
                 workdirs,
                 default_topic_id,
+                machine_seed,
             }),
             ServerMessage::TopicCreated { topic } => Some(ConnEvent::TopicCreated(topic)),
             ServerMessage::AgentCreated { agent_id, .. } => Some(ConnEvent::AgentCreated(agent_id)),

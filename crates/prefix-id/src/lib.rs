@@ -1,6 +1,6 @@
 //! Fixed-length counter IDs with short dynamic prefixes.
 //!
-//! `PrefixId` maps a monotonically increasing counter to an 8-character
+//! `PrefixId` maps a monotonically increasing counter to a 12-character
 //! lowercase alphanumeric (`a-z0-9`) ID. Properties:
 //!
 //! - **Short unique prefixes**: the low-order base36 counter digits are emitted
@@ -14,8 +14,14 @@
 //!   deterministic — the first character cycles through a fixed,
 //!   domain-specific order with period 36, which is unavoidable given the
 //!   prefix-uniqueness guarantee.
-//! - **Domain separation**: encoding is keyed by [`PrefixIdDomain`], so the
-//!   same counter encodes differently across ID families.
+//! - **Cross-machine uniqueness**: every character is scrambled keyed by the
+//!   domain's machine seed, so IDs from machines with different seeds
+//!   collide with probability ~`36^-12` per ID pair, and nothing about an ID
+//!   is readable or linkable by outsiders. Resolution self-scopes: a foreign
+//!   full ID decodes under the wrong seed to a pseudorandom counter, which
+//!   almost surely exceeds `total_generated` and resolves to `NotFound`.
+//! - **Domain separation**: encoding is keyed by [`PrefixIdDomain::KIND`], so
+//!   the same counter encodes differently across ID families.
 //! - **Stateless**: counter and ID convert in both directions with no lookup
 //!   table; only the raw counter is stored (fixed-width `u64` in redb).
 
@@ -27,10 +33,10 @@ const ALPHABET: &[u8; BASE as usize] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 const BASE: u64 = 36;
 
 
-/// Fixed ID length.
-pub const LEN: usize = 8;
+/// Fixed ID length: the largest for which `36^LEN` still fits in a `u64`.
+pub const LEN: usize = 12;
 
-/// Number of distinct IDs representable by this crate: `36^8`.
+/// Number of distinct counters representable per machine: `36^12`.
 pub const CAPACITY: u64 = BASE.pow(LEN as u32);
 
 /// A fixed-length alphanumeric ID optimized for short dynamic prefixes.
@@ -40,9 +46,15 @@ pub struct PrefixId<D: PrefixIdDomain> {
     _domain: PhantomData<fn() -> D>,
 }
 
-/// Marker trait selecting the hash domain for a prefix ID family.
+/// Keys the encoding for an ID family.
 pub trait PrefixIdDomain {
-    const HASH_DOMAIN: &'static str;
+    /// Distinguishes ID families (agents vs topics); part of every hash key.
+    const KIND: &'static str;
+
+    /// Wide random identity of the generating machine, persisted once per
+    /// database. It keys all character scrambling, so it must be
+    /// full-entropy random, not a small assigned number.
+    fn machine_seed(&self) -> u64;
 }
 
 impl<D: PrefixIdDomain> PrefixId<D> {
@@ -69,18 +81,18 @@ impl<D: PrefixIdDomain> PrefixId<D> {
         self.counter
     }
 
-    /// Returns the encoded 8-character ID.
-    pub fn encoded(&self) -> String {
+    /// Returns the encoded fixed-length ID, scrambled keyed by the domain's
+    /// kind and machine seed.
+    pub fn encoded(&self, domain: &D) -> String {
         let mut bytes = [0; LEN];
         let mut remaining = self.counter;
-        let mut hasher = domain_hasher::<D>();
+        let mut hasher = machine_hasher(domain);
 
         for pos in 0..LEN {
             let digit = (remaining % BASE) as u8;
             remaining /= BASE;
 
-            let encoded = permute_digit(&hasher, digit);
-            bytes[pos] = ALPHABET[encoded as usize];
+            bytes[pos] = ALPHABET[permute_digit(&hasher, digit) as usize];
             hasher.write(&bytes[pos..=pos]);
         }
 
@@ -120,6 +132,7 @@ impl<D: PrefixIdDomain> PrefixId<D> {
     pub fn from_prefix(
         prefix: &str,
         total_generated: u64,
+        domain: &D,
     ) -> Result<PrefixResolution<D>, ParsePrefixIdError> {
         if prefix.len() > LEN {
             return Err(ParsePrefixIdError::PrefixTooLong {
@@ -136,7 +149,7 @@ impl<D: PrefixIdDomain> PrefixId<D> {
 
         let mut residue = 0u64;
         let mut place = 1u64;
-        let mut hasher = domain_hasher::<D>();
+        let mut hasher = machine_hasher(domain);
 
         for byte in prefix.bytes() {
             let encoded = ALPHABET
@@ -243,7 +256,10 @@ impl<D: PrefixIdDomain> redb::Value for PrefixId<D> {
     }
 
     fn type_name() -> redb::TypeName {
-        redb::TypeName::new(&format!("prefix_id::PrefixId<{}>", D::HASH_DOMAIN))
+        redb::TypeName::new(&format!(
+            "prefix_id::PrefixId<{}>",
+            std::any::type_name::<D>()
+        ))
     }
 }
 
@@ -288,11 +304,11 @@ impl fmt::Display for ParsePrefixIdError {
 
 impl std::error::Error for ParsePrefixIdError {}
 
-/// A hasher fed the domain and then each emitted character, so the digit shift
-/// at each position depends on the characters before it.
-fn domain_hasher<D: PrefixIdDomain>() -> fnv::FnvHasher {
+/// Keys all character scrambling for one machine's IDs.
+fn machine_hasher<D: PrefixIdDomain>(domain: &D) -> fnv::FnvHasher {
     let mut hasher = fnv::FnvHasher::default();
-    hasher.write(D::HASH_DOMAIN.as_bytes());
+    hasher.write(D::KIND.as_bytes());
+    hasher.write(&domain.machine_seed().to_le_bytes());
     hasher
 }
 
@@ -357,7 +373,23 @@ mod tests {
     struct TestDomain;
 
     impl PrefixIdDomain for TestDomain {
-        const HASH_DOMAIN: &'static str = "test-id";
+        const KIND: &'static str = "test-id";
+
+        fn machine_seed(&self) -> u64 {
+            0x746573742d6d6163
+        }
+    }
+
+    /// Same kind as [`TestDomain`], different machine.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct TestMachine(u64);
+
+    impl PrefixIdDomain for TestMachine {
+        const KIND: &'static str = "test-id";
+
+        fn machine_seed(&self) -> u64 {
+            self.0
+        }
     }
 
     type Id = PrefixId<TestDomain>;
@@ -366,9 +398,9 @@ mod tests {
     fn ids_are_fixed_length_and_lowercase_alphanumeric() {
         for counter in 0..1_000 {
             let id = Id::from_counter(counter).unwrap();
-            assert_eq!(id.encoded().len(), LEN);
+            assert_eq!(id.encoded(&TestDomain).len(), LEN);
             assert!(
-                id.encoded()
+                id.encoded(&TestDomain)
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
             );
@@ -383,7 +415,7 @@ mod tests {
             let id = Id::from_counter(counter).unwrap();
             assert_eq!(id.to_counter(), counter);
             assert_eq!(
-                Id::from_prefix(&id.encoded(), CAPACITY).unwrap(),
+                Id::from_prefix(&id.encoded(&TestDomain), CAPACITY, &TestDomain).unwrap(),
                 PrefixResolution::Unique(id)
             );
         }
@@ -406,16 +438,19 @@ mod tests {
 
     #[test]
     fn domains_use_different_first_character_orders() {
-        fn first_char_cycle<D: PrefixIdDomain>() -> Vec<u8> {
+        fn first_char_cycle<D: PrefixIdDomain>(domain: &D) -> Vec<u8> {
             (0..BASE)
                 .map(|counter| {
-                    PrefixId::<D>::from_counter(counter).unwrap().encoded().into_bytes()[0]
+                    PrefixId::<D>::from_counter(counter)
+                        .unwrap()
+                        .encoded(domain)
+                        .into_bytes()[0]
                 })
                 .collect()
         }
 
-        let test_cycle = first_char_cycle::<TestDomain>();
-        let other_cycle = first_char_cycle::<OtherDomain>();
+        let test_cycle = first_char_cycle(&TestDomain);
+        let other_cycle = first_char_cycle(&OtherDomain);
         let is_rotation = (0..BASE as usize).any(|offset| {
             (0..BASE as usize)
                 .all(|i| test_cycle[i] == other_cycle[(i + offset) % BASE as usize])
@@ -426,7 +461,10 @@ mod tests {
     #[test]
     fn consecutive_counters_do_not_look_sequential() {
         let canonical_index = |counter: u64| {
-            let first = Id::from_counter(counter).unwrap().encoded().into_bytes()[0];
+            let first = Id::from_counter(counter)
+                .unwrap()
+                .encoded(&TestDomain)
+                .into_bytes()[0];
             ALPHABET.iter().position(|byte| *byte == first).unwrap()
         };
 
@@ -450,7 +488,48 @@ mod tests {
     struct OtherDomain;
 
     impl PrefixIdDomain for OtherDomain {
-        const HASH_DOMAIN: &'static str = "other-id";
+        const KIND: &'static str = "other-id";
+
+        fn machine_seed(&self) -> u64 {
+            0x746573742d6d6163
+        }
+    }
+
+    #[test]
+    fn machine_seed_changes_encoding_and_scopes_resolution() {
+        let (machine_a, machine_b) = (TestMachine(1), TestMachine(2));
+
+        let id = PrefixId::<TestMachine>::from_counter(42).unwrap();
+        let encoded_a = id.encoded(&machine_a);
+        assert_ne!(encoded_a, id.encoded(&machine_b));
+
+        // A full ID resolves on its own machine; under a foreign seed it
+        // decodes to a pseudorandom counter far beyond any realistic
+        // `total_generated`, so resolution self-scopes.
+        assert_eq!(
+            PrefixId::from_prefix(&encoded_a, 100, &machine_a).unwrap(),
+            PrefixResolution::Unique(id)
+        );
+        assert_eq!(
+            PrefixId::from_prefix(&encoded_a, 100, &machine_b).unwrap(),
+            PrefixResolution::NotFound
+        );
+    }
+
+    #[test]
+    fn ids_from_different_machines_do_not_collide() {
+        let (machine_a, machine_b) = (TestMachine(1), TestMachine(2));
+        for counter_a in 0..100u64 {
+            let encoded_a = PrefixId::<TestMachine>::from_counter(counter_a)
+                .unwrap()
+                .encoded(&machine_a);
+            for counter_b in 0..100u64 {
+                let encoded_b = PrefixId::<TestMachine>::from_counter(counter_b)
+                    .unwrap()
+                    .encoded(&machine_b);
+                assert_ne!(encoded_a, encoded_b);
+            }
+        }
     }
 
     #[test]
@@ -458,7 +537,7 @@ mod tests {
         let test_id = Id::from_counter(42).unwrap();
         let other_id = PrefixId::<OtherDomain>::from_counter(42).unwrap();
 
-        assert_ne!(test_id.encoded(), other_id.encoded());
+        assert_ne!(test_id.encoded(&TestDomain), other_id.encoded(&OtherDomain));
         assert_eq!(other_id.to_counter(), 42);
     }
 
@@ -473,11 +552,11 @@ mod tests {
     fn resolves_unique_prefixes() {
         let id = Id::from_counter(20).unwrap();
         assert_eq!(
-            Id::from_prefix(&id.encoded()[..1], 36).unwrap(),
+            Id::from_prefix(&id.encoded(&TestDomain)[..1], 36, &TestDomain).unwrap(),
             PrefixResolution::Unique(id)
         );
         assert_eq!(
-            Id::from_prefix(&id.encoded()[..2], 36 * 36).unwrap(),
+            Id::from_prefix(&id.encoded(&TestDomain)[..2], 36 * 36, &TestDomain).unwrap(),
             PrefixResolution::Unique(id)
         );
     }
@@ -486,7 +565,7 @@ mod tests {
     fn resolves_ambiguous_prefixes() {
         let id = Id::from_counter(20).unwrap();
         assert_eq!(
-            Id::from_prefix(&id.encoded()[..1], 36 + 21).unwrap(),
+            Id::from_prefix(&id.encoded(&TestDomain)[..1], 36 + 21, &TestDomain).unwrap(),
             PrefixResolution::Ambiguous { matches: 2 }
         );
     }
@@ -495,7 +574,7 @@ mod tests {
     fn resolves_missing_prefixes() {
         let id = Id::from_counter(20).unwrap();
         assert_eq!(
-            Id::from_prefix(&id.encoded()[..1], 20).unwrap(),
+            Id::from_prefix(&id.encoded(&TestDomain)[..1], 20, &TestDomain).unwrap(),
             PrefixResolution::NotFound
         );
     }
@@ -518,7 +597,7 @@ mod tests {
         let mut prefixes = HashSet::new();
         for counter in 0..count as u64 {
             let id = Id::from_counter(counter).unwrap();
-            assert!(prefixes.insert(id.encoded()[..prefix_len].to_owned()));
+            assert!(prefixes.insert(id.encoded(&TestDomain)[..prefix_len].to_owned()));
         }
     }
 }

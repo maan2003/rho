@@ -15,6 +15,10 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use crate::AgentEvent;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
+/// Singleton row holding this database's random machine seed (see
+/// [`PrefixIdDomain::machine_seed`]), generated once at init.
+const MACHINE: TableDefinition<u8, u64> = TableDefinition::new("machine");
+const MACHINE_SEED_KEY: u8 = 0;
 const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentEventPos> =
     TableDefinition::new("lineage_parents");
 const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
@@ -53,11 +57,16 @@ impl CounterKey {
 )]
 pub struct AgentId(PrefixId<AgentIdDomain>);
 
+/// Keys agent-id encoding with this database's persisted machine seed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AgentIdDomain;
+pub struct AgentIdDomain(pub u64);
 
 impl PrefixIdDomain for AgentIdDomain {
-    const HASH_DOMAIN: &'static str = "agent-id";
+    const KIND: &'static str = "agent-id";
+
+    fn machine_seed(&self) -> u64 {
+        self.0
+    }
 }
 
 impl AgentId {
@@ -67,6 +76,10 @@ impl AgentId {
 
     pub fn prefix_id(&self) -> &PrefixId<AgentIdDomain> {
         &self.0
+    }
+
+    pub fn encoded(&self, domain: &AgentIdDomain) -> String {
+        self.0.encoded(domain)
     }
 }
 
@@ -184,6 +197,9 @@ pub struct AgentRecord {
 }
 
 pub trait AgentReadTxnExt {
+    /// This database's random machine seed; present once
+    /// [`AgentWriteTxnExt::init_agent_tables`] has run.
+    fn machine_seed(&self) -> u64;
     fn get_topic(&self, topic_id: TopicId) -> TopicRecord;
     fn list_topics(&self) -> Vec<(TopicId, TopicRecord)>;
     fn list_topic_agents(&self, topic_id: TopicId) -> Vec<AgentId>;
@@ -227,6 +243,13 @@ pub trait AgentWriteTxnExt {
 }
 
 impl AgentReadTxnExt for ReadTxn {
+    fn machine_seed(&self) -> u64 {
+        self.open_table(MACHINE)
+            .get(&MACHINE_SEED_KEY)
+            .expect("machine seed missing; init_agent_tables must run first")
+            .value()
+    }
+
     fn get_topic(&self, topic_id: TopicId) -> TopicRecord {
         self.open_table(TOPICS)
             .get(&topic_id)
@@ -325,6 +348,10 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(TOPICS);
         self.open_table(TOPIC_AGENTS);
         self.open_table(WORKDIRS);
+        let mut machine = self.open_table(MACHINE);
+        if machine.get(&MACHINE_SEED_KEY).is_none() {
+            machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
+        }
     }
 
     fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId {

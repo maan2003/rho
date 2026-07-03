@@ -77,6 +77,7 @@ pub struct AgentClient {
     known_agent_ids: watch::Receiver<Vec<AgentId>>,
     frames: broadcast::Sender<(AgentId, AgentRemoteFrame)>,
     counters: IoCounters,
+    machine_seed: u64,
 }
 
 impl AgentClient {
@@ -104,6 +105,7 @@ impl AgentClient {
             topics,
             workdirs,
             default_topic_id,
+            machine_seed,
         } = read_frame_counted(&mut stream, Some(&client_counters)).await?
         else {
             anyhow::bail!("rho daemon did not send ready message");
@@ -116,6 +118,7 @@ impl AgentClient {
                     topics: topics.clone(),
                     workdirs: workdirs.clone(),
                     default_topic_id,
+                    machine_seed,
                 },
             );
         }
@@ -162,6 +165,7 @@ impl AgentClient {
                         topics,
                         workdirs,
                         default_topic_id,
+                        machine_seed: _,
                     } => {
                         known_agent_ids = topic_agent_ids(&topics);
                         if topics_tx.send(topics).is_err() {
@@ -233,11 +237,17 @@ impl AgentClient {
             known_agent_ids: known_agent_ids_rx,
             frames: frame_tx,
             counters: client_counters,
+            machine_seed,
         })
     }
 
     pub fn io_counters(&self) -> IoCounters {
         self.counters.clone()
+    }
+
+    /// The daemon database's machine seed, for encoding agent IDs.
+    pub fn machine_seed(&self) -> u64 {
+        self.machine_seed
     }
 
     pub fn blocks(&self) -> Vec<UiBlock> {

@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use rho_ui_proto::{AgentId, UiTopic};
+use rho_ui_proto::{AgentId, AgentIdDomain, UiTopic};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentLife {
@@ -32,9 +32,16 @@ pub struct AgentRegistry {
     agents: BTreeMap<AgentId, AgentLife>,
     topics: Vec<UiTopic>,
     active: ActivePane,
+    /// The daemon database's machine seed, from `Ready`; keys agent ID
+    /// encoding.
+    machine_seed: u64,
 }
 
 impl AgentRegistry {
+    pub fn set_machine_seed(&mut self, machine_seed: u64) {
+        self.machine_seed = machine_seed;
+    }
+
     pub fn set_topics(&mut self, topics: Vec<UiTopic>) {
         for topic in &topics {
             for agent_id in topic.agent_ids() {
@@ -68,7 +75,7 @@ impl AgentRegistry {
         let total_generated = self.rounded_total_generated_for(agent_id);
         let prefix_id = agent_id.prefix_id();
         let prefix_len = prefix_id.unique_prefix_len(total_generated).max(2);
-        let encoded = prefix_id.encoded();
+        let encoded = agent_id.encoded(&AgentIdDomain(self.machine_seed));
         format!("ag{}", &encoded[..prefix_len])
     }
 

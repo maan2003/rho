@@ -100,6 +100,9 @@ struct AgentRegistry {
     /// The daemon-created topic agents are born into; announced in `Ready`
     /// so clients never guess it from topic ordering.
     default_topic_id: TopicId,
+    /// The database's machine seed, announced in `Ready` so clients can
+    /// encode agent IDs.
+    machine_seed: u64,
     agents: Mutex<HashMap<AgentId, Agent>>,
 }
 
@@ -108,6 +111,7 @@ impl AgentRegistry {
         let mut write = db.write().await;
         write.init_agent_tables();
         write.commit();
+        let machine_seed = db.read().machine_seed();
         // Topics are ad-hoc tab groups; every agent starts in the default
         // one (the oldest topic) until it is moved somewhere more specific.
         let default_topic_id = match db.read().list_topics().first() {
@@ -128,6 +132,7 @@ impl AgentRegistry {
             auth,
             inference_config,
             default_topic_id,
+            machine_seed,
             agents: Mutex::new(HashMap::new()),
         }
     }
@@ -180,6 +185,7 @@ impl AgentRegistry {
             topics: self.topics(),
             workdirs: self.workdirs(),
             default_topic_id: self.default_topic_id,
+            machine_seed: self.machine_seed,
         }
     }
 
