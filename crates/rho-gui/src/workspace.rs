@@ -6,10 +6,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-use camino::{Utf8Path, Utf8PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
@@ -323,6 +322,7 @@ impl Workspace {
         self.awaiting_draft_agent = true;
         self.connection.send(ClientMessage::NewAgent {
             topic_id,
+            backend: rho_ui_proto::AgentBackend::Rho,
             start,
             content: Some(vec![ContentPart::Text { text: body }]),
         });
@@ -340,8 +340,9 @@ impl Workspace {
         target: &str,
         workdir: Option<Utf8PathBuf>,
     ) -> Result<rho_ui_proto::StartMode, String> {
-        use crate::draft_view::StartFieldMode;
         use rho_ui_proto::{JoinTarget, StartMode, WorkspaceInfo};
+
+        use crate::draft_view::StartFieldMode;
         let require_workdir = || {
             workdir.clone().ok_or_else(|| {
                 "no working directory for the new agent: type one in the \

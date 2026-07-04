@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-use camino::{Utf8Path, Utf8PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Context as _;
+use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
-use rho_agent::Agent;
-use rho_agent::db::{AgentId, AgentReadTxnExt as _, AgentWriteTxnExt as _, Status, TopicId};
+use futures::stream::BoxStream;
+use rho_agent::claude::ClaudeAgent;
+use rho_agent::db::{
+    AgentId, AgentKind, AgentReadTxnExt as _, AgentWriteTxnExt as _, Status, TopicId,
+};
+use rho_agent::{Agent, AgentState};
 use rho_core::text_content;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
@@ -16,7 +19,7 @@ use rho_inference::config::InferenceConfig;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, JoinTarget, ServerMessage, StartMode, UiAgentSummary, UiTopic,
+    AgentBackend, ClientMessage, JoinTarget, ServerMessage, StartMode, UiAgentSummary, UiTopic,
     UiWorkdir, read_frame_counted, write_frame_counted,
 };
 use rho_workspaces::{Repo, WorkspaceInfo};
@@ -111,7 +114,7 @@ struct AgentRegistry {
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
-    agents: Mutex<HashMap<AgentId, Agent>>,
+    agents: Mutex<HashMap<AgentId, RunningAgent>>,
     /// One shared handle per repo root: live-workspace sharing (joined
     /// agents get one checkout + namespace) only holds within one instance.
     repos: Mutex<HashMap<Utf8PathBuf, Arc<Repo>>>,
@@ -211,7 +214,7 @@ impl AgentRegistry {
         }
     }
 
-    async fn loaded(&self) -> Vec<(AgentId, Agent)> {
+    async fn loaded(&self) -> Vec<(AgentId, RunningAgent)> {
         let mut agents = self
             .agents
             .lock()
@@ -223,7 +226,7 @@ impl AgentRegistry {
         agents
     }
 
-    async fn get(&self, agent_id: AgentId) -> Option<Agent> {
+    async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
         self.agents.lock().await.get(&agent_id).cloned()
     }
 
@@ -242,8 +245,9 @@ impl AgentRegistry {
     async fn create(
         &self,
         topic_id: TopicId,
+        backend: AgentBackend,
         start: StartMode,
-    ) -> anyhow::Result<(TopicId, AgentId, Agent)> {
+    ) -> anyhow::Result<(TopicId, AgentId, RunningAgent)> {
         let start = match start {
             StartMode::NewOn { repo, revset } => {
                 let repo = validate_repo_root(repo)?;
@@ -260,15 +264,25 @@ impl AgentRegistry {
                 rho_agent::StartWorkspace::Existing(self.repo(&repo).await?.user_checkout().await?)
             }
         };
-        let (agent_id, agent) = Agent::create(
-            self.db.clone(),
-            self.auth.clone(),
-            self.inference_config.clone(),
-            topic_id,
-            None,
-            start,
-        )
-        .await?;
+        let (agent_id, agent) = match backend {
+            AgentBackend::Rho => {
+                let (agent_id, agent) = Agent::create(
+                    self.db.clone(),
+                    self.auth.clone(),
+                    self.inference_config.clone(),
+                    topic_id,
+                    None,
+                    start,
+                )
+                .await?;
+                (agent_id, RunningAgent::Rho(agent))
+            }
+            AgentBackend::Claude { model } => {
+                let (agent_id, agent) =
+                    ClaudeAgent::create(self.db.clone(), topic_id, None, start, model).await?;
+                (agent_id, RunningAgent::Claude(agent))
+            }
+        };
         self.agents.lock().await.insert(agent_id, agent.clone());
         Ok((topic_id, agent_id, agent))
     }
@@ -381,15 +395,61 @@ impl AgentRegistry {
         Ok(())
     }
 
-    async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, Agent, bool)> {
+    async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, RunningAgent, bool)> {
         if let Some(agent) = self.agents.lock().await.get(&agent_id).cloned() {
             return Ok((agent_id, agent, false));
         }
         let record = self.db.read().get_agent(agent_id);
         let workspace = self.open_workspace(&record.workspace).await?;
-        let agent = Agent::load(self.db.clone(), self.auth.clone(), agent_id, workspace);
+        let agent = match record.kind {
+            AgentKind::Rho { .. } => RunningAgent::Rho(Agent::load(
+                self.db.clone(),
+                self.auth.clone(),
+                agent_id,
+                workspace,
+            )),
+            AgentKind::Claude { .. } => {
+                RunningAgent::Claude(ClaudeAgent::load(self.db.clone(), agent_id, workspace).await?)
+            }
+        };
         self.agents.lock().await.insert(agent_id, agent.clone());
         Ok((agent_id, agent, true))
+    }
+}
+
+#[derive(Clone)]
+enum RunningAgent {
+    Rho(Agent),
+    Claude(ClaudeAgent),
+}
+
+impl RunningAgent {
+    fn state(&self) -> AgentState {
+        match self {
+            Self::Rho(agent) => agent.state(),
+            Self::Claude(agent) => agent.state(),
+        }
+    }
+
+    fn send_user_message(&self, text: String) {
+        match self {
+            Self::Rho(agent) => agent.send_user_message(text),
+            Self::Claude(agent) => agent.send_user_message(text),
+        }
+    }
+
+    fn cancel(&self) {
+        match self {
+            Self::Rho(agent) => agent.cancel(),
+            Self::Claude(agent) => agent.cancel(),
+        }
+    }
+
+    fn subscribe(&self) -> BoxStream<'static, AgentState> {
+        match self {
+            Self::Rho(agent) => agent.subscribe().boxed(),
+            Self::Claude(agent) => agent.subscribe().boxed(),
+        }
     }
 }
 
@@ -465,10 +525,11 @@ async fn handle_message(
         }
         ClientMessage::NewAgent {
             topic_id,
+            backend,
             start,
             content,
         } => {
-            let (topic_id, agent_id, agent) = agents.create(topic_id, start).await?;
+            let (topic_id, agent_id, agent) = agents.create(topic_id, backend, start).await?;
             subscribe_agent(agent_id, agent.clone(), outgoing_tx.clone());
             let _ = outgoing_tx.send(ServerMessage::AgentCreated { topic_id, agent_id });
             if let Some(content) = content {
@@ -532,7 +593,7 @@ async fn handle_message(
 
 fn subscribe_agent(
     agent_id: AgentId,
-    agent: Agent,
+    agent: RunningAgent,
     state_tx: mpsc::UnboundedSender<ServerMessage>,
 ) {
     tokio::spawn(async move {

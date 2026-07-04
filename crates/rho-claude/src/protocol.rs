@@ -1,9 +1,9 @@
-use senax_encoder::{Decode, Encode};
+use senax_encoder::{Decode, Encode, Pack, Unpack};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Encode, Decode)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Model {
     Opus,
     Sonnet,

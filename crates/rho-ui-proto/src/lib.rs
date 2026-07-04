@@ -4,11 +4,11 @@
 //! and daemon can map these messages onto concrete `rho-agent` handles without
 //! teaching lower crates about sockets or UI policy.
 
-use camino::Utf8PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, bail};
+use camino::Utf8PathBuf;
 pub use rho_agent::db::{AgentId, AgentIdDomain, Status, TopicId, TopicIdDomain};
 use rho_core::ContentPart;
 pub use rho_workspaces::WorkspaceInfo;
@@ -69,6 +69,7 @@ pub enum ClientMessage {
     },
     NewAgent {
         topic_id: TopicId,
+        backend: AgentBackend,
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).
         start: StartMode,
@@ -118,6 +119,12 @@ pub enum ClientMessage {
     WorkdirRemove {
         path: Utf8PathBuf,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum AgentBackend {
+    Rho,
+    Claude { model: rho_claude::Model },
 }
 
 /// Where a new agent works. Each mode carries exactly the data it needs:

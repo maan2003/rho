@@ -15,6 +15,7 @@ futures.workspace = true
 async-stream.workspace = true
 bytes.workspace = true
 rho-agent.workspace = true
+rho-claude.workspace = true
 rho-core.workspace = true
 senax-encoder.workspace = true
 tokio.workspace = true
