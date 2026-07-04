@@ -10,6 +10,27 @@ pub enum Model {
     Fable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub(crate) fn as_arg(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 impl Model {
     pub(crate) fn as_arg(self) -> &'static str {
         match self {

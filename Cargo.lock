@@ -8447,7 +8447,6 @@ dependencies = [
  "camino",
  "futures",
  "rho-agent",
- "rho-claude",
  "rho-core",
  "rho-workspaces",
  "senax-encoder",

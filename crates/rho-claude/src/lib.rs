@@ -15,7 +15,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 pub mod protocol;
 mod transcript;
 
-pub use protocol::{ClaudeEvent, Model, Session};
+pub use protocol::{ClaudeEvent, Effort, Model, Session};
 pub use transcript::*;
 
 const DEFAULT_COMMAND: &str = "claude";
@@ -29,15 +29,22 @@ pub struct ClaudeCodeOptions {
     pub command: Utf8PathBuf,
     pub cwd: Utf8PathBuf,
     pub model: Model,
+    pub effort: Effort,
     pub session: Session,
 }
 
 impl ClaudeCodeOptions {
-    pub fn new(cwd: impl Into<Utf8PathBuf>, model: Model, session_id: uuid::Uuid) -> Self {
+    pub fn new(
+        cwd: impl Into<Utf8PathBuf>,
+        model: Model,
+        effort: Effort,
+        session_id: uuid::Uuid,
+    ) -> Self {
         Self {
             command: DEFAULT_COMMAND.into(),
             cwd: cwd.into(),
             model,
+            effort,
             session: Session::New { session_id },
         }
     }
@@ -55,6 +62,8 @@ impl ClaudeCodeOptions {
             "--allow-dangerously-skip-permissions".to_owned(),
             "--model".to_owned(),
             self.model.as_arg().to_owned(),
+            "--effort".to_owned(),
+            self.effort.as_arg().to_owned(),
         ];
         match &self.session {
             Session::New { session_id } => {
@@ -183,6 +192,7 @@ mod tests {
         let options = ClaudeCodeOptions::new(
             "/tmp/project",
             Model::Sonnet,
+            Effort::Medium,
             uuid::uuid!("00000000-0000-4000-8000-000000000000"),
         );
 
@@ -200,6 +210,8 @@ mod tests {
                 "--allow-dangerously-skip-permissions",
                 "--model",
                 "sonnet",
+                "--effort",
+                "medium",
                 "--session-id",
                 "00000000-0000-4000-8000-000000000000",
             ]

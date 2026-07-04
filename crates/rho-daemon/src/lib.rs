@@ -9,18 +9,17 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use rho_agent::claude::ClaudeAgent;
 use rho_agent::db::{
-    AgentId, AgentKind, AgentReadTxnExt as _, AgentWriteTxnExt as _, Status, TopicId,
+    AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, Status, TopicId,
 };
 use rho_agent::{Agent, AgentState};
 use rho_core::text_content;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
-use rho_inference::config::InferenceConfig;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    AgentBackend, ClientMessage, JoinTarget, ServerMessage, StartMode, UiAgentSummary, UiTopic,
-    UiWorkdir, read_frame_counted, write_frame_counted,
+    ClientMessage, JoinTarget, ServerMessage, StartMode, UiAgentSummary, UiTopic, UiWorkdir,
+    read_frame_counted, write_frame_counted,
 };
 use rho_workspaces::{Repo, WorkspaceInfo};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -68,8 +67,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     let db = RhoDb::open(default_db_path()?);
     let auth = InferenceAuth::named(&args.auth)?;
-    let inference_config = InferenceConfig::deep();
-    let agents = Arc::new(AgentRegistry::new(db, auth, inference_config).await);
+    let agents = Arc::new(AgentRegistry::new(db, auth).await);
 
     let active_connections = Arc::new(AtomicUsize::new(0));
     let connection_closed = Arc::new(Notify::new());
@@ -107,7 +105,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 struct AgentRegistry {
     db: RhoDb,
     auth: InferenceAuth,
-    inference_config: InferenceConfig,
     /// The daemon-created topic agents are born into; announced in `Ready`
     /// so clients never guess it from topic ordering.
     default_topic_id: TopicId,
@@ -121,7 +118,7 @@ struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    async fn new(db: RhoDb, auth: InferenceAuth, inference_config: InferenceConfig) -> Self {
+    async fn new(db: RhoDb, auth: InferenceAuth) -> Self {
         let mut write = db.write().await;
         write.init_agent_tables();
         write.commit();
@@ -149,7 +146,6 @@ impl AgentRegistry {
         Self {
             db,
             auth,
-            inference_config,
             default_topic_id,
             machine_seed,
             agents: Mutex::new(HashMap::new()),
@@ -245,7 +241,7 @@ impl AgentRegistry {
     async fn create(
         &self,
         topic_id: TopicId,
-        backend: AgentBackend,
+        mode: AgentMode,
         start: StartMode,
     ) -> anyhow::Result<(TopicId, AgentId, RunningAgent)> {
         let start = match start {
@@ -264,12 +260,12 @@ impl AgentRegistry {
                 rho_agent::StartWorkspace::Existing(self.repo(&repo).await?.user_checkout().await?)
             }
         };
-        let (agent_id, agent) = match backend {
-            AgentBackend::Rho => {
+        let (agent_id, agent) = match mode {
+            AgentMode::Deep { .. } => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
                     self.auth.clone(),
-                    self.inference_config.clone(),
+                    mode,
                     topic_id,
                     None,
                     start,
@@ -277,9 +273,9 @@ impl AgentRegistry {
                 .await?;
                 (agent_id, RunningAgent::Rho(agent))
             }
-            AgentBackend::Claude { model } => {
+            AgentMode::Fable { .. } => {
                 let (agent_id, agent) =
-                    ClaudeAgent::create(self.db.clone(), topic_id, None, start, model).await?;
+                    ClaudeAgent::create(self.db.clone(), topic_id, None, start, mode).await?;
                 (agent_id, RunningAgent::Claude(agent))
             }
         };
@@ -401,14 +397,14 @@ impl AgentRegistry {
         }
         let record = self.db.read().get_agent(agent_id);
         let workspace = self.open_workspace(&record.workspace).await?;
-        let agent = match record.kind {
-            AgentKind::Rho { .. } => RunningAgent::Rho(Agent::load(
+        let agent = match record.runtime {
+            AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load(
                 self.db.clone(),
                 self.auth.clone(),
                 agent_id,
                 workspace,
             )),
-            AgentKind::Claude { .. } => {
+            AgentRuntime::Claude { .. } => {
                 RunningAgent::Claude(ClaudeAgent::load(self.db.clone(), agent_id, workspace).await?)
             }
         };
@@ -525,11 +521,11 @@ async fn handle_message(
         }
         ClientMessage::NewAgent {
             topic_id,
-            backend,
+            mode,
             start,
             content,
         } => {
-            let (topic_id, agent_id, agent) = agents.create(topic_id, backend, start).await?;
+            let (topic_id, agent_id, agent) = agents.create(topic_id, mode, start).await?;
             subscribe_agent(agent_id, agent.clone(), outgoing_tx.clone());
             let _ = outgoing_tx.send(ServerMessage::AgentCreated { topic_id, agent_id });
             if let Some(content) = content {

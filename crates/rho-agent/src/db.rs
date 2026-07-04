@@ -7,7 +7,7 @@ use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
-use rho_inference::config::InferenceProtectedConfig;
+use rho_inference::config::{Effort as InferenceEffort, InferenceConfig, InferenceProtectedConfig};
 use rho_workspaces::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
@@ -31,7 +31,7 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "b146bc14";
+const CURRENT_AGENT_DB_FORMAT: &str = "8f6a5d2c";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -39,7 +39,11 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "b146bc14",
+    to: CURRENT_AGENT_DB_FORMAT,
+    migrate: migrate_agent_records,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -167,7 +171,7 @@ impl AgentEventPos {
 
 pub type UnixMillis = UnixMs;
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
     /// Where this agent works. Fixed at creation: the accumulated model
@@ -180,11 +184,149 @@ pub struct AgentRecord {
     pub updated_at: UnixMillis,
     pub current_lineage: AgentLineageId,
     pub parent_agent: Option<AgentId>,
-    pub kind: AgentKind,
+    pub mode: AgentMode,
+    pub runtime: AgentRuntime,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum AgentKind {
+pub enum AgentRuntime {
+    Rho {
+        prompt_cache_key: PromptCacheKey,
+    },
+    Claude {
+        session_id: Uuid,
+        transcript_path: Option<Utf8PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum AgentMode {
+    Deep { effort: DeepEffort },
+    Fable { effort: FableEffort },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum DeepEffort {
+    Low,
+    Medium,
+    Xhigh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum FableEffort {
+    Medium,
+    Xhigh,
+}
+
+impl AgentMode {
+    pub fn deep_default() -> Self {
+        Self::Deep {
+            effort: DeepEffort::Medium,
+        }
+    }
+
+    pub fn inference_config(self) -> Option<InferenceConfig> {
+        let Self::Deep { effort } = self else {
+            return None;
+        };
+        let mut config = InferenceConfig::deep();
+        match &mut config {
+            InferenceConfig::Gpt5(config) => config.effort = effort.to_inference_effort(),
+        }
+        Some(config)
+    }
+
+    pub fn claude_model(self) -> Option<rho_claude::Model> {
+        match self {
+            Self::Fable { .. } => Some(rho_claude::Model::Fable),
+            Self::Deep { .. } => None,
+        }
+    }
+
+    pub fn claude_effort(self) -> Option<rho_claude::Effort> {
+        match self {
+            Self::Fable { effort } => Some(effort.to_claude_effort()),
+            Self::Deep { .. } => None,
+        }
+    }
+
+    pub fn is_claude(self) -> bool {
+        matches!(self, Self::Fable { .. })
+    }
+}
+
+impl DeepEffort {
+    fn to_inference_effort(self) -> InferenceEffort {
+        match self {
+            Self::Low => InferenceEffort::Low,
+            Self::Medium => InferenceEffort::Medium,
+            Self::Xhigh => InferenceEffort::Xhigh,
+        }
+    }
+}
+
+impl FableEffort {
+    fn to_claude_effort(self) -> rho_claude::Effort {
+        match self {
+            Self::Medium => rho_claude::Effort::Medium,
+            Self::Xhigh => rho_claude::Effort::Xhigh,
+        }
+    }
+}
+
+impl senax_encoder::Decoder for AgentRecord {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        let wire = AgentRecordDecode::decode(reader)?;
+        if let (Some(mode), Some(runtime)) = (wire.mode, wire.runtime) {
+            return Ok(Self {
+                display_name: wire.display_name,
+                workspace: wire.workspace,
+                status: wire.status,
+                created_at: wire.created_at,
+                updated_at: wire.updated_at,
+                current_lineage: wire.current_lineage,
+                parent_agent: wire.parent_agent,
+                mode,
+                runtime,
+            });
+        }
+        let Some(kind) = wire.previous_kind else {
+            return Err(senax_encoder::EncoderError::Decode(
+                "agent record missing mode/runtime".to_owned(),
+            ));
+        };
+        let (mode, runtime) = kind.into_mode_runtime();
+        Ok(Self {
+            display_name: wire.display_name,
+            workspace: wire.workspace,
+            status: wire.status,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+            current_lineage: wire.current_lineage,
+            parent_agent: wire.parent_agent,
+            mode,
+            runtime,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Decode)]
+struct AgentRecordDecode {
+    display_name: Option<String>,
+    workspace: WorkspaceInfo,
+    status: Status,
+    created_at: UnixMillis,
+    updated_at: UnixMillis,
+    current_lineage: AgentLineageId,
+    parent_agent: Option<AgentId>,
+    mode: Option<AgentMode>,
+    runtime: Option<AgentRuntime>,
+    #[senax(rename = "kind")]
+    previous_kind: Option<PreviousAgentKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+enum PreviousAgentKind {
     Rho {
         prompt_cache_key: PromptCacheKey,
         config: InferenceProtectedConfig,
@@ -194,6 +336,46 @@ pub enum AgentKind {
         session_id: Uuid,
         transcript_path: Option<Utf8PathBuf>,
     },
+}
+
+impl PreviousAgentKind {
+    fn into_mode_runtime(self) -> (AgentMode, AgentRuntime) {
+        match self {
+            Self::Rho {
+                prompt_cache_key,
+                config,
+            } => (
+                AgentMode::Deep {
+                    effort: DeepEffort::from_inference_effort(config.config()),
+                },
+                AgentRuntime::Rho { prompt_cache_key },
+            ),
+            Self::Claude {
+                session_id,
+                transcript_path,
+                ..
+            } => (
+                AgentMode::Fable {
+                    effort: FableEffort::Medium,
+                },
+                AgentRuntime::Claude {
+                    session_id,
+                    transcript_path,
+                },
+            ),
+        }
+    }
+}
+
+impl DeepEffort {
+    fn from_inference_effort(config: &InferenceConfig) -> Self {
+        let InferenceConfig::Gpt5(config) = config;
+        match config.effort {
+            InferenceEffort::Minimal | InferenceEffort::Low => Self::Low,
+            InferenceEffort::Medium => Self::Medium,
+            InferenceEffort::High | InferenceEffort::Xhigh | InferenceEffort::Max => Self::Xhigh,
+        }
+    }
 }
 
 pub trait AgentReadTxnExt {
@@ -242,7 +424,8 @@ pub trait AgentWriteTxnExt {
         topic_id: TopicId,
         display_name: Option<String>,
         workspace: WorkspaceInfo,
-        kind: AgentKind,
+        mode: AgentMode,
+        runtime: AgentRuntime,
     ) -> AgentEventPos;
 
     /// Re-points the agent's topic membership. Topics are ad-hoc groupings
@@ -448,10 +631,10 @@ impl AgentWriteTxnExt for WriteTxn {
             .expect("agent id missing")
             .value()
             .into_owned();
-        let AgentKind::Claude {
+        let AgentRuntime::Claude {
             transcript_path: path,
             ..
-        } = &mut agent.kind
+        } = &mut agent.runtime
         else {
             panic!("set_claude_transcript_path called for non-Claude agent");
         };
@@ -479,7 +662,8 @@ impl AgentWriteTxnExt for WriteTxn {
         topic_id: TopicId,
         display_name: Option<String>,
         workspace: WorkspaceInfo,
-        kind: AgentKind,
+        mode: AgentMode,
+        runtime: AgentRuntime,
     ) -> AgentEventPos {
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
@@ -491,7 +675,8 @@ impl AgentWriteTxnExt for WriteTxn {
             updated_at: now,
             current_lineage: lineage_id,
             parent_agent: None,
-            kind,
+            mode,
+            runtime,
         };
         self.open_table(AGENTS)
             .insert(&agent_id, SenValue::borrowed(&agent));
@@ -563,6 +748,20 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
+}
+
+fn migrate_agent_records(write: &mut WriteTxn) {
+    let records = {
+        let agents = write.open_table(AGENTS);
+        agents
+            .iter()
+            .map(|(agent_id, record)| (agent_id.value(), record.value().into_owned()))
+            .collect::<Vec<_>>()
+    };
+    let mut agents = write.open_table(AGENTS);
+    for (agent_id, record) in records {
+        agents.insert(&agent_id, SenValue::borrowed(&record));
+    }
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

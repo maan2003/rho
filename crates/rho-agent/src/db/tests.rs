@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
-use rho_inference::config::InferenceConfig;
+use rho_inference::config::{Effort as InferenceEffort, InferenceConfig};
 use rho_workspaces::WorkspaceInfo;
 
 use super::*;
@@ -17,11 +17,22 @@ fn test_workspace() -> WorkspaceInfo {
     }
 }
 
-fn test_agent_kind() -> AgentKind {
-    AgentKind::Rho {
+fn test_agent_runtime() -> AgentRuntime {
+    AgentRuntime::Rho {
         prompt_cache_key: PromptCacheKey::generate(),
-        config: InferenceConfig::deep().protect(),
     }
+}
+
+#[derive(Encode)]
+struct PreviousAgentRecord {
+    display_name: Option<String>,
+    workspace: WorkspaceInfo,
+    status: Status,
+    created_at: UnixMillis,
+    updated_at: UnixMillis,
+    current_lineage: AgentLineageId,
+    parent_agent: Option<AgentId>,
+    kind: PreviousAgentKind,
 }
 
 #[test]
@@ -109,6 +120,54 @@ async fn init_agent_tables_stamps_current_db_format() {
 }
 
 #[tokio::test]
+async fn init_agent_tables_migrates_previous_agent_kind_to_mode_and_runtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let prompt_cache_key = PromptCacheKey::generate();
+    let mut previous_config = InferenceConfig::deep();
+    match &mut previous_config {
+        InferenceConfig::Gpt5(config) => config.effort = InferenceEffort::Xhigh,
+    }
+
+    let mut write = db.write().await;
+    write.open_table(FORMAT).insert(&(), &"b146bc14".to_owned());
+    write.open_table(COUNTERS);
+    write.open_table(MACHINE).insert(&MACHINE_SEED_KEY, &7);
+    let agent_id =
+        AgentId::from_counter(1, &AgentIdDomain(7)).expect("valid test agent id counter");
+    let previous = PreviousAgentRecord {
+        display_name: Some("legacy".to_owned()),
+        workspace: test_workspace(),
+        status: Status::Normal,
+        created_at: UnixMs(1),
+        updated_at: UnixMs(2),
+        current_lineage: AgentLineageId(1),
+        parent_agent: None,
+        kind: PreviousAgentKind::Rho {
+            prompt_cache_key,
+            config: previous_config.protect(),
+        },
+    };
+    write
+        .open_table(AGENTS)
+        .insert(&agent_id, SenValue::<AgentRecord>::borrowed(&previous));
+
+    write.init_agent_tables();
+    write.commit();
+
+    let record = db.read().get_agent(agent_id);
+    assert_eq!(
+        record.mode,
+        AgentMode::Deep {
+            effort: DeepEffort::Xhigh,
+        }
+    );
+    assert_eq!(record.runtime, AgentRuntime::Rho { prompt_cache_key });
+    assert_eq!(record.display_name.as_deref(), Some("legacy"));
+}
+
+#[tokio::test]
 #[should_panic(expected = "Update rho one version at a time")]
 async fn init_agent_tables_rejects_unsupported_db_format() {
     let temp = tempfile::tempdir().unwrap();
@@ -134,7 +193,8 @@ async fn create_agent_and_append_events_with_cursor() {
         topic_id,
         Some("main".to_owned()),
         test_workspace(),
-        test_agent_kind(),
+        AgentMode::deep_default(),
+        test_agent_runtime(),
     );
     let next = write.append_agent_event(
         next,
@@ -187,7 +247,8 @@ async fn agent_events_read_lineage_parents() {
         topic_id,
         Some("main".to_owned()),
         test_workspace(),
-        test_agent_kind(),
+        AgentMode::deep_default(),
+        test_agent_runtime(),
     );
     let fork_at = write.append_agent_event(
         next,
@@ -260,7 +321,8 @@ async fn move_agent_to_topic_repoints_membership() {
         default_topic,
         None,
         test_workspace(),
-        test_agent_kind(),
+        AgentMode::deep_default(),
+        test_agent_runtime(),
     );
     write.move_agent_to_topic(agent_id, named_topic);
     write.commit();
@@ -291,7 +353,8 @@ async fn topic_and_agent_statuses_are_settable() {
         topic_id,
         None,
         test_workspace(),
-        test_agent_kind(),
+        AgentMode::deep_default(),
+        test_agent_runtime(),
     );
     write.set_topic_status(UnixMs(2), topic_id, Status::Pinned);
     write.set_topic_name(UnixMs(3), topic_id, "platform".to_owned());
@@ -357,7 +420,8 @@ async fn agent_ids_allocate_before_records_exist() {
         topic_id,
         None,
         test_workspace(),
-        test_agent_kind(),
+        AgentMode::deep_default(),
+        test_agent_runtime(),
     );
     write.commit();
 

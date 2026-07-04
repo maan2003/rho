@@ -9,13 +9,15 @@ use std::sync::{Arc, RwLock};
 
 use async_stream::stream;
 use futures::Stream;
-use rho_claude::{ClaudeCode, ClaudeCodeOptions, Model, Session};
+use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, Session};
 use rho_core::{ContentPart, ContextBlock, ContextItemEvent, PendingInferenceResponse};
 use rho_db::RhoDb;
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
-use crate::db::{AgentId, AgentKind, AgentReadTxnExt, AgentWriteTxnExt, TopicId, UnixMillis};
+use crate::db::{
+    AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, TopicId, UnixMillis,
+};
 use crate::{AgentState, AgentStateKind, FailedInferenceResponse, StartWorkspace, system_prompt};
 
 mod projection;
@@ -36,8 +38,14 @@ impl ClaudeAgent {
         topic_id: TopicId,
         display_name: Option<String>,
         start: StartWorkspace,
-        model: Model,
+        mode: AgentMode,
     ) -> anyhow::Result<(AgentId, Self)> {
+        let model = mode
+            .claude_model()
+            .ok_or_else(|| anyhow::anyhow!("cannot create Claude runtime for Rho agent mode"))?;
+        let effort = mode
+            .claude_effort()
+            .ok_or_else(|| anyhow::anyhow!("cannot create Claude runtime for Rho agent mode"))?;
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
         let workspace = match start {
@@ -58,8 +66,8 @@ impl ClaudeAgent {
             topic_id,
             display_name,
             workspace.info().clone(),
-            AgentKind::Claude {
-                model,
+            mode,
+            AgentRuntime::Claude {
                 session_id,
                 transcript_path: None,
             },
@@ -79,6 +87,7 @@ impl ClaudeAgent {
                 agent_id,
                 workspace,
                 model,
+                effort,
                 session_id,
                 None,
                 state,
@@ -93,14 +102,21 @@ impl ClaudeAgent {
         workspace: Arc<rho_workspaces::Workspace>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
-        let AgentKind::Claude {
-            model,
+        let AgentRuntime::Claude {
             session_id,
             transcript_path,
-        } = record.kind
+        } = record.runtime
         else {
             anyhow::bail!("cannot load Rho agent with the Claude agent runtime");
         };
+        let model = record
+            .mode
+            .claude_model()
+            .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
+        let effort = record
+            .mode
+            .claude_effort()
+            .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
         let blocks = match &transcript_path {
             Some(path) => {
                 let messages = rho_claude::read_session_messages(
@@ -123,6 +139,7 @@ impl ClaudeAgent {
             agent_id,
             workspace,
             model,
+            effort,
             session_id,
             transcript_path,
             state,
@@ -135,6 +152,7 @@ impl ClaudeAgent {
         agent_id: AgentId,
         workspace: Arc<rho_workspaces::Workspace>,
         model: Model,
+        effort: Effort,
         session_id: Uuid,
         transcript_path: Option<camino::Utf8PathBuf>,
         state: AgentState,
@@ -148,6 +166,7 @@ impl ClaudeAgent {
             agent_id,
             workspace,
             model,
+            effort,
             session_id,
             transcript_path,
             start_mode,
@@ -212,6 +231,7 @@ struct ClaudeLoop {
     agent_id: AgentId,
     workspace: Arc<rho_workspaces::Workspace>,
     model: Model,
+    effort: Effort,
     session_id: Uuid,
     transcript_path: Option<camino::Utf8PathBuf>,
     start_mode: ClaudeStartMode,
@@ -302,6 +322,7 @@ impl ClaudeLoop {
         let mut options = ClaudeCodeOptions::new(
             self.workspace.repo().to_owned(),
             self.model,
+            self.effort,
             self.session_id,
         );
         options.session = session;

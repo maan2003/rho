@@ -13,14 +13,15 @@ use rho_core::{
     ToolResult, ToolResultMetadata, ToolSpec, UnixMs,
 };
 use rho_db::RhoDb;
-use rho_inference::config::InferenceConfig;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_workspaces::{Repo, Workspace};
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{Notify, mpsc};
 
-use crate::db::{AgentEventPos, AgentId, AgentKind, AgentReadTxnExt, AgentWriteTxnExt, UnixMillis};
+use crate::db::{
+    AgentEventPos, AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, UnixMillis,
+};
 
 pub mod claude;
 pub mod db;
@@ -133,12 +134,15 @@ impl Agent {
     pub async fn create(
         db: RhoDb,
         auth: InferenceAuth,
-        config: InferenceConfig,
+        mode: AgentMode,
         topic_id: db::TopicId,
         display_name: Option<String>,
         start: StartWorkspace,
     ) -> anyhow::Result<(AgentId, Self)> {
         let prompt_cache_key = PromptCacheKey::generate();
+        let config = mode
+            .inference_config()
+            .ok_or_else(|| anyhow::anyhow!("cannot create Rho runtime for Claude agent mode"))?;
         let config = config.protect();
         // One transaction spans id allocation, the jj workspace creation
         // (the workspace is named after the id), and the record write:
@@ -164,10 +168,8 @@ impl Agent {
             topic_id,
             display_name,
             workspace.info().clone(),
-            AgentKind::Rho {
-                prompt_cache_key,
-                config: config.clone(),
-            },
+            mode,
+            AgentRuntime::Rho { prompt_cache_key },
         );
         write.commit();
         let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
@@ -278,13 +280,14 @@ impl Agent {
                 completed_tool_calls: completed_tool_calls.into(),
             },
         };
-        let AgentKind::Rho {
-            prompt_cache_key,
-            config,
-        } = record.kind
-        else {
+        let AgentRuntime::Rho { prompt_cache_key } = record.runtime else {
             panic!("cannot load Claude agent with the Rho agent runtime");
         };
+        let config = record
+            .mode
+            .inference_config()
+            .expect("Rho runtime stored with non-Rho agent mode")
+            .protect();
         let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),

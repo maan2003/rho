@@ -322,7 +322,7 @@ impl Workspace {
         self.awaiting_draft_agent = true;
         self.connection.send(ClientMessage::NewAgent {
             topic_id,
-            backend: rho_ui_proto::AgentBackend::Rho,
+            mode: rho_ui_proto::AgentMode::deep_default(),
             start,
             content: Some(vec![ContentPart::Text { text: body }]),
         });
