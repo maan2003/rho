@@ -552,8 +552,10 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
             .find(|migration| migration.from == format)
         else {
             panic!(
-                "unsupported agent db format {format}; expected {} or a serially migratable format",
-                current
+                "this rho agent database was written by an incompatible rho version \
+                 (database format {format}, this build expects {current}). \
+                 Update rho one version at a time so migrations can run, or remove \
+                 the local rho database if you do not need the saved agents."
             );
         };
         (migration.migrate)(write);

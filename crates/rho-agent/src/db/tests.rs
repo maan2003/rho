@@ -77,7 +77,7 @@ async fn init_agent_tables_stamps_current_db_format() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "unsupported agent db format")]
+#[should_panic(expected = "Update rho one version at a time")]
 async fn init_agent_tables_rejects_unsupported_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
