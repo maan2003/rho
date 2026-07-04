@@ -108,6 +108,7 @@ impl AgentClient {
             workdirs,
             default_topic_id,
             machine_seed,
+            workspace_counter,
         } = read_frame_counted(&mut stream, Some(&client_counters)).await?
         else {
             anyhow::bail!("rho daemon did not send ready message");
@@ -121,6 +122,7 @@ impl AgentClient {
                     workdirs: workdirs.clone(),
                     default_topic_id,
                     machine_seed,
+                    workspace_counter,
                 },
             );
         }
@@ -168,6 +170,7 @@ impl AgentClient {
                         workdirs,
                         default_topic_id,
                         machine_seed: _,
+                        workspace_counter: _,
                     } => {
                         known_agent_ids = topic_agent_ids(&topics);
                         if topics_tx.send(topics).is_err() {

@@ -10,6 +10,12 @@ use editor::HighlightKey;
 use gpui::{App, FontWeight, HighlightStyle, Hsla};
 use theme::ActiveTheme as _;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeFamily {
+    Deep,
+    Fable,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StyleClass {
     Default,
@@ -116,6 +122,27 @@ pub fn user_prompt_gutter_color(cx: &App) -> Hsla {
 pub fn cwd_chip_style(cx: &App) -> HighlightStyle {
     HighlightStyle {
         color: Some(cx.theme().colors().terminal_foreground),
+        ..HighlightStyle::default()
+    }
+}
+
+pub fn workspace_chip_style(cx: &App) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(cx.theme().colors().terminal_ansi_green),
+        font_weight: Some(FontWeight::BOLD),
+        ..HighlightStyle::default()
+    }
+}
+
+pub fn mode_chip_style(family: ModeFamily, cx: &App) -> HighlightStyle {
+    let colors = cx.theme().colors();
+    let color = match family {
+        ModeFamily::Deep => colors.terminal_ansi_cyan,
+        ModeFamily::Fable => colors.terminal_ansi_magenta,
+    };
+    HighlightStyle {
+        color: Some(color),
+        font_weight: Some(FontWeight::BOLD),
         ..HighlightStyle::default()
     }
 }

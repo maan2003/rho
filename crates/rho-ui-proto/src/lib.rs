@@ -13,7 +13,7 @@ pub use rho_agent::db::{
     AgentId, AgentIdDomain, AgentMode, DeepEffort, FableEffort, Status, TopicId, TopicIdDomain,
 };
 use rho_core::ContentPart;
-pub use rho_workspaces::WorkspaceInfo;
+pub use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 pub mod client;
@@ -170,6 +170,9 @@ pub enum ServerMessage {
         /// The daemon database's machine seed; clients need it to encode
         /// agent IDs (see [`AgentIdDomain`]).
         machine_seed: u64,
+        /// Last allocated workspace-id counter; clients use it for the same
+        /// uniform short-prefix rendering as agent ids.
+        workspace_counter: u64,
     },
     Error {
         message: String,
@@ -212,6 +215,8 @@ impl UiTopic {
 pub struct UiAgentSummary {
     pub agent_id: AgentId,
     pub display_name: Option<String>,
+    /// The model/runtime mode this agent was created with.
+    pub mode: AgentMode,
     /// Where the agent works. Clients resolve start targets against this
     /// themselves: "on top of agent" is the revset `<workspace name>@`, and
     /// joining sends the info back verbatim.

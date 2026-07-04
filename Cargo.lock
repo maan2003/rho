@@ -8462,6 +8462,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "camino",
+ "prefix-id",
  "rustix 1.1.4",
  "senax-encoder",
  "tempfile",

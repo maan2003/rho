@@ -10,6 +10,7 @@ rust-version.workspace = true
 camino.workspace = true
 anyhow.workspace = true
 bytes = "1"
+prefix-id = { path = "../prefix-id" }
 rustix = { version = "1", features = ["fs", "mount", "process", "thread"] }
 senax-encoder.workspace = true
 tokio.workspace = true

@@ -54,8 +54,7 @@ impl ClaudeAgent {
                 parent_revset,
             } => {
                 let workspace_id = write.alloc_workspace_id();
-                repo.create_workspace(&workspace_id.encoded(), &parent_revset)
-                    .await?
+                repo.create_workspace(workspace_id, &parent_revset).await?
             }
             StartWorkspace::Existing(workspace) => workspace,
         };

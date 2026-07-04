@@ -1,10 +1,10 @@
 //! Per-agent jj workspaces backed by the fork's workspace pool.
 //!
 //! Each agent works in a jj pool slot (`<repo>/.jj/ws-pool/N`) claimed with
-//! `jj workspace add --pool`. The jj workspace *name* (the creating agent's
-//! id) is the durable handle — the repo view's `wc_commit_ids[name]` follows
-//! the agent's change across every operation — while the slot directory is
-//! droppable cache that jj rebinds on attach. With namespaces available,
+//! `jj workspace add --pool`. The jj workspace *name* (the workspace id's
+//! encoding) is the durable handle — the repo view's `wc_commit_ids[name]`
+//! follows the agent's change across every operation — while the slot directory
+//! is droppable cache that jj rebinds on attach. With namespaces available,
 //! each agent's commands run in a private mount namespace where the slot is
 //! mounted *over the origin repo path*, so the agent sees the real path:
 //! informative context, working `../` relative references, and
@@ -22,12 +22,29 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
+use prefix_id::{PrefixId, PrefixIdDomain};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Mutex, OnceCell};
 
 mod ns;
 
 pub use ns::init_daemon_namespace;
+
+pub type WorkspaceId = PrefixId<WorkspaceIdDomain>;
+
+/// Keys workspace-id encoding with the daemon database's persisted machine
+/// seed. The id is stored as part of [`WorkspaceInfo`] and its encoded form is
+/// the jj workspace name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkspaceIdDomain(pub u64);
+
+impl PrefixIdDomain for WorkspaceIdDomain {
+    const KIND: &'static str = "workspace-id";
+
+    fn machine_seed(&self) -> u64 {
+        self.0
+    }
+}
 
 /// Where an agent works, stored inline on the agent record. Self-contained:
 /// there is no separate workspace table.
@@ -36,11 +53,15 @@ pub enum WorkspaceInfo {
     /// The user's own checkout: the agent works directly at the repo path,
     /// no separate checkout and no namespace.
     UserCheckout { repo: Utf8PathBuf },
-    /// A jj workspace named after the creating agent. It is checked out in
-    /// a pool slot, but that is an implementation detail: the slot directory
-    /// is queried from jj, never stored — it changes across detach/attach
-    /// cycles.
-    Workspace { repo: Utf8PathBuf, name: String },
+    /// A jj workspace named after this workspace id's encoding. It is checked
+    /// out in a pool slot, but that is an implementation detail: the slot
+    /// directory is queried from jj, never stored — it changes across
+    /// detach/attach cycles.
+    Workspace {
+        repo: Utf8PathBuf,
+        #[senax(rename = "name")]
+        id: WorkspaceId,
+    },
 }
 
 impl WorkspaceInfo {
@@ -52,6 +73,17 @@ impl WorkspaceInfo {
 
     pub fn is_user_checkout(&self) -> bool {
         matches!(self, Self::UserCheckout { .. })
+    }
+
+    pub fn workspace_id(&self) -> Option<WorkspaceId> {
+        match self {
+            Self::UserCheckout { .. } => None,
+            Self::Workspace { id, .. } => Some(*id),
+        }
+    }
+
+    pub fn workspace_name(&self) -> Option<String> {
+        self.workspace_id().map(|id| id.encoded())
     }
 }
 
@@ -94,31 +126,36 @@ impl Repo {
         })
     }
 
-    /// Creates the jj workspace named `name` for a new agent in a pool slot
-    /// with a new change on top of `parent_revset` (resolved against this
-    /// repo, so `@` is the user's checkout and `<name>@` another
+    /// Creates the jj workspace named after `id`'s encoding for a new agent
+    /// in a pool slot with a new change on top of `parent_revset` (resolved
+    /// against this repo, so `@` is the user's checkout and `<id>@` another
     /// workspace's). A background `pool prepare` keeps warm slots ready for
     /// later agents.
     pub async fn create_workspace(
         self: &Arc<Self>,
-        name: &str,
+        id: WorkspaceId,
         parent_revset: &str,
     ) -> anyhow::Result<Arc<Workspace>> {
-        let slot = self.attach(name, Some(parent_revset)).await?;
+        let name = id.encoded();
+        let slot = self.attach(&name, Some(parent_revset)).await?;
         self.warm_pool();
-        self.cache_workspace(self.workspace_info(name), slot).await
+        self.cache_workspace(self.workspace_info(id), slot).await
     }
 
     /// Opens an existing workspace, returning the live shared instance when
     /// one exists — agents in the same workspace share one checkout and one
     /// mount namespace. A pool workspace is (re)attached idempotently, so a
     /// workspace detached earlier is rematerialized into a fresh slot here.
-    pub async fn open_workspace(self: &Arc<Self>, name: &str) -> anyhow::Result<Arc<Workspace>> {
-        let info = self.workspace_info(name);
+    pub async fn open_workspace(
+        self: &Arc<Self>,
+        id: WorkspaceId,
+    ) -> anyhow::Result<Arc<Workspace>> {
+        let info = self.workspace_info(id);
         if let Some(workspace) = self.workspaces.lock().await.get(&info) {
             return Ok(Arc::clone(workspace));
         }
-        let slot = self.attach(name, None).await?;
+        let name = id.encoded();
+        let slot = self.attach(&name, None).await?;
         self.cache_workspace(info, slot).await
     }
 
@@ -139,10 +176,10 @@ impl Repo {
         &self.root
     }
 
-    fn workspace_info(&self, name: &str) -> WorkspaceInfo {
+    fn workspace_info(&self, id: WorkspaceId) -> WorkspaceInfo {
         WorkspaceInfo::Workspace {
             repo: self.root.clone(),
-            name: name.to_owned(),
+            id,
         }
     }
 

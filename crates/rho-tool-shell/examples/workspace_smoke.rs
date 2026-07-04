@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolType};
 use rho_tool_shell::{SHELL_COMMAND_TOOL_NAME, ShellTools};
-use rho_workspaces::Repo;
+use rho_workspaces::{Repo, WorkspaceId, WorkspaceIdDomain};
 
 fn shell_call(command: &str) -> ToolCall {
     ToolCall {
@@ -64,9 +64,13 @@ async fn run() -> anyhow::Result<()> {
     };
     let _ = &temp;
     let repo_handle = Arc::new(Repo::open(&repo)?);
+    let workspace_domain = WorkspaceIdDomain(0);
+    let main_id = WorkspaceId::from_counter(1, &workspace_domain).unwrap();
+    let agent_a_id = WorkspaceId::from_counter(2, &workspace_domain).unwrap();
+    let agent_b_id = WorkspaceId::from_counter(3, &workspace_domain).unwrap();
 
     let started = std::time::Instant::now();
-    let workspace = repo_handle.create_workspace("agent-main", "@").await?;
+    let workspace = repo_handle.create_workspace(main_id, "@").await?;
     println!("created workspace in {:?}", started.elapsed());
     println!("repo: {}", workspace.repo());
     println!("slot: {}", workspace.slot());
@@ -119,7 +123,10 @@ async fn run() -> anyhow::Result<()> {
              'git diff --stat && git commit -am from-git && git log --oneline | head -1'",
         ))
         .await;
-    println!("real git diff + commit inside namespace:\n{}", result.output);
+    println!(
+        "real git diff + commit inside namespace:\n{}",
+        result.output
+    );
     assert!(
         result.output.contains("Exit code: 0"),
         "git diff/commit should work inside the namespace"
@@ -172,10 +179,15 @@ async fn run() -> anyhow::Result<()> {
 
     // Joining a workspace shares the live instance: same checkout, same
     // mount namespace, edits visible to each other instantly (no snapshot).
-    let joined = repo_handle.open_workspace("agent-main").await?;
-    assert!(Arc::ptr_eq(&workspace, &joined), "join shares the live workspace instance");
+    let joined = repo_handle.open_workspace(main_id).await?;
+    assert!(
+        Arc::ptr_eq(&workspace, &joined),
+        "join shares the live workspace instance"
+    );
     let tools_joined = ShellTools::new(Duration::from_secs(30), joined);
-    let result = tools_joined.call(shell_call("echo joint > joint.txt")).await;
+    let result = tools_joined
+        .call(shell_call("echo joint > joint.txt"))
+        .await;
     assert!(result.output.contains("Exit code: 0"));
     let result = tools.call(shell_call("cat joint.txt")).await;
     assert!(
@@ -196,8 +208,8 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- multi-workspace snapshot matrix ----
     // Two independent sibling workspaces, both children of the user's @.
-    let wa = repo_handle.create_workspace("agent-a", "@").await?;
-    let wb = repo_handle.create_workspace("agent-b", "@").await?;
+    let wa = repo_handle.create_workspace(agent_a_id, "@").await?;
+    let wb = repo_handle.create_workspace(agent_b_id, "@").await?;
     let tools_a = ShellTools::new(Duration::from_secs(30), Arc::clone(&wa));
 
     // (1) Snapshot from OUTSIDE (origin jj): the user's edit follows down
@@ -207,11 +219,26 @@ async fn run() -> anyhow::Result<()> {
     std::fs::write(wb.slot().join("b.txt"), "two\n")?;
     std::fs::write(repo.join("u.txt"), "user\n")?;
     jj(&repo, &["st"]);
-    assert!(wa.slot().join("u.txt").exists(), "user edit follows into slot a");
-    assert!(wb.slot().join("u.txt").exists(), "user edit follows into slot b");
-    assert!(!wa.slot().join("b.txt").exists(), "sibling edits stay isolated");
-    assert!(!wb.slot().join("a.txt").exists(), "sibling edits stay isolated");
-    assert!(!repo.join("a.txt").exists(), "agent work must not leak into the user's checkout");
+    assert!(
+        wa.slot().join("u.txt").exists(),
+        "user edit follows into slot a"
+    );
+    assert!(
+        wb.slot().join("u.txt").exists(),
+        "user edit follows into slot b"
+    );
+    assert!(
+        !wa.slot().join("b.txt").exists(),
+        "sibling edits stay isolated"
+    );
+    assert!(
+        !wb.slot().join("a.txt").exists(),
+        "sibling edits stay isolated"
+    );
+    assert!(
+        !repo.join("a.txt").exists(),
+        "agent work must not leak into the user's checkout"
+    );
     println!("outside snapshot: parent following + sibling isolation: ok");
 
     // (2) Snapshot from INSIDE an agent namespace: the agent's own jj must
@@ -219,8 +246,15 @@ async fn run() -> anyhow::Result<()> {
     // namespace-local paths.
     std::fs::write(repo.join("u2.txt"), "user\n")?;
     let result = tools_a.call(shell_call("jj st")).await;
-    assert!(result.output.contains("Exit code: 0"), "jj st in namespace: {}", result.output);
-    assert!(wa.slot().join("u2.txt").exists(), "user edit followed from inside the namespace");
+    assert!(
+        result.output.contains("Exit code: 0"),
+        "jj st in namespace: {}",
+        result.output
+    );
+    assert!(
+        wa.slot().join("u2.txt").exists(),
+        "user edit followed from inside the namespace"
+    );
     println!("inside-namespace snapshot: ok");
 
     // (3) Snapshot from inside a slot on the HOST (cd .jj/ws-pool/N; jj
@@ -228,7 +262,9 @@ async fn run() -> anyhow::Result<()> {
     std::fs::write(wa.slot().join("d.txt"), "dee\n")?;
     let output = std::process::Command::new("jj")
         .current_dir(wb.slot())
-        .args(["log", "--no-graph", "-r", "agent-a@", "-T", "diff.files().len()"])
+        .args(["log", "--no-graph", "-r"])
+        .arg(format!("{}@", agent_a_id.encoded()))
+        .args(["-T", "diff.files().len()"])
         .output()?;
     assert!(
         output.status.success(),
@@ -246,19 +282,23 @@ async fn run() -> anyhow::Result<()> {
     // attachments as stale: its first touch of the repo detaches everything
     // pool-attached (`pool detach --all`), then reattaches what it needs.
     let repo_handle2 = Arc::new(Repo::open(&repo)?);
-    let wb2 = repo_handle2.open_workspace("agent-b").await?;
+    let wb2 = repo_handle2.open_workspace(agent_b_id).await?;
     let output = std::process::Command::new("jj")
         .arg("--repository")
         .arg(&repo)
         .args(["workspace", "pool", "list"])
         .output()?;
     let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+    let main_name = main_id.encoded();
+    let agent_a_name = agent_a_id.encoded();
+    let agent_b_name = agent_b_id.encoded();
     assert!(
-        listing.contains("agent-b"),
-        "agent-b should be reattached: {listing}"
+        listing.contains(&agent_b_name),
+        "{} should be reattached: {listing}",
+        agent_b_name
     );
     assert!(
-        !listing.contains("agent-a") && !listing.contains("agent-main"),
+        !listing.contains(&agent_a_name) && !listing.contains(&main_name),
         "other stale attachments should have been reaped: {listing}"
     );
     let tools_b2 = ShellTools::new(Duration::from_secs(30), Arc::clone(&wb2));

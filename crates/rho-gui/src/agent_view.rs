@@ -228,9 +228,36 @@ impl AgentView {
         );
     }
 
-    pub fn set_status(&mut self, project_label: &str, cx: &mut Context<Self>) {
+    pub fn set_status(
+        &mut self,
+        project_label: &str,
+        workspace_label: Option<&str>,
+        mode_label: Option<(&str, style::ModeFamily)>,
+        cx: &mut Context<Self>,
+    ) {
         let mut spans = Vec::new();
-        spans.push((project_label.to_owned(), style::cwd_chip_style(cx)));
+        if !project_label.is_empty() {
+            spans.push((project_label.to_owned(), style::cwd_chip_style(cx)));
+        }
+        if let Some(workspace_label) = workspace_label
+            && !workspace_label.is_empty()
+        {
+            if !spans.is_empty() {
+                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
+            }
+            spans.push((workspace_label.to_owned(), style::workspace_chip_style(cx)));
+        }
+        if let Some((mode_label, mode_family)) = mode_label
+            && !mode_label.is_empty()
+        {
+            if !spans.is_empty() {
+                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
+            }
+            spans.push((
+                mode_label.to_owned(),
+                style::mode_chip_style(mode_family, cx),
+            ));
+        }
         self.status_spans = spans;
         self.apply_status(cx);
     }

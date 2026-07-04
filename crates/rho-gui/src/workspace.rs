@@ -22,7 +22,7 @@ use crate::connection::{ConnEvent, Connection};
 use crate::draft_view::DraftView;
 use crate::registry::{ActivePane, AgentRegistry};
 use crate::store::{AgentStore, FrameSummary};
-use crate::style::StyleClass;
+use crate::style::{ModeFamily, StyleClass};
 use crate::{
     AgentNew, AgentNext, AgentPrevious, RoleCycle, RoleCycleGroup, SubmitPrompt, TaskBoard,
 };
@@ -123,9 +123,11 @@ impl Workspace {
                 workdirs,
                 default_topic_id,
                 machine_seed,
+                workspace_counter,
             } => {
                 let first_ready = !self.connected;
                 self.registry.set_machine_seed(machine_seed);
+                self.registry.set_workspace_counter(workspace_counter);
                 self.registry.set_topics(topics);
                 self.workdirs = workdirs;
                 self.default_topic_id = Some(default_topic_id);
@@ -367,10 +369,10 @@ impl Workspace {
             (StartFieldMode::NewOn, "", _) => {
                 return Err("pick a base: a revset like `@-` or an agent label".to_owned());
             }
-            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workspace { repo, name })) => {
+            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workspace { repo, id })) => {
                 StartMode::NewOn {
                     repo,
-                    revset: format!("{name}@"),
+                    revset: format!("{}@", id.encoded()),
                 }
             }
             // An agent in the user's checkout works on the user's own change.
@@ -880,8 +882,19 @@ impl Workspace {
                 view.sync(state, FrameSummary::everything(), now_ms(), cx);
             });
         }
-        let label = self.working_directory_label(agent_id);
-        view.update(cx, |view, cx| view.set_status(&label, cx));
+        let directory_label = self.working_directory_label(agent_id);
+        let workspace_label = self.registry.workspace_id_label(*agent_id);
+        let mode_label = self.mode_label(agent_id);
+        view.update(cx, |view, cx| {
+            view.set_status(
+                &directory_label,
+                workspace_label.as_deref(),
+                mode_label
+                    .as_ref()
+                    .map(|label| (label.text.as_str(), label.family)),
+                cx,
+            )
+        });
         self.views.insert(*agent_id, view.clone());
         view
     }
@@ -914,8 +927,19 @@ impl Workspace {
 
     fn update_statuses(&self, cx: &mut Context<Self>) {
         for (agent_id, view) in &self.views {
-            let label = self.working_directory_label(agent_id);
-            view.update(cx, |view, cx| view.set_status(&label, cx));
+            let directory_label = self.working_directory_label(agent_id);
+            let workspace_label = self.registry.workspace_id_label(*agent_id);
+            let mode_label = self.mode_label(agent_id);
+            view.update(cx, |view, cx| {
+                view.set_status(
+                    &directory_label,
+                    workspace_label.as_deref(),
+                    mode_label
+                        .as_ref()
+                        .map(|label| (label.text.as_str(), label.family)),
+                    cx,
+                )
+            });
         }
     }
 
@@ -929,6 +953,10 @@ impl Workspace {
             .file_name()
             .map(str::to_owned)
             .unwrap_or_else(|| directory.to_string())
+    }
+
+    fn mode_label(&self, agent_id: &AgentId) -> Option<ModeLabel> {
+        self.registry.agent_mode(*agent_id).map(agent_mode_label)
     }
 
     pub fn live_agent_names(&self) -> Vec<String> {
@@ -1024,6 +1052,37 @@ fn cycle_agent_mode_text(current: &str) -> &'static str {
     }
 }
 
+struct ModeLabel {
+    text: String,
+    family: ModeFamily,
+}
+
+fn agent_mode_label(mode: AgentMode) -> ModeLabel {
+    match mode {
+        AgentMode::Deep { effort } => {
+            let effort = match effort {
+                DeepEffort::Low => "¹",
+                DeepEffort::Medium => "²",
+                DeepEffort::Xhigh => "³",
+            };
+            ModeLabel {
+                text: format!("deep{effort}"),
+                family: ModeFamily::Deep,
+            }
+        }
+        AgentMode::Fable { effort } => {
+            let suffix = match effort {
+                FableEffort::Medium => "",
+                FableEffort::Xhigh => "²",
+            };
+            ModeLabel {
+                text: format!("fable{suffix}"),
+                family: ModeFamily::Fable,
+            }
+        }
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
@@ -1106,5 +1165,38 @@ mod tests {
         );
         assert!(parse_agent_mode("fable low").is_err());
         assert!(parse_agent_mode("sonnet medium").is_err());
+    }
+
+    #[test]
+    fn renders_compact_agent_mode_labels() {
+        let low = agent_mode_label(AgentMode::Deep {
+            effort: DeepEffort::Low,
+        });
+        assert_eq!(low.text, "deep¹");
+        assert_eq!(low.family, ModeFamily::Deep);
+
+        let medium = agent_mode_label(AgentMode::Deep {
+            effort: DeepEffort::Medium,
+        });
+        assert_eq!(medium.text, "deep²");
+        assert_eq!(medium.family, ModeFamily::Deep);
+
+        let xhigh = agent_mode_label(AgentMode::Deep {
+            effort: DeepEffort::Xhigh,
+        });
+        assert_eq!(xhigh.text, "deep³");
+        assert_eq!(xhigh.family, ModeFamily::Deep);
+
+        let fable = agent_mode_label(AgentMode::Fable {
+            effort: FableEffort::Medium,
+        });
+        assert_eq!(fable.text, "fable");
+        assert_eq!(fable.family, ModeFamily::Fable);
+
+        let fable_xhigh = agent_mode_label(AgentMode::Fable {
+            effort: FableEffort::Xhigh,
+        });
+        assert_eq!(fable_xhigh.text, "fable²");
+        assert_eq!(fable_xhigh.family, ModeFamily::Fable);
     }
 }

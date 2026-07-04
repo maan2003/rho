@@ -179,6 +179,7 @@ impl AgentRegistry {
                         .map(|(agent_id, agent)| UiAgentSummary {
                             agent_id,
                             display_name: agent.display_name,
+                            mode: agent.mode,
                             workspace: agent.workspace,
                             status: agent.status,
                         })
@@ -209,6 +210,7 @@ impl AgentRegistry {
             workdirs: self.workdirs(),
             default_topic_id: self.default_topic_id,
             machine_seed: self.machine_seed,
+            workspace_counter: self.db.read().last_workspace_counter(),
         }
     }
 
@@ -304,7 +306,7 @@ impl AgentRegistry {
         let repo = self.repo(info.repo()).await?;
         match info {
             WorkspaceInfo::UserCheckout { .. } => repo.user_checkout().await,
-            WorkspaceInfo::Workspace { name, .. } => repo.open_workspace(name).await,
+            WorkspaceInfo::Workspace { id, .. } => repo.open_workspace(*id).await,
         }
     }
 

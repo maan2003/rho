@@ -12,7 +12,7 @@ use super::*;
 fn test_workspace() -> WorkspaceInfo {
     WorkspaceInfo::Workspace {
         repo: "/home/user/src/rho".into(),
-        name: "test-agent".to_owned(),
+        id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
     }
 }
 
