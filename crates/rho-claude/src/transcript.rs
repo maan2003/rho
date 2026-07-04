@@ -355,6 +355,19 @@ fn latest_chain(entries: &[TranscriptEntry]) -> Vec<&TranscriptEntry> {
     chain
 }
 
+/// Usage recorded with the most recent assistant message, if any. Transcript
+/// entries log `input_tokens` as a streaming placeholder, but the cache
+/// read/creation buckets — which dominate context occupancy — are recorded
+/// accurately, so this slightly undercounts and self-corrects on the next
+/// live turn.
+pub fn last_assistant_usage(messages: &[SessionMessage]) -> Option<crate::protocol::TokenUsage> {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.kind == SessionMessageKind::Assistant)
+        .find_map(|message| serde_json::from_value(message.message.get("usage")?.clone()).ok())
+}
+
 fn to_session_message(entry: &TranscriptEntry) -> Option<SessionMessage> {
     Some(SessionMessage {
         kind: match entry.kind {
@@ -392,6 +405,34 @@ mod tests {
             subtype: None,
             compact_metadata: None,
         }
+    }
+
+    #[test]
+    fn restores_usage_from_last_assistant_entry() {
+        let a = uuid::uuid!("00000000-0000-4000-8000-00000000000a");
+        let b = uuid::uuid!("00000000-0000-4000-8000-00000000000b");
+        let c = uuid::uuid!("00000000-0000-4000-8000-00000000000c");
+        let mut old = entry(TranscriptEntryKind::Assistant, b, Some(a));
+        old.message =
+            json!({"role": "assistant", "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let mut last = entry(TranscriptEntryKind::Assistant, c, Some(b));
+        last.message = json!({
+            "role": "assistant",
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 60_000,
+                "output_tokens": 200,
+                "service_tier": "standard"
+            }
+        });
+        let messages = session_messages(
+            vec![entry(TranscriptEntryKind::User, a, None), old, last],
+            SessionMessagesOptions::default(),
+        );
+
+        let usage = last_assistant_usage(&messages).expect("usage present");
+        assert_eq!(usage.context_total(), 60_303);
     }
 
     #[test]

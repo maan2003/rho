@@ -118,13 +118,15 @@ impl ClaudeAgent {
         )
         .await?;
         let blocks = transcript_messages_to_context(&messages)?;
+        let context_used =
+            rho_claude::last_assistant_usage(&messages).map(|usage| usage.context_total());
         let state = AgentState {
             blocks,
             tool_specs: Arc::from([]),
             system_prompt: system_prompt::prompt(workspace.repo()),
             queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
-            context_used: None,
+            context_used,
         };
         Ok(Self::new(
             workspace,
@@ -412,18 +414,12 @@ impl ClaudeLoop {
         self.notify.notify_waiters();
     }
 
-    /// Publishes the in-flight message's usage as context occupancy: every
-    /// input bucket (fresh, cache creation, cache read) plus output counts
-    /// toward the window.
+    /// Publishes the in-flight message's usage as context occupancy.
     fn update_context_used(&self) {
         let Some(usage) = &self.turn_usage else {
             return;
         };
-        let total = usage.input_tokens.unwrap_or(0)
-            + usage.cache_creation_input_tokens.unwrap_or(0)
-            + usage.cache_read_input_tokens.unwrap_or(0)
-            + usage.output_tokens.unwrap_or(0);
-        self.state.write().expect("poison").context_used = Some(total);
+        self.state.write().expect("poison").context_used = Some(usage.context_total());
         self.notify.notify_waiters();
     }
 

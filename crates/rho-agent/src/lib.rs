@@ -38,6 +38,10 @@ pub enum AgentEvent<'a> {
     InferenceResponse {
         items: Cow<'a, [InferenceResponseItem]>,
         provider_response_id: Option<ProviderResponseId>,
+        /// Context-window occupancy reported with this response (all input
+        /// plus output tokens). `None` in events persisted before this field
+        /// existed, or when the provider omitted usage.
+        context_used: Option<u64>,
     },
     ToolResult {
         result: Cow<'a, ToolResult>,
@@ -64,8 +68,9 @@ pub struct AgentState {
     pub kind: AgentStateKind,
     /// Tokens occupying the model's context window after the latest
     /// response (all input, cached or not, plus that response's output).
-    /// `None` until the first response of this process's lifetime; not
-    /// restored on load.
+    /// Restored on load from the event log (Rho runtime) or the session
+    /// transcript (Claude runtime); `None` until the agent's first response
+    /// reports usage.
     pub context_used: Option<u64>,
 }
 
@@ -237,6 +242,7 @@ impl Agent {
         let (next_event, events) = db.read().agent_events(agent_id);
         let mut blocks = Vec::new();
         let mut turn: Option<RestoreToolTurn> = None;
+        let mut context_used = None;
         let commit_finished_turn =
             |turn: &mut Option<RestoreToolTurn>, blocks: &mut Vec<Arc<ContextBlock>>| {
                 let Some(turn) = turn.take() else {
@@ -259,7 +265,11 @@ impl Agent {
                 AgentEvent::InferenceResponse {
                     items,
                     provider_response_id,
+                    context_used: response_context_used,
                 } => {
+                    if response_context_used.is_some() {
+                        context_used = response_context_used;
+                    }
                     commit_finished_turn(&mut turn, &mut blocks);
                     let outstanding_calls = items
                         .iter()
@@ -328,7 +338,7 @@ impl Agent {
             system_prompt: system_prompt::prompt(workspace.repo()),
             queued_messages: Vec::new(),
             kind,
-            context_used: None,
+            context_used,
         };
         Self::new(
             inference_session,
@@ -541,9 +551,11 @@ impl AgentLoop {
                             usage,
                             provider_response_id,
                         } => {
-                            if let Some(usage) = &usage {
-                                state.context_used =
-                                    Some(usage.input_tokens + usage.output_tokens);
+                            let context_used = usage
+                                .as_ref()
+                                .map(|usage| usage.input_tokens + usage.output_tokens);
+                            if context_used.is_some() {
+                                state.context_used = context_used;
                             }
                             match pending_response.finish() {
                             Err(error) => {
@@ -576,6 +588,7 @@ impl AgentLoop {
                                 self.persist_event(AgentEvent::InferenceResponse {
                                     items: Cow::Borrowed(&items),
                                     provider_response_id: provider_response_id.clone(),
+                                    context_used,
                                 })
                                 .await;
                                 state.blocks.push(Arc::new(ContextBlock::InferenceResponse {

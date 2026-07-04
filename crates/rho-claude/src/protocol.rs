@@ -291,6 +291,18 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: Option<u64>,
 }
 
+impl TokenUsage {
+    /// Tokens this message occupies in the context window: every input
+    /// bucket (fresh, cache creation, cache read) plus output all count
+    /// toward the window.
+    pub fn context_total(&self) -> u64 {
+        self.input_tokens.unwrap_or(0)
+            + self.cache_creation_input_tokens.unwrap_or(0)
+            + self.cache_read_input_tokens.unwrap_or(0)
+            + self.output_tokens.unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct StreamError {
     #[serde(rename = "type")]
