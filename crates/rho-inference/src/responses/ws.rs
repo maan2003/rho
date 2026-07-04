@@ -15,7 +15,10 @@ use super::{InferenceSession, OPENAI_BETA_WS, responses_url};
 
 /// How long an active turn may go without any provider event before we treat
 /// the socket as wedged and fail the turn. Not applied while idle.
-pub(crate) const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// Codex's default streaming idle timeout is 5 minutes; keep Rho aligned so
+/// slow server-side compaction has time to emit its first item.
+pub(crate) const EVENT_TIMEOUT: Duration = Duration::from_secs(300);
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// Margin under the server's ~60-minute hard cap: a connection this old is
 /// reopened before sending, so a turn never dies mid-stream from the server
