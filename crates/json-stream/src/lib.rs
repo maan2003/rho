@@ -8,12 +8,67 @@ fn decode_json_string(raw: &str) -> Result<String, String> {
     serde_json::from_str::<String>(&format!("\"{raw}\"")).map_err(|e| e.to_string())
 }
 
+fn decode_json_string_partial(raw: &[char]) -> String {
+    let mut out = String::new();
+    let mut chars = raw.iter().copied();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+
+        let Some(escaped) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+
+        match escaped {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let mut hex = String::new();
+                for _ in 0..4 {
+                    let Some(digit) = chars.next() else {
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                        return out;
+                    };
+                    hex.push(digit);
+                }
+                match u16::from_str_radix(&hex, 16)
+                    .ok()
+                    .and_then(|code| char::from_u32(code.into()))
+                {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug)]
 enum ObjectStatus {
     // We are ready to start a new object.
     Ready,
     // We are in the beginning of a string, likely because we just received an opening quote.
-    StringQuoteOpen,
+    StringQuoteOpen {
+        raw_so_far: Vec<char>,
+    },
     // We just finished a string, likely because we just received a closing quote.
     StringQuoteClose,
     // We are in the middle of a scalar value, likely because we just received a digit.
@@ -28,6 +83,7 @@ enum ObjectStatus {
     // We are in the beginning of an array string value.
     ArrayValueQuoteOpen {
         index: usize,
+        raw_so_far: Vec<char>,
     },
     // We just closed an array string value.
     ArrayValueQuoteClose,
@@ -58,6 +114,7 @@ enum ObjectStatus {
     // We are in the beginning of a value, likely because we just received a quote.
     ValueQuoteOpen {
         key: Vec<char>,
+        raw_so_far: Vec<char>,
         // We don't need to store the valueSoFar because we can add the value to the object
         // immediately.
     },
@@ -91,7 +148,9 @@ fn process_char(
     match (object, current_status, current_char) {
         (val @ Value::Null, sts @ ObjectStatus::Ready, '"') => {
             *val = json!("");
-            *sts = ObjectStatus::StringQuoteOpen;
+            *sts = ObjectStatus::StringQuoteOpen {
+                raw_so_far: Vec::new(),
+            };
         }
         (val @ Value::Null, sts @ ObjectStatus::Ready, '{') => {
             *val = json!({});
@@ -223,6 +282,7 @@ fn process_char(
             arr.push(json!(""));
             *sts = ObjectStatus::ArrayValueQuoteOpen {
                 index: arr.len() - 1,
+                raw_so_far: Vec::new(),
             };
         }
         (Value::Array(arr), sts @ ObjectStatus::StartArray, char) => {
@@ -233,22 +293,25 @@ fn process_char(
             };
         }
         (Value::Array(arr), sts @ ObjectStatus::ArrayValueQuoteOpen { .. }, '"') => {
-            let index = match *sts {
-                ObjectStatus::ArrayValueQuoteOpen { index } => index,
+            let (index, raw_so_far) = match sts {
+                ObjectStatus::ArrayValueQuoteOpen { index, raw_so_far } => (*index, raw_so_far),
                 _ => unreachable!(),
             };
             if let Some(Value::String(s)) = arr.get_mut(index) {
-                if ends_with_odd_backslashes(s) {
-                    s.push('"');
+                let raw = raw_so_far.iter().collect::<String>();
+                if ends_with_odd_backslashes(&raw) {
+                    raw_so_far.push('"');
+                    *s = decode_json_string_partial(raw_so_far);
                     return Ok(());
                 }
-                *s = decode_json_string(s)?;
+                *s = decode_json_string(&raw)?;
             }
             *sts = ObjectStatus::ArrayValueQuoteClose;
         }
-        (Value::Array(arr), ObjectStatus::ArrayValueQuoteOpen { index }, char) => {
+        (Value::Array(arr), ObjectStatus::ArrayValueQuoteOpen { index, raw_so_far }, char) => {
+            raw_so_far.push(char);
             if let Some(Value::String(s)) = arr.get_mut(*index) {
-                s.push(char);
+                *s = decode_json_string_partial(raw_so_far);
             } else {
                 return Err("Invalid string value in array".to_string());
             }
@@ -296,17 +359,23 @@ fn process_char(
             value_so_far.push(char);
         }
         // ------ string ------
-        (Value::String(s), sts @ ObjectStatus::StringQuoteOpen, '"') => {
-            if ends_with_odd_backslashes(s) {
-                s.push('"');
+        (Value::String(s), sts @ ObjectStatus::StringQuoteOpen { .. }, '"') => {
+            let raw_so_far = match sts {
+                ObjectStatus::StringQuoteOpen { raw_so_far } => raw_so_far,
+                _ => unreachable!(),
+            };
+            let raw = raw_so_far.iter().collect::<String>();
+            if ends_with_odd_backslashes(&raw) {
+                raw_so_far.push('"');
+                *s = decode_json_string_partial(raw_so_far);
             } else {
-                *s = decode_json_string(s)?;
+                *s = decode_json_string(&raw)?;
                 *sts = ObjectStatus::StringQuoteClose;
             }
         }
-        (Value::String(str), sts @ ObjectStatus::StringQuoteOpen, char) => {
-            str.push(char);
-            *sts = ObjectStatus::StringQuoteOpen;
+        (Value::String(str), ObjectStatus::StringQuoteOpen { raw_so_far }, char) => {
+            raw_so_far.push(char);
+            *str = decode_json_string_partial(raw_so_far);
         }
         (Value::Object(_obj), sts @ ObjectStatus::StartProperty, '"') => {
             *sts = ObjectStatus::KeyQuoteOpen { key_so_far: vec![] };
@@ -333,35 +402,41 @@ fn process_char(
         (Value::Object(_obj), ObjectStatus::Colon { .. }, ' ' | '\n' | '\t' | '\r') => {}
         (Value::Object(obj), sts @ ObjectStatus::Colon { .. }, '"') => {
             if let ObjectStatus::Colon { key } = sts.clone() {
-                *sts = ObjectStatus::ValueQuoteOpen { key: key.clone() };
+                *sts = ObjectStatus::ValueQuoteOpen {
+                    key: key.clone(),
+                    raw_so_far: Vec::new(),
+                };
                 // create an empty string for the value
                 obj.insert(key.iter().collect::<String>().clone(), json!(""));
             }
         }
         // ------ Add String Value ------
         (Value::Object(obj), sts @ ObjectStatus::ValueQuoteOpen { .. }, '"') => {
-            let key_vec = match sts {
-                ObjectStatus::ValueQuoteOpen { key } => key.clone(),
+            let (key_vec, raw_so_far) = match sts {
+                ObjectStatus::ValueQuoteOpen { key, raw_so_far } => (key.clone(), raw_so_far),
                 _ => unreachable!(),
             };
             let key_string = key_vec.iter().collect::<String>();
             if let Some(Value::String(value)) = obj.get_mut(&key_string) {
-                if ends_with_odd_backslashes(value) {
-                    value.push('"');
+                let raw = raw_so_far.iter().collect::<String>();
+                if ends_with_odd_backslashes(&raw) {
+                    raw_so_far.push('"');
+                    *value = decode_json_string_partial(raw_so_far);
                     return Ok(());
                 }
-                *value = decode_json_string(value)?;
+                *value = decode_json_string(&raw)?;
             }
             *sts = ObjectStatus::ValueQuoteClose;
         }
-        (Value::Object(obj), ObjectStatus::ValueQuoteOpen { key }, char) => {
+        (Value::Object(obj), ObjectStatus::ValueQuoteOpen { key, raw_so_far }, char) => {
             let key_string = key.iter().collect::<String>();
             let value = obj
                 .get_mut(&key_string)
                 .ok_or_else(|| format!("missing key {key_string}"))?;
             match value {
                 Value::String(value) => {
-                    value.push(char);
+                    raw_so_far.push(char);
+                    *value = decode_json_string_partial(raw_so_far);
                 }
                 _ => {
                     return Err(format!("Invalid value type for key {key_string}"));
@@ -802,6 +877,7 @@ param_test! {
     empty_string: r#""""#, Value::String("".to_string())
     single_character_string: r#""a""#, Value::String("a".to_string())
     string_with_escaped_quote: r#""a\"b""#, Value::String("a\"b".to_string())
+    string_with_escaped_newline: r#""a\nb""#, Value::String("a\nb".to_string())
     string_with_spaces: r#""a b c""#, Value::String("a b c".to_string())
     string_with_space_at_end: r#""a b c ""#, Value::String("a b c ".to_string())
     string_with_space_at_start: r#"" a b c""#, Value::String(" a b c".to_string())
@@ -937,5 +1013,30 @@ mod array_tests {
             parser.add_char(c).unwrap();
         }
         assert_eq!(parser.get_result(), &expected);
+    }
+}
+
+#[cfg(test)]
+mod string_escape_tests {
+    use super::JsonStreamParser;
+
+    #[test]
+    fn decodes_escaped_newline_before_string_is_closed() {
+        let mut parser = JsonStreamParser::new();
+        for c in r#"{"command":"printf hi\n"#.chars() {
+            parser.add_char(c).unwrap();
+        }
+
+        assert_eq!(parser.get_result()["command"].as_str(), Some("printf hi\n"));
+    }
+
+    #[test]
+    fn keeps_pending_escape_visible_until_escape_is_complete() {
+        let mut parser = JsonStreamParser::new();
+        for c in r#"{"command":"printf hi\"#.chars() {
+            parser.add_char(c).unwrap();
+        }
+
+        assert_eq!(parser.get_result()["command"].as_str(), Some("printf hi\\"));
     }
 }
