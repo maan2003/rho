@@ -652,3 +652,86 @@ fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContex
         "a failed draft submit should keep the message: {text:?}"
     );
 }
+
+/// Restore flow: the agent's first frame is a snapshot that already carries
+/// `context_used` (daemon loaded it from the event log / transcript). The
+/// status chips must show it without any live turn happening.
+#[gpui::test]
+fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Snapshot(UiAgentState {
+            blocks: vec![
+                user("go"),
+                assistant("done", Some(UiMessagePhase::FinalAnswer)),
+            ],
+            status: UiAgentStatus::Idle,
+            context_used: Some(194_816),
+        }),
+    );
+    let spans = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .active_agent_view()
+                .expect("agent view")
+                .read(cx)
+                .status_span_text()
+        })
+        .expect("read spans");
+    assert!(
+        spans.contains("195k"),
+        "restored context chip missing from status spans: {spans:?}"
+    );
+}
+
+/// The view can exist before any frame arrives (agent selected first, load
+/// completes later): the chip must appear when the snapshot lands.
+#[gpui::test]
+fn context_chip_appears_when_frame_arrives_after_selection(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(Some(agent(1)), window, cx);
+        })
+        .expect("select agent");
+    let spans_before = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .active_agent_view()
+                .expect("agent view")
+                .read(cx)
+                .status_span_text()
+        })
+        .expect("read spans");
+    assert!(
+        !spans_before.contains('k'),
+        "no chip expected before any frame: {spans_before:?}"
+    );
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Snapshot(UiAgentState {
+            blocks: vec![user("go")],
+            status: UiAgentStatus::Idle,
+            context_used: Some(62_300),
+        }),
+    );
+    let spans = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .active_agent_view()
+                .expect("agent view")
+                .read(cx)
+                .status_span_text()
+        })
+        .expect("read spans");
+    assert!(
+        spans.contains("62k"),
+        "context chip missing after late frame: {spans:?}"
+    );
+}

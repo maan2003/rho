@@ -272,6 +272,14 @@ impl AgentView {
         self.apply_status(cx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn status_span_text(&self) -> String {
+        self.status_spans
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect()
+    }
+
     fn apply_status(&self, cx: &mut Context<Self>) {
         let Some(anchor) = self
             .multi_buffer
