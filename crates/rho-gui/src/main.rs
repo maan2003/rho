@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use gpui::{App, AppContext as _, WindowOptions, actions};
+use gpui::{App, AppContext as _, KeyBinding, WindowOptions, actions};
 use settings::SettingsStore;
 
 use crate::workspace::{AttachTarget, Workspace};
@@ -118,7 +118,26 @@ fn init_app(cx: &mut App) -> Result<()> {
         settings::KeymapFile::load_asset_allow_partial_failure(settings::VIM_KEYMAP_PATH, cx)
             .context("failed to load vim keymap")?;
     cx.bind_keys(vim_key_bindings);
+    bind_rho_key_overrides(cx);
     Ok(())
+}
+
+fn bind_rho_key_overrides(cx: &mut App) {
+    // Keep draft field navigation available in vim normal mode. The bundled
+    // vim keymap only binds the rho prompt keys for insert mode, while the
+    // default keymap's Tab binding can lose to vim's normal-mode handling.
+    cx.bind_keys([
+        KeyBinding::new(
+            "tab",
+            RoleCycle,
+            Some("RhoGui > Editor && !showing_completions"),
+        ),
+        KeyBinding::new(
+            "shift-tab",
+            RoleCycleGroup,
+            Some("RhoGui > Editor && !showing_completions"),
+        ),
+    ]);
 }
 
 const DEFAULT_SETTINGS: &str = r#"// Rho GUI user settings. Values here override bundled defaults.

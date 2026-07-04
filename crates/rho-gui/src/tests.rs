@@ -36,6 +36,7 @@ fn bind_test_keymaps(cx: &mut App) {
         settings::KeymapFile::load_asset_allow_partial_failure(settings::VIM_KEYMAP_PATH, cx)
             .expect("load vim keymap");
     cx.bind_keys(vim_key_bindings);
+    crate::bind_rho_key_overrides(cx);
 }
 
 fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
