@@ -115,14 +115,14 @@ impl AssistantMessage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssistantConversationMessage {
     pub role: Option<Role>,
     #[serde(default)]
     pub content: Vec<AssistantContent>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantContent {
     Text {
@@ -281,14 +281,14 @@ pub struct UserOutputMessage {
     pub uuid: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutputConversationMessage {
     pub role: Role,
     #[serde(default)]
     pub content: Vec<OutputContent>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputContent {
     Text { text: String },

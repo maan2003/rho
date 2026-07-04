@@ -15,7 +15,8 @@
 //! multiple workspaces, and the workspace pool commands exist.
 
 use std::collections::HashMap;
-use std::os::fd::OwnedFd;
+use std::ffi::{CStr, CString};
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -328,10 +329,7 @@ impl Workspace {
     /// every later turn, so there is deliberately no degraded mode.
     /// User-checkout workspaces never call this — they have no namespace.
     pub async fn mnt_ns(&self) -> &OwnedFd {
-        assert!(
-            !self.is_user_checkout(),
-            "user checkouts have no namespace"
-        );
+        assert!(!self.is_user_checkout(), "user checkouts have no namespace");
         self.mnt_ns
             .get_or_init(|| async {
                 let repo = self.repo.root().to_owned();
@@ -339,11 +337,33 @@ impl Workspace {
                 tokio::task::spawn_blocking(move || {
                     ns::create_workspace_ns(repo.as_std_path(), slot.as_std_path())
                 })
-                    .await
-                    .expect("namespace task panicked")
-                    .expect("workspace mount namespace setup failed")
+                .await
+                .expect("namespace task panicked")
+                .expect("workspace mount namespace setup failed")
             })
             .await
+    }
+
+    /// Configure a child process to run in this workspace's path view.
+    ///
+    /// User checkouts run directly at the repo root. Pool workspaces enter the
+    /// workspace mount namespace in `pre_exec` and then chdir to the origin
+    /// repo path, which resolves to the pool slot inside that namespace.
+    pub async fn prepare_command(
+        &self,
+        command: &mut tokio::process::Command,
+    ) -> anyhow::Result<()> {
+        if self.is_user_checkout() {
+            command.current_dir(self.repo().as_std_path());
+            return Ok(());
+        }
+        let ns_fd = std::os::fd::AsRawFd::as_raw_fd(self.mnt_ns().await);
+        let cwd = CString::new(self.repo().as_str().as_bytes())
+            .map_err(|_| anyhow::anyhow!("workspace path contains a NUL byte"))?;
+        unsafe {
+            command.pre_exec(move || enter_workspace_ns(ns_fd, &cwd));
+        }
+        Ok(())
     }
 
     /// Commits the checkout's current file state into the repo (any jj
@@ -356,6 +376,31 @@ impl Workspace {
         run_jj(command).await.context("jj snapshot")?;
         Ok(())
     }
+}
+
+/// Runs between fork and exec: enter the workspace's mount namespace, move
+/// to the working directory (whose path only resolves inside it), and shed
+/// the daemon's in-namespace privileges. Must not allocate — the forked
+/// child could deadlock on the allocator lock.
+fn enter_workspace_ns(ns_fd: RawFd, cwd: &CStr) -> std::io::Result<()> {
+    use rustix::thread::{CapabilitySet, CapabilitySets, LinkNameSpaceType};
+
+    // SAFETY: the fd is kept alive by the `Workspace` held by the spawning
+    // agent/tool for the duration of spawn.
+    let fd = unsafe { BorrowedFd::borrow_raw(ns_fd) };
+    rustix::thread::move_into_link_name_space(fd, Some(LinkNameSpaceType::Mount))?;
+    rustix::process::chdir(cwd)?;
+    rustix::thread::set_no_new_privs(true)?;
+    let empty = CapabilitySet::empty();
+    rustix::thread::set_capabilities(
+        None,
+        CapabilitySets {
+            effective: empty,
+            permitted: empty,
+            inheritable: empty,
+        },
+    )?;
+    Ok(())
 }
 
 async fn run_jj(mut command: tokio::process::Command) -> anyhow::Result<Vec<u8>> {
@@ -382,7 +427,10 @@ pub fn resolve_repo_root(path: &Path) -> anyhow::Result<Utf8PathBuf> {
         .canonicalize()
         .with_context(|| format!("repo does not exist: {}", path.display()))?;
     let path = Utf8PathBuf::try_from(path).context("repo path is not valid UTF-8")?;
-    anyhow::ensure!(path.join(".jj").is_dir(), "not a jj repository root: {path}");
+    anyhow::ensure!(
+        path.join(".jj").is_dir(),
+        "not a jj repository root: {path}"
+    );
     let pointer = path.join(".jj").join("repo");
     if pointer.is_file() {
         // A secondary workspace: the pointer names `<origin>/.jj/repo`.

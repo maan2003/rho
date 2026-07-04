@@ -70,6 +70,10 @@ impl ClaudeCodeOptions {
     }
 
     pub async fn spawn(&self) -> Result<ClaudeCode> {
+        ClaudeCode::spawn_command(self.command()).await
+    }
+
+    pub fn command(&self) -> Command {
         let mut command = Command::new(self.command.as_std_path());
         command.args(self.args());
         command.current_dir(self.cwd.as_std_path());
@@ -80,7 +84,12 @@ impl ClaudeCodeOptions {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::null());
         command.kill_on_drop(true);
+        command
+    }
+}
 
+impl ClaudeCode {
+    pub async fn spawn_command(mut command: Command) -> Result<Self> {
         let mut child = command.spawn().context("spawn Claude Code")?;
         let stdin = child
             .stdin

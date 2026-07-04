@@ -211,6 +211,13 @@ pub trait AgentWriteTxnExt {
 
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
 
+    fn set_claude_transcript_path(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        transcript_path: Utf8PathBuf,
+    );
+
     fn alloc_agent_id(&mut self) -> AgentId;
 
     /// Reserves a fresh jj workspace name. Ids never repeat, so recreated
@@ -411,6 +418,30 @@ impl AgentWriteTxnExt for WriteTxn {
             .value()
             .into_owned();
         agent.display_name = Some(name);
+        agent.updated_at = now;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
+    fn set_claude_transcript_path(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        transcript_path: Utf8PathBuf,
+    ) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        let AgentKind::Claude {
+            transcript_path: path,
+            ..
+        } = &mut agent.kind
+        else {
+            panic!("set_claude_transcript_path called for non-Claude agent");
+        };
+        *path = Some(transcript_path);
         agent.updated_at = now;
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
