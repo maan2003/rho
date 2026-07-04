@@ -249,7 +249,7 @@ impl ChatApp {
                     return Ok(true);
                 };
                 self.term
-                    .print_system(&format!("new agent in {}", working_directory.display()));
+                    .print_system(&format!("new agent in {working_directory}"));
                 self.agent.new_agent_in_topic(topic_id, working_directory);
             }
             rho_commands::Command::AgentRename { name } => {
@@ -306,7 +306,7 @@ impl ChatApp {
                     return Ok(true);
                 };
                 self.term
-                    .print_system(&format!("registered {}", path.display()));
+                    .print_system(&format!("registered {path}"));
                 self.agent.set_workdir(path, name);
             }
             rho_commands::Command::WorkdirRemove { path } => {
@@ -468,7 +468,10 @@ fn send_prompt(agent: &AgentClient, text: String) {
     } else {
         // New agents work where the CLI was launched; the daemon's own cwd
         // is meaningless by design.
-        let Ok(working_directory) = std::env::current_dir() else {
+        let Ok(working_directory) = std::env::current_dir()
+            .map_err(anyhow::Error::from)
+            .and_then(|cwd| Ok(camino::Utf8PathBuf::try_from(cwd)?))
+        else {
             return;
         };
         agent.new_agent_with_user_message_in_topic(
@@ -485,7 +488,7 @@ fn workdir_table(agent: &AgentClient) -> Vec<(String, String)> {
     agent
         .workdirs()
         .into_iter()
-        .map(|workdir| (workdir.name, workdir.path.display().to_string()))
+        .map(|workdir| (workdir.name, workdir.path.into_string()))
         .collect()
 }
 
@@ -502,22 +505,24 @@ fn topic_labels(agent: &AgentClient) -> Vec<(String, rho_ui_proto::TopicId)> {
 /// name, `~`-expanded, or relative to where the CLI was launched. `None`
 /// falls back to the CLI's own cwd.
 fn resolve_working_directory(
-    argument: Option<std::path::PathBuf>,
+    argument: Option<camino::Utf8PathBuf>,
     workdirs: &[(String, String)],
-) -> Option<std::path::PathBuf> {
-    let cwd = std::env::current_dir().ok();
+) -> Option<camino::Utf8PathBuf> {
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| camino::Utf8PathBuf::try_from(cwd).ok());
     let Some(argument) = argument else {
         return cwd;
     };
-    if let Some(path) = rho_commands::resolve_workdir(&argument.display().to_string(), workdirs) {
+    if let Some(path) = rho_commands::resolve_workdir(argument.as_str(), workdirs) {
         return Some(path.into());
     }
-    let argument = argument.display().to_string();
+    let home = || camino::Utf8PathBuf::try_from(dirs::home_dir()?).ok();
     if argument == "~" {
-        return dirs::home_dir();
+        return home();
     }
-    if let Some(rest) = argument.strip_prefix("~/") {
-        return Some(dirs::home_dir()?.join(rest));
+    if let Ok(rest) = argument.strip_prefix("~/") {
+        return Some(home()?.join(rest));
     }
     Some(cwd?.join(argument))
 }

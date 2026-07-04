@@ -3,7 +3,10 @@ use rho_core::{ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
 use super::*;
 
 fn test_tools(timeout_secs: u64) -> ShellTools {
-    ShellTools::in_directory(Duration::from_secs(timeout_secs), std::env::temp_dir())
+    ShellTools::in_directory(
+        Duration::from_secs(timeout_secs),
+        camino::Utf8PathBuf::try_from(std::env::temp_dir()).unwrap(),
+    )
 }
 
 fn shell_call(arguments: serde_json::Value) -> ToolCall {
@@ -149,7 +152,10 @@ async fn apply_patch_custom_tool_applies_patch() {
 #[tokio::test]
 async fn shell_commands_run_in_the_agents_working_directory() {
     let temp = tempfile::tempdir().unwrap();
-    let tools = ShellTools::in_directory(Duration::from_secs(2), temp.path().to_path_buf());
+    let tools = ShellTools::in_directory(
+        Duration::from_secs(2),
+        camino::Utf8PathBuf::try_from(temp.path().to_path_buf()).unwrap(),
+    );
     let result = tools.call(shell_call(json!({"command": "pwd"}))).await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
@@ -165,7 +171,10 @@ async fn shell_commands_run_in_the_agents_working_directory() {
 async fn relative_model_cwd_resolves_against_working_directory() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("sub")).unwrap();
-    let tools = ShellTools::in_directory(Duration::from_secs(2), temp.path().to_path_buf());
+    let tools = ShellTools::in_directory(
+        Duration::from_secs(2),
+        camino::Utf8PathBuf::try_from(temp.path().to_path_buf()).unwrap(),
+    );
     let result = tools
         .call(shell_call(json!({"command": "pwd", "cwd": "sub"})))
         .await;

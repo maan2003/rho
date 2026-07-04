@@ -16,10 +16,11 @@
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use camino::{Utf8Path, Utf8PathBuf};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Mutex, OnceCell};
 
@@ -33,16 +34,16 @@ pub use ns::init_daemon_namespace;
 pub enum WorkspaceInfo {
     /// The user's own checkout: the agent works directly at the repo path,
     /// no separate checkout and no namespace.
-    UserCheckout { repo: String },
+    UserCheckout { repo: Utf8PathBuf },
     /// A jj workspace named after the creating agent. It is checked out in
     /// a pool slot, but that is an implementation detail: the slot directory
     /// is queried from jj, never stored — it changes across detach/attach
     /// cycles.
-    Workspace { repo: String, name: String },
+    Workspace { repo: Utf8PathBuf, name: String },
 }
 
 impl WorkspaceInfo {
-    pub fn repo(&self) -> &str {
+    pub fn repo(&self) -> &Utf8Path {
         match self {
             Self::UserCheckout { repo } | Self::Workspace { repo, .. } => repo,
         }
@@ -64,7 +65,7 @@ impl WorkspaceInfo {
 #[derive(Debug)]
 pub struct Repo {
     /// Canonicalized origin root; UTF-8 validated at open.
-    root: String,
+    root: Utf8PathBuf,
     /// Serializes jj invocations. jj's op log makes concurrent commands safe
     /// on its own; this is simplicity insurance while the fork's
     /// all-workspace snapshot path is young.
@@ -84,13 +85,8 @@ impl Repo {
     /// Opens the repo containing `path` (resolving through workspace
     /// pointers to the origin root).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let root = resolve_repo_root(path)?;
-        let root = root
-            .into_os_string()
-            .into_string()
-            .map_err(|root| anyhow::anyhow!("repo path is not valid UTF-8: {root:?}"))?;
         Ok(Self {
-            root,
+            root: resolve_repo_root(path)?,
             jj_lock: Mutex::new(()),
             workspaces: Mutex::new(HashMap::new()),
             reaped: OnceCell::new(),
@@ -134,12 +130,12 @@ impl Repo {
         if let Some(workspace) = self.workspaces.lock().await.get(&info) {
             return Ok(Arc::clone(workspace));
         }
-        self.cache_workspace(info, PathBuf::from(&self.root)).await
+        self.cache_workspace(info, self.root.clone()).await
     }
 
     /// The origin repo root (canonicalized).
-    pub fn root(&self) -> &Path {
-        Path::new(&self.root)
+    pub fn root(&self) -> &Utf8Path {
+        &self.root
     }
 
     fn workspace_info(&self, name: &str) -> WorkspaceInfo {
@@ -153,7 +149,7 @@ impl Repo {
     /// first when `create_revset` is given) and returns the slot directory,
     /// with its repo pointers rewritten through ws-parent and its flake
     /// files' mtimes restored for direnv/nix fingerprints.
-    async fn attach(&self, name: &str, create_revset: Option<&str>) -> anyhow::Result<PathBuf> {
+    async fn attach(&self, name: &str, create_revset: Option<&str>) -> anyhow::Result<Utf8PathBuf> {
         let _guard = self.jj_lock.lock().await;
         self.ensure_reaped().await?;
         let mut command = self.jj();
@@ -179,7 +175,7 @@ impl Repo {
     async fn cache_workspace(
         self: &Arc<Self>,
         info: WorkspaceInfo,
-        slot: PathBuf,
+        slot: Utf8PathBuf,
     ) -> anyhow::Result<Arc<Workspace>> {
         let workspace = Arc::new(Workspace {
             info: info.clone(),
@@ -239,16 +235,15 @@ impl Repo {
     }
 
     /// The slot directory a workspace is currently attached at, per jj.
-    async fn workspace_root(&self, name: &str) -> anyhow::Result<PathBuf> {
+    async fn workspace_root(&self, name: &str) -> anyhow::Result<Utf8PathBuf> {
         let mut command = self.jj();
         command.args(["workspace", "root", "--name", name]);
         let stdout = run_jj(command).await.context("jj workspace root")?;
         let path = String::from_utf8(stdout).context("workspace root is not valid UTF-8")?;
-        let path = PathBuf::from(path.trim());
+        let path = Utf8PathBuf::from(path.trim());
         anyhow::ensure!(
             path.is_absolute() && path.is_dir(),
-            "jj reported a bad workspace root: {}",
-            path.display()
+            "jj reported a bad workspace root: {path}",
         );
         Ok(path)
     }
@@ -260,7 +255,7 @@ impl Repo {
     /// the `.git` worktree pointer each time. Also ensures the origin's
     /// ws-parent symlink, which must exist before the rewritten pointer is
     /// ever read.
-    fn rewrite_pointers(&self, slot: &Path) -> anyhow::Result<()> {
+    fn rewrite_pointers(&self, slot: &Utf8Path) -> anyhow::Result<()> {
         ensure_ws_parent_symlink(self.root())?;
         let parent = self.root().join(".jj").join(ns::WS_PARENT);
         // The slot-side directory the agent namespace binds the origin onto.
@@ -272,8 +267,8 @@ impl Repo {
 
         let jj_pointer = slot.join(".jj").join("repo");
         let target = parent.join(".jj").join("repo");
-        std::fs::write(&jj_pointer, target.as_os_str().as_encoded_bytes())
-            .with_context(|| format!("rewrite {}", jj_pointer.display()))?;
+        std::fs::write(&jj_pointer, target.as_str())
+            .with_context(|| format!("rewrite {jj_pointer}"))?;
 
         // Git worktree slots get a `gitdir: <origin>/...` file; same
         // treatment. Replacement is a no-op when the pointer was already
@@ -282,11 +277,11 @@ impl Repo {
         if git_pointer.is_file() {
             let content =
                 std::fs::read_to_string(&git_pointer).context("read git worktree pointer")?;
-            let parent_str = parent
-                .to_str()
-                .expect("ws-parent path derives from UTF-8 root");
-            std::fs::write(&git_pointer, content.replace(&self.root, parent_str))
-                .context("rewrite git worktree pointer")?;
+            std::fs::write(
+                &git_pointer,
+                content.replace(self.root.as_str(), parent.as_str()),
+            )
+            .context("rewrite git worktree pointer")?;
         }
         Ok(())
     }
@@ -299,7 +294,7 @@ impl Repo {
 pub struct Workspace {
     info: WorkspaceInfo,
     repo: Arc<Repo>,
-    slot: PathBuf,
+    slot: Utf8PathBuf,
     mnt_ns: OnceCell<OwnedFd>,
 }
 
@@ -314,13 +309,13 @@ impl Workspace {
 
     /// The origin repo root — the path agents see and the system prompt
     /// reports (the slot is mounted over it in the agent's namespace).
-    pub fn repo(&self) -> &Path {
+    pub fn repo(&self) -> &Utf8Path {
         self.repo.root()
     }
 
     /// The checkout directory in the daemon/host namespace. In-process file
     /// operations (patches) and namespace-less fallback execution use this.
-    pub fn slot(&self) -> &Path {
+    pub fn slot(&self) -> &Utf8Path {
         &self.slot
     }
 
@@ -341,7 +336,9 @@ impl Workspace {
             .get_or_init(|| async {
                 let repo = self.repo.root().to_owned();
                 let slot = self.slot.clone();
-                tokio::task::spawn_blocking(move || ns::create_workspace_ns(&repo, &slot))
+                tokio::task::spawn_blocking(move || {
+                    ns::create_workspace_ns(repo.as_std_path(), slot.as_std_path())
+                })
                     .await
                     .expect("namespace task panicked")
                     .expect("workspace mount namespace setup failed")
@@ -372,10 +369,10 @@ async fn run_jj(mut command: tokio::process::Command) -> anyhow::Result<Vec<u8>>
     Ok(output.stdout)
 }
 
-/// Repo roots must be absolute, existing jj repo roots. A path inside a
-/// secondary workspace resolves to its origin repo via the `.jj/repo`
+/// Repo roots must be absolute, existing, UTF-8 jj repo roots. A path inside
+/// a secondary workspace resolves to its origin repo via the `.jj/repo`
 /// pointer.
-pub fn resolve_repo_root(path: &Path) -> anyhow::Result<PathBuf> {
+pub fn resolve_repo_root(path: &Path) -> anyhow::Result<Utf8PathBuf> {
     anyhow::ensure!(
         path.is_absolute(),
         "repo path must be absolute: {}",
@@ -384,28 +381,24 @@ pub fn resolve_repo_root(path: &Path) -> anyhow::Result<PathBuf> {
     let path = path
         .canonicalize()
         .with_context(|| format!("repo does not exist: {}", path.display()))?;
-    anyhow::ensure!(
-        path.join(".jj").is_dir(),
-        "not a jj repository root: {}",
-        path.display()
-    );
+    let path = Utf8PathBuf::try_from(path).context("repo path is not valid UTF-8")?;
+    anyhow::ensure!(path.join(".jj").is_dir(), "not a jj repository root: {path}");
     let pointer = path.join(".jj").join("repo");
     if pointer.is_file() {
         // A secondary workspace: the pointer names `<origin>/.jj/repo`.
-        let target = PathBuf::from(
+        let target = Utf8PathBuf::from(
             std::fs::read_to_string(&pointer)
-                .with_context(|| format!("read {}", pointer.display()))?
+                .with_context(|| format!("read {pointer}"))?
                 .trim(),
         );
         let origin = target
             .parent()
-            .and_then(Path::parent)
-            .with_context(|| format!("malformed repo pointer in {}", pointer.display()))?
+            .and_then(Utf8Path::parent)
+            .with_context(|| format!("malformed repo pointer in {pointer}"))?
             .to_owned();
         anyhow::ensure!(
             origin.join(".jj").is_dir(),
-            "workspace points at a missing repo: {}",
-            origin.display()
+            "workspace points at a missing repo: {origin}",
         );
         return Ok(origin);
     }
@@ -416,16 +409,16 @@ pub fn resolve_repo_root(path: &Path) -> anyhow::Result<PathBuf> {
 /// target resolves relative to the `.jj` dir holding the link) that slot
 /// pointers route through (see [`ns::WS_PARENT`]); created once per repo,
 /// idempotent.
-fn ensure_ws_parent_symlink(repo: &Path) -> anyhow::Result<()> {
+fn ensure_ws_parent_symlink(repo: &Utf8Path) -> anyhow::Result<()> {
     let link = repo.join(".jj").join(ns::WS_PARENT);
     match std::os::unix::fs::symlink("..", &link) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("create {}", link.display())),
+        Err(error) => Err(error).with_context(|| format!("create {link}")),
     }
 }
 
-fn copy_mtime(source: PathBuf, target: PathBuf) -> std::io::Result<()> {
+fn copy_mtime(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Result<()> {
     let meta = std::fs::metadata(source)?;
     let times = std::fs::FileTimes::new()
         .set_accessed(meta.accessed()?)

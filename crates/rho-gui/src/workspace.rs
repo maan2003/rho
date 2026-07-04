@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+use camino::{Utf8Path, Utf8PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt as _;
@@ -304,23 +306,13 @@ impl Workspace {
         };
         let field = self.draft_view.read(cx).workdir_text(cx).trim().to_owned();
         let working_directory = (!field.is_empty())
-            .then(|| self.resolve_workdir_path(PathBuf::from(field)))
+            .then(|| self.resolve_workdir_path(Utf8PathBuf::from(field)))
             .or_else(|| self.draft_default_workdir());
-        let Some(working_directory) = working_directory else {
-            self.notice_on(
-                None,
-                "no working directory for the new agent: type one in the \
-                 Workdir field, or register one with :workdirs add <path>",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        };
         let start = {
             let draft = self.draft_view.read(cx);
             let mode = draft.start_mode();
             let target = draft.start_text(cx).trim().to_owned();
-            match self.parse_start(mode, &target) {
+            match self.parse_start(mode, &target, working_directory) {
                 Ok(start) => start,
                 Err(message) => {
                     self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -331,7 +323,6 @@ impl Workspace {
         self.awaiting_draft_agent = true;
         self.connection.send(ClientMessage::NewAgent {
             topic_id,
-            repo: working_directory,
             start,
             content: Some(vec![ContentPart::Text { text: body }]),
         });
@@ -341,14 +332,23 @@ impl Workspace {
     /// your working copy). An agent label resolves to the agent's workspace
     /// — `<name>@` as a stacking base, or the workspace itself for Join;
     /// anything else is a revset (stacking only). `user` is only meaningful
-    /// for Join — your own checkout.
+    /// for Join — your own checkout. Agent targets carry their own repo;
+    /// `workdir` is only needed (and only checked) for the other arms.
     fn parse_start(
         &self,
         mode: crate::draft_view::StartFieldMode,
         target: &str,
+        workdir: Option<Utf8PathBuf>,
     ) -> Result<rho_ui_proto::StartMode, String> {
         use crate::draft_view::StartFieldMode;
         use rho_ui_proto::{JoinTarget, StartMode, WorkspaceInfo};
+        let require_workdir = || {
+            workdir.clone().ok_or_else(|| {
+                "no working directory for the new agent: type one in the \
+                 Workdir field, or register one with :workdirs add <path>"
+                    .to_owned()
+            })
+        };
         let workspace = self
             .registry
             .agent_by_label(target)
@@ -358,12 +358,18 @@ impl Workspace {
             (StartFieldMode::NewOn, "", _) => {
                 return Err("pick a base: a revset like `@-` or an agent label".to_owned());
             }
-            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workspace { name, .. })) => {
-                StartMode::NewOn(format!("{name}@"))
+            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workspace { repo, name })) => {
+                StartMode::NewOn {
+                    repo,
+                    revset: format!("{name}@"),
+                }
             }
             // An agent in the user's checkout works on the user's own change.
-            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::UserCheckout { .. })) => {
-                StartMode::NewOn("@".to_owned())
+            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
+                StartMode::NewOn {
+                    repo,
+                    revset: "@".to_owned(),
+                }
             }
             (StartFieldMode::NewOn, _, None) => {
                 if target.eq_ignore_ascii_case("user") {
@@ -374,14 +380,19 @@ impl Workspace {
                 if target.starts_with('@') && target.len() > 1 {
                     return Err(format!("no agent named `{target}`"));
                 }
-                StartMode::NewOn(target.to_owned())
+                StartMode::NewOn {
+                    repo: require_workdir()?,
+                    revset: target.to_owned(),
+                }
             }
             (StartFieldMode::Join, _, Some(workspace)) => {
                 StartMode::Join(JoinTarget::Workspace(workspace))
             }
             (StartFieldMode::Join, target, None) => {
                 if target.is_empty() || target.eq_ignore_ascii_case("user") {
-                    StartMode::Join(JoinTarget::User)
+                    StartMode::Join(JoinTarget::User {
+                        repo: require_workdir()?,
+                    })
                 } else {
                     return Err(format!(
                         "join target must be `user` or an agent label, not `{target}`"
@@ -557,7 +568,7 @@ impl Workspace {
     /// otherwise the scaffold default is derived from the inherited topic.
     pub fn enter_draft(
         &mut self,
-        working_directory: Option<PathBuf>,
+        working_directory: Option<Utf8PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -722,7 +733,7 @@ impl Workspace {
     /// topic's newest agent sets the precedent, else the first registered
     /// workdir. All daemon-side data — the GUI may run on another machine,
     /// so its own cwd is meaningless here.
-    fn draft_default_workdir(&self) -> Option<PathBuf> {
+    fn draft_default_workdir(&self) -> Option<Utf8PathBuf> {
         self.draft_target_topic()
             .and_then(|topic_id| self.registry.last_working_directory(topic_id))
             .or_else(|| self.workdirs.first().map(|workdir| workdir.path.clone()))
@@ -730,12 +741,12 @@ impl Workspace {
 
     /// How a path reads in the draft header: its registered workdir name
     /// when it has one, else the full path.
-    fn workdir_label(&self, path: &std::path::Path) -> String {
+    fn workdir_label(&self, path: &Utf8Path) -> String {
         self.workdirs
             .iter()
             .find(|workdir| workdir.path == path)
             .map(|workdir| workdir.name.clone())
-            .unwrap_or_else(|| path.display().to_string())
+            .unwrap_or_else(|| path.to_string())
     }
 
     /// Topics as the `(name, id)` pairs shared resolution expects.
@@ -759,7 +770,7 @@ impl Workspace {
     pub fn workdir_table(&self) -> Vec<(String, String)> {
         self.workdirs
             .iter()
-            .map(|workdir| (workdir.name.clone(), workdir.path.display().to_string()))
+            .map(|workdir| (workdir.name.clone(), workdir.path.to_string()))
             .collect()
     }
 
@@ -767,9 +778,9 @@ impl Workspace {
     /// through untouched. Paths name directories on the daemon's machine,
     /// so the GUI never joins its own cwd or expands its own home — the
     /// daemon expands `~` and validates.
-    fn resolve_workdir_path(&self, path: PathBuf) -> PathBuf {
-        rho_commands::resolve_workdir(&path.display().to_string(), &self.workdir_table())
-            .map(PathBuf::from)
+    fn resolve_workdir_path(&self, path: Utf8PathBuf) -> Utf8PathBuf {
+        rho_commands::resolve_workdir(path.as_str(), &self.workdir_table())
+            .map(Utf8PathBuf::from)
             .unwrap_or(path)
     }
 
@@ -901,9 +912,8 @@ impl Workspace {
         };
         directory
             .file_name()
-            .and_then(|name| name.to_str())
             .map(str::to_owned)
-            .unwrap_or_else(|| directory.display().to_string())
+            .unwrap_or_else(|| directory.to_string())
     }
 
     pub fn live_agent_names(&self) -> Vec<String> {

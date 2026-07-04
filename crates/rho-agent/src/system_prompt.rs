@@ -1,7 +1,7 @@
-use std::path::Path;
+use camino::Utf8Path;
 use std::sync::Arc;
 
-pub fn prompt(working_directory: &Path) -> Arc<str> {
+pub fn prompt(working_directory: &Utf8Path) -> Arc<str> {
     format!(
         "{BASE_PROMPT}## Environment
 
@@ -10,7 +10,7 @@ Working directory: {}
 Relative paths in commands and patches resolve against this directory. Stay \
 within it unless the user points you elsewhere.
 ",
-        working_directory.display()
+        working_directory
     )
     .into()
 }

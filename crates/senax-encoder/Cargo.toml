@@ -27,6 +27,7 @@ smol_str = ["dep:smol_str"]
 thiserror = "1.0"
 senax-encoder-derive = { path = "./derive", version = "0.2.1" }
 bytes = "1.5"
+camino = "1"
 indexmap = { version = "2.2", optional = true }
 chrono = { version = "0.4", optional = true }
 rust_decimal = { version = "1.35", optional = true }

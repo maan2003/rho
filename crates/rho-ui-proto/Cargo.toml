@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+camino.workspace = true
 rho-workspaces.workspace = true
 anyhow.workspace = true
 futures.workspace = true

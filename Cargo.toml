@@ -31,6 +31,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
+camino = "1"
 async-stream = "0.3"
 base64 = "0.22"
 bytes = "1"

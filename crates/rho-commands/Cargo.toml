@@ -6,4 +6,5 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
+camino.workspace = true
 rho-ui-proto.workspace = true

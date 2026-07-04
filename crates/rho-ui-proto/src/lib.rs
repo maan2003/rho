@@ -4,7 +4,7 @@
 //! and daemon can map these messages onto concrete `rho-agent` handles without
 //! teaching lower crates about sockets or UI policy.
 
-use std::path::PathBuf;
+use camino::Utf8PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,8 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 const FRAME_LEN_BYTES: u64 = size_of::<u32>() as u64;
-const PROTOCOL_LOG_ENCODE_MAGIC: &[u8; 4] = b"RUP1";
-const PROTOCOL_LOG_PACK_MAGIC: &[u8; 4] = b"RUP2";
+const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP2";
 
 /// Shared byte counters for one UI protocol connection.
 ///
@@ -70,11 +69,8 @@ pub enum ClientMessage {
     },
     NewAgent {
         topic_id: TopicId,
-        /// jj repo root the agent works on. Clients choose it (workdirs are
-        /// the suggested vocabulary); the daemon creates a dedicated jj
-        /// workspace checkout in it for the agent's life.
-        repo: PathBuf,
-        /// Where the agent's working copy starts.
+        /// Where the agent's working copy starts (including which repo, for
+        /// the modes that need one).
         start: StartMode,
         content: Option<Vec<ContentPart>>,
     },
@@ -116,21 +112,23 @@ pub enum ClientMessage {
     /// Registers a workdir, or renames it if `path` is already registered.
     /// `name` defaults to the path's basename.
     WorkdirSet {
-        path: PathBuf,
+        path: Utf8PathBuf,
         name: Option<String>,
     },
     WorkdirRemove {
-        path: PathBuf,
+        path: Utf8PathBuf,
     },
 }
 
-/// Where a new agent works, relative to a target checkout.
+/// Where a new agent works. Each mode carries exactly the data it needs:
+/// joining an existing workspace already knows its repo, the others say
+/// which repo they mean.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum StartMode {
-    /// A fresh workspace with a new change on top of the revset. Clients
-    /// resolve agent targets to `<workspace name>@` themselves (workspace
-    /// names arrive on [`UiAgentSummary`]).
-    NewOn(String),
+    /// A fresh workspace in `repo` with a new change on top of the revset.
+    /// Clients resolve agent targets to `<workspace name>@` themselves
+    /// (workspace names arrive on [`UiAgentSummary`]).
+    NewOn { repo: Utf8PathBuf, revset: String },
     /// The SAME workspace as the target: no new checkout — agents share the
     /// directory (and namespace), seeing each other's edits instantly.
     /// Joining the user means working directly in the user's checkout.
@@ -142,8 +140,8 @@ pub enum StartMode {
 pub enum JoinTarget {
     /// A known workspace, sent back verbatim from [`UiAgentSummary`].
     Workspace(WorkspaceInfo),
-    /// The user's own checkout of the draft's repo.
-    User,
+    /// The user's own checkout of `repo`.
+    User { repo: Utf8PathBuf },
 }
 
 /// Destination of [`ClientMessage::MoveAgent`]. `Named` is resolved by the
@@ -222,7 +220,7 @@ pub struct UiAgentSummary {
 /// only, keyed by path.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiWorkdir {
-    pub path: PathBuf,
+    pub path: Utf8PathBuf,
     pub name: String,
 }
 
@@ -365,7 +363,7 @@ pub fn append_protocol_log_record(
         .len()
         .try_into()
         .context("protocol log frame too large")?;
-    writer.write_all(PROTOCOL_LOG_PACK_MAGIC)?;
+    writer.write_all(PROTOCOL_LOG_MAGIC)?;
     writer.write_all(&unix_ms.to_le_bytes())?;
     writer.write_all(&[direction.byte()])?;
     writer.write_all(&len.to_le_bytes())?;
@@ -379,29 +377,21 @@ pub fn print_protocol_log(
 ) -> anyhow::Result<()> {
     let mut input = std::fs::File::open(path).context("open protocol log")?;
     loop {
-        let Some((encoding, unix_ms, direction, frame)) = read_protocol_log_record(&mut input)?
-        else {
+        let Some((unix_ms, direction, frame)) = read_protocol_log_record(&mut input)? else {
             return Ok(());
         };
         if frame.len() < size_of::<u32>() {
             bail!("protocol log frame shorter than length prefix");
         }
         let payload_len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
-        let payload = frame
+        let mut payload = frame
             .get(4..)
             .filter(|payload| payload.len() == payload_len)
             .context("protocol log frame length mismatch")?;
         match direction {
             ProtocolLogDirection::ClientToServer => {
-                let mut payload = payload;
-                let message: ClientMessage = match encoding {
-                    ProtocolLogEncoding::Encode => {
-                        senax_encoder::decode(&mut payload).context("decode client frame")?
-                    }
-                    ProtocolLogEncoding::Pack => {
-                        senax_encoder::unpack(&mut payload).context("unpack client frame")?
-                    }
-                };
+                let message: ClientMessage =
+                    senax_encoder::unpack(&mut payload).context("unpack client frame")?;
                 writeln!(
                     output,
                     "{unix_ms} {} {}B {message:#?}",
@@ -410,15 +400,8 @@ pub fn print_protocol_log(
                 )?;
             }
             ProtocolLogDirection::ServerToClient => {
-                let mut payload = payload;
-                let message: ServerMessage = match encoding {
-                    ProtocolLogEncoding::Encode => {
-                        senax_encoder::decode(&mut payload).context("decode server frame")?
-                    }
-                    ProtocolLogEncoding::Pack => {
-                        senax_encoder::unpack(&mut payload).context("unpack server frame")?
-                    }
-                };
+                let message: ServerMessage =
+                    senax_encoder::unpack(&mut payload).context("unpack server frame")?;
                 writeln!(
                     output,
                     "{unix_ms} {} {}B {message:#?}",
@@ -432,14 +415,16 @@ pub fn print_protocol_log(
 
 fn read_protocol_log_record(
     input: &mut impl std::io::Read,
-) -> anyhow::Result<Option<(ProtocolLogEncoding, u64, ProtocolLogDirection, Vec<u8>)>> {
+) -> anyhow::Result<Option<(u64, ProtocolLogDirection, Vec<u8>)>> {
     let mut magic = [0; 4];
     match input.read_exact(&mut magic) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error).context("read protocol log magic"),
     }
-    let encoding = ProtocolLogEncoding::from_magic(&magic)?;
+    if &magic != PROTOCOL_LOG_MAGIC {
+        bail!("invalid protocol log magic");
+    }
     let mut timestamp = [0; 8];
     input
         .read_exact(&mut timestamp)
@@ -459,23 +444,7 @@ fn read_protocol_log_record(
     input
         .read_exact(&mut frame)
         .context("read protocol log frame")?;
-    Ok(Some((encoding, unix_ms, direction, frame)))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProtocolLogEncoding {
-    Encode,
-    Pack,
-}
-
-impl ProtocolLogEncoding {
-    fn from_magic(magic: &[u8; 4]) -> anyhow::Result<Self> {
-        match magic {
-            PROTOCOL_LOG_ENCODE_MAGIC => Ok(Self::Encode),
-            PROTOCOL_LOG_PACK_MAGIC => Ok(Self::Pack),
-            _ => bail!("invalid protocol log magic"),
-        }
-    }
+    Ok(Some((unix_ms, direction, frame)))
 }
 
 /// Marker tying this protocol layer to `rho-agent` without putting socket code
@@ -500,9 +469,8 @@ mod tests {
             .unwrap();
 
         let mut cursor = std::io::Cursor::new(log);
-        let (encoding, unix_ms, direction, recorded_frame) =
+        let (unix_ms, direction, recorded_frame) =
             read_protocol_log_record(&mut cursor).unwrap().unwrap();
-        assert_eq!(encoding, ProtocolLogEncoding::Pack);
         assert_eq!(unix_ms, 123);
         assert_eq!(direction, ProtocolLogDirection::ClientToServer);
         assert_eq!(recorded_frame, frame);

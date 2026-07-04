@@ -6,7 +6,7 @@
 //! client-local dispatch (quit, clear); this crate owns what the commands
 //! *are*.
 
-use std::path::PathBuf;
+use camino::Utf8PathBuf;
 
 use rho_ui_proto::{Status, TopicId};
 
@@ -108,7 +108,7 @@ pub const COMMANDS: &[CommandSpec] = &[
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     AgentNew {
-        working_directory: Option<PathBuf>,
+        working_directory: Option<Utf8PathBuf>,
     },
     AgentRename {
         name: String,
@@ -132,7 +132,7 @@ pub enum Command {
         name: Option<String>,
     },
     WorkdirAdd {
-        path: Option<PathBuf>,
+        path: Option<Utf8PathBuf>,
         name: Option<String>,
     },
     WorkdirRemove {
@@ -160,7 +160,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
     let parsed = match first {
         "agent" => match tokens.next() {
             Some("new") => Parsed::Command(Command::AgentNew {
-                working_directory: tokens.next().map(PathBuf::from),
+                working_directory: tokens.next().map(Utf8PathBuf::from),
             }),
             Some("rename") => match joined_name(rest) {
                 Some(name) => Parsed::Command(Command::AgentRename { name }),
@@ -194,7 +194,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
         },
         "workdirs" => match tokens.next() {
             Some("add") => Parsed::Command(Command::WorkdirAdd {
-                path: tokens.next().map(PathBuf::from),
+                path: tokens.next().map(Utf8PathBuf::from),
                 name: tokens.next().map(str::to_owned),
             }),
             Some("rm") => match tokens.next() {

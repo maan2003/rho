@@ -10,7 +10,9 @@ mod truncate;
 
 use std::ffi::{CStr, CString};
 use std::os::fd::{BorrowedFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use camino::Utf8PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,7 +43,7 @@ pub struct ShellTools {
 #[derive(Clone, Debug)]
 enum ExecContext {
     /// Run directly in a directory (tests, workspace-less fallbacks).
-    Directory(PathBuf),
+    Directory(Utf8PathBuf),
     /// Run in the workspace: inside its mount namespace at the origin repo
     /// path.
     Workspace(Arc<Workspace>),
@@ -73,7 +75,7 @@ impl ShellTools {
     }
 
     /// Tools running directly in a directory, without a workspace.
-    pub fn in_directory(timeout: Duration, working_directory: PathBuf) -> Self {
+    pub fn in_directory(timeout: Duration, working_directory: Utf8PathBuf) -> Self {
         Self {
             default_timeout: timeout,
             exec: ExecContext::Directory(working_directory),
@@ -84,8 +86,8 @@ impl ShellTools {
     /// files, never a namespace-relative path.
     fn patch_directory(&self) -> &Path {
         match &self.exec {
-            ExecContext::Directory(dir) => dir,
-            ExecContext::Workspace(workspace) => workspace.slot(),
+            ExecContext::Directory(dir) => dir.as_std_path(),
+            ExecContext::Workspace(workspace) => workspace.slot().as_std_path(),
         }
     }
 
@@ -226,7 +228,7 @@ impl ShellTools {
                 // namespace and chdir both happen post-fork. Everything the
                 // closure needs is prepared here: pre_exec runs between fork
                 // and exec where allocation is off-limits.
-                let cwd = CString::new(cwd.into_os_string().into_encoded_bytes())
+                let cwd = CString::new(cwd.into_string().into_bytes())
                     .map_err(|_| anyhow!("working directory contains a NUL byte"))?;
                 unsafe {
                     command.pre_exec(move || enter_workspace_ns(ns_fd, &cwd));

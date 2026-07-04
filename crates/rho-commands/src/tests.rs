@@ -1,3 +1,4 @@
+use camino::Utf8PathBuf;
 use super::*;
 
 fn values(candidates: &[Candidate]) -> Vec<&str> {
@@ -24,7 +25,7 @@ fn parses_agent_commands() {
     assert_eq!(
         parse(":agent new ~/src/rho"),
         Some(Parsed::Command(Command::AgentNew {
-            working_directory: Some(PathBuf::from("~/src/rho"))
+            working_directory: Some(Utf8PathBuf::from("~/src/rho"))
         }))
     );
     assert_eq!(
@@ -149,7 +150,7 @@ fn parses_workdir_commands() {
     assert_eq!(
         parse(":workdirs add /home/u/src/rho rho"),
         Some(Parsed::Command(Command::WorkdirAdd {
-            path: Some(PathBuf::from("/home/u/src/rho")),
+            path: Some(Utf8PathBuf::from("/home/u/src/rho")),
             name: Some("rho".to_owned()),
         }))
     );

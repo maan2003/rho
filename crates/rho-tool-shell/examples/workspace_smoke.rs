@@ -68,8 +68,8 @@ async fn run() -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let workspace = repo_handle.create_workspace("agent-main", "@").await?;
     println!("created workspace in {:?}", started.elapsed());
-    println!("repo: {}", workspace.repo().display());
-    println!("slot: {}", workspace.slot().display());
+    println!("repo: {}", workspace.repo());
+    println!("slot: {}", workspace.slot());
     assert!(
         workspace.slot().starts_with(repo.join(".jj/ws-pool")),
         "slots live inside the repo's pool"

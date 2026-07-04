@@ -1246,6 +1246,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "camino"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f2d30e4173c4026932d51d31d6b0613b1fd3014bf3f9f8943d4ba139c437ba0"
+
+[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1455,6 +1461,17 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "claude-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "client"
@@ -2625,7 +2642,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3025,7 +3042,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4875,7 +4892,7 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6177,7 +6194,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8214,6 +8231,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "bytes",
+ "camino",
  "futures",
  "prefix-id",
  "rand 0.8.6",
@@ -8243,6 +8261,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "camino",
  "clap",
  "dirs",
  "futures",
@@ -8277,6 +8296,7 @@ dependencies = [
 name = "rho-commands"
 version = "0.1.0"
 dependencies = [
+ "camino",
  "rho-ui-proto",
 ]
 
@@ -8296,6 +8316,7 @@ name = "rho-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "camino",
  "clap",
  "dirs",
  "futures",
@@ -8326,6 +8347,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assets",
+ "camino",
  "clap",
  "command_palette",
  "editor",
@@ -8399,6 +8421,7 @@ name = "rho-tool-shell"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "camino",
  "rho-core",
  "rho-db",
  "rho-workspaces",
@@ -8416,6 +8439,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "bytes",
+ "camino",
  "futures",
  "rho-agent",
  "rho-core",
@@ -8430,6 +8454,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "camino",
  "rustix 1.1.4",
  "senax-encoder",
  "tempfile",
@@ -8668,7 +8693,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8758,7 +8783,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.8",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9036,6 +9061,7 @@ dependencies = [
  "ahash 0.8.12",
  "bigdecimal",
  "bytes",
+ "camino",
  "chrono",
  "fxhash",
  "indexmap",
@@ -10079,7 +10105,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12002,7 +12028,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

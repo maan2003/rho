@@ -12,6 +12,7 @@ name = "rho-gui"
 path = "src/main.rs"
 
 [dependencies]
+camino.workspace = true
 anyhow.workspace = true
 assets = { path = "../../../zed/crates/assets" }
 clap.workspace = true

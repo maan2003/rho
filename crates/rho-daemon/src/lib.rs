@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use camino::{Utf8Path, Utf8PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -112,7 +114,7 @@ struct AgentRegistry {
     agents: Mutex<HashMap<AgentId, Agent>>,
     /// One shared handle per repo root: live-workspace sharing (joined
     /// agents get one checkout + namespace) only holds within one instance.
-    repos: Mutex<HashMap<PathBuf, Arc<Repo>>>,
+    repos: Mutex<HashMap<Utf8PathBuf, Arc<Repo>>>,
 }
 
 impl AgentRegistry {
@@ -240,24 +242,20 @@ impl AgentRegistry {
     async fn create(
         &self,
         topic_id: TopicId,
-        repo: PathBuf,
         start: StartMode,
     ) -> anyhow::Result<(TopicId, AgentId, Agent)> {
-        self.db.read().get_topic(topic_id);
         let start = match start {
-            StartMode::NewOn(revset) => {
+            StartMode::NewOn { repo, revset } => {
                 let repo = validate_repo_root(repo)?;
                 rho_agent::StartWorkspace::Create {
                     repo: self.repo(&repo).await?,
                     parent_revset: revset,
                 }
             }
-            // Joining a workspace means working wherever it is — the repo
-            // field only matters for User (no workspace to inherit from).
             StartMode::Join(JoinTarget::Workspace(info)) => {
                 rho_agent::StartWorkspace::Existing(self.open_workspace(&info).await?)
             }
-            StartMode::Join(JoinTarget::User) => {
+            StartMode::Join(JoinTarget::User { repo }) => {
                 let repo = validate_repo_root(repo)?;
                 rho_agent::StartWorkspace::Existing(self.repo(&repo).await?.user_checkout().await?)
             }
@@ -276,8 +274,8 @@ impl AgentRegistry {
     }
 
     /// The shared handle for the repo rooted at (or containing) `path`.
-    async fn repo(&self, path: &Path) -> anyhow::Result<Arc<Repo>> {
-        let repo = Repo::open(path)?;
+    async fn repo(&self, path: &Utf8Path) -> anyhow::Result<Arc<Repo>> {
+        let repo = Repo::open(path.as_std_path())?;
         let mut repos = self.repos.lock().await;
         Ok(match repos.entry(repo.root().to_owned()) {
             std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
@@ -291,23 +289,11 @@ impl AgentRegistry {
         &self,
         info: &WorkspaceInfo,
     ) -> anyhow::Result<Arc<rho_workspaces::Workspace>> {
-        let repo = self.repo(Path::new(info.repo())).await?;
+        let repo = self.repo(info.repo()).await?;
         match info {
             WorkspaceInfo::UserCheckout { .. } => repo.user_checkout().await,
             WorkspaceInfo::Workspace { name, .. } => repo.open_workspace(name).await,
         }
-    }
-
-    fn agent_record(&self, agent_id: AgentId) -> anyhow::Result<rho_agent::db::AgentRecord> {
-        let read = self.db.read();
-        let Some((_, agent)) = read
-            .list_agents()
-            .into_iter()
-            .find(|(id, _)| *id == agent_id)
-        else {
-            anyhow::bail!("unknown agent id: {agent_id:?}");
-        };
-        Ok(agent)
     }
 
     async fn move_agent(
@@ -315,24 +301,16 @@ impl AgentRegistry {
         agent_id: AgentId,
         target: rho_ui_proto::TopicTarget,
     ) -> anyhow::Result<()> {
-        let read = self.db.read();
-        if !read.list_agents().into_iter().any(|(id, _)| id == agent_id) {
-            anyhow::bail!("unknown agent id: {agent_id:?}");
-        }
-        let topics = read.list_topics();
-        drop(read);
         let mut write = self.db.write().await;
         let topic_id = match target {
-            rho_ui_proto::TopicTarget::Existing(topic_id) => {
-                if !topics.iter().any(|(id, _)| *id == topic_id) {
-                    anyhow::bail!("unknown topic id: {topic_id:?}");
-                }
-                topic_id
-            }
-            rho_ui_proto::TopicTarget::Named(name) => topics
-                .iter()
+            rho_ui_proto::TopicTarget::Existing(topic_id) => topic_id,
+            rho_ui_proto::TopicTarget::Named(name) => self
+                .db
+                .read()
+                .list_topics()
+                .into_iter()
                 .find(|(_, topic)| topic.name == name)
-                .map(|(topic_id, _)| *topic_id)
+                .map(|(topic_id, _)| topic_id)
                 .unwrap_or_else(|| {
                     write.create_topic(rho_core::UnixMs::now(), name, Status::Normal)
                 }),
@@ -343,15 +321,6 @@ impl AgentRegistry {
     }
 
     async fn set_agent_status(&self, agent_id: AgentId, status: Status) -> anyhow::Result<()> {
-        if !self
-            .db
-            .read()
-            .list_agents()
-            .into_iter()
-            .any(|(id, _)| id == agent_id)
-        {
-            anyhow::bail!("unknown agent id: {agent_id:?}");
-        }
         let mut write = self.db.write().await;
         write.set_agent_status(rho_core::UnixMs::now(), agent_id, status);
         write.commit();
@@ -361,15 +330,6 @@ impl AgentRegistry {
     async fn rename_agent(&self, agent_id: AgentId, name: String) -> anyhow::Result<()> {
         if name.trim().is_empty() {
             anyhow::bail!("agent name cannot be empty");
-        }
-        if !self
-            .db
-            .read()
-            .list_agents()
-            .into_iter()
-            .any(|(id, _)| id == agent_id)
-        {
-            anyhow::bail!("unknown agent id: {agent_id:?}");
         }
         let mut write = self.db.write().await;
         write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, name);
@@ -381,15 +341,6 @@ impl AgentRegistry {
         if name.trim().is_empty() {
             anyhow::bail!("topic name cannot be empty");
         }
-        if !self
-            .db
-            .read()
-            .list_topics()
-            .into_iter()
-            .any(|(id, _)| id == topic_id)
-        {
-            anyhow::bail!("unknown topic id: {topic_id:?}");
-        }
         let mut write = self.db.write().await;
         write.set_topic_name(rho_core::UnixMs::now(), topic_id, name);
         write.commit();
@@ -397,15 +348,6 @@ impl AgentRegistry {
     }
 
     async fn set_topic_status(&self, topic_id: TopicId, status: Status) -> anyhow::Result<()> {
-        if !self
-            .db
-            .read()
-            .list_topics()
-            .into_iter()
-            .any(|(id, _)| id == topic_id)
-        {
-            anyhow::bail!("unknown topic id: {topic_id:?}");
-        }
         // New agents land in the default topic; archiving it would hide them
         // as they are created.
         if topic_id == self.default_topic_id && status == Status::Archived {
@@ -417,33 +359,24 @@ impl AgentRegistry {
         Ok(())
     }
 
-    async fn set_workdir(&self, path: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+    async fn set_workdir(&self, path: Utf8PathBuf, name: Option<String>) -> anyhow::Result<()> {
         let path = validate_repo_root(path)?;
         let name = match name {
             Some(name) => name,
             None => path
                 .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("workdir path has no basename: {}", path.display())
-                })?,
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("workdir path has no basename: {path}"))?,
         };
-        let path = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("workdir path is not valid UTF-8"))?
-            .to_owned();
         let mut write = self.db.write().await;
-        write.upsert_workdir(rho_core::UnixMs::now(), &path, name);
+        write.upsert_workdir(rho_core::UnixMs::now(), path.as_str(), name);
         write.commit();
         Ok(())
     }
 
-    async fn remove_workdir(&self, path: PathBuf) -> anyhow::Result<()> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("workdir path is not valid UTF-8"))?;
+    async fn remove_workdir(&self, path: Utf8PathBuf) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
-        write.remove_workdir(path);
+        write.remove_workdir(path.as_str());
         write.commit();
         Ok(())
     }
@@ -452,17 +385,8 @@ impl AgentRegistry {
         if let Some(agent) = self.agents.lock().await.get(&agent_id).cloned() {
             return Ok((agent_id, agent, false));
         }
-        if !self
-            .db
-            .read()
-            .list_agents()
-            .into_iter()
-            .any(|(id, _)| id == agent_id)
-        {
-            anyhow::bail!("unknown agent id: {agent_id:?}");
-        }
-        let info = self.db.read().get_agent(agent_id).workspace;
-        let workspace = self.open_workspace(&info).await?;
+        let record = self.db.read().get_agent(agent_id);
+        let workspace = self.open_workspace(&record.workspace).await?;
         let agent = Agent::load(self.db.clone(), self.auth.clone(), agent_id, workspace);
         self.agents.lock().await.insert(agent_id, agent.clone());
         Ok((agent_id, agent, true))
@@ -499,155 +423,109 @@ async fn serve_connection(
 
     let mut reader = reader;
     loop {
-        match read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await? {
-            ClientMessage::Ping => {
-                let _ = outgoing_tx.send(ServerMessage::Pong);
-            }
-            ClientMessage::Subscribe => {}
-            ClientMessage::NewTopic { name } => {
-                let topic = agents.create_topic(name).await;
-                let _ = outgoing_tx.send(ServerMessage::TopicCreated { topic });
+        let message = read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await?;
+        match handle_message(&agents, &outgoing_tx, message).await {
+            Ok(Refresh::Ready) => {
                 let _ = outgoing_tx.send(agents.ready_message());
             }
-            ClientMessage::NewAgent {
-                topic_id,
-                repo,
-                start,
-                content,
-            } => {
-                let (topic_id, agent_id, agent) =
-                    match agents.create(topic_id, repo, start).await {
-                        Ok(created) => created,
-                        Err(error) => {
-                            let _ = outgoing_tx.send(ServerMessage::Error {
-                                message: error.to_string(),
-                            });
-                            continue;
-                        }
-                    };
-                subscribe_agent(agent_id.clone(), agent.clone(), outgoing_tx.clone());
-                let _ = outgoing_tx.send(ServerMessage::AgentCreated {
-                    topic_id,
-                    agent_id: agent_id.clone(),
+            Ok(Refresh::None) => {}
+            Err(error) => {
+                let _ = outgoing_tx.send(ServerMessage::Error {
+                    message: error.to_string(),
                 });
-                let _ = outgoing_tx.send(agents.ready_message());
-                if let Some(content) = content {
-                    agent.send_user_message(text_content(&content));
-                }
             }
-            ClientMessage::WorkdirSet { path, name } => {
-                match agents.set_workdir(path, name).await {
-                    Ok(()) => {
-                        let _ = outgoing_tx.send(agents.ready_message());
-                    }
-                    Err(error) => {
-                        let _ = outgoing_tx.send(ServerMessage::Error {
-                            message: error.to_string(),
-                        });
-                    }
-                }
-            }
-            ClientMessage::WorkdirRemove { path } => match agents.remove_workdir(path).await {
-                Ok(()) => {
-                    let _ = outgoing_tx.send(agents.ready_message());
-                }
-                Err(error) => {
-                    let _ = outgoing_tx.send(ServerMessage::Error {
-                        message: error.to_string(),
-                    });
-                }
-            },
-            ClientMessage::LoadAgent { agent_id } => match agents.load(agent_id).await {
-                Ok((agent_id, agent, loaded_now)) => {
-                    if loaded_now {
-                        subscribe_agent(agent_id.clone(), agent, outgoing_tx.clone());
-                    }
-                    let _ = outgoing_tx.send(ServerMessage::AgentLoaded { agent_id });
-                }
-                Err(error) => {
-                    let _ = outgoing_tx.send(ServerMessage::Error {
-                        message: error.to_string(),
-                    });
-                }
-            },
-            ClientMessage::SendUserMessage { agent_id, content } => {
-                let agent = match agents.get(agent_id).await {
-                    Some(agent) => agent,
-                    None => {
-                        let _ = outgoing_tx.send(ServerMessage::Error {
-                            message: format!("agent is not loaded: {agent_id:?}"),
-                        });
-                        continue;
-                    }
-                };
+        }
+    }
+}
+
+/// Whether a handled message changed registry state that clients see through
+/// `Ready` (topics, agents, workdirs).
+enum Refresh {
+    Ready,
+    None,
+}
+
+/// One client request. `Err` becomes a [`ServerMessage::Error`]; extra replies
+/// (creation events, pongs) are sent inline before the caller's `Ready`.
+async fn handle_message(
+    agents: &Arc<AgentRegistry>,
+    outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
+    message: ClientMessage,
+) -> anyhow::Result<Refresh> {
+    match message {
+        ClientMessage::Ping => {
+            let _ = outgoing_tx.send(ServerMessage::Pong);
+            Ok(Refresh::None)
+        }
+        ClientMessage::Subscribe => Ok(Refresh::None),
+        ClientMessage::NewTopic { name } => {
+            let topic = agents.create_topic(name).await;
+            let _ = outgoing_tx.send(ServerMessage::TopicCreated { topic });
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::NewAgent {
+            topic_id,
+            start,
+            content,
+        } => {
+            let (topic_id, agent_id, agent) = agents.create(topic_id, start).await?;
+            subscribe_agent(agent_id, agent.clone(), outgoing_tx.clone());
+            let _ = outgoing_tx.send(ServerMessage::AgentCreated { topic_id, agent_id });
+            if let Some(content) = content {
                 agent.send_user_message(text_content(&content));
             }
-            ClientMessage::MoveAgent { agent_id, topic } => {
-                match agents.move_agent(agent_id, topic).await {
-                    Ok(()) => {
-                        let _ = outgoing_tx.send(agents.ready_message());
-                    }
-                    Err(error) => {
-                        let _ = outgoing_tx.send(ServerMessage::Error {
-                            message: error.to_string(),
-                        });
-                    }
-                }
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::WorkdirSet { path, name } => {
+            agents.set_workdir(path, name).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::WorkdirRemove { path } => {
+            agents.remove_workdir(path).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::LoadAgent { agent_id } => {
+            let (agent_id, agent, loaded_now) = agents.load(agent_id).await?;
+            if loaded_now {
+                subscribe_agent(agent_id, agent, outgoing_tx.clone());
             }
-            ClientMessage::SetAgentStatus { agent_id, status } => {
-                match agents.set_agent_status(agent_id, status).await {
-                    Ok(()) => {
-                        let _ = outgoing_tx.send(agents.ready_message());
-                    }
-                    Err(error) => {
-                        let _ = outgoing_tx.send(ServerMessage::Error {
-                            message: error.to_string(),
-                        });
-                    }
-                }
+            let _ = outgoing_tx.send(ServerMessage::AgentLoaded { agent_id });
+            Ok(Refresh::None)
+        }
+        ClientMessage::SendUserMessage { agent_id, content } => {
+            let agent = agents
+                .get(agent_id)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
+            agent.send_user_message(text_content(&content));
+            Ok(Refresh::None)
+        }
+        ClientMessage::MoveAgent { agent_id, topic } => {
+            agents.move_agent(agent_id, topic).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::SetAgentStatus { agent_id, status } => {
+            agents.set_agent_status(agent_id, status).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::RenameAgent { agent_id, name } => {
+            agents.rename_agent(agent_id, name).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::RenameTopic { topic_id, name } => {
+            agents.rename_topic(topic_id, name).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::SetTopicStatus { topic_id, status } => {
+            agents.set_topic_status(topic_id, status).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::CancelTurn { agent_id } => {
+            if let Some(agent) = agents.get(agent_id).await {
+                agent.cancel();
+                let _ = outgoing_tx.send(ServerMessage::TurnCancelled { agent_id });
             }
-            ClientMessage::RenameAgent { agent_id, name } => {
-                match agents.rename_agent(agent_id, name).await {
-                    Ok(()) => {
-                        let _ = outgoing_tx.send(agents.ready_message());
-                    }
-                    Err(error) => {
-                        let _ = outgoing_tx.send(ServerMessage::Error {
-                            message: error.to_string(),
-                        });
-                    }
-                }
-            }
-            ClientMessage::RenameTopic { topic_id, name } => {
-                match agents.rename_topic(topic_id, name).await {
-                    Ok(()) => {
-                        let _ = outgoing_tx.send(agents.ready_message());
-                    }
-                    Err(error) => {
-                        let _ = outgoing_tx.send(ServerMessage::Error {
-                            message: error.to_string(),
-                        });
-                    }
-                }
-            }
-            ClientMessage::SetTopicStatus { topic_id, status } => {
-                match agents.set_topic_status(topic_id, status).await {
-                    Ok(()) => {
-                        let _ = outgoing_tx.send(agents.ready_message());
-                    }
-                    Err(error) => {
-                        let _ = outgoing_tx.send(ServerMessage::Error {
-                            message: error.to_string(),
-                        });
-                    }
-                }
-            }
-            ClientMessage::CancelTurn { agent_id } => {
-                if let Some(agent) = agents.get(agent_id).await {
-                    agent.cancel();
-                    let _ = outgoing_tx.send(ServerMessage::TurnCancelled { agent_id });
-                }
-            }
+            Ok(Refresh::None)
         }
     }
 }
@@ -661,14 +539,14 @@ fn subscribe_agent(
         let changes = agent.subscribe();
         let mut encoder = AgentRemoteEncoder::new();
         let _ = state_tx.send(ServerMessage::Agent {
-            agent_id: agent_id.clone(),
+            agent_id,
             frame: encoder.encode(agent.state()),
         });
         futures::pin_mut!(changes);
         while let Some(state) = changes.next().await {
             if state_tx
                 .send(ServerMessage::Agent {
-                    agent_id: agent_id.clone(),
+                    agent_id,
                     frame: encoder.encode(state),
                 })
                 .is_err()
@@ -684,12 +562,13 @@ fn subscribe_agent(
 /// workdir registration and agent creation take repos. A leading `~` expands
 /// to the daemon's home: clients may run on another machine, so path
 /// interpretation belongs here.
-fn validate_repo_root(path: PathBuf) -> anyhow::Result<PathBuf> {
+fn validate_repo_root(path: Utf8PathBuf) -> anyhow::Result<Utf8PathBuf> {
     let path = expand_home(&path).unwrap_or(path);
-    rho_workspaces::resolve_repo_root(&path)
+    rho_workspaces::resolve_repo_root(path.as_std_path())
 }
 
-fn expand_home(path: &std::path::Path) -> Option<PathBuf> {
+fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
     let rest = path.strip_prefix("~").ok()?;
-    Some(dirs::home_dir()?.join(rest))
+    let home = Utf8PathBuf::try_from(dirs::home_dir()?).ok()?;
+    Some(home.join(rest))
 }

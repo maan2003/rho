@@ -1297,3 +1297,49 @@ impl Unpacker for Box<RawValue> {
         Self::decode(reader)
     }
 }
+
+// --- camino Utf8Path / Utf8PathBuf ---
+// Same wire format as strings (and therefore as `std::path` types).
+impl Encoder for camino::Utf8Path {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        self.as_str().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.as_str().is_empty()
+    }
+}
+
+impl Packer for camino::Utf8Path {
+    fn pack(&self, writer: &mut BytesMut) -> Result<()> {
+        self.as_str().pack(writer)
+    }
+}
+
+impl Encoder for camino::Utf8PathBuf {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        self.as_str().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.as_str().is_empty()
+    }
+}
+
+impl Packer for camino::Utf8PathBuf {
+    fn pack(&self, writer: &mut BytesMut) -> Result<()> {
+        self.as_str().pack(writer)
+    }
+}
+
+impl Decoder for camino::Utf8PathBuf {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        Ok(Self::from(String::decode(reader)?))
+    }
+}
+
+impl Unpacker for camino::Utf8PathBuf {
+    fn unpack(reader: &mut impl Buf) -> Result<Self> {
+        Ok(Self::from(String::unpack(reader)?))
+    }
+}

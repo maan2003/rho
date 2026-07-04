@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+use camino::Utf8PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::Stream;
@@ -297,22 +299,20 @@ impl AgentClient {
     pub fn new_agent_with_user_message_in_topic(
         &self,
         topic_id: TopicId,
-        repo: PathBuf,
+        repo: Utf8PathBuf,
         text: String,
     ) {
         let _ = self.commands.send(ClientMessage::NewAgent {
             topic_id,
-            repo,
-            start: default_start(),
+            start: default_start(repo),
             content: Some(vec![ContentPart::Text { text }]),
         });
     }
 
-    pub fn new_agent_in_topic(&self, topic_id: TopicId, repo: PathBuf) {
+    pub fn new_agent_in_topic(&self, topic_id: TopicId, repo: Utf8PathBuf) {
         let _ = self.commands.send(ClientMessage::NewAgent {
             topic_id,
-            repo,
-            start: default_start(),
+            start: default_start(repo),
             content: None,
         });
     }
@@ -321,11 +321,11 @@ impl AgentClient {
         let _ = self.commands.send(ClientMessage::NewTopic { name });
     }
 
-    pub fn set_workdir(&self, path: PathBuf, name: Option<String>) {
+    pub fn set_workdir(&self, path: Utf8PathBuf, name: Option<String>) {
         let _ = self.commands.send(ClientMessage::WorkdirSet { path, name });
     }
 
-    pub fn remove_workdir(&self, path: PathBuf) {
+    pub fn remove_workdir(&self, path: Utf8PathBuf) {
         let _ = self.commands.send(ClientMessage::WorkdirRemove { path });
     }
 
@@ -453,6 +453,9 @@ impl ProtocolLogger {
 
 /// Without an explicit start point, new agents begin on the parents of the
 /// user's working copy — a sibling of it.
-fn default_start() -> StartMode {
-    StartMode::NewOn("@-".to_owned())
+fn default_start(repo: Utf8PathBuf) -> StartMode {
+    StartMode::NewOn {
+        repo,
+        revset: "@-".to_owned(),
+    }
 }

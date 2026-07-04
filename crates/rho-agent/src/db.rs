@@ -1,6 +1,6 @@
 //! Raw redb schema for persisted agents.
 
-use std::path::PathBuf;
+use camino::Utf8PathBuf;
 
 use prefix_id::{PrefixId, PrefixIdDomain};
 use redb::{TableDefinition, Value as _};
@@ -182,7 +182,7 @@ pub trait AgentReadTxnExt {
     fn list_topic_agents(&self, topic_id: TopicId) -> Vec<AgentId>;
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
     fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
-    fn list_workdirs(&self) -> Vec<(PathBuf, WorkdirRecord)>;
+    fn list_workdirs(&self) -> Vec<(Utf8PathBuf, WorkdirRecord)>;
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
 }
 
@@ -276,10 +276,10 @@ impl AgentReadTxnExt for ReadTxn {
             .collect()
     }
 
-    fn list_workdirs(&self) -> Vec<(PathBuf, WorkdirRecord)> {
+    fn list_workdirs(&self) -> Vec<(Utf8PathBuf, WorkdirRecord)> {
         self.open_table(WORKDIRS)
             .iter()
-            .map(|(key, value)| (PathBuf::from(key.value()), value.value().into_owned()))
+            .map(|(key, value)| (Utf8PathBuf::from(key.value()), value.value().into_owned()))
             .collect()
     }
 

@@ -6,7 +6,7 @@
 //! cycling operate over live agents only.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use camino::Utf8PathBuf;
 
 use rho_ui_proto::{AgentId, AgentIdDomain, UiTopic};
 
@@ -53,13 +53,13 @@ impl AgentRegistry {
 
     /// Where a new agent should work: the newest agent in the topic sets the
     /// precedent, since sibling agents usually share a project.
-    pub fn last_working_directory(&self, topic_id: rho_ui_proto::TopicId) -> Option<PathBuf> {
+    pub fn last_working_directory(&self, topic_id: rho_ui_proto::TopicId) -> Option<Utf8PathBuf> {
         self.topics
             .iter()
             .find(|topic| topic.topic_id == topic_id)?
             .agents
             .last()
-            .map(|agent| PathBuf::from(agent.workspace.repo()))
+            .map(|agent| agent.workspace.repo().to_owned())
     }
 
     /// The topic an agent currently belongs to, from topic summaries.
@@ -89,9 +89,9 @@ impl AgentRegistry {
             .unwrap_or(0)
     }
 
-    pub fn working_directory(&self, agent_id: AgentId) -> Option<PathBuf> {
+    pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
         self.agent_summary(agent_id)
-            .map(|agent| PathBuf::from(agent.workspace.repo()))
+            .map(|agent| agent.workspace.repo().to_owned())
     }
 
     pub fn agent_workspace(&self, agent_id: AgentId) -> Option<&rho_ui_proto::WorkspaceInfo> {
@@ -236,7 +236,7 @@ mod tests {
             agent_id: agent_id(id),
             display_name: None,
             workspace: rho_ui_proto::WorkspaceInfo::UserCheckout {
-                repo: "/tmp".to_owned(),
+                repo: "/tmp".into(),
             },
             status,
         }

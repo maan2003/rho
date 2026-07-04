@@ -11,7 +11,7 @@ use super::*;
 /// Tests exercise agent records only; any workspace info will do.
 fn test_workspace() -> WorkspaceInfo {
     WorkspaceInfo::Workspace {
-        repo: "/home/user/src/rho".to_owned(),
+        repo: "/home/user/src/rho".into(),
         name: "test-agent".to_owned(),
     }
 }

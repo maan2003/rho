@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+camino.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
