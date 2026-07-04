@@ -44,15 +44,12 @@ fn agent_db_migrations_eventually_reach_current_format() {
                 seen.insert(format),
                 "agent db migrations cycle before reaching current format: {format}"
             );
-            assert!(
-                starts.contains(format),
-                "agent db migration chain from {} stops at {format}",
-                start
-            );
             let next = AGENT_DB_MIGRATIONS
                 .iter()
                 .find(|candidate| candidate.from == format)
-                .expect("migration start checked above");
+                .unwrap_or_else(|| {
+                    panic!("agent db migration chain from {start} stops at {format}")
+                });
             format = next.to;
         }
     }
