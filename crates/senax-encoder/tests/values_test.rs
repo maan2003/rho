@@ -13,7 +13,7 @@ use rust_decimal::Decimal;
 use senax_encoder::{Decoder, Encoder};
 use senax_encoder_derive::{Decode, Encode};
 #[cfg(feature = "serde_json")]
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 #[cfg(feature = "ulid")]
 use ulid::Ulid;
 #[cfg(feature = "uuid")]
@@ -1252,15 +1252,15 @@ fn test_cross_decode_struct_option() {
 fn test_decimal_encode() {
     // Test various Decimal values
     let test_values = vec![
-        Decimal::new(0, 0),                                                   // 0
-        Decimal::new(123, 0),                                                 // 123
-        Decimal::new(-456, 0),                                                // -456
-        Decimal::new(12345, 2),                                               // 123.45
-        Decimal::new(-67890, 3),                                              // -67.890
-        Decimal::from_str("3.14159").unwrap(),                                // π approximation
-        Decimal::from_str("999999999999999999999999999.999999999").unwrap(),  // Large value
+        Decimal::new(0, 0),                                                  // 0
+        Decimal::new(123, 0),                                                // 123
+        Decimal::new(-456, 0),                                               // -456
+        Decimal::new(12345, 2),                                              // 123.45
+        Decimal::new(-67890, 3),                                             // -67.890
+        Decimal::from_str("3.14159").unwrap(),                               // π approximation
+        Decimal::from_str("999999999999999999999999999.999999999").unwrap(), // Large value
         Decimal::from_str("-999999999999999999999999999.999999999").unwrap(), /* Large negative
-                                                                               * value */
+                                                                              * value */
     ];
 
     for &original in &test_values {

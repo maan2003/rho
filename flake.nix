@@ -279,7 +279,8 @@
             pkgs.protobuf
             pkgs.taplo
             selfciPkg
-          ] ++ guiBuildInputs;
+          ]
+          ++ guiBuildInputs;
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           LD_LIBRARY_PATH = guiLibraryPath;
           NIX_LD_LIBRARY_PATH = guiLibraryPath;

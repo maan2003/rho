@@ -87,12 +87,15 @@ impl UiAgentState {
         let mut blocks = ui_blocks(&state.blocks);
         merge_active_tool_state(&mut blocks, &state.kind);
         blocks.extend(in_flight_blocks(&state.kind));
-        blocks.extend(state.queued_messages.iter().map(|message| {
-            UiBlock::QueuedMessage {
-                text: text_content(&message.content),
-                delivery: message.delivery,
-            }
-        }));
+        blocks.extend(
+            state
+                .queued_messages
+                .iter()
+                .map(|message| UiBlock::QueuedMessage {
+                    text: text_content(&message.content),
+                    delivery: message.delivery,
+                }),
+        );
         Self {
             blocks,
             status: ui_status(&state.kind),

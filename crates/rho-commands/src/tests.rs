@@ -1,4 +1,5 @@
 use camino::Utf8PathBuf;
+
 use super::*;
 
 fn values(candidates: &[Candidate]) -> Vec<&str> {

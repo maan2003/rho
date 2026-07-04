@@ -2,14 +2,14 @@ extern crate proc_macro;
 
 use std::collections::{HashMap, HashSet};
 
-use crc::{Crc, CRC_64_ECMA_182};
+use crc::{CRC_64_ECMA_182, Crc};
 use itertools::izip;
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::{
-    parse_macro_input, Attribute, Data, DeriveInput, Fields, GenericArgument, Ident, PathArguments,
-    Type,
+    Attribute, Data, DeriveInput, Fields, GenericArgument, Ident, PathArguments, Type,
+    parse_macro_input,
 };
 
 /// CRC-64 hasher for field name to ID conversion

@@ -7,7 +7,6 @@
 //! *are*.
 
 use camino::Utf8PathBuf;
-
 use rho_ui_proto::{Status, TopicId};
 
 pub struct CommandSpec {

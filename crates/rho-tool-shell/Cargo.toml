@@ -7,8 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-camino.workspace = true
 anyhow.workspace = true
+camino.workspace = true
 rho-core.workspace = true
 rho-workspaces.workspace = true
 rustix = { version = "1", features = ["process", "thread"] }

@@ -345,7 +345,10 @@ mod tests {
     #[test]
     fn claude_bash_renders_as_shell_prompt() {
         assert_eq!(
-            tool_label("Bash", r#"{"command":"cargo test","description":"Run tests"}"#),
+            tool_label(
+                "Bash",
+                r#"{"command":"cargo test","description":"Run tests"}"#
+            ),
             ("$ cargo test".to_owned(), StyleClass::ToolShell)
         );
         // Streaming partial JSON still resolves the command field.

@@ -13,9 +13,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::remote::{AgentRemoteFrame, UiAgentState, UiBlock};
 use crate::{
     AgentMode, ClientMessage, IoCounters, MessageDelivery, ProtocolLogDirection, ServerMessage,
-    StartMode, UiTopic,
-    UiWorkdir, append_protocol_log_record, protocol_frame_bytes, read_frame_counted,
-    write_frame_counted,
+    StartMode, UiTopic, UiWorkdir, append_protocol_log_record, protocol_frame_bytes,
+    read_frame_counted, write_frame_counted,
 };
 
 /// Raw async client for the rho UI Unix-socket protocol.

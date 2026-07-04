@@ -8,14 +8,14 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-camino.workspace = true
 anyhow.workspace = true
+camino.workspace = true
 clap.workspace = true
 dirs.workspace = true
 futures.workspace = true
 rho-agent.workspace = true
-rho-core.workspace = true
 rho-claude.workspace = true
+rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
 rho-ui-proto.workspace = true

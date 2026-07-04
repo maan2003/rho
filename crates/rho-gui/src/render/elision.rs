@@ -264,7 +264,12 @@ mod tests {
 
     #[test]
     fn trailing_unlabeled_message_is_the_final_answer() {
-        let blocks = vec![user("go"), unlabeled("thinking"), tool("a"), unlabeled("done")];
+        let blocks = vec![
+            user("go"),
+            unlabeled("thinking"),
+            tool("a"),
+            unlabeled("done"),
+        ];
         let plans = elision_plans(&blocks, &all_visible(&blocks));
         assert_eq!(
             plans,
@@ -301,7 +306,12 @@ mod tests {
 
     #[test]
     fn open_turn_only_affects_the_last_turn() {
-        let blocks = vec![user("one"), unlabeled("done"), user("two"), unlabeled("wip")];
+        let blocks = vec![
+            user("one"),
+            unlabeled("done"),
+            user("two"),
+            unlabeled("wip"),
+        ];
         let plans = elision_plans_from(&blocks, &all_visible(&blocks), 0, None, true);
         assert_eq!(
             plans,

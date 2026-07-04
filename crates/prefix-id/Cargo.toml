@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-senax-encoder.workspace = true
-redb.workspace = true
 bytes.workspace = true
 fnv.workspace = true
+redb.workspace = true
+senax-encoder.workspace = true

@@ -21,12 +21,12 @@ use std::ops::Range;
 use editor::Editor;
 use elisions::ElisionSync;
 use gpui::{Context, Entity};
+use inlays::InlayRecord;
 use language::Buffer;
 use multi_buffer::MultiBuffer;
 use project::InlayId;
 use rho_ui_proto::remote::UiAgentState;
 use text::{Anchor, ToOffset as _};
-use inlays::InlayRecord;
 
 use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::render::elision::ElisionPlan;

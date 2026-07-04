@@ -12,25 +12,30 @@ name = "rho-gui"
 path = "src/main.rs"
 
 [dependencies]
-camino.workspace = true
 anyhow.workspace = true
 assets = { git = "https://github.com/maan2003/zed", branch = "rho" }
+camino.workspace = true
 clap.workspace = true
 command_palette = { git = "https://github.com/maan2003/zed", branch = "rho" }
 editor = { git = "https://github.com/maan2003/zed", branch = "rho" }
 futures.workspace = true
-gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = ["wayland"] }
-gpui_platform = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = ["font-kit", "wayland"] }
+gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
+  "wayland",
+] }
+gpui_platform = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
+  "font-kit",
+  "wayland",
+] }
 gpui_tokio = { git = "https://github.com/maan2003/zed", branch = "rho" }
 json-stream.workspace = true
 language = { git = "https://github.com/maan2003/zed", branch = "rho" }
 multi_buffer = { git = "https://github.com/maan2003/zed", branch = "rho" }
+prefix-id.workspace = true
 project = { git = "https://github.com/maan2003/zed", branch = "rho" }
 release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
 rho-commands.workspace = true
 rho-core.workspace = true
 rho-daemon.workspace = true
-prefix-id.workspace = true
 rho-ui-proto.workspace = true
 rustc-hash = "2.1.0"
 search = { git = "https://github.com/maan2003/zed", branch = "rho" }
@@ -39,10 +44,12 @@ settings = { git = "https://github.com/maan2003/zed", branch = "rho" }
 text = { git = "https://github.com/maan2003/zed", branch = "rho" }
 theme = { git = "https://github.com/maan2003/zed", branch = "rho" }
 theme_settings = { git = "https://github.com/maan2003/zed", branch = "rho" }
-tokio = { workspace = true, features = ["rt", "net", "io-util"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt"] }
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 ui = { git = "https://github.com/maan2003/zed", branch = "rho" }
 vim = { git = "https://github.com/maan2003/zed", branch = "rho" }
 
 [dev-dependencies]
-gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = ["test-support"] }
+gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
+  "test-support",
+] }

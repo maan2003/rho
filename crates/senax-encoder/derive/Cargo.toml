@@ -1,7 +1,7 @@
 [package]
 name = "senax-encoder-derive"
 version = "0.2.1"
-edition = "2021"
+edition = "2024"
 description = "A fast, compact, and schema-evolution-friendly binary serialization library for Rust."
 authors = ["yossyX"]
 license = "MIT OR Apache-2.0"
@@ -11,8 +11,8 @@ repository = "https://github.com/yossyX/senax-encoder"
 proc-macro = true
 
 [dependencies]
-syn = { version = "2.0", features = ["full"] }
-quote = "1.0"
-proc-macro2 = "1.0"
 crc = "3.0"
 itertools = "0.13.0"
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }

@@ -3,7 +3,7 @@
 use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
-use senax_encoder::{decode, encode, pack, unpack, Encoder};
+use senax_encoder::{Encoder, decode, encode, pack, unpack};
 
 #[test]
 fn test_bigdecimal_encode_decode() {

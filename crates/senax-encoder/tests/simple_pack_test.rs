@@ -1,4 +1,4 @@
-use senax_encoder::{pack, unpack, Pack, Unpack};
+use senax_encoder::{Pack, Unpack, pack, unpack};
 
 #[derive(Pack, Unpack, PartialEq, Debug)]
 struct SimpleStruct {

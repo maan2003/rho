@@ -1,40 +1,40 @@
 [package]
 name = "senax-encoder"
 version = "0.2.2"
-edition = "2021"
+edition = "2024"
 description = "A fast, compact, and schema-evolution-friendly binary serialization library for Rust."
 authors = ["yossyX"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yossyX/senax-encoder"
-keywords = ["senax", "encode", "serialize", "serializer", "binary"]
+keywords = ["binary", "encode", "senax", "serialize", "serializer"]
 categories = ["encoding"]
 readme = "README.md"
 
 [features]
-indexmap = ["dep:indexmap"]
-chrono = ["dep:chrono"]
-rust_decimal = ["dep:rust_decimal"]
-bigdecimal = ["dep:bigdecimal"]
-uuid = ["dep:uuid"]
-ulid = ["dep:ulid"]
-serde_json = ["dep:serde_json"]
-raw_value = ["serde_json", "serde_json/raw_value"]
-fxhash = ["dep:fxhash"]
 ahash = ["dep:ahash"]
+bigdecimal = ["dep:bigdecimal"]
+chrono = ["dep:chrono"]
+fxhash = ["dep:fxhash"]
+indexmap = ["dep:indexmap"]
+raw_value = ["serde_json", "serde_json/raw_value"]
+rust_decimal = ["dep:rust_decimal"]
+serde_json = ["dep:serde_json"]
 smol_str = ["dep:smol_str"]
+ulid = ["dep:ulid"]
+uuid = ["dep:uuid"]
 
 [dependencies]
-thiserror = "1.0"
-senax-encoder-derive = { path = "./derive", version = "0.2.1" }
+ahash = { version = "0.8", optional = true }
+bigdecimal = { version = "0.4", optional = true }
 bytes = "1.5"
 camino = "1"
-indexmap = { version = "2.2", optional = true }
 chrono = { version = "0.4", optional = true }
-rust_decimal = { version = "1.35", optional = true }
-bigdecimal = { version = "0.4", optional = true }
-uuid = { version = "1.8", features = ["v4"], optional = true }
-ulid = { version = "1.1", optional = true }
-serde_json = { version = "1.0", optional = true }
 fxhash = { version = "0.2", optional = true }
-ahash = { version = "0.8", optional = true }
+indexmap = { version = "2.2", optional = true }
+rust_decimal = { version = "1.35", optional = true }
+senax-encoder-derive = { path = "./derive", version = "0.2.1" }
+serde_json = { version = "1.0", optional = true }
 smol_str = { version = "0.3", optional = true }
+thiserror = "1.0"
+ulid = { version = "1.1", optional = true }
+uuid = { version = "1.8", features = ["v4"], optional = true }

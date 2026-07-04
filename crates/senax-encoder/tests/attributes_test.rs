@@ -52,7 +52,7 @@ fn test_default_attribute_backward_compatibility() {
     assert_eq!(extended.another_field, "hello");
     assert_eq!(extended.new_field, 0); // Default::default() for i32
     assert_eq!(extended.new_optional_field, None); // Default::default() for
-                                                   // Option<String>
+    // Option<String>
 }
 
 #[test]

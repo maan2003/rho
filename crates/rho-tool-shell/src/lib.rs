@@ -11,17 +11,16 @@ mod truncate;
 use std::ffi::{CStr, CString};
 use std::os::fd::{BorrowedFd, RawFd};
 use std::path::Path;
-
-use camino::Utf8PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use rho_workspaces::Workspace;
+use camino::Utf8PathBuf;
 use rho_core::{
     ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
     ToolOutputStatus, ToolResultMetadata, ToolSpec, ToolType,
 };
+use rho_workspaces::Workspace;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -200,9 +199,7 @@ impl ShellTools {
         let (base_dir, mnt_ns) = match &self.exec {
             ExecContext::Directory(dir) => (dir.clone(), None),
             // A user-checkout workspace IS the repo path: no namespace.
-            ExecContext::Workspace(workspace)
-                if workspace.is_user_checkout() =>
-            {
+            ExecContext::Workspace(workspace) if workspace.is_user_checkout() => {
                 (workspace.repo().to_owned(), None)
             }
             ExecContext::Workspace(workspace) => {

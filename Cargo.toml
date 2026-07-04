@@ -1,13 +1,13 @@
 [workspace]
 members = [
   "crates/json-stream",
-  "crates/rho-claude",
   "crates/prefix-id",
   "crates/rho-agent",
   "crates/rho-blocking-notify-channel",
+  "crates/rho-claude",
   "crates/rho-cli",
-  "crates/rho-commands",
   "crates/rho-cli-term-raw",
+  "crates/rho-commands",
   "crates/rho-core",
   "crates/rho-daemon",
   "crates/rho-db",
@@ -32,42 +32,42 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
-camino = "1"
 async-stream = "0.3"
 base64 = "0.22"
-bytes = "1"
 bon = { version = "3", default-features = false }
+bytes = "1"
+camino = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", default-features = false, features = [
   "bracketed-paste",
   "events",
 ] }
 dirs = { version = "6", default-features = false }
-futures = "0.3"
 fnv = "1"
+futures = "0.3"
 futures-util = "0.3"
 json-stream = { path = "crates/json-stream" }
+prefix-id = { path = "crates/prefix-id" }
 rand = "0.8"
 redb = "4.1.0"
 rho-agent = { path = "crates/rho-agent" }
-rho-claude = { path = "crates/rho-claude" }
 rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
+rho-claude = { path = "crates/rho-claude" }
 rho-cli = { path = "crates/rho-cli" }
-rho-commands = { path = "crates/rho-commands" }
 rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
+rho-commands = { path = "crates/rho-commands" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
 rho-inference = { path = "crates/rho-inference" }
-prefix-id = { path = "crates/prefix-id" }
 rho-term-screen = { path = "crates/rho-term-screen" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
 rho-workspaces = { path = "crates/rho-workspaces" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 senax-encoder = { path = "crates/senax-encoder" }
 senax-encoder-derive = { path = "crates/senax-encoder/derive" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 tempfile = { version = "3", default-features = false }
 tokio = { version = "1", features = [
@@ -96,8 +96,8 @@ ureq = { version = "3", default-features = false, features = [
   "platform-verifier",
   "rustls",
 ] }
-uuid = { version = "1", features = ["serde", "v4"] }
 url = { version = "2", default-features = false }
+uuid = { version = "1", features = ["serde", "v4"] }
 vt100 = { version = "0.16", default-features = false }
 
 [profile.ci]

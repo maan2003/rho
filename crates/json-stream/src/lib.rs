@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn ends_with_odd_backslashes(s: &str) -> bool {
     s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
@@ -108,22 +108,14 @@ fn process_char(
                 value_so_far: vec!['t'],
             };
         }
-        (
-            Value::Bool(true),
-            ObjectStatus::Scalar {
-                ref mut value_so_far,
-            },
-            'r',
-        ) if *value_so_far == vec!['t'] => {
+        (Value::Bool(true), ObjectStatus::Scalar { value_so_far }, 'r')
+            if *value_so_far == vec!['t'] =>
+        {
             value_so_far.push('r');
         }
-        (
-            Value::Bool(true),
-            ObjectStatus::Scalar {
-                ref mut value_so_far,
-            },
-            'u',
-        ) if *value_so_far == vec!['t', 'r'] => {
+        (Value::Bool(true), ObjectStatus::Scalar { value_so_far }, 'u')
+            if *value_so_far == vec!['t', 'r'] =>
+        {
             value_so_far.push('u');
         }
         (Value::Bool(true), sts @ ObjectStatus::Scalar { .. }, 'e') => {
@@ -136,31 +128,19 @@ fn process_char(
                 value_so_far: vec!['f'],
             };
         }
-        (
-            Value::Bool(false),
-            ObjectStatus::Scalar {
-                ref mut value_so_far,
-            },
-            'a',
-        ) if *value_so_far == vec!['f'] => {
+        (Value::Bool(false), ObjectStatus::Scalar { value_so_far }, 'a')
+            if *value_so_far == vec!['f'] =>
+        {
             value_so_far.push('a');
         }
-        (
-            Value::Bool(false),
-            ObjectStatus::Scalar {
-                ref mut value_so_far,
-            },
-            'l',
-        ) if *value_so_far == vec!['f', 'a'] => {
+        (Value::Bool(false), ObjectStatus::Scalar { value_so_far }, 'l')
+            if *value_so_far == vec!['f', 'a'] =>
+        {
             value_so_far.push('l');
         }
-        (
-            Value::Bool(false),
-            ObjectStatus::Scalar {
-                ref mut value_so_far,
-            },
-            's',
-        ) if *value_so_far == vec!['f', 'a', 'l'] => {
+        (Value::Bool(false), ObjectStatus::Scalar { value_so_far }, 's')
+            if *value_so_far == vec!['f', 'a', 'l'] =>
+        {
             value_so_far.push('s');
         }
         (Value::Bool(false), sts @ ObjectStatus::Scalar { .. }, 'e') => {
@@ -173,22 +153,12 @@ fn process_char(
                 value_so_far: vec!['n'],
             };
         }
-        (
-            Value::Null,
-            ObjectStatus::Scalar {
-                ref mut value_so_far,
-            },
-            'u',
-        ) if *value_so_far == vec!['n'] => {
+        (Value::Null, ObjectStatus::Scalar { value_so_far }, 'u') if *value_so_far == vec!['n'] => {
             value_so_far.push('u');
         }
-        (
-            Value::Null,
-            ObjectStatus::Scalar {
-                ref mut value_so_far,
-            },
-            'l',
-        ) if *value_so_far == vec!['n', 'u'] => {
+        (Value::Null, ObjectStatus::Scalar { value_so_far }, 'l')
+            if *value_so_far == vec!['n', 'u'] =>
+        {
             value_so_far.push('l');
         }
         (Value::Null, sts @ ObjectStatus::Scalar { .. }, 'l') => {
@@ -208,13 +178,7 @@ fn process_char(
                 value_so_far: vec!['-'],
             };
         }
-        (
-            Value::Number(ref mut num),
-            ObjectStatus::ScalarNumber {
-                ref mut value_so_far,
-            },
-            c @ '0'..='9',
-        ) => {
+        (Value::Number(num), ObjectStatus::ScalarNumber { value_so_far }, c @ '0'..='9') => {
             value_so_far.push(c);
             // if the number contains a decimal point or an exponent, parse as f64
             if value_so_far.contains(&'.')
@@ -239,31 +203,15 @@ fn process_char(
                 *num = parsed_number.into();
             }
         }
-        (
-            Value::Number(_),
-            ObjectStatus::ScalarNumber {
-                ref mut value_so_far,
-            },
-            'e' | 'E',
-        ) => {
+        (Value::Number(_), ObjectStatus::ScalarNumber { value_so_far }, 'e' | 'E') => {
             value_so_far.push(current_char);
         }
-        (
-            Value::Number(_),
-            ObjectStatus::ScalarNumber {
-                ref mut value_so_far,
-            },
-            '+' | '-',
-        ) if matches!(value_so_far.last(), Some('e') | Some('E')) => {
+        (Value::Number(_), ObjectStatus::ScalarNumber { value_so_far }, '+' | '-')
+            if matches!(value_so_far.last(), Some('e') | Some('E')) =>
+        {
             value_so_far.push(current_char);
         }
-        (
-            Value::Number(_),
-            ObjectStatus::ScalarNumber {
-                ref mut value_so_far,
-            },
-            '.',
-        ) => {
+        (Value::Number(_), ObjectStatus::ScalarNumber { value_so_far }, '.') => {
             value_so_far.push('.');
         }
         // ------ array ------
@@ -271,20 +219,20 @@ fn process_char(
             *sts = ObjectStatus::Closed;
         }
         (Value::Array(_), ObjectStatus::StartArray, ' ' | '\n') => {}
-        (Value::Array(ref mut arr), sts @ ObjectStatus::StartArray, '"') => {
+        (Value::Array(arr), sts @ ObjectStatus::StartArray, '"') => {
             arr.push(json!(""));
             *sts = ObjectStatus::ArrayValueQuoteOpen {
                 index: arr.len() - 1,
             };
         }
-        (Value::Array(ref mut arr), sts @ ObjectStatus::StartArray, char) => {
+        (Value::Array(arr), sts @ ObjectStatus::StartArray, char) => {
             arr.push(Value::Null);
             *sts = ObjectStatus::ArrayValueScalar {
                 index: arr.len() - 1,
                 value_so_far: vec![char],
             };
         }
-        (Value::Array(ref mut arr), sts @ ObjectStatus::ArrayValueQuoteOpen { .. }, '"') => {
+        (Value::Array(arr), sts @ ObjectStatus::ArrayValueQuoteOpen { .. }, '"') => {
             let index = match *sts {
                 ObjectStatus::ArrayValueQuoteOpen { index } => index,
                 _ => unreachable!(),
@@ -298,7 +246,7 @@ fn process_char(
             }
             *sts = ObjectStatus::ArrayValueQuoteClose;
         }
-        (Value::Array(ref mut arr), ObjectStatus::ArrayValueQuoteOpen { index }, char) => {
+        (Value::Array(arr), ObjectStatus::ArrayValueQuoteOpen { index }, char) => {
             if let Some(Value::String(s)) = arr.get_mut(*index) {
                 s.push(char);
             } else {
@@ -312,10 +260,10 @@ fn process_char(
         (Value::Array(_), sts @ ObjectStatus::ArrayValueQuoteClose, ']') => {
             *sts = ObjectStatus::Closed;
         }
-        (Value::Array(ref mut arr), sts @ ObjectStatus::ArrayValueScalar { .. }, ',') => {
+        (Value::Array(arr), sts @ ObjectStatus::ArrayValueScalar { .. }, ',') => {
             if let ObjectStatus::ArrayValueScalar {
                 index,
-                ref mut value_so_far,
+                value_so_far,
             } = sts
             {
                 let value_string = value_so_far.iter().collect::<String>();
@@ -328,10 +276,10 @@ fn process_char(
             }
             *sts = ObjectStatus::StartArray;
         }
-        (Value::Array(ref mut arr), sts @ ObjectStatus::ArrayValueScalar { .. }, ']') => {
+        (Value::Array(arr), sts @ ObjectStatus::ArrayValueScalar { .. }, ']') => {
             if let ObjectStatus::ArrayValueScalar {
                 index,
-                ref mut value_so_far,
+                value_so_far,
             } = sts
             {
                 let value_string = value_so_far.iter().collect::<String>();
@@ -344,18 +292,11 @@ fn process_char(
             }
             *sts = ObjectStatus::Closed;
         }
-        (
-            Value::Array(_),
-            ObjectStatus::ArrayValueScalar {
-                ref mut value_so_far,
-                ..
-            },
-            char,
-        ) => {
+        (Value::Array(_), ObjectStatus::ArrayValueScalar { value_so_far, .. }, char) => {
             value_so_far.push(char);
         }
         // ------ string ------
-        (Value::String(ref mut s), sts @ ObjectStatus::StringQuoteOpen, '"') => {
+        (Value::String(s), sts @ ObjectStatus::StringQuoteOpen, '"') => {
             if ends_with_odd_backslashes(s) {
                 s.push('"');
             } else {
@@ -373,7 +314,7 @@ fn process_char(
         (Value::Object(_obj), sts @ ObjectStatus::StartProperty, '}') => {
             *sts = ObjectStatus::Closed;
         }
-        (Value::Object(ref mut obj), sts @ ObjectStatus::KeyQuoteOpen { .. }, '"') => {
+        (Value::Object(obj), sts @ ObjectStatus::KeyQuoteOpen { .. }, '"') => {
             if let ObjectStatus::KeyQuoteOpen { key_so_far } = sts.clone() {
                 *sts = ObjectStatus::KeyQuoteClose {
                     key: key_so_far.clone(),
@@ -381,7 +322,7 @@ fn process_char(
                 obj.insert(key_so_far.iter().collect::<String>(), Value::Null);
             }
         }
-        (Value::Object(_obj), ObjectStatus::KeyQuoteOpen { ref mut key_so_far }, char) => {
+        (Value::Object(_obj), ObjectStatus::KeyQuoteOpen { key_so_far }, char) => {
             key_so_far.push(char);
         }
         (Value::Object(_obj), sts @ ObjectStatus::KeyQuoteClose { .. }, ':') => {
@@ -390,7 +331,7 @@ fn process_char(
             }
         }
         (Value::Object(_obj), ObjectStatus::Colon { .. }, ' ' | '\n' | '\t' | '\r') => {}
-        (Value::Object(ref mut obj), sts @ ObjectStatus::Colon { .. }, '"') => {
+        (Value::Object(obj), sts @ ObjectStatus::Colon { .. }, '"') => {
             if let ObjectStatus::Colon { key } = sts.clone() {
                 *sts = ObjectStatus::ValueQuoteOpen { key: key.clone() };
                 // create an empty string for the value
@@ -398,7 +339,7 @@ fn process_char(
             }
         }
         // ------ Add String Value ------
-        (Value::Object(ref mut obj), sts @ ObjectStatus::ValueQuoteOpen { .. }, '"') => {
+        (Value::Object(obj), sts @ ObjectStatus::ValueQuoteOpen { .. }, '"') => {
             let key_vec = match sts {
                 ObjectStatus::ValueQuoteOpen { key } => key.clone(),
                 _ => unreachable!(),
@@ -413,7 +354,7 @@ fn process_char(
             }
             *sts = ObjectStatus::ValueQuoteClose;
         }
-        (Value::Object(ref mut obj), ObjectStatus::ValueQuoteOpen { key }, char) => {
+        (Value::Object(obj), ObjectStatus::ValueQuoteOpen { key }, char) => {
             let key_string = key.iter().collect::<String>();
             let value = obj
                 .get_mut(&key_string)
@@ -437,7 +378,7 @@ fn process_char(
                 };
             }
         }
-        (Value::Object(ref mut obj), sts @ ObjectStatus::ValueScalar { .. }, ',') => {
+        (Value::Object(obj), sts @ ObjectStatus::ValueScalar { .. }, ',') => {
             if let ObjectStatus::ValueScalar { key, value_so_far } = sts.clone() {
                 let key_string = key.iter().collect::<String>();
                 let value_string = value_so_far.iter().collect::<String>();
@@ -451,7 +392,7 @@ fn process_char(
                 *sts = ObjectStatus::StartProperty;
             }
         }
-        (Value::Object(ref mut obj), sts @ ObjectStatus::ValueScalar { .. }, '}') => {
+        (Value::Object(obj), sts @ ObjectStatus::ValueScalar { .. }, '}') => {
             if let ObjectStatus::ValueScalar { key, value_so_far } = sts.clone() {
                 let key_string = key.iter().collect::<String>();
                 let value_string = value_so_far.iter().collect::<String>();
@@ -470,7 +411,7 @@ fn process_char(
             Value::Object(_obj),
             ObjectStatus::ValueScalar {
                 key: _key,
-                ref mut value_so_far,
+                value_so_far,
             },
             char,
         ) => {
@@ -542,7 +483,7 @@ fn add_char_into_object(
     }
 
     {
-        let (ref mut val, ref mut status) = stack.last_mut().unwrap();
+        let (val, status) = stack.last_mut().unwrap();
         process_char(val, status, current_char)?;
     }
 
@@ -584,7 +525,7 @@ fn add_char_into_object(
 pub fn parse_stream(json_string: &str) -> Result<Value, String> {
     let mut stack: Vec<(Value, ObjectStatus)> = vec![(Value::Null, ObjectStatus::Ready)];
     for current_char in json_string.chars() {
-        let (ref val, ref st) = stack.last().unwrap();
+        let (val, st) = stack.last().unwrap();
         println!(
             "variables: {:?} {:?} {:?}",
             val,
@@ -892,7 +833,7 @@ param_test! {
 mod array_tests {
     use serde_json::json;
 
-    use super::{parse_stream, JsonStreamParser};
+    use super::{JsonStreamParser, parse_stream};
 
     #[test]
     fn empty_array() {
