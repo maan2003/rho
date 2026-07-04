@@ -7,7 +7,7 @@ use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
-use rho_inference::config::{Effort as InferenceEffort, InferenceConfig, InferenceProtectedConfig};
+use rho_inference::config::{Effort as InferenceEffort, InferenceConfig};
 use rho_workspaces::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
@@ -39,11 +39,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "8f6a5d2c",
-    to: CURRENT_AGENT_DB_FORMAT,
-    migrate: migrate_agent_records,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -171,7 +167,7 @@ impl AgentEventPos {
 
 pub type UnixMillis = UnixMs;
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
     /// Where this agent works. Fixed at creation: the accumulated model
@@ -270,101 +266,6 @@ impl FableEffort {
         match self {
             Self::Medium => rho_claude::Effort::Medium,
             Self::Xhigh => rho_claude::Effort::Xhigh,
-        }
-    }
-}
-
-impl senax_encoder::Decoder for AgentRecord {
-    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
-        AgentRecordWire::decode(reader).map(AgentRecordWire::into_current)
-    }
-}
-
-#[derive(Clone, Debug, Decode)]
-struct AgentRecordWire {
-    display_name: Option<String>,
-    workspace: WorkspaceInfo,
-    status: Status,
-    created_at: UnixMillis,
-    updated_at: UnixMillis,
-    current_lineage: AgentLineageId,
-    parent_agent: Option<AgentId>,
-    mode: Option<AgentMode>,
-    runtime: Option<AgentRuntime>,
-    #[senax(rename = "kind")]
-    previous_kind: Option<PreviousAgentKind>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-enum PreviousAgentKind {
-    Rho {
-        prompt_cache_key: PromptCacheKey,
-        config: InferenceProtectedConfig,
-    },
-    Claude {
-        model: rho_claude::Model,
-        session_id: Uuid,
-        transcript_path: Option<Utf8PathBuf>,
-    },
-}
-
-impl AgentRecordWire {
-    fn into_current(self) -> AgentRecord {
-        let (mode, runtime) = match (self.mode, self.runtime, self.previous_kind) {
-            (Some(mode), Some(runtime), _) => (mode, runtime),
-            (_, _, Some(kind)) => kind.into_mode_runtime(),
-            _ => panic!("agent record missing mode/runtime and legacy kind during repair"),
-        };
-        AgentRecord {
-            display_name: self.display_name,
-            workspace: self.workspace,
-            status: self.status,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            current_lineage: self.current_lineage,
-            parent_agent: self.parent_agent,
-            mode,
-            runtime,
-        }
-    }
-}
-
-impl PreviousAgentKind {
-    fn into_mode_runtime(self) -> (AgentMode, AgentRuntime) {
-        match self {
-            Self::Rho {
-                prompt_cache_key,
-                config,
-            } => (
-                AgentMode::Deep {
-                    effort: DeepEffort::from_inference_config(config.config()),
-                },
-                AgentRuntime::Rho { prompt_cache_key },
-            ),
-            Self::Claude {
-                session_id,
-                transcript_path,
-                ..
-            } => (
-                AgentMode::Fable {
-                    effort: FableEffort::Medium,
-                },
-                AgentRuntime::Claude {
-                    session_id,
-                    transcript_path,
-                },
-            ),
-        }
-    }
-}
-
-impl DeepEffort {
-    fn from_inference_config(config: &InferenceConfig) -> Self {
-        let InferenceConfig::Gpt5(config) = config;
-        match config.effort {
-            InferenceEffort::Minimal | InferenceEffort::Low => Self::Low,
-            InferenceEffort::Medium => Self::Medium,
-            InferenceEffort::High | InferenceEffort::Xhigh | InferenceEffort::Max => Self::Xhigh,
         }
     }
 }
@@ -739,20 +640,6 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
-}
-
-fn migrate_agent_records(write: &mut WriteTxn) {
-    let records = {
-        let agents = write.open_table(AGENTS);
-        agents
-            .iter()
-            .map(|(agent_id, record)| (agent_id.value(), record.value().into_owned()))
-            .collect::<Vec<_>>()
-    };
-    let mut agents = write.open_table(AGENTS);
-    for (agent_id, record) in records {
-        agents.insert(&agent_id, SenValue::borrowed(&record));
-    }
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

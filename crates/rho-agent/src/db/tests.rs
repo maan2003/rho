@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
-use rho_inference::config::{Effort as InferenceEffort, InferenceConfig};
 use rho_workspaces::WorkspaceInfo;
 
 use super::*;
@@ -21,18 +20,6 @@ fn test_agent_runtime() -> AgentRuntime {
     AgentRuntime::Rho {
         prompt_cache_key: PromptCacheKey::generate(),
     }
-}
-
-#[derive(Encode)]
-struct PreviousAgentRecord {
-    display_name: Option<String>,
-    workspace: WorkspaceInfo,
-    status: Status,
-    created_at: UnixMillis,
-    updated_at: UnixMillis,
-    current_lineage: AgentLineageId,
-    parent_agent: Option<AgentId>,
-    kind: PreviousAgentKind,
 }
 
 #[test]
@@ -115,53 +102,6 @@ async fn init_agent_tables_stamps_current_db_format() {
     write.init_agent_tables();
     write.commit();
 
-    let format = db.read().open_table(FORMAT).get(&()).unwrap().value();
-    assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
-}
-
-#[tokio::test]
-async fn init_agent_tables_migrates_previous_kind_records() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let prompt_cache_key = PromptCacheKey::generate();
-    let mut previous_config = InferenceConfig::deep();
-    match &mut previous_config {
-        InferenceConfig::Gpt5(config) => config.effort = InferenceEffort::Xhigh,
-    }
-
-    let mut write = db.write().await;
-    write.open_table(FORMAT).insert(&(), &"8f6a5d2c".to_owned());
-    let agent_id =
-        AgentId::from_counter(1, &AgentIdDomain(7)).expect("valid test agent id counter");
-    let previous = PreviousAgentRecord {
-        display_name: Some("legacy".to_owned()),
-        workspace: test_workspace(),
-        status: Status::Normal,
-        created_at: UnixMs(1),
-        updated_at: UnixMs(2),
-        current_lineage: AgentLineageId(1),
-        parent_agent: None,
-        kind: PreviousAgentKind::Rho {
-            prompt_cache_key,
-            config: previous_config.protect(),
-        },
-    };
-    write
-        .open_table(AGENTS)
-        .insert(&agent_id, SenValue::<AgentRecord>::borrowed(&previous));
-    write.init_agent_tables();
-    write.commit();
-
-    let record = db.read().get_agent(agent_id);
-    assert_eq!(
-        record.mode,
-        AgentMode::Deep {
-            effort: DeepEffort::Xhigh,
-        }
-    );
-    assert_eq!(record.runtime, AgentRuntime::Rho { prompt_cache_key });
-    assert_eq!(record.display_name.as_deref(), Some("legacy"));
     let format = db.read().open_table(FORMAT).get(&()).unwrap().value();
     assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
 }
