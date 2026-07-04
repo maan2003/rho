@@ -53,6 +53,7 @@ nix develop -c cargo run -p rho-cli -- auth list
 nix develop -c cargo run -p rho-cli -- auth remove default
 nix develop -c cargo run -p rho-cli -- auth path --name default
 nix develop -c cargo run -p rho-cli -- auth status --name default
+nix develop -c cargo run -p rho-cli -- auth rate-limits --name default
 nix develop -c cargo run -p rho-cli -- auth import --name default --file credentials.json
 ```
 

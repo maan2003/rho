@@ -334,7 +334,10 @@ fn post_form(url: &str, body: &str) -> io::Result<Value> {
     read_success_json(url, resp)
 }
 
-fn read_success_json(url: &str, mut resp: ureq::http::Response<ureq::Body>) -> io::Result<Value> {
+pub(crate) fn read_success_json(
+    url: &str,
+    mut resp: ureq::http::Response<ureq::Body>,
+) -> io::Result<Value> {
     let status = resp.status();
     if !status.is_success() {
         let content_type = resp

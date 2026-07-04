@@ -1,15 +1,19 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use serde::Deserialize;
 
+use crate::responses::DEFAULT_CHATGPT_BASE_URL;
 use crate::responses::oauth::{
-    OAuthFile, ResponsesOAuthCredentials, oauth_token_should_refresh, openai_codex_auth_url,
-    openai_codex_exchange, parse_redirect_url,
+    InferenceAuth, OAuthFile, ResponsesOAuthCredentials, oauth_token_should_refresh,
+    openai_codex_auth_url, openai_codex_exchange, parse_redirect_url, read_success_json,
 };
 
 const DEFAULT_AUTH_NAME: &str = "default";
+const USER_AGENT: &str = "rho-cli";
 
 #[derive(Clone, Subcommand)]
 pub enum AuthArgs {
@@ -26,6 +30,10 @@ pub enum AuthArgs {
         name: String,
     },
     Status {
+        #[arg(long, default_value = DEFAULT_AUTH_NAME)]
+        name: String,
+    },
+    RateLimits {
         #[arg(long, default_value = DEFAULT_AUTH_NAME)]
         name: String,
     },
@@ -63,6 +71,7 @@ pub fn run_auth_cli(command: AuthArgs) -> Result<()> {
             println!("{}", status_line(name)?);
             Ok(())
         }
+        AuthArgs::RateLimits { name } => print_rate_limits(name.trim()),
         AuthArgs::Import { name, path } => {
             let credentials_json = read_credentials_json(path)?;
             println!("{}", save_json(name, &credentials_json)?);
@@ -241,4 +250,158 @@ fn status_line_for(path: &Path, credentials: Option<&ResponsesOAuthCredentials>)
         refresh,
         credentials.expires_at_ms
     )
+}
+
+fn print_rate_limits(name: impl AsRef<str>) -> Result<()> {
+    let auth = InferenceAuth::named(name)?;
+    let resolved = auth.resolve().context("resolving OAuth credentials")?;
+    let status = fetch_rate_limit_status(&resolved.bearer_token, resolved.account_id.as_deref())
+        .context("fetching ChatGPT rate limits")?;
+
+    let account = resolved.account_id.as_deref().unwrap_or("unknown");
+    let available = status
+        .rate_limit_reset_credits
+        .as_ref()
+        .map(|credits| credits.available_count.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("account={account} rate_limit_reset_credits_available={available}");
+
+    let primary = status.rate_limit.as_ref().map(|rate_limit| {
+        (
+            "codex",
+            None,
+            rate_limit.primary_window.as_ref(),
+            rate_limit.secondary_window.as_ref(),
+        )
+    });
+    for (limit_id, limit_name, primary, secondary) in
+        primary
+            .into_iter()
+            .chain(
+                status
+                    .additional_rate_limits
+                    .iter()
+                    .flatten()
+                    .filter_map(|limit| {
+                        let rate_limit = limit.rate_limit.as_ref()?;
+                        Some((
+                            limit.metered_feature.as_deref().unwrap_or("unknown"),
+                            limit.limit_name.as_deref(),
+                            rate_limit.primary_window.as_ref(),
+                            rate_limit.secondary_window.as_ref(),
+                        ))
+                    }),
+            )
+    {
+        print_window(limit_id, limit_name, "primary", primary);
+        print_window(limit_id, limit_name, "secondary", secondary);
+    }
+    Ok(())
+}
+
+fn fetch_rate_limit_status(
+    bearer_token: &str,
+    account_id: Option<&str>,
+) -> io::Result<RateLimitStatus> {
+    let url = format!("{DEFAULT_CHATGPT_BASE_URL}/wham/usage");
+    let authorization = format!("Bearer {bearer_token}");
+    let mut request = ureq::get(&url)
+        .header("Authorization", &authorization)
+        .header("User-Agent", USER_AGENT);
+    if let Some(account_id) = account_id {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+    let json = read_success_json(
+        &url,
+        request
+            .call()
+            .map_err(|error| io::Error::other(format!("{url}: {error}")))?,
+    )?;
+    serde_json::from_value(json).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn print_window(
+    limit_id: &str,
+    limit_name: Option<&str>,
+    kind: &str,
+    window: Option<&RateLimitWindow>,
+) {
+    let Some(window) = window else {
+        return;
+    };
+    let window_mins = window
+        .limit_window_seconds
+        .map(|seconds| seconds / 60)
+        .map(|mins| mins.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let resets_at = window.reset_at.or_else(|| {
+        window
+            .reset_after_seconds
+            .map(|seconds| now_secs().saturating_add(seconds))
+    });
+    let resets_at = resets_at
+        .map(|timestamp| timestamp.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let resets_in = window
+        .reset_after_seconds
+        .map(|seconds| seconds.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let limit_name = limit_name.unwrap_or("-");
+    println!(
+        "limit={limit_id} name={limit_name} window={kind} used_percent={} window_mins={window_mins} resets_at_unix={resets_at} resets_in_secs={resets_in}",
+        window.used_percent
+    );
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitStatus {
+    #[serde(default)]
+    rate_limit: Option<RateLimitDetails>,
+    #[serde(default)]
+    additional_rate_limits: Option<Vec<AdditionalRateLimit>>,
+    #[serde(default)]
+    rate_limit_reset_credits: Option<RateLimitResetCredits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitDetails {
+    #[serde(default)]
+    primary_window: Option<RateLimitWindow>,
+    #[serde(default)]
+    secondary_window: Option<RateLimitWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitWindow {
+    used_percent: f64,
+    #[serde(default)]
+    limit_window_seconds: Option<i64>,
+    #[serde(default)]
+    reset_after_seconds: Option<i64>,
+    #[serde(default)]
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdditionalRateLimit {
+    #[serde(default)]
+    limit_name: Option<String>,
+    #[serde(default)]
+    metered_feature: Option<String>,
+    #[serde(default)]
+    rate_limit: Option<RateLimitDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitResetCredits {
+    available_count: i64,
 }
