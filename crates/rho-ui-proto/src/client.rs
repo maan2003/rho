@@ -158,7 +158,7 @@ impl AgentClient {
                 }
                 match message {
                     ServerMessage::Agent { agent_id, frame } => {
-                        let _ = reader_frame_tx.send((agent_id.clone(), frame.clone()));
+                        let _ = reader_frame_tx.send((agent_id, frame.clone()));
                         let agent_state = state.entry(agent_id).or_insert_with(empty_agent_state);
                         frame.apply_diff(agent_state);
                         if state_tx.send(state.clone()).is_err() {

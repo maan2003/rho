@@ -427,11 +427,10 @@ fn diff_blocks(previous: &[UiBlock], current: &[UiBlock]) -> UiBlocksDiff {
         .iter()
         .zip(&current[..common_len])
         .enumerate()
-        .filter_map(|(index, (previous, current))| {
-            (previous != current).then(|| UiBlockUpdate {
-                index,
-                block: diff_block(previous, current),
-            })
+        .filter(|(_, (previous, current))| previous != current)
+        .map(|(index, (previous, current))| UiBlockUpdate {
+            index,
+            block: diff_block(previous, current),
         })
         .collect::<Vec<_>>();
     updates.extend(

@@ -166,7 +166,7 @@ async fn connect_or_start_daemon(
     loop {
         match UiClient::connect(socket_path).await {
             Ok(client) => return Ok(client),
-            Err(error) if tokio::time::Instant::now() >= deadline => return Err(error.into()),
+            Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
         }
     }

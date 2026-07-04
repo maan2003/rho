@@ -299,15 +299,15 @@ fn apply_compact_boundaries(entries: &mut [TranscriptEntry]) {
                     entry.parent_uuid = Some(last);
                 }
             }
-        } else if let Some(preserved) = metadata.preserved_segment {
-            if let Some(head_index) = by_uuid.get(&preserved.head_uuid).copied() {
-                entries[head_index].parent_uuid = Some(preserved.anchor_uuid);
-                for entry in entries.iter_mut() {
-                    if entry.parent_uuid == Some(preserved.anchor_uuid)
-                        && entry.uuid != Some(preserved.head_uuid)
-                    {
-                        entry.parent_uuid = Some(preserved.tail_uuid);
-                    }
+        } else if let Some(preserved) = metadata.preserved_segment
+            && let Some(head_index) = by_uuid.get(&preserved.head_uuid).copied()
+        {
+            entries[head_index].parent_uuid = Some(preserved.anchor_uuid);
+            for entry in entries.iter_mut() {
+                if entry.parent_uuid == Some(preserved.anchor_uuid)
+                    && entry.uuid != Some(preserved.head_uuid)
+                {
+                    entry.parent_uuid = Some(preserved.tail_uuid);
                 }
             }
         }
@@ -338,10 +338,7 @@ fn latest_chain(entries: &[TranscriptEntry]) -> Vec<&TranscriptEntry> {
 
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
-    loop {
-        let Some(uuid) = current.uuid() else {
-            break;
-        };
+    while let Some(uuid) = current.uuid() {
         if !seen.insert(uuid) {
             break;
         }

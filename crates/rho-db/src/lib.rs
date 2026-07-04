@@ -44,11 +44,17 @@ impl<'a, T> SenValue<'a, T> {
         Self::Borrowed(value)
     }
 
-    pub fn as_ref(&self) -> &T {
+    fn owned_ref(&self) -> &T {
         match self {
             Self::Owned(value) => value,
             Self::Borrowed(_) => panic!("borrowed sen value has no owned reference"),
         }
+    }
+}
+
+impl<T> AsRef<T> for SenValue<'_, T> {
+    fn as_ref(&self) -> &T {
+        self.owned_ref()
     }
 }
 

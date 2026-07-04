@@ -123,11 +123,17 @@
           pkgs.wayland
         ];
         guiLibraryPath = pkgs.lib.makeLibraryPath guiBuildInputs;
+        zedSrc = pkgs.fetchFromGitHub {
+          owner = "maan2003";
+          repo = "zed";
+          rev = "8c93f816e224648577dcb1c1b58b9445a6633416";
+          hash = "sha256-Xw756jnCJPmTjLEPo8KYcplo/9Sk+ccjK9iHD8UhN4Y=";
+        };
 
         multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
           craneLib':
           let
-            craneLib = craneLib'.overrideArgs {
+            craneLibBase = craneLib'.overrideArgs {
               pname = projectName;
               src = buildSrc;
               nativeBuildInputs = guiNativeBuildInputs;
@@ -136,6 +142,22 @@
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
+            };
+            cargoVendorDirBase = craneLibBase.vendorCargoDeps { };
+            cargoVendorDir = pkgs.runCommand "rho-cargo-vendor-deps" { } ''
+              cp -aL ${cargoVendorDirBase} $out
+              chmod -R u+w $out
+              substituteInPlace $out/config.toml \
+                --replace-fail ${cargoVendorDirBase} $out
+
+              # The Zed `assets` crate embeds files from `../../assets`. Crane's
+              # vendoring splits git workspaces into per-crate directories, so
+              # provide the full-repo asset directory at the relative path the
+              # crate expects.
+              ln -s ${zedSrc}/assets $out/assets
+            '';
+            craneLib = craneLibBase.overrideArgs {
+              inherit cargoVendorDir;
             };
           in
           rec {

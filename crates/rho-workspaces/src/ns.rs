@@ -94,7 +94,7 @@ pub fn create_workspace_ns(repo: &Path, slot: &Path) -> anyhow::Result<OwnedFd> 
             origin_tree.as_fd(),
             "",
             CWD,
-            &repo.join(".jj").join(WS_PARENT),
+            repo.join(".jj").join(WS_PARENT),
             MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
         )
         .context("bind origin at ws-parent")?;

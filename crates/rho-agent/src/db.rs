@@ -262,6 +262,7 @@ pub trait AgentReadTxnExt {
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
 

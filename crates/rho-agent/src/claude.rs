@@ -226,18 +226,20 @@ impl ClaudeLoop {
                     tokio::select! {
                         biased;
                         control = control_rx.recv() => ClaudeLoopEvent::Control(control),
-                        event = process.next_event() => ClaudeLoopEvent::Protocol(event),
+                        event = process.next_event() => ClaudeLoopEvent::Protocol(Box::new(event)),
                     }
                 };
                 match event {
                     ClaudeLoopEvent::Control(Some(control)) => self.handle_control(control).await,
                     ClaudeLoopEvent::Control(None) => return,
-                    ClaudeLoopEvent::Protocol(Ok(Some(event))) => self.handle_event(event).await,
-                    ClaudeLoopEvent::Protocol(Ok(None)) => self.process = None,
-                    ClaudeLoopEvent::Protocol(Err(error)) => {
-                        self.process = None;
-                        self.fail(error);
-                    }
+                    ClaudeLoopEvent::Protocol(event) => match *event {
+                        Ok(Some(event)) => self.handle_event(event).await,
+                        Ok(None) => self.process = None,
+                        Err(error) => {
+                            self.process = None;
+                            self.fail(error);
+                        }
+                    },
                 }
             } else {
                 let Some(control) = self.control_rx.recv().await else {
@@ -430,5 +432,5 @@ impl ClaudeLoop {
 
 enum ClaudeLoopEvent {
     Control(Option<ClaudeControl>),
-    Protocol(anyhow::Result<Option<rho_claude::ClaudeEvent>>),
+    Protocol(Box<anyhow::Result<Option<rho_claude::ClaudeEvent>>>),
 }
