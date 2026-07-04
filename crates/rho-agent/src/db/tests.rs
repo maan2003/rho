@@ -36,9 +36,9 @@ fn agent_db_migrations_eventually_reach_current_format() {
         );
     }
 
-    for migration in AGENT_DB_MIGRATIONS {
+    for &start in &starts {
         let mut seen = HashSet::new();
-        let mut format = migration.from;
+        let mut format = start;
         while format != current {
             assert!(
                 seen.insert(format),
@@ -47,7 +47,7 @@ fn agent_db_migrations_eventually_reach_current_format() {
             assert!(
                 starts.contains(format),
                 "agent db migration chain from {} stops at {format}",
-                migration.from
+                start
             );
             let next = AGENT_DB_MIGRATIONS
                 .iter()
