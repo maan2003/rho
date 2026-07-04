@@ -25,6 +25,7 @@ use rho_workspaces::{Repo, WorkspaceInfo};
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, mpsc};
 
 pub mod debug;
+mod voice;
 
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
     let base = dirs::runtime_dir()
@@ -122,6 +123,8 @@ struct AgentRegistry {
     title_tasks: Mutex<HashSet<AgentId>>,
     land_locks: Mutex<HashMap<Utf8PathBuf, Arc<TokioMutex<()>>>>,
     land_statuses: Mutex<HashMap<Utf8PathBuf, LandStatus>>,
+    /// At most one realtime voice session per daemon (see [`voice`]).
+    voice_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentRegistry {
@@ -160,6 +163,7 @@ impl AgentRegistry {
             title_tasks: Mutex::new(HashSet::new()),
             land_locks: Mutex::new(HashMap::new()),
             land_statuses: Mutex::new(HashMap::new()),
+            voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         registry.load_non_archived_agents().await;
         registry
@@ -645,8 +649,21 @@ async fn serve_connection(
 
     let mut reader = reader;
     let mut land_leases: Vec<(Utf8PathBuf, OwnedMutexGuard<()>)> = Vec::new();
+    // The voice session (at most one) is owned by this connection: dropping
+    // the handle on disconnect ends the session task.
+    let mut voice: Option<voice::VoiceHandle> = None;
     loop {
         let message = read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await?;
+        match voice::handle_client_message(&agents, &outgoing_tx, &mut voice, &message) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                let _ = outgoing_tx.send(ServerMessage::Error {
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        }
         match handle_message(&agents, &outgoing_tx, &mut land_leases, message).await {
             Ok(Refresh::Ready) => {
                 let _ = outgoing_tx.send(agents.ready_message());
@@ -803,6 +820,11 @@ async fn handle_message(
             }
             Ok(Refresh::None)
         }
+        // Intercepted by `voice::handle_client_message` before this dispatch.
+        ClientMessage::VoiceStart
+        | ClientMessage::VoiceStop
+        | ClientMessage::VoiceAudio { .. }
+        | ClientMessage::VoiceFocus { .. } => Ok(Refresh::None),
     }
 }
 

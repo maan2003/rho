@@ -216,10 +216,18 @@ impl AgentClient {
                             }
                         }
                     }
+                    // Voice frames are only meaningful to the client that
+                    // started the session (the GUI); this CLI client has no
+                    // audio path.
                     ServerMessage::Pong
                     | ServerMessage::TurnCancelled { .. }
                     | ServerMessage::LandLeaseGranted { .. }
-                    | ServerMessage::LandStatus { .. } => {}
+                    | ServerMessage::LandStatus { .. }
+                    | ServerMessage::VoiceAudio { .. }
+                    | ServerMessage::VoiceFlushPlayback
+                    | ServerMessage::VoiceState { .. }
+                    | ServerMessage::VoiceTranscript { .. }
+                    | ServerMessage::VoiceUiAction(_) => {}
                 }
             }
         });

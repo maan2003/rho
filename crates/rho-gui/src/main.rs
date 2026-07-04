@@ -15,6 +15,7 @@ mod style;
 mod tests;
 mod topic_rail;
 mod transcript;
+mod voice_audio;
 mod workspace;
 
 use std::fs;

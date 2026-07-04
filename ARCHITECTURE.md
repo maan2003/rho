@@ -17,6 +17,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   session.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
   rendering. They should not own inference protocol details.
+- `rho-voice` is a provider-protocol crate outside the inference contract: it
+  speaks the xAI realtime voice WebSocket (audio streams, voice tool calls)
+  and deliberately never touches `rho-core` transcript vocabulary. Voice is a
+  control surface over agents, assembled by the daemon, not an inference
+  provider.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
   execution.
 

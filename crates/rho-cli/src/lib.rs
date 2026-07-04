@@ -24,6 +24,7 @@ use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::client::{AgentClient, Client as UiClient};
 use rho_ui_proto::remote::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 use rho_ui_proto::{AgentId, IoCounters, MessageDelivery};
+use rho_voice::{VoiceArgs, run_voice_cli};
 use tokio::task::JoinHandle;
 
 mod completion;
@@ -66,6 +67,10 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Auth(auth) => {
             run_auth_cli(auth)?;
+            Ok(())
+        }
+        Command::Voice(voice) => {
+            run_voice_cli(voice)?;
             Ok(())
         }
         Command::Daemon(args) => rho_daemon::run(args).await,
@@ -245,6 +250,12 @@ impl ChatApp {
         };
         match command {
             rho_commands::Command::Quit => unreachable!("handled before command dispatch"),
+            rho_commands::Command::VoiceToggle => {
+                // Voice needs an audio device next to the user; only the GUI
+                // client carries one.
+                self.term
+                    .print_system(":voice is only available in rho-gui");
+            }
             rho_commands::Command::AgentCancel => {
                 self.cancel_running_turn().await;
             }
@@ -1071,6 +1082,7 @@ struct Args {
 enum Command {
     Chat(ChatArgs),
     Auth(AuthArgs),
+    Voice(VoiceArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
     Land(LandArgs),
@@ -1092,6 +1104,10 @@ enum CliCommand {
     Auth {
         #[command(subcommand)]
         command: AuthArgs,
+    },
+    Voice {
+        #[command(subcommand)]
+        command: VoiceArgs,
     },
     Daemon(DaemonArgs),
     Debug(DebugArgs),
@@ -1132,6 +1148,7 @@ impl Args {
         let cli = Cli::try_parse_from(std::iter::once("rho".to_owned()).chain(args))?;
         let command = match cli.command {
             Some(CliCommand::Auth { command }) => Command::Auth(command),
+            Some(CliCommand::Voice { command }) => Command::Voice(command),
             Some(CliCommand::Daemon(args)) => Command::Daemon(args),
             Some(CliCommand::Debug(args)) => Command::Debug(args),
             Some(CliCommand::Land(args)) => Command::Land(args),

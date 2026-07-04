@@ -145,6 +145,46 @@ pub enum ClientMessage {
     ReleaseLandLease {
         repo: Utf8PathBuf,
     },
+    /// Start the daemon's realtime voice session (one per daemon; the
+    /// connection that starts it owns it). Explicit user action: audio
+    /// leaves the machine and sessions are billed per minute.
+    VoiceStart,
+    VoiceStop,
+    /// One chunk of microphone audio: raw PCM16 little-endian mono at
+    /// [`VOICE_SAMPLE_RATE`]. Raw bytes on this local socket; base64 only at
+    /// the provider boundary.
+    VoiceAudio {
+        pcm: Vec<u8>,
+    },
+    /// What the GUI is looking at; voice tools resolve "the current agent"
+    /// against this.
+    VoiceFocus {
+        agent_id: Option<AgentId>,
+    },
+}
+
+/// PCM sample rate used on both legs of the voice path.
+pub const VOICE_SAMPLE_RATE: u32 = 24000;
+
+/// Lifecycle of the daemon's voice session, for client display.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum VoiceState {
+    Starting,
+    Active,
+    Stopped { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum VoiceRole {
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum VoiceUiAction {
+    FocusAgent { agent_id: AgentId },
+    ShowAgents,
+    EnterNewAgentScreen,
 }
 
 /// Where a new agent works. Each mode carries exactly the data it needs:
@@ -238,6 +278,24 @@ pub enum ServerMessage {
         repo: Utf8PathBuf,
         status: LandStatus,
     },
+    /// Assistant audio: raw PCM16 little-endian mono at
+    /// [`VOICE_SAMPLE_RATE`], for immediate playback.
+    VoiceAudio {
+        pcm: Vec<u8>,
+    },
+    /// The user barged in over the assistant; drop any buffered playback
+    /// immediately.
+    VoiceFlushPlayback,
+    VoiceState {
+        state: VoiceState,
+    },
+    /// A transcript fragment (append to the previous fragment of the same
+    /// role) for on-screen display of the spoken conversation.
+    VoiceTranscript {
+        role: VoiceRole,
+        text: String,
+    },
+    VoiceUiAction(VoiceUiAction),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

@@ -19,6 +19,7 @@ rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
 rho-ui-proto.workspace = true
+rho-voice.workspace = true
 rho-workspaces.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

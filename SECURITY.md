@@ -28,6 +28,33 @@ AI APIs.
 - Production paths should not panic on malformed inference data, bad local input,
   missing files, or network failures.
 
+## Realtime voice provider (`rho-voice`)
+
+- `rho-voice` is a client for the xAI realtime voice WebSocket (Grok Voice
+  Agent API). Server events are remote, semi-trusted input: parsing is
+  defensive, unknown event types are preserved rather than rejected, and
+  malformed payloads (bad base64 audio, missing fields) are errors, never
+  panics.
+- Authentication is OAuth-only: rho copies the Grok CLI login from
+  `~/.grok/auth.json` into its own state auth file on first voice use, then
+  refreshes through `auth.x.ai`. OAuth bearer tokens are never printed.
+- The daemon runs at most one voice session, started only by an explicit
+  client `VoiceStart` (`:voice` in the GUI) because microphone audio leaves
+  the machine (to xAI) and sessions are billed per minute. The session stops
+  on client request, on disconnect of the owning connection, and
+  automatically after five minutes without detected speech.
+- Voice tool calls are provider-controlled input executed against the agent
+  registry; the tool surface is limited to the same operations UI clients
+  already have (list/status/send/create/cancel/rename/move/archive), name
+  resolution reports ambiguity instead of guessing, and tool errors are
+  returned to the model as text, never panics.
+- GUI audio: mic capture and playback ride the existing UI socket as raw
+  PCM frames; the capture thread stops when the session ends or the
+  connection channel closes.
+- Bounded waits: socket reads take a per-event timeout, keepalive pings run
+  every 25 seconds, and the smoke binary bounds its whole run by a
+  per-event timeout.
+
 ## Future review notes
 
 Future changes that add providers, credential storage, transcript persistence,
