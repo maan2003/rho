@@ -133,6 +133,9 @@ pub(super) fn assistant_message_to_block(
 pub(super) fn user_output_to_block(
     message: rho_claude::protocol::UserOutputMessage,
 ) -> anyhow::Result<Option<Arc<ContextBlock>>> {
+    if message.is_synthetic.unwrap_or(false) || message.is_replay.unwrap_or(false) {
+        return Ok(None);
+    }
     let Some(output) = message.message else {
         return Ok(None);
     };
@@ -330,6 +333,34 @@ mod tests {
             panic!("expected user message");
         };
         assert_eq!(text_content(content), "hello");
+    }
+
+    #[test]
+    fn ignores_synthetic_user_output() {
+        let message = serde_json::from_value(json!({
+            "message": {
+                "role": "user",
+                "content": "This session is being continued from a previous conversation."
+            },
+            "isSynthetic": true
+        }))
+        .unwrap();
+
+        assert!(user_output_to_block(message).unwrap().is_none());
+    }
+
+    #[test]
+    fn ignores_replayed_user_output() {
+        let message = serde_json::from_value(json!({
+            "message": {
+                "role": "user",
+                "content": "<task-notification><status>completed</status></task-notification>"
+            },
+            "isReplay": true
+        }))
+        .unwrap();
+
+        assert!(user_output_to_block(message).unwrap().is_none());
     }
 
     #[test]

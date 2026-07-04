@@ -119,7 +119,7 @@ impl ClaudeAgent {
         .await?;
         let blocks = transcript_messages_to_context(&messages)?;
         let context_used =
-            rho_claude::last_assistant_usage(&messages).map(|usage| usage.context_total());
+            rho_claude::read_session_context_used_by_id(session_id, workspace.repo()).await?;
         let state = AgentState {
             blocks,
             tool_specs: Arc::from([]),
@@ -418,7 +418,9 @@ impl ClaudeLoop {
 
     async fn handle_event(&mut self, event: rho_claude::ClaudeEvent) {
         match event {
-            rho_claude::ClaudeEvent::System(_) => {}
+            rho_claude::ClaudeEvent::System(message) => {
+                self.handle_system_message(message).await;
+            }
             rho_claude::ClaudeEvent::ControlResponse(_) => {}
             rho_claude::ClaudeEvent::Assistant(message) => {
                 match assistant_message_to_block(message) {
@@ -460,6 +462,51 @@ impl ClaudeLoop {
     }
 
     async fn persist_inference_block(&self, _block: &Arc<ContextBlock>) {}
+
+    async fn handle_system_message(&mut self, message: rho_claude::protocol::SystemMessage) {
+        let rho_claude::protocol::SystemMessage::CompactBoundary {
+            compact_metadata, ..
+        } = message
+        else {
+            return;
+        };
+
+        {
+            let mut state = self.state.write().expect("poison");
+            remove_compact_commands(&mut state.queued_messages);
+            if let Some(post_tokens) = compact_metadata.and_then(|metadata| metadata.post_tokens) {
+                state.context_used = Some(post_tokens);
+            }
+        }
+        self.notify.notify_waiters();
+
+        match self.refresh_from_transcript().await {
+            Ok(()) => {}
+            Err(error) => eprintln!("rho-agent Claude compaction refresh failed: {error:#}"),
+        }
+    }
+
+    async fn refresh_from_transcript(&self) -> anyhow::Result<()> {
+        let messages = rho_claude::read_session_messages_by_id(
+            self.session_id,
+            self.workspace.repo(),
+            rho_claude::SessionMessagesOptions::default(),
+        )
+        .await?;
+        let blocks = transcript_messages_to_context(&messages)?;
+        let context_used =
+            rho_claude::read_session_context_used_by_id(self.session_id, self.workspace.repo())
+                .await?;
+        {
+            let mut state = self.state.write().expect("poison");
+            state.blocks = blocks;
+            if context_used.is_some() {
+                state.context_used = context_used;
+            }
+        }
+        self.notify.notify_waiters();
+        Ok(())
+    }
 
     fn push_block(&self, block: Arc<ContextBlock>) {
         self.state.write().expect("poison").blocks.push(block);
@@ -576,4 +623,15 @@ fn merge_usage(
     base.cache_read_input_tokens = update
         .cache_read_input_tokens
         .or(base.cache_read_input_tokens);
+}
+
+fn remove_compact_commands(messages: &mut Vec<QueuedUserMessage>) {
+    messages.retain(|message| !is_compact_command(&message.content));
+}
+
+fn is_compact_command(content: &[ContentPart]) -> bool {
+    match content {
+        [ContentPart::Text { text }] => text.trim() == "/compact",
+        _ => false,
+    }
 }

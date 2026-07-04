@@ -386,4 +386,151 @@ mod tests {
 
         assert!(matches!(event, protocol::ClaudeEvent::RateLimitEvent));
     }
+
+    #[test]
+    fn parses_system_compact_boundary_event() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "content": "Conversation compacted",
+            "compactMetadata": {
+                "trigger": "manual",
+                "preTokens": 411842,
+                "postTokens": 7797
+            },
+            "uuid": "1d31a2a9-8361-4561-afac-fdd5f9216d1c",
+            "session_id": "00000000-0000-4000-8000-000000000001"
+        }))
+        .unwrap();
+
+        let protocol::ClaudeEvent::System(protocol::SystemMessage::CompactBoundary {
+            compact_metadata,
+            ..
+        }) = event
+        else {
+            panic!("expected system event");
+        };
+        let metadata = compact_metadata.expect("compact metadata");
+        assert_eq!(metadata.trigger.as_deref(), Some("manual"));
+        assert_eq!(metadata.pre_tokens, Some(411842));
+        assert_eq!(metadata.post_tokens, Some(7797));
+    }
+
+    #[test]
+    fn parses_observed_system_subtypes() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "system",
+            "subtype": "turn_duration",
+            "durationMs": 362188,
+            "messageCount": 4,
+            "session_id": "00000000-0000-4000-8000-000000000001",
+            "uuid": "00000000-0000-4000-8000-000000000002"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            protocol::ClaudeEvent::System(protocol::SystemMessage::TurnDuration {
+                duration_ms: Some(362188),
+                message_count: Some(4),
+                ..
+            })
+        ));
+
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "system",
+            "subtype": "away_summary",
+            "content": "summary",
+            "sessionId": "00000000-0000-4000-8000-000000000001"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            protocol::ClaudeEvent::System(protocol::SystemMessage::AwaySummary {
+                content: Some(content),
+                ..
+            }) if content == "summary"
+        ));
+
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<command-name>/resume</command-name>",
+            "level": "info"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            protocol::ClaudeEvent::System(protocol::SystemMessage::LocalCommand {
+                level: Some(level),
+                ..
+            }) if level == "info"
+        ));
+
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "system",
+            "subtype": "api_error",
+            "level": "error",
+            "error": {"message": "rate limited"},
+            "retryAttempt": 2,
+            "retryInMs": 1000,
+            "maxRetries": 5
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            protocol::ClaudeEvent::System(protocol::SystemMessage::ApiError {
+                retry_attempt: Some(2),
+                retry_in_ms: Some(1000),
+                max_retries: Some(5),
+                ..
+            })
+        ));
+
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "system",
+            "subtype": "informational",
+            "content": "Unknown command",
+            "level": "warning",
+            "sessionKind": "primary"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            protocol::ClaudeEvent::System(protocol::SystemMessage::Informational {
+                level: Some(level),
+                session_kind: Some(kind),
+                ..
+            }) if level == "warning" && kind == "primary"
+        ));
+    }
+
+    #[test]
+    fn parses_synthetic_user_replay_with_string_content() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": "This session is being continued from a previous conversation."
+            },
+            "session_id": "5050cd3e-a4d6-4d2f-bf2c-1e0982515411",
+            "parent_tool_use_id": null,
+            "uuid": "95c8ed9e-05b1-4cf8-95fd-99c8f9e4934b",
+            "timestamp": "2026-07-04T19:01:59.790Z",
+            "isReplay": false,
+            "isSynthetic": true
+        }))
+        .unwrap();
+
+        let protocol::ClaudeEvent::User(message) = event else {
+            panic!("expected user event");
+        };
+        assert_eq!(message.is_synthetic, Some(true));
+        let content = &message.message.expect("user message").content;
+        assert_eq!(
+            content,
+            &[protocol::OutputContent::Text {
+                text: "This session is being continued from a previous conversation.".to_owned()
+            }]
+        );
+    }
 }

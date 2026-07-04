@@ -47,6 +47,10 @@ struct TranscriptEntry {
     #[serde(alias = "parent_tool_use_id")]
     parent_tool_use_id: Option<String>,
     is_meta: Option<bool>,
+    #[serde(alias = "isReplay")]
+    is_replay: Option<bool>,
+    #[serde(alias = "isSynthetic")]
+    is_synthetic: Option<bool>,
     is_sidechain: Option<bool>,
     team_name: Option<String>,
     subtype: Option<String>,
@@ -68,6 +72,7 @@ enum TranscriptEntryKind {
 struct CompactMetadata {
     preserved_messages: Option<PreservedMessages>,
     preserved_segment: Option<PreservedSegment>,
+    post_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -112,6 +117,8 @@ impl TranscriptEntry {
             _ => return false,
         }
         !self.is_meta.unwrap_or(false)
+            && !self.is_replay.unwrap_or(false)
+            && !self.is_synthetic.unwrap_or(false)
             && !self.is_sidechain.unwrap_or(false)
             && self.team_name.is_none()
     }
@@ -121,6 +128,11 @@ pub async fn read_session_messages(
     transcript_path: &Utf8Path,
     options: SessionMessagesOptions,
 ) -> Result<Vec<SessionMessage>> {
+    let entries = read_transcript_entries(transcript_path).await?;
+    Ok(session_messages(entries, options))
+}
+
+async fn read_transcript_entries(transcript_path: &Utf8Path) -> Result<Vec<TranscriptEntry>> {
     let file = tokio::fs::File::open(transcript_path)
         .await
         .with_context(|| format!("open Claude transcript {transcript_path}"))?;
@@ -149,7 +161,7 @@ pub async fn read_session_messages(
             entries.push(entry);
         }
     }
-    Ok(session_messages(entries, options))
+    Ok(entries)
 }
 
 pub async fn read_session_messages_by_id(
@@ -161,6 +173,17 @@ pub async fn read_session_messages_by_id(
         return Ok(Vec::new());
     };
     read_session_messages(&transcript_path, options).await
+}
+
+pub async fn read_session_context_used_by_id(
+    session_id: Uuid,
+    cwd: &Utf8Path,
+) -> Result<Option<u64>> {
+    let Some(transcript_path) = find_session_transcript(session_id, cwd).await? else {
+        return Ok(None);
+    };
+    let entries = read_transcript_entries(&transcript_path).await?;
+    Ok(latest_context_used(&entries))
 }
 
 pub async fn find_session_transcript(
@@ -368,6 +391,33 @@ pub fn last_assistant_usage(messages: &[SessionMessage]) -> Option<crate::protoc
         .find_map(|message| serde_json::from_value(message.message.get("usage")?.clone()).ok())
 }
 
+fn latest_context_used(entries: &[TranscriptEntry]) -> Option<u64> {
+    entries
+        .iter()
+        .filter(|entry| entry.visible(true))
+        .filter_map(entry_context_used)
+        .last()
+}
+
+fn entry_context_used(entry: &TranscriptEntry) -> Option<u64> {
+    if entry.kind == TranscriptEntryKind::System
+        && entry.subtype.as_deref() == Some("compact_boundary")
+    {
+        return entry
+            .compact_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.post_tokens);
+    }
+    if entry.kind == TranscriptEntryKind::Assistant {
+        return serde_json::from_value::<crate::protocol::TokenUsage>(
+            entry.message.get("usage")?.clone(),
+        )
+        .ok()
+        .map(|usage| usage.context_total());
+    }
+    None
+}
+
 fn to_session_message(entry: &TranscriptEntry) -> Option<SessionMessage> {
     Some(SessionMessage {
         kind: match entry.kind {
@@ -400,11 +450,31 @@ mod tests {
             timestamp: None,
             parent_tool_use_id: None,
             is_meta: None,
+            is_replay: None,
+            is_synthetic: None,
             is_sidechain: None,
             team_name: None,
             subtype: None,
             compact_metadata: None,
         }
+    }
+
+    #[test]
+    fn restores_context_from_latest_compaction_boundary() {
+        let a = uuid::uuid!("00000000-0000-4000-8000-00000000000a");
+        let b = uuid::uuid!("00000000-0000-4000-8000-00000000000b");
+        let mut assistant = entry(TranscriptEntryKind::Assistant, a, None);
+        assistant.message =
+            json!({"role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 5}});
+        let mut compact = entry(TranscriptEntryKind::System, b, Some(a));
+        compact.subtype = Some("compact_boundary".to_owned());
+        compact.compact_metadata = Some(CompactMetadata {
+            preserved_messages: None,
+            preserved_segment: None,
+            post_tokens: Some(7),
+        });
+
+        assert_eq!(latest_context_used(&[assistant, compact]), Some(7));
     }
 
     #[test]
@@ -469,6 +539,50 @@ mod tests {
 
         let messages = session_messages(
             vec![entry(TranscriptEntryKind::User, a, None), system],
+            SessionMessagesOptions::default(),
+        );
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.uuid)
+                .collect::<Vec<_>>(),
+            [a]
+        );
+    }
+
+    #[test]
+    fn filters_synthetic_messages() {
+        let a = uuid::uuid!("00000000-0000-4000-8000-00000000000a");
+        let b = uuid::uuid!("00000000-0000-4000-8000-00000000000b");
+        let mut synthetic = entry(TranscriptEntryKind::User, b, Some(a));
+        synthetic.is_synthetic = Some(true);
+        synthetic.message = json!({"role": "user", "content": "continued summary"});
+
+        let messages = session_messages(
+            vec![entry(TranscriptEntryKind::User, a, None), synthetic],
+            SessionMessagesOptions::default(),
+        );
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.uuid)
+                .collect::<Vec<_>>(),
+            [a]
+        );
+    }
+
+    #[test]
+    fn filters_replay_messages() {
+        let a = uuid::uuid!("00000000-0000-4000-8000-00000000000a");
+        let b = uuid::uuid!("00000000-0000-4000-8000-00000000000b");
+        let mut replay = entry(TranscriptEntryKind::User, b, Some(a));
+        replay.is_replay = Some(true);
+        replay.message = json!({"role": "user", "content": "<task-notification />"});
+
+        let messages = session_messages(
+            vec![entry(TranscriptEntryKind::User, a, None), replay],
             SessionMessagesOptions::default(),
         );
 

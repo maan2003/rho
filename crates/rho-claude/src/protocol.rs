@@ -1,5 +1,5 @@
 use senax_encoder::{Decode, Encode, Pack, Unpack};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -198,10 +198,67 @@ pub enum ResultSubtype {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct SystemMessage {
-    pub subtype: Option<String>,
-    pub session_id: Option<Uuid>,
-    pub uuid: Option<String>,
+#[serde(
+    tag = "subtype",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum SystemMessage {
+    ApiError {
+        #[serde(alias = "session_id")]
+        session_id: Option<Uuid>,
+        uuid: Option<String>,
+        level: Option<String>,
+        error: Option<Value>,
+        retry_attempt: Option<u64>,
+        retry_in_ms: Option<u64>,
+        max_retries: Option<u64>,
+    },
+    AwaySummary {
+        #[serde(alias = "session_id")]
+        session_id: Option<Uuid>,
+        uuid: Option<String>,
+        content: Option<String>,
+    },
+    CompactBoundary {
+        #[serde(alias = "session_id")]
+        session_id: Option<Uuid>,
+        uuid: Option<String>,
+        content: Option<String>,
+        compact_metadata: Option<SystemCompactMetadata>,
+    },
+    Informational {
+        #[serde(alias = "session_id")]
+        session_id: Option<Uuid>,
+        uuid: Option<String>,
+        content: Option<String>,
+        level: Option<String>,
+        session_kind: Option<String>,
+    },
+    LocalCommand {
+        #[serde(alias = "session_id")]
+        session_id: Option<Uuid>,
+        uuid: Option<String>,
+        content: Option<String>,
+        level: Option<String>,
+    },
+    TurnDuration {
+        #[serde(alias = "session_id")]
+        session_id: Option<Uuid>,
+        uuid: Option<String>,
+        duration_ms: Option<u64>,
+        message_count: Option<u64>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemCompactMetadata {
+    pub trigger: Option<String>,
+    pub pre_tokens: Option<u64>,
+    pub post_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -329,12 +386,16 @@ pub struct UserOutputMessage {
     pub message: Option<OutputConversationMessage>,
     pub parent_tool_use_id: Option<String>,
     pub uuid: Option<String>,
+    #[serde(rename = "isReplay")]
+    pub is_replay: Option<bool>,
+    #[serde(rename = "isSynthetic")]
+    pub is_synthetic: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutputConversationMessage {
     pub role: Role,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_output_content")]
     pub content: Vec<OutputContent>,
 }
 
@@ -343,4 +404,21 @@ pub struct OutputConversationMessage {
 pub enum OutputContent {
     Text { text: String },
     ToolResult { tool_use_id: String, content: Value },
+}
+
+fn deserialize_output_content<'de, D>(deserializer: D) -> Result<Vec<OutputContent>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(text)) => Ok(vec![OutputContent::Text { text }]),
+        Some(value @ Value::Array(_)) => {
+            serde_json::from_value(value).map_err(serde::de::Error::custom)
+        }
+        Some(value) => Err(serde::de::Error::custom(format!(
+            "expected user output content string or array, got {value}"
+        ))),
+    }
 }

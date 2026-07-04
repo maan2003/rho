@@ -54,8 +54,9 @@ pub enum AgentEvent<'a> {
 #[derive(Clone, Debug, PartialEq)]
 // should be cheap to clone, it is cloned a lot
 pub struct AgentState {
-    /// Invariant: append-only. Blocks are only ever pushed — never removed,
-    /// replaced, or reordered.
+    /// Rho-runtime blocks are append-only. Provider-managed runtimes may
+    /// replace this with a compacted transcript snapshot when the provider
+    /// rewrites history.
     pub blocks: Vec<Arc<ContextBlock>>,
     /// Invariant: immutable. Set once at construction and never changed for the
     /// life of the agent. Enforced by exposing no mutator.
