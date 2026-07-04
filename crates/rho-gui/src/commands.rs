@@ -110,11 +110,56 @@ pub fn workdir_field_candidates(
         .collect()
 }
 
+/// Completion inside the draft's mode field buffer.
+pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
+    let trimmed = text_before_cursor.trim_start();
+    let token = last_token(text_before_cursor);
+    let typing_new_token = text_before_cursor
+        .chars()
+        .last()
+        .is_none_or(char::is_whitespace);
+    let words = trimmed.split_whitespace().collect::<Vec<_>>();
+    if words.is_empty() || (words.len() == 1 && !typing_new_token) {
+        return ["deep", "fable"]
+            .into_iter()
+            .filter(|mode| fuzzy_contains(mode, token))
+            .map(|mode| Candidate {
+                value: mode.to_owned(),
+                description: match mode {
+                    "deep" => "rho deep agent".to_owned(),
+                    "fable" => "Claude Fable agent".to_owned(),
+                    _ => unreachable!(),
+                },
+            })
+            .collect();
+    }
+
+    let efforts: &[(&str, &str)] = match words.first().copied() {
+        Some("deep") => &[
+            ("low", "low effort"),
+            ("medium", "medium effort"),
+            ("xhigh", "extra-high effort"),
+        ],
+        Some("fable") => &[("medium", "medium effort"), ("xhigh", "extra-high effort")],
+        _ => return Vec::new(),
+    };
+    efforts
+        .iter()
+        .filter(|(effort, _)| fuzzy_contains(effort, token))
+        .map(|(value, description)| Candidate {
+            value: (*value).to_owned(),
+            description: (*description).to_owned(),
+        })
+        .collect()
+}
+
 pub struct WorkspaceCompletionProvider {
     workspace: WeakEntity<Workspace>,
     /// The draft view's workdir field buffer: completions in it come from
     /// the registered workdirs, not the prompt grammar.
     workdir_buffer: Option<gpui::EntityId>,
+    /// The draft view's mode field buffer: completions are mode/effort names.
+    mode_buffer: Option<gpui::EntityId>,
     /// The draft view's start field buffer: completions are `user` and the
     /// live agent labels.
     start_buffer: Option<gpui::EntityId>,
@@ -124,11 +169,13 @@ impl WorkspaceCompletionProvider {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         workdir_buffer: Option<gpui::EntityId>,
+        mode_buffer: Option<gpui::EntityId>,
         start_buffer: Option<gpui::EntityId>,
     ) -> Rc<Self> {
         Rc::new(Self {
             workspace,
             workdir_buffer,
+            mode_buffer,
             start_buffer,
         })
     }
@@ -157,6 +204,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             .unwrap_or_default();
 
         let in_workdir_field = self.workdir_buffer == Some(buffer.entity_id());
+        let in_mode_field = self.mode_buffer == Some(buffer.entity_id());
         let in_start_field = self.start_buffer == Some(buffer.entity_id());
         let buffer = buffer.read(cx);
         let cursor_offset = buffer_position.to_offset(buffer);
@@ -166,6 +214,8 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             buffer.anchor_before(replace_start)..buffer.anchor_before(cursor_offset);
         let candidates = if in_workdir_field {
             workdir_field_candidates(&text_before_cursor, &workdirs)
+        } else if in_mode_field {
+            mode_field_candidates(&text_before_cursor)
         } else if in_start_field {
             start_field_candidates(&text_before_cursor, &live_agents)
         } else {
@@ -281,5 +331,25 @@ mod tests {
         assert_eq!(candidates[0].description, "/home/u/src/rho");
         // An empty field offers everything.
         assert_eq!(workdir_field_candidates("", &workdirs).len(), 2);
+    }
+
+    #[test]
+    fn mode_field_completes_modes_and_efforts() {
+        let candidates = mode_field_candidates("f");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].value, "fable");
+
+        let candidates = mode_field_candidates("deep x");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].value, "xhigh");
+
+        let candidates = mode_field_candidates("fable ");
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.value)
+                .collect::<Vec<_>>(),
+            ["medium", "xhigh"]
+        );
     }
 }

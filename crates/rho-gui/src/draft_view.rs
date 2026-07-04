@@ -129,6 +129,7 @@ impl DraftView {
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
                 workspace.clone(),
                 Some(workdir_buffer.entity_id()),
+                Some(mode_buffer.entity_id()),
                 Some(start_buffer.entity_id()),
             )));
             editor
