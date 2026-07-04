@@ -18,7 +18,10 @@ use uuid::Uuid;
 use crate::db::{
     AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, TopicId, UnixMillis,
 };
-use crate::{AgentState, AgentStateKind, FailedInferenceResponse, StartWorkspace, system_prompt};
+use crate::{
+    AgentState, AgentStateKind, FailedInferenceResponse, MessageDelivery, QueuedUserMessage,
+    StartWorkspace, system_prompt,
+};
 
 mod projection;
 
@@ -267,16 +270,26 @@ impl ClaudeLoop {
                     self.fail(error);
                     return;
                 }
-                self.pending_response = PendingInferenceResponse::default();
-                self.stream_items.clear();
-                let content = vec![ContentPart::Text { text: text.clone() }];
-                self.push_block(Arc::new(ContextBlock::UserMessage {
-                    content: content.clone(),
-                }));
-                self.set_kind(AgentStateKind::ApiStreaming {
-                    pending_response: self.pending_response.clone(),
-                    previous_attempt: None,
-                });
+                // The --replay-user-messages echo inserts every message into
+                // history when it enters context. Mid-turn sends additionally
+                // mirror the CLI's queue meanwhile; turn-opening sends show
+                // nothing until the echo — it arrives as the turn starts, and
+                // a moment of nothing beats a queue-label flicker.
+                if matches!(
+                    self.state.read().expect("poison").kind,
+                    AgentStateKind::ApiStreaming { .. }
+                ) {
+                    let content = vec![ContentPart::Text { text: text.clone() }];
+                    self.state
+                        .write()
+                        .expect("poison")
+                        .queued_messages
+                        .push(QueuedUserMessage {
+                            content: Arc::new(content),
+                            delivery: MessageDelivery::NextRequest,
+                        });
+                    self.notify.notify_waiters();
+                }
                 if let Err(error) = self.process.as_mut().unwrap().send_user_message(text).await {
                     self.fail(error);
                 }
@@ -287,9 +300,36 @@ impl ClaudeLoop {
                         let _ = process.close().await;
                     });
                 }
+                self.state
+                    .write()
+                    .expect("poison")
+                    .queued_messages
+                    .clear();
                 self.set_kind(AgentStateKind::Idle);
             }
         }
+    }
+
+    /// Routes a user-output block. With --replay-user-messages the CLI echoes
+    /// every user message when it enters context: an echo confirms a mirrored
+    /// queued message and promotes it to history. Anything else (tool
+    /// results, CLI-injected user content) passes through.
+    fn handle_user_block(&mut self, block: Arc<ContextBlock>) {
+        if let ContextBlock::UserMessage { content } = &*block {
+            let mut state = self.state.write().expect("poison");
+            if let Some(pos) = state
+                .queued_messages
+                .iter()
+                .position(|queued| *queued.content == *content)
+            {
+                state.queued_messages.remove(pos);
+                state.blocks.push(block);
+                drop(state);
+                self.notify.notify_waiters();
+                return;
+            }
+        }
+        self.push_block(block);
     }
 
     async fn ensure_process(&mut self) -> anyhow::Result<()> {
@@ -334,7 +374,7 @@ impl ClaudeLoop {
                 }
             }
             rho_claude::ClaudeEvent::User(message) => match user_output_to_block(message) {
-                Ok(Some(block)) => self.push_block(block),
+                Ok(Some(block)) => self.handle_user_block(block),
                 Ok(None) => {}
                 Err(error) => self.fail(error),
             },
