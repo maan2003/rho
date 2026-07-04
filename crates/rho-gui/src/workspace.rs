@@ -377,7 +377,10 @@ impl Workspace {
                          or Shift-Tab to Join mode"
                         .to_owned());
                 }
-                if target.starts_with('@') && target.len() > 1 {
+                if target
+                    .strip_prefix('@')
+                    .is_some_and(|label| label.starts_with('a'))
+                {
                     return Err(format!("no agent named `{target}`"));
                 }
                 StartMode::NewOn {
