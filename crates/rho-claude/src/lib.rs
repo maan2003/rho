@@ -286,4 +286,24 @@ mod tests {
         assert!(message.is_error);
         assert_eq!(message.errors, ["too many turns"]);
     }
+
+    #[test]
+    fn parses_rate_limit_event_without_body() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "resetsAt": 1783173000,
+                "rateLimitType": "five_hour",
+                "overageStatus": "rejected",
+                "overageDisabledReason": "org_level_disabled",
+                "isUsingOverage": false
+            },
+            "uuid": "7850a2a7-37f3-4b5d-9bb6-4aebf33231d5",
+            "session_id": "b1dcda9c-a439-4dd5-b76b-10bec779996c"
+        }))
+        .unwrap();
+
+        assert!(matches!(event, protocol::ClaudeEvent::RateLimitEvent));
+    }
 }

@@ -381,6 +381,7 @@ impl ClaudeLoop {
                     self.fail(error);
                 }
             }
+            rho_claude::ClaudeEvent::RateLimitEvent => {}
         }
     }
 

@@ -108,6 +108,7 @@ enum InputContent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeEvent {
     Assistant(AssistantMessage),
+    RateLimitEvent,
     Result(ResultMessage),
     System(SystemMessage),
     StreamEvent(StreamEvent),
