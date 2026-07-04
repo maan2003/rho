@@ -120,7 +120,7 @@ async fn init_agent_tables_stamps_current_db_format() {
 }
 
 #[tokio::test]
-async fn get_agent_decodes_previous_kind_records() {
+async fn init_agent_tables_migrates_previous_kind_records() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
@@ -131,6 +131,7 @@ async fn get_agent_decodes_previous_kind_records() {
     }
 
     let mut write = db.write().await;
+    write.open_table(FORMAT).insert(&(), &"8f6a5d2c".to_owned());
     let agent_id =
         AgentId::from_counter(1, &AgentIdDomain(7)).expect("valid test agent id counter");
     let previous = PreviousAgentRecord {
@@ -149,6 +150,7 @@ async fn get_agent_decodes_previous_kind_records() {
     write
         .open_table(AGENTS)
         .insert(&agent_id, SenValue::<AgentRecord>::borrowed(&previous));
+    write.init_agent_tables();
     write.commit();
 
     let record = db.read().get_agent(agent_id);
@@ -160,6 +162,8 @@ async fn get_agent_decodes_previous_kind_records() {
     );
     assert_eq!(record.runtime, AgentRuntime::Rho { prompt_cache_key });
     assert_eq!(record.display_name.as_deref(), Some("legacy"));
+    let format = db.read().open_table(FORMAT).get(&()).unwrap().value();
+    assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
 }
 
 #[tokio::test]

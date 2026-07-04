@@ -31,7 +31,7 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "8f6a5d2c";
+const CURRENT_AGENT_DB_FORMAT: &str = "c7b31a9e";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -39,7 +39,11 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "8f6a5d2c",
+    to: CURRENT_AGENT_DB_FORMAT,
+    migrate: migrate_agent_records,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -735,6 +739,20 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
+}
+
+fn migrate_agent_records(write: &mut WriteTxn) {
+    let records = {
+        let agents = write.open_table(AGENTS);
+        agents
+            .iter()
+            .map(|(agent_id, record)| (agent_id.value(), record.value().into_owned()))
+            .collect::<Vec<_>>()
+    };
+    let mut agents = write.open_table(AGENTS);
+    for (agent_id, record) in records {
+        agents.insert(&agent_id, SenValue::borrowed(&record));
+    }
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
