@@ -19,6 +19,8 @@ const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counter
 /// [`PrefixIdDomain::machine_seed`]), generated once at init.
 const MACHINE: TableDefinition<u8, u64> = TableDefinition::new("machine");
 const MACHINE_SEED_KEY: u8 = 0;
+const FORMAT: TableDefinition<u8, String> = TableDefinition::new("format");
+const AGENT_DB_FORMAT_KEY: u8 = 0;
 const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentEventPos> =
     TableDefinition::new("lineage_parents");
 const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
@@ -29,6 +31,18 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// Keyed by the workdir's absolute path (UTF-8; paths are strings on disk
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
+
+fn current_agent_db_format() -> Uuid {
+    uuid::uuid!("b146bc14-1d6d-4f09-9478-ae30ae71228b")
+}
+
+struct AgentDbMigration {
+    from: Uuid,
+    to: Uuid,
+    migrate: fn(&mut WriteTxn),
+}
+
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -346,6 +360,7 @@ impl AgentReadTxnExt for ReadTxn {
 impl AgentWriteTxnExt for WriteTxn {
     fn init_agent_tables(&mut self) {
         self.open_table(COUNTERS);
+        self.open_table(FORMAT);
         self.open_table(LINEAGE_PARENTS);
         self.open_table(AGENT_EVENTS);
         self.open_table(AGENTS);
@@ -356,6 +371,8 @@ impl AgentWriteTxnExt for WriteTxn {
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
         }
+        drop(machine);
+        migrate_agent_db_format(self);
     }
 
     fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId {
@@ -520,6 +537,39 @@ impl AgentWriteTxnExt for WriteTxn {
             .insert(&at, SenValue::borrowed(event));
         at.next()
     }
+}
+
+fn migrate_agent_db_format(write: &mut WriteTxn) {
+    let current = current_agent_db_format();
+    let mut format = {
+        let table = write.open_table(FORMAT);
+        table
+            .get(&AGENT_DB_FORMAT_KEY)
+            .map(|value| {
+                Uuid::parse_str(&value.value()).unwrap_or_else(|error| {
+                    panic!("invalid agent db format uuid: {error}");
+                })
+            })
+            .unwrap_or(current)
+    };
+
+    while format != current {
+        let Some(migration) = AGENT_DB_MIGRATIONS
+            .iter()
+            .find(|migration| migration.from == format)
+        else {
+            panic!(
+                "unsupported agent db format {format}; expected {} or a serially migratable format",
+                current
+            );
+        };
+        (migration.migrate)(write);
+        format = migration.to;
+    }
+
+    write
+        .open_table(FORMAT)
+        .insert(&AGENT_DB_FORMAT_KEY, &current.to_string());
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

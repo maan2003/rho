@@ -64,6 +64,38 @@ async fn agent_event_positions_sort_by_lineage_then_seq() {
 }
 
 #[tokio::test]
+async fn init_agent_tables_stamps_current_db_format() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    let format = db
+        .read()
+        .open_table(FORMAT)
+        .get(&AGENT_DB_FORMAT_KEY)
+        .unwrap()
+        .value();
+    assert_eq!(format, current_agent_db_format().to_string());
+}
+
+#[tokio::test]
+#[should_panic(expected = "unsupported agent db format")]
+async fn init_agent_tables_rejects_unsupported_db_format() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.open_table(FORMAT).insert(
+        &AGENT_DB_FORMAT_KEY,
+        &uuid::uuid!("00000000-0000-4000-8000-000000000000").to_string(),
+    );
+    write.init_agent_tables();
+}
+
+#[tokio::test]
 async fn create_agent_and_append_events_with_cursor() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
