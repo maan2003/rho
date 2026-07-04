@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rho_agent::{AgentState, AgentStateKind, ToolPreviewMetadata};
+use rho_agent::{AgentState, AgentStateKind};
 use rho_core::{
     ApplyPatchMetadata, ContextBlock, InferenceResponseItem, MessagePhase, StreamingContextItem,
     StreamingContextItemState, ToolFileStatus, ToolOutputStatus, ToolResultMetadata, UnixMs,
@@ -517,7 +517,6 @@ fn merge_active_tool_state(blocks: &mut [UiBlock], kind: &AgentStateKind) {
             tool.status = UiToolStatus::Running;
             tool.started_at = Some(preview.started_at);
             tool.finished_at = None;
-            tool.preview = preview.metadata.as_ref().and_then(tool_preview_text);
         }
     }
 
@@ -536,15 +535,6 @@ fn find_tool_block_mut<'a>(blocks: &'a mut [UiBlock], id: &str) -> Option<&'a mu
         UiBlock::Tool(tool) if tool.id == id => Some(tool),
         _ => None,
     })
-}
-
-fn tool_preview_text(metadata: &ToolPreviewMetadata) -> Option<String> {
-    match metadata {
-        ToolPreviewMetadata::ShellCommand { output_tail } => {
-            (!output_tail.is_empty()).then(|| output_tail.clone())
-        }
-        ToolPreviewMetadata::ApplyPatch(_) => None,
-    }
 }
 
 fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> {
@@ -711,7 +701,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
 
-    use rho_agent::{FailedInferenceResponse, ToolPreview};
+    use rho_agent::{FailedInferenceResponse, ToolPreview, ToolPreviewMetadata};
     use rho_core::{
         AStr, ApplyPatchMetadata, ContentPart, PendingInferenceResponse, ToolCall, ToolCallId,
         ToolFileChange, ToolFileStatus, ToolName, ToolOutput, ToolResult, ToolType,

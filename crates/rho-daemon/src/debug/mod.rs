@@ -115,6 +115,6 @@ fn fable_effort_name(effort: FableEffort) -> &'static str {
 fn workspace_name(workspace: &WorkspaceInfo) -> String {
     match workspace {
         WorkspaceInfo::UserCheckout { repo } => format!("user-checkout {repo}"),
-        WorkspaceInfo::Workspace { repo, name } => format!("workspace {name} in {repo}"),
+        WorkspaceInfo::Workspace { repo, id } => format!("workspace {} in {repo}", id.encoded()),
     }
 }

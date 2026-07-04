@@ -47,12 +47,13 @@ impl ElisionSync {
         blocks: &[UiBlock],
         first_changed_block: usize,
         visible: &[bool],
+        turn_in_progress: bool,
         plan_range: impl Fn(&ElisionPlan) -> Option<Range<Anchor>>,
         multi_buffer: &Entity<MultiBuffer>,
         editor: &Entity<Editor>,
         cx: &mut Context<V>,
     ) {
-        self.rebuild_plans(blocks, first_changed_block, visible);
+        self.rebuild_plans(blocks, first_changed_block, visible, turn_in_progress);
         let specs = self
             .plans
             .iter()
@@ -70,7 +71,13 @@ impl ElisionSync {
     /// Plans depend only on their own turn's blocks, so plans for turns
     /// before the change never move; recompute only from the changed turn
     /// onward.
-    fn rebuild_plans(&mut self, blocks: &[UiBlock], first_changed_block: usize, visible: &[bool]) {
+    fn rebuild_plans(
+        &mut self,
+        blocks: &[UiBlock],
+        first_changed_block: usize,
+        visible: &[bool],
+        turn_in_progress: bool,
+    ) {
         let mut from_block = turn_start_index(blocks, first_changed_block);
         // A cached plan straddles a turn boundary only when a user message
         // rendered invisible; recompute from the straddling plan's start.
@@ -100,8 +107,13 @@ impl ElisionSync {
             (Some(plan), Some(index)) if plan.end_block == index => self.plans.pop(),
             _ => None,
         };
-        self.plans
-            .extend(elision_plans_from(blocks, visible, from_block, carry));
+        self.plans.extend(elision_plans_from(
+            blocks,
+            visible,
+            from_block,
+            carry,
+            turn_in_progress,
+        ));
     }
 
     fn apply<V: 'static>(

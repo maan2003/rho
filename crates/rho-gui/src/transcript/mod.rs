@@ -294,6 +294,7 @@ impl TranscriptModel {
             &state.blocks,
             first_changed_block,
             &visible,
+            crate::store::turn_open(state.status),
             |plan| plan_anchor_range(records, plan),
             multi_buffer,
             editor,

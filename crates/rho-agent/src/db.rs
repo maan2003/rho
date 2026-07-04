@@ -8,7 +8,7 @@ use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
 use rho_inference::config::{Effort as InferenceEffort, InferenceConfig};
-use rho_workspaces::WorkspaceInfo;
+use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 
@@ -59,23 +59,6 @@ pub struct AgentIdDomain(pub u64);
 
 impl PrefixIdDomain for AgentIdDomain {
     const KIND: &'static str = "agent-id";
-
-    fn machine_seed(&self) -> u64 {
-        self.0
-    }
-}
-
-pub type WorkspaceId = PrefixId<WorkspaceIdDomain>;
-
-/// Keys workspace-id encoding with this database's persisted machine seed.
-/// Workspace ids only exist to NAME jj workspaces (there is no workspace
-/// table — [`rho_workspaces::WorkspaceInfo`] on the agent record is
-/// self-contained); a separate id space keeps them from aliasing agent ids.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WorkspaceIdDomain(pub u64);
-
-impl PrefixIdDomain for WorkspaceIdDomain {
-    const KIND: &'static str = "workspace-id";
 
     fn machine_seed(&self) -> u64 {
         self.0
@@ -269,6 +252,7 @@ pub trait AgentReadTxnExt {
     /// This database's random machine seed; present once
     /// [`AgentWriteTxnExt::init_agent_tables`] has run.
     fn machine_seed(&self) -> u64;
+    fn last_workspace_counter(&self) -> u64;
     fn get_topic(&self, topic_id: TopicId) -> TopicRecord;
     fn list_topics(&self) -> Vec<(TopicId, TopicRecord)>;
     fn list_topic_agents(&self, topic_id: TopicId) -> Vec<AgentId>;
@@ -326,6 +310,13 @@ impl AgentReadTxnExt for ReadTxn {
             .get(&MACHINE_SEED_KEY)
             .expect("machine seed missing; init_agent_tables must run first")
             .value()
+    }
+
+    fn last_workspace_counter(&self) -> u64 {
+        self.open_table(COUNTERS)
+            .get(&CounterKey::LAST_WORKSPACE_ID)
+            .map(|counter| counter.value())
+            .unwrap_or(0)
     }
 
     fn get_topic(&self, topic_id: TopicId) -> TopicRecord {

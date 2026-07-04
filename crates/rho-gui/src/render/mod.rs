@@ -150,33 +150,14 @@ fn invisible(kind: BlockKind) -> RenderedBlock {
     }
 }
 
-/// Renders one tool call line: `label status [duration]\n[preview]`.
+/// Renders one tool call line: `label status [duration]`.
 ///
 /// Finished tools render their duration as text. Running tools with a start
 /// timestamp get an empty position span instead: the live duration renders
 /// as an inlay there, so per-second ticks never edit the buffer.
 fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<TimerSpec> {
-    let is_shell = matches!(tool.name.as_str(), "shell" | "shell_command");
-    let label = if is_shell {
-        let command = shell_command_argument_label(&tool.arguments);
-        if command.is_empty() {
-            "$".to_owned()
-        } else {
-            format!("$ {command}")
-        }
-    } else if tool.arguments.is_empty() {
-        tool.name.clone()
-    } else {
-        format!("{} {}", tool.name, tool.arguments)
-    };
-    spans.push(Span::new(
-        label,
-        if is_shell {
-            StyleClass::ToolShell
-        } else {
-            StyleClass::ToolName
-        },
-    ));
+    let (label, class) = tool_label(&tool.name, &tool.arguments);
+    spans.push(Span::new(label, class));
     spans.push(Span::new(" ", StyleClass::ToolDetail));
     let status = tool_status_label(tool.status);
     spans.push(Span::new(status, tool_status_class(tool.status)));
@@ -197,10 +178,6 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
         ));
     }
 
-    if let Some(text) = tool.preview.as_deref().or(tool.output.as_deref()) {
-        spans.push(Span::new("\n", StyleClass::ToolDetail));
-        spans.push(Span::new(text.to_owned(), StyleClass::ToolDetail));
-    }
     if !spans.last().is_some_and(|span| span.text.ends_with('\n')) {
         spans.push(Span::new("\n", StyleClass::Default));
     }
@@ -250,6 +227,36 @@ pub fn format_running_duration(started_at_ms: u64, now_ms: u64) -> String {
         String::new()
     } else {
         format!(" {}", format_tool_duration(duration))
+    }
+}
+
+/// Label for a tool call, with the style class for its verb.
+///
+/// Shell-like tools (Codex `shell`/`shell_command`, Claude `Bash`) render as
+/// `$ command`. Claude's file tools render as `read/write/edit path` so the
+/// transcript shows the touched file instead of raw JSON arguments. Argument
+/// extraction tolerates the partial JSON seen while arguments stream.
+fn tool_label(name: &str, arguments: &str) -> (String, StyleClass) {
+    match name {
+        "shell" | "shell_command" | "Bash" => {
+            let command = shell_command_argument_label(arguments);
+            let label = if command.is_empty() {
+                "$".to_owned()
+            } else {
+                format!("$ {command}")
+            };
+            (label, StyleClass::ToolShell)
+        }
+        "Read" | "Write" | "Edit" => {
+            let verb = name.to_ascii_lowercase();
+            let label = match streaming_json_text_field(arguments, "file_path") {
+                Some(path) if !path.is_empty() => format!("{verb} {path}"),
+                _ => verb,
+            };
+            (label, StyleClass::ToolName)
+        }
+        _ if arguments.is_empty() => (name.to_owned(), StyleClass::ToolName),
+        _ => (format!("{name} {arguments}"), StyleClass::ToolName),
     }
 }
 
@@ -303,6 +310,42 @@ mod tests {
         assert_eq!(shell_command_argument_label(r#"{"command":"echo"#), "echo");
         assert_eq!(shell_command_argument_label(r#"{"comm"#), "");
         assert_eq!(shell_command_argument_label("echo ok"), "echo ok");
+    }
+
+    #[test]
+    fn claude_bash_renders_as_shell_prompt() {
+        assert_eq!(
+            tool_label("Bash", r#"{"command":"cargo test","description":"Run tests"}"#),
+            ("$ cargo test".to_owned(), StyleClass::ToolShell)
+        );
+        // Streaming partial JSON still resolves the command field.
+        assert_eq!(
+            tool_label("Bash", r#"{"command":"cargo te"#),
+            ("$ cargo te".to_owned(), StyleClass::ToolShell)
+        );
+        assert_eq!(
+            tool_label("Bash", r#"{"desc"#),
+            ("$".to_owned(), StyleClass::ToolShell)
+        );
+    }
+
+    #[test]
+    fn claude_file_tools_render_verb_and_path() {
+        assert_eq!(
+            tool_label("Read", r#"{"file_path":"/tmp/a.rs","limit":40}"#),
+            ("read /tmp/a.rs".to_owned(), StyleClass::ToolName)
+        );
+        assert_eq!(
+            tool_label(
+                "Edit",
+                r#"{"file_path":"/tmp/a.rs","old_string":"a","new_string":"b"}"#
+            ),
+            ("edit /tmp/a.rs".to_owned(), StyleClass::ToolName)
+        );
+        assert_eq!(
+            tool_label("Write", r#"{"file_p"#),
+            ("write".to_owned(), StyleClass::ToolName)
+        );
     }
 
     #[test]

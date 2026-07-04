@@ -6,8 +6,8 @@
 //! cycling operate over live agents only.
 
 use std::collections::BTreeMap;
-use camino::Utf8PathBuf;
 
+use camino::Utf8PathBuf;
 use rho_ui_proto::{AgentId, AgentIdDomain, UiTopic};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,11 +35,18 @@ pub struct AgentRegistry {
     /// The daemon database's machine seed, from `Ready`; keys agent ID
     /// encoding.
     machine_seed: u64,
+    /// Last workspace id counter, from `Ready`; keys uniform workspace label
+    /// prefix length just like the generated-agent population does for agents.
+    workspace_counter: u64,
 }
 
 impl AgentRegistry {
     pub fn set_machine_seed(&mut self, machine_seed: u64) {
         self.machine_seed = machine_seed;
+    }
+
+    pub fn set_workspace_counter(&mut self, workspace_counter: u64) {
+        self.workspace_counter = workspace_counter;
     }
 
     pub fn set_topics(&mut self, topics: Vec<UiTopic>) {
@@ -96,6 +103,18 @@ impl AgentRegistry {
 
     pub fn agent_workspace(&self, agent_id: AgentId) -> Option<&rho_ui_proto::WorkspaceInfo> {
         self.agent_summary(agent_id).map(|agent| &agent.workspace)
+    }
+
+    pub fn workspace_id_label(&self, agent_id: AgentId) -> Option<String> {
+        let workspace_id = self
+            .agent_summary(agent_id)
+            .and_then(|agent| agent.workspace.workspace_id())?;
+        let prefix_len = prefix_id::uniform_prefix_len(self.workspace_counter, LABEL_HEADROOM);
+        Some(format!("w{}", &workspace_id.encoded()[..prefix_len]))
+    }
+
+    pub fn agent_mode(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentMode> {
+        self.agent_summary(agent_id).map(|agent| agent.mode)
     }
 
     /// The pin/archive status of an agent, from topic summaries.
@@ -223,7 +242,7 @@ const LABEL_HEADROOM: u64 = 200;
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::{Status, TopicIdDomain, UiAgentSummary};
+    use rho_ui_proto::{Status, TopicIdDomain, UiAgentSummary, WorkspaceId, WorkspaceIdDomain};
 
     use super::*;
 
@@ -235,10 +254,24 @@ mod tests {
         UiAgentSummary {
             agent_id: agent_id(id),
             display_name: None,
+            mode: rho_ui_proto::AgentMode::deep_default(),
             workspace: rho_ui_proto::WorkspaceInfo::UserCheckout {
                 repo: "/tmp".into(),
             },
             status,
+        }
+    }
+
+    fn workspace_agent(id: u64, workspace_id: WorkspaceId) -> UiAgentSummary {
+        UiAgentSummary {
+            agent_id: agent_id(id),
+            display_name: None,
+            mode: rho_ui_proto::AgentMode::deep_default(),
+            workspace: rho_ui_proto::WorkspaceInfo::Workspace {
+                repo: "/tmp".into(),
+                id: workspace_id,
+            },
+            status: Status::Normal,
         }
     }
 
@@ -274,5 +307,35 @@ mod tests {
         assert_eq!(registry.next_live_agent(-1), Some(visible));
         assert!(registry.agent_hidden(agent_id(2)));
         assert!(registry.agent_hidden(agent_id(3)));
+    }
+
+    #[test]
+    fn workspace_labels_use_uniform_unique_prefixes() {
+        let domain = WorkspaceIdDomain(0);
+        let short_workspace = WorkspaceId::from_counter(1, &domain).unwrap();
+        let long_workspace = WorkspaceId::from_counter(36 * 36, &domain).unwrap();
+
+        let mut registry = AgentRegistry::default();
+        registry.set_machine_seed(0);
+        registry.set_workspace_counter(36 * 36);
+        registry.set_topics(vec![topic(
+            1,
+            Status::Normal,
+            vec![
+                workspace_agent(1, short_workspace),
+                workspace_agent(2, long_workspace),
+                agent(3, Status::Normal),
+            ],
+        )]);
+
+        assert_eq!(
+            registry.workspace_id_label(agent_id(1)),
+            Some(format!("w{}", &short_workspace.encoded()[..3]))
+        );
+        assert_eq!(
+            registry.workspace_id_label(agent_id(2)),
+            Some(format!("w{}", &long_workspace.encoded()[..3]))
+        );
+        assert_eq!(registry.workspace_id_label(agent_id(3)), None);
     }
 }
