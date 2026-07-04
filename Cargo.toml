@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/json-stream",
+  "crates/claude-sdk",
   "crates/prefix-id",
   "crates/rho-agent",
   "crates/rho-blocking-notify-channel",
