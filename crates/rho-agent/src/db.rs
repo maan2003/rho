@@ -179,7 +179,7 @@ pub enum AgentKind {
         config: InferenceProtectedConfig,
     },
     Claude {
-        model: claude_sdk::Model,
+        model: rho_claude::Model,
         session_id: Uuid,
         transcript_path: Option<Utf8PathBuf>,
     },

@@ -1,9 +1,8 @@
-//! Minimal Claude Code stream-json stdio wrapper.
+//! Rho's Claude Code integration.
 //!
-//! This is intentionally not the Anthropic TypeScript SDK. It speaks the small
-//! process protocol used by Claude Code's non-interactive stream-json mode so
-//! Rho can build a Claude-specialized agent without routing it through the
-//! existing inference/tool loop.
+//! The Claude Code process protocol is intentionally private to this crate.
+//! Public APIs should expose Rho-facing vocabulary and typed metadata rather
+//! than raw stream-json messages.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -13,13 +12,15 @@ use camino::Utf8PathBuf;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+#[allow(dead_code)]
+mod protocol;
 mod transcript;
-mod types;
 
+pub use protocol::{Model, Session};
 pub use transcript::*;
-pub use types::*;
 
 const DEFAULT_COMMAND: &str = "claude";
+#[allow(dead_code)]
 const CLAUDE_AGENT_SDK_VERSION: &str = "0.3.201";
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +33,7 @@ pub struct ClaudeCodeOptions {
     pub session: Session,
 }
 
+#[allow(dead_code)]
 impl ClaudeCodeOptions {
     pub fn new(cwd: impl Into<Utf8PathBuf>, model: Model) -> Self {
         Self {
@@ -42,7 +44,7 @@ impl ClaudeCodeOptions {
         }
     }
 
-    fn args(&self) -> Vec<String> {
+    pub(crate) fn args(&self) -> Vec<String> {
         let mut args = vec![
             "--output-format".to_owned(),
             "stream-json".to_owned(),
@@ -70,7 +72,7 @@ impl ClaudeCodeOptions {
         args
     }
 
-    pub async fn spawn(&self) -> Result<ClaudeSession> {
+    pub(crate) async fn spawn(&self) -> Result<ClaudeSession> {
         let mut command = Command::new(self.command.as_std_path());
         command.args(self.args());
         command.current_dir(self.cwd.as_std_path());
@@ -99,18 +101,21 @@ impl ClaudeCodeOptions {
     }
 }
 
+#[allow(dead_code)]
 pub struct ClaudeSession {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
 }
 
+#[allow(dead_code)]
 impl ClaudeSession {
-    pub async fn send_user_message(&mut self, text: impl Into<String>) -> Result<()> {
-        self.write_message(&InputMessage::user(text)).await
+    pub(crate) async fn send_user_message(&mut self, text: impl Into<String>) -> Result<()> {
+        self.write_message(&protocol::InputMessage::user(text))
+            .await
     }
 
-    async fn write_message(&mut self, message: &InputMessage) -> Result<()> {
+    async fn write_message(&mut self, message: &protocol::InputMessage) -> Result<()> {
         let Some(stdin) = &mut self.stdin else {
             bail!("Claude Code stdin is closed");
         };
@@ -121,7 +126,7 @@ impl ClaudeSession {
         Ok(())
     }
 
-    pub async fn next_event(&mut self) -> Result<Option<ClaudeEvent>> {
+    pub(crate) async fn next_event(&mut self) -> Result<Option<protocol::ClaudeEvent>> {
         loop {
             let Some(line) = self.stdout.next_line().await? else {
                 return Ok(None);
@@ -197,7 +202,7 @@ mod tests {
     #[test]
     fn builds_user_message() {
         assert_eq!(
-            serde_json::to_value(InputMessage::user("hello")).unwrap(),
+            serde_json::to_value(protocol::InputMessage::user("hello")).unwrap(),
             json!({
                 "type": "user",
                 "session_id": "",
@@ -212,7 +217,7 @@ mod tests {
 
     #[test]
     fn parses_assistant_event() {
-        let event: ClaudeEvent = serde_json::from_value(json!({
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
             "type": "assistant",
             "session_id": "00000000-0000-4000-8000-000000000001",
             "message": {
@@ -225,7 +230,7 @@ mod tests {
         }))
         .unwrap();
 
-        let ClaudeEvent::Assistant(message) = event else {
+        let protocol::ClaudeEvent::Assistant(message) = event else {
             panic!("expected assistant event");
         };
         assert_eq!(
@@ -235,7 +240,7 @@ mod tests {
         assert_eq!(message.text(), "hello world");
         assert!(matches!(
             &message.message.content[1],
-            AssistantContent::ToolUse {
+            protocol::AssistantContent::ToolUse {
                 id,
                 name,
                 input,
@@ -247,7 +252,7 @@ mod tests {
 
     #[test]
     fn parses_result_event() {
-        let event: ClaudeEvent = serde_json::from_value(json!({
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
             "type": "result",
             "subtype": "error_max_turns",
             "is_error": true,
@@ -255,10 +260,10 @@ mod tests {
         }))
         .unwrap();
 
-        let ClaudeEvent::Result(message) = event else {
+        let protocol::ClaudeEvent::Result(message) = event else {
             panic!("expected result event");
         };
-        assert_eq!(message.subtype, ResultSubtype::ErrorMaxTurns);
+        assert_eq!(message.subtype, protocol::ResultSubtype::ErrorMaxTurns);
         assert!(message.is_error);
         assert_eq!(message.errors, ["too many turns"]);
     }

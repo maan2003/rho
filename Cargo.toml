@@ -1,7 +1,7 @@
 [workspace]
 members = [
   "crates/json-stream",
-  "crates/claude-sdk",
+  "crates/rho-claude",
   "crates/prefix-id",
   "crates/rho-agent",
   "crates/rho-blocking-notify-channel",
@@ -38,7 +38,6 @@ base64 = "0.22"
 bytes = "1"
 bon = { version = "3", default-features = false }
 clap = { version = "4", features = ["derive"] }
-claude-sdk = { path = "crates/claude-sdk" }
 crossterm = { version = "0.28", default-features = false, features = [
   "bracketed-paste",
   "events",
@@ -51,6 +50,7 @@ json-stream = { path = "crates/json-stream" }
 rand = "0.8"
 redb = "4.1.0"
 rho-agent = { path = "crates/rho-agent" }
+rho-claude = { path = "crates/rho-claude" }
 rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
 rho-cli = { path = "crates/rho-cli" }
 rho-commands = { path = "crates/rho-commands" }

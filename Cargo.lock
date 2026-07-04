@@ -1463,20 +1463,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "claude-sdk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "camino",
- "senax-encoder",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "client"
 version = "0.1.0"
 dependencies = [
@@ -8235,12 +8221,12 @@ dependencies = [
  "async-stream",
  "bytes",
  "camino",
- "claude-sdk",
  "futures",
  "prefix-id",
  "rand 0.8.6",
  "redb",
  "redb-derive",
+ "rho-claude",
  "rho-core",
  "rho-db",
  "rho-inference",
@@ -8258,6 +8244,20 @@ name = "rho-blocking-notify-channel"
 version = "0.1.0"
 dependencies = [
  "static_assertions",
+]
+
+[[package]]
+name = "rho-claude"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "camino",
+ "senax-encoder",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
