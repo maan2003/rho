@@ -68,7 +68,7 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Daemon(args) => rho_daemon::run(args).await,
         Command::Debug(args) => {
-            rho_daemon::debug::run(args)?;
+            rho_daemon::debug::run(args).await?;
             Ok(())
         }
         Command::ProtocolLog(args) => {

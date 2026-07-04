@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context as _, Result};
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
@@ -150,6 +150,96 @@ pub async fn read_session_messages(
         }
     }
     Ok(session_messages(entries, options))
+}
+
+pub async fn read_session_messages_by_id(
+    session_id: Uuid,
+    cwd: &Utf8Path,
+    options: SessionMessagesOptions,
+) -> Result<Vec<SessionMessage>> {
+    let Some(transcript_path) = find_session_transcript(session_id, cwd).await? else {
+        return Ok(Vec::new());
+    };
+    read_session_messages(&transcript_path, options).await
+}
+
+pub async fn find_session_transcript(
+    session_id: Uuid,
+    cwd: &Utf8Path,
+) -> Result<Option<Utf8PathBuf>> {
+    let Some(projects_dir) = claude_projects_dir() else {
+        return Ok(None);
+    };
+    let cwd = canonical_utf8(cwd).await.unwrap_or_else(|| cwd.to_owned());
+    let project_key = project_key(&cwd);
+    let direct = projects_dir
+        .join(&project_key)
+        .join(format!("{session_id}.jsonl"));
+    if non_empty_file(&direct).await? {
+        return Ok(Some(direct));
+    }
+    if project_key.len() <= MAX_PROJECT_KEY_LEN {
+        return Ok(None);
+    }
+
+    let prefix = format!("{}-", &project_key[..MAX_PROJECT_KEY_LEN]);
+    let mut entries = match tokio::fs::read_dir(&projects_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read Claude projects directory"),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !file_name.starts_with(&prefix) {
+            continue;
+        }
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .ok()
+            .map(|path| path.join(format!("{session_id}.jsonl")));
+        let Some(path) = path else {
+            continue;
+        };
+        if non_empty_file(&path).await? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+const MAX_PROJECT_KEY_LEN: usize = 200;
+
+fn claude_projects_dir() -> Option<Utf8PathBuf> {
+    let config_dir = std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .map(Utf8PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| Utf8PathBuf::from(home).join(".claude"))
+        })?;
+    Some(config_dir.join("projects"))
+}
+
+async fn canonical_utf8(path: &Utf8Path) -> Option<Utf8PathBuf> {
+    let path = tokio::fs::canonicalize(path).await.ok()?;
+    Utf8PathBuf::from_path_buf(path).ok()
+}
+
+fn project_key(path: &Utf8Path) -> String {
+    path.as_str()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
+}
+
+async fn non_empty_file(path: &Utf8Path) -> Result<bool> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("stat Claude transcript {path}")),
+    }
 }
 
 fn session_messages(

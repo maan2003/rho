@@ -8326,6 +8326,7 @@ dependencies = [
  "dirs",
  "futures",
  "rho-agent",
+ "rho-claude",
  "rho-core",
  "rho-db",
  "rho-inference",

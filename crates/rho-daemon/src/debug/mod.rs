@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 
@@ -26,13 +27,13 @@ enum DebugCommand {
     Agents,
 }
 
-pub fn run(args: DebugArgs) -> anyhow::Result<()> {
+pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
     match args.command {
-        DebugCommand::Agents => print_agents(args.db_path),
+        DebugCommand::Agents => print_agents(args.db_path).await,
     }
 }
 
-fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let source = db_path
         .map(Ok)
         .unwrap_or_else(default_db_path)
@@ -47,37 +48,37 @@ fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let mut agents = read.list_agents();
     agents.sort_by_key(|(id, _)| *id);
 
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "source: {}", source.display())?;
-    writeln!(stdout, "snapshot: {}", snapshot.display())?;
-    writeln!(stdout, "agents: {}", agents.len())?;
+    let mut output = String::new();
+    writeln!(output, "source: {}", source.display())?;
+    writeln!(output, "snapshot: {}", snapshot.display())?;
+    writeln!(output, "agents: {}", agents.len())?;
     for (agent_id, agent) in agents {
-        writeln!(stdout)?;
-        writeln!(stdout, "{agent_id:?}")?;
+        writeln!(output)?;
+        writeln!(output, "{agent_id:?}")?;
         if let Some(name) = &agent.display_name {
-            writeln!(stdout, "  name: {name}")?;
+            writeln!(output, "  name: {name}")?;
         }
-        writeln!(stdout, "  status: {}", status_name(agent.status))?;
-        writeln!(stdout, "  mode: {}", mode_name(agent.mode))?;
-        writeln!(stdout, "  workspace: {}", workspace_name(&agent.workspace))?;
+        writeln!(output, "  status: {}", status_name(agent.status))?;
+        writeln!(output, "  mode: {}", mode_name(agent.mode))?;
+        writeln!(output, "  workspace: {}", workspace_name(&agent.workspace))?;
         match agent.runtime {
             AgentRuntime::Rho { prompt_cache_key } => {
-                writeln!(stdout, "  runtime: rho")?;
-                writeln!(stdout, "  prompt_cache_key: {prompt_cache_key:?}")?;
+                writeln!(output, "  runtime: rho")?;
+                writeln!(output, "  prompt_cache_key: {prompt_cache_key:?}")?;
             }
-            AgentRuntime::Claude {
-                session_id,
-                transcript_path,
-            } => {
-                writeln!(stdout, "  runtime: claude")?;
-                writeln!(stdout, "  session_id: {session_id}")?;
-                match transcript_path {
-                    Some(path) => writeln!(stdout, "  transcript_path: {path}")?,
-                    None => writeln!(stdout, "  transcript_path: <none>")?,
+            AgentRuntime::Claude { session_id } => {
+                writeln!(output, "  runtime: claude")?;
+                writeln!(output, "  session_id: {session_id}")?;
+                match rho_claude::find_session_transcript(session_id, agent.workspace.repo())
+                    .await?
+                {
+                    Some(path) => writeln!(output, "  transcript: {path}")?,
+                    None => writeln!(output, "  transcript: <missing>")?,
                 }
             }
         }
     }
+    io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
 }
 

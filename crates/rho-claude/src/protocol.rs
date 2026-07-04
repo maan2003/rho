@@ -189,7 +189,6 @@ pub struct SystemMessage {
     pub subtype: Option<String>,
     pub session_id: Option<Uuid>,
     pub uuid: Option<String>,
-    pub transcript_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]

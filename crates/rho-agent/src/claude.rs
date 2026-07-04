@@ -67,10 +67,7 @@ impl ClaudeAgent {
             display_name,
             workspace.info().clone(),
             mode,
-            AgentRuntime::Claude {
-                session_id,
-                transcript_path: None,
-            },
+            AgentRuntime::Claude { session_id },
         );
         write.commit();
 
@@ -83,13 +80,10 @@ impl ClaudeAgent {
         Ok((
             agent_id,
             Self::new(
-                db,
-                agent_id,
                 workspace,
                 model,
                 effort,
                 session_id,
-                None,
                 state,
                 ClaudeStartMode::New,
             ),
@@ -102,11 +96,7 @@ impl ClaudeAgent {
         workspace: Arc<rho_workspaces::Workspace>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
-        let AgentRuntime::Claude {
-            session_id,
-            transcript_path,
-        } = record.runtime
-        else {
+        let AgentRuntime::Claude { session_id } = record.runtime else {
             anyhow::bail!("cannot load Rho agent with the Claude agent runtime");
         };
         let model = record
@@ -117,17 +107,13 @@ impl ClaudeAgent {
             .mode
             .claude_effort()
             .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
-        let blocks = match &transcript_path {
-            Some(path) => {
-                let messages = rho_claude::read_session_messages(
-                    path,
-                    rho_claude::SessionMessagesOptions::default(),
-                )
-                .await?;
-                transcript_messages_to_context(&messages)?
-            }
-            None => Vec::new(),
-        };
+        let messages = rho_claude::read_session_messages_by_id(
+            session_id,
+            workspace.repo(),
+            rho_claude::SessionMessagesOptions::default(),
+        )
+        .await?;
+        let blocks = transcript_messages_to_context(&messages)?;
         let state = AgentState {
             blocks,
             tool_specs: Arc::from([]),
@@ -135,26 +121,20 @@ impl ClaudeAgent {
             kind: AgentStateKind::Idle,
         };
         Ok(Self::new(
-            db,
-            agent_id,
             workspace,
             model,
             effort,
             session_id,
-            transcript_path,
             state,
             ClaudeStartMode::Resume,
         ))
     }
 
     fn new(
-        db: RhoDb,
-        agent_id: AgentId,
         workspace: Arc<rho_workspaces::Workspace>,
         model: Model,
         effort: Effort,
         session_id: Uuid,
-        transcript_path: Option<camino::Utf8PathBuf>,
         state: AgentState,
         start_mode: ClaudeStartMode,
     ) -> Self {
@@ -162,13 +142,10 @@ impl ClaudeAgent {
         let notify = Arc::new(Notify::new());
         let (control, control_rx) = mpsc::unbounded_channel();
         let loop_state = ClaudeLoop {
-            db,
-            agent_id,
             workspace,
             model,
             effort,
             session_id,
-            transcript_path,
             start_mode,
             process: None,
             pending_response: PendingInferenceResponse::default(),
@@ -227,13 +204,10 @@ enum ClaudeControl {
 }
 
 struct ClaudeLoop {
-    db: RhoDb,
-    agent_id: AgentId,
     workspace: Arc<rho_workspaces::Workspace>,
     model: Model,
     effort: Effort,
     session_id: Uuid,
-    transcript_path: Option<camino::Utf8PathBuf>,
     start_mode: ClaudeStartMode,
     process: Option<ClaudeCode>,
     pending_response: PendingInferenceResponse,
@@ -335,17 +309,7 @@ impl ClaudeLoop {
 
     async fn handle_event(&mut self, event: rho_claude::ClaudeEvent) {
         match event {
-            rho_claude::ClaudeEvent::System(message) => {
-                if message.subtype.as_deref() == Some("init")
-                    && let Some(path) = message.transcript_path
-                {
-                    let path = camino::Utf8PathBuf::from(path);
-                    self.transcript_path = Some(path.clone());
-                    let mut write = self.db.write().await;
-                    write.set_claude_transcript_path(UnixMillis::now(), self.agent_id, path);
-                    write.commit();
-                }
-            }
+            rho_claude::ClaudeEvent::System(_) => {}
             rho_claude::ClaudeEvent::Assistant(message) => {
                 match assistant_message_to_block(message) {
                     Ok(block) => {
