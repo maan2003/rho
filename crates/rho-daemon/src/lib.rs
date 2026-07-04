@@ -210,6 +210,7 @@ impl AgentRegistry {
             workdirs: self.workdirs(),
             default_topic_id: self.default_topic_id,
             machine_seed: self.machine_seed,
+            agent_counter: self.db.read().last_agent_counter(),
             workspace_counter: self.db.read().last_workspace_counter(),
         }
     }

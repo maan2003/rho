@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use rho_agent::db::{
-    AgentMode, AgentReadTxnExt as _, AgentRuntime, DeepEffort, FableEffort, Status,
+    AgentMode, AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, DeepEffort, FableEffort,
+    Status,
 };
 use rho_db::RhoDb;
 use rho_workspaces::WorkspaceInfo;
@@ -25,15 +26,24 @@ pub struct DebugArgs {
 enum DebugCommand {
     /// Snapshot the database and print persisted agent records.
     Agents,
+    /// Snapshot the database and run pending migrations on the copy.
+    Migrate,
 }
 
 pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
     match args.command {
         DebugCommand::Agents => print_agents(args.db_path).await,
+        DebugCommand::Migrate => test_migration(args.db_path).await,
     }
 }
 
-async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+struct Snapshot {
+    source: PathBuf,
+    path: PathBuf,
+    _temp: tempfile::TempDir,
+}
+
+fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
     let source = db_path
         .map(Ok)
         .unwrap_or_else(default_db_path)
@@ -42,15 +52,24 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let snapshot = temp.path().join("rho.redb");
     std::fs::copy(&source, &snapshot)
         .with_context(|| format!("copy rho db snapshot from {}", source.display()))?;
+    Ok(Snapshot {
+        source,
+        path: snapshot,
+        _temp: temp,
+    })
+}
 
-    let db = RhoDb::open(&snapshot);
+async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let snapshot = copy_snapshot(db_path)?;
+
+    let db = RhoDb::open(&snapshot.path);
     let read = db.read();
     let mut agents = read.list_agents();
     agents.sort_by_key(|(id, _)| *id);
 
     let mut output = String::new();
-    writeln!(output, "source: {}", source.display())?;
-    writeln!(output, "snapshot: {}", snapshot.display())?;
+    writeln!(output, "source: {}", snapshot.source.display())?;
+    writeln!(output, "snapshot: {}", snapshot.path.display())?;
     writeln!(output, "agents: {}", agents.len())?;
     for (agent_id, agent) in agents {
         writeln!(output)?;
@@ -78,6 +97,25 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
             }
         }
     }
+    io::stdout().lock().write_all(output.as_bytes())?;
+    Ok(())
+}
+
+async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let snapshot = copy_snapshot(db_path)?;
+    let db = RhoDb::open(&snapshot.path);
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    let read = db.read();
+    let agents = read.list_agents();
+
+    let mut output = String::new();
+    writeln!(output, "source: {}", snapshot.source.display())?;
+    writeln!(output, "snapshot: {}", snapshot.path.display())?;
+    writeln!(output, "migration on copied database: ok")?;
+    writeln!(output, "agents decoded: {}", agents.len())?;
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
 }

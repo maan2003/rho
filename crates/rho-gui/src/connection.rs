@@ -22,6 +22,7 @@ pub enum ConnEvent {
         workdirs: Vec<UiWorkdir>,
         default_topic_id: rho_ui_proto::TopicId,
         machine_seed: u64,
+        agent_counter: u64,
         workspace_counter: u64,
     },
     TopicCreated(UiTopic),
@@ -86,6 +87,7 @@ async fn run(
         workdirs,
         default_topic_id,
         machine_seed,
+        agent_counter,
         workspace_counter,
     } = message
     else {
@@ -97,6 +99,7 @@ async fn run(
             workdirs,
             default_topic_id,
             machine_seed,
+            agent_counter,
             workspace_counter,
         })
         .is_err()
@@ -127,12 +130,14 @@ async fn run(
                 workdirs,
                 default_topic_id,
                 machine_seed,
+                agent_counter,
                 workspace_counter,
             } => Some(ConnEvent::Ready {
                 topics,
                 workdirs,
                 default_topic_id,
                 machine_seed,
+                agent_counter,
                 workspace_counter,
             }),
             ServerMessage::TopicCreated { topic } => Some(ConnEvent::TopicCreated(topic)),

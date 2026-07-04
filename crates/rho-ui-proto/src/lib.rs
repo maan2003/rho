@@ -172,6 +172,9 @@ pub enum ServerMessage {
         /// The daemon database's machine seed; clients need it to encode
         /// agent IDs (see [`AgentIdDomain`]).
         machine_seed: u64,
+        /// Last allocated agent-id counter; clients use it for uniform
+        /// short-prefix rendering.
+        agent_counter: u64,
         /// Last allocated workspace-id counter; clients use it for the same
         /// uniform short-prefix rendering as agent ids.
         workspace_counter: u64,

@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use camino::Utf8PathBuf;
-use rho_ui_proto::{AgentId, AgentIdDomain, UiTopic};
+use rho_ui_proto::{AgentId, UiTopic};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentLife {
@@ -32,9 +32,12 @@ pub struct AgentRegistry {
     agents: BTreeMap<AgentId, AgentLife>,
     topics: Vec<UiTopic>,
     active: ActivePane,
-    /// The daemon database's machine seed, from `Ready`; keys agent ID
-    /// encoding.
+    /// The daemon database's machine seed, from `Ready`; kept for consumers
+    /// that resolve ids.
     machine_seed: u64,
+    /// Last agent id counter, from `Ready`; keys uniform agent label prefix
+    /// length.
+    agent_counter: u64,
     /// Last workspace id counter, from `Ready`; keys uniform workspace label
     /// prefix length just like the generated-agent population does for agents.
     workspace_counter: u64,
@@ -43,6 +46,10 @@ pub struct AgentRegistry {
 impl AgentRegistry {
     pub fn set_machine_seed(&mut self, machine_seed: u64) {
         self.machine_seed = machine_seed;
+    }
+
+    pub fn set_agent_counter(&mut self, agent_counter: u64) {
+        self.agent_counter = agent_counter;
     }
 
     pub fn set_workspace_counter(&mut self, workspace_counter: u64) {
@@ -80,20 +87,8 @@ impl AgentRegistry {
     /// The short display label of an agent: a prefix of its encoded ID,
     /// unique among all generated IDs.
     pub fn agent_id_label(&self, agent_id: AgentId) -> String {
-        let prefix_len = prefix_id::uniform_prefix_len(self.max_counter(agent_id), LABEL_HEADROOM);
+        let prefix_len = prefix_id::uniform_prefix_len(self.agent_counter, LABEL_HEADROOM);
         format!("a{}", &agent_id.encoded()[..prefix_len])
-    }
-
-    fn max_counter(&self, agent_id: AgentId) -> u64 {
-        let domain = AgentIdDomain(self.machine_seed);
-        self.topics
-            .iter()
-            .flat_map(UiTopic::agent_ids)
-            .chain(self.agents.keys().copied())
-            .chain(std::iter::once(agent_id))
-            .map(|id| id.to_counter(&domain))
-            .max()
-            .unwrap_or(0)
     }
 
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
@@ -242,7 +237,9 @@ const LABEL_HEADROOM: u64 = 200;
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::{Status, TopicIdDomain, UiAgentSummary, WorkspaceId, WorkspaceIdDomain};
+    use rho_ui_proto::{
+        AgentIdDomain, Status, TopicIdDomain, UiAgentSummary, WorkspaceId, WorkspaceIdDomain,
+    };
 
     use super::*;
 
@@ -337,5 +334,17 @@ mod tests {
             Some(format!("w{}", &long_workspace.encoded()[..3]))
         );
         assert_eq!(registry.workspace_id_label(agent_id(3)), None);
+    }
+
+    #[test]
+    fn agent_labels_use_ready_counter() {
+        let id = agent_id(1);
+        let mut registry = AgentRegistry::default();
+        registry.set_agent_counter(36 * 36);
+
+        assert_eq!(
+            registry.agent_id_label(id),
+            format!("a{}", &id.encoded()[..3])
+        );
     }
 }
