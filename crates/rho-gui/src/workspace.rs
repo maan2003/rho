@@ -14,7 +14,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
 use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
-use rho_ui_proto::{AgentId, ClientMessage};
+use rho_ui_proto::{AgentId, AgentMode, ClientMessage, DeepEffort, FableEffort};
 use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentView;
@@ -155,6 +155,7 @@ impl Workspace {
                     self.draft_view.update(cx, |view, cx| {
                         view.set_body_text("", cx);
                         view.set_workdir_text(&label, cx);
+                        view.set_mode_text(crate::draft_view::DEFAULT_MODE, cx);
                         view.set_start_text(crate::draft_view::DEFAULT_START, cx);
                     });
                     self.select_agent(Some(agent_id), window, cx);
@@ -319,10 +320,17 @@ impl Workspace {
                 }
             }
         };
+        let mode = match parse_agent_mode(self.draft_view.read(cx).mode_text(cx).trim()) {
+            Ok(mode) => mode,
+            Err(message) => {
+                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                return;
+            }
+        };
         self.awaiting_draft_agent = true;
         self.connection.send(ClientMessage::NewAgent {
             topic_id,
-            mode: rho_ui_proto::AgentMode::deep_default(),
+            mode,
             start,
             content: Some(vec![ContentPart::Text { text: body }]),
         });
@@ -698,7 +706,10 @@ impl Workspace {
     fn cycle_draft_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.registry.selected_agent().is_none() {
             self.draft_view.update(cx, |view, cx| {
-                if view.cursor_in_start_field(cx) {
+                if view.cursor_in_mode_field(cx) {
+                    let next = cycle_agent_mode_text(&view.mode_text(cx));
+                    view.set_mode_text(next, cx);
+                } else if view.cursor_in_start_field(cx) {
                     view.cycle_start_mode(cx);
                 } else {
                     view.toggle_field(window, cx);
@@ -958,6 +969,61 @@ impl Workspace {
     }
 }
 
+fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
+    let mut words = text.split_whitespace();
+    let kind = words.next().unwrap_or("deep").to_ascii_lowercase();
+    let effort = words.next().unwrap_or("medium").to_ascii_lowercase();
+    if words.next().is_some() {
+        return Err("mode must be `deep [low|medium|xhigh]` or `fable [medium|xhigh]`".to_owned());
+    }
+    match kind.as_str() {
+        "deep" => Ok(AgentMode::Deep {
+            effort: match effort.as_str() {
+                "low" => DeepEffort::Low,
+                "medium" => DeepEffort::Medium,
+                "xhigh" => DeepEffort::Xhigh,
+                _ => {
+                    return Err(format!(
+                        "unknown deep effort `{effort}`; use low, medium, or xhigh"
+                    ));
+                }
+            },
+        }),
+        "fable" => Ok(AgentMode::Fable {
+            effort: match effort.as_str() {
+                "medium" => FableEffort::Medium,
+                "xhigh" => FableEffort::Xhigh,
+                _ => {
+                    return Err(format!(
+                        "unknown fable effort `{effort}`; use medium or xhigh"
+                    ));
+                }
+            },
+        }),
+        _ => Err(format!("unknown mode `{kind}`; use deep or fable")),
+    }
+}
+
+fn cycle_agent_mode_text(current: &str) -> &'static str {
+    match parse_agent_mode(current).unwrap_or_else(|_| AgentMode::deep_default()) {
+        AgentMode::Deep {
+            effort: DeepEffort::Low,
+        } => "deep medium",
+        AgentMode::Deep {
+            effort: DeepEffort::Medium,
+        } => "deep xhigh",
+        AgentMode::Deep {
+            effort: DeepEffort::Xhigh,
+        } => "fable medium",
+        AgentMode::Fable {
+            effort: FableEffort::Medium,
+        } => "fable xhigh",
+        AgentMode::Fable {
+            effort: FableEffort::Xhigh,
+        } => "deep low",
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
@@ -1018,4 +1084,27 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_agent_mode_field() {
+        assert_eq!(
+            parse_agent_mode("deep low").unwrap(),
+            AgentMode::Deep {
+                effort: DeepEffort::Low,
+            }
+        );
+        assert_eq!(
+            parse_agent_mode("fable xhigh").unwrap(),
+            AgentMode::Fable {
+                effort: FableEffort::Xhigh,
+            }
+        );
+        assert!(parse_agent_mode("fable low").is_err());
+        assert!(parse_agent_mode("sonnet medium").is_err());
+    }
 }

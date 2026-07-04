@@ -24,11 +24,13 @@ use crate::workspace::Workspace;
 
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
 const WORKDIR_LABEL_INLAY_ID: usize = 1;
-const START_LABEL_INLAY_ID: usize = 2;
+const MODE_LABEL_INLAY_ID: usize = 2;
+const START_LABEL_INLAY_ID: usize = 3;
 
 /// The start field's default base: the parents of the user's working copy —
 /// visible and editable rather than an empty field with implicit meaning.
 pub const DEFAULT_START: &str = "@-";
+pub const DEFAULT_MODE: &str = "deep medium";
 
 /// How the start field's target is interpreted; toggled with Shift-Tab while
 /// the cursor is in the field. The field label shows the current mode.
@@ -58,6 +60,7 @@ pub struct DraftView {
     system_buffer: Entity<Buffer>,
     system_styles: Vec<(StyleClass, Range<text::Anchor>)>,
     workdir_buffer: Entity<Buffer>,
+    mode_buffer: Entity<Buffer>,
     start_buffer: Entity<Buffer>,
     start_mode: StartFieldMode,
     body_buffer: Entity<Buffer>,
@@ -78,6 +81,7 @@ impl DraftView {
             buffer
         });
         let workdir_buffer = cx.new(|cx| Buffer::local("", cx));
+        let mode_buffer = cx.new(|cx| Buffer::local(DEFAULT_MODE, cx));
         let start_buffer = cx.new(|cx| Buffer::local(DEFAULT_START, cx));
         let body_buffer = cx.new(|cx| Buffer::local("", cx));
         let body_end = body_buffer.read(cx).anchor_after(0);
@@ -86,8 +90,9 @@ impl DraftView {
             for (key, buffer) in [
                 (0, &system_buffer),
                 (1, &workdir_buffer),
-                (2, &start_buffer),
-                (3, &body_buffer),
+                (2, &mode_buffer),
+                (3, &start_buffer),
+                (4, &body_buffer),
             ] {
                 multi_buffer.set_excerpts_for_path(
                     PathKey::sorted(key),
@@ -112,7 +117,13 @@ impl DraftView {
                 cx,
             );
             crate::editor_config::configure(&mut editor, window, cx);
-            for buffer in [&system_buffer, &workdir_buffer, &start_buffer, &body_buffer] {
+            for buffer in [
+                &system_buffer,
+                &workdir_buffer,
+                &mode_buffer,
+                &start_buffer,
+                &body_buffer,
+            ] {
                 editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
             }
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
@@ -135,6 +146,11 @@ impl DraftView {
                     this.note_draft_edit(cx);
                 }
             }),
+            cx.subscribe(&mode_buffer, |this, _, event, cx| {
+                if matches!(event, BufferEvent::Edited { .. }) {
+                    this.note_draft_edit(cx);
+                }
+            }),
             cx.subscribe(&start_buffer, |this, _, event, cx| {
                 if matches!(event, BufferEvent::Edited { .. }) {
                     this.note_draft_edit(cx);
@@ -149,6 +165,7 @@ impl DraftView {
             system_buffer,
             system_styles: Vec::new(),
             workdir_buffer,
+            mode_buffer,
             start_buffer,
             start_mode: StartFieldMode::NewOn,
             body_buffer,
@@ -158,6 +175,7 @@ impl DraftView {
         };
         crate::banner::insert(&this.editor, &this.multi_buffer, cx);
         this.insert_workdir_label(cx);
+        this.insert_mode_label(cx);
         this.insert_start_label(cx);
         this.insert_body_gap(cx);
         this.pin_autoscroll(cx);
@@ -178,6 +196,20 @@ impl DraftView {
     pub fn set_workdir_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.suppress_draft_activation = true;
         self.workdir_buffer.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, text)], None, cx);
+        });
+        self.suppress_draft_activation = false;
+    }
+
+    pub fn mode_text(&self, cx: &gpui::App) -> String {
+        let buffer = self.mode_buffer.read(cx);
+        buffer.text_for_range(0..buffer.len()).collect()
+    }
+
+    pub fn set_mode_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.suppress_draft_activation = true;
+        self.mode_buffer.update(cx, |buffer, cx| {
             let len = buffer.len();
             buffer.edit([(0..len, text)], None, cx);
         });
@@ -215,6 +247,10 @@ impl DraftView {
 
     pub fn cursor_in_start_field(&self, cx: &gpui::App) -> bool {
         self.cursor_in(&self.start_buffer, cx)
+    }
+
+    pub fn cursor_in_mode_field(&self, cx: &gpui::App) -> bool {
+        self.cursor_in(&self.mode_buffer, cx)
     }
 
     fn cursor_in(&self, buffer: &Entity<Buffer>, cx: &gpui::App) -> bool {
@@ -273,10 +309,12 @@ impl DraftView {
         }
     }
 
-    /// Tab: cycles workdir field → start field → message body (field values
-    /// arrive selected, so typing replaces them).
+    /// Tab: cycles workdir field → mode field → start field → message body
+    /// (field values arrive selected, so typing replaces them).
     pub fn toggle_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let target = if self.cursor_in(&self.workdir_buffer, cx) {
+            &self.mode_buffer
+        } else if self.cursor_in(&self.mode_buffer, cx) {
             &self.start_buffer
         } else if self.cursor_in(&self.start_buffer, cx) {
             self.focus_body(window, cx);
@@ -361,6 +399,22 @@ impl DraftView {
                     field_start,
                     "Workdir: ",
                 )],
+                cx,
+            );
+        });
+    }
+
+    fn insert_mode_label(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(field_start) =
+            snapshot.anchor_in_excerpt(self.mode_buffer.read(cx).anchor_before(0))
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(
+                &[],
+                vec![Inlay::custom(MODE_LABEL_INLAY_ID, field_start, "Mode: ")],
                 cx,
             );
         });
