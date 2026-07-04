@@ -156,7 +156,7 @@ impl AgentEventPos {
 
 pub type UnixMillis = UnixMs;
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
     /// Where this agent works. Fixed at creation: the accumulated model
@@ -170,6 +170,52 @@ pub struct AgentRecord {
     pub current_lineage: AgentLineageId,
     pub parent_agent: Option<AgentId>,
     pub kind: AgentKind,
+}
+
+impl senax_encoder::Decoder for AgentRecord {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        let record = AgentRecordDecode::decode(reader)?;
+        let kind = match record.kind {
+            Some(kind) => kind,
+            None => match (record.legacy_prompt_cache_key, record.legacy_config) {
+                (Some(prompt_cache_key), Some(config)) => AgentKind::Rho {
+                    prompt_cache_key,
+                    config,
+                },
+                _ => {
+                    return Err(senax_encoder::EncoderError::Decode(
+                        "agent record missing kind".to_owned(),
+                    ));
+                }
+            },
+        };
+        Ok(Self {
+            display_name: record.display_name,
+            workspace: record.workspace,
+            status: record.status,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            current_lineage: record.current_lineage,
+            parent_agent: record.parent_agent,
+            kind,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Decode)]
+struct AgentRecordDecode {
+    display_name: Option<String>,
+    workspace: WorkspaceInfo,
+    status: Status,
+    created_at: UnixMillis,
+    updated_at: UnixMillis,
+    current_lineage: AgentLineageId,
+    parent_agent: Option<AgentId>,
+    kind: Option<AgentKind>,
+    #[senax(rename = "prompt_cache_key")]
+    legacy_prompt_cache_key: Option<PromptCacheKey>,
+    #[senax(rename = "config")]
+    legacy_config: Option<InferenceProtectedConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -356,6 +402,8 @@ impl AgentWriteTxnExt for WriteTxn {
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
         }
+        drop(machine);
+        migrate_agent_records(self);
     }
 
     fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId {
@@ -519,6 +567,20 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENT_EVENTS)
             .insert(&at, SenValue::borrowed(event));
         at.next()
+    }
+}
+
+fn migrate_agent_records(write: &mut WriteTxn) {
+    let records = {
+        let agents = write.open_table(AGENTS);
+        agents
+            .iter()
+            .map(|(agent_id, record)| (agent_id.value(), record.value().into_owned()))
+            .collect::<Vec<_>>()
+    };
+    let mut agents = write.open_table(AGENTS);
+    for (agent_id, record) in records {
+        agents.insert(&agent_id, SenValue::borrowed(&record));
     }
 }
 

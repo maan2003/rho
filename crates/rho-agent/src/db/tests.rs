@@ -23,6 +23,19 @@ fn test_agent_kind() -> AgentKind {
     }
 }
 
+#[derive(Encode)]
+struct OldAgentRecord {
+    display_name: Option<String>,
+    workspace: WorkspaceInfo,
+    status: Status,
+    created_at: UnixMillis,
+    updated_at: UnixMillis,
+    current_lineage: AgentLineageId,
+    parent_agent: Option<AgentId>,
+    prompt_cache_key: PromptCacheKey,
+    config: rho_inference::config::InferenceProtectedConfig,
+}
+
 #[tokio::test]
 async fn agent_event_positions_sort_by_lineage_then_seq() {
     let temp = tempfile::tempdir().unwrap();
@@ -114,6 +127,48 @@ async fn create_agent_and_append_events_with_cursor() {
             }]),
         }
     );
+}
+
+#[tokio::test]
+async fn init_agent_tables_migrates_old_rho_agent_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let prompt_cache_key = PromptCacheKey::generate();
+    let config = InferenceConfig::deep().protect();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = write.alloc_agent_id();
+    let old = OldAgentRecord {
+        display_name: Some("old".to_owned()),
+        workspace: test_workspace(),
+        status: Status::Normal,
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        current_lineage: AgentLineageId(1),
+        parent_agent: None,
+        prompt_cache_key,
+        config: config.clone(),
+    };
+    write
+        .open_table(AGENTS)
+        .insert(&agent_id, SenValue::borrowed(&old));
+    write.commit();
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    let record = db.read().get_agent(agent_id);
+    let AgentKind::Rho {
+        prompt_cache_key: migrated_key,
+        config: migrated_config,
+    } = record.kind
+    else {
+        panic!("expected migrated Rho agent");
+    };
+    assert_eq!(migrated_key, prompt_cache_key);
+    assert_eq!(migrated_config.config(), config.config());
 }
 
 #[tokio::test]
