@@ -8331,6 +8331,7 @@ dependencies = [
  "rho-inference",
  "rho-ui-proto",
  "rho-workspaces",
+ "tempfile",
  "tokio",
 ]
 

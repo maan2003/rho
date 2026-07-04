@@ -24,6 +24,8 @@ use rho_ui_proto::{
 use rho_workspaces::{Repo, WorkspaceInfo};
 use tokio::sync::{Mutex, Notify, mpsc};
 
+pub mod debug;
+
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
     let base = dirs::runtime_dir()
         .or_else(dirs::state_dir)

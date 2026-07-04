@@ -17,6 +17,7 @@ use rho_cli_term_raw::{
     BlockId, Color, CursorShape, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle,
 };
 use rho_core::ToolOutputStatus;
+use rho_daemon::debug::DebugArgs;
 use rho_daemon::{DaemonArgs, default_socket_path};
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::client::{AgentClient, Client as UiClient};
@@ -66,6 +67,10 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Daemon(args) => rho_daemon::run(args).await,
+        Command::Debug(args) => {
+            rho_daemon::debug::run(args)?;
+            Ok(())
+        }
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
             rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
@@ -305,8 +310,7 @@ impl ChatApp {
                         .print_system("cannot determine a working directory");
                     return Ok(true);
                 };
-                self.term
-                    .print_system(&format!("registered {path}"));
+                self.term.print_system(&format!("registered {path}"));
                 self.agent.set_workdir(path, name);
             }
             rho_commands::Command::WorkdirRemove { path } => {
@@ -1012,6 +1016,7 @@ enum Command {
     Chat(ChatArgs),
     Auth(AuthArgs),
     Daemon(DaemonArgs),
+    Debug(DebugArgs),
     ProtocolLog(ProtocolLogArgs),
 }
 
@@ -1032,6 +1037,7 @@ enum CliCommand {
         command: AuthArgs,
     },
     Daemon(DaemonArgs),
+    Debug(DebugArgs),
     ProtocolLog(ProtocolLogArgs),
 }
 
@@ -1058,6 +1064,7 @@ impl Args {
         let command = match cli.command {
             Some(CliCommand::Auth { command }) => Command::Auth(command),
             Some(CliCommand::Daemon(args)) => Command::Daemon(args),
+            Some(CliCommand::Debug(args)) => Command::Debug(args),
             Some(CliCommand::ProtocolLog(args)) => Command::ProtocolLog(args),
             None => Command::Chat(cli.chat),
         };
