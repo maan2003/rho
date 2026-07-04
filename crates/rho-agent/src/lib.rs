@@ -26,6 +26,7 @@ use crate::db::{
 pub mod claude;
 pub mod db;
 pub mod system_prompt;
+pub mod title;
 
 /// An agent timeline event. Some events fold into model context; future
 /// runtime-only events, like tool output chunks, can live here without becoming

@@ -45,6 +45,7 @@ pub struct Gpt5Model(pub Cow<'static, str>);
 
 impl Gpt5Model {
     pub const GPT_5_5: Self = Self(Cow::Borrowed("gpt-5.5"));
+    pub const GPT_5_4_MINI: Self = Self(Cow::Borrowed("gpt-5.4-mini"));
 }
 
 impl senax_encoder::Encoder for Gpt5Model {
@@ -107,6 +108,18 @@ impl InferenceConfig {
             effort: Effort::Medium,
             text_verbosity: TextVerbosity::Low,
             service_tier: ServiceTier::Priority,
+        })
+    }
+
+    /// One-shot title generation: small model, no thread to compact.
+    pub fn titler() -> Self {
+        Self::Gpt5(Gpt5Config {
+            model: Gpt5Model::GPT_5_4_MINI,
+            auto_compaction: None,
+            reasoning_context: ReasoningContext::CurrentTurn,
+            effort: Effort::Medium,
+            text_verbosity: TextVerbosity::Low,
+            service_tier: ServiceTier::Normal,
         })
     }
 

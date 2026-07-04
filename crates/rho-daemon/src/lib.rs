@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -117,6 +117,9 @@ struct AgentRegistry {
     /// One shared handle per repo root: live-workspace sharing (joined
     /// agents get one checkout + namespace) only holds within one instance.
     repos: Mutex<HashMap<Utf8PathBuf, Arc<Repo>>>,
+    /// Agents with a title generation in flight, so a burst of messages to an
+    /// untitled agent starts at most one task.
+    title_tasks: Mutex<HashSet<AgentId>>,
 }
 
 impl AgentRegistry {
@@ -152,6 +155,7 @@ impl AgentRegistry {
             machine_seed,
             agents: Mutex::new(HashMap::new()),
             repos: Mutex::new(HashMap::new()),
+            title_tasks: Mutex::new(HashSet::new()),
         }
     }
 
@@ -340,6 +344,44 @@ impl AgentRegistry {
         write.set_agent_status(rho_core::UnixMs::now(), agent_id, status);
         write.commit();
         Ok(())
+    }
+
+    /// Titles an untitled agent from its first user message, in the
+    /// background. Policy: only fills an empty `display_name` — a manual
+    /// rename, before or during generation, always wins — and at most one
+    /// generation runs per agent at a time. The requesting connection gets a
+    /// `Ready` refresh when the title lands.
+    async fn maybe_generate_title(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        text: String,
+        outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
+    ) {
+        if text.trim().is_empty() || self.db.read().get_agent(agent_id).display_name.is_some() {
+            return;
+        }
+        if !self.title_tasks.lock().await.insert(agent_id) {
+            return;
+        }
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            let generate = rho_agent::title::generate_title(registry.auth.clone(), &text);
+            match tokio::time::timeout(std::time::Duration::from_secs(60), generate).await {
+                Ok(Ok(title)) => {
+                    let mut write = registry.db.write().await;
+                    // The write txn is the single writer, so this read can't
+                    // race a rename committing between check and set.
+                    if registry.db.read().get_agent(agent_id).display_name.is_none() {
+                        write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, title);
+                        write.commit();
+                        let _ = outgoing_tx.send(registry.ready_message());
+                    }
+                }
+                Ok(Err(error)) => eprintln!("rho-daemon: title generation failed: {error:#}"),
+                Err(_) => eprintln!("rho-daemon: title generation timed out"),
+            }
+            registry.title_tasks.lock().await.remove(&agent_id);
+        });
     }
 
     async fn rename_agent(&self, agent_id: AgentId, name: String) -> anyhow::Result<()> {
@@ -536,8 +578,12 @@ async fn handle_message(
             subscribe_agent(agent_id, agent.clone(), outgoing_tx.clone());
             let _ = outgoing_tx.send(ServerMessage::AgentCreated { topic_id, agent_id });
             if let Some(content) = content {
+                let text = text_content(&content);
                 // The agent is fresh, so the lanes are equivalent here.
-                agent.send_user_message(text_content(&content), MessageDelivery::NextRequest);
+                agent.send_user_message(text.clone(), MessageDelivery::NextRequest);
+                agents
+                    .maybe_generate_title(agent_id, text, outgoing_tx.clone())
+                    .await;
             }
             Ok(Refresh::Ready)
         }
@@ -566,7 +612,11 @@ async fn handle_message(
                 .get(agent_id)
                 .await
                 .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
-            agent.send_user_message(text_content(&content), delivery);
+            let text = text_content(&content);
+            agent.send_user_message(text.clone(), delivery);
+            agents
+                .maybe_generate_title(agent_id, text, outgoing_tx.clone())
+                .await;
             Ok(Refresh::None)
         }
         ClientMessage::MoveAgent { agent_id, topic } => {
