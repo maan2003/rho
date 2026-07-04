@@ -38,7 +38,11 @@ fn assistant(text: &str) -> UiBlock {
 }
 
 fn agent_state(blocks: Vec<UiBlock>, status: UiAgentStatus) -> UiAgentState {
-    UiAgentState { blocks, status }
+    UiAgentState {
+        blocks,
+        status,
+        context_used: None,
+    }
 }
 
 fn streaming_state(blocks: Vec<UiBlock>) -> UiAgentState {

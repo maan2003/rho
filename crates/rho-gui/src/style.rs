@@ -134,6 +134,13 @@ pub fn workspace_chip_style(cx: &App) -> HighlightStyle {
     }
 }
 
+pub fn context_chip_style(cx: &App) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(cx.theme().colors().text_muted),
+        ..HighlightStyle::default()
+    }
+}
+
 pub fn mode_chip_style(family: ModeFamily, cx: &App) -> HighlightStyle {
     let colors = cx.theme().colors();
     let color = match family {

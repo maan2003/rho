@@ -78,6 +78,7 @@ fn empty_state() -> UiAgentState {
     UiAgentState {
         blocks: Vec::new(),
         status: UiAgentStatus::Idle,
+        context_used: None,
     }
 }
 
@@ -85,7 +86,7 @@ fn empty_state() -> UiAgentState {
 fn summarize(frame: &AgentRemoteFrame) -> FrameSummary {
     match frame {
         AgentRemoteFrame::Snapshot(_) => FrameSummary::everything(),
-        AgentRemoteFrame::Diff { blocks, status: _ } => {
+        AgentRemoteFrame::Diff { blocks, .. } => {
             let mut first_changed = None;
             let mut note = |index: usize| {
                 first_changed = Some(first_changed.map_or(index, |first: usize| first.min(index)));
@@ -113,6 +114,7 @@ mod tests {
         AgentRemoteFrame::Diff {
             blocks,
             status: None,
+            context_used: None,
         }
     }
 
@@ -173,6 +175,7 @@ mod tests {
                     },
                 ],
                 status: UiAgentStatus::Streaming,
+                context_used: None,
             }),
         );
         let summary = store.apply(
@@ -183,6 +186,7 @@ mod tests {
                     updates: Vec::new(),
                 },
                 status: Some(UiAgentStatus::Idle),
+                context_used: None,
             },
         );
         assert_eq!(summary.first_changed_block, Some(1));

@@ -30,6 +30,8 @@ impl AgentRemoteEncoder {
             Some(previous) => AgentRemoteFrame::Diff {
                 blocks: diff_blocks(&previous.blocks, &current.blocks),
                 status: (previous.status != current.status).then_some(current.status),
+                context_used: (previous.context_used != current.context_used)
+                    .then_some(current.context_used),
             },
             None => AgentRemoteFrame::Snapshot(current.clone()),
         };
@@ -50,6 +52,8 @@ pub enum AgentRemoteFrame {
     Diff {
         blocks: UiBlocksDiff,
         status: Option<UiAgentStatus>,
+        /// `None` means unchanged; `Some(value)` overwrites.
+        context_used: Option<Option<u64>>,
     },
 }
 
@@ -57,10 +61,17 @@ impl AgentRemoteFrame {
     pub fn apply_diff(self, state: &mut UiAgentState) {
         match self {
             Self::Snapshot(snapshot) => *state = snapshot,
-            Self::Diff { blocks, status } => {
+            Self::Diff {
+                blocks,
+                status,
+                context_used,
+            } => {
                 blocks.apply_diff(&mut state.blocks);
                 if let Some(status) = status {
                     state.status = status;
+                }
+                if let Some(context_used) = context_used {
+                    state.context_used = context_used;
                 }
             }
         }
@@ -80,6 +91,9 @@ impl AgentRemoteFrame {
 pub struct UiAgentState {
     pub blocks: Vec<UiBlock>,
     pub status: UiAgentStatus,
+    /// Tokens occupying the model's context window after the latest
+    /// response; `None` until the agent's first response.
+    pub context_used: Option<u64>,
 }
 
 impl UiAgentState {
@@ -99,6 +113,7 @@ impl UiAgentState {
         Self {
             blocks,
             status: ui_status(&state.kind),
+            context_used: state.context_used,
         }
     }
 }
@@ -740,6 +755,7 @@ mod tests {
                 },
                 previous_attempt: None,
             },
+            context_used: None,
         }
     }
 
@@ -777,6 +793,7 @@ mod tests {
                 attempt_count: NonZeroU64::MIN,
                 error: Arc::new(message.to_owned()),
             }),
+            context_used: None,
         }
     }
 
@@ -795,6 +812,7 @@ mod tests {
             system_prompt: Arc::from(""),
             queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
+            context_used: None,
         }
     }
 
@@ -829,6 +847,7 @@ mod tests {
             system_prompt: Arc::from(""),
             queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
+            context_used: None,
         }
     }
 
@@ -862,6 +881,7 @@ mod tests {
                 previews,
                 results: Vec::new(),
             },
+            context_used: None,
         }
     }
 
@@ -892,7 +912,7 @@ mod tests {
         };
 
         let frame = encoder.encode(streaming_state("hello"));
-        let AgentRemoteFrame::Diff { blocks, status } = &frame else {
+        let AgentRemoteFrame::Diff { blocks, status, .. } = &frame else {
             panic!("second frame should be a diff");
         };
         assert_eq!(*status, None);
@@ -936,7 +956,7 @@ mod tests {
         };
 
         let frame = encoder.encode(finished_state("hello"));
-        let AgentRemoteFrame::Diff { blocks, status } = &frame else {
+        let AgentRemoteFrame::Diff { blocks, status, .. } = &frame else {
             panic!("second frame should be a diff");
         };
         assert_eq!(

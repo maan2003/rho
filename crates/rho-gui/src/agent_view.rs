@@ -233,6 +233,7 @@ impl AgentView {
         project_label: &str,
         workspace_label: Option<&str>,
         mode_label: Option<(&str, style::ModeFamily)>,
+        context_used: Option<u64>,
         cx: &mut Context<Self>,
     ) {
         let mut spans = Vec::new();
@@ -256,6 +257,15 @@ impl AgentView {
             spans.push((
                 mode_label.to_owned(),
                 style::mode_chip_style(mode_family, cx),
+            ));
+        }
+        if let Some(context_used) = context_used {
+            if !spans.is_empty() {
+                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
+            }
+            spans.push((
+                format_token_count(context_used),
+                style::context_chip_style(cx),
             ));
         }
         self.status_spans = spans;
@@ -322,5 +332,44 @@ impl AgentView {
             );
         });
         cx.notify();
+    }
+}
+
+/// Renders a token count compactly for the status chip: bare below a
+/// thousand, then `k`/`M` with one decimal while a single digit (`9.5k`,
+/// `1.2M`) and whole numbers after (`62k`, `12M`).
+fn format_token_count(tokens: u64) -> String {
+    fn scaled(value: f64, suffix: &str) -> String {
+        if value < 9.95 {
+            format!("{value:.1}{suffix}")
+        } else {
+            format!("{value:.0}{suffix}")
+        }
+    }
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else if tokens < 999_500 {
+        scaled(tokens as f64 / 1_000.0, "k")
+    } else {
+        scaled(tokens as f64 / 1_000_000.0, "M")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_token_count;
+
+    #[test]
+    fn token_counts_render_compactly() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1_000), "1.0k");
+        assert_eq!(format_token_count(9_400), "9.4k");
+        assert_eq!(format_token_count(9_950), "10k");
+        assert_eq!(format_token_count(62_300), "62k");
+        assert_eq!(format_token_count(999_499), "999k");
+        assert_eq!(format_token_count(999_500), "1.0M");
+        assert_eq!(format_token_count(1_250_000), "1.2M");
+        assert_eq!(format_token_count(12_000_000), "12M");
     }
 }

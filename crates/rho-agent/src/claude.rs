@@ -76,6 +76,7 @@ impl ClaudeAgent {
             system_prompt: system_prompt::prompt(workspace.repo()),
             queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
+            context_used: None,
         };
         Ok((
             agent_id,
@@ -120,6 +121,7 @@ impl ClaudeAgent {
             system_prompt: system_prompt::prompt(workspace.repo()),
             queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
+            context_used: None,
         };
         Ok(Self::new(
             workspace,
@@ -151,6 +153,7 @@ impl ClaudeAgent {
             process: None,
             pending_response: PendingInferenceResponse::default(),
             stream_items: BTreeMap::new(),
+            turn_usage: None,
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
             control_rx,
@@ -213,6 +216,11 @@ struct ClaudeLoop {
     process: Option<ClaudeCode>,
     pending_response: PendingInferenceResponse,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
+    /// Usage of the in-flight message: `message_start` seeds it,
+    /// `message_delta` overlays the final counts (`message_start`'s
+    /// `input_tokens` is a streaming placeholder). Snapshots are taken as-is,
+    /// never accumulated — stream-json repeats usage per content block.
+    turn_usage: Option<rho_claude::protocol::TokenUsage>,
     state: Arc<RwLock<AgentState>>,
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
@@ -364,6 +372,21 @@ impl ClaudeLoop {
         self.notify.notify_waiters();
     }
 
+    /// Publishes the in-flight message's usage as context occupancy: every
+    /// input bucket (fresh, cache creation, cache read) plus output counts
+    /// toward the window.
+    fn update_context_used(&self) {
+        let Some(usage) = &self.turn_usage else {
+            return;
+        };
+        let total = usage.input_tokens.unwrap_or(0)
+            + usage.cache_creation_input_tokens.unwrap_or(0)
+            + usage.cache_read_input_tokens.unwrap_or(0)
+            + usage.output_tokens.unwrap_or(0);
+        self.state.write().expect("poison").context_used = Some(total);
+        self.notify.notify_waiters();
+    }
+
     fn set_streaming_kind(&self) {
         self.set_kind(AgentStateKind::ApiStreaming {
             pending_response: self.pending_response.clone(),
@@ -384,9 +407,10 @@ impl ClaudeLoop {
         event: rho_claude::protocol::MessageStreamEvent,
     ) -> anyhow::Result<()> {
         match event {
-            rho_claude::protocol::MessageStreamEvent::MessageStart { .. } => {
+            rho_claude::protocol::MessageStreamEvent::MessageStart { message } => {
                 self.pending_response = PendingInferenceResponse::default();
                 self.stream_items.clear();
+                self.turn_usage = message.usage;
                 self.set_streaming_kind();
             }
             rho_claude::protocol::MessageStreamEvent::ContentBlockStart {
@@ -424,8 +448,16 @@ impl ClaudeLoop {
                         .unwrap_or_else(|| "Claude stream error".to_owned())
                 );
             }
-            rho_claude::protocol::MessageStreamEvent::MessageDelta { .. }
-            | rho_claude::protocol::MessageStreamEvent::MessageStop
+            rho_claude::protocol::MessageStreamEvent::MessageDelta { delta: _, usage } => {
+                if let Some(usage) = usage {
+                    match &mut self.turn_usage {
+                        Some(turn_usage) => merge_usage(turn_usage, usage),
+                        None => self.turn_usage = Some(usage),
+                    }
+                }
+                self.update_context_used();
+            }
+            rho_claude::protocol::MessageStreamEvent::MessageStop
             | rho_claude::protocol::MessageStreamEvent::Ping => {}
         }
         Ok(())
@@ -435,4 +467,20 @@ impl ClaudeLoop {
 enum ClaudeLoopEvent {
     Control(Option<ClaudeControl>),
     Protocol(Box<anyhow::Result<Option<rho_claude::ClaudeEvent>>>),
+}
+
+/// Overlays the fields a later usage snapshot reports onto an earlier one,
+/// keeping earlier values for fields the update omits.
+fn merge_usage(
+    base: &mut rho_claude::protocol::TokenUsage,
+    update: rho_claude::protocol::TokenUsage,
+) {
+    base.input_tokens = update.input_tokens.or(base.input_tokens);
+    base.output_tokens = update.output_tokens.or(base.output_tokens);
+    base.cache_creation_input_tokens = update
+        .cache_creation_input_tokens
+        .or(base.cache_creation_input_tokens);
+    base.cache_read_input_tokens = update
+        .cache_read_input_tokens
+        .or(base.cache_read_input_tokens);
 }

@@ -62,6 +62,11 @@ pub struct AgentState {
     /// if the process dies before delivery.
     pub queued_messages: Vec<QueuedUserMessage>,
     pub kind: AgentStateKind,
+    /// Tokens occupying the model's context window after the latest
+    /// response (all input, cached or not, plus that response's output).
+    /// `None` until the first response of this process's lifetime; not
+    /// restored on load.
+    pub context_used: Option<u64>,
 }
 
 /// A user message waiting in the agent's queue.
@@ -205,6 +210,7 @@ impl Agent {
             system_prompt: system_prompt::prompt(workspace.repo()),
             queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
+            context_used: None,
         };
         let agent = Self::new(
             inference_session,
@@ -322,6 +328,7 @@ impl Agent {
             system_prompt: system_prompt::prompt(workspace.repo()),
             queued_messages: Vec::new(),
             kind,
+            context_used: None,
         };
         Self::new(
             inference_session,
@@ -531,9 +538,14 @@ impl AgentLoop {
                             });
                         }
                         InferenceEvent::Finished {
-                            usage: _,
+                            usage,
                             provider_response_id,
-                        } => match pending_response.finish() {
+                        } => {
+                            if let Some(usage) = &usage {
+                                state.context_used =
+                                    Some(usage.input_tokens + usage.output_tokens);
+                            }
+                            match pending_response.finish() {
                             Err(error) => {
                                 let attempt_count = previous_attempt
                                     .map_or(NonZeroU64::MIN, |a| a.attempt_count.saturating_add(1));
@@ -631,7 +643,7 @@ impl AgentLoop {
                                     };
                                 }
                             }
-                        },
+                        }},
                     }
                 }
                 Some(result) = self.pending_tools.next() => {

@@ -171,8 +171,21 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::Frame { agent_id, frame } => {
+                let old_context = self
+                    .store
+                    .get(&agent_id)
+                    .and_then(|state| state.context_used);
                 let summary = self.store.apply(agent_id, frame);
                 self.registry.mark_live(agent_id);
+                let new_context = self
+                    .store
+                    .get(&agent_id)
+                    .and_then(|state| state.context_used);
+                if old_context != new_context
+                    && let Some(view) = self.views.get(&agent_id).cloned()
+                {
+                    self.refresh_view_status(&agent_id, &view, cx);
+                }
                 if matches!(self.registry.active_pane(), ActivePane::Startup) {
                     // First live agent: show it. Materialization renders the
                     // full state, so the per-frame sync below is unnecessary.
@@ -885,9 +898,25 @@ impl Workspace {
                 view.sync(state, FrameSummary::everything(), now_ms(), cx);
             });
         }
+        self.refresh_view_status(agent_id, &view, cx);
+        self.views.insert(*agent_id, view.clone());
+        view
+    }
+
+    /// Recomputes the right-prompt status chips for one agent's view.
+    fn refresh_view_status(
+        &self,
+        agent_id: &AgentId,
+        view: &Entity<AgentView>,
+        cx: &mut Context<Self>,
+    ) {
         let directory_label = self.working_directory_label(agent_id);
         let workspace_label = self.registry.workspace_id_label(*agent_id);
         let mode_label = self.mode_label(agent_id);
+        let context_used = self
+            .store
+            .get(agent_id)
+            .and_then(|state| state.context_used);
         view.update(cx, |view, cx| {
             view.set_status(
                 &directory_label,
@@ -895,11 +924,10 @@ impl Workspace {
                 mode_label
                     .as_ref()
                     .map(|label| (label.text.as_str(), label.family)),
+                context_used,
                 cx,
             )
         });
-        self.views.insert(*agent_id, view.clone());
-        view
     }
 
     #[cfg(test)]
@@ -930,19 +958,7 @@ impl Workspace {
 
     fn update_statuses(&self, cx: &mut Context<Self>) {
         for (agent_id, view) in &self.views {
-            let directory_label = self.working_directory_label(agent_id);
-            let workspace_label = self.registry.workspace_id_label(*agent_id);
-            let mode_label = self.mode_label(agent_id);
-            view.update(cx, |view, cx| {
-                view.set_status(
-                    &directory_label,
-                    workspace_label.as_deref(),
-                    mode_label
-                        .as_ref()
-                        .map(|label| (label.text.as_str(), label.family)),
-                    cx,
-                )
-            });
+            self.refresh_view_status(agent_id, view, cx);
         }
     }
 

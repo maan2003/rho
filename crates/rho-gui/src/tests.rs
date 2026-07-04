@@ -136,6 +136,7 @@ fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
     UiAgentState {
         blocks,
         status: UiAgentStatus::Streaming,
+        context_used: None,
     }
 }
 
@@ -215,6 +216,7 @@ fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
                 }],
             },
             status: None,
+            context_used: None,
         },
     );
     let text = display_text(&workspace, cx);
