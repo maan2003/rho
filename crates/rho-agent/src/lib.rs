@@ -22,6 +22,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::db::{AgentEventPos, AgentId, AgentKind, AgentReadTxnExt, AgentWriteTxnExt, UnixMillis};
 
+pub mod claude;
 pub mod db;
 pub mod system_prompt;
 

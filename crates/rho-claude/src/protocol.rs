@@ -22,9 +22,8 @@ impl Model {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Session {
-    New,
-    Id(Uuid),
-    Resume(Uuid),
+    New { session_id: Uuid },
+    Resume { session_id: Uuid },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]

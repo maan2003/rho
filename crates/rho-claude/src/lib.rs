@@ -1,8 +1,8 @@
-//! Rho's Claude Code integration.
+//! Typed Claude Code protocol support for Rho.
 //!
-//! The Claude Code process protocol is intentionally private to this crate.
-//! Public APIs should expose Rho-facing vocabulary and typed metadata rather
-//! than raw stream-json messages.
+//! This crate deliberately stays at the Claude Code boundary: process
+//! spawning, stream-json messages, and transcript loading. Rho-specific
+//! projection into `rho_core` lives in `rho-agent`.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -12,11 +12,10 @@ use camino::Utf8PathBuf;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-#[allow(dead_code)]
-mod protocol;
+pub mod protocol;
 mod transcript;
 
-pub use protocol::{Model, Session};
+pub use protocol::{ClaudeEvent, Model, Session};
 pub use transcript::*;
 
 const DEFAULT_COMMAND: &str = "claude";
@@ -33,18 +32,17 @@ pub struct ClaudeCodeOptions {
     pub session: Session,
 }
 
-#[allow(dead_code)]
 impl ClaudeCodeOptions {
-    pub fn new(cwd: impl Into<Utf8PathBuf>, model: Model) -> Self {
+    pub fn new(cwd: impl Into<Utf8PathBuf>, model: Model, session_id: uuid::Uuid) -> Self {
         Self {
             command: DEFAULT_COMMAND.into(),
             cwd: cwd.into(),
             model,
-            session: Session::New,
+            session: Session::New { session_id },
         }
     }
 
-    pub(crate) fn args(&self) -> Vec<String> {
+    fn args(&self) -> Vec<String> {
         let mut args = vec![
             "--output-format".to_owned(),
             "stream-json".to_owned(),
@@ -59,12 +57,11 @@ impl ClaudeCodeOptions {
             self.model.as_arg().to_owned(),
         ];
         match &self.session {
-            Session::New => {}
-            Session::Id(session_id) => {
+            Session::New { session_id } => {
                 args.push("--session-id".to_owned());
                 args.push(session_id.to_string());
             }
-            Session::Resume(session_id) => {
+            Session::Resume { session_id } => {
                 args.push("--resume".to_owned());
                 args.push(session_id.to_string());
             }
@@ -72,7 +69,7 @@ impl ClaudeCodeOptions {
         args
     }
 
-    pub(crate) async fn spawn(&self) -> Result<ClaudeSession> {
+    pub async fn spawn(&self) -> Result<ClaudeCode> {
         let mut command = Command::new(self.command.as_std_path());
         command.args(self.args());
         command.current_dir(self.cwd.as_std_path());
@@ -93,7 +90,7 @@ impl ClaudeCodeOptions {
             .stdout
             .take()
             .context("Claude Code stdout was not piped")?;
-        Ok(ClaudeSession {
+        Ok(ClaudeCode {
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout).lines(),
@@ -101,16 +98,14 @@ impl ClaudeCodeOptions {
     }
 }
 
-#[allow(dead_code)]
-pub struct ClaudeSession {
+pub struct ClaudeCode {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
 }
 
-#[allow(dead_code)]
-impl ClaudeSession {
-    pub(crate) async fn send_user_message(&mut self, text: impl Into<String>) -> Result<()> {
+impl ClaudeCode {
+    pub async fn send_user_message(&mut self, text: impl Into<String>) -> Result<()> {
         self.write_message(&protocol::InputMessage::user(text))
             .await
     }
@@ -126,7 +121,7 @@ impl ClaudeSession {
         Ok(())
     }
 
-    pub(crate) async fn next_event(&mut self) -> Result<Option<protocol::ClaudeEvent>> {
+    pub async fn next_event(&mut self) -> Result<Option<ClaudeEvent>> {
         loop {
             let Some(line) = self.stdout.next_line().await? else {
                 return Ok(None);
@@ -176,8 +171,11 @@ mod tests {
 
     #[test]
     fn builds_stream_json_args() {
-        let mut options = ClaudeCodeOptions::new("/tmp/project", Model::Sonnet);
-        options.session = Session::Id(uuid::uuid!("00000000-0000-4000-8000-000000000000"));
+        let options = ClaudeCodeOptions::new(
+            "/tmp/project",
+            Model::Sonnet,
+            uuid::uuid!("00000000-0000-4000-8000-000000000000"),
+        );
 
         assert_eq!(
             options.args(),
