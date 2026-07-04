@@ -11,6 +11,7 @@ pub mod markdown;
 use std::time::Duration;
 
 use gpui::App;
+use rho_ui_proto::MessageDelivery;
 use rho_ui_proto::remote::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 
 use crate::style::StyleClass;
@@ -37,12 +38,20 @@ pub enum BlockKind {
     Response { working: bool },
 }
 
-/// A running tool's live duration position: an empty span marking where the
-/// transcript places the duration inlay it refreshes once per second.
+/// An inlay position: an empty span marking where the transcript places
+/// non-buffer text (a running tool's ticking duration, a queue label).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TimerSpec {
+pub struct InlaySpec {
     pub span_index: usize,
-    pub started_at_ms: u64,
+    pub content: InlayContent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlayContent {
+    /// Refreshed once per second while the tool runs.
+    RunningDuration { started_at_ms: u64 },
+    /// Fixed text, e.g. a queued message's delivery label.
+    Label(&'static str),
 }
 
 #[derive(Debug)]
@@ -51,7 +60,7 @@ pub struct RenderedBlock {
     pub kind: BlockKind,
     /// Index of the span that should carry the user-message gutter accent.
     pub gutter_span: Option<usize>,
-    pub timer: Option<TimerSpec>,
+    pub inlay: Option<InlaySpec>,
 }
 
 impl RenderedBlock {
@@ -69,6 +78,7 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => {
             BlockKind::Response { working: true }
         }
+        UiBlock::QueuedMessage { .. } => BlockKind::User,
     }
 }
 
@@ -99,7 +109,7 @@ pub fn render_block(
     let kind = block_kind(block);
     let mut spans = Vec::new();
     let mut gutter_span = None;
-    let mut timer = None;
+    let mut inlay = None;
     match block {
         UiBlock::UserMessage { text } => {
             if text.is_empty() {
@@ -119,7 +129,7 @@ pub fn render_block(
         UiBlock::Reasoning { .. } => return invisible(kind),
         UiBlock::Tool(tool) => {
             spans.extend(separator(prev, kind));
-            timer = push_tool_spans(&mut spans, tool, now_ms);
+            inlay = push_tool_spans(&mut spans, tool, now_ms);
         }
         UiBlock::Notice { text } => {
             if text.is_empty() {
@@ -132,12 +142,30 @@ pub fn render_block(
             }
             spans.push(Span::new(text, StyleClass::SystemInfo));
         }
+        UiBlock::QueuedMessage { text, delivery } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            gutter_span = Some(spans.len());
+            spans.push(Span::new(text.clone(), StyleClass::UserMessage));
+            let label = match delivery {
+                MessageDelivery::NextRequest => " (steering)",
+                MessageDelivery::NextTurn => " (queued)",
+            };
+            inlay = Some(InlaySpec {
+                span_index: spans.len(),
+                content: InlayContent::Label(label),
+            });
+            spans.push(Span::new("", StyleClass::SystemInfo));
+            spans.push(Span::new("\n\n", StyleClass::Default));
+        }
     }
     RenderedBlock {
         spans,
         kind,
         gutter_span,
-        timer,
+        inlay,
     }
 }
 
@@ -146,7 +174,7 @@ fn invisible(kind: BlockKind) -> RenderedBlock {
         spans: Vec::new(),
         kind,
         gutter_span: None,
-        timer: None,
+        inlay: None,
     }
 }
 
@@ -155,7 +183,7 @@ fn invisible(kind: BlockKind) -> RenderedBlock {
 /// Finished tools render their duration as text. Running tools with a start
 /// timestamp get an empty position span instead: the live duration renders
 /// as an inlay there, so per-second ticks never edit the buffer.
-fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<TimerSpec> {
+fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<InlaySpec> {
     let (label, class) = tool_label(&tool.name, &tool.arguments);
     spans.push(Span::new(label, class));
     spans.push(Span::new(" ", StyleClass::ToolDetail));
@@ -165,9 +193,11 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
     let mut timer = None;
     if tool.status == UiToolStatus::Running {
         if let Some(started_at) = tool.started_at {
-            timer = Some(TimerSpec {
+            timer = Some(InlaySpec {
                 span_index: spans.len(),
-                started_at_ms: started_at.0,
+                content: InlayContent::RunningDuration {
+                    started_at_ms: started_at.0,
+                },
             });
             spans.push(Span::new("", StyleClass::Time));
         }

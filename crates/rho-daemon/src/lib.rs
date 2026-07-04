@@ -11,7 +11,7 @@ use rho_agent::claude::ClaudeAgent;
 use rho_agent::db::{
     AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, Status, TopicId,
 };
-use rho_agent::{Agent, AgentState};
+use rho_agent::{Agent, AgentState, MessageDelivery};
 use rho_core::text_content;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
@@ -431,9 +431,11 @@ impl RunningAgent {
         }
     }
 
-    fn send_user_message(&self, text: String) {
+    fn send_user_message(&self, text: String, delivery: MessageDelivery) {
         match self {
-            Self::Rho(agent) => agent.send_user_message(text),
+            Self::Rho(agent) => agent.send_user_message(text, delivery),
+            // The Claude CLI does its own mid-turn steering; there is no
+            // lane choice to forward.
             Self::Claude(agent) => agent.send_user_message(text),
         }
     }
@@ -533,7 +535,8 @@ async fn handle_message(
             subscribe_agent(agent_id, agent.clone(), outgoing_tx.clone());
             let _ = outgoing_tx.send(ServerMessage::AgentCreated { topic_id, agent_id });
             if let Some(content) = content {
-                agent.send_user_message(text_content(&content));
+                // The agent is fresh, so the lanes are equivalent here.
+                agent.send_user_message(text_content(&content), MessageDelivery::NextRequest);
             }
             Ok(Refresh::Ready)
         }
@@ -553,12 +556,16 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::AgentLoaded { agent_id });
             Ok(Refresh::None)
         }
-        ClientMessage::SendUserMessage { agent_id, content } => {
+        ClientMessage::SendUserMessage {
+            agent_id,
+            content,
+            delivery,
+        } => {
             let agent = agents
                 .get(agent_id)
                 .await
                 .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
-            agent.send_user_message(text_content(&content));
+            agent.send_user_message(text_content(&content), delivery);
             Ok(Refresh::None)
         }
         ClientMessage::MoveAgent { agent_id, topic } => {

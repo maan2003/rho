@@ -12,7 +12,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::remote::{AgentRemoteFrame, UiAgentState, UiBlock};
 use crate::{
-    AgentMode, ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, StartMode, UiTopic,
+    AgentMode, ClientMessage, IoCounters, MessageDelivery, ProtocolLogDirection, ServerMessage,
+    StartMode, UiTopic,
     UiWorkdir, append_protocol_log_record, protocol_frame_bytes, read_frame_counted,
     write_frame_counted,
 };
@@ -367,10 +368,11 @@ impl AgentClient {
         let _ = self.commands.send(ClientMessage::LoadAgent { agent_id });
     }
 
-    pub fn send_user_message(&self, agent_id: AgentId, text: String) {
+    pub fn send_user_message(&self, agent_id: AgentId, text: String, delivery: MessageDelivery) {
         let _ = self.commands.send(ClientMessage::SendUserMessage {
             agent_id,
             content: vec![ContentPart::Text { text }],
+            delivery,
         });
     }
 

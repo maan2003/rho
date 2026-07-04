@@ -13,7 +13,7 @@
 //! the buffer.
 
 mod elisions;
-mod timers;
+mod inlays;
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -26,7 +26,7 @@ use multi_buffer::MultiBuffer;
 use project::InlayId;
 use rho_ui_proto::remote::UiAgentState;
 use text::{Anchor, ToOffset as _};
-use timers::TimerRecord;
+use inlays::InlayRecord;
 
 use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::render::elision::ElisionPlan;
@@ -44,9 +44,9 @@ pub struct TranscriptModel {
     /// in the live-turn region.
     turn_boundary: usize,
     elisions: ElisionSync,
-    // Timer inlay ids share the editor's custom-inlay id space with the
-    // prompt placeholder (id 0), so they start at 1.
-    next_timer_inlay_id: usize,
+    // Custom inlay ids share the editor's id space with the prompt
+    // placeholder (id 0), so they start at 1.
+    next_inlay_id: usize,
 }
 
 struct BlockRecord {
@@ -54,7 +54,7 @@ struct BlockRecord {
     kind: BlockKind,
     visible: bool,
     gutter: Option<Range<Anchor>>,
-    timer: Option<TimerRecord>,
+    inlay: Option<InlayRecord>,
     styles: Vec<(StyleClass, Range<Anchor>)>,
 }
 
@@ -74,7 +74,7 @@ impl TranscriptModel {
             records: Vec::new(),
             turn_boundary: 0,
             elisions: ElisionSync::default(),
-            next_timer_inlay_id: 1,
+            next_inlay_id: 1,
         }
     }
 
@@ -124,7 +124,7 @@ impl TranscriptModel {
                 for (class, _) in &record.styles {
                     changed.insert(*class);
                 }
-                stale_inlays.extend(record.timer.as_ref().and_then(TimerRecord::inlay_id));
+                stale_inlays.extend(record.inlay.as_ref().and_then(InlayRecord::inlay_id));
                 gutters_changed |= record.gutter.is_some();
             }
             let start_offset = removed
@@ -168,7 +168,7 @@ impl TranscriptModel {
 
         self.apply_region_styles(Region::History, &changed_history, cx);
         self.apply_region_styles(Region::LiveTurn, &changed_live, cx);
-        self.refresh_timer_inlays(now_ms, stale_inlays, cx);
+        self.refresh_inlays(now_ms, stale_inlays, cx);
         if gutters_changed {
             self.refresh_gutters(cx);
         }
@@ -181,11 +181,11 @@ impl TranscriptModel {
         if !self.has_timers() {
             return;
         }
-        self.refresh_timer_inlays(now_ms, Vec::new(), cx);
+        self.refresh_inlays(now_ms, Vec::new(), cx);
         cx.notify();
     }
 
-    fn refresh_timer_inlays<V: 'static>(
+    fn refresh_inlays<V: 'static>(
         &mut self,
         now_ms: u64,
         stale: Vec<InlayId>,
@@ -195,16 +195,16 @@ impl TranscriptModel {
             records,
             multi_buffer,
             editor,
-            next_timer_inlay_id,
+            next_inlay_id,
             ..
         } = self;
-        timers::refresh_timer_inlays(
+        inlays::refresh_inlays(
             records
                 .iter_mut()
-                .filter_map(|record| record.timer.as_mut()),
+                .filter_map(|record| record.inlay.as_mut()),
             now_ms,
             stale,
-            next_timer_inlay_id,
+            next_inlay_id,
             multi_buffer,
             editor,
             cx,
@@ -212,7 +212,9 @@ impl TranscriptModel {
     }
 
     pub fn has_timers(&self) -> bool {
-        self.records.iter().any(|record| record.timer.is_some())
+        self.records
+            .iter()
+            .any(|record| record.inlay.as_ref().is_some_and(InlayRecord::ticks))
     }
 
     fn apply_region_styles<V: 'static>(
@@ -331,7 +333,7 @@ fn append_block(
     rendered: RenderedBlock,
 ) -> BlockRecord {
     let start = buffer.len();
-    let (span_ranges, timer, gutter) = append_spans(buffer, cx, &rendered);
+    let (span_ranges, inlay, gutter) = append_spans(buffer, cx, &rendered);
     let styles = rendered
         .spans
         .iter()
@@ -344,21 +346,21 @@ fn append_block(
         kind: rendered.kind,
         visible: rendered.visible(),
         gutter,
-        timer,
+        inlay,
         styles,
     }
 }
 
 /// Appends a rendered block's text at the end of the buffer and returns the
-/// anchor range of each span. The timer span is empty; its position anchors
-/// the running-tool duration inlay.
+/// anchor range of each span. The inlay span is empty; its position anchors
+/// the block's custom inlay (running duration or queue label).
 fn append_spans(
     buffer: &mut Buffer,
     cx: &mut Context<Buffer>,
     rendered: &RenderedBlock,
 ) -> (
     Vec<Range<Anchor>>,
-    Option<TimerRecord>,
+    Option<InlayRecord>,
     Option<Range<Anchor>>,
 ) {
     let start = buffer.len();
@@ -372,14 +374,14 @@ fn append_spans(
     }
 
     let mut ranges = Vec::with_capacity(rendered.spans.len());
-    let mut timer = None;
+    let mut inlay = None;
     let mut gutter = None;
     let mut offset = start;
     for (index, span) in rendered.spans.iter().enumerate() {
         let end = offset + span.text.len();
         let range = buffer.anchor_before(offset)..buffer.anchor_before(end);
-        if let Some(spec) = rendered.timer.filter(|spec| spec.span_index == index) {
-            timer = Some(TimerRecord::new(range.start, spec.started_at_ms));
+        if let Some(spec) = rendered.inlay.filter(|spec| spec.span_index == index) {
+            inlay = Some(InlayRecord::new(range.start, spec.content));
         }
         if rendered.gutter_span == Some(index) {
             let trimmed = span.text.trim_end_matches('\n').len();
@@ -388,5 +390,5 @@ fn append_spans(
         ranges.push(range);
         offset = end;
     }
-    (ranges, timer, gutter)
+    (ranges, inlay, gutter)
 }

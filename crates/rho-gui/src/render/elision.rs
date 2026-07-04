@@ -132,6 +132,7 @@ fn block_is_working(turn: &[UiBlock], offset: usize, tail_open: bool) -> bool {
             }
         },
         UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => true,
+        UiBlock::QueuedMessage { .. } => false,
     }
 }
 

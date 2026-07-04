@@ -22,7 +22,7 @@ use rho_daemon::{DaemonArgs, default_socket_path};
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::client::{AgentClient, Client as UiClient};
 use rho_ui_proto::remote::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
-use rho_ui_proto::{AgentId, IoCounters};
+use rho_ui_proto::{AgentId, IoCounters, MessageDelivery};
 use tokio::task::JoinHandle;
 
 mod completion;
@@ -468,7 +468,7 @@ fn primary_state(states: &HashMap<AgentId, UiAgentState>) -> Option<&UiAgentStat
 
 fn send_prompt(agent: &AgentClient, text: String) {
     if let Some(agent_id) = primary_agent_id(agent) {
-        agent.send_user_message(agent_id, text);
+        agent.send_user_message(agent_id, text, MessageDelivery::NextRequest);
     } else {
         // New agents work where the CLI was launched; the daemon's own cwd
         // is meaningless by design.
@@ -724,6 +724,9 @@ impl ChatTerm {
                 UiBlock::Notice { text } => {
                     self.print_system(text);
                 }
+                UiBlock::QueuedMessage { text, delivery } => {
+                    self.print_system(&format!("{text} {}", delivery_label(*delivery)));
+                }
             }
         }
     }
@@ -952,6 +955,10 @@ impl StreamingRenderer {
             UiBlock::Notice { text } => {
                 self.set_index_block(index, "notice", StyledBlock::new(dim_text(text)));
             }
+            UiBlock::QueuedMessage { text, delivery } => {
+                let queued = format!("{text} {}", delivery_label(*delivery));
+                self.set_index_block(index, "queued", StyledBlock::new(dim_text(&queued)));
+            }
         }
     }
 
@@ -1086,6 +1093,13 @@ fn user_message_block(text: &str) -> StyledBlock {
 
 fn assistant_message_block(text: &str) -> StyledBlock {
     markdown_block(text)
+}
+
+fn delivery_label(delivery: MessageDelivery) -> &'static str {
+    match delivery {
+        MessageDelivery::NextRequest => "(steering)",
+        MessageDelivery::NextTurn => "(queued)",
+    }
 }
 
 fn dim_text(text: &str) -> StyledText {

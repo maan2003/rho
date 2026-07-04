@@ -74,6 +74,7 @@ impl ClaudeAgent {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: system_prompt::prompt(workspace.repo()),
+            queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
         };
         Ok((
@@ -117,6 +118,7 @@ impl ClaudeAgent {
             blocks,
             tool_specs: Arc::from([]),
             system_prompt: system_prompt::prompt(workspace.repo()),
+            queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
         };
         Ok(Self::new(

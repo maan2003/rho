@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rho_agent::{AgentState, AgentStateKind};
+use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
 use rho_core::{
     ApplyPatchMetadata, ContextBlock, InferenceResponseItem, MessagePhase, StreamingContextItem,
     StreamingContextItemState, ToolFileStatus, ToolOutputStatus, ToolResultMetadata, UnixMs,
@@ -87,6 +87,12 @@ impl UiAgentState {
         let mut blocks = ui_blocks(&state.blocks);
         merge_active_tool_state(&mut blocks, &state.kind);
         blocks.extend(in_flight_blocks(&state.kind));
+        blocks.extend(state.queued_messages.iter().map(|message| {
+            UiBlock::QueuedMessage {
+                text: text_content(&message.content),
+                delivery: message.delivery,
+            }
+        }));
         Self {
             blocks,
             status: ui_status(&state.kind),
@@ -109,6 +115,12 @@ pub enum UiBlock {
     Tool(UiTool),
     Notice {
         text: String,
+    },
+    /// A user message waiting in the agent's queue; becomes a `UserMessage`
+    /// block at delivery. Always trails the transcript.
+    QueuedMessage {
+        text: String,
+        delivery: MessageDelivery,
     },
 }
 
@@ -713,6 +725,7 @@ mod tests {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
+            queued_messages: Vec::new(),
             kind: AgentStateKind::ApiStreaming {
                 pending_response: PendingInferenceResponse {
                     items: vec![StreamingContextItemState::Pending(
@@ -748,6 +761,7 @@ mod tests {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
+            queued_messages: Vec::new(),
             kind: AgentStateKind::Error(FailedInferenceResponse {
                 partial_response: PendingInferenceResponse {
                     items: vec![StreamingContextItemState::Pending(
@@ -776,6 +790,7 @@ mod tests {
             })],
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
+            queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
         }
     }
@@ -809,6 +824,7 @@ mod tests {
             ],
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
+            queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
         }
     }
@@ -838,6 +854,7 @@ mod tests {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
+            queued_messages: Vec::new(),
             kind: AgentStateKind::ToolCalling {
                 previews,
                 results: Vec::new(),

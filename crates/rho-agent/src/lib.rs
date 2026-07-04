@@ -16,7 +16,7 @@ use rho_db::RhoDb;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_workspaces::{Repo, Workspace};
-use senax_encoder::{Decode, Encode};
+use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc};
 
 use crate::db::{
@@ -56,7 +56,30 @@ pub struct AgentState {
     pub tool_specs: Arc<[ToolSpec]>,
     /// Invariant: immutable
     pub system_prompt: Arc<str>,
+    /// Messages waiting to enter model context. Not persisted: a queued
+    /// message only becomes an `AgentEvent::UserMessage` at delivery, so the
+    /// event log stays exactly what the model saw. Queued messages are lost
+    /// if the process dies before delivery.
+    pub queued_messages: Vec<QueuedUserMessage>,
     pub kind: AgentStateKind,
+}
+
+/// A user message waiting in the agent's queue.
+#[derive(Clone, Debug, PartialEq)]
+// content is Arc'd because the queue rides AgentState, which is cloned a lot
+pub struct QueuedUserMessage {
+    pub content: Arc<Vec<ContentPart>>,
+    pub delivery: MessageDelivery,
+}
+
+/// When a message sent while the agent is busy enters model context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum MessageDelivery {
+    /// Steer the current turn: delivered at the next inference request, i.e.
+    /// right after the in-flight tool batch commits its results.
+    NextRequest,
+    /// Wait until the current turn finishes, then start a new turn.
+    NextTurn,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -180,6 +203,7 @@ impl Agent {
             blocks: Vec::new(),
             tool_specs: shell_tools.specs().into(),
             system_prompt: system_prompt::prompt(workspace.repo()),
+            queued_messages: Vec::new(),
             kind: AgentStateKind::Idle,
         };
         let agent = Self::new(
@@ -296,6 +320,7 @@ impl Agent {
             blocks,
             tool_specs: shell_tools.specs().into(),
             system_prompt: system_prompt::prompt(workspace.repo()),
+            queued_messages: Vec::new(),
             kind,
         };
         Self::new(
@@ -343,12 +368,16 @@ impl Agent {
         self.state().blocks
     }
 
-    pub fn send_user_message(&self, text: impl Into<String>) {
+    /// Send a message. If the agent is busy it queues and enters model context
+    /// at the point `delivery` names; otherwise it starts a turn immediately.
+    pub fn send_user_message(&self, text: impl Into<String>, delivery: MessageDelivery) {
         let _ = self.control.send(AgentControl::UserMessage {
             content: vec![ContentPart::Text { text: text.into() }],
+            delivery,
         });
     }
 
+    /// Stop the current turn and drop all queued messages.
     pub fn cancel(&self) {
         let _ = self.control.send(AgentControl::Cancel);
     }
@@ -377,7 +406,10 @@ struct AgentPersistence {
 }
 
 enum AgentControl {
-    UserMessage { content: Vec<ContentPart> },
+    UserMessage {
+        content: Vec<ContentPart>,
+        delivery: MessageDelivery,
+    },
     Cancel,
 }
 
@@ -400,17 +432,16 @@ impl AgentLoop {
     /// whatever tools the model calls, feed the results back, and repeat until
     /// it answers without calling tools (→ `Idle`) or the turn fails for good
     /// (→ `Error`). The whole state machine lives in this one loop on purpose.
+    ///
+    /// Messages arriving mid-turn queue instead of interrupting: the
+    /// `NextRequest` lane drains right before each mid-turn inference request,
+    /// the `NextTurn` lane when the turn completes (a non-empty queue then
+    /// starts the next turn instead of going `Idle`). On `Error` the queue is
+    /// held — no automatic retry — until the user sends another message
+    /// (drains everything) or cancels (drops everything).
     async fn run(mut self) {
         loop {
             let mut state = self.state.read().expect("poison").clone();
-            let mut persist_event = async |event: AgentEvent<'_>| {
-                if let Some(persistence) = &mut self.persistence {
-                    let mut write = persistence.db.write().await;
-                    persistence.next_event =
-                        write.append_agent_event(persistence.next_event, &event);
-                    write.commit();
-                }
-            };
 
             tokio::select! {
                 biased;
@@ -419,30 +450,37 @@ impl AgentLoop {
                         return;
                     };
                     match control {
-                        AgentControl::UserMessage { content } => {
-                            self.inference_session.abort();
-                            self.pending_tools.clear();
-
-                            persist_event(AgentEvent::UserMessage {
-                                content: Cow::Borrowed(&content),
-                            })
-                            .await;
-                            state
-                                .blocks
-                                .push(Arc::new(ContextBlock::UserMessage { content }));
-                            self.inference_session.request(InferenceRequest {
-                                instructions: state.system_prompt.clone(),
-                                input: state.blocks.clone(),
-                                tools: Arc::clone(&state.tool_specs),
+                        AgentControl::UserMessage { content, delivery } => {
+                            state.queued_messages.push(QueuedUserMessage {
+                                content: Arc::new(content),
+                                delivery,
                             });
-                            state.kind = AgentStateKind::ApiStreaming {
-                                pending_response: PendingInferenceResponse::default(),
-                                previous_attempt: None,
-                            };
+                            match state.kind {
+                                // Busy: the message waits in the queue for its
+                                // delivery point.
+                                AgentStateKind::ApiStreaming { .. }
+                                | AgentStateKind::ToolCalling { .. } => {}
+                                // No turn in flight: deliver everything now
+                                // (including messages held through an Error).
+                                AgentStateKind::Idle
+                                | AgentStateKind::Error(_)
+                                | AgentStateKind::UnfinishedTurn { .. } => {
+                                    self.inference_session.abort();
+                                    self.pending_tools.clear();
+                                    self.deliver_queued(&mut state, MessageDelivery::NextTurn)
+                                        .await;
+                                    self.send_request(&state);
+                                    state.kind = AgentStateKind::ApiStreaming {
+                                        pending_response: PendingInferenceResponse::default(),
+                                        previous_attempt: None,
+                                    };
+                                }
+                            }
                         }
                         AgentControl::Cancel => {
                             self.inference_session.abort();
                             self.pending_tools.clear();
+                            state.queued_messages.clear();
 
                             state.kind = AgentStateKind::Idle;
                         }
@@ -452,7 +490,7 @@ impl AgentLoop {
                     let AgentStateKind::ApiStreaming {
                         mut pending_response,
                         previous_attempt,
-                    } = state.kind
+                    } = std::mem::replace(&mut state.kind, AgentStateKind::Idle)
                     else {
                         unreachable!("provider streamed outside ApiStreaming");
                     };
@@ -523,7 +561,7 @@ impl AgentLoop {
                                         _ => None,
                                     })
                                     .collect();
-                                persist_event(AgentEvent::InferenceResponse {
+                                self.persist_event(AgentEvent::InferenceResponse {
                                     items: Cow::Borrowed(&items),
                                     provider_response_id: provider_response_id.clone(),
                                 })
@@ -544,7 +582,17 @@ impl AgentLoop {
                                             }
                                         });
                                     }
-                                    state.kind = AgentStateKind::Idle;
+                                    if state.queued_messages.is_empty() {
+                                        state.kind = AgentStateKind::Idle;
+                                    } else {
+                                        self.deliver_queued(&mut state, MessageDelivery::NextTurn)
+                                            .await;
+                                        self.send_request(&state);
+                                        state.kind = AgentStateKind::ApiStreaming {
+                                            pending_response: PendingInferenceResponse::default(),
+                                            previous_attempt: None,
+                                        };
+                                    }
                                 } else {
                                     let mut previews = BTreeMap::new();
                                     for call in calls {
@@ -590,24 +638,21 @@ impl AgentLoop {
                     let AgentStateKind::ToolCalling {
                         mut previews,
                         mut results,
-                    } = state.kind else {
+                    } = std::mem::replace(&mut state.kind, AgentStateKind::Idle) else {
                         unreachable!("tool finished outside ToolCalling");
                     };
                     previews.remove(&result.call_id);
                     results.push(result);
                     if self.pending_tools.is_empty() {
                         for result in &results {
-                            persist_event(AgentEvent::ToolResult {
+                            self.persist_event(AgentEvent::ToolResult {
                                 result: Cow::Borrowed(result),
                             })
                             .await;
                         }
                         state.blocks.push(Arc::new(ContextBlock::ToolResults { results }));
-                        self.inference_session.request(InferenceRequest {
-                            instructions: state.system_prompt.clone(),
-                            input: state.blocks.clone(),
-                            tools: Arc::clone(&state.tool_specs),
-                        });
+                        self.deliver_queued(&mut state, MessageDelivery::NextRequest).await;
+                        self.send_request(&state);
                         state.kind = AgentStateKind::ApiStreaming {
                             pending_response: PendingInferenceResponse::default(),
                             previous_attempt: None,
@@ -620,6 +665,49 @@ impl AgentLoop {
             *self.state.write().expect("poison") = state.clone();
             self.notify.notify_waiters();
         }
+    }
+
+    async fn persist_event(&mut self, event: AgentEvent<'_>) {
+        if let Some(persistence) = &mut self.persistence {
+            let mut write = persistence.db.write().await;
+            persistence.next_event = write.append_agent_event(persistence.next_event, &event);
+            write.commit();
+        }
+    }
+
+    /// Move queued messages into model context at a delivery boundary.
+    /// `boundary` is the point the loop has reached: `NextRequest` (about to
+    /// issue a mid-turn inference request) delivers only the steering lane;
+    /// `NextTurn` (the turn is over) delivers both lanes. Relative order of
+    /// delivered messages is preserved.
+    async fn deliver_queued(&mut self, state: &mut AgentState, boundary: MessageDelivery) {
+        let mut held = Vec::new();
+        for message in std::mem::take(&mut state.queued_messages) {
+            if boundary == MessageDelivery::NextTurn
+                || message.delivery == MessageDelivery::NextRequest
+            {
+                self.persist_event(AgentEvent::UserMessage {
+                    content: Cow::Borrowed(message.content.as_slice()),
+                })
+                .await;
+                let content =
+                    Arc::try_unwrap(message.content).unwrap_or_else(|content| (*content).clone());
+                state
+                    .blocks
+                    .push(Arc::new(ContextBlock::UserMessage { content }));
+            } else {
+                held.push(message);
+            }
+        }
+        state.queued_messages = held;
+    }
+
+    fn send_request(&mut self, state: &AgentState) {
+        self.inference_session.request(InferenceRequest {
+            instructions: state.system_prompt.clone(),
+            input: state.blocks.clone(),
+            tools: Arc::clone(&state.tool_specs),
+        });
     }
 }
 

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
+pub use rho_agent::MessageDelivery;
 pub use rho_agent::db::{
     AgentId, AgentIdDomain, AgentMode, DeepEffort, FableEffort, Status, TopicId, TopicIdDomain,
 };
@@ -83,6 +84,7 @@ pub enum ClientMessage {
     SendUserMessage {
         agent_id: AgentId,
         content: Vec<ContentPart>,
+        delivery: MessageDelivery,
     },
     RenameAgent {
         agent_id: AgentId,

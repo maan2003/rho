@@ -14,7 +14,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
 use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
-use rho_ui_proto::{AgentId, AgentMode, ClientMessage, DeepEffort, FableEffort};
+use rho_ui_proto::{AgentId, AgentMode, ClientMessage, DeepEffort, FableEffort, MessageDelivery};
 use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentView;
@@ -264,6 +264,7 @@ impl Workspace {
         self.connection.send(ClientMessage::SendUserMessage {
             agent_id,
             content: vec![ContentPart::Text { text }],
+            delivery: MessageDelivery::NextRequest,
         });
     }
 
