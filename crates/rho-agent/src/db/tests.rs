@@ -78,7 +78,7 @@ async fn init_agent_tables_stamps_current_db_format() {
         .get(&AGENT_DB_FORMAT_KEY)
         .unwrap()
         .value();
-    assert_eq!(format, current_agent_db_format().to_string());
+    assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
 }
 
 #[tokio::test]
@@ -88,10 +88,9 @@ async fn init_agent_tables_rejects_unsupported_db_format() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
-    write.open_table(FORMAT).insert(
-        &AGENT_DB_FORMAT_KEY,
-        &uuid::uuid!("00000000-0000-4000-8000-000000000000").to_string(),
-    );
+    write
+        .open_table(FORMAT)
+        .insert(&AGENT_DB_FORMAT_KEY, &"deadbeef".to_owned());
     write.init_agent_tables();
 }
 

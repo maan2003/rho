@@ -32,13 +32,11 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
 
-fn current_agent_db_format() -> Uuid {
-    uuid::uuid!("b146bc14-1d6d-4f09-9478-ae30ae71228b")
-}
+const CURRENT_AGENT_DB_FORMAT: &str = "b146bc14";
 
 struct AgentDbMigration {
-    from: Uuid,
-    to: Uuid,
+    from: &'static str,
+    to: &'static str,
     migrate: fn(&mut WriteTxn),
 }
 
@@ -540,17 +538,13 @@ impl AgentWriteTxnExt for WriteTxn {
 }
 
 fn migrate_agent_db_format(write: &mut WriteTxn) {
-    let current = current_agent_db_format();
+    let current = CURRENT_AGENT_DB_FORMAT;
     let mut format = {
         let table = write.open_table(FORMAT);
         table
             .get(&AGENT_DB_FORMAT_KEY)
-            .map(|value| {
-                Uuid::parse_str(&value.value()).unwrap_or_else(|error| {
-                    panic!("invalid agent db format uuid: {error}");
-                })
-            })
-            .unwrap_or(current)
+            .map(|value| value.value())
+            .unwrap_or_else(|| current.to_owned())
     };
 
     while format != current {
@@ -564,12 +558,12 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
             );
         };
         (migration.migrate)(write);
-        format = migration.to;
+        format = migration.to.to_owned();
     }
 
     write
         .open_table(FORMAT)
-        .insert(&AGENT_DB_FORMAT_KEY, &current.to_string());
+        .insert(&AGENT_DB_FORMAT_KEY, &current.to_owned());
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
