@@ -72,12 +72,7 @@ async fn init_agent_tables_stamps_current_db_format() {
     write.init_agent_tables();
     write.commit();
 
-    let format = db
-        .read()
-        .open_table(FORMAT)
-        .get(&AGENT_DB_FORMAT_KEY)
-        .unwrap()
-        .value();
+    let format = db.read().open_table(FORMAT).get(&()).unwrap().value();
     assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
 }
 
@@ -88,9 +83,7 @@ async fn init_agent_tables_rejects_unsupported_db_format() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
-    write
-        .open_table(FORMAT)
-        .insert(&AGENT_DB_FORMAT_KEY, &"deadbeef".to_owned());
+    write.open_table(FORMAT).insert(&(), &"deadbeef".to_owned());
     write.init_agent_tables();
 }
 

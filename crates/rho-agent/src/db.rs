@@ -19,8 +19,7 @@ const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counter
 /// [`PrefixIdDomain::machine_seed`]), generated once at init.
 const MACHINE: TableDefinition<u8, u64> = TableDefinition::new("machine");
 const MACHINE_SEED_KEY: u8 = 0;
-const FORMAT: TableDefinition<u8, String> = TableDefinition::new("format");
-const AGENT_DB_FORMAT_KEY: u8 = 0;
+const FORMAT: TableDefinition<(), String> = TableDefinition::new("format");
 const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentEventPos> =
     TableDefinition::new("lineage_parents");
 const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
@@ -542,7 +541,7 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     let mut format = {
         let table = write.open_table(FORMAT);
         table
-            .get(&AGENT_DB_FORMAT_KEY)
+            .get(&())
             .map(|value| value.value())
             .unwrap_or_else(|| current.to_owned())
     };
@@ -561,9 +560,7 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
         format = migration.to.to_owned();
     }
 
-    write
-        .open_table(FORMAT)
-        .insert(&AGENT_DB_FORMAT_KEY, &current.to_owned());
+    write.open_table(FORMAT).insert(&(), &current.to_owned());
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
