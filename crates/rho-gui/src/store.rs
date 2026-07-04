@@ -44,13 +44,33 @@ pub struct AgentStore {
 impl AgentStore {
     pub fn apply(&mut self, agent_id: AgentId, frame: AgentRemoteFrame) -> FrameSummary {
         let state = self.states.entry(agent_id).or_insert_with(empty_state);
-        let summary = summarize(&frame);
+        let old_status = state.status;
+        let mut summary = summarize(&frame);
         frame.apply_diff(state);
+        // Elision reads the last turn's trailing text differently while the
+        // turn is open, so ending (or reopening) a turn re-renders its last
+        // block even when no block content changed.
+        if turn_open(old_status) != turn_open(state.status) && !state.blocks.is_empty() {
+            summary = summary.merge(FrameSummary {
+                first_changed_block: Some(state.blocks.len() - 1),
+            });
+        }
         summary
     }
 
     pub fn get(&self, agent_id: &AgentId) -> Option<&UiAgentState> {
         self.states.get(agent_id)
+    }
+}
+
+/// Whether the agent is still producing the last turn; while open, its
+/// trailing unlabeled assistant text may yet be followed by tool calls.
+pub fn turn_open(status: UiAgentStatus) -> bool {
+    match status {
+        UiAgentStatus::Streaming
+        | UiAgentStatus::ToolCalling
+        | UiAgentStatus::UnfinishedTurn { .. } => true,
+        UiAgentStatus::Idle | UiAgentStatus::Error => false,
     }
 }
 
@@ -134,6 +154,38 @@ mod tests {
                 first_changed_block: Some(4),
             }
         );
+    }
+
+    #[test]
+    fn closing_the_turn_re_renders_the_last_block() {
+        let mut store = AgentStore::default();
+        let agent = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+        store.apply(
+            agent,
+            AgentRemoteFrame::Snapshot(UiAgentState {
+                blocks: vec![
+                    UiBlock::UserMessage {
+                        text: "go".to_owned(),
+                    },
+                    UiBlock::AssistantMessage {
+                        text: "done".to_owned(),
+                        phase: None,
+                    },
+                ],
+                status: UiAgentStatus::Streaming,
+            }),
+        );
+        let summary = store.apply(
+            agent,
+            AgentRemoteFrame::Diff {
+                blocks: UiBlocksDiff {
+                    truncate_to: None,
+                    updates: Vec::new(),
+                },
+                status: Some(UiAgentStatus::Idle),
+            },
+        );
+        assert_eq!(summary.first_changed_block, Some(1));
     }
 
     #[test]
