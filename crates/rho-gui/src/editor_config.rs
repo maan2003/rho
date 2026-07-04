@@ -13,6 +13,7 @@ pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
     editor.set_show_code_actions(false, cx);
     editor.set_show_runnables(false, cx);
     editor.set_show_breakpoints(false, cx);
+    editor.set_show_bookmarks(false, cx);
     editor.set_show_vertical_scrollbar(false, cx);
     editor.set_show_horizontal_scrollbar(false, cx);
     editor.set_offset_content(false, cx);
