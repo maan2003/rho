@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
@@ -20,6 +21,40 @@ fn test_agent_kind() -> AgentKind {
     AgentKind::Rho {
         prompt_cache_key: PromptCacheKey::generate(),
         config: InferenceConfig::deep().protect(),
+    }
+}
+
+#[test]
+fn agent_db_migrations_eventually_reach_current_format() {
+    let current = CURRENT_AGENT_DB_FORMAT;
+    let mut starts = HashSet::new();
+    for migration in AGENT_DB_MIGRATIONS {
+        assert!(
+            starts.insert(migration.from),
+            "duplicate agent db migration from {}",
+            migration.from
+        );
+    }
+
+    for migration in AGENT_DB_MIGRATIONS {
+        let mut seen = HashSet::new();
+        let mut format = migration.from;
+        while format != current {
+            assert!(
+                seen.insert(format),
+                "agent db migrations cycle before reaching current format: {format}"
+            );
+            let next = AGENT_DB_MIGRATIONS
+                .iter()
+                .find(|candidate| candidate.from == format)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "agent db migration chain from {} stops at {format}",
+                        migration.from
+                    )
+                });
+            format = next.to;
+        }
     }
 }
 
