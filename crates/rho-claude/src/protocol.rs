@@ -150,6 +150,10 @@ pub enum AssistantContent {
     Text {
         text: String,
     },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
     ToolUse {
         id: String,
         name: String,

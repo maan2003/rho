@@ -270,6 +270,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_assistant_thinking_event() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-fable-5",
+                "id": "msg_012GScG8H33PDS5vpbdZ11kY",
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": "CAISvwMKYggPGAIq"
+                }],
+                "stop_reason": null,
+                "usage": {"input_tokens": 2, "output_tokens": 4}
+            },
+            "parent_tool_use_id": null,
+            "session_id": "b1dcda9c-a439-4dd5-b76b-10bec779996c",
+            "uuid": "83f8bc79-9c3f-4271-b834-e81d82fbc319",
+            "request_id": "req_011CcgmqLKAkdDsusvzJDNFY"
+        }))
+        .unwrap();
+
+        let protocol::ClaudeEvent::Assistant(message) = event else {
+            panic!("expected assistant event");
+        };
+        assert!(matches!(
+            &message.message.content[0],
+            protocol::AssistantContent::Thinking { thinking, signature }
+                if thinking.is_empty() && signature.as_deref() == Some("CAISvwMKYggPGAIq")
+        ));
+    }
+
+    #[test]
     fn parses_result_event() {
         let event: protocol::ClaudeEvent = serde_json::from_value(json!({
             "type": "result",
