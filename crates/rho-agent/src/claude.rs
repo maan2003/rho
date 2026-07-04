@@ -3,16 +3,18 @@
 //! `rho-claude` owns the Claude Code protocol. This module owns the projection
 //! from Claude protocol/transcript messages into Rho agent vocabulary.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context as _;
 use async_stream::stream;
 use futures::Stream;
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Model, Session};
 use rho_core::{
-    ContentPart, ContextBlock, InferenceResponseItem, PendingInferenceResponse, ToolCallId,
-    ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, UnixMs,
+    ContentPart, ContextBlock, ContextItemEvent, InferenceResponseItem, PendingInferenceResponse,
+    StreamingContextItem, ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType,
+    UnixMs,
 };
 use rho_db::RhoDb;
 use serde_json::Value;
@@ -24,7 +26,7 @@ use crate::{AgentState, AgentStateKind, FailedInferenceResponse, StartWorkspace,
 
 #[derive(Clone)]
 pub struct ClaudeAgent {
-    state: Arc<std::sync::RwLock<AgentState>>,
+    state: Arc<RwLock<AgentState>>,
     control: mpsc::UnboundedSender<ClaudeControl>,
     notify: Arc<Notify>,
 }
@@ -139,7 +141,7 @@ impl ClaudeAgent {
         state: AgentState,
         start_mode: ClaudeStartMode,
     ) -> Self {
-        let state = Arc::new(std::sync::RwLock::new(state));
+        let state = Arc::new(RwLock::new(state));
         let notify = Arc::new(Notify::new());
         let (control, control_rx) = mpsc::unbounded_channel();
         let loop_state = ClaudeLoop {
@@ -151,6 +153,8 @@ impl ClaudeAgent {
             transcript_path,
             start_mode,
             process: None,
+            pending_response: PendingInferenceResponse::default(),
+            stream_items: BTreeMap::new(),
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
             control_rx,
@@ -213,7 +217,9 @@ struct ClaudeLoop {
     transcript_path: Option<camino::Utf8PathBuf>,
     start_mode: ClaudeStartMode,
     process: Option<ClaudeCode>,
-    state: Arc<std::sync::RwLock<AgentState>>,
+    pending_response: PendingInferenceResponse,
+    stream_items: BTreeMap<usize, ClaudeStreamItem>,
+    state: Arc<RwLock<AgentState>>,
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
 }
@@ -257,12 +263,14 @@ impl ClaudeLoop {
                     self.fail(error);
                     return;
                 }
+                self.pending_response = PendingInferenceResponse::default();
+                self.stream_items.clear();
                 let content = vec![ContentPart::Text { text: text.clone() }];
                 self.push_block(Arc::new(ContextBlock::UserMessage {
                     content: content.clone(),
                 }));
                 self.set_kind(AgentStateKind::ApiStreaming {
-                    pending_response: PendingInferenceResponse::default(),
+                    pending_response: self.pending_response.clone(),
                     previous_attempt: None,
                 });
                 if let Err(error) = self.process.as_mut().unwrap().send_user_message(text).await {
@@ -321,8 +329,11 @@ impl ClaudeLoop {
             rho_claude::ClaudeEvent::Assistant(message) => {
                 match assistant_message_to_block(message) {
                     Ok(block) => {
+                        self.pending_response = PendingInferenceResponse::default();
+                        self.stream_items.clear();
                         self.persist_inference_block(&block).await;
                         self.push_block(block);
+                        self.set_streaming_kind();
                     }
                     Err(error) => self.fail(error),
                 }
@@ -345,7 +356,11 @@ impl ClaudeLoop {
                     });
                 }
             }
-            rho_claude::ClaudeEvent::StreamEvent(_) => {}
+            rho_claude::ClaudeEvent::StreamEvent(event) => {
+                if let Err(error) = self.handle_stream_event(event.event) {
+                    self.fail(error);
+                }
+            }
         }
     }
 
@@ -361,18 +376,168 @@ impl ClaudeLoop {
         self.notify.notify_waiters();
     }
 
+    fn set_streaming_kind(&self) {
+        self.set_kind(AgentStateKind::ApiStreaming {
+            pending_response: self.pending_response.clone(),
+            previous_attempt: None,
+        });
+    }
+
     fn fail(&self, error: anyhow::Error) {
         self.set_kind(AgentStateKind::Error(FailedInferenceResponse {
-            partial_response: PendingInferenceResponse::default(),
+            partial_response: self.pending_response.clone(),
             attempt_count: NonZeroU64::MIN,
             error: Arc::new(error.to_string()),
         }));
+    }
+
+    fn handle_stream_event(
+        &mut self,
+        event: rho_claude::protocol::MessageStreamEvent,
+    ) -> anyhow::Result<()> {
+        match event {
+            rho_claude::protocol::MessageStreamEvent::MessageStart { .. } => {
+                self.pending_response = PendingInferenceResponse::default();
+                self.stream_items.clear();
+                self.set_streaming_kind();
+            }
+            rho_claude::protocol::MessageStreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                let item = ClaudeStreamItem::from_content_block(content_block)?;
+                self.pending_response.apply(
+                    index,
+                    ContextItemEvent::Update(item.to_streaming_context_item()?),
+                );
+                self.stream_items.insert(index, item);
+                self.set_streaming_kind();
+            }
+            rho_claude::protocol::MessageStreamEvent::ContentBlockDelta { index, delta } => {
+                if let Some(item) = self.stream_items.get_mut(&index) {
+                    item.apply_delta(delta)?;
+                    self.pending_response.apply(
+                        index,
+                        ContextItemEvent::Update(item.to_streaming_context_item()?),
+                    );
+                    self.set_streaming_kind();
+                }
+            }
+            rho_claude::protocol::MessageStreamEvent::ContentBlockStop { index } => {
+                self.pending_response.apply(index, ContextItemEvent::Finish);
+                self.set_streaming_kind();
+            }
+            rho_claude::protocol::MessageStreamEvent::Error { error } => {
+                anyhow::bail!(
+                    "{}",
+                    error
+                        .message
+                        .or(error.error_type)
+                        .unwrap_or_else(|| "Claude stream error".to_owned())
+                );
+            }
+            rho_claude::protocol::MessageStreamEvent::MessageDelta { .. }
+            | rho_claude::protocol::MessageStreamEvent::MessageStop
+            | rho_claude::protocol::MessageStreamEvent::Ping => {}
+        }
+        Ok(())
     }
 }
 
 enum ClaudeLoopEvent {
     Control(Option<ClaudeControl>),
     Protocol(anyhow::Result<Option<rho_claude::ClaudeEvent>>),
+}
+
+enum ClaudeStreamItem {
+    Text(String),
+    Thinking(String),
+    ToolUse {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+}
+
+impl ClaudeStreamItem {
+    fn from_content_block(block: rho_claude::protocol::StreamContentBlock) -> anyhow::Result<Self> {
+        Ok(match block {
+            rho_claude::protocol::StreamContentBlock::Text { text } => Self::Text(text),
+            rho_claude::protocol::StreamContentBlock::Thinking { thinking, .. } => {
+                Self::Thinking(thinking)
+            }
+            rho_claude::protocol::StreamContentBlock::ToolUse { id, name, input }
+            | rho_claude::protocol::StreamContentBlock::ServerToolUse { id, name, input } => {
+                Self::ToolUse {
+                    id,
+                    name,
+                    arguments: serde_json::to_string(&input)?,
+                }
+            }
+            rho_claude::protocol::StreamContentBlock::RedactedThinking { data } => {
+                Self::Thinking(data)
+            }
+            rho_claude::protocol::StreamContentBlock::WebSearchToolResult { content, .. } => {
+                Self::Text(serde_json::to_string(&content)?)
+            }
+        })
+    }
+
+    fn apply_delta(
+        &mut self,
+        delta: rho_claude::protocol::ContentBlockDelta,
+    ) -> anyhow::Result<()> {
+        match (self, delta) {
+            (
+                Self::Text(text),
+                rho_claude::protocol::ContentBlockDelta::TextDelta { text: delta },
+            ) => {
+                text.push_str(&delta);
+            }
+            (
+                Self::Thinking(thinking),
+                rho_claude::protocol::ContentBlockDelta::ThinkingDelta { thinking: delta },
+            ) => {
+                thinking.push_str(&delta);
+            }
+            (
+                Self::ToolUse { arguments, .. },
+                rho_claude::protocol::ContentBlockDelta::InputJsonDelta { partial_json },
+            ) => {
+                if arguments == "null" || arguments == "{}" {
+                    arguments.clear();
+                }
+                arguments.push_str(&partial_json);
+            }
+            (_, rho_claude::protocol::ContentBlockDelta::SignatureDelta { .. })
+            | (_, rho_claude::protocol::ContentBlockDelta::CitationsDelta { .. }) => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn to_streaming_context_item(&self) -> anyhow::Result<StreamingContextItem> {
+        Ok(match self {
+            Self::Text(text) => StreamingContextItem::AssistantMessage {
+                content: vec![text.as_str().into()],
+                phase: None,
+            },
+            Self::Thinking(thinking) => StreamingContextItem::RawReasoning {
+                content: thinking.as_str().into(),
+                summary: Vec::new(),
+            },
+            Self::ToolUse {
+                id,
+                name,
+                arguments,
+            } => StreamingContextItem::ToolCall {
+                id: ToolCallId::try_from(id.as_str())?,
+                name: ToolName::try_from(name.as_str())?,
+                tool_type: ToolType::Function,
+                arguments: arguments.as_str().into(),
+            },
+        })
+    }
 }
 
 pub fn transcript_messages_to_context(
