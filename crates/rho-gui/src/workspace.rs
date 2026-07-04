@@ -123,10 +123,12 @@ impl Workspace {
                 workdirs,
                 default_topic_id,
                 machine_seed,
+                agent_counter,
                 workspace_counter,
             } => {
                 let first_ready = !self.connected;
                 self.registry.set_machine_seed(machine_seed);
+                self.registry.set_agent_counter(agent_counter);
                 self.registry.set_workspace_counter(workspace_counter);
                 self.registry.set_topics(topics);
                 self.workdirs = workdirs;

@@ -80,6 +80,7 @@ pub struct AgentClient {
     frames: broadcast::Sender<(AgentId, AgentRemoteFrame)>,
     counters: IoCounters,
     machine_seed: u64,
+    agent_counter: u64,
 }
 
 impl AgentClient {
@@ -108,6 +109,7 @@ impl AgentClient {
             workdirs,
             default_topic_id,
             machine_seed,
+            agent_counter,
             workspace_counter,
         } = read_frame_counted(&mut stream, Some(&client_counters)).await?
         else {
@@ -122,6 +124,7 @@ impl AgentClient {
                     workdirs: workdirs.clone(),
                     default_topic_id,
                     machine_seed,
+                    agent_counter,
                     workspace_counter,
                 },
             );
@@ -170,6 +173,7 @@ impl AgentClient {
                         workdirs,
                         default_topic_id,
                         machine_seed: _,
+                        agent_counter: _,
                         workspace_counter: _,
                     } => {
                         known_agent_ids = topic_agent_ids(&topics);
@@ -244,6 +248,7 @@ impl AgentClient {
             frames: frame_tx,
             counters: client_counters,
             machine_seed,
+            agent_counter,
         })
     }
 
@@ -254,6 +259,10 @@ impl AgentClient {
     /// The daemon database's machine seed, for encoding agent IDs.
     pub fn machine_seed(&self) -> u64 {
         self.machine_seed
+    }
+
+    pub fn agent_counter(&self) -> u64 {
+        self.agent_counter
     }
 
     pub fn blocks(&self) -> Vec<UiBlock> {

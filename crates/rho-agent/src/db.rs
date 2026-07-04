@@ -252,6 +252,7 @@ pub trait AgentReadTxnExt {
     /// This database's random machine seed; present once
     /// [`AgentWriteTxnExt::init_agent_tables`] has run.
     fn machine_seed(&self) -> u64;
+    fn last_agent_counter(&self) -> u64;
     fn last_workspace_counter(&self) -> u64;
     fn get_topic(&self, topic_id: TopicId) -> TopicRecord;
     fn list_topics(&self) -> Vec<(TopicId, TopicRecord)>;
@@ -310,6 +311,13 @@ impl AgentReadTxnExt for ReadTxn {
             .get(&MACHINE_SEED_KEY)
             .expect("machine seed missing; init_agent_tables must run first")
             .value()
+    }
+
+    fn last_agent_counter(&self) -> u64 {
+        self.open_table(COUNTERS)
+            .get(&CounterKey::LAST_AGENT_ID)
+            .map(|counter| counter.value())
+            .unwrap_or(0)
     }
 
     fn last_workspace_counter(&self) -> u64 {
