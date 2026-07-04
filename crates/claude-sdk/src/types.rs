@@ -1,7 +1,9 @@
+use senax_encoder::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Encode, Decode)]
 pub enum Model {
     Opus,
     Sonnet,
@@ -21,8 +23,8 @@ impl Model {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Session {
     New,
-    Id(String),
-    Resume(String),
+    Id(Uuid),
+    Resume(Uuid),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -94,7 +96,7 @@ pub enum ClaudeEvent {
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct AssistantMessage {
-    pub session_id: Option<String>,
+    pub session_id: Option<Uuid>,
     pub message: AssistantConversationMessage,
     pub parent_tool_use_id: Option<String>,
     pub uuid: Option<String>,
@@ -137,7 +139,7 @@ pub enum AssistantContent {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct ResultMessage {
     pub subtype: ResultSubtype,
-    pub session_id: Option<String>,
+    pub session_id: Option<Uuid>,
     #[serde(default)]
     pub is_error: bool,
     pub result: Option<String>,
@@ -160,14 +162,15 @@ pub enum ResultSubtype {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct SystemMessage {
     pub subtype: Option<String>,
-    pub session_id: Option<String>,
+    pub session_id: Option<Uuid>,
     pub uuid: Option<String>,
+    pub transcript_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct StreamEvent {
     pub event: MessageStreamEvent,
-    pub session_id: Option<String>,
+    pub session_id: Option<Uuid>,
     pub uuid: Option<String>,
 }
 
@@ -273,7 +276,7 @@ pub struct StreamError {
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct UserOutputMessage {
-    pub session_id: Option<String>,
+    pub session_id: Option<Uuid>,
     pub message: Option<OutputConversationMessage>,
     pub parent_tool_use_id: Option<String>,
     pub uuid: Option<String>,

@@ -20,7 +20,7 @@ use rho_workspaces::{Repo, Workspace};
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{Notify, mpsc};
 
-use crate::db::{AgentEventPos, AgentId, AgentReadTxnExt, AgentWriteTxnExt, UnixMillis};
+use crate::db::{AgentEventPos, AgentId, AgentKind, AgentReadTxnExt, AgentWriteTxnExt, UnixMillis};
 
 pub mod db;
 pub mod system_prompt;
@@ -163,8 +163,10 @@ impl Agent {
             topic_id,
             display_name,
             workspace.info().clone(),
-            prompt_cache_key,
-            config.clone(),
+            AgentKind::Rho {
+                prompt_cache_key,
+                config: config.clone(),
+            },
         );
         write.commit();
         let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
@@ -275,7 +277,14 @@ impl Agent {
                 completed_tool_calls: completed_tool_calls.into(),
             },
         };
-        let inference_session = InferenceSession::new(auth, record.config, record.prompt_cache_key);
+        let AgentKind::Rho {
+            prompt_cache_key,
+            config,
+        } = record.kind
+        else {
+            panic!("cannot load Claude agent with the Rho agent runtime");
+        };
+        let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             Arc::clone(&workspace),

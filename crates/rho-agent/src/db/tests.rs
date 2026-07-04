@@ -16,6 +16,13 @@ fn test_workspace() -> WorkspaceInfo {
     }
 }
 
+fn test_agent_kind() -> AgentKind {
+    AgentKind::Rho {
+        prompt_cache_key: PromptCacheKey::generate(),
+        config: InferenceConfig::deep().protect(),
+    }
+}
+
 #[tokio::test]
 async fn agent_event_positions_sort_by_lineage_then_seq() {
     let temp = tempfile::tempdir().unwrap();
@@ -71,8 +78,7 @@ async fn create_agent_and_append_events_with_cursor() {
         topic_id,
         Some("main".to_owned()),
         test_workspace(),
-        PromptCacheKey::generate(),
-        InferenceConfig::deep().protect(),
+        test_agent_kind(),
     );
     let next = write.append_agent_event(
         next,
@@ -125,8 +131,7 @@ async fn agent_events_read_lineage_parents() {
         topic_id,
         Some("main".to_owned()),
         test_workspace(),
-        PromptCacheKey::generate(),
-        InferenceConfig::deep().protect(),
+        test_agent_kind(),
     );
     let fork_at = write.append_agent_event(
         next,
@@ -199,8 +204,7 @@ async fn move_agent_to_topic_repoints_membership() {
         default_topic,
         None,
         test_workspace(),
-        PromptCacheKey::generate(),
-        InferenceConfig::deep().protect(),
+        test_agent_kind(),
     );
     write.move_agent_to_topic(agent_id, named_topic);
     write.commit();
@@ -231,8 +235,7 @@ async fn topic_and_agent_statuses_are_settable() {
         topic_id,
         None,
         test_workspace(),
-        PromptCacheKey::generate(),
-        InferenceConfig::deep().protect(),
+        test_agent_kind(),
     );
     write.set_topic_status(UnixMs(2), topic_id, Status::Pinned);
     write.set_topic_name(UnixMs(3), topic_id, "platform".to_owned());
@@ -298,8 +301,7 @@ async fn agent_ids_allocate_before_records_exist() {
         topic_id,
         None,
         test_workspace(),
-        PromptCacheKey::generate(),
-        InferenceConfig::deep().protect(),
+        test_agent_kind(),
     );
     write.commit();
 

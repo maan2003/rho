@@ -13,8 +13,10 @@ use camino::Utf8PathBuf;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+mod transcript;
 mod types;
 
+pub use transcript::*;
 pub use types::*;
 
 const DEFAULT_COMMAND: &str = "claude";
@@ -58,11 +60,11 @@ impl ClaudeCodeOptions {
             Session::New => {}
             Session::Id(session_id) => {
                 args.push("--session-id".to_owned());
-                args.push(session_id.clone());
+                args.push(session_id.to_string());
             }
             Session::Resume(session_id) => {
                 args.push("--resume".to_owned());
-                args.push(session_id.clone());
+                args.push(session_id.to_string());
             }
         }
         args
@@ -170,7 +172,7 @@ mod tests {
     #[test]
     fn builds_stream_json_args() {
         let mut options = ClaudeCodeOptions::new("/tmp/project", Model::Sonnet);
-        options.session = Session::Id("00000000-0000-4000-8000-000000000000".to_owned());
+        options.session = Session::Id(uuid::uuid!("00000000-0000-4000-8000-000000000000"));
 
         assert_eq!(
             options.args(),
@@ -212,7 +214,7 @@ mod tests {
     fn parses_assistant_event() {
         let event: ClaudeEvent = serde_json::from_value(json!({
             "type": "assistant",
-            "session_id": "session-1",
+            "session_id": "00000000-0000-4000-8000-000000000001",
             "message": {
                 "content": [
                     {"type": "text", "text": "hello"},
@@ -226,7 +228,10 @@ mod tests {
         let ClaudeEvent::Assistant(message) = event else {
             panic!("expected assistant event");
         };
-        assert_eq!(message.session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            message.session_id,
+            Some(uuid::uuid!("00000000-0000-4000-8000-000000000001"))
+        );
         assert_eq!(message.text(), "hello world");
         assert!(matches!(
             &message.message.content[1],

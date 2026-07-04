@@ -1467,10 +1467,13 @@ name = "claude-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "camino",
+ "senax-encoder",
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -8232,6 +8235,7 @@ dependencies = [
  "async-stream",
  "bytes",
  "camino",
+ "claude-sdk",
  "futures",
  "prefix-id",
  "rand 0.8.6",
@@ -8246,6 +8250,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

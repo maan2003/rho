@@ -1,7 +1,6 @@
 //! Raw redb schema for persisted agents.
 
 use camino::Utf8PathBuf;
-
 use prefix_id::{PrefixId, PrefixIdDomain};
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
@@ -11,6 +10,7 @@ use rho_inference::PromptCacheKey;
 use rho_inference::config::InferenceProtectedConfig;
 use rho_workspaces::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
+use uuid::Uuid;
 
 use crate::AgentEvent;
 
@@ -169,8 +169,20 @@ pub struct AgentRecord {
     pub updated_at: UnixMillis,
     pub current_lineage: AgentLineageId,
     pub parent_agent: Option<AgentId>,
-    pub prompt_cache_key: PromptCacheKey,
-    pub config: InferenceProtectedConfig,
+    pub kind: AgentKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum AgentKind {
+    Rho {
+        prompt_cache_key: PromptCacheKey,
+        config: InferenceProtectedConfig,
+    },
+    Claude {
+        model: claude_sdk::Model,
+        session_id: Uuid,
+        transcript_path: Option<Utf8PathBuf>,
+    },
 }
 
 pub trait AgentReadTxnExt {
@@ -212,8 +224,7 @@ pub trait AgentWriteTxnExt {
         topic_id: TopicId,
         display_name: Option<String>,
         workspace: WorkspaceInfo,
-        prompt_cache_key: PromptCacheKey,
-        config: InferenceProtectedConfig,
+        kind: AgentKind,
     ) -> AgentEventPos;
 
     /// Re-points the agent's topic membership. Topics are ad-hoc groupings
@@ -423,8 +434,7 @@ impl AgentWriteTxnExt for WriteTxn {
         topic_id: TopicId,
         display_name: Option<String>,
         workspace: WorkspaceInfo,
-        prompt_cache_key: PromptCacheKey,
-        config: InferenceProtectedConfig,
+        kind: AgentKind,
     ) -> AgentEventPos {
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
@@ -436,8 +446,7 @@ impl AgentWriteTxnExt for WriteTxn {
             updated_at: now,
             current_lineage: lineage_id,
             parent_agent: None,
-            prompt_cache_key,
-            config,
+            kind,
         };
         self.open_table(AGENTS)
             .insert(&agent_id, SenValue::borrowed(&agent));

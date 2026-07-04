@@ -1,5 +1,6 @@
-use camino::Utf8Path;
 use std::sync::Arc;
+
+use camino::Utf8Path;
 
 pub fn prompt(working_directory: &Utf8Path) -> Arc<str> {
     format!(
