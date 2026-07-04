@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -26,6 +27,7 @@ use rho_ui_proto::{AgentId, IoCounters, MessageDelivery};
 use tokio::task::JoinHandle;
 
 mod completion;
+mod land;
 mod markdown;
 mod tool_render;
 
@@ -71,6 +73,7 @@ async fn run(command: Command) -> Result<()> {
             rho_daemon::debug::run(args).await?;
             Ok(())
         }
+        Command::Land(args) => land::run(args).await,
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
             rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
@@ -121,7 +124,8 @@ async fn run_prompt_stdin(args: ChatArgs) -> Result<()> {
 async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Result<AgentClient> {
     let socket_path = default_socket_path()?;
     let client =
-        AgentClient::connect_client(connect_or_start_daemon(&socket_path, args).await?).await?;
+        AgentClient::connect_client(connect_or_start_daemon(&socket_path, &args.auth).await?)
+            .await?;
     if renderer.is_some() {
         let changes = client.subscribe();
         tokio::spawn(async move {
@@ -141,9 +145,9 @@ async fn build_agent(args: &ChatArgs, renderer: Option<UpdateRenderer>) -> Resul
     Ok(client)
 }
 
-async fn connect_or_start_daemon(
+pub(crate) async fn connect_or_start_daemon(
     socket_path: &std::path::Path,
-    args: &ChatArgs,
+    auth: &str,
 ) -> Result<UiClient> {
     if let Ok(client) = UiClient::connect(socket_path).await {
         return Ok(client);
@@ -153,7 +157,7 @@ async fn connect_or_start_daemon(
     std::process::Command::new(exe)
         .arg("daemon")
         .arg("--auth")
-        .arg(&args.auth)
+        .arg(auth)
         .arg("--socket-path")
         .arg(socket_path)
         .arg("--die-on-detached")
@@ -1069,6 +1073,7 @@ enum Command {
     Auth(AuthArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
+    Land(LandArgs),
     ProtocolLog(ProtocolLogArgs),
 }
 
@@ -1090,6 +1095,7 @@ enum CliCommand {
     },
     Daemon(DaemonArgs),
     Debug(DebugArgs),
+    Land(LandArgs),
     ProtocolLog(ProtocolLogArgs),
 }
 
@@ -1099,6 +1105,17 @@ struct ChatArgs {
     auth: String,
     #[arg(long = "prompt-stdin")]
     prompt_stdin: bool,
+}
+
+#[derive(Clone, clap::Args)]
+pub(crate) struct LandArgs {
+    #[arg(long = "auth", default_value = "default")]
+    auth: String,
+    /// Checkout path to land from (defaults to the current directory).
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
 }
 
 #[derive(Clone, clap::Args)]
@@ -1117,6 +1134,7 @@ impl Args {
             Some(CliCommand::Auth { command }) => Command::Auth(command),
             Some(CliCommand::Daemon(args)) => Command::Daemon(args),
             Some(CliCommand::Debug(args)) => Command::Debug(args),
+            Some(CliCommand::Land(args)) => Command::Land(args),
             Some(CliCommand::ProtocolLog(args)) => Command::ProtocolLog(args),
             None => Command::Chat(cli.chat),
         };

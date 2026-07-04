@@ -1,0 +1,22 @@
+# Vendored from selfci v0.5.0 (rad:z2tDzYbAXxTQEKTGFVwiJPajkbeDU.git via
+# radicle.dpc.pw). selfci is MPL-2.0; the vendored files keep that license,
+# so this crate is MPL-2.0 unlike the rest of the workspace.
+[package]
+name = "rho-ci"
+version = "0.1.0"
+edition.workspace = true
+license = "MPL-2.0"
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "selfci"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tempfile.workspace = true
+tracing.workspace = true

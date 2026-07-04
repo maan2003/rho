@@ -135,6 +135,16 @@ pub enum ClientMessage {
     WorkdirRemove {
         path: Utf8PathBuf,
     },
+    AcquireLandLease {
+        repo: Utf8PathBuf,
+    },
+    LandStatus {
+        repo: Utf8PathBuf,
+        status: LandStatus,
+    },
+    ReleaseLandLease {
+        repo: Utf8PathBuf,
+    },
 }
 
 /// Where a new agent works. Each mode carries exactly the data it needs:
@@ -168,6 +178,16 @@ pub enum JoinTarget {
 pub enum TopicTarget {
     Existing(TopicId),
     Named(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum LandStatus {
+    Queued,
+    Preparing,
+    Checking,
+    Publishing,
+    Landed,
+    Bounced,
 }
 
 /// Message sent from the rho daemon to a UI client.
@@ -210,6 +230,13 @@ pub enum ServerMessage {
     },
     TurnCancelled {
         agent_id: AgentId,
+    },
+    LandLeaseGranted {
+        repo: Utf8PathBuf,
+    },
+    LandStatus {
+        repo: Utf8PathBuf,
+        status: LandStatus,
     },
 }
 

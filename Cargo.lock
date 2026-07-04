@@ -8316,6 +8316,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-ci"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ciborium",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "rho-claude"
 version = "0.1.0"
 dependencies = [
@@ -8340,6 +8352,7 @@ dependencies = [
  "dirs",
  "futures",
  "rho-agent",
+ "rho-ci",
  "rho-cli-term-raw",
  "rho-commands",
  "rho-core",
@@ -8348,6 +8361,7 @@ dependencies = [
  "rho-inference",
  "rho-tool-shell",
  "rho-ui-proto",
+ "rho-workspaces",
  "serde_json",
  "tokio",
  "tracing",

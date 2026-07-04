@@ -4,6 +4,7 @@ members = [
   "crates/prefix-id",
   "crates/rho-agent",
   "crates/rho-blocking-notify-channel",
+  "crates/rho-ci",
   "crates/rho-claude",
   "crates/rho-cli",
   "crates/rho-cli-term-raw",
@@ -37,6 +38,7 @@ base64 = "0.22"
 bon = { version = "3", default-features = false }
 bytes = "1"
 camino = "1"
+ciborium = "0.2"
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", default-features = false, features = [
   "bracketed-paste",
@@ -53,6 +55,7 @@ redb = "4.1.0"
 rho-agent = { path = "crates/rho-agent" }
 rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
 rho-claude = { path = "crates/rho-claude" }
+rho-ci = { path = "crates/rho-ci" }
 rho-cli = { path = "crates/rho-cli" }
 rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
 rho-commands = { path = "crates/rho-commands" }
@@ -68,6 +71,7 @@ senax-encoder = { path = "crates/senax-encoder" }
 senax-encoder-derive = { path = "crates/senax-encoder/derive" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 sha2 = "0.10"
 tempfile = { version = "3", default-features = false }
 tokio = { version = "1", features = [

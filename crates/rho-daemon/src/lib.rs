@@ -18,11 +18,11 @@ use rho_inference::InferenceAuth;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, JoinTarget, ServerMessage, StartMode, UiAgentSummary, UiTopic, UiWorkdir,
-    read_frame_counted, write_frame_counted,
+    ClientMessage, JoinTarget, LandStatus, ServerMessage, StartMode, UiAgentSummary, UiTopic,
+    UiWorkdir, read_frame_counted, write_frame_counted,
 };
 use rho_workspaces::{Repo, WorkspaceInfo};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, mpsc};
 
 pub mod debug;
 
@@ -120,6 +120,8 @@ struct AgentRegistry {
     /// Agents with a title generation in flight, so a burst of messages to an
     /// untitled agent starts at most one task.
     title_tasks: Mutex<HashSet<AgentId>>,
+    land_locks: Mutex<HashMap<Utf8PathBuf, Arc<TokioMutex<()>>>>,
+    land_statuses: Mutex<HashMap<Utf8PathBuf, LandStatus>>,
 }
 
 impl AgentRegistry {
@@ -156,6 +158,8 @@ impl AgentRegistry {
             agents: Mutex::new(HashMap::new()),
             repos: Mutex::new(HashMap::new()),
             title_tasks: Mutex::new(HashSet::new()),
+            land_locks: Mutex::new(HashMap::new()),
+            land_statuses: Mutex::new(HashMap::new()),
         };
         registry.load_non_archived_agents().await;
         registry
@@ -256,6 +260,26 @@ impl AgentRegistry {
 
     async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
         self.agents.lock().await.get(&agent_id).cloned()
+    }
+
+    async fn acquire_land_lease(&self, repo: Utf8PathBuf) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.land_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(repo.clone())
+                    .or_insert_with(|| Arc::new(TokioMutex::new(()))),
+            )
+        };
+        self.land_statuses
+            .lock()
+            .await
+            .insert(repo, LandStatus::Queued);
+        lock.lock_owned().await
+    }
+
+    async fn set_land_status(&self, repo: Utf8PathBuf, status: LandStatus) {
+        self.land_statuses.lock().await.insert(repo, status);
     }
 
     async fn create_topic(&self, name: String) -> UiTopic {
@@ -620,9 +644,10 @@ async fn serve_connection(
     }
 
     let mut reader = reader;
+    let mut land_leases: Vec<(Utf8PathBuf, OwnedMutexGuard<()>)> = Vec::new();
     loop {
         let message = read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await?;
-        match handle_message(&agents, &outgoing_tx, message).await {
+        match handle_message(&agents, &outgoing_tx, &mut land_leases, message).await {
             Ok(Refresh::Ready) => {
                 let _ = outgoing_tx.send(agents.ready_message());
             }
@@ -648,6 +673,7 @@ enum Refresh {
 async fn handle_message(
     agents: &Arc<AgentRegistry>,
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
+    land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
     match message {
@@ -687,6 +713,26 @@ async fn handle_message(
         ClientMessage::WorkdirRemove { path } => {
             agents.remove_workdir(path).await?;
             Ok(Refresh::Ready)
+        }
+        ClientMessage::AcquireLandLease { repo } => {
+            let lease = agents.acquire_land_lease(repo.clone()).await;
+            land_leases.push((repo.clone(), lease));
+            let _ = outgoing_tx.send(ServerMessage::LandLeaseGranted { repo });
+            Ok(Refresh::None)
+        }
+        ClientMessage::LandStatus { repo, status } => {
+            agents.set_land_status(repo.clone(), status.clone()).await;
+            let _ = outgoing_tx.send(ServerMessage::LandStatus { repo, status });
+            Ok(Refresh::None)
+        }
+        ClientMessage::ReleaseLandLease { repo } => {
+            if let Some(index) = land_leases
+                .iter()
+                .position(|(leased_repo, _)| *leased_repo == repo)
+            {
+                land_leases.swap_remove(index);
+            }
+            Ok(Refresh::None)
         }
         ClientMessage::LoadAgent { agent_id } => {
             let (agent_id, agent, loaded_now) = agents.load(agent_id).await?;

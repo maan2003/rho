@@ -146,7 +146,9 @@ async fn run(
             ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame { agent_id, frame }),
             ServerMessage::TurnCancelled { agent_id } => Some(ConnEvent::TurnCancelled(agent_id)),
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
-            ServerMessage::Pong => None,
+            ServerMessage::Pong
+            | ServerMessage::LandLeaseGranted { .. }
+            | ServerMessage::LandStatus { .. } => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()

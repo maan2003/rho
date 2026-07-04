@@ -216,7 +216,10 @@ impl AgentClient {
                             }
                         }
                     }
-                    ServerMessage::Pong | ServerMessage::TurnCancelled { .. } => {}
+                    ServerMessage::Pong
+                    | ServerMessage::TurnCancelled { .. }
+                    | ServerMessage::LandLeaseGranted { .. }
+                    | ServerMessage::LandStatus { .. } => {}
                 }
             }
         });

@@ -61,7 +61,7 @@ fn colon_completion_lists_matching_commands() {
             .iter()
             .map(|candidate| candidate.label.as_str())
             .collect::<Vec<_>>(),
-        ["cancel", "clear"]
+        ["cancel", "continue", "clear"]
     );
 }
 
