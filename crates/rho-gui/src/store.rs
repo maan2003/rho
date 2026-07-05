@@ -47,9 +47,9 @@ impl AgentStore {
         let old_status = state.status;
         let mut summary = summarize(&frame);
         frame.apply_diff(state);
-        // Elision reads the last turn's trailing text differently while the
-        // turn is open, so ending (or reopening) a turn re-renders its last
-        // block even when no block content changed.
+        // Elision gives the last fold in an open turn a limited visible tail,
+        // so ending (or reopening) a turn re-renders its last block even when
+        // no block content changed.
         if turn_open(old_status) != turn_open(state.status) && !state.blocks.is_empty() {
             summary = summary.merge(FrameSummary {
                 first_changed_block: Some(state.blocks.len() - 1),
@@ -63,8 +63,8 @@ impl AgentStore {
     }
 }
 
-/// Whether the agent is still producing the last turn; while open, its
-/// trailing unlabeled assistant text may yet be followed by tool calls.
+/// Whether the agent is still producing the last turn; while open, the final
+/// working fold keeps a limited visible tail.
 pub fn turn_open(status: UiAgentStatus) -> bool {
     match status {
         UiAgentStatus::Streaming

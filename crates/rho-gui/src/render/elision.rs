@@ -29,8 +29,9 @@ pub struct ElisionPlan {
 /// boundary (its end is the last visible block before `from_block`); it is
 /// extended or flushed exactly as a full recomputation would.
 ///
-/// `turn_in_progress` says the last turn is still being produced; open turns
-/// keep a limited visible tail in their folds instead of collapsing fully.
+/// `turn_in_progress` says the last turn is still being produced; the last
+/// fold in that open turn keeps a limited visible tail instead of collapsing
+/// fully.
 pub fn elision_plans_from(
     blocks: &[UiBlock],
     visible: &[bool],
@@ -40,6 +41,7 @@ pub fn elision_plans_from(
 ) -> Vec<ElisionPlan> {
     let mut plans = Vec::new();
     let mut current: Option<ElisionPlan> = carry;
+    let mut open_turn_start = None;
 
     let mut turn_start = from_block;
     while turn_start < blocks.len() {
@@ -50,12 +52,15 @@ pub fn elision_plans_from(
             .unwrap_or(blocks.len());
         let turn = &blocks[turn_start..turn_end];
         let tail_open = turn_in_progress && turn_end == blocks.len();
+        if tail_open {
+            open_turn_start = Some(turn_start);
+        }
         let has_non_working = (0..turn.len())
             .any(|offset| !is_user(&turn[offset]) && !block_is_working(&turn[offset]));
-        let tail_rows = if tail_open || !has_non_working {
-            LIMITED_TAIL_ROWS
-        } else {
+        let tail_rows = if has_non_working {
             0
+        } else {
+            LIMITED_TAIL_ROWS
         };
 
         for offset in 0..turn.len() {
@@ -90,6 +95,14 @@ pub fn elision_plans_from(
     }
 
     plans.extend(current);
+    if let Some(open_turn_start) = open_turn_start
+        && let Some(plan) = plans
+            .iter_mut()
+            .rev()
+            .find(|plan| plan.end_block >= open_turn_start)
+    {
+        plan.tail_rows = LIMITED_TAIL_ROWS;
+    }
     plans
 }
 
@@ -317,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn open_turn_only_keeps_the_last_turn_tail_limited() {
+    fn open_turn_only_keeps_the_last_elision_tail_limited() {
         let blocks = vec![
             user("one"),
             unlabeled("done"),
@@ -345,6 +358,35 @@ mod tests {
                 tool_count: 1,
                 tail_rows: 0,
             }]
+        );
+    }
+
+    #[test]
+    fn open_turn_collapses_earlier_elisions_in_the_last_turn() {
+        let blocks = vec![
+            user("go"),
+            tool("a"),
+            unlabeled("final"),
+            tool("b"),
+            unlabeled("streaming..."),
+        ];
+        let plans = elision_plans_from(&blocks, &all_visible(&blocks), 0, None, true);
+        assert_eq!(
+            plans,
+            vec![
+                ElisionPlan {
+                    start_block: 1,
+                    end_block: 1,
+                    tool_count: 1,
+                    tail_rows: 0,
+                },
+                ElisionPlan {
+                    start_block: 3,
+                    end_block: 3,
+                    tool_count: 1,
+                    tail_rows: LIMITED_TAIL_ROWS,
+                }
+            ]
         );
     }
 
