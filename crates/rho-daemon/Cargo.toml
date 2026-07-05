@@ -34,7 +34,12 @@ rho-workspaces.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rho-zed-host.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+prost = "0.9"
+rpc = { git = "https://github.com/maan2003/zed", branch = "rho" }

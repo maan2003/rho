@@ -21,7 +21,7 @@ use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
     McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
-    UiTopic, read_frame_counted, write_frame_counted,
+    UiTopic, WorkspaceInfo, read_frame_counted, write_frame, write_frame_counted,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc};
 
@@ -498,6 +498,10 @@ struct AgentRegistry {
     events: broadcast::Sender<ServerMessage>,
     /// Enrollment/trust for iroh clients; `None` unless `--iroh` is set.
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
+    /// The in-process zed host (headless gpui thread), spawned lazily on the
+    /// first channel open so daemons that never serve an editing client
+    /// never start it.
+    zed_host: std::sync::OnceLock<rho_zed_host::ZedHost>,
 }
 
 impl AgentRegistry {
@@ -549,6 +553,7 @@ impl AgentRegistry {
             platform_secrets,
             events: broadcast::channel(1024).0,
             iroh_auth,
+            zed_host: std::sync::OnceLock::new(),
         };
         registry.pool.load_non_hidden_agents().await;
         Ok(registry)
@@ -602,6 +607,10 @@ impl AgentRegistry {
             agent_id,
             attention: attention_level(kind.as_ref(), disposition),
         });
+    }
+
+    fn zed_host(&self) -> &rho_zed_host::ZedHost {
+        self.zed_host.get_or_init(rho_zed_host::ZedHost::spawn)
     }
 
     fn topics(&self, kinds: &HashMap<AgentId, AgentStateKind>) -> Vec<UiTopic> {
@@ -1140,6 +1149,16 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // The first client frame chooses the stream's protocol: `ChannelOpen`
+    // dedicates the whole stream to one zed channel, anything else starts a
+    // normal UI session (every UI client speaks first — Subscribe or a
+    // command — so waiting here never deadlocks).
+    let mut reader = reader;
+    let first = read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await?;
+    if let ClientMessage::ChannelOpen { workspace } = first {
+        return serve_zed_channel(agents, reader, writer, workspace).await;
+    }
+
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let writer_counters = counters.clone();
     tokio::spawn(async move {
@@ -1197,7 +1216,6 @@ where
         });
     }
 
-    let mut reader = reader;
     // Daemon-wide events fan out to every client, not just the connection
     // whose action produced them; aborted on disconnect so the writer channel
     // can close.
@@ -1221,9 +1239,13 @@ where
     // The voice session (at most one) is owned by this connection: dropping
     // the handle on disconnect ends the session task.
     let mut voice: Option<voice::VoiceHandle> = None;
+    let mut first = Some(first);
     let result = loop {
-        let message =
-            match read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await {
+        let message = match first.take() {
+            Some(message) => message,
+            None => match read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters))
+                .await
+            {
                 Ok(message) => message,
                 Err(error) => {
                     for (repo, _) in &land_leases {
@@ -1231,7 +1253,8 @@ where
                     }
                     break Err(error);
                 }
-            };
+            },
+        };
         match voice::handle_client_message(&agents, &outgoing_tx, &mut voice, &message) {
             Ok(true) => continue,
             Ok(false) => {}
@@ -1828,9 +1851,77 @@ async fn handle_message(
         | ClientMessage::VoiceStop
         | ClientMessage::VoiceAudio { .. }
         | ClientMessage::VoiceFocus { .. } => Ok(Refresh::None),
+        // Only valid as a stream's first frame (see `serve_connection_io`);
+        // inside a UI session it is a protocol error.
+        ClientMessage::ChannelOpen { .. } => {
+            anyhow::bail!("ChannelOpen must be the first frame on a dedicated stream")
+        }
     }
 }
 
+/// Serves a stream dedicated to one zed channel: binds a headless project
+/// session, replies `ChannelOpened { root }`, then pumps raw envelope frames
+/// both ways until either side closes. Stream teardown is session teardown.
+async fn serve_zed_channel<R, W>(
+    agents: Arc<AgentRegistry>,
+    mut reader: R,
+    mut writer: W,
+    workspace: WorkspaceInfo,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let workspace = match agents.pool.open_workspace(&workspace).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            let _ = write_frame(
+                &mut writer,
+                &ServerMessage::ChannelClosed {
+                    reason: format!("{error:#}"),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let root = workspace.slot().to_owned();
+
+    let (to_host_tx, to_host_rx) = futures::channel::mpsc::unbounded();
+    let (from_host_tx, mut from_host_rx) = futures::channel::mpsc::unbounded();
+    let session_id = agents.zed_host().open_session(rho_zed_host::SessionStreams {
+        incoming: to_host_rx,
+        outgoing: from_host_tx,
+    });
+
+    write_frame(&mut writer, &ServerMessage::ChannelOpened { root }).await?;
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(payload) = from_host_rx.next().await {
+            if rho_ui_proto::write_raw_frame(&mut writer, &payload)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let result = loop {
+        match rho_ui_proto::read_raw_frame(&mut reader).await {
+            Ok(Some(payload)) => {
+                if to_host_tx.unbounded_send(payload).is_err() {
+                    break Ok(());
+                }
+            }
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
+        }
+    };
+    agents.zed_host().close_session(session_id);
+    writer_task.abort();
+    result
+}
 fn subscribe_agent(
     agent_id: AgentId,
     agent: RunningAgent,

@@ -250,6 +250,9 @@ impl AgentClient {
                     | ServerMessage::IrohApproved { .. }
                     | ServerMessage::IrohRevoked { .. }
                     | ServerMessage::PrCommandResult { .. } => {}
+                    // Zed channel handshake replies only appear on dedicated
+                    // channel streams, never in a UI session.
+                    ServerMessage::ChannelOpened { .. } | ServerMessage::ChannelClosed { .. } => {}
                 }
             }
         });

@@ -29,6 +29,7 @@ members = [
   "crates/rho-voice",
   "crates/rho-webui-messages",
   "crates/rho-workspaces",
+  "crates/rho-zed-host",
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
 ]
@@ -71,6 +72,7 @@ octo-server = { path = "crates/octo-server" }
 octo-types = { path = "crates/octo-types" }
 pprof = { path = "crates/pprof", default-features = false }
 prefix-id = { path = "crates/prefix-id", default-features = false }
+rho-zed-host = { path = "crates/rho-zed-host" }
 rand = "0.8"
 redb = "4.1.0"
 redb-derive = "0.1.0"
@@ -149,3 +151,39 @@ lto = "off"
 [profile.profiling]
 debug = "line-tables-only"
 inherits = "release"
+
+# Temporary: build zed crates from the local fork checkout while rho-zed-host
+# work is in flight. Remove once the fork changes are pushed to the `rho`
+# branch on github and the git dep is bumped.
+[patch."https://github.com/maan2003/zed"]
+askpass = { path = "/home/maan2003/src/zed/crates/askpass" }
+assets = { path = "/home/maan2003/src/zed/crates/assets" }
+client = { path = "/home/maan2003/src/zed/crates/client" }
+clock = { path = "/home/maan2003/src/zed/crates/clock" }
+collections = { path = "/home/maan2003/src/zed/crates/collections" }
+command_palette = { path = "/home/maan2003/src/zed/crates/command_palette" }
+editor = { path = "/home/maan2003/src/zed/crates/editor" }
+extension = { path = "/home/maan2003/src/zed/crates/extension" }
+fs = { path = "/home/maan2003/src/zed/crates/fs" }
+gpui = { path = "/home/maan2003/src/zed/crates/gpui" }
+gpui_platform = { path = "/home/maan2003/src/zed/crates/gpui_platform" }
+gpui_tokio = { path = "/home/maan2003/src/zed/crates/gpui_tokio" }
+http_client = { path = "/home/maan2003/src/zed/crates/http_client" }
+language = { path = "/home/maan2003/src/zed/crates/language" }
+multi_buffer = { path = "/home/maan2003/src/zed/crates/multi_buffer" }
+node_runtime = { path = "/home/maan2003/src/zed/crates/node_runtime" }
+project = { path = "/home/maan2003/src/zed/crates/project" }
+release_channel = { path = "/home/maan2003/src/zed/crates/release_channel" }
+remote = { path = "/home/maan2003/src/zed/crates/remote" }
+remote_server = { path = "/home/maan2003/src/zed/crates/remote_server" }
+rpc = { path = "/home/maan2003/src/zed/crates/rpc" }
+search = { path = "/home/maan2003/src/zed/crates/search" }
+settings = { path = "/home/maan2003/src/zed/crates/settings" }
+text = { path = "/home/maan2003/src/zed/crates/text" }
+theme = { path = "/home/maan2003/src/zed/crates/theme" }
+theme_settings = { path = "/home/maan2003/src/zed/crates/theme_settings" }
+ui = { path = "/home/maan2003/src/zed/crates/ui" }
+util = { path = "/home/maan2003/src/zed/crates/util" }
+vim = { path = "/home/maan2003/src/zed/crates/vim" }
+worktree = { path = "/home/maan2003/src/zed/crates/worktree" }
+

@@ -878,6 +878,38 @@ impl Workspace {
                 }
             }
             Command::VoiceToggle => self.toggle_voice(cx),
+            Command::Open { path } => {
+                let target = source_agent.or_else(|| self.registry.selected_agent().copied());
+                let Some(agent_id) = target else {
+                    self.notice_on(None, ":open: no agent selected", StyleClass::SystemInfo, cx);
+                    return;
+                };
+                let Some(workspace) = self.registry.agent_workspace(agent_id).cloned() else {
+                    self.notice_on(
+                        None,
+                        ":open: agent has no workspace",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                };
+                let task =
+                    crate::zed_remote::open_file_window(&self.connection, workspace, path, cx);
+                cx.spawn(async move |this, cx| {
+                    if let Err(error) = task.await {
+                        let _ = this.update(cx, |this, cx| {
+                            this.notice_on(
+                                None,
+                                &format!(":open failed: {error:#}"),
+                                StyleClass::SystemInfo,
+                                cx,
+                            );
+                        });
+                    }
+                })
+                .detach();
+            }
+
             Command::Quit => cx.quit(),
             Command::Help => {
                 let help = rho_commands::COMMANDS

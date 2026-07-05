@@ -13,12 +13,18 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+askpass = { git = "https://github.com/maan2003/zed", branch = "rho" }
 assets = { git = "https://github.com/maan2003/zed", branch = "rho" }
+async-trait = "0.1"
 camino.workspace = true
 clap.workspace = true
+client = { git = "https://github.com/maan2003/zed", branch = "rho" }
+clock = { git = "https://github.com/maan2003/zed", branch = "rho" }
+collections = { git = "https://github.com/maan2003/zed", branch = "rho" }
 command_palette = { git = "https://github.com/maan2003/zed", branch = "rho" }
 dirs.workspace = true
 editor = { git = "https://github.com/maan2003/zed", branch = "rho" }
+fs = { git = "https://github.com/maan2003/zed", branch = "rho" }
 futures.workspace = true
 iroh = { workspace = true, features = ["tls-ring"] }
 gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
@@ -29,12 +35,16 @@ gpui_platform = { git = "https://github.com/maan2003/zed", branch = "rho", defau
   "wayland",
 ] }
 gpui_tokio = { git = "https://github.com/maan2003/zed", branch = "rho" }
+http_client = { git = "https://github.com/maan2003/zed", branch = "rho" }
 json-stream.workspace = true
 language = { git = "https://github.com/maan2003/zed", branch = "rho" }
 multi_buffer = { git = "https://github.com/maan2003/zed", branch = "rho" }
 prefix-id = { workspace = true, features = ["redb"] }
+node_runtime = { git = "https://github.com/maan2003/zed", branch = "rho" }
 project = { git = "https://github.com/maan2003/zed", branch = "rho" }
+prost = "0.9"
 release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
+remote = { git = "https://github.com/maan2003/zed", branch = "rho" }
 rho-commands.workspace = true
 rho-core.workspace = true
 rho-daemon.workspace = true
@@ -48,6 +58,7 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
   "recording",
   "wav",
 ] }
+rpc = { git = "https://github.com/maan2003/zed", branch = "rho" }
 rustc-hash = "2.1.0"
 search = { git = "https://github.com/maan2003/zed", branch = "rho" }
 semver = { version = "1.0", features = ["serde"] }
@@ -62,6 +73,7 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 ui = { git = "https://github.com/maan2003/zed", branch = "rho" }
+util = { git = "https://github.com/maan2003/zed", branch = "rho" }
 vim = { git = "https://github.com/maan2003/zed", branch = "rho" }
 
 [dev-dependencies]

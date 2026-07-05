@@ -3,10 +3,13 @@
 //! [`ConnEvent`]s on a futures channel the workspace awaits (no polling);
 //! outbound commands are fire-and-forget.
 
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use anyhow::Context as _;
+use camino::Utf8PathBuf;
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use gpui::{App, Task};
@@ -14,6 +17,7 @@ use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
+    WorkspaceInfo,
     AgentId, ClientMessage, ServerMessage, UiProject, UiTopic, VoiceRole, VoiceState,
     VoiceUiAction, read_frame, write_frame,
 };
@@ -92,8 +96,87 @@ pub enum ConnEvent {
     VoiceUiAction(VoiceUiAction),
 }
 
+/// One open zed channel: a dedicated stream to the daemon carrying raw
+/// prost-envelope frames after the handshake. Dropping `outgoing` half-closes
+/// the stream; the daemon tears the headless project session down on EOF.
+pub struct ZedChannel {
+    /// The project root to open worktrees under (the daemon's view of the
+    /// workspace checkout).
+    pub root: Utf8PathBuf,
+    /// prost-encoded envelopes, GUI → headless project.
+    pub outgoing: futures_mpsc::UnboundedSender<Vec<u8>>,
+    /// prost-encoded envelopes, headless project → GUI.
+    pub incoming: futures_mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+/// How to dial an extra stream to the daemon for a zed channel: locally a
+/// second Unix connection, remotely another bi-stream on the already
+/// authenticated iroh connection. Set by the IO task once connected.
+#[derive(Clone)]
+enum ChannelDialer {
+    Unix(PathBuf),
+    Iroh(iroh::endpoint::Connection),
+}
+
+async fn dial_channel(
+    dialer: ChannelDialer,
+    workspace: WorkspaceInfo,
+) -> anyhow::Result<ZedChannel> {
+    let mut stream = match dialer {
+        ChannelDialer::Unix(socket_path) => {
+            let client = Client::connect(&socket_path)
+                .await
+                .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+            Box::new(client.into_stream()) as Box<dyn AsyncStream>
+        }
+        ChannelDialer::Iroh(connection) => {
+            let (send, recv) = connection
+                .open_bi()
+                .await
+                .context("open iroh zed-channel stream")?;
+            Box::new(tokio::io::join(recv, send)) as Box<dyn AsyncStream>
+        }
+    };
+    write_frame(&mut stream, &ClientMessage::ChannelOpen { workspace }).await?;
+    let reply: ServerMessage = read_frame(&mut stream).await?;
+    let root = match reply {
+        ServerMessage::ChannelOpened { root } => root,
+        ServerMessage::ChannelClosed { reason } => {
+            anyhow::bail!("daemon refused zed channel: {reason}")
+        }
+        _ => anyhow::bail!("unexpected reply to ChannelOpen"),
+    };
+
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (incoming_tx, incoming_rx) = futures_mpsc::unbounded();
+    let (outgoing_tx, mut outgoing_rx) = futures_mpsc::unbounded::<Vec<u8>>();
+    tokio::spawn(async move {
+        while let Ok(Some(payload)) = rho_ui_proto::read_raw_frame(&mut reader).await {
+            if incoming_tx.unbounded_send(payload).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(payload) = outgoing_rx.next().await {
+            if rho_ui_proto::write_raw_frame(&mut writer, &payload).await.is_err() {
+                break;
+            }
+        }
+        // Half-close so the daemon sees EOF and tears the session down.
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    });
+    Ok(ZedChannel {
+        root,
+        outgoing: outgoing_tx,
+        incoming: incoming_rx,
+    })
+}
+
 pub struct Connection {
     commands: futures_mpsc::UnboundedSender<ClientMessage>,
+    /// `None` until the IO task connects; channels cannot open earlier.
+    dialer: Arc<Mutex<Option<ChannelDialer>>>,
     /// Dropping this aborts the IO task, tearing the connection down with the
     /// workspace.
     _io_task: Task<Result<(), gpui_tokio::JoinError>>,
@@ -104,10 +187,22 @@ impl Connection {
         let _ = self.commands.unbounded_send(message);
     }
 
-    /// A handle other threads (the microphone capture thread) can send
-    /// through without touching the gpui entity.
     pub fn sender(&self) -> futures_mpsc::UnboundedSender<ClientMessage> {
         self.commands.clone()
+    }
+
+    /// Dials a dedicated stream for a zed channel onto `workspace` and runs
+    /// the handshake.
+    pub fn open_channel(
+        &self,
+        workspace: WorkspaceInfo,
+        cx: &App,
+    ) -> Task<Result<anyhow::Result<ZedChannel>, gpui_tokio::JoinError>> {
+        let dialer = self.dialer.lock().unwrap().clone();
+        Tokio::spawn(cx, async move {
+            let dialer = dialer.context("not connected to rho-daemon")?;
+            dial_channel(dialer, workspace).await
+        })
     }
 }
 
@@ -117,14 +212,17 @@ pub fn spawn(
 ) -> (Connection, futures_mpsc::UnboundedReceiver<ConnEvent>) {
     let (event_tx, event_rx) = futures_mpsc::unbounded();
     let (command_tx, command_rx) = futures_mpsc::unbounded();
+    let dialer = Arc::new(Mutex::new(None));
+    let io_dialer = dialer.clone();
     let io_task = Tokio::spawn(cx, async move {
-        if let Err(error) = run(target, &event_tx, command_rx).await {
+        if let Err(error) = run(target, &event_tx, command_rx, &io_dialer).await {
             let _ = event_tx.unbounded_send(ConnEvent::Disconnected(format!("{error:#}")));
         }
     });
     (
         Connection {
             commands: command_tx,
+            dialer,
             _io_task: io_task,
         },
         event_rx,
@@ -135,19 +233,26 @@ async fn run(
     target: AttachTarget,
     events: &futures_mpsc::UnboundedSender<ConnEvent>,
     mut commands: futures_mpsc::UnboundedReceiver<ClientMessage>,
+    dialer: &Mutex<Option<ChannelDialer>>,
 ) -> anyhow::Result<()> {
     let mut stream = match target {
         AttachTarget::Unix(socket_path) => {
             let client = Client::connect(&socket_path)
                 .await
                 .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+            *dialer.lock().unwrap() = Some(ChannelDialer::Unix(socket_path));
             Box::new(client.into_stream()) as Box<dyn AsyncStream>
         }
         AttachTarget::Iroh {
             endpoint_id,
             ssh_destination,
             remote_rho,
-        } => connect_iroh(endpoint_id, &ssh_destination, &remote_rho).await?,
+        } => {
+            let (stream, connection) =
+                connect_iroh(endpoint_id, &ssh_destination, &remote_rho).await?;
+            *dialer.lock().unwrap() = Some(ChannelDialer::Iroh(connection));
+            stream
+        }
     };
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
@@ -238,6 +343,9 @@ async fn run(
             | ServerMessage::IrohApproved { .. }
             | ServerMessage::IrohRevoked { .. }
             | ServerMessage::PrCommandResult { .. } => None,
+            // Zed channel handshake replies belong to dedicated channel
+            // streams, never the UI session.
+            ServerMessage::ChannelOpened { .. } | ServerMessage::ChannelClosed { .. } => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()
@@ -253,7 +361,7 @@ async fn connect_iroh(
     daemon_id: iroh::EndpointId,
     ssh_destination: &str,
     remote_rho: &str,
-) -> anyhow::Result<Box<dyn AsyncStream>> {
+) -> anyhow::Result<(Box<dyn AsyncStream>, iroh::endpoint::Connection)> {
     // The native client's identity intentionally lives only as long as this
     // process. The daemon can trust it in memory via an existing SSH login.
     let secret = iroh::SecretKey::generate();
@@ -286,10 +394,11 @@ async fn connect_iroh(
         "daemon did not approve SSH-trusted iroh client"
     );
     let (send, recv) = connection.open_bi().await.context("open iroh UI stream")?;
-    Ok(Box::new(IrohStream {
+    let stream = Box::new(IrohStream {
         inner: tokio::io::join(recv, send),
         _endpoint: endpoint,
-    }))
+    });
+    Ok((stream, connection))
 }
 
 async fn trust_in_memory_over_ssh(

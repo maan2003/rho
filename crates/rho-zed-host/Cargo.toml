@@ -1,0 +1,30 @@
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-zed-host"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+extension = { git = "https://github.com/maan2003/zed", branch = "rho" }
+fs = { git = "https://github.com/maan2003/zed", branch = "rho" }
+futures.workspace = true
+gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false }
+gpui_platform = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
+  "font-kit",
+] }
+gpui_tokio = { git = "https://github.com/maan2003/zed", branch = "rho" }
+http_client = { git = "https://github.com/maan2003/zed", branch = "rho" }
+language = { git = "https://github.com/maan2003/zed", branch = "rho" }
+log = "0.4"
+node_runtime = { git = "https://github.com/maan2003/zed", branch = "rho" }
+prost = "0.9"
+release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
+remote = { git = "https://github.com/maan2003/zed", branch = "rho" }
+remote_server = { git = "https://github.com/maan2003/zed", branch = "rho" }
+rpc = { git = "https://github.com/maan2003/zed", branch = "rho" }
+semver = { version = "1.0", features = ["serde"] }
+settings = { git = "https://github.com/maan2003/zed", branch = "rho" }

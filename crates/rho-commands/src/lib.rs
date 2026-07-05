@@ -132,6 +132,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: ":quit",
         description: "Exit",
     },
+    CommandSpec {
+        name: "open",
+        usage: ":open <path>",
+        description: "Open a file from the agent's workspace",
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -182,6 +187,9 @@ pub enum Command {
         duration_ms: u64,
     },
 
+    Open {
+        path: Utf8PathBuf,
+    },
     Quit,
     Clear,
     Help,
@@ -261,6 +269,12 @@ pub fn parse(line: &str) -> Option<Parsed> {
         "compact" => Parsed::Command(Command::Compact),
         "done" => parse_done(&mut tokens),
         "snooze" => parse_snooze(&mut tokens),
+        "open" => match tokens.next() {
+            Some(path) => Parsed::Command(Command::Open {
+                path: Utf8PathBuf::from(path),
+            }),
+            None => Parsed::Invalid(":open <path>".to_owned()),
+        },
         "quit" | "exit" => Parsed::Command(Command::Quit),
         "clear" => Parsed::Command(Command::Clear),
         "help" => Parsed::Command(Command::Help),

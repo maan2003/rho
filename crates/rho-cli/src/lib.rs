@@ -300,6 +300,9 @@ impl ChatApp {
                 self.term
                     .print_system(":voice is only available in rho-gui");
             }
+            rho_commands::Command::Open { .. } => {
+                self.term.print_system(":open is GUI-only");
+            }
             rho_commands::Command::AgentCancel => {
                 self.cancel_running_turn().await;
             }

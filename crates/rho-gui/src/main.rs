@@ -19,6 +19,7 @@ mod topic_rail;
 mod transcript;
 mod voice_audio;
 mod workspace;
+mod zed_remote;
 
 use std::fs::{self, File};
 use std::io::BufWriter;
@@ -48,7 +49,8 @@ actions!(
         AgentDone,
         RoleCycle,
         RoleCycleGroup,
-        TaskBoard
+        TaskBoard,
+        FileSave
     ]
 );
 
@@ -402,6 +404,7 @@ fn bind_rho_key_overrides(cx: &mut App) {
             RoleCycleGroup,
             Some("RhoGui > Editor && !showing_completions"),
         ),
+        KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
     ]);
 }
 
