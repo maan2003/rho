@@ -14,7 +14,9 @@ use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
 use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
-use rho_ui_proto::{AgentId, AgentMode, ClientMessage, DeepEffort, FableEffort, MessageDelivery};
+use rho_ui_proto::{
+    AgentId, AgentMode, ClientMessage, DeepConfig, DeepEffort, FableEffort, MessageDelivery,
+};
 use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentView;
@@ -515,6 +517,26 @@ impl Workspace {
             Command::AgentArchive => {
                 self.toggle_agent_status(source_agent, rho_ui_proto::Status::Archived, window, cx);
             }
+            Command::AgentFast { enabled } => {
+                self.update_deep_config(
+                    source_agent,
+                    ":agent fast: no agent selected",
+                    |config| {
+                        config.fast_mode = enabled.unwrap_or(!config.fast_mode);
+                    },
+                    cx,
+                );
+            }
+            Command::AgentEffort { effort } => {
+                self.update_deep_config(
+                    source_agent,
+                    ":agent effort: no agent selected",
+                    |config| {
+                        config.effort = effort;
+                    },
+                    cx,
+                );
+            }
             Command::TopicPin { name } => {
                 self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
             }
@@ -714,7 +736,7 @@ impl Workspace {
     }
 
     /// Tab in the draft cycles the `Workdir:` field, the start field, and
-    /// the body; on agent views it does nothing (yet).
+    /// the body. On agent views it does nothing.
     fn cycle_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.registry.selected_agent().is_none() {
             self.draft_view
@@ -723,7 +745,8 @@ impl Workspace {
     }
 
     /// Shift-Tab in the draft: with the cursor in the start field, flip its
-    /// mode (on top of ↔ join); anywhere else, cycle fields like Tab.
+    /// mode (on top of ↔ join); anywhere else, cycle fields like Tab. On agent
+    /// views it does nothing.
     fn cycle_draft_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.registry.selected_agent().is_none() {
             self.draft_view.update(cx, |view, cx| {
@@ -737,6 +760,34 @@ impl Workspace {
                 }
             });
         }
+    }
+
+    fn update_deep_config(
+        &mut self,
+        source_agent: Option<AgentId>,
+        no_target_message: &str,
+        update: impl FnOnce(&mut DeepConfig),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
+        else {
+            self.notice_on(None, no_target_message, StyleClass::SystemInfo, cx);
+            return;
+        };
+        let Some(AgentMode::Deep(mut config)) = self.registry.agent_mode(agent_id) else {
+            self.notice_on(
+                Some(&agent_id),
+                "mode changes are only available for deep agents",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        update(&mut config);
+        self.connection.send(ClientMessage::SetAgentMode {
+            agent_id,
+            mode: AgentMode::Deep(config),
+        });
     }
 
     /// (Re)writes the draft scaffold with the derived default workdir; the
@@ -1053,7 +1104,7 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
         return Err("mode must be `deep [low|medium|xhigh]` or `fable [medium|xhigh]`".to_owned());
     }
     match kind.as_str() {
-        "deep" => Ok(AgentMode::Deep {
+        "deep" => Ok(AgentMode::Deep(DeepConfig {
             effort: match effort.as_str() {
                 "low" => DeepEffort::Low,
                 "medium" => DeepEffort::Medium,
@@ -1065,7 +1116,7 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
                 }
             },
             fast_mode: true,
-        }),
+        })),
         "fable" => Ok(AgentMode::Fable {
             effort: match effort.as_str() {
                 "medium" => FableEffort::Medium,
@@ -1083,18 +1134,18 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
 
 fn cycle_agent_mode_text(current: &str) -> &'static str {
     match parse_agent_mode(current).unwrap_or_else(|_| AgentMode::deep_default()) {
-        AgentMode::Deep {
+        AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Low,
             ..
-        } => "deep medium",
-        AgentMode::Deep {
+        }) => "deep medium",
+        AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Medium,
             ..
-        } => "deep xhigh",
-        AgentMode::Deep {
+        }) => "deep xhigh",
+        AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Xhigh,
             ..
-        } => "fable medium",
+        }) => "fable medium",
         AgentMode::Fable {
             effort: FableEffort::Medium,
         } => "fable xhigh",
@@ -1111,7 +1162,9 @@ struct ModeLabel {
 
 fn agent_mode_label(mode: AgentMode) -> ModeLabel {
     match mode {
-        AgentMode::Deep { effort, fast_mode } => {
+        AgentMode::Deep(config) => {
+            let effort = config.effort;
+            let fast_mode = config.fast_mode;
             let effort = match effort {
                 DeepEffort::Low => "¹",
                 DeepEffort::Medium => "²",
@@ -1206,10 +1259,10 @@ mod tests {
     fn parses_agent_mode_field() {
         assert_eq!(
             parse_agent_mode("deep low").unwrap(),
-            AgentMode::Deep {
+            AgentMode::Deep(DeepConfig {
                 effort: DeepEffort::Low,
                 fast_mode: true,
-            }
+            })
         );
         assert_eq!(
             parse_agent_mode("fable xhigh").unwrap(),
@@ -1223,31 +1276,31 @@ mod tests {
 
     #[test]
     fn renders_compact_agent_mode_labels() {
-        let low = agent_mode_label(AgentMode::Deep {
+        let low = agent_mode_label(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Low,
             fast_mode: true,
-        });
+        }));
         assert_eq!(low.text, "deep¹⚡");
         assert_eq!(low.family, ModeFamily::Deep);
 
-        let medium = agent_mode_label(AgentMode::Deep {
+        let medium = agent_mode_label(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: true,
-        });
+        }));
         assert_eq!(medium.text, "deep²⚡");
         assert_eq!(medium.family, ModeFamily::Deep);
 
-        let xhigh = agent_mode_label(AgentMode::Deep {
+        let xhigh = agent_mode_label(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Xhigh,
             fast_mode: true,
-        });
+        }));
         assert_eq!(xhigh.text, "deep³⚡");
         assert_eq!(xhigh.family, ModeFamily::Deep);
 
-        let slow = agent_mode_label(AgentMode::Deep {
+        let slow = agent_mode_label(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: false,
-        });
+        }));
         assert_eq!(slow.text, "deep²");
         assert_eq!(slow.family, ModeFamily::Deep);
 

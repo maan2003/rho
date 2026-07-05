@@ -293,7 +293,7 @@ impl AgentRegistry {
             }
         };
         let (agent_id, agent) = match mode {
-            AgentMode::Deep { .. } => {
+            AgentMode::Deep(_) => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
                     self.auth.clone(),
@@ -367,6 +367,30 @@ impl AgentRegistry {
         write.set_agent_status(rho_core::UnixMs::now(), agent_id, status);
         write.commit();
         Ok(())
+    }
+
+    async fn set_agent_mode(&self, agent_id: AgentId, mode: AgentMode) -> anyhow::Result<()> {
+        let record = self.db.read().get_agent(agent_id);
+        match (record.runtime, mode) {
+            (AgentRuntime::Rho { .. }, AgentMode::Deep(config)) => {
+                if let Some(agent) = self.get(agent_id).await {
+                    agent.set_deep_config(config)?;
+                }
+                let mut write = self.db.write().await;
+                write.set_agent_mode(rho_core::UnixMs::now(), agent_id, mode);
+                write.commit();
+                Ok(())
+            }
+            (AgentRuntime::Rho { .. }, AgentMode::Fable { .. }) => {
+                anyhow::bail!("cannot switch a Rho agent to a Fable runtime")
+            }
+            (AgentRuntime::Claude { .. }, AgentMode::Deep(_)) => {
+                anyhow::bail!("cannot switch a Claude agent to a Deep runtime")
+            }
+            (AgentRuntime::Claude { .. }, AgentMode::Fable { .. }) => {
+                anyhow::bail!("runtime mode updates are only supported for deep agents")
+            }
+        }
     }
 
     /// Titles an untitled agent from its first user message, in the
@@ -519,6 +543,16 @@ impl RunningAgent {
         }
     }
 
+    fn set_deep_config(&self, config: rho_agent::db::DeepConfig) -> anyhow::Result<()> {
+        match self {
+            Self::Rho(agent) => {
+                agent.set_deep_config(config);
+                Ok(())
+            }
+            Self::Claude(_) => anyhow::bail!("cannot apply deep config to Claude agent"),
+        }
+    }
+
     fn subscribe(&self) -> BoxStream<'static, AgentState> {
         match self {
             Self::Rho(agent) => agent.subscribe().boxed(),
@@ -654,6 +688,10 @@ async fn handle_message(
         }
         ClientMessage::SetAgentStatus { agent_id, status } => {
             agents.set_agent_status(agent_id, status).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::SetAgentMode { agent_id, mode } => {
+            agents.set_agent_mode(agent_id, mode).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::RenameAgent { agent_id, name } => {

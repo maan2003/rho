@@ -20,7 +20,8 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc};
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, UnixMillis,
+    AgentEventPos, AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, DeepConfig,
+    UnixMillis,
 };
 
 pub mod claude;
@@ -179,9 +180,8 @@ impl Agent {
     ) -> anyhow::Result<(AgentId, Self)> {
         let prompt_cache_key = PromptCacheKey::generate();
         let config = mode
-            .inference_config()
+            .deep_config()
             .ok_or_else(|| anyhow::anyhow!("cannot create Rho runtime for Claude agent mode"))?;
-        let config = config.protect();
         // One transaction spans id allocation, the jj workspace creation
         // (the workspace is named after the id), and the record write:
         // failure anywhere drops the transaction, leaving nothing behind —
@@ -209,7 +209,7 @@ impl Agent {
             AgentRuntime::Rho { prompt_cache_key },
         );
         write.commit();
-        let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
+        let inference_session = InferenceSession::new_deep(auth, config, prompt_cache_key);
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             Arc::clone(&workspace),
@@ -329,10 +329,9 @@ impl Agent {
         };
         let config = record
             .mode
-            .inference_config()
-            .expect("Rho runtime stored with non-Rho agent mode")
-            .protect();
-        let inference_session = InferenceSession::new(auth, config, prompt_cache_key);
+            .deep_config()
+            .expect("Rho runtime stored with non-Rho agent mode");
+        let inference_session = InferenceSession::new_deep(auth, config, prompt_cache_key);
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             Arc::clone(&workspace),
@@ -404,6 +403,10 @@ impl Agent {
         let _ = self.control.send(AgentControl::Cancel);
     }
 
+    pub fn set_deep_config(&self, config: DeepConfig) {
+        let _ = self.control.send(AgentControl::SetDeepConfig(config));
+    }
+
     pub fn subscribe(&self) -> impl Stream<Item = AgentState> + use<> {
         let state = Arc::clone(&self.state);
         let notify = Arc::clone(&self.notify);
@@ -432,6 +435,7 @@ enum AgentControl {
         content: Vec<ContentPart>,
         delivery: MessageDelivery,
     },
+    SetDeepConfig(DeepConfig),
     Cancel,
 }
 
@@ -505,6 +509,9 @@ impl AgentLoop {
                             state.queued_messages.clear();
 
                             state.kind = AgentStateKind::Idle;
+                        }
+                        AgentControl::SetDeepConfig(config) => {
+                            let _ = self.inference_session.set_deep_config(config);
                         }
                     }
                 }

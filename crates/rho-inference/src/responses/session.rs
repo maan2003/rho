@@ -13,7 +13,7 @@ use super::DEFAULT_CHATGPT_BASE_URL;
 use super::oauth::InferenceAuth;
 use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{self, WebSocketConnection};
-use crate::config::InferenceProtectedConfig;
+use crate::config::{DeepConfig, DeepEffort};
 
 #[derive(
     Clone, Copy, Debug, Decode, Encode, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
@@ -105,15 +105,120 @@ pub struct InferenceSession {
     buffered: VecDeque<InferenceEvent>,
     pub(crate) base_url: String,
     pub(crate) auth: InferenceAuth,
-    pub(crate) config: InferenceProtectedConfig,
+    pub(crate) mode: InferenceSessionMode,
+    pub(crate) responses_config: ResponsesConfig,
     pub(crate) prompt_cache_key: PromptCacheKey,
     debug_counter: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum InferenceSessionMode {
+    Deep(DeepConfig),
+    Title,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ResponsesConfig {
+    pub model: ResponsesModel,
+    pub auto_compaction: Option<AutoCompaction>,
+    pub reasoning_context: ReasoningContext,
+    pub effort: ResponsesEffort,
+    pub text_verbosity: TextVerbosity,
+    pub service_tier: ServiceTier,
+}
+
+impl ResponsesConfig {
+    fn deep(config: DeepConfig) -> Self {
+        Self {
+            model: ResponsesModel::Gpt55,
+            auto_compaction: Some(AutoCompaction::Threshold(272_000 * 95 / 100 * 90 / 100)),
+            reasoning_context: ReasoningContext::AllTurns,
+            effort: config.effort.into(),
+            text_verbosity: TextVerbosity::Low,
+            service_tier: if config.fast_mode {
+                ServiceTier::Priority
+            } else {
+                ServiceTier::Normal
+            },
+        }
+    }
+
+    fn title() -> Self {
+        Self {
+            model: ResponsesModel::Gpt54Mini,
+            auto_compaction: None,
+            reasoning_context: ReasoningContext::CurrentTurn,
+            effort: ResponsesEffort::Medium,
+            text_verbosity: TextVerbosity::Low,
+            service_tier: ServiceTier::Normal,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ResponsesModel {
+    Gpt55,
+    Gpt54Mini,
+    #[cfg(test)]
+    Test(String),
+}
+
+impl ResponsesModel {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Gpt55 => "gpt-5.5",
+            Self::Gpt54Mini => "gpt-5.4-mini",
+            #[cfg(test)]
+            Self::Test(model) => model,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ResponsesEffort {
+    Low,
+    Medium,
+    Xhigh,
+}
+
+impl From<DeepEffort> for ResponsesEffort {
+    fn from(effort: DeepEffort) -> Self {
+        match effort {
+            DeepEffort::Low => Self::Low,
+            DeepEffort::Medium => Self::Medium,
+            DeepEffort::Xhigh => Self::Xhigh,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ServiceTier {
+    Priority,
+    Normal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum TextVerbosity {
+    Low,
+    #[cfg(test)]
+    Medium,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ReasoningContext {
+    CurrentTurn,
+    AllTurns,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum AutoCompaction {
+    Threshold(u64),
+}
+
 impl InferenceSession {
-    pub fn new(
+    pub fn new_deep(
         auth: InferenceAuth,
-        config: InferenceProtectedConfig,
+        config: DeepConfig,
         prompt_cache_key: PromptCacheKey,
     ) -> Self {
         Self {
@@ -122,18 +227,40 @@ impl InferenceSession {
             buffered: VecDeque::new(),
             base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
             auth,
-            config,
+            mode: InferenceSessionMode::Deep(config),
+            responses_config: ResponsesConfig::deep(config),
             prompt_cache_key,
             debug_counter: 0,
         }
     }
 
-    pub fn prompt_cache_key(&self) -> PromptCacheKey {
-        self.prompt_cache_key
+    pub fn new_title(auth: InferenceAuth, prompt_cache_key: PromptCacheKey) -> Self {
+        Self {
+            connection: None,
+            turn: None,
+            buffered: VecDeque::new(),
+            base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+            auth,
+            mode: InferenceSessionMode::Title,
+            responses_config: ResponsesConfig::title(),
+            prompt_cache_key,
+            debug_counter: 0,
+        }
     }
 
-    pub fn config(&self) -> &InferenceProtectedConfig {
-        &self.config
+    pub fn set_deep_config(&mut self, config: DeepConfig) -> bool {
+        match &mut self.mode {
+            InferenceSessionMode::Deep(current) => {
+                *current = config;
+                self.responses_config = ResponsesConfig::deep(config);
+                true
+            }
+            InferenceSessionMode::Title => false,
+        }
+    }
+
+    pub fn prompt_cache_key(&self) -> PromptCacheKey {
+        self.prompt_cache_key
     }
 
     /// Queue a turn. The work happens in `run`.
@@ -492,7 +619,8 @@ impl std::fmt::Debug for InferenceSession {
         f.debug_struct("InferenceSession")
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
-            .field("config", &self.config.config())
+            .field("mode", &self.mode)
+            .field("responses_config", &self.responses_config)
             .field("prompt_cache_key", &self.prompt_cache_key)
             .finish()
     }

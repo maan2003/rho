@@ -14,8 +14,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::InferenceSession;
-use crate::config::{
-    AutoCompaction, Effort, InferenceConfig, ReasoningContext, ServiceTier, TextVerbosity,
+use super::session::{
+    AutoCompaction, ReasoningContext, ResponsesEffort, ServiceTier, TextVerbosity,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -137,7 +137,7 @@ impl ResponsesRequest {
             .prompt_cache_key
             .to_wire_uuid(&session.base_url, [0; 32]);
         let previous_response_id = previous_response.map(|(id, _)| id);
-        let InferenceConfig::Gpt5(config) = session.config().config();
+        let config = &session.responses_config;
         let context_management = config
             .auto_compaction
             .as_ref()
@@ -153,7 +153,7 @@ impl ResponsesRequest {
             .unwrap_or_default();
 
         Self {
-            model: config.model.0.to_string(),
+            model: config.model.as_str().to_owned(),
             instructions: request.instructions,
             input,
             store: Some(false),
@@ -162,8 +162,8 @@ impl ResponsesRequest {
             text: Some(TextRequest {
                 verbosity: match config.text_verbosity {
                     TextVerbosity::Low => "low",
+                    #[cfg(test)]
                     TextVerbosity::Medium => "medium",
-                    TextVerbosity::High => "high",
                 },
             }),
             reasoning: Some(ReasoningRequest {
@@ -172,17 +172,13 @@ impl ResponsesRequest {
                     ReasoningContext::AllTurns => "all_turns",
                 },
                 effort: match config.effort {
-                    Effort::Minimal => "minimal",
-                    Effort::Low => "low",
-                    Effort::Medium => "medium",
-                    Effort::High => "high",
-                    Effort::Xhigh => "xhigh",
-                    Effort::Max => "max",
+                    ResponsesEffort::Low => "low",
+                    ResponsesEffort::Medium => "medium",
+                    ResponsesEffort::Xhigh => "xhigh",
                 },
                 summary: "auto",
             }),
             service_tier: Some(match config.service_tier {
-                ServiceTier::Flex => "flex",
                 ServiceTier::Priority => "priority",
                 ServiceTier::Normal => "default",
             }),

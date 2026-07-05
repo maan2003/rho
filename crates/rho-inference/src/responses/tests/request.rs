@@ -128,19 +128,17 @@ fn serializes_configured_reasoning_effort() {
 #[test]
 fn serializes_configured_reasoning_context() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = InferenceSession::new(
+    let mut session = InferenceSession::new_deep(
         auth,
-        InferenceConfig::Gpt5(Gpt5Config {
-            model: Gpt5Model(Cow::Owned("gpt-test".into())),
-            auto_compaction: None,
-            reasoning_context: ReasoningContext::CurrentTurn,
-            effort: Effort::Medium,
-            text_verbosity: TextVerbosity::Medium,
-            service_tier: ServiceTier::Normal,
-        })
-        .protect(),
+        DeepConfig {
+            effort: DeepEffort::Medium,
+            fast_mode: false,
+        },
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
+    session.responses_config.model = ResponsesModel::Test("gpt-test".to_owned());
+    session.responses_config.reasoning_context = ReasoningContext::CurrentTurn;
+    session.responses_config.text_verbosity = TextVerbosity::Medium;
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(&session, request);

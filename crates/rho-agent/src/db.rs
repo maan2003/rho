@@ -7,7 +7,7 @@ use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
-use rho_inference::config::{Effort as InferenceEffort, InferenceConfig, ServiceTier};
+pub use rho_inference::config::{DeepConfig, DeepEffort};
 use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
@@ -31,7 +31,7 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "c7b31a9e-fast-mode";
+const CURRENT_AGENT_DB_FORMAT: &str = "2a7f4d91";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -42,7 +42,7 @@ struct AgentDbMigration {
 const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
     from: "c7b31a9e",
     to: CURRENT_AGENT_DB_FORMAT,
-    migrate: migrate_deep_fast_mode_default,
+    migrate: migrate_deep_config_encoding,
 }];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -177,23 +177,113 @@ pub enum AgentRuntime {
     Claude { session_id: Uuid },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum AgentMode {
-    Deep {
-        effort: DeepEffort,
-        #[senax(default)]
-        fast_mode: bool,
-    },
-    Fable {
-        effort: FableEffort,
-    },
+    Deep(DeepConfig),
+    Fable { effort: FableEffort },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum DeepEffort {
-    Low,
-    Medium,
-    Xhigh,
+impl senax_encoder::Decoder for AgentMode {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        const DEEP_ID: u64 = 0x8e6fe05daf9b4e5c;
+        const FABLE_ID: u64 = 0x2324b4411e2d6595;
+        const EFFORT_ID: u64 = 0xae8c1bc4a13b4c9c;
+        const FAST_MODE_ID: u64 = 0xdfdfaae5d197e253;
+
+        if reader.remaining() == 0 {
+            return Err(senax_encoder::EncoderError::InsufficientData);
+        }
+        let tag = reader.get_u8();
+        match tag {
+            senax_encoder::core::TAG_ENUM_UNNAMED => {
+                let variant_id = senax_encoder::core::read_field_id_optimized(reader)?;
+                match variant_id {
+                    DEEP_ID => {
+                        let count = usize::decode(reader)?;
+                        if count != 1 {
+                            return Err(senax_encoder::EncoderError::EnumDecode(
+                                senax_encoder::EnumDecodeError::FieldCountMismatch {
+                                    enum_name: "AgentMode",
+                                    variant_name: "Deep",
+                                    expected: 1,
+                                    actual: count,
+                                },
+                            ));
+                        }
+                        Ok(Self::Deep(DeepConfig::decode(reader)?))
+                    }
+                    _ => Err(senax_encoder::EncoderError::EnumDecode(
+                        senax_encoder::EnumDecodeError::UnknownVariantId {
+                            variant_id,
+                            enum_name: "AgentMode",
+                        },
+                    )),
+                }
+            }
+            senax_encoder::core::TAG_ENUM_NAMED => {
+                let variant_id = senax_encoder::core::read_field_id_optimized(reader)?;
+                match variant_id {
+                    DEEP_ID => {
+                        let mut effort = None;
+                        let mut fast_mode = None;
+                        loop {
+                            match senax_encoder::core::read_field_id_optimized(reader)? {
+                                0 => break,
+                                EFFORT_ID => effort = Some(DeepEffort::decode(reader)?),
+                                FAST_MODE_ID => fast_mode = Some(bool::decode(reader)?),
+                                _ => senax_encoder::core::skip_value(reader)?,
+                            }
+                        }
+                        Ok(Self::Deep(DeepConfig {
+                            effort: effort.ok_or_else(|| {
+                                senax_encoder::EncoderError::EnumDecode(
+                                    senax_encoder::EnumDecodeError::MissingRequiredField {
+                                        field: "effort",
+                                        enum_name: "AgentMode",
+                                        variant_name: "Deep",
+                                    },
+                                )
+                            })?,
+                            fast_mode: fast_mode.unwrap_or(true),
+                        }))
+                    }
+                    FABLE_ID => {
+                        let mut effort = None;
+                        loop {
+                            match senax_encoder::core::read_field_id_optimized(reader)? {
+                                0 => break,
+                                EFFORT_ID => effort = Some(FableEffort::decode(reader)?),
+                                _ => senax_encoder::core::skip_value(reader)?,
+                            }
+                        }
+                        Ok(Self::Fable {
+                            effort: effort.ok_or_else(|| {
+                                senax_encoder::EncoderError::EnumDecode(
+                                    senax_encoder::EnumDecodeError::MissingRequiredField {
+                                        field: "effort",
+                                        enum_name: "AgentMode",
+                                        variant_name: "Fable",
+                                    },
+                                )
+                            })?,
+                        })
+                    }
+                    _ => Err(senax_encoder::EncoderError::EnumDecode(
+                        senax_encoder::EnumDecodeError::UnknownVariantId {
+                            variant_id,
+                            enum_name: "AgentMode",
+                        },
+                    )),
+                }
+            }
+            unknown_tag => Err(senax_encoder::EncoderError::EnumDecode(
+                senax_encoder::EnumDecodeError::UnknownTag {
+                    tag: unknown_tag,
+                    enum_name: "AgentMode",
+                },
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -204,54 +294,32 @@ pub enum FableEffort {
 
 impl AgentMode {
     pub fn deep_default() -> Self {
-        Self::Deep {
-            effort: DeepEffort::Medium,
-            fast_mode: true,
-        }
+        Self::Deep(DeepConfig::default())
     }
 
-    pub fn inference_config(self) -> Option<InferenceConfig> {
-        let Self::Deep { effort, fast_mode } = self else {
-            return None;
-        };
-        let mut config = InferenceConfig::deep();
-        match &mut config {
-            InferenceConfig::Gpt5(config) => {
-                config.effort = effort.to_inference_effort();
-                if !fast_mode {
-                    config.service_tier = ServiceTier::Normal;
-                }
-            }
+    pub fn deep_config(self) -> Option<DeepConfig> {
+        match self {
+            Self::Deep(config) => Some(config),
+            Self::Fable { .. } => None,
         }
-        Some(config)
     }
 
     pub fn claude_model(self) -> Option<rho_claude::Model> {
         match self {
             Self::Fable { .. } => Some(rho_claude::Model::Fable),
-            Self::Deep { .. } => None,
+            Self::Deep(_) => None,
         }
     }
 
     pub fn claude_effort(self) -> Option<rho_claude::Effort> {
         match self {
             Self::Fable { effort } => Some(effort.to_claude_effort()),
-            Self::Deep { .. } => None,
+            Self::Deep(_) => None,
         }
     }
 
     pub fn is_claude(self) -> bool {
         matches!(self, Self::Fable { .. })
-    }
-}
-
-impl DeepEffort {
-    fn to_inference_effort(self) -> InferenceEffort {
-        match self {
-            Self::Low => InferenceEffort::Low,
-            Self::Medium => InferenceEffort::Medium,
-            Self::Xhigh => InferenceEffort::Xhigh,
-        }
     }
 }
 
@@ -290,6 +358,8 @@ pub trait AgentWriteTxnExt {
     fn set_topic_status(&mut self, now: UnixMillis, topic_id: TopicId, status: Status);
 
     fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status);
+
+    fn set_agent_mode(&mut self, now: UnixMillis, agent_id: AgentId, mode: AgentMode);
 
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
 
@@ -503,6 +573,18 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
+    fn set_agent_mode(&mut self, now: UnixMillis, agent_id: AgentId, mode: AgentMode) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.mode = mode;
+        agent.updated_at = now;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String) {
         let mut agents = self.open_table(AGENTS);
         let mut agent = agents
@@ -622,25 +704,15 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     write.open_table(FORMAT).insert(&(), &current.to_owned());
 }
 
-fn migrate_deep_fast_mode_default(write: &mut WriteTxn) {
+fn migrate_deep_config_encoding(write: &mut WriteTxn) {
     let agents: Vec<_> = write
         .open_table(AGENTS)
         .iter()
         .map(|(key, value)| (key.value(), value.value().into_owned()))
         .collect();
     let mut table = write.open_table(AGENTS);
-    for (agent_id, mut agent) in agents {
-        if let AgentMode::Deep {
-            effort,
-            fast_mode: false,
-        } = agent.mode
-        {
-            agent.mode = AgentMode::Deep {
-                effort,
-                fast_mode: true,
-            };
-            table.insert(&agent_id, SenValue::borrowed(&agent));
-        }
+    for (agent_id, agent) in agents {
+        table.insert(&agent_id, SenValue::borrowed(&agent));
     }
 }
 

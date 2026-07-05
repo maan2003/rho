@@ -231,7 +231,9 @@ fn status_name(status: Status) -> &'static str {
 
 fn mode_name(mode: AgentMode) -> String {
     match mode {
-        AgentMode::Deep { effort, fast_mode } => {
+        AgentMode::Deep(config) => {
+            let effort = config.effort;
+            let fast_mode = config.fast_mode;
             let fast = if fast_mode { " ⚡" } else { "" };
             format!("deep{fast} {}", deep_effort_name(effort))
         }

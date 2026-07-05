@@ -46,6 +46,32 @@ fn parses_agent_commands() {
 }
 
 #[test]
+fn parses_agent_mode_commands() {
+    assert_eq!(
+        parse(":agent fast"),
+        Some(Parsed::Command(Command::AgentFast { enabled: None }))
+    );
+    assert_eq!(
+        parse(":agent fast off"),
+        Some(Parsed::Command(Command::AgentFast {
+            enabled: Some(false)
+        }))
+    );
+    assert_eq!(
+        parse(":agent effort xhigh"),
+        Some(Parsed::Command(Command::AgentEffort {
+            effort: DeepEffort::Xhigh
+        }))
+    );
+    assert_eq!(
+        parse(":agent effort"),
+        Some(Parsed::Invalid(
+            ":agent effort <low|medium|xhigh>".to_owned()
+        ))
+    );
+}
+
+#[test]
 fn parses_topic_new_with_multi_word_name() {
     assert_eq!(
         parse(":topic new fix auth bug"),
@@ -187,7 +213,9 @@ fn completes_command_words_stepwise() {
     let second = completion_candidates(":agent ", &ctx);
     assert_eq!(
         values(&second),
-        ["new", "cancel", "rename", "pin", "archive"]
+        [
+            "new", "cancel", "rename", "pin", "archive", "fast", "effort"
+        ]
     );
 
     let partial = completion_candidates(":agent ar", &ctx);
@@ -204,6 +232,14 @@ fn completes_arguments_from_context() {
     };
 
     assert_eq!(values(&completion_candidates(":agent new ", &ctx)), ["rho"]);
+    assert_eq!(
+        values(&completion_candidates(":agent fast ", &ctx)),
+        ["on", "off"]
+    );
+    assert_eq!(
+        values(&completion_candidates(":agent effort x", &ctx)),
+        ["xhigh"]
+    );
     assert_eq!(
         values(&completion_candidates(":topic move in", &ctx)),
         ["infra"]

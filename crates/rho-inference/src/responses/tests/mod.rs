@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,13 +17,13 @@ use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::oauth::{InferenceAuth, OAuthFile, ResponsesOAuthCredentials};
+use super::session::{
+    AutoCompaction, ReasoningContext, ResponsesEffort, ResponsesModel, ServiceTier, TextVerbosity,
+};
 use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
-use crate::config::{
-    AutoCompaction, Effort, Gpt5Config, Gpt5Model, InferenceConfig, ReasoningContext, ServiceTier,
-    TextVerbosity,
-};
+use crate::config::{DeepConfig, DeepEffort};
 
 fn first_assistant_message(
     items: &[InferenceResponseItem],
@@ -220,16 +219,23 @@ fn test_inference_service_with(
     prompt_cache_key: PromptCacheKey,
     auto_compaction: Option<AutoCompaction>,
 ) -> InferenceSession {
-    let config = InferenceConfig::Gpt5(Gpt5Config {
-        model: Gpt5Model(Cow::Owned(model.into())),
+    let mut session = InferenceSession::new_deep(
+        auth,
+        DeepConfig {
+            effort: DeepEffort::Medium,
+            fast_mode: false,
+        },
+        prompt_cache_key,
+    );
+    session.responses_config = super::session::ResponsesConfig {
+        model: ResponsesModel::Test(model.into()),
         auto_compaction,
-        reasoning_context: ReasoningContext::AllTurns,
-        effort: Effort::Medium,
+        reasoning_context: super::session::ReasoningContext::AllTurns,
+        effort: ResponsesEffort::Medium,
         text_verbosity: TextVerbosity::Medium,
         service_tier: ServiceTier::Normal,
-    })
-    .protect();
-    InferenceSession::new(auth, config, prompt_cache_key)
+    };
+    session
 }
 
 fn test_oauth_file_in(

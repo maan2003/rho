@@ -11,7 +11,8 @@ use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
 pub use rho_agent::MessageDelivery;
 pub use rho_agent::db::{
-    AgentId, AgentIdDomain, AgentMode, DeepEffort, FableEffort, Status, TopicId, TopicIdDomain,
+    AgentId, AgentIdDomain, AgentMode, DeepConfig, DeepEffort, FableEffort, Status, TopicId,
+    TopicIdDomain,
 };
 use rho_core::ContentPart;
 pub use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
@@ -109,6 +110,10 @@ pub enum ClientMessage {
     SetAgentStatus {
         agent_id: AgentId,
         status: Status,
+    },
+    SetAgentMode {
+        agent_id: AgentId,
+        mode: AgentMode,
     },
     SetTopicStatus {
         topic_id: TopicId,
