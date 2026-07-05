@@ -220,6 +220,7 @@ impl UiTopic {
 pub struct UiAgentSummary {
     pub agent_id: AgentId,
     pub display_name: Option<String>,
+    pub updated_at: rho_core::UnixMs,
     /// The model/runtime mode this agent was created with.
     pub mode: AgentMode,
     /// Where the agent works. Clients resolve start targets against this

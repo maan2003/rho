@@ -8,6 +8,7 @@
 //! Clicking an agent opens it (loading it on demand); the `+` row opens the
 //! draft compose view and doubles as its selection indicator.
 
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 
 use gpui::prelude::*;
@@ -141,6 +142,51 @@ fn show_archived_row(
         }))
 }
 
+#[cfg(test)]
+mod tests {
+    use rho_core::UnixMs;
+    use rho_ui_proto::{AgentIdDomain, AgentMode, TopicId, TopicIdDomain, WorkspaceInfo};
+
+    use super::*;
+
+    fn agent(id: u64, status: Status, updated_at: u64) -> UiAgentSummary {
+        UiAgentSummary {
+            agent_id: AgentId::from_counter(id, &AgentIdDomain(0)).unwrap(),
+            display_name: None,
+            updated_at: UnixMs(updated_at),
+            mode: AgentMode::deep_default(),
+            workspace: WorkspaceInfo::UserCheckout {
+                repo: "/tmp".into(),
+            },
+            status,
+        }
+    }
+
+    fn topic(status: Status, agents: Vec<UiAgentSummary>) -> UiTopic {
+        UiTopic {
+            topic_id: TopicId::from_counter(1, &TopicIdDomain(0)).unwrap(),
+            name: "topic".to_owned(),
+            status,
+            agents,
+        }
+    }
+
+    #[test]
+    fn archived_agents_sort_by_updated_at_newest_first() {
+        let old = agent(1, Status::Archived, 10);
+        let new = agent(2, Status::Archived, 30);
+        let middle = agent(3, Status::Archived, 20);
+        let topic = topic(Status::Normal, vec![old, new, middle]);
+
+        let visible = visible_agents(&topic, true)
+            .into_iter()
+            .map(|summary| summary.updated_at)
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible, [UnixMs(30), UnixMs(20), UnixMs(10)]);
+    }
+}
+
 fn new_agent_row(
     draft_selected: bool,
     text_style: &TextStyle,
@@ -187,7 +233,11 @@ fn visible_agents(topic: &UiTopic, show_archived: bool) -> Vec<&UiAgentSummary> 
             hidden == show_archived
         })
         .collect::<Vec<_>>();
-    agents.sort_by_key(|summary| summary.status != Status::Pinned);
+    if show_archived {
+        agents.sort_by_key(|summary| Reverse(summary.updated_at));
+    } else {
+        agents.sort_by_key(|summary| summary.status != Status::Pinned);
+    }
     agents
 }
 

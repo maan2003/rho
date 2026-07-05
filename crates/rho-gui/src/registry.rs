@@ -251,6 +251,7 @@ mod tests {
         UiAgentSummary {
             agent_id: agent_id(id),
             display_name: None,
+            updated_at: rho_core::UnixMs(id),
             mode: rho_ui_proto::AgentMode::deep_default(),
             workspace: rho_ui_proto::WorkspaceInfo::UserCheckout {
                 repo: "/tmp".into(),
@@ -263,6 +264,7 @@ mod tests {
         UiAgentSummary {
             agent_id: agent_id(id),
             display_name: None,
+            updated_at: rho_core::UnixMs(id),
             mode: rho_ui_proto::AgentMode::deep_default(),
             workspace: rho_ui_proto::WorkspaceInfo::Workspace {
                 repo: "/tmp".into(),
