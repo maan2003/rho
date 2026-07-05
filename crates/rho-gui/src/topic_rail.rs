@@ -153,6 +153,7 @@ mod tests {
         UiAgentSummary {
             agent_id: AgentId::from_counter(id, &AgentIdDomain(0)).unwrap(),
             display_name: None,
+            created_at: UnixMs(id),
             updated_at: UnixMs(updated_at),
             mode: AgentMode::deep_default(),
             workspace: WorkspaceInfo::UserCheckout {
@@ -184,6 +185,28 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(visible, [UnixMs(30), UnixMs(20), UnixMs(10)]);
+    }
+
+    #[test]
+    fn active_agents_sort_by_created_at_newest_first_after_pins() {
+        let old = agent(1, Status::Normal, 10);
+        let pinned = agent(2, Status::Pinned, 10);
+        let new = agent(3, Status::Normal, 10);
+        let topic = topic(Status::Normal, vec![old, pinned, new]);
+
+        let visible = visible_agents(&topic, false)
+            .into_iter()
+            .map(|summary| summary.agent_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible,
+            [
+                AgentId::from_counter(2, &AgentIdDomain(0)).unwrap(),
+                AgentId::from_counter(3, &AgentIdDomain(0)).unwrap(),
+                AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
+            ]
+        );
     }
 }
 
@@ -236,7 +259,12 @@ fn visible_agents(topic: &UiTopic, show_archived: bool) -> Vec<&UiAgentSummary> 
     if show_archived {
         agents.sort_by_key(|summary| Reverse(summary.updated_at));
     } else {
-        agents.sort_by_key(|summary| summary.status != Status::Pinned);
+        agents.sort_by_key(|summary| {
+            (
+                summary.status != Status::Pinned,
+                Reverse(summary.created_at),
+            )
+        });
     }
     agents
 }

@@ -183,6 +183,7 @@ impl AgentRegistry {
                         .map(|(agent_id, agent)| UiAgentSummary {
                             agent_id,
                             display_name: agent.display_name,
+                            created_at: agent.created_at,
                             updated_at: agent.updated_at,
                             mode: agent.mode,
                             workspace: agent.workspace,

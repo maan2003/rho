@@ -258,6 +258,7 @@ mod tests {
         UiAgentSummary {
             agent_id: agent_id(id),
             display_name: None,
+            created_at: rho_core::UnixMs(id),
             updated_at: rho_core::UnixMs(id),
             mode: rho_ui_proto::AgentMode::deep_default(),
             workspace: rho_ui_proto::WorkspaceInfo::UserCheckout {
@@ -278,6 +279,7 @@ mod tests {
         UiAgentSummary {
             agent_id: agent_id(id),
             display_name: None,
+            created_at: rho_core::UnixMs(id),
             updated_at: rho_core::UnixMs(id),
             mode: rho_ui_proto::AgentMode::deep_default(),
             workspace: rho_ui_proto::WorkspaceInfo::Workspace {
