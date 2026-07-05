@@ -31,10 +31,14 @@ impl Span {
     }
 }
 
-/// Coarse block classification used for separator and elision decisions.
+/// Coarse block classification used for separators and transcript turn
+/// boundaries. Queued user messages render like user messages, but they do
+/// not start a real turn until the daemon confirms delivery as a
+/// [`UiBlock::UserMessage`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     User,
+    QueuedUser,
     Response { working: bool },
 }
 
@@ -78,7 +82,7 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => {
             BlockKind::Response { working: true }
         }
-        UiBlock::QueuedMessage { .. } => BlockKind::User,
+        UiBlock::QueuedMessage { .. } => BlockKind::QueuedUser,
     }
 }
 
@@ -89,11 +93,11 @@ fn separator(prev: Option<BlockKind>, current: BlockKind) -> Option<Span> {
         (None, _) => None,
         // A new user message starts a new turn; the previous response block
         // ended with a single newline, so one more makes a blank line.
-        (Some(BlockKind::Response { .. }), BlockKind::User) => {
+        (Some(BlockKind::Response { .. }), BlockKind::User | BlockKind::QueuedUser) => {
             Some(Span::new("\n", StyleClass::Default))
         }
         // User messages already end with a blank line.
-        (Some(BlockKind::User), _) => None,
+        (Some(BlockKind::User | BlockKind::QueuedUser), _) => None,
         // Consecutive response items are separated by their own trailing
         // newlines.
         (Some(BlockKind::Response { .. }), BlockKind::Response { .. }) => None,
@@ -435,6 +439,13 @@ mod tests {
         assert_eq!(
             separator(Some(BlockKind::User), BlockKind::Response { working: true }),
             None
+        );
+        assert_eq!(
+            separator(
+                Some(BlockKind::Response { working: true }),
+                BlockKind::QueuedUser
+            ),
+            Some(Span::new("\n", StyleClass::Default))
         );
     }
 }
