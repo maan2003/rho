@@ -5,6 +5,7 @@
 //! connection has received frames for it). Selection and next/previous
 //! cycling operate over live agents only.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 use camino::Utf8PathBuf;
@@ -191,11 +192,27 @@ impl AgentRegistry {
     /// the current selection. Cycling follows rail order (topics, then
     /// agents within each topic); agent id order is meaningless.
     pub fn next_live_agent(&self, delta: isize) -> Option<AgentId> {
-        let mut candidates = self
-            .topics
-            .iter()
-            .flat_map(UiTopic::agent_ids)
-            .collect::<Vec<_>>();
+        let mut topics = self.topics.iter().collect::<Vec<_>>();
+        topics.sort_by_key(|topic| topic.status != rho_ui_proto::Status::Pinned);
+
+        let mut candidates = Vec::new();
+        for topic in topics {
+            if topic.status == rho_ui_proto::Status::Archived {
+                continue;
+            }
+            let mut agents = topic
+                .agents
+                .iter()
+                .filter(|agent| agent.status != rho_ui_proto::Status::Archived)
+                .collect::<Vec<_>>();
+            agents.sort_by_key(|agent| {
+                (
+                    agent.status != rho_ui_proto::Status::Pinned,
+                    Reverse(agent.created_at),
+                )
+            });
+            candidates.extend(agents.into_iter().map(|agent| agent.agent_id));
+        }
         for agent_id in self.agents.keys() {
             if !candidates.contains(agent_id) {
                 candidates.push(*agent_id);
@@ -297,6 +314,31 @@ mod tests {
             status,
             agents,
         }
+    }
+
+    #[test]
+    fn cycling_follows_active_rail_order() {
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic(
+            1,
+            Status::Normal,
+            vec![
+                agent(1, Status::Normal),
+                agent(2, Status::Pinned),
+                agent(3, Status::Normal),
+            ],
+        )]);
+        for id in 1..=3 {
+            registry.mark_live(agent_id(id));
+        }
+
+        // Active rail order is pinned first, then newest-created first:
+        // 2, 3, 1. Forward cycling should move down that visible order.
+        registry.select_agent(agent_id(2));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
+        registry.select_agent(agent_id(3));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
+        assert_eq!(registry.next_live_agent(-1), Some(agent_id(2)));
     }
 
     #[test]
