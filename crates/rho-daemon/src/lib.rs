@@ -148,7 +148,7 @@ impl AgentRegistry {
                 topic_id
             }
         };
-        Self {
+        let registry = Self {
             db,
             auth,
             default_topic_id,
@@ -156,7 +156,9 @@ impl AgentRegistry {
             agents: Mutex::new(HashMap::new()),
             repos: Mutex::new(HashMap::new()),
             title_tasks: Mutex::new(HashSet::new()),
-        }
+        };
+        registry.load_non_archived_agents().await;
+        registry
     }
 
     fn topics(&self) -> Vec<UiTopic> {
@@ -231,6 +233,25 @@ impl AgentRegistry {
             .collect::<Vec<_>>();
         agents.sort_by_key(|(agent_id, _)| *agent_id);
         agents
+    }
+
+    async fn load_non_archived_agents(&self) {
+        let agent_ids = self.non_archived_agent_ids();
+        for agent_id in agent_ids {
+            if let Err(error) = self.load(agent_id).await {
+                eprintln!("rho-daemon: failed to load active agent {agent_id:?}: {error:#}");
+            }
+        }
+    }
+
+    fn non_archived_agent_ids(&self) -> Vec<AgentId> {
+        let read = self.db.read();
+        read.list_topics()
+            .into_iter()
+            .filter(|(_, topic)| topic.status != Status::Archived)
+            .flat_map(|(topic_id, _)| read.list_topic_agents(topic_id))
+            .filter(|agent_id| read.get_agent(*agent_id).status != Status::Archived)
+            .collect()
     }
 
     async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {

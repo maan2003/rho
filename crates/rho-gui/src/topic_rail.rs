@@ -5,11 +5,10 @@
 //! name as the header, which advertises that grouping exists. Pinned topics
 //! and agents sort first; archived ones are hidden until the "archived"
 //! view mode flips the filter, showing exactly what the normal view hides.
-//! Clicking an agent opens it (loading it on demand); the `+` row opens the
-//! draft compose view and doubles as its selection indicator.
+//! Clicking an agent opens it (loading archived agents on demand); the `+` row
+//! opens the draft compose view and doubles as its selection indicator.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
 
 use gpui::prelude::*;
 use gpui::{Context, Div, MouseButton, TextStyle, div, px};
@@ -34,7 +33,6 @@ pub fn render_topic_rail(
         )
     };
     let selected_agent = registry.selected_agent().cloned();
-    let live = registry.live_agents().cloned().collect::<BTreeSet<_>>();
 
     let mut visible_topics = registry
         .topics()
@@ -53,7 +51,6 @@ pub fn render_topic_rail(
                 topic,
                 agents,
                 selected_agent.as_ref(),
-                &live,
                 registry,
                 text_style,
                 selected_color,
@@ -273,7 +270,6 @@ fn render_topic_rows(
     topic: &UiTopic,
     agents: Vec<&UiAgentSummary>,
     selected_agent: Option<&AgentId>,
-    live: &BTreeSet<AgentId>,
     registry: &AgentRegistry,
     text_style: &TextStyle,
     selected_color: gpui::Hsla,
@@ -310,7 +306,6 @@ fn render_topic_rows(
                 .clone()
                 .unwrap_or_else(|| registry.agent_id_label(summary.agent_id));
             let selected = selected_agent == Some(agent_id);
-            let is_live = live.contains(agent_id);
             let pinned = summary.status == Status::Pinned;
             let text_color = if selected {
                 selected_color
@@ -319,7 +314,7 @@ fn render_topic_rows(
             };
             let icon_color = if selected {
                 selected_color
-            } else if is_live || pinned {
+            } else if pinned {
                 text_style.color.opacity(0.9)
             } else {
                 text_style.color.opacity(0.5)
