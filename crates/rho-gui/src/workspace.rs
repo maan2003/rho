@@ -1035,6 +1035,7 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
                     ));
                 }
             },
+            fast_mode: true,
         }),
         "fable" => Ok(AgentMode::Fable {
             effort: match effort.as_str() {
@@ -1055,12 +1056,15 @@ fn cycle_agent_mode_text(current: &str) -> &'static str {
     match parse_agent_mode(current).unwrap_or_else(|_| AgentMode::deep_default()) {
         AgentMode::Deep {
             effort: DeepEffort::Low,
+            ..
         } => "deep medium",
         AgentMode::Deep {
             effort: DeepEffort::Medium,
+            ..
         } => "deep xhigh",
         AgentMode::Deep {
             effort: DeepEffort::Xhigh,
+            ..
         } => "fable medium",
         AgentMode::Fable {
             effort: FableEffort::Medium,
@@ -1078,14 +1082,15 @@ struct ModeLabel {
 
 fn agent_mode_label(mode: AgentMode) -> ModeLabel {
     match mode {
-        AgentMode::Deep { effort } => {
+        AgentMode::Deep { effort, fast_mode } => {
             let effort = match effort {
                 DeepEffort::Low => "¹",
                 DeepEffort::Medium => "²",
                 DeepEffort::Xhigh => "³",
             };
+            let fast = if fast_mode { "⚡" } else { "" };
             ModeLabel {
-                text: format!("deep{effort}"),
+                text: format!("deep{effort}{fast}"),
                 family: ModeFamily::Deep,
             }
         }
@@ -1174,6 +1179,7 @@ mod tests {
             parse_agent_mode("deep low").unwrap(),
             AgentMode::Deep {
                 effort: DeepEffort::Low,
+                fast_mode: true,
             }
         );
         assert_eq!(
@@ -1190,21 +1196,31 @@ mod tests {
     fn renders_compact_agent_mode_labels() {
         let low = agent_mode_label(AgentMode::Deep {
             effort: DeepEffort::Low,
+            fast_mode: true,
         });
-        assert_eq!(low.text, "deep¹");
+        assert_eq!(low.text, "deep¹⚡");
         assert_eq!(low.family, ModeFamily::Deep);
 
         let medium = agent_mode_label(AgentMode::Deep {
             effort: DeepEffort::Medium,
+            fast_mode: true,
         });
-        assert_eq!(medium.text, "deep²");
+        assert_eq!(medium.text, "deep²⚡");
         assert_eq!(medium.family, ModeFamily::Deep);
 
         let xhigh = agent_mode_label(AgentMode::Deep {
             effort: DeepEffort::Xhigh,
+            fast_mode: true,
         });
-        assert_eq!(xhigh.text, "deep³");
+        assert_eq!(xhigh.text, "deep³⚡");
         assert_eq!(xhigh.family, ModeFamily::Deep);
+
+        let slow = agent_mode_label(AgentMode::Deep {
+            effort: DeepEffort::Medium,
+            fast_mode: false,
+        });
+        assert_eq!(slow.text, "deep²");
+        assert_eq!(slow.family, ModeFamily::Deep);
 
         let fable = agent_mode_label(AgentMode::Fable {
             effort: FableEffort::Medium,

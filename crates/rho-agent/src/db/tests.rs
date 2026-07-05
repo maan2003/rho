@@ -53,6 +53,22 @@ fn agent_db_migrations_eventually_reach_current_format() {
     }
 }
 
+#[test]
+fn deep_fast_mode_controls_service_tier() {
+    let fast = AgentMode::deep_default().inference_config().unwrap();
+    let slow = AgentMode::Deep {
+        effort: DeepEffort::Medium,
+        fast_mode: false,
+    }
+    .inference_config()
+    .unwrap();
+
+    let InferenceConfig::Gpt5(fast) = fast;
+    let InferenceConfig::Gpt5(slow) = slow;
+    assert_eq!(fast.service_tier, ServiceTier::Priority);
+    assert_eq!(slow.service_tier, ServiceTier::Normal);
+}
+
 #[tokio::test]
 async fn agent_event_positions_sort_by_lineage_then_seq() {
     let temp = tempfile::tempdir().unwrap();

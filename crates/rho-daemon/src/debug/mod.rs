@@ -231,7 +231,10 @@ fn status_name(status: Status) -> &'static str {
 
 fn mode_name(mode: AgentMode) -> String {
     match mode {
-        AgentMode::Deep { effort } => format!("deep {}", deep_effort_name(effort)),
+        AgentMode::Deep { effort, fast_mode } => {
+            let fast = if fast_mode { " ⚡" } else { "" };
+            format!("deep{fast} {}", deep_effort_name(effort))
+        }
         AgentMode::Fable { effort } => format!("fable {}", fable_effort_name(effort)),
     }
 }

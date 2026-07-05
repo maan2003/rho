@@ -7,7 +7,7 @@ use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
-use rho_inference::config::{Effort as InferenceEffort, InferenceConfig};
+use rho_inference::config::{Effort as InferenceEffort, InferenceConfig, ServiceTier};
 use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
@@ -31,7 +31,7 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "c7b31a9e";
+const CURRENT_AGENT_DB_FORMAT: &str = "c7b31a9e-fast-mode";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -39,7 +39,11 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "c7b31a9e",
+    to: CURRENT_AGENT_DB_FORMAT,
+    migrate: migrate_deep_fast_mode_default,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -175,8 +179,14 @@ pub enum AgentRuntime {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum AgentMode {
-    Deep { effort: DeepEffort },
-    Fable { effort: FableEffort },
+    Deep {
+        effort: DeepEffort,
+        #[senax(default)]
+        fast_mode: bool,
+    },
+    Fable {
+        effort: FableEffort,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -196,16 +206,22 @@ impl AgentMode {
     pub fn deep_default() -> Self {
         Self::Deep {
             effort: DeepEffort::Medium,
+            fast_mode: true,
         }
     }
 
     pub fn inference_config(self) -> Option<InferenceConfig> {
-        let Self::Deep { effort } = self else {
+        let Self::Deep { effort, fast_mode } = self else {
             return None;
         };
         let mut config = InferenceConfig::deep();
         match &mut config {
-            InferenceConfig::Gpt5(config) => config.effort = effort.to_inference_effort(),
+            InferenceConfig::Gpt5(config) => {
+                config.effort = effort.to_inference_effort();
+                if !fast_mode {
+                    config.service_tier = ServiceTier::Normal;
+                }
+            }
         }
         Some(config)
     }
@@ -604,6 +620,28 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
+}
+
+fn migrate_deep_fast_mode_default(write: &mut WriteTxn) {
+    let agents: Vec<_> = write
+        .open_table(AGENTS)
+        .iter()
+        .map(|(key, value)| (key.value(), value.value().into_owned()))
+        .collect();
+    let mut table = write.open_table(AGENTS);
+    for (agent_id, mut agent) in agents {
+        if let AgentMode::Deep {
+            effort,
+            fast_mode: false,
+        } = agent.mode
+        {
+            agent.mode = AgentMode::Deep {
+                effort,
+                fast_mode: true,
+            };
+            table.insert(&agent_id, SenValue::borrowed(&agent));
+        }
+    }
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
