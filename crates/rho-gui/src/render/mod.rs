@@ -32,9 +32,9 @@ impl Span {
 }
 
 /// Coarse block classification used for separators and transcript turn
-/// boundaries. Queued user messages render like user messages, but they do
-/// not start a real turn until the daemon confirms delivery as a
-/// [`UiBlock::UserMessage`].
+/// boundaries. Immediate queued messages render like user messages and open
+/// a turn right away; queued/steering placeholders render like user messages
+/// but stay inside the current live turn until delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     User,
@@ -82,7 +82,10 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => {
             BlockKind::Response { working: true }
         }
-        UiBlock::QueuedMessage { .. } => BlockKind::QueuedUser,
+        UiBlock::QueuedMessage { delivery, .. } => match delivery {
+            MessageDelivery::Immediate => BlockKind::User,
+            MessageDelivery::NextRequest | MessageDelivery::NextTurn => BlockKind::QueuedUser,
+        },
     }
 }
 
@@ -446,6 +449,31 @@ mod tests {
                 BlockKind::QueuedUser
             ),
             Some(Span::new("\n", StyleClass::Default))
+        );
+    }
+
+    #[test]
+    fn only_immediate_queued_messages_are_turn_users() {
+        assert_eq!(
+            block_kind(&UiBlock::QueuedMessage {
+                text: "now".to_owned(),
+                delivery: MessageDelivery::Immediate,
+            }),
+            BlockKind::User
+        );
+        assert_eq!(
+            block_kind(&UiBlock::QueuedMessage {
+                text: "later".to_owned(),
+                delivery: MessageDelivery::NextRequest,
+            }),
+            BlockKind::QueuedUser
+        );
+        assert_eq!(
+            block_kind(&UiBlock::QueuedMessage {
+                text: "later".to_owned(),
+                delivery: MessageDelivery::NextTurn,
+            }),
+            BlockKind::QueuedUser
         );
     }
 }

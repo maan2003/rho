@@ -4,6 +4,7 @@
 //! Pure over the block list plus a per-block visibility mask; the transcript
 //! model materializes the resulting index ranges into buffer anchors.
 
+use rho_ui_proto::MessageDelivery;
 use rho_ui_proto::remote::{UiBlock, UiMessagePhase};
 
 pub const LIMITED_TAIL_ROWS: u32 = 12;
@@ -113,7 +114,14 @@ pub fn turn_start_index(blocks: &[UiBlock], block_index: usize) -> usize {
 }
 
 fn is_user(block: &UiBlock) -> bool {
-    matches!(block, UiBlock::UserMessage { .. })
+    matches!(
+        block,
+        UiBlock::UserMessage { .. }
+            | UiBlock::QueuedMessage {
+                delivery: MessageDelivery::Immediate,
+                ..
+            }
+    )
 }
 
 pub fn elision_label(tool_count: usize) -> String {
@@ -149,6 +157,13 @@ mod tests {
     fn user(text: &str) -> UiBlock {
         UiBlock::UserMessage {
             text: text.to_owned(),
+        }
+    }
+
+    fn queued(text: &str, delivery: MessageDelivery) -> UiBlock {
+        UiBlock::QueuedMessage {
+            text: text.to_owned(),
+            delivery,
         }
     }
 
@@ -385,6 +400,64 @@ mod tests {
                     end_block: 3,
                     tool_count: 1,
                     tail_rows: LIMITED_TAIL_ROWS,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn immediate_queued_message_starts_a_turn() {
+        let blocks = vec![
+            user("one"),
+            tool("a"),
+            queued("two", MessageDelivery::Immediate),
+            tool("b"),
+        ];
+        let plans = elision_plans(&blocks, &all_visible(&blocks));
+        assert_eq!(
+            plans,
+            vec![
+                ElisionPlan {
+                    start_block: 1,
+                    end_block: 1,
+                    tool_count: 1,
+                    tail_rows: LIMITED_TAIL_ROWS,
+                },
+                ElisionPlan {
+                    start_block: 3,
+                    end_block: 3,
+                    tool_count: 1,
+                    tail_rows: LIMITED_TAIL_ROWS,
+                }
+            ]
+        );
+        assert_eq!(turn_start_index(&blocks, 3), 2);
+    }
+
+    #[test]
+    fn non_immediate_queued_message_stays_in_current_turn() {
+        let blocks = vec![
+            user("one"),
+            tool("a"),
+            queued("steer", MessageDelivery::NextRequest),
+            tool("b"),
+        ];
+        assert_eq!(turn_start_index(&blocks, 3), 0);
+        let plans = elision_plans(&blocks, &all_visible(&blocks));
+        assert_eq!(
+            plans,
+            vec![
+                ElisionPlan {
+                    start_block: 1,
+                    end_block: 1,
+                    tool_count: 1,
+                    tail_rows: 0,
+                },
+                ElisionPlan {
+                    start_block: 3,
+                    end_block: 3,
+                    tool_count: 1,
+                    tail_rows: 0,
                 }
             ]
         );
