@@ -235,7 +235,10 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
         agent(1),
         snapshot_frame(state(
             vec![user("do work")],
-            vec![assistant(&long_working_text(), None)],
+            vec![assistant(
+                &long_working_text(),
+                Some(UiMessagePhase::Commentary),
+            )],
         )),
     );
     assert!(has_display_elision(&workspace, cx));
@@ -246,7 +249,7 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
     );
     assert!(
         !text.contains("alpha"),
-        "unknown-phase pending assistant should be elided: {text:?}"
+        "explicit commentary assistant should be elided: {text:?}"
     );
     assert!(
         text.contains("echo"),
@@ -591,7 +594,10 @@ fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
         agent(1),
         snapshot_frame(state(
             vec![user("do work")],
-            vec![assistant(&long_working_text(), None)],
+            vec![assistant(
+                &long_working_text(),
+                Some(UiMessagePhase::Commentary),
+            )],
         )),
     );
     let collapsed = display_text(&workspace, cx);

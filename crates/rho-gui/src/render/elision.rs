@@ -29,9 +29,8 @@ pub struct ElisionPlan {
 /// boundary (its end is the last visible block before `from_block`); it is
 /// extended or flushed exactly as a full recomputation would.
 ///
-/// `turn_in_progress` says the last turn is still being produced: its
-/// trailing unlabeled assistant message may yet be followed by tool calls,
-/// so it stays working instead of being read as the final answer.
+/// `turn_in_progress` says the last turn is still being produced; open turns
+/// keep a limited visible tail in their folds instead of collapsing fully.
 pub fn elision_plans_from(
     blocks: &[UiBlock],
     visible: &[bool],
@@ -51,16 +50,12 @@ pub fn elision_plans_from(
             .unwrap_or(blocks.len());
         let turn = &blocks[turn_start..turn_end];
         let tail_open = turn_in_progress && turn_end == blocks.len();
-        let tool_count = turn
-            .iter()
-            .filter(|block| matches!(block, UiBlock::Tool(_)))
-            .count();
         let has_non_working = (0..turn.len())
-            .any(|offset| !is_user(&turn[offset]) && !block_is_working(turn, offset, tail_open));
-        let tail_rows = if has_non_working {
-            0
-        } else {
+            .any(|offset| !is_user(&turn[offset]) && !block_is_working(&turn[offset]));
+        let tail_rows = if tail_open || !has_non_working {
             LIMITED_TAIL_ROWS
+        } else {
+            0
         };
 
         for offset in 0..turn.len() {
@@ -68,17 +63,21 @@ pub fn elision_plans_from(
             if !visible.get(index).copied().unwrap_or(false) {
                 continue;
             }
-            if block_is_working(turn, offset, tail_open) {
+            if block_is_working(&turn[offset]) {
+                let is_tool = matches!(turn[offset], UiBlock::Tool(_));
                 match current.as_mut() {
-                    Some(plan) if plan.tool_count == tool_count && plan.tail_rows == tail_rows => {
+                    Some(plan) if plan.tail_rows == tail_rows => {
                         plan.end_block = index;
+                        if is_tool {
+                            plan.tool_count += 1;
+                        }
                     }
                     _ => {
                         plans.extend(current.take());
                         current = Some(ElisionPlan {
                             start_block: index,
                             end_block: index,
-                            tool_count,
+                            tool_count: usize::from(is_tool),
                             tail_rows,
                         });
                     }
@@ -112,24 +111,16 @@ pub fn elision_label(tool_count: usize) -> String {
     }
 }
 
-/// Whether `turn[offset]` is working output. Assistant messages without a
-/// phase label (Claude-backed agents) are classified structurally: the
-/// turn's trailing assistant message is its final answer, anything followed
-/// by more tool activity is commentary. While the turn is still open
-/// (`tail_open`), trailing text may yet turn out to be commentary, so it
-/// counts as working.
-fn block_is_working(turn: &[UiBlock], offset: usize, tail_open: bool) -> bool {
-    match &turn[offset] {
+/// Whether a block is working output. Assistant messages without a phase
+/// label are treated as final/non-working; only explicit commentary is folded
+/// as working text.
+fn block_is_working(block: &UiBlock) -> bool {
+    match block {
         UiBlock::UserMessage { .. } => false,
         UiBlock::AssistantMessage { phase, .. } => match phase {
             Some(UiMessagePhase::FinalAnswer) => false,
             Some(UiMessagePhase::Commentary) => true,
-            None => {
-                tail_open
-                    || turn[offset + 1..].iter().any(|later| {
-                        matches!(later, UiBlock::Tool(_) | UiBlock::AssistantMessage { .. })
-                    })
-            }
+            None => false,
         },
         UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => true,
         UiBlock::QueuedMessage { .. } => false,
@@ -263,10 +254,39 @@ mod tests {
     }
 
     #[test]
-    fn trailing_unlabeled_message_is_the_final_answer() {
+    fn unlabeled_messages_split_tool_elisions() {
         let blocks = vec![
             user("go"),
-            unlabeled("thinking"),
+            tool("a"),
+            unlabeled("done"),
+            tool("b"),
+            unlabeled("also done"),
+        ];
+        let plans = elision_plans(&blocks, &all_visible(&blocks));
+        assert_eq!(
+            plans,
+            vec![
+                ElisionPlan {
+                    start_block: 1,
+                    end_block: 1,
+                    tool_count: 1,
+                    tail_rows: 0,
+                },
+                ElisionPlan {
+                    start_block: 3,
+                    end_block: 3,
+                    tool_count: 1,
+                    tail_rows: 0,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn unlabeled_before_tool_is_not_working() {
+        let blocks = vec![
+            user("go"),
+            unlabeled("I'll check"),
             tool("a"),
             unlabeled("done"),
         ];
@@ -274,7 +294,7 @@ mod tests {
         assert_eq!(
             plans,
             vec![ElisionPlan {
-                start_block: 1,
+                start_block: 2,
                 end_block: 2,
                 tool_count: 1,
                 tail_rows: 0,
@@ -290,36 +310,40 @@ mod tests {
     }
 
     #[test]
-    fn open_turn_keeps_trailing_unlabeled_text_working() {
+    fn open_turn_does_not_make_unlabeled_text_working() {
         let blocks = vec![user("go"), unlabeled("streaming...")];
         let plans = elision_plans_from(&blocks, &all_visible(&blocks), 0, None, true);
-        assert_eq!(
-            plans,
-            vec![ElisionPlan {
-                start_block: 1,
-                end_block: 1,
-                tool_count: 0,
-                tail_rows: LIMITED_TAIL_ROWS,
-            }]
-        );
+        assert_eq!(plans, Vec::new());
     }
 
     #[test]
-    fn open_turn_only_affects_the_last_turn() {
+    fn open_turn_only_keeps_the_last_turn_tail_limited() {
         let blocks = vec![
             user("one"),
             unlabeled("done"),
             user("two"),
-            unlabeled("wip"),
+            tool("a"),
+            unlabeled("streaming..."),
         ];
-        let plans = elision_plans_from(&blocks, &all_visible(&blocks), 0, None, true);
+        let visible = all_visible(&blocks);
+        let open_plans = elision_plans_from(&blocks, &visible, 0, None, true);
         assert_eq!(
-            plans,
+            open_plans,
             vec![ElisionPlan {
                 start_block: 3,
                 end_block: 3,
-                tool_count: 0,
+                tool_count: 1,
                 tail_rows: LIMITED_TAIL_ROWS,
+            }]
+        );
+        let closed_plans = elision_plans_from(&blocks, &visible, 0, None, false);
+        assert_eq!(
+            closed_plans,
+            vec![ElisionPlan {
+                start_block: 3,
+                end_block: 3,
+                tool_count: 1,
+                tail_rows: 0,
             }]
         );
     }
