@@ -134,6 +134,7 @@ impl Workspace {
                 self.workdirs = workdirs;
                 self.default_topic_id = Some(default_topic_id);
                 self.connected = true;
+                self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.registry.active_pane(), ActivePane::Startup) {
                     // The startup scaffold guessed before daemon data existed;
                     // refresh it now that workdir names and topics are known.
@@ -144,6 +145,7 @@ impl Workspace {
             }
             ConnEvent::TopicCreated(topic) => {
                 self.registry.add_topic(topic);
+                self.refresh_draft_agent_targets(cx);
                 cx.notify();
             }
             ConnEvent::AgentCreated(agent_id) => {
@@ -177,6 +179,7 @@ impl Workspace {
                     .and_then(|state| state.context_used);
                 let summary = self.store.apply(agent_id, frame);
                 self.registry.mark_live(agent_id);
+                self.refresh_draft_agent_targets(cx);
                 let new_context = self
                     .store
                     .get(&agent_id)
@@ -978,11 +981,37 @@ impl Workspace {
         self.registry.agent_mode(*agent_id).map(agent_mode_label)
     }
 
-    pub fn live_agent_names(&self) -> Vec<String> {
-        self.registry
-            .live_agents()
-            .map(|agent_id| self.registry.agent_id_label(*agent_id))
-            .collect()
+    pub fn live_agent_targets(&self) -> Vec<crate::commands::Candidate> {
+        let mut candidates = Vec::new();
+        for agent_id in self.registry.live_agents() {
+            let id_label = self.registry.agent_id_label(*agent_id);
+            let display_name = self
+                .registry
+                .agent_display_name(*agent_id)
+                .map(str::to_owned);
+            candidates.push(crate::commands::Candidate {
+                value: id_label.clone(),
+                description: display_name.clone().unwrap_or_else(|| "agent".to_owned()),
+            });
+        }
+        candidates
+    }
+
+    fn agent_target_hints(&self) -> Vec<(String, String)> {
+        let mut hints = Vec::new();
+        for agent_id in self.registry.live_agents() {
+            let id_label = self.registry.agent_id_label(*agent_id);
+            if let Some(display_name) = self.registry.agent_display_name(*agent_id) {
+                hints.push((id_label, display_name.to_owned()));
+            }
+        }
+        hints
+    }
+
+    fn refresh_draft_agent_targets(&mut self, cx: &mut Context<Self>) {
+        let hints = self.agent_target_hints();
+        self.draft_view
+            .update(cx, |view, cx| view.set_start_target_hints(hints, cx));
     }
 
     fn ensure_duration_timer(&mut self, cx: &mut Context<Self>) {

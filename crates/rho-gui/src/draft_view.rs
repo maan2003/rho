@@ -26,6 +26,7 @@ const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
 const WORKDIR_LABEL_INLAY_ID: usize = 1;
 const MODE_LABEL_INLAY_ID: usize = 2;
 const START_LABEL_INLAY_ID: usize = 3;
+const START_TARGET_HINT_INLAY_ID: usize = 4;
 
 /// The start field's default base: the parents of the user's working copy —
 /// visible and editable rather than an empty field with implicit meaning.
@@ -63,6 +64,7 @@ pub struct DraftView {
     mode_buffer: Entity<Buffer>,
     start_buffer: Entity<Buffer>,
     start_mode: StartFieldMode,
+    start_target_hints: Vec<(String, String)>,
     body_buffer: Entity<Buffer>,
     body_end: text::Anchor,
     suppress_draft_activation: bool,
@@ -155,6 +157,7 @@ impl DraftView {
             cx.subscribe(&start_buffer, |this, _, event, cx| {
                 if matches!(event, BufferEvent::Edited { .. }) {
                     this.note_draft_edit(cx);
+                    this.update_start_target_hint(cx);
                 }
             }),
         ];
@@ -169,6 +172,7 @@ impl DraftView {
             mode_buffer,
             start_buffer,
             start_mode: StartFieldMode::NewOn,
+            start_target_hints: Vec::new(),
             body_buffer,
             body_end,
             suppress_draft_activation: false,
@@ -178,6 +182,7 @@ impl DraftView {
         this.insert_workdir_label(cx);
         this.insert_mode_label(cx);
         this.insert_start_label(cx);
+        this.update_start_target_hint(cx);
         this.insert_body_gap(cx);
         this.pin_autoscroll(cx);
         this.update_body_chrome(cx);
@@ -233,6 +238,12 @@ impl DraftView {
             buffer.edit([(0..len, text)], None, cx);
         });
         self.suppress_draft_activation = false;
+        self.update_start_target_hint(cx);
+    }
+
+    pub fn set_start_target_hints(&mut self, hints: Vec<(String, String)>, cx: &mut Context<Self>) {
+        self.start_target_hints = hints;
+        self.update_start_target_hint(cx);
     }
 
     /// Shift-Tab while the cursor is in the start field: flip how the
@@ -243,6 +254,7 @@ impl DraftView {
             StartFieldMode::Join => StartFieldMode::NewOn,
         };
         self.insert_start_label(cx);
+        self.update_start_target_hint(cx);
         cx.notify();
     }
 
@@ -438,6 +450,29 @@ impl DraftView {
                 )],
                 cx,
             );
+        });
+    }
+
+    fn update_start_target_hint(&mut self, cx: &mut Context<Self>) {
+        let target = self.start_text(cx).trim().to_owned();
+        let hint = self
+            .start_target_hints
+            .iter()
+            .find(|(label, _)| label == &target)
+            .map(|(_, hint)| hint);
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let start_buffer = self.start_buffer.read(cx);
+        let Some(field_end) =
+            snapshot.anchor_in_excerpt(start_buffer.anchor_after(start_buffer.len()))
+        else {
+            return;
+        };
+        let inlays = hint
+            .map(|hint| Inlay::custom(START_TARGET_HINT_INLAY_ID, field_end, format!("  {hint}")))
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(&[InlayId::Custom(START_TARGET_HINT_INLAY_ID)], inlays, cx);
         });
     }
 

@@ -22,17 +22,16 @@ pub struct Candidate {
 pub fn completions_for(
     text_before_cursor: &str,
     workdirs: &[(String, String)],
-    live_agents: &[String],
+    live_agents: &[Candidate],
     topics: &[String],
 ) -> Vec<Candidate> {
     if let Some(mention) = mention_prefix(text_before_cursor) {
         return live_agents
             .iter()
-            .filter(|agent| fuzzy_contains(agent, mention))
-            .map(|agent| Candidate {
-                value: agent.clone(),
-                description: "agent".to_owned(),
+            .filter(|agent| {
+                fuzzy_contains(&agent.value, mention) || fuzzy_contains(&agent.description, mention)
             })
+            .cloned()
             .collect();
     }
     let trimmed = text_before_cursor.trim_start();
@@ -79,17 +78,19 @@ fn mention_prefix(text: &str) -> Option<&str> {
 
 /// Completion inside the draft's start field buffer: `user` plus the live
 /// agent labels, filtered by the token being typed.
-pub fn start_field_candidates(text_before_cursor: &str, live_agents: &[String]) -> Vec<Candidate> {
+pub fn start_field_candidates(
+    text_before_cursor: &str,
+    live_agents: &[Candidate],
+) -> Vec<Candidate> {
     let needle = last_token(text_before_cursor);
     std::iter::once(Candidate {
         value: "user".to_owned(),
         description: "your checkout (Join mode)".to_owned(),
     })
-    .chain(live_agents.iter().map(|agent| Candidate {
-        value: agent.clone(),
-        description: "agent".to_owned(),
-    }))
-    .filter(|candidate| fuzzy_contains(&candidate.value, needle))
+    .chain(live_agents.iter().cloned())
+    .filter(|candidate| {
+        fuzzy_contains(&candidate.value, needle) || fuzzy_contains(&candidate.description, needle)
+    })
     .collect()
 }
 
@@ -197,7 +198,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
                 let workspace = workspace.read(cx);
                 (
                     workspace.workdir_table(),
-                    workspace.live_agent_names(),
+                    workspace.live_agent_targets(),
                     workspace.topic_names(),
                 )
             })
@@ -275,13 +276,17 @@ mod tests {
 
     #[test]
     fn start_field_offers_user_and_agents() {
-        let agents = vec!["a3f".to_owned(), "a41".to_owned()];
+        let agents = vec![Candidate {
+            value: "a3f".to_owned(),
+            description: "fix tests".to_owned(),
+        }];
         let candidates = start_field_candidates("", &agents);
         assert_eq!(candidates[0].value, "user");
         assert!(candidates.iter().any(|c| c.value == "a3f"));
-        let candidates = start_field_candidates("a4", &agents);
+        let candidates = start_field_candidates("tes", &agents);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "a41");
+        assert_eq!(candidates[0].value, "a3f");
+        assert_eq!(candidates[0].description, "fix tests");
     }
 
     #[test]
@@ -313,7 +318,16 @@ mod tests {
 
     #[test]
     fn mentions_complete_live_agents() {
-        let live = vec!["helper".to_owned(), "worker".to_owned()];
+        let live = vec![
+            Candidate {
+                value: "helper".to_owned(),
+                description: "agent".to_owned(),
+            },
+            Candidate {
+                value: "worker".to_owned(),
+                description: "agent".to_owned(),
+            },
+        ];
         let candidates = completions_for("ask @w", &[], &live, &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "worker");

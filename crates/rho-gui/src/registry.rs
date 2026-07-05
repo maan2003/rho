@@ -126,6 +126,11 @@ impl AgentRegistry {
             .find(|agent| agent.agent_id == agent_id)
     }
 
+    pub fn agent_display_name(&self, agent_id: AgentId) -> Option<&str> {
+        self.agent_summary(agent_id)
+            .and_then(|agent| agent.display_name.as_deref())
+    }
+
     pub fn add_topic(&mut self, topic: UiTopic) {
         // Topics stay in the daemon's creation order; a new topic is the
         // newest, so it belongs at the end.
@@ -215,13 +220,15 @@ impl AgentRegistry {
     }
 
     /// Resolves an agent label (as produced by [`Self::agent_id_label`],
-    /// with or without a leading `@`) back to the agent id.
+    /// with or without a leading `@`) or display name back to the agent id.
     pub fn agent_by_label(&self, label: &str) -> Option<AgentId> {
         let label = label.strip_prefix('@').unwrap_or(label);
-        self.agents
-            .keys()
-            .copied()
-            .find(|agent_id| self.agent_id_label(*agent_id) == label)
+        self.agents.keys().copied().find(|agent_id| {
+            self.agent_id_label(*agent_id) == label
+                || self
+                    .agent_display_name(*agent_id)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(label))
+        })
     }
 
     pub fn live_agents(&self) -> impl Iterator<Item = &AgentId> {
@@ -257,6 +264,13 @@ mod tests {
                 repo: "/tmp".into(),
             },
             status,
+        }
+    }
+
+    fn named_agent(id: u64, name: &str) -> UiAgentSummary {
+        UiAgentSummary {
+            display_name: Some(name.to_owned()),
+            ..agent(id, Status::Normal)
         }
     }
 
@@ -347,6 +361,22 @@ mod tests {
         assert_eq!(
             registry.agent_id_label(id),
             format!("a{}", &id.encoded()[..3])
+        );
+    }
+
+    #[test]
+    fn agent_lookup_accepts_display_name() {
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic(
+            1,
+            Status::Normal,
+            vec![named_agent(1, "Fix Tests")],
+        )]);
+
+        assert_eq!(registry.agent_by_label("fix tests"), Some(agent_id(1)));
+        assert_eq!(
+            registry.agent_by_label(&registry.agent_id_label(agent_id(1))),
+            Some(agent_id(1))
         );
     }
 }
