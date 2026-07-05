@@ -724,9 +724,13 @@ impl ChatTerm {
                 UiBlock::Notice { text } => {
                     self.print_system(text);
                 }
-                UiBlock::QueuedMessage { text, delivery } => {
-                    self.print_system(&format!("{text} {}", delivery_label(*delivery)));
-                }
+                UiBlock::QueuedMessage { text, delivery } => match delivery_label(*delivery) {
+                    Some(label) => self.print_system(&format!("{text} {label}")),
+                    None => {
+                        self.handle
+                            .print_output("history-message", user_message_block(text));
+                    }
+                },
             }
         }
     }
@@ -955,10 +959,15 @@ impl StreamingRenderer {
             UiBlock::Notice { text } => {
                 self.set_index_block(index, "notice", StyledBlock::new(dim_text(text)));
             }
-            UiBlock::QueuedMessage { text, delivery } => {
-                let queued = format!("{text} {}", delivery_label(*delivery));
-                self.set_index_block(index, "queued", StyledBlock::new(dim_text(&queued)));
-            }
+            UiBlock::QueuedMessage { text, delivery } => match delivery_label(*delivery) {
+                Some(label) => {
+                    let queued = format!("{text} {label}");
+                    self.set_index_block(index, "queued", StyledBlock::new(dim_text(&queued)));
+                }
+                None => {
+                    self.set_index_block(index, "user", user_message_block(text));
+                }
+            },
         }
     }
 
@@ -1095,10 +1104,11 @@ fn assistant_message_block(text: &str) -> StyledBlock {
     markdown_block(text)
 }
 
-fn delivery_label(delivery: MessageDelivery) -> &'static str {
+fn delivery_label(delivery: MessageDelivery) -> Option<&'static str> {
     match delivery {
-        MessageDelivery::NextRequest => "(steering)",
-        MessageDelivery::NextTurn => "(queued)",
+        MessageDelivery::Immediate => None,
+        MessageDelivery::NextRequest => Some("(steering)"),
+        MessageDelivery::NextTurn => Some("(queued)"),
     }
 }
 

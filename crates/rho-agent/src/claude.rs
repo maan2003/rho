@@ -272,26 +272,31 @@ impl ClaudeLoop {
                     self.fail(error);
                     return;
                 }
-                // The --replay-user-messages echo inserts every message into
-                // history when it enters context. Mid-turn sends additionally
-                // mirror the CLI's queue meanwhile; turn-opening sends show
-                // nothing until the echo — it arrives as the turn starts, and
-                // a moment of nothing beats a queue-label flicker.
-                if matches!(
+                // Every message mirrors into the queue until its
+                // --replay-user-messages echo confirms it entered context and
+                // promotes it into history. Mid-turn sends wait on the CLI's
+                // internal queue and show the steering label; turn-opening
+                // sends render as a plain user message right away (the echo
+                // can trail a cold CLI spawn by many seconds).
+                let busy = matches!(
                     self.state.read().expect("poison").kind,
                     AgentStateKind::ApiStreaming { .. }
-                ) {
-                    let content = vec![ContentPart::Text { text: text.clone() }];
-                    self.state
-                        .write()
-                        .expect("poison")
-                        .queued_messages
-                        .push(QueuedUserMessage {
-                            content: Arc::new(content),
-                            delivery: MessageDelivery::NextRequest,
-                        });
-                    self.notify.notify_waiters();
-                }
+                );
+                let delivery = if busy {
+                    MessageDelivery::NextRequest
+                } else {
+                    MessageDelivery::Immediate
+                };
+                let content = vec![ContentPart::Text { text: text.clone() }];
+                self.state
+                    .write()
+                    .expect("poison")
+                    .queued_messages
+                    .push(QueuedUserMessage {
+                        content: Arc::new(content),
+                        delivery,
+                    });
+                self.notify.notify_waiters();
                 if let Err(error) = self.process.as_mut().unwrap().send_user_message(text).await {
                     self.fail(error);
                 }

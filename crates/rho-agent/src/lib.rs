@@ -86,6 +86,10 @@ pub struct QueuedUserMessage {
 /// When a message sent while the agent is busy enters model context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum MessageDelivery {
+    /// Nothing to wait for: the message opens a turn right away. Renders as a
+    /// plain user message, never with a queue label. Sent while busy it
+    /// behaves like `NextRequest`.
+    Immediate,
     /// Steer the current turn: delivered at the next inference request, i.e.
     /// right after the in-flight tool batch commits its results.
     NextRequest,
@@ -710,7 +714,7 @@ impl AgentLoop {
         let mut held = Vec::new();
         for message in std::mem::take(&mut state.queued_messages) {
             if boundary == MessageDelivery::NextTurn
-                || message.delivery == MessageDelivery::NextRequest
+                || message.delivery != MessageDelivery::NextTurn
             {
                 self.persist_event(AgentEvent::UserMessage {
                     content: Cow::Borrowed(message.content.as_slice()),

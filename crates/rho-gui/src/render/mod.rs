@@ -150,14 +150,17 @@ pub fn render_block(
             gutter_span = Some(spans.len());
             spans.push(Span::new(text.clone(), StyleClass::UserMessage));
             let label = match delivery {
-                MessageDelivery::NextRequest => " (steering)",
-                MessageDelivery::NextTurn => " (queued)",
+                MessageDelivery::Immediate => None,
+                MessageDelivery::NextRequest => Some(" (steering)"),
+                MessageDelivery::NextTurn => Some(" (queued)"),
             };
-            inlay = Some(InlaySpec {
-                span_index: spans.len(),
-                content: InlayContent::Label(label),
-            });
-            spans.push(Span::new("", StyleClass::SystemInfo));
+            if let Some(label) = label {
+                inlay = Some(InlaySpec {
+                    span_index: spans.len(),
+                    content: InlayContent::Label(label),
+                });
+                spans.push(Span::new("", StyleClass::SystemInfo));
+            }
             spans.push(Span::new("\n\n", StyleClass::Default));
         }
     }
