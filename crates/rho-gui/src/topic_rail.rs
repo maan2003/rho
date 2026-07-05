@@ -64,7 +64,7 @@ pub fn render_topic_rail(
     div()
         .id("rho-gui-topic-rail")
         .h_full()
-        .w(px(224.))
+        .w(px(275.))
         .flex_none()
         .border_r_1()
         .border_color(border_color)
