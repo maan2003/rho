@@ -272,6 +272,10 @@ impl ChatApp {
             rho_commands::Command::AgentArchive => {
                 self.toggle_agent_status(rho_ui_proto::Status::Archived);
             }
+            rho_commands::Command::AgentFast { .. } | rho_commands::Command::AgentEffort { .. } => {
+                self.term
+                    .print_system("runtime mode changes are only available in rho-gui");
+            }
             rho_commands::Command::TopicNew { name } => {
                 self.term.print_system(&format!("creating topic `{name}`"));
                 self.agent.new_topic(name);

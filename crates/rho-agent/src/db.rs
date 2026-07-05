@@ -39,11 +39,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "c7b31a9e",
-    to: CURRENT_AGENT_DB_FORMAT,
-    migrate: migrate_deep_config_encoding,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -702,18 +698,6 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
-}
-
-fn migrate_deep_config_encoding(write: &mut WriteTxn) {
-    let agents: Vec<_> = write
-        .open_table(AGENTS)
-        .iter()
-        .map(|(key, value)| (key.value(), value.value().into_owned()))
-        .collect();
-    let mut table = write.open_table(AGENTS);
-    for (agent_id, agent) in agents {
-        table.insert(&agent_id, SenValue::borrowed(&agent));
-    }
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
