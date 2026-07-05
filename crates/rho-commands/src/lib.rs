@@ -50,7 +50,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "agent effort",
         usage: ":agent effort <low|medium|xhigh>",
-        description: "Set reasoning effort for the current Deep agent",
+        description: "Set reasoning effort for the current agent",
     },
     CommandSpec {
         name: "topic new",

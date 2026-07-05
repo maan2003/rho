@@ -134,7 +134,27 @@ impl ClaudeCode {
             .await
     }
 
+    pub async fn apply_effort(&mut self, effort: Effort) -> Result<String> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.write_json(&serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "apply_flag_settings",
+                "settings": {
+                    "effortLevel": effort.as_arg(),
+                },
+            },
+        }))
+        .await?;
+        Ok(request_id)
+    }
+
     async fn write_message(&mut self, message: &protocol::InputMessage) -> Result<()> {
+        self.write_json(message).await
+    }
+
+    async fn write_json(&mut self, message: &impl serde::Serialize) -> Result<()> {
         let Some(stdin) = &mut self.stdin else {
             bail!("Claude Code stdin is closed");
         };
@@ -326,6 +346,25 @@ mod tests {
         assert_eq!(message.subtype, protocol::ResultSubtype::ErrorMaxTurns);
         assert!(message.is_error);
         assert_eq!(message.errors, ["too many turns"]);
+    }
+
+    #[test]
+    fn parses_control_response_event() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "control_response",
+            "response": {
+                "request_id": "request-1",
+                "subtype": "success",
+            },
+        }))
+        .unwrap();
+
+        let protocol::ClaudeEvent::ControlResponse(message) = event else {
+            panic!("expected control response event");
+        };
+        assert_eq!(message.response.request_id, "request-1");
+        assert_eq!(message.response.subtype, "success");
+        assert_eq!(message.response.error, None);
     }
 
     #[test]

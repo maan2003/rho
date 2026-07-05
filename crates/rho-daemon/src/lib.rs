@@ -388,7 +388,16 @@ impl AgentRegistry {
                 anyhow::bail!("cannot switch a Claude agent to a Deep runtime")
             }
             (AgentRuntime::Claude { .. }, AgentMode::Fable { .. }) => {
-                anyhow::bail!("runtime mode updates are only supported for deep agents")
+                let effort = mode
+                    .claude_effort()
+                    .ok_or_else(|| anyhow::anyhow!("Fable mode missing Claude effort"))?;
+                if let Some(agent) = self.get(agent_id).await {
+                    agent.set_claude_effort(effort).await?;
+                }
+                let mut write = self.db.write().await;
+                write.set_agent_mode(rho_core::UnixMs::now(), agent_id, mode);
+                write.commit();
+                Ok(())
             }
         }
     }
@@ -550,6 +559,13 @@ impl RunningAgent {
                 Ok(())
             }
             Self::Claude(_) => anyhow::bail!("cannot apply deep config to Claude agent"),
+        }
+    }
+
+    async fn set_claude_effort(&self, effort: rho_claude::Effort) -> anyhow::Result<()> {
+        match self {
+            Self::Claude(agent) => agent.set_effort(effort).await,
+            Self::Rho(_) => anyhow::bail!("cannot apply Claude effort to Rho agent"),
         }
     }
 

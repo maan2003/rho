@@ -528,14 +528,7 @@ impl Workspace {
                 );
             }
             Command::AgentEffort { effort } => {
-                self.update_deep_config(
-                    source_agent,
-                    ":agent effort: no agent selected",
-                    |config| {
-                        config.effort = effort;
-                    },
-                    cx,
-                );
+                self.update_agent_effort(source_agent, effort, cx);
             }
             Command::TopicPin { name } => {
                 self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
@@ -788,6 +781,51 @@ impl Workspace {
             agent_id,
             mode: AgentMode::Deep(config),
         });
+    }
+
+    fn update_agent_effort(
+        &mut self,
+        source_agent: Option<AgentId>,
+        effort: DeepEffort,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
+        else {
+            self.notice_on(
+                None,
+                ":agent effort: no agent selected",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let Some(mode) = self.registry.agent_mode(agent_id) else {
+            return;
+        };
+        let mode = match mode {
+            AgentMode::Deep(mut config) => {
+                config.effort = effort;
+                AgentMode::Deep(config)
+            }
+            AgentMode::Fable { .. } => {
+                let effort = match effort {
+                    DeepEffort::Low => {
+                        self.notice_on(
+                            Some(&agent_id),
+                            "low effort is only available for deep agents",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                        return;
+                    }
+                    DeepEffort::Medium => FableEffort::Medium,
+                    DeepEffort::Xhigh => FableEffort::Xhigh,
+                };
+                AgentMode::Fable { effort }
+            }
+        };
+        self.connection
+            .send(ClientMessage::SetAgentMode { agent_id, mode });
     }
 
     /// (Re)writes the draft scaffold with the derived default workdir; the

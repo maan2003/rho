@@ -108,11 +108,24 @@ enum InputContent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeEvent {
     Assistant(AssistantMessage),
+    ControlResponse(ControlResponseMessage),
     RateLimitEvent,
     Result(ResultMessage),
     System(SystemMessage),
     StreamEvent(StreamEvent),
     User(UserOutputMessage),
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ControlResponseMessage {
+    pub response: ControlResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ControlResponse {
+    pub request_id: String,
+    pub subtype: String,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]

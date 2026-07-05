@@ -12,7 +12,7 @@ use futures::Stream;
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, Session};
 use rho_core::{ContentPart, ContextBlock, ContextItemEvent, PendingInferenceResponse};
 use rho_db::RhoDb;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{
@@ -179,6 +179,16 @@ impl ClaudeAgent {
         let _ = self.control.send(ClaudeControl::UserMessage(text.into()));
     }
 
+    pub async fn set_effort(&self, effort: Effort) -> anyhow::Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ClaudeControl::SetEffort { effort, reply })
+            .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?;
+        result
+            .await
+            .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?
+    }
+
     pub fn cancel(&self) {
         let _ = self.control.send(ClaudeControl::Cancel);
     }
@@ -209,6 +219,10 @@ enum ClaudeStartMode {
 
 enum ClaudeControl {
     UserMessage(String),
+    SetEffort {
+        effort: Effort,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
     Cancel,
 }
 
@@ -301,6 +315,9 @@ impl ClaudeLoop {
                     self.fail(error);
                 }
             }
+            ClaudeControl::SetEffort { effort, reply } => {
+                let _ = reply.send(self.set_effort(effort).await);
+            }
             ClaudeControl::Cancel => {
                 if let Some(process) = self.process.take() {
                     tokio::spawn(async move {
@@ -309,6 +326,44 @@ impl ClaudeLoop {
                 }
                 self.state.write().expect("poison").queued_messages.clear();
                 self.set_kind(AgentStateKind::Idle);
+            }
+        }
+    }
+
+    async fn set_effort(&mut self, effort: Effort) -> anyhow::Result<()> {
+        self.effort = effort;
+        let Some(process) = self.process.as_mut() else {
+            return Ok(());
+        };
+        let request_id = process.apply_effort(effort).await?;
+        loop {
+            let event = {
+                let Some(process) = self.process.as_mut() else {
+                    anyhow::bail!("Claude Code exited before applying effort");
+                };
+                process.next_event().await?
+            };
+            let Some(event) = event else {
+                self.process = None;
+                anyhow::bail!("Claude Code exited before applying effort");
+            };
+            match event {
+                rho_claude::ClaudeEvent::ControlResponse(message)
+                    if message.response.request_id == request_id =>
+                {
+                    if message.response.subtype == "success" {
+                        return Ok(());
+                    }
+                    anyhow::bail!(
+                        "{}",
+                        message
+                            .response
+                            .error
+                            .unwrap_or_else(|| "Claude Code rejected effort update".to_owned())
+                    );
+                }
+                rho_claude::ClaudeEvent::ControlResponse(_) => {}
+                event => self.handle_event(event).await,
             }
         }
     }
@@ -364,6 +419,7 @@ impl ClaudeLoop {
     async fn handle_event(&mut self, event: rho_claude::ClaudeEvent) {
         match event {
             rho_claude::ClaudeEvent::System(_) => {}
+            rho_claude::ClaudeEvent::ControlResponse(_) => {}
             rho_claude::ClaudeEvent::Assistant(message) => {
                 match assistant_message_to_block(message) {
                     Ok(block) => {
