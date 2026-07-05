@@ -21,6 +21,7 @@ pub use transcript::*;
 const DEFAULT_COMMAND: &str = "claude";
 #[allow(dead_code)]
 const CLAUDE_AGENT_SDK_VERSION: &str = "0.3.201";
+const CLAUDE_CODE_AUTO_COMPACT_WINDOW: &str = "320000";
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -89,6 +90,10 @@ impl ClaudeCodeOptions {
         command.current_dir(self.cwd.as_std_path());
         command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
         command.env("CLAUDE_AGENT_SDK_VERSION", CLAUDE_AGENT_SDK_VERSION);
+        command.env(
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+        );
         command.env_remove("NODE_OPTIONS");
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
