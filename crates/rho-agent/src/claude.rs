@@ -302,11 +302,7 @@ impl ClaudeLoop {
                         let _ = process.close().await;
                     });
                 }
-                self.state
-                    .write()
-                    .expect("poison")
-                    .queued_messages
-                    .clear();
+                self.state.write().expect("poison").queued_messages.clear();
                 self.set_kind(AgentStateKind::Idle);
             }
         }

@@ -371,7 +371,13 @@ impl AgentRegistry {
                     let mut write = registry.db.write().await;
                     // The write txn is the single writer, so this read can't
                     // race a rename committing between check and set.
-                    if registry.db.read().get_agent(agent_id).display_name.is_none() {
+                    if registry
+                        .db
+                        .read()
+                        .get_agent(agent_id)
+                        .display_name
+                        .is_none()
+                    {
                         write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, title);
                         write.commit();
                         let _ = outgoing_tx.send(registry.ready_message());
