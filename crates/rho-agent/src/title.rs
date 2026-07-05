@@ -14,9 +14,19 @@ use rho_core::{
 use rho_inference::config::InferenceConfig;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 
-const INSTRUCTIONS: &str = "Write a kebab-case title (at most 25 characters) summarizing the \
-user's request to a coding agent. Respond with only the title: lowercase words joined by \
-hyphens, no quotes.";
+const INSTRUCTIONS: &str = "Write a kebab-case title (at most 25 characters) for a coding \
+agent's conversation. Name the subject — the component, feature, or problem — not the kind of \
+task, because the task may change (exploration becomes implementation) while the subject stays. \
+Never use task words such as explore, investigate, implement, propose, alternatives, options. \
+Exception: code review requests are titled review-<subject>, since a review stays a review.
+
+Examples:
+\"explore alternatives to elision breaking when claude emits a second final message\" -> claude-elision
+\"implement retry with backoff for the upload endpoint\" -> upload-retry
+\"why is the topic rail flickering on resize?\" -> topic-rail-flicker
+\"review my changes to the daemon socket protocol\" -> review-daemon-socket
+
+Respond with only the title: lowercase words joined by hyphens, no quotes.";
 
 /// The prompt excerpt is capped so a pasted wall of text doesn't balloon the
 /// title request; the opening of a message is what names it anyway.
