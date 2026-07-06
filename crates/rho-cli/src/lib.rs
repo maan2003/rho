@@ -276,6 +276,20 @@ impl ChatApp {
                 self.term
                     .print_system("runtime mode changes are only available in rho-gui");
             }
+            rho_commands::Command::Rewind { turns } => {
+                if self.turn_is_running() {
+                    self.term
+                        .print_system(":rewind is only available while idle; use :cancel first");
+                    return Ok(true);
+                }
+                let Some(agent_id) = primary_agent_id(&self.agent) else {
+                    self.term.print_system(":rewind: no agent yet");
+                    return Ok(true);
+                };
+                self.term
+                    .print_system(&format!("rewinding {turns} turn(s)"));
+                self.agent.rewind(agent_id, turns);
+            }
             rho_commands::Command::TopicNew { name } => {
                 self.term.print_system(&format!("creating topic `{name}`"));
                 self.agent.new_topic(name);

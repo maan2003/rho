@@ -43,6 +43,18 @@ fn parses_agent_commands() {
         parse(":agent rename"),
         Some(Parsed::Invalid(":agent rename <name>".to_owned()))
     );
+    assert_eq!(
+        parse(":rewind"),
+        Some(Parsed::Command(Command::Rewind { turns: 1 }))
+    );
+    assert_eq!(
+        parse(":rewind 3"),
+        Some(Parsed::Command(Command::Rewind { turns: 3 }))
+    );
+    assert_eq!(
+        parse(":rewind 0"),
+        Some(Parsed::Invalid(":rewind [turns]".to_owned()))
+    );
 }
 
 #[test]

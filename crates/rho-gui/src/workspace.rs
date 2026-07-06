@@ -485,6 +485,21 @@ impl Workspace {
                     ),
                 }
             }
+            Command::Rewind { turns } => {
+                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
+                match target {
+                    Some(agent_id) => {
+                        self.connection
+                            .send(ClientMessage::RewindAgent { agent_id, turns });
+                    }
+                    None => self.notice_on(
+                        None,
+                        ":rewind: no agent selected",
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            }
             Command::AgentRename { name } => {
                 let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
                 match target {

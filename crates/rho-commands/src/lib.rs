@@ -93,6 +93,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Alias for :agent cancel",
     },
     CommandSpec {
+        name: "rewind",
+        usage: ":rewind [turns]",
+        description: "Fork the current agent's history before previous turns",
+    },
+    CommandSpec {
         name: "clear",
         usage: ":clear",
         description: "Clear rendered output",
@@ -152,6 +157,9 @@ pub enum Command {
     },
     WorkdirRemove {
         path: String,
+    },
+    Rewind {
+        turns: u32,
     },
     Quit,
     Clear,
@@ -223,6 +231,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
             _ => Parsed::Invalid(":workdirs add|rm".to_owned()),
         },
         "cancel" => Parsed::Command(Command::AgentCancel),
+        "rewind" => parse_rewind(&mut tokens),
         "quit" | "exit" => Parsed::Command(Command::Quit),
         "clear" => Parsed::Command(Command::Clear),
         "help" => Parsed::Command(Command::Help),
@@ -314,6 +323,17 @@ pub fn completion_candidates(text_before_cursor: &str, ctx: &CompletionCtx) -> V
         [] => command_word_candidates(&[], partial),
         [first] if !command_exists(&[first]) => command_word_candidates(&[first], partial),
         resolved => argument_candidates(resolved, partial, ctx),
+    }
+}
+
+fn parse_rewind<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed {
+    match (tokens.next(), tokens.next()) {
+        (None, None) => Parsed::Command(Command::Rewind { turns: 1 }),
+        (Some(value), None) => match value.parse::<u32>() {
+            Ok(turns) if turns > 0 => Parsed::Command(Command::Rewind { turns }),
+            _ => Parsed::Invalid(":rewind [turns]".to_owned()),
+        },
+        _ => Parsed::Invalid(":rewind [turns]".to_owned()),
     }
 }
 

@@ -569,6 +569,13 @@ impl RunningAgent {
         }
     }
 
+    async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
+        match self {
+            Self::Rho(agent) => agent.rewind(turns).await,
+            Self::Claude(_) => anyhow::bail!("rewind is only available for Rho agents"),
+        }
+    }
+
     fn subscribe(&self) -> BoxStream<'static, AgentState> {
         match self {
             Self::Rho(agent) => agent.subscribe().boxed(),
@@ -728,6 +735,14 @@ async fn handle_message(
                 let _ = outgoing_tx.send(ServerMessage::TurnCancelled { agent_id });
             }
             Ok(Refresh::None)
+        }
+        ClientMessage::RewindAgent { agent_id, turns } => {
+            let agent = agents
+                .get(agent_id)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
+            agent.rewind(turns).await?;
+            Ok(Refresh::Ready)
         }
     }
 }

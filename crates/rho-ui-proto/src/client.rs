@@ -388,6 +388,12 @@ impl AgentClient {
         let _ = self.commands.send(ClientMessage::CancelTurn { agent_id });
     }
 
+    pub fn rewind(&self, agent_id: AgentId, turns: u32) {
+        let _ = self
+            .commands
+            .send(ClientMessage::RewindAgent { agent_id, turns });
+    }
+
     pub fn subscribe(&self) -> impl Stream<Item = HashMap<AgentId, UiAgentState>> + use<> {
         let mut state = self.state.clone();
         async_stream::stream! {

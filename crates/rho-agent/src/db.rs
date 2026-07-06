@@ -341,6 +341,10 @@ pub trait AgentReadTxnExt {
     fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
     fn list_workdirs(&self) -> Vec<(Utf8PathBuf, WorkdirRecord)>;
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
+    fn agent_event_records(
+        &self,
+        agent_id: AgentId,
+    ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -386,6 +390,13 @@ pub trait AgentWriteTxnExt {
     fn remove_workdir(&mut self, path: &str);
 
     fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos;
+
+    fn fork_agent_lineage(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        parent: AgentEventPos,
+    ) -> AgentEventPos;
 }
 
 impl AgentReadTxnExt for ReadTxn {
@@ -458,6 +469,14 @@ impl AgentReadTxnExt for ReadTxn {
     }
 
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>) {
+        let (next, records) = self.agent_event_records(agent_id);
+        (next, records.into_iter().map(|(_, event)| event).collect())
+    }
+
+    fn agent_event_records(
+        &self,
+        agent_id: AgentId,
+    ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>) {
         let agent = self.get_agent(agent_id);
         let mut segments = Vec::new();
         let mut lineage_id = agent.current_lineage;
@@ -492,7 +511,7 @@ impl AgentReadTxnExt for ReadTxn {
                 if is_current_lineage {
                     next = key.next();
                 }
-                events.push(value.value().into_owned());
+                events.push((key, value.value().into_owned()));
             }
         }
         (next, events)
@@ -668,6 +687,27 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENT_EVENTS)
             .insert(&at, SenValue::borrowed(event));
         at.next()
+    }
+
+    fn fork_agent_lineage(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        parent: AgentEventPos,
+    ) -> AgentEventPos {
+        let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
+        self.open_table(LINEAGE_PARENTS)
+            .insert(&lineage_id, &parent);
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.current_lineage = lineage_id;
+        agent.updated_at = now;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+        AgentEventPos::root(lineage_id)
     }
 }
 

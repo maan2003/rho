@@ -253,6 +253,65 @@ async fn agent_events_read_lineage_parents() {
 }
 
 #[tokio::test]
+async fn fork_agent_lineage_repoints_current_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
+    let agent_id = write.alloc_agent_id();
+    let next = write.create_agent(
+        UnixMs(1),
+        agent_id,
+        topic_id,
+        Some("main".to_owned()),
+        test_workspace(),
+        AgentMode::deep_default(),
+        test_agent_runtime(),
+    );
+    let fork_at = write.append_agent_event(
+        next,
+        &AgentEvent::UserMessage {
+            content: Cow::Owned(vec![ContentPart::Text {
+                text: "parent".to_owned(),
+            }]),
+        },
+    );
+    write.append_agent_event(
+        fork_at,
+        &AgentEvent::UserMessage {
+            content: Cow::Owned(vec![ContentPart::Text {
+                text: "old branch".to_owned(),
+            }]),
+        },
+    );
+
+    let child_next = write.fork_agent_lineage(UnixMs(2), agent_id, fork_at);
+    write.append_agent_event(
+        child_next,
+        &AgentEvent::UserMessage {
+            content: Cow::Owned(vec![ContentPart::Text {
+                text: "new branch".to_owned(),
+            }]),
+        },
+    );
+    write.commit();
+
+    let (_, events) = db.read().agent_events(agent_id);
+    let texts = events
+        .into_iter()
+        .map(|event| match event {
+            AgentEvent::UserMessage { content } => match &content[0] {
+                ContentPart::Text { text } => text.clone(),
+            },
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts, ["parent", "new branch"]);
+}
+
+#[tokio::test]
 async fn move_agent_to_topic_repoints_membership() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));

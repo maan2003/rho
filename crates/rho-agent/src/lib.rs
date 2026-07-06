@@ -17,7 +17,7 @@ use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_workspaces::{Repo, Workspace};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::db::{
     AgentEventPos, AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, DeepConfig,
@@ -130,6 +130,96 @@ pub enum AgentStateKind {
     Idle,
 }
 
+struct RestoreToolTurn {
+    outstanding_calls: Vec<ToolCall>,
+    completed_tool_calls: Vec<ToolResult>,
+}
+
+fn restore_events(
+    events: Vec<AgentEvent<'static>>,
+) -> (Vec<Arc<ContextBlock>>, AgentStateKind, Option<u64>) {
+    let mut blocks = Vec::new();
+    let mut turn: Option<RestoreToolTurn> = None;
+    let mut context_used = None;
+    let commit_finished_turn =
+        |turn: &mut Option<RestoreToolTurn>, blocks: &mut Vec<Arc<ContextBlock>>| {
+            let Some(turn) = turn.take() else {
+                return;
+            };
+            if !turn.completed_tool_calls.is_empty() {
+                blocks.push(Arc::new(ContextBlock::ToolResults {
+                    results: turn.completed_tool_calls,
+                }));
+            }
+        };
+    for event in events {
+        match event {
+            AgentEvent::UserMessage { content } => {
+                commit_finished_turn(&mut turn, &mut blocks);
+                blocks.push(Arc::new(ContextBlock::UserMessage {
+                    content: content.into_owned(),
+                }));
+            }
+            AgentEvent::InferenceResponse {
+                items,
+                provider_response_id,
+                context_used: response_context_used,
+            } => {
+                if response_context_used.is_some() {
+                    context_used = response_context_used;
+                }
+                commit_finished_turn(&mut turn, &mut blocks);
+                let outstanding_calls = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        InferenceResponseItem::ToolCall {
+                            id,
+                            name,
+                            tool_type,
+                            arguments,
+                        } => Some(ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            tool_type: *tool_type,
+                            arguments: arguments.clone(),
+                        }),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if !outstanding_calls.is_empty() {
+                    turn = Some(RestoreToolTurn {
+                        outstanding_calls,
+                        completed_tool_calls: Vec::new(),
+                    });
+                }
+                blocks.push(Arc::new(ContextBlock::InferenceResponse {
+                    items: items.into_owned(),
+                    provider_response_id,
+                }));
+            }
+            AgentEvent::ToolResult { result } => {
+                let Some(turn) = &mut turn else {
+                    unreachable!("tool result restored without a preceding tool call");
+                };
+                turn.outstanding_calls
+                    .retain(|call| call.id != result.call_id);
+                turn.completed_tool_calls.push(result.into_owned());
+            }
+        }
+    }
+    let kind = match turn {
+        None => AgentStateKind::Idle,
+        Some(RestoreToolTurn {
+            outstanding_calls,
+            completed_tool_calls,
+        }) => AgentStateKind::UnfinishedTurn {
+            outstanding_calls: outstanding_calls.into(),
+            completed_tool_calls: completed_tool_calls.into(),
+        },
+    };
+    (blocks, kind, context_used)
+}
+
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct ToolPreview {
     pub call: ToolCall,
@@ -228,7 +318,11 @@ impl Agent {
             shell_tools,
             Some(workspace),
             state,
-            Some(AgentPersistence { db, next_event }),
+            Some(AgentPersistence {
+                db,
+                agent_id,
+                next_event,
+            }),
         );
         Ok((agent_id, agent))
     }
@@ -240,91 +334,8 @@ impl Agent {
         workspace: Arc<Workspace>,
     ) -> Self {
         let record = db.read().get_agent(agent_id);
-        struct RestoreToolTurn {
-            outstanding_calls: Vec<ToolCall>,
-            completed_tool_calls: Vec<ToolResult>,
-        }
-
         let (next_event, events) = db.read().agent_events(agent_id);
-        let mut blocks = Vec::new();
-        let mut turn: Option<RestoreToolTurn> = None;
-        let mut context_used = None;
-        let commit_finished_turn =
-            |turn: &mut Option<RestoreToolTurn>, blocks: &mut Vec<Arc<ContextBlock>>| {
-                let Some(turn) = turn.take() else {
-                    return;
-                };
-                if !turn.completed_tool_calls.is_empty() {
-                    blocks.push(Arc::new(ContextBlock::ToolResults {
-                        results: turn.completed_tool_calls,
-                    }));
-                }
-            };
-        for event in events {
-            match event {
-                AgentEvent::UserMessage { content } => {
-                    commit_finished_turn(&mut turn, &mut blocks);
-                    blocks.push(Arc::new(ContextBlock::UserMessage {
-                        content: content.into_owned(),
-                    }));
-                }
-                AgentEvent::InferenceResponse {
-                    items,
-                    provider_response_id,
-                    context_used: response_context_used,
-                } => {
-                    if response_context_used.is_some() {
-                        context_used = response_context_used;
-                    }
-                    commit_finished_turn(&mut turn, &mut blocks);
-                    let outstanding_calls = items
-                        .iter()
-                        .filter_map(|item| match item {
-                            InferenceResponseItem::ToolCall {
-                                id,
-                                name,
-                                tool_type,
-                                arguments,
-                            } => Some(ToolCall {
-                                id: id.clone(),
-                                name: name.clone(),
-                                tool_type: *tool_type,
-                                arguments: arguments.clone(),
-                            }),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>();
-                    if !outstanding_calls.is_empty() {
-                        turn = Some(RestoreToolTurn {
-                            outstanding_calls,
-                            completed_tool_calls: Vec::new(),
-                        });
-                    }
-                    blocks.push(Arc::new(ContextBlock::InferenceResponse {
-                        items: items.into_owned(),
-                        provider_response_id,
-                    }));
-                }
-                AgentEvent::ToolResult { result } => {
-                    let Some(turn) = &mut turn else {
-                        unreachable!("tool result restored without a preceding tool call");
-                    };
-                    turn.outstanding_calls
-                        .retain(|call| call.id != result.call_id);
-                    turn.completed_tool_calls.push(result.into_owned());
-                }
-            }
-        }
-        let kind = match turn {
-            None => AgentStateKind::Idle,
-            Some(RestoreToolTurn {
-                outstanding_calls,
-                completed_tool_calls,
-            }) => AgentStateKind::UnfinishedTurn {
-                outstanding_calls: outstanding_calls.into(),
-                completed_tool_calls: completed_tool_calls.into(),
-            },
-        };
+        let (blocks, kind, context_used) = restore_events(events);
         let AgentRuntime::Rho { prompt_cache_key } = record.runtime else {
             panic!("cannot load Claude agent with the Rho agent runtime");
         };
@@ -350,7 +361,11 @@ impl Agent {
             shell_tools,
             Some(workspace),
             state,
-            Some(AgentPersistence { db, next_event }),
+            Some(AgentPersistence {
+                db,
+                agent_id,
+                next_event,
+            }),
         )
     }
 
@@ -408,6 +423,16 @@ impl Agent {
         let _ = self.control.send(AgentControl::SetDeepConfig(config));
     }
 
+    pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(AgentControl::Rewind { turns, reply })
+            .map_err(|_| anyhow::anyhow!("agent control loop is closed"))?;
+        result
+            .await
+            .map_err(|_| anyhow::anyhow!("agent control loop is closed"))?
+    }
+
     pub fn subscribe(&self) -> impl Stream<Item = AgentState> + use<> {
         let state = Arc::clone(&self.state);
         let notify = Arc::clone(&self.notify);
@@ -428,6 +453,7 @@ impl Agent {
 
 struct AgentPersistence {
     db: RhoDb,
+    agent_id: AgentId,
     next_event: AgentEventPos,
 }
 
@@ -437,6 +463,10 @@ enum AgentControl {
         delivery: MessageDelivery,
     },
     SetDeepConfig(DeepConfig),
+    Rewind {
+        turns: u32,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
     Cancel,
 }
 
@@ -544,6 +574,78 @@ impl AgentLoop {
                         }
                         AgentControl::SetDeepConfig(config) => {
                             let _ = self.inference_session.set_deep_config(config);
+                        }
+                        AgentControl::Rewind { turns, reply } => {
+                            let result = if turns == 0 {
+                                Err(anyhow::anyhow!(":rewind turns must be greater than zero"))
+                            } else if !matches!(
+                                state.kind,
+                                AgentStateKind::Idle | AgentStateKind::Error(_)
+                            ) {
+                                Err(anyhow::anyhow!(
+                                    ":rewind is only available while idle or errored; use :cancel first"
+                                ))
+                            } else if !state.queued_messages.is_empty() {
+                                Err(anyhow::anyhow!(
+                                    ":rewind is not available with queued messages"
+                                ))
+                            } else if !self.pending_tools.is_empty()
+                                || self.inference_session.has_active_request()
+                            {
+                                Err(anyhow::anyhow!(
+                                    ":rewind is not available while work is running"
+                                ))
+                            } else if let Some(persistence) = self.persistence.as_ref() {
+                                let db = persistence.db.clone();
+                                let agent_id = persistence.agent_id;
+                                let cursor = {
+                                    let (_, records) = db.read().agent_event_records(agent_id);
+                                    let user_positions = records
+                                        .iter()
+                                        .filter_map(|(pos, event)| {
+                                            matches!(event, AgentEvent::UserMessage { .. })
+                                                .then_some(*pos)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    if user_positions.is_empty() {
+                                        None
+                                    } else {
+                                        let index = user_positions
+                                            .len()
+                                            .saturating_sub(turns as usize);
+                                        Some(user_positions[index])
+                                    }
+                                };
+                                match cursor {
+                                    None => Err(anyhow::anyhow!("nothing to rewind")),
+                                    Some(cursor) => {
+                                        let mut write = db.write().await;
+                                        let next_event = write.fork_agent_lineage(
+                                            UnixMillis::now(),
+                                            agent_id,
+                                            cursor,
+                                        );
+                                        write.commit();
+
+                                        let (loaded_next_event, events) =
+                                            db.read().agent_events(agent_id);
+                                        debug_assert_eq!(loaded_next_event, next_event);
+                                        let (blocks, kind, context_used) = restore_events(events);
+                                        state.blocks = blocks;
+                                        state.kind = kind;
+                                        state.context_used = context_used;
+                                        state.queued_messages.clear();
+                                        self.inference_session.abort();
+                                        if let Some(persistence) = &mut self.persistence {
+                                            persistence.next_event = next_event;
+                                        }
+                                        Ok(())
+                                    }
+                                }
+                            } else {
+                                Err(anyhow::anyhow!(":rewind requires a persisted agent"))
+                            };
+                            let _ = reply.send(result);
                         }
                     }
                 }
