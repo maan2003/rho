@@ -12,7 +12,7 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
-use rho_workspaces::{Repo, WorkspaceInfo};
+use rho_workspaces::{PathOverrides, Repo, WorkspaceInfo};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
@@ -30,6 +30,7 @@ const ID_LABEL_HEADROOM: u64 = 200;
 pub struct AgentPool {
     db: RhoDb,
     auth: InferenceAuth,
+    path_overrides: PathOverrides,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
     /// One shared handle per repo root: live-workspace sharing (joined
     /// agents get one checkout + namespace) only holds within one instance.
@@ -59,13 +60,14 @@ pub enum SpawnWorkspace {
 
 impl AgentPool {
     /// Opens the pool over `db`, initializing the agent tables.
-    pub async fn new(db: RhoDb, auth: InferenceAuth) -> Arc<Self> {
+    pub async fn new(db: RhoDb, auth: InferenceAuth, path_overrides: PathOverrides) -> Arc<Self> {
         let mut write = db.write().await;
         write.init_agent_tables();
         write.commit();
         Arc::new(Self {
             db,
             auth,
+            path_overrides,
             agents: Mutex::new(HashMap::new()),
             repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
@@ -291,7 +293,7 @@ impl AgentPool {
 
     /// The shared handle for the repo rooted at (or containing) `path`.
     pub async fn repo(&self, path: &Utf8Path) -> anyhow::Result<Arc<Repo>> {
-        let repo = Repo::open(path.as_std_path())?;
+        let repo = Repo::open_with_path_overrides(path.as_std_path(), self.path_overrides.clone())?;
         let mut repos = self.repos.lock().await;
         Ok(match repos.entry(repo.root().to_owned()) {
             std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),

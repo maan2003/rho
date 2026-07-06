@@ -517,7 +517,13 @@ impl ClaudeLoop {
         );
         options.session = session;
         let file_mounts = self.write_claude_prompt_mount()?.into_iter().collect();
-        let mut command = options.command();
+        let mut command = match options.command().await {
+            Ok(command) => command,
+            Err(error) => {
+                self.remove_claude_runtime_files();
+                return Err(error);
+            }
+        };
         if let Some(tools) = &self.multi_agent {
             command.env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
         }

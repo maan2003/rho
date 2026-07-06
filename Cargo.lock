@@ -9756,6 +9756,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "camino",
+ "rho-workspaces",
  "senax-encoder",
  "serde",
  "serde_json",

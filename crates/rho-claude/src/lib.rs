@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use camino::Utf8PathBuf;
+use rho_workspaces::PathOverrides;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -32,6 +33,7 @@ pub struct ClaudeCodeOptions {
     pub model: Model,
     pub effort: Effort,
     pub session: Session,
+    pub path_overrides: PathOverrides,
 }
 
 impl ClaudeCodeOptions {
@@ -41,12 +43,14 @@ impl ClaudeCodeOptions {
         effort: Effort,
         session_id: uuid::Uuid,
     ) -> Self {
+        let cwd = cwd.into();
         Self {
             command: DEFAULT_COMMAND.into(),
-            cwd: cwd.into(),
+            cwd: cwd.clone(),
             model,
             effort,
             session: Session::New { session_id },
+            path_overrides: PathOverrides::default(),
         }
     }
 
@@ -81,13 +85,12 @@ impl ClaudeCodeOptions {
     }
 
     pub async fn spawn(&self) -> Result<ClaudeCode> {
-        ClaudeCode::spawn_command(self.command()).await
+        ClaudeCode::spawn_command(self.command().await?).await
     }
 
-    pub fn command(&self) -> Command {
+    pub async fn command(&self) -> Result<Command> {
         let mut command = Command::new(self.command.as_std_path());
         command.args(self.args());
-        command.current_dir(self.cwd.as_std_path());
         command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
         command.env("CLAUDE_AGENT_SDK_VERSION", CLAUDE_AGENT_SDK_VERSION);
         command.env(
@@ -96,12 +99,18 @@ impl ClaudeCodeOptions {
         );
         command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
         command.env("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", "1");
+        command.env(
+            "PATH",
+            self.path_overrides
+                .add_to(&std::env::var_os("PATH").expect("PATH must be set")),
+        );
+        command.current_dir(self.cwd.as_std_path());
         command.env_remove("NODE_OPTIONS");
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::null());
         command.kill_on_drop(true);
-        command
+        Ok(command)
     }
 }
 

@@ -8,19 +8,17 @@
 mod apply_patch;
 mod truncate;
 
-use std::ffi::{CStr, CString};
-use std::os::fd::{BorrowedFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use rho_core::{
     ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
     ToolOutputStatus, ToolResultMetadata, ToolSpec, ToolType,
 };
-use rho_workspaces::Workspace;
+use rho_workspaces::{PathOverrides, Workspace};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -37,14 +35,12 @@ pub struct ShellTools {
     exec: ExecContext,
 }
 
-/// Where and how tool commands execute; the owning process's cwd is never
-/// consulted.
 #[derive(Clone, Debug)]
 enum ExecContext {
-    /// Run directly in a directory (tests, workspace-less fallbacks).
-    Directory(Utf8PathBuf),
-    /// Run in the workspace: inside its mount namespace at the origin repo
-    /// path.
+    Directory {
+        working_directory: Utf8PathBuf,
+        path_overrides: PathOverrides,
+    },
     Workspace(Arc<Workspace>),
 }
 
@@ -74,10 +70,17 @@ impl ShellTools {
     }
 
     /// Tools running directly in a directory, without a workspace.
-    pub fn in_directory(timeout: Duration, working_directory: Utf8PathBuf) -> Self {
+    pub fn in_directory(
+        timeout: Duration,
+        working_directory: Utf8PathBuf,
+        path_overrides: PathOverrides,
+    ) -> Self {
         Self {
             default_timeout: timeout,
-            exec: ExecContext::Directory(working_directory),
+            exec: ExecContext::Directory {
+                working_directory,
+                path_overrides,
+            },
         }
     }
 
@@ -85,7 +88,9 @@ impl ShellTools {
     /// files, never a namespace-relative path.
     fn patch_directory(&self) -> &Path {
         match &self.exec {
-            ExecContext::Directory(dir) => dir.as_std_path(),
+            ExecContext::Directory {
+                working_directory, ..
+            } => working_directory.as_std_path(),
             ExecContext::Workspace(workspace) => workspace.slot().as_std_path(),
         }
     }
@@ -196,43 +201,31 @@ impl ShellTools {
             return Err(anyhow!("timeout must be greater than zero"));
         }
 
-        let (base_dir, mnt_ns) = match &self.exec {
-            ExecContext::Directory(dir) => (dir.clone(), None),
-            // A user-checkout workspace IS the repo path: no namespace.
-            ExecContext::Workspace(workspace) if workspace.is_user_checkout() => {
-                (workspace.repo().to_owned(), None)
-            }
-            ExecContext::Workspace(workspace) => {
-                // The raw fd stays valid: the workspace (and its namespace
-                // fd) lives in `self.exec` past the spawn.
-                let ns_fd = std::os::fd::AsRawFd::as_raw_fd(workspace.mnt_ns().await);
-                (workspace.repo().to_owned(), Some(ns_fd))
-            }
-        };
-
         let mut command = Command::new("sh");
         command.arg("-c").arg(&args.command);
         command.kill_on_drop(true);
-        // An absolute model-supplied cwd wins; a relative one resolves
-        // against the agent's working directory (join handles both).
-        let cwd = match args.cwd {
-            Some(cwd) => base_dir.join(cwd),
-            None => base_dir,
-        };
-        match mnt_ns {
-            Some(ns_fd) => {
-                // The namespaced cwd only exists after setns, so entering the
-                // namespace and chdir both happen post-fork. Everything the
-                // closure needs is prepared here: pre_exec runs between fork
-                // and exec where allocation is off-limits.
-                let cwd = CString::new(cwd.into_string().into_bytes())
-                    .map_err(|_| anyhow!("working directory contains a NUL byte"))?;
-                unsafe {
-                    command.pre_exec(move || enter_workspace_ns(ns_fd, &cwd));
-                }
+        let cwd = args.cwd.as_deref().map(Utf8Path::new);
+        match &self.exec {
+            ExecContext::Directory {
+                working_directory,
+                path_overrides,
+            } => {
+                command.env(
+                    "PATH",
+                    path_overrides.add_to(&std::env::var_os("PATH").expect("PATH must be set")),
+                );
+                // An absolute model-supplied cwd wins; a relative one resolves
+                // against the tool's working directory (join handles both).
+                let cwd = cwd.map_or_else(
+                    || working_directory.clone(),
+                    |cwd| working_directory.join(cwd),
+                );
+                command.current_dir(cwd.as_std_path());
             }
-            None => {
-                command.current_dir(cwd);
+            ExecContext::Workspace(workspace) => {
+                workspace
+                    .prepare_command_with_cwd(&mut command, cwd)
+                    .await?;
             }
         }
 
@@ -314,31 +307,6 @@ impl ShellTools {
             })),
         ))
     }
-}
-
-/// Runs between fork and exec: enter the workspace's mount namespace, move
-/// to the working directory (whose path only resolves inside it), and shed
-/// the daemon's in-namespace privileges. Must not allocate — the forked
-/// child could deadlock on the allocator lock.
-fn enter_workspace_ns(ns_fd: RawFd, cwd: &CStr) -> std::io::Result<()> {
-    use rustix::thread::{CapabilitySet, CapabilitySets, LinkNameSpaceType};
-
-    // SAFETY: the fd is kept alive by the `Arc<Workspace>` held in the
-    // spawning `ShellTools` for the duration of the spawn.
-    let fd = unsafe { BorrowedFd::borrow_raw(ns_fd) };
-    rustix::thread::move_into_link_name_space(fd, Some(LinkNameSpaceType::Mount))?;
-    rustix::process::chdir(cwd)?;
-    rustix::thread::set_no_new_privs(true)?;
-    let empty = CapabilitySet::empty();
-    rustix::thread::set_capabilities(
-        None,
-        CapabilitySets {
-            effective: empty,
-            permitted: empty,
-            inheritable: empty,
-        },
-    )?;
-    Ok(())
 }
 
 fn decode_output(bytes: Vec<u8>) -> (String, bool) {

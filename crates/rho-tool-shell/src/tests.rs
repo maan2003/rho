@@ -1,4 +1,5 @@
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
+use rho_workspaces::PathOverrides;
 
 use super::*;
 
@@ -6,6 +7,7 @@ fn test_tools(timeout_secs: u64) -> ShellTools {
     ShellTools::in_directory(
         Duration::from_secs(timeout_secs),
         camino::Utf8PathBuf::try_from(std::env::temp_dir()).unwrap(),
+        PathOverrides::default(),
     )
 }
 
@@ -168,6 +170,7 @@ async fn shell_commands_run_in_the_agents_working_directory() {
     let tools = ShellTools::in_directory(
         Duration::from_secs(2),
         camino::Utf8PathBuf::try_from(temp.path().to_path_buf()).unwrap(),
+        PathOverrides::default(),
     );
     let result = tools.call(shell_call(json!({"command": "pwd"}))).await;
 
@@ -187,6 +190,7 @@ async fn relative_model_cwd_resolves_against_working_directory() {
     let tools = ShellTools::in_directory(
         Duration::from_secs(2),
         camino::Utf8PathBuf::try_from(temp.path().to_path_buf()).unwrap(),
+        PathOverrides::default(),
     );
     let result = tools
         .call(shell_call(json!({"command": "pwd", "cwd": "sub"})))
@@ -194,4 +198,49 @@ async fn relative_model_cwd_resolves_against_working_directory() {
 
     assert_eq!(result.status, ToolOutputStatus::Success);
     assert!(result.output.as_ref().contains("/sub"));
+}
+
+#[tokio::test]
+async fn shell_path_overrides_prepend_and_append_entries() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let before = temp.path().join("before");
+    let after = temp.path().join("after");
+    std::fs::create_dir_all(&before).unwrap();
+    std::fs::create_dir_all(&after).unwrap();
+
+    let selected = before.join("rho-path-selected");
+    std::fs::write(&selected, "#!/bin/sh\nprintf before\n").unwrap();
+    std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let shadowed = after.join("rho-path-selected");
+    std::fs::write(&shadowed, "#!/bin/sh\nprintf after\n").unwrap();
+    std::fs::set_permissions(&shadowed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let after_only = after.join("rho-path-after-only");
+    std::fs::write(&after_only, "#!/bin/sh\nprintf after-only\n").unwrap();
+    std::fs::set_permissions(&after_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let tools = ShellTools::in_directory(
+        Duration::from_secs(2),
+        camino::Utf8PathBuf::try_from(temp.path().to_path_buf()).unwrap(),
+        PathOverrides {
+            before: vec![before],
+            after: vec![after],
+        },
+    );
+    let result = tools
+        .call(shell_call(
+            json!({"command": "rho-path-selected; printf ' '; rho-path-after-only"}),
+        ))
+        .await;
+
+    assert_eq!(result.status, ToolOutputStatus::Success);
+    assert!(
+        result
+            .output
+            .as_ref()
+            .contains("Output:\nbefore after-only")
+    );
 }

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,7 +43,7 @@ pub fn default_db_path() -> anyhow::Result<PathBuf> {
 /// Re-exported so daemon entry points can set up the user+mount namespace
 /// before the async runtime starts (see
 /// [`rho_workspaces::init_daemon_namespace`]).
-pub use rho_workspaces::init_daemon_namespace;
+pub use rho_workspaces::{PathOverrides, init_daemon_namespace};
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct DaemonArgs {
@@ -53,6 +54,10 @@ pub struct DaemonArgs {
     /// Exit once the last UI client disconnects.
     #[arg(long = "die-on-detached")]
     pub die_on_detached: bool,
+    #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
+    pub extra_before_path: Option<OsString>,
+    #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
+    pub extra_after_path: Option<OsString>,
 }
 
 pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
@@ -70,7 +75,17 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     let db = RhoDb::open(default_db_path()?);
     let auth = InferenceAuth::named(&args.auth)?;
-    let agents = Arc::new(AgentRegistry::new(db, auth).await);
+    let path_overrides = PathOverrides {
+        before: args
+            .extra_before_path
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default(),
+        after: args
+            .extra_after_path
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default(),
+    };
+    let agents = Arc::new(AgentRegistry::new(db, auth, path_overrides).await);
 
     // Attention watchers: one per loaded agent, daemon-owned (not tied to
     // any connection). Preloaded agents are covered here; later creations
@@ -165,8 +180,8 @@ struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    async fn new(db: RhoDb, auth: InferenceAuth) -> Self {
-        let pool = AgentPool::new(db.clone(), auth.clone()).await;
+    async fn new(db: RhoDb, auth: InferenceAuth, path_overrides: PathOverrides) -> Self {
+        let pool = AgentPool::new(db.clone(), auth.clone(), path_overrides).await;
         let machine_seed = db.read().machine_seed();
         // Topics are ad-hoc tab groups; every agent starts in the default
         // one (the oldest topic) until it is moved somewhere more specific.

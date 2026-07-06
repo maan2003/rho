@@ -15,9 +15,9 @@
 //! multiple workspaces, and the workspace pool commands exist.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Context as _;
@@ -31,6 +31,31 @@ mod ns;
 pub use ns::init_daemon_namespace;
 
 pub type WorkspaceId = PrefixId<WorkspaceIdDomain>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathOverrides {
+    pub before: Vec<PathBuf>,
+    pub after: Vec<PathBuf>,
+}
+
+impl PathOverrides {
+    pub fn add_to(&self, from_env: &OsStr) -> OsString {
+        let mut path = OsString::new();
+        for entry in self
+            .before
+            .iter()
+            .cloned()
+            .chain(std::env::split_paths(from_env))
+            .chain(self.after.iter().cloned())
+        {
+            if !path.is_empty() {
+                path.push(if cfg!(windows) { ";" } else { ":" });
+            }
+            path.push(entry);
+        }
+        path
+    }
+}
 
 /// Keys workspace-id encoding with the daemon database's persisted machine
 /// seed. The id is stored as part of [`WorkspaceInfo`] and its encoded form is
@@ -99,6 +124,8 @@ impl WorkspaceInfo {
 pub struct Repo {
     /// Canonicalized origin root; UTF-8 validated at open.
     root: Utf8PathBuf,
+    /// PATH entries applied to commands prepared for this repo's workspaces.
+    path_overrides: PathOverrides,
     /// Serializes jj invocations. jj's op log makes concurrent commands safe
     /// on its own; this is simplicity insurance while the fork's
     /// all-workspace snapshot path is young.
@@ -118,8 +145,18 @@ impl Repo {
     /// Opens the repo containing `path` (resolving through workspace
     /// pointers to the origin root).
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_with_path_overrides(path, PathOverrides::default())
+    }
+
+    /// Opens the repo containing `path` and records command PATH overrides
+    /// for workspaces materialized from this handle.
+    pub fn open_with_path_overrides(
+        path: &Path,
+        path_overrides: PathOverrides,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             root: resolve_repo_root(path)?,
+            path_overrides,
             jj_lock: Mutex::new(()),
             workspaces: Mutex::new(HashMap::new()),
             reaped: OnceCell::new(),
@@ -174,6 +211,10 @@ impl Repo {
     /// The origin repo root (canonicalized).
     pub fn root(&self) -> &Utf8Path {
         &self.root
+    }
+
+    pub fn path_overrides(&self) -> &PathOverrides {
+        &self.path_overrides
     }
 
     fn workspace_info(&self, id: WorkspaceId) -> WorkspaceInfo {
@@ -405,6 +446,17 @@ impl Workspace {
             .await
     }
 
+    /// Configure a child process to run in this workspace's path view with a
+    /// cwd relative to the origin repo root.
+    pub async fn prepare_command_with_cwd(
+        &self,
+        command: &mut tokio::process::Command,
+        cwd: Option<&Utf8Path>,
+    ) -> anyhow::Result<()> {
+        self.prepare_command_with_cwd_and_file_mounts(command, cwd, Vec::new())
+            .await
+    }
+
     /// Configure a child process to run in this workspace's path view and
     /// file-bind additional paths inside that private mount namespace.
     ///
@@ -417,16 +469,33 @@ impl Workspace {
         command: &mut tokio::process::Command,
         file_mounts: Vec<(Utf8PathBuf, Utf8PathBuf)>,
     ) -> anyhow::Result<()> {
+        self.prepare_command_with_cwd_and_file_mounts(command, None, file_mounts)
+            .await
+    }
+
+    async fn prepare_command_with_cwd_and_file_mounts(
+        &self,
+        command: &mut tokio::process::Command,
+        cwd: Option<&Utf8Path>,
+        file_mounts: Vec<(Utf8PathBuf, Utf8PathBuf)>,
+    ) -> anyhow::Result<()> {
+        command.env(
+            "PATH",
+            self.repo
+                .path_overrides()
+                .add_to(&std::env::var_os("PATH").expect("PATH must be set")),
+        );
+        let cwd = cwd.map_or_else(|| self.repo().to_owned(), |cwd| self.repo().join(cwd));
         if self.is_user_checkout() {
             anyhow::ensure!(
                 file_mounts.is_empty(),
                 "user checkouts have no private mount namespace for file mounts"
             );
-            command.current_dir(self.repo().as_std_path());
+            command.current_dir(cwd.as_std_path());
             return Ok(());
         }
         let ns_fd = std::os::fd::AsRawFd::as_raw_fd(self.mnt_ns().await);
-        let cwd = CString::new(self.repo().as_str().as_bytes())
+        let cwd = CString::new(cwd.as_str().as_bytes())
             .map_err(|_| anyhow::anyhow!("workspace path contains a NUL byte"))?;
         let mut mounts = Vec::with_capacity(file_mounts.len());
         for (source, target) in file_mounts {
