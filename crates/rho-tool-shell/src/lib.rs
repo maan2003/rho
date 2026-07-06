@@ -237,6 +237,7 @@ impl ShellTools {
         }
 
         let started = Instant::now();
+        command.stdin(std::process::Stdio::null());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
