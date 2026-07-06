@@ -78,12 +78,9 @@ struct Turn {
     /// The original request, kept so a stale-`previous_response` failure can be
     /// rebuilt as a full replay.
     request: InferenceRequest,
-    /// The envelope still waiting to be sent; `None` once it is on the wire.
-    pending_send: Option<ResponsesRequest>,
+    phase: TurnPhase,
     /// Translates streamed events into provider-neutral updates.
     response: ResponseState,
-    /// Whether we already retried this turn as a full replay.
-    replayed: bool,
     /// Whether we have announced `StreamingStarted` for the current attempt.
     streaming_started: bool,
     /// Monotonic debug request/response sequence for the in-flight send
@@ -91,6 +88,17 @@ struct Turn {
     debug_sequence: Option<u64>,
     /// Raw provider text frames observed for the in-flight send attempt.
     raw_events: Vec<serde_json::Value>,
+}
+
+enum TurnPhase {
+    /// A request is waiting to be sent. `replay` means the previous attempt hit
+    /// a stale `previous_response_id`, so this send must be a full replay.
+    Queued { replay: bool },
+    /// A request is on the wire and we are reading its response.
+    InFlight {
+        replay: bool,
+        used_previous_response_id: bool,
+    },
 }
 
 pub struct InferenceSession {
@@ -269,13 +277,11 @@ impl InferenceSession {
 
     /// Queue a turn. The work happens in `run`.
     pub fn request(&mut self, request: InferenceRequest) {
-        let body = ResponsesRequest::from_inference_request(self, request.clone());
         self.buffered.clear();
         self.turn = Some(Turn {
             request,
-            pending_send: Some(body),
+            phase: TurnPhase::Queued { replay: false },
             response: ResponseState::new(),
-            replayed: false,
             streaming_started: false,
             debug_sequence: None,
             raw_events: Vec::new(),
@@ -302,7 +308,7 @@ impl InferenceSession {
             if self
                 .turn
                 .as_ref()
-                .is_some_and(|turn| turn.pending_send.is_some())
+                .is_some_and(|turn| matches!(turn.phase, TurnPhase::Queued { .. }))
             {
                 if let Err(error) = self.ensure_connection().await {
                     self.turn = None;
@@ -312,16 +318,35 @@ impl InferenceSession {
                     };
                 }
                 let debug_sequence = self.next_debug_sequence();
-                let mut body = {
-                    let turn = self.turn.as_mut().unwrap();
-                    turn.debug_sequence = Some(debug_sequence);
-                    turn.raw_events.clear();
-                    turn.pending_send.take().unwrap()
+                let cached_response_id = self
+                    .connection
+                    .as_ref()
+                    .and_then(|connection| connection.cached_response_id.as_deref())
+                    .map(str::to_owned);
+                let (replay, request) = {
+                    let turn = self.turn.as_ref().unwrap();
+                    let replay = match turn.phase {
+                        TurnPhase::Queued { replay } => replay,
+                        TurnPhase::InFlight { .. } => unreachable!("checked above"),
+                    };
+                    (replay, turn.request.clone())
                 };
+                let mut body = ResponsesRequest::from_inference_request(
+                    self,
+                    request,
+                    (!replay).then_some(cached_response_id).flatten().as_deref(),
+                );
                 let connection = self.connection.as_ref().unwrap();
                 body.prompt_cache_key = self
                     .prompt_cache_key
                     .to_wire_uuid(&self.base_url, connection.client_secret);
+                let turn = self.turn.as_mut().unwrap();
+                turn.debug_sequence = Some(debug_sequence);
+                turn.raw_events.clear();
+                turn.phase = TurnPhase::InFlight {
+                    replay,
+                    used_previous_response_id: body.previous_response_id.is_some(),
+                };
                 self.maybe_debug_write_provider_request(debug_sequence, &body);
                 if let Err(error) = self.connection.as_mut().unwrap().send_envelope(body).await {
                     match self.on_socket_failure(error) {
@@ -415,12 +440,24 @@ impl InferenceSession {
                 }
                 // The terminal `InferenceUpdate::Finished` is emitted by
                 // `apply_event` itself, so here we just drop the finished turn.
+                let response_id = updates.iter().find_map(|update| match update {
+                    InferenceEvent::Finished {
+                        provider_response_id,
+                        ..
+                    } => provider_response_id
+                        .as_ref()
+                        .map(|id| id.as_str().to_owned()),
+                    _ => None,
+                });
                 self.buffered.extend(updates);
                 if done {
                     let debug = turn
                         .debug_sequence
                         .map(|sequence| (sequence, turn.raw_events.clone()));
                     self.turn = None;
+                    if let Some(connection) = self.connection.as_mut() {
+                        connection.cached_response_id = response_id;
+                    }
                     if let Some((sequence, raw_events)) = debug {
                         self.maybe_debug_write_provider_response(sequence, &raw_events, None);
                     }
@@ -459,15 +496,17 @@ impl InferenceSession {
                 Some(error_message.as_str()),
             );
         }
-        let replayable = matches!(&self.turn, Some(turn) if !turn.replayed)
-            && super::is_stale_previous_response_error(&error)
+        let replayable = matches!(
+            &self.turn,
+            Some(Turn {
+                phase: TurnPhase::InFlight { replay: false, .. },
+                ..
+            })
+        ) && super::is_stale_previous_response_error(&error)
             && self.turn_has_previous_response_id();
         if replayable {
-            let request = self.turn.as_ref().unwrap().request.clone();
-            let body = ResponsesRequest::from_inference_request_full_replay(self, request);
             let turn = self.turn.as_mut().unwrap();
-            turn.pending_send = Some(body);
-            turn.replayed = true;
+            turn.phase = TurnPhase::Queued { replay: true };
             turn.streaming_started = false;
             turn.debug_sequence = None;
             turn.raw_events.clear();
@@ -546,12 +585,16 @@ impl InferenceSession {
     }
 
     fn turn_has_previous_response_id(&self) -> bool {
-        match &self.turn {
-            Some(turn) => ResponsesRequest::from_inference_request(self, turn.request.clone())
-                .previous_response_id
-                .is_some(),
-            None => false,
-        }
+        matches!(
+            &self.turn,
+            Some(Turn {
+                phase: TurnPhase::InFlight {
+                    used_previous_response_id: true,
+                    ..
+                },
+                ..
+            })
+        )
     }
 
     /// Ensure a usable connection, reopening when missing, when OAuth rotated
@@ -567,8 +610,12 @@ impl InferenceSession {
             let thread_id = self
                 .turn
                 .as_ref()
-                .and_then(|turn| turn.pending_send.as_ref())
-                .map(|body| body.prompt_cache_key.to_string());
+                .filter(|turn| matches!(turn.phase, TurnPhase::Queued { .. }))
+                .map(|_| {
+                    self.prompt_cache_key
+                        .to_wire_uuid(&self.base_url, resolved.client_secret)
+                        .to_string()
+                });
             let request = ws::build_ws_request(self, thread_id.as_deref(), &resolved)?;
             let (socket, _response) = connect_async(request).await?;
             self.connection = Some(WebSocketConnection::new(socket, &resolved));

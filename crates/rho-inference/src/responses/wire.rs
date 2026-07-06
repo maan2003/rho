@@ -68,38 +68,37 @@ impl ResponsesRequest {
     pub(crate) fn from_inference_request(
         session: &InferenceSession,
         request: InferenceRequest,
+        cached_response_id: Option<&str>,
     ) -> Self {
         let mut previous_response = None;
-        for (index, block) in request.input.iter().enumerate() {
-            let ContextBlock::InferenceResponse {
-                provider_response_id,
-                items,
-            } = &**block
-            else {
-                continue;
-            };
+        if let Some(cached_response_id) = cached_response_id {
+            for (index, block) in request.input.iter().enumerate() {
+                let ContextBlock::InferenceResponse {
+                    provider_response_id,
+                    items,
+                } = &**block
+                else {
+                    continue;
+                };
 
-            let has_compaction = items
-                .iter()
-                .any(|item| matches!(item, InferenceResponseItem::Compaction(_)));
+                let has_compaction = items
+                    .iter()
+                    .any(|item| matches!(item, InferenceResponseItem::Compaction(_)));
 
-            if has_compaction {
-                previous_response = None;
-            } else {
-                previous_response = provider_response_id
+                if has_compaction {
+                    previous_response = None;
+                } else if provider_response_id
                     .as_ref()
-                    .map(|id| (id.as_str().to_owned(), index + 1));
+                    .is_some_and(|id| id.as_str() == cached_response_id)
+                {
+                    previous_response = provider_response_id
+                        .as_ref()
+                        .map(|id| (id.as_str().to_owned(), index + 1));
+                }
             }
         }
 
         Self::from_inference_request_with_previous(session, request, previous_response)
-    }
-
-    pub(crate) fn from_inference_request_full_replay(
-        session: &InferenceSession,
-        request: InferenceRequest,
-    ) -> Self {
-        Self::from_inference_request_with_previous(session, request, None)
     }
 
     fn from_inference_request_with_previous(

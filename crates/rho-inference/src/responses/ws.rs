@@ -35,6 +35,9 @@ pub(crate) struct WebSocketConnection {
     pub(crate) opened_at: tokio::time::Instant,
     pub(crate) bearer_token: String,
     pub(crate) client_secret: [u8; 32],
+    /// Response id returned on this live connection. It is only used as
+    /// `previous_response_id` when that same id is present in the next prompt.
+    pub(crate) cached_response_id: Option<String>,
     ping_interval: tokio::time::Interval,
     last_event_at: tokio::time::Instant,
 }
@@ -47,6 +50,7 @@ impl WebSocketConnection {
             opened_at: now,
             bearer_token: auth.bearer_token.clone(),
             client_secret: auth.client_secret,
+            cached_response_id: None,
             ping_interval: tokio::time::interval_at(now + PING_INTERVAL, PING_INTERVAL),
             last_event_at: now,
         }
