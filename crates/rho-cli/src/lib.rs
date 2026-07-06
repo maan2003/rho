@@ -244,6 +244,24 @@ impl ChatApp {
             rho_commands::Command::AgentCancel => {
                 self.cancel_running_turn().await;
             }
+            rho_commands::Command::Continue => {
+                if self.turn_is_running() {
+                    self.term
+                        .print_system("agent is running; press Ctrl-C twice to cancel");
+                    return Ok(true);
+                }
+                let Some(agent_id) = primary_agent_id(&self.agent) else {
+                    self.term.print_system(":continue: no agent yet");
+                    return Ok(true);
+                };
+                self.term.set_status("running");
+                self.agent.continue_turn(agent_id);
+                self.running_turn = Some(spawn_turn_watcher(
+                    self.agent.clone(),
+                    self.term.renderer(),
+                    self.term.handle.clone(),
+                ));
+            }
             rho_commands::Command::AgentNew { working_directory } => {
                 let topic_id = self.agent.default_topic_id();
                 let Some(working_directory) =

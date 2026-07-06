@@ -500,6 +500,21 @@ impl Workspace {
                     ),
                 }
             }
+            Command::Continue => {
+                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
+                match target {
+                    Some(agent_id) => {
+                        self.connection
+                            .send(ClientMessage::ContinueTurn { agent_id });
+                    }
+                    None => self.notice_on(
+                        None,
+                        ":continue: no agent selected",
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            }
             Command::AgentRename { name } => {
                 let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
                 match target {

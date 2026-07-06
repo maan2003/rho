@@ -552,6 +552,13 @@ impl RunningAgent {
         }
     }
 
+    fn continue_unfinished(&self) {
+        match self {
+            Self::Rho(agent) => agent.continue_unfinished(),
+            Self::Claude(_) => {}
+        }
+    }
+
     fn set_deep_config(&self, config: rho_agent::db::DeepConfig) -> anyhow::Result<()> {
         match self {
             Self::Rho(agent) => {
@@ -743,6 +750,12 @@ async fn handle_message(
                 .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
             agent.rewind(turns).await?;
             Ok(Refresh::Ready)
+        }
+        ClientMessage::ContinueTurn { agent_id } => {
+            if let Some(agent) = agents.get(agent_id).await {
+                agent.continue_unfinished();
+            }
+            Ok(Refresh::None)
         }
     }
 }

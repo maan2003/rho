@@ -98,6 +98,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Fork the current agent's history before previous turns",
     },
     CommandSpec {
+        name: "continue",
+        usage: ":continue",
+        description: "Continue an unfinished turn after daemon restart",
+    },
+    CommandSpec {
         name: "clear",
         usage: ":clear",
         description: "Clear rendered output",
@@ -161,6 +166,7 @@ pub enum Command {
     Rewind {
         turns: u32,
     },
+    Continue,
     Quit,
     Clear,
     Help,
@@ -232,6 +238,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
         },
         "cancel" => Parsed::Command(Command::AgentCancel),
         "rewind" => parse_rewind(&mut tokens),
+        "continue" => Parsed::Command(Command::Continue),
         "quit" | "exit" => Parsed::Command(Command::Quit),
         "clear" => Parsed::Command(Command::Clear),
         "help" => Parsed::Command(Command::Help),

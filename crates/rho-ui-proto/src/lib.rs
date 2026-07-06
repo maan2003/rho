@@ -102,6 +102,9 @@ pub enum ClientMessage {
         agent_id: AgentId,
         turns: u32,
     },
+    ContinueTurn {
+        agent_id: AgentId,
+    },
     /// Re-points the agent's topic membership. Topics are ad-hoc tab groups:
     /// agents start in the default topic and move into a topic once they
     /// prove worth organizing.

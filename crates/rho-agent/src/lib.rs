@@ -419,6 +419,10 @@ impl Agent {
         let _ = self.control.send(AgentControl::Cancel);
     }
 
+    pub fn continue_unfinished(&self) {
+        let _ = self.control.send(AgentControl::ContinueUnfinished);
+    }
+
     pub fn set_deep_config(&self, config: DeepConfig) {
         let _ = self.control.send(AgentControl::SetDeepConfig(config));
     }
@@ -468,6 +472,7 @@ enum AgentControl {
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     Cancel,
+    ContinueUnfinished,
 }
 
 struct AgentLoop {
@@ -571,6 +576,40 @@ impl AgentLoop {
                             state.queued_messages.clear();
 
                             state.kind = AgentStateKind::Idle;
+                        }
+                        AgentControl::ContinueUnfinished => {
+                            let AgentStateKind::UnfinishedTurn { .. } = state.kind else {
+                                continue;
+                            };
+                            assert!(!self.inference_session.has_active_request());
+                            assert!(self.pending_tools.is_empty());
+                            let AgentStateKind::UnfinishedTurn {
+                                outstanding_calls,
+                                completed_tool_calls,
+                            } = std::mem::replace(&mut state.kind, AgentStateKind::Idle)
+                            else {
+                                unreachable!("checked unfinished turn");
+                            };
+                            let mut results =
+                                completed_tool_calls.iter().cloned().collect::<Vec<_>>();
+                            for call in outstanding_calls.iter() {
+                                let result = interrupted_tool_result(call);
+                                self.persist_event(AgentEvent::ToolResult {
+                                    result: Cow::Borrowed(&result),
+                                })
+                                .await;
+                                results.push(result);
+                            }
+                            if !results.is_empty() {
+                                state
+                                    .blocks
+                                    .push(Arc::new(ContextBlock::ToolResults { results }));
+                            }
+                            self.send_request(&state);
+                            state.kind = AgentStateKind::ApiStreaming {
+                                pending_response: PendingInferenceResponse::default(),
+                                previous_attempt: None,
+                            };
                         }
                         AgentControl::SetDeepConfig(config) => {
                             let _ = self.inference_session.set_deep_config(config);
