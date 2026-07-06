@@ -499,8 +499,8 @@ impl AgentLoop {
     /// `NextRequest` lane drains right before each mid-turn inference request,
     /// the `NextTurn` lane when the turn completes (a non-empty queue then
     /// starts the next turn instead of going `Idle`). On `Error` the queue is
-    /// held — no automatic retry — until the user sends another message
-    /// (drains everything) or cancels (drops everything).
+    /// held — no automatic retry — until the user sends another message or
+    /// continues (drains everything), or cancels (drops everything).
     async fn run(mut self) {
         loop {
             let mut state = self.state.read().expect("poison").clone();
@@ -578,38 +578,48 @@ impl AgentLoop {
                             state.kind = AgentStateKind::Idle;
                         }
                         AgentControl::ContinueUnfinished => {
-                            let AgentStateKind::UnfinishedTurn { .. } = state.kind else {
-                                continue;
-                            };
                             assert!(!self.inference_session.has_active_request());
                             assert!(self.pending_tools.is_empty());
-                            let AgentStateKind::UnfinishedTurn {
-                                outstanding_calls,
-                                completed_tool_calls,
-                            } = std::mem::replace(&mut state.kind, AgentStateKind::Idle)
-                            else {
-                                unreachable!("checked unfinished turn");
-                            };
-                            let mut results =
-                                completed_tool_calls.iter().cloned().collect::<Vec<_>>();
-                            for call in outstanding_calls.iter() {
-                                let result = interrupted_tool_result(call);
-                                self.persist_event(AgentEvent::ToolResult {
-                                    result: Cow::Borrowed(&result),
-                                })
-                                .await;
-                                results.push(result);
+                            match std::mem::replace(&mut state.kind, AgentStateKind::Idle) {
+                                AgentStateKind::UnfinishedTurn {
+                                    outstanding_calls,
+                                    completed_tool_calls,
+                                } => {
+                                    let mut results =
+                                        completed_tool_calls.iter().cloned().collect::<Vec<_>>();
+                                    for call in outstanding_calls.iter() {
+                                        let result = interrupted_tool_result(call);
+                                        self.persist_event(AgentEvent::ToolResult {
+                                            result: Cow::Borrowed(&result),
+                                        })
+                                        .await;
+                                        results.push(result);
+                                    }
+                                    if !results.is_empty() {
+                                        state.blocks.push(Arc::new(ContextBlock::ToolResults {
+                                            results,
+                                        }));
+                                    }
+                                    self.send_request(&state);
+                                    state.kind = AgentStateKind::ApiStreaming {
+                                        pending_response: PendingInferenceResponse::default(),
+                                        previous_attempt: None,
+                                    };
+                                }
+                                AgentStateKind::Error(previous_attempt) => {
+                                    self.deliver_queued(&mut state, MessageDelivery::NextTurn)
+                                        .await;
+                                    self.send_request(&state);
+                                    state.kind = AgentStateKind::ApiStreaming {
+                                        pending_response: PendingInferenceResponse::default(),
+                                        previous_attempt: Some(previous_attempt),
+                                    };
+                                }
+                                other => {
+                                    state.kind = other;
+                                    continue;
+                                }
                             }
-                            if !results.is_empty() {
-                                state
-                                    .blocks
-                                    .push(Arc::new(ContextBlock::ToolResults { results }));
-                            }
-                            self.send_request(&state);
-                            state.kind = AgentStateKind::ApiStreaming {
-                                pending_response: PendingInferenceResponse::default(),
-                                previous_attempt: None,
-                            };
                         }
                         AgentControl::SetDeepConfig(config) => {
                             let _ = self.inference_session.set_deep_config(config);
