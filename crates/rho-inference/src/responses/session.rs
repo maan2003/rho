@@ -263,6 +263,10 @@ impl InferenceSession {
         self.prompt_cache_key
     }
 
+    pub fn has_active_request(&self) -> bool {
+        self.turn.is_some()
+    }
+
     /// Queue a turn. The work happens in `run`.
     pub fn request(&mut self, request: InferenceRequest) {
         let body = ResponsesRequest::from_inference_request(self, request.clone());

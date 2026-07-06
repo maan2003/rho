@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt};
 use rho_core::{
     ApplyPatchMetadata, ContentPart, ContextBlock, InferenceEvent, InferenceRequest,
     InferenceResponseItem, PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId,
-    ToolResult, ToolResultMetadata, ToolSpec, UnixMs,
+    ToolOutput, ToolOutputStatus, ToolResult, ToolResultMetadata, ToolSpec, UnixMs,
 };
 use rho_db::RhoDb;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
@@ -482,18 +482,49 @@ impl AgentLoop {
                                 content: Arc::new(content),
                                 delivery,
                             });
-                            match state.kind {
+                            match &state.kind {
                                 // Busy: the message waits in the queue for its
                                 // delivery point.
                                 AgentStateKind::ApiStreaming { .. }
                                 | AgentStateKind::ToolCalling { .. } => {}
                                 // No turn in flight: deliver everything now
                                 // (including messages held through an Error).
-                                AgentStateKind::Idle
-                                | AgentStateKind::Error(_)
-                                | AgentStateKind::UnfinishedTurn { .. } => {
-                                    self.inference_session.abort();
-                                    self.pending_tools.clear();
+                                AgentStateKind::Idle | AgentStateKind::Error(_) => {
+                                    assert!(!self.inference_session.has_active_request());
+                                    assert!(self.pending_tools.is_empty());
+                                    self.deliver_queued(&mut state, MessageDelivery::NextTurn)
+                                        .await;
+                                    self.send_request(&state);
+                                    state.kind = AgentStateKind::ApiStreaming {
+                                        pending_response: PendingInferenceResponse::default(),
+                                        previous_attempt: None,
+                                    };
+                                }
+                                AgentStateKind::UnfinishedTurn { .. } => {
+                                    assert!(!self.inference_session.has_active_request());
+                                    assert!(self.pending_tools.is_empty());
+                                    let AgentStateKind::UnfinishedTurn {
+                                        outstanding_calls,
+                                        completed_tool_calls,
+                                    } = std::mem::replace(&mut state.kind, AgentStateKind::Idle)
+                                    else {
+                                        unreachable!("checked unfinished turn");
+                                    };
+                                    let mut results =
+                                        completed_tool_calls.iter().cloned().collect::<Vec<_>>();
+                                    for call in outstanding_calls.iter() {
+                                        let result = interrupted_tool_result(call);
+                                        self.persist_event(AgentEvent::ToolResult {
+                                            result: Cow::Borrowed(&result),
+                                        })
+                                        .await;
+                                        results.push(result);
+                                    }
+                                    if !results.is_empty() {
+                                        state
+                                            .blocks
+                                            .push(Arc::new(ContextBlock::ToolResults { results }));
+                                    }
                                     self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                         .await;
                                     self.send_request(&state);
@@ -752,5 +783,24 @@ impl AgentLoop {
 fn tool_preview_metadata(metadata: ToolResultMetadata) -> ToolPreviewMetadata {
     match metadata {
         ToolResultMetadata::ApplyPatch(metadata) => ToolPreviewMetadata::ApplyPatch(metadata),
+    }
+}
+
+fn interrupted_tool_result(call: &ToolCall) -> ToolResult {
+    let now = UnixMs::now();
+    ToolResult {
+        call_id: call.id.clone(),
+        tool_type: call.tool_type,
+        body: ToolOutput {
+            output: Arc::new(
+                "Tool execution was interrupted by a daemon restart. It may have completed \
+                 partially."
+                    .to_owned(),
+            ),
+            status: ToolOutputStatus::Error,
+        },
+        started_at: now,
+        finished_at: now,
+        metadata: None,
     }
 }
