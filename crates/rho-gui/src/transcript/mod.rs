@@ -15,7 +15,7 @@
 mod elisions;
 mod inlays;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use editor::Editor;
@@ -225,9 +225,6 @@ impl TranscriptModel {
             Region::LiveTurn
         };
         let mut changed = HashSet::new();
-        for (class, _) in &old_record.styles {
-            changed.insert(*class);
-        }
         let stale_inlays = old_record
             .inlay
             .as_ref()
@@ -238,6 +235,8 @@ impl TranscriptModel {
         let mut gutters_changed = false;
         self.buffer.clone().update(cx, |buffer, cx| {
             let block_start = self.records[index].range.start.to_offset(buffer);
+            let old_relative_styles =
+                relative_style_ranges(buffer, block_start, &self.records[index].styles);
             let edit_start = block_start + edit.old_range.start;
             let edit_end = block_start + edit.old_range.end;
             buffer.edit([(edit_start..edit_end, edit.inserted.clone())], None, cx);
@@ -250,9 +249,11 @@ impl TranscriptModel {
                 .filter(|(span, _)| span.class != StyleClass::Default && !span.text.is_empty())
                 .map(|(span, range)| (span.class, range.clone()))
                 .collect::<Vec<_>>();
-            for (class, _) in &styles {
-                changed.insert(*class);
-            }
+            let new_relative_styles = relative_style_ranges(buffer, block_start, &styles);
+            changed.extend(changed_style_classes(
+                &old_relative_styles,
+                &new_relative_styles,
+            ));
 
             let new_end = block_start + new_text.len();
             gutters_changed = self.records[index].gutter.is_some() || gutter.is_some();
@@ -331,22 +332,17 @@ impl TranscriptModel {
             Region::LiveTurn => &self.records[self.turn_boundary..],
             _ => &self.records[..self.turn_boundary],
         };
-        let by_class = changed
+        let mut by_class = changed
             .iter()
-            .map(|class| {
-                let ranges = records
-                    .iter()
-                    .flat_map(|record| {
-                        record
-                            .styles
-                            .iter()
-                            .filter(|(range_class, _)| range_class == class)
-                            .map(|(_, range)| range.clone())
-                    })
-                    .collect::<Vec<_>>();
-                (*class, ranges)
-            })
-            .collect::<Vec<_>>();
+            .map(|class| (*class, Vec::new()))
+            .collect::<HashMap<_, _>>();
+        for record in records {
+            for (class, range) in &record.styles {
+                if let Some(ranges) = by_class.get_mut(class) {
+                    ranges.push(range.clone());
+                }
+            }
+        }
         apply_class_highlights(
             &self.editor,
             &self.multi_buffer,
@@ -498,6 +494,31 @@ fn rendered_text_edit(old: &str, new: &str) -> Option<RenderedTextEdit> {
         old_range: prefix..old.len() - suffix,
         inserted: new[prefix..new.len() - suffix].to_owned(),
     })
+}
+
+fn relative_style_ranges(
+    buffer: &Buffer,
+    block_start: usize,
+    styles: &[(StyleClass, Range<Anchor>)],
+) -> HashMap<StyleClass, Vec<Range<usize>>> {
+    let mut by_class: HashMap<_, Vec<_>> = HashMap::new();
+    for (class, range) in styles {
+        let start = range.start.to_offset(buffer).saturating_sub(block_start);
+        let end = range.end.to_offset(buffer).saturating_sub(block_start);
+        by_class.entry(*class).or_default().push(start..end);
+    }
+    by_class
+}
+
+fn changed_style_classes(
+    old: &HashMap<StyleClass, Vec<Range<usize>>>,
+    new: &HashMap<StyleClass, Vec<Range<usize>>>,
+) -> HashSet<StyleClass> {
+    old.keys()
+        .chain(new.keys())
+        .filter(|class| old.get(class) != new.get(class))
+        .copied()
+        .collect()
 }
 
 /// Appends a rendered block's text at the end of the buffer and returns the
