@@ -1058,8 +1058,15 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
 
                         named_variant_arms.push(quote! {
                             x if x == #variant_id => {
+                                // The phantom ties FieldValues to every enum
+                                // generic: a variant whose fields skip a
+                                // lifetime/type param would otherwise make
+                                // this helper ill-formed (E0392).
                                 #[derive(Default)]
-                                struct FieldValues #impl_generics #where_clause { #(#field_value_definitions_enum)* }
+                                struct FieldValues #impl_generics #where_clause {
+                                    #(#field_value_definitions_enum)*
+                                    __senax_phantom: ::core::marker::PhantomData<fn() -> #name #ty_generics>,
+                                }
                                 let mut field_values = #field_values_default;
                                 loop {
                                     let field_id = {

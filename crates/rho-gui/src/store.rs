@@ -82,7 +82,7 @@ impl AgentStore {
 pub fn turn_open(status: UiAgentStatus) -> bool {
     match status {
         UiAgentStatus::Streaming
-        | UiAgentStatus::ToolCalling
+        | UiAgentStatus::ToolCalling { .. }
         | UiAgentStatus::UnfinishedTurn { .. } => true,
         UiAgentStatus::Idle | UiAgentStatus::Error => false,
     }

@@ -38,6 +38,7 @@ pub async fn generate_title(auth: InferenceAuth, user_message: &str) -> anyhow::
     session.request(InferenceRequest {
         instructions: Arc::from(INSTRUCTIONS),
         input: vec![Arc::new(ContextBlock::UserMessage {
+            sender: rho_core::MessageSender::User,
             content: vec![ContentPart::Text {
                 text: truncate_chars(user_message, MAX_PROMPT_CHARS).to_owned(),
             }],

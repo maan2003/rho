@@ -181,6 +181,7 @@ fn project_user_message(message: &rho_claude::SessionMessage) -> anyhow::Result<
         return Ok(Arc::new(ContextBlock::ToolResults { results }));
     }
     Ok(Arc::new(ContextBlock::UserMessage {
+        sender: rho_core::MessageSender::User,
         content: vec![ContentPart::Text { text }],
     }))
 }
@@ -329,7 +330,7 @@ mod tests {
         )])
         .unwrap();
 
-        let ContextBlock::UserMessage { content } = blocks[0].as_ref() else {
+        let ContextBlock::UserMessage { content, .. } = blocks[0].as_ref() else {
             panic!("expected user message");
         };
         assert_eq!(text_content(content), "hello");

@@ -784,13 +784,26 @@ impl ChatTerm {
                 UiBlock::Notice { text } => {
                     self.print_system(text);
                 }
-                UiBlock::QueuedMessage { text, delivery } => match delivery_label(*delivery) {
-                    Some(label) => self.print_system(&format!("{text} {label}")),
-                    None => {
-                        self.handle
-                            .print_output("history-message", user_message_block(text));
+                UiBlock::QueuedMessage {
+                    text,
+                    delivery,
+                    sender,
+                } => {
+                    let text = queued_message_text(text, sender.as_deref());
+                    match delivery_label(*delivery) {
+                        Some(label) => self.print_system(&format!("{text} {label}")),
+                        None => {
+                            self.handle
+                                .print_output("history-message", user_message_block(&text));
+                        }
                     }
-                },
+                }
+                UiBlock::AgentMessage { sender, text } => {
+                    self.handle.print_output(
+                        "history-message",
+                        user_message_block(&format!("[from {sender}] {text}")),
+                    );
+                }
             }
         }
     }
@@ -986,7 +999,9 @@ impl StreamingRenderer {
                     self.finish_turn();
                 }
             }
-            UiAgentStatus::Streaming | UiAgentStatus::ToolCalling | UiAgentStatus::Error => {
+            UiAgentStatus::Streaming
+            | UiAgentStatus::ToolCalling { .. }
+            | UiAgentStatus::Error => {
                 let turn_base = *self
                     .turn_base
                     .get_or_insert_with(|| turn_base_index(&state.blocks));
@@ -1019,15 +1034,29 @@ impl StreamingRenderer {
             UiBlock::Notice { text } => {
                 self.set_index_block(index, "notice", StyledBlock::new(dim_text(text)));
             }
-            UiBlock::QueuedMessage { text, delivery } => match delivery_label(*delivery) {
-                Some(label) => {
-                    let queued = format!("{text} {label}");
-                    self.set_index_block(index, "queued", StyledBlock::new(dim_text(&queued)));
+            UiBlock::QueuedMessage {
+                text,
+                delivery,
+                sender,
+            } => {
+                let text = queued_message_text(text, sender.as_deref());
+                match delivery_label(*delivery) {
+                    Some(label) => {
+                        let queued = format!("{text} {label}");
+                        self.set_index_block(index, "queued", StyledBlock::new(dim_text(&queued)));
+                    }
+                    None => {
+                        self.set_index_block(index, "user", user_message_block(&text));
+                    }
                 }
-                None => {
-                    self.set_index_block(index, "user", user_message_block(text));
-                }
-            },
+            }
+            UiBlock::AgentMessage { sender, text } => {
+                self.set_index_block(
+                    index,
+                    "user",
+                    user_message_block(&format!("[from {sender}] {text}")),
+                );
+            }
         }
     }
 
@@ -1189,6 +1218,16 @@ fn delivery_label(delivery: MessageDelivery) -> Option<&'static str> {
         MessageDelivery::Immediate => None,
         MessageDelivery::NextRequest => Some("(steering)"),
         MessageDelivery::NextTurn => Some("(queued)"),
+        MessageDelivery::QueueOnly => Some("(mail)"),
+    }
+}
+
+/// Queued mail carries its sender inline so the queue rendering shows who
+/// is waiting to be heard.
+fn queued_message_text(text: &str, sender: Option<&str>) -> String {
+    match sender {
+        Some(sender) => format!("[from {sender}] {text}"),
+        None => text.to_owned(),
     }
 }
 

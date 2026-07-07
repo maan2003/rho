@@ -9722,6 +9722,7 @@ dependencies = [
  "rho-tool-shell",
  "rho-workspaces",
  "senax-encoder",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -9815,6 +9816,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "prefix-id",
  "senax-encoder",
  "serde",
  "serde_json",

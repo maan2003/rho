@@ -6,12 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
-use futures::stream::BoxStream;
-use rho_agent::claude::ClaudeAgent;
+use rho_agent::MessageDelivery;
 use rho_agent::db::{
     AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, Status, TopicId,
 };
-use rho_agent::{Agent, AgentState, MessageDelivery};
+use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_core::text_content;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
@@ -21,8 +20,7 @@ use rho_ui_proto::{
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, ServerMessage, StartMode,
     UiAgentSummary, UiTopic, UiWorkdir, read_frame_counted, write_frame_counted,
 };
-use rho_workspaces::{Repo, WorkspaceInfo};
-use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, mpsc};
+use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc};
 
 pub mod debug;
 mod voice;
@@ -106,6 +104,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 }
 
 struct AgentRegistry {
+    pool: Arc<AgentPool>,
     db: RhoDb,
     auth: InferenceAuth,
     /// The daemon-created topic agents are born into; announced in `Ready`
@@ -114,10 +113,6 @@ struct AgentRegistry {
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
-    agents: Mutex<HashMap<AgentId, RunningAgent>>,
-    /// One shared handle per repo root: live-workspace sharing (joined
-    /// agents get one checkout + namespace) only holds within one instance.
-    repos: Mutex<HashMap<Utf8PathBuf, Arc<Repo>>>,
     /// Agents with a title generation in flight, so a burst of messages to an
     /// untitled agent starts at most one task.
     title_tasks: Mutex<HashSet<AgentId>>,
@@ -130,9 +125,7 @@ struct AgentRegistry {
 
 impl AgentRegistry {
     async fn new(db: RhoDb, auth: InferenceAuth) -> Self {
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        write.commit();
+        let pool = AgentPool::new(db.clone(), auth.clone()).await;
         let machine_seed = db.read().machine_seed();
         // Topics are ad-hoc tab groups; every agent starts in the default
         // one (the oldest topic) until it is moved somewhere more specific.
@@ -155,19 +148,18 @@ impl AgentRegistry {
             }
         };
         let registry = Self {
+            pool,
             db,
             auth,
             default_topic_id,
             machine_seed,
-            agents: Mutex::new(HashMap::new()),
-            repos: Mutex::new(HashMap::new()),
             title_tasks: Mutex::new(HashSet::new()),
             land_locks: Mutex::new(HashMap::new()),
             land_holders: Mutex::new(HashMap::new()),
             land_statuses: Mutex::new(HashMap::new()),
             voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        registry.load_non_archived_agents().await;
+        registry.pool.load_non_archived_agents().await;
         registry
     }
 
@@ -234,38 +226,11 @@ impl AgentRegistry {
     }
 
     async fn loaded(&self) -> Vec<(AgentId, RunningAgent)> {
-        let mut agents = self
-            .agents
-            .lock()
-            .await
-            .iter()
-            .map(|(agent_id, agent)| (*agent_id, agent.clone()))
-            .collect::<Vec<_>>();
-        agents.sort_by_key(|(agent_id, _)| *agent_id);
-        agents
-    }
-
-    async fn load_non_archived_agents(&self) {
-        let agent_ids = self.non_archived_agent_ids();
-        for agent_id in agent_ids {
-            if let Err(error) = self.load(agent_id).await {
-                eprintln!("rho-daemon: failed to load active agent {agent_id:?}: {error:#}");
-            }
-        }
-    }
-
-    fn non_archived_agent_ids(&self) -> Vec<AgentId> {
-        let read = self.db.read();
-        read.list_topics()
-            .into_iter()
-            .filter(|(_, topic)| topic.status != Status::Archived)
-            .flat_map(|(topic_id, _)| read.list_topic_agents(topic_id))
-            .filter(|agent_id| read.get_agent(*agent_id).status != Status::Archived)
-            .collect()
+        self.pool.loaded().await
     }
 
     async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
-        self.agents.lock().await.get(&agent_id).cloned()
+        self.pool.get(agent_id).await
     }
 
     async fn land_lock(&self, repo: Utf8PathBuf) -> Arc<TokioMutex<()>> {
@@ -315,62 +280,22 @@ impl AgentRegistry {
             StartMode::NewOn { repo, revset } => {
                 let repo = validate_repo_root(repo)?;
                 rho_agent::StartWorkspace::Create {
-                    repo: self.repo(&repo).await?,
+                    repo: self.pool.repo(&repo).await?,
                     parent_revset: revset,
                 }
             }
             StartMode::Join(JoinTarget::Workspace(info)) => {
-                rho_agent::StartWorkspace::Existing(self.open_workspace(&info).await?)
+                rho_agent::StartWorkspace::Existing(self.pool.open_workspace(&info).await?)
             }
             StartMode::Join(JoinTarget::User { repo }) => {
                 let repo = validate_repo_root(repo)?;
-                rho_agent::StartWorkspace::Existing(self.repo(&repo).await?.user_checkout().await?)
-            }
-        };
-        let (agent_id, agent) = match mode {
-            AgentMode::Deep(_) => {
-                let (agent_id, agent) = Agent::create(
-                    self.db.clone(),
-                    self.auth.clone(),
-                    mode,
-                    topic_id,
-                    None,
-                    start,
+                rho_agent::StartWorkspace::Existing(
+                    self.pool.repo(&repo).await?.user_checkout().await?,
                 )
-                .await?;
-                (agent_id, RunningAgent::Rho(agent))
-            }
-            AgentMode::Fable { .. } | AgentMode::Opus { .. } => {
-                let (agent_id, agent) =
-                    ClaudeAgent::create(self.db.clone(), topic_id, None, start, mode).await?;
-                (agent_id, RunningAgent::Claude(agent))
             }
         };
-        self.agents.lock().await.insert(agent_id, agent.clone());
+        let (agent_id, agent) = self.pool.create(topic_id, mode, None, start).await?;
         Ok((topic_id, agent_id, agent))
-    }
-
-    /// The shared handle for the repo rooted at (or containing) `path`.
-    async fn repo(&self, path: &Utf8Path) -> anyhow::Result<Arc<Repo>> {
-        let repo = Repo::open(path.as_std_path())?;
-        let mut repos = self.repos.lock().await;
-        Ok(match repos.entry(repo.root().to_owned()) {
-            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                Arc::clone(entry.insert(Arc::new(repo)))
-            }
-        })
-    }
-
-    async fn open_workspace(
-        &self,
-        info: &WorkspaceInfo,
-    ) -> anyhow::Result<Arc<rho_workspaces::Workspace>> {
-        let repo = self.repo(info.repo()).await?;
-        match info {
-            WorkspaceInfo::UserCheckout { .. } => repo.user_checkout().await,
-            WorkspaceInfo::Workspace { id, .. } => repo.open_workspace(*id).await,
-        }
     }
 
     async fn move_agent(
@@ -539,106 +464,7 @@ impl AgentRegistry {
     }
 
     async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, RunningAgent, bool)> {
-        if let Some(agent) = self.agents.lock().await.get(&agent_id).cloned() {
-            return Ok((agent_id, agent, false));
-        }
-        let record = self.db.read().get_agent(agent_id);
-        let workspace = self.open_workspace(&record.workspace).await?;
-        let agent = match record.runtime {
-            AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load(
-                self.db.clone(),
-                self.auth.clone(),
-                agent_id,
-                workspace,
-            )),
-            AgentRuntime::Claude { .. } => {
-                RunningAgent::Claude(ClaudeAgent::load(self.db.clone(), agent_id, workspace).await?)
-            }
-        };
-        self.agents.lock().await.insert(agent_id, agent.clone());
-        Ok((agent_id, agent, true))
-    }
-}
-
-#[derive(Clone)]
-enum RunningAgent {
-    Rho(Agent),
-    Claude(ClaudeAgent),
-}
-
-impl RunningAgent {
-    fn state(&self) -> AgentState {
-        match self {
-            Self::Rho(agent) => agent.state(),
-            Self::Claude(agent) => agent.state(),
-        }
-    }
-
-    fn send_user_message(&self, text: String, delivery: MessageDelivery) {
-        match self {
-            Self::Rho(agent) => agent.send_user_message(text, delivery),
-            // The Claude CLI does its own mid-turn steering; there is no
-            // lane choice to forward.
-            Self::Claude(agent) => agent.send_user_message(text),
-        }
-    }
-
-    fn compact(&self, delivery: MessageDelivery) -> anyhow::Result<()> {
-        match self {
-            Self::Claude(agent) => {
-                agent.compact();
-                Ok(())
-            }
-            Self::Rho(agent) => {
-                agent.compact(delivery);
-                Ok(())
-            }
-        }
-    }
-
-    fn cancel(&self) {
-        match self {
-            Self::Rho(agent) => agent.cancel(),
-            Self::Claude(agent) => agent.cancel(),
-        }
-    }
-
-    fn continue_unfinished(&self) {
-        match self {
-            Self::Rho(agent) => agent.continue_unfinished(),
-            Self::Claude(_) => {}
-        }
-    }
-
-    fn set_deep_config(&self, config: rho_agent::db::DeepConfig) -> anyhow::Result<()> {
-        match self {
-            Self::Rho(agent) => {
-                agent.set_deep_config(config);
-                Ok(())
-            }
-            Self::Claude(_) => anyhow::bail!("cannot apply deep config to Claude agent"),
-        }
-    }
-
-    async fn set_claude_effort(&self, effort: rho_claude::Effort) -> anyhow::Result<()> {
-        match self {
-            Self::Claude(agent) => agent.set_effort(effort).await,
-            Self::Rho(_) => anyhow::bail!("cannot apply Claude effort to Rho agent"),
-        }
-    }
-
-    async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
-        match self {
-            Self::Rho(agent) => agent.rewind(turns).await,
-            Self::Claude(_) => anyhow::bail!("rewind is only available for Rho agents"),
-        }
-    }
-
-    fn subscribe(&self) -> BoxStream<'static, AgentState> {
-        match self {
-            Self::Rho(agent) => agent.subscribe().boxed(),
-            Self::Claude(agent) => agent.subscribe().boxed(),
-        }
+        self.pool.load(agent_id).await
     }
 }
 
@@ -671,8 +497,45 @@ async fn serve_connection(
 
     let _ = outgoing_tx.send(agents.ready_message());
 
+    // Subscribe to creations before snapshotting the loaded set so no agent
+    // slips between the two.
+    let mut created_rx = agents.pool.subscribe_created();
     for (agent_id, agent) in agents.loaded().await {
         subscribe_agent(agent_id, agent, outgoing_tx.clone());
+    }
+
+    // Announce every agent created in the pool — by clients or by other
+    // agents spawning children — so it shows up on this connection.
+    {
+        let agents = Arc::clone(&agents);
+        let outgoing_tx = outgoing_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match created_rx.recv().await {
+                    Ok(created) => {
+                        subscribe_agent(created.agent_id, created.agent, outgoing_tx.clone());
+                        if outgoing_tx
+                            .send(ServerMessage::AgentCreated {
+                                topic_id: created.topic_id,
+                                agent_id: created.agent_id,
+                            })
+                            .is_err()
+                            || outgoing_tx.send(agents.ready_message()).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Missed creations still appear in the refreshed
+                        // agent list.
+                        if outgoing_tx.send(agents.ready_message()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     let mut reader = reader;
@@ -756,9 +619,9 @@ async fn handle_message(
             start,
             content,
         } => {
-            let (topic_id, agent_id, agent) = agents.create(topic_id, mode, start).await?;
-            subscribe_agent(agent_id, agent.clone(), outgoing_tx.clone());
-            let _ = outgoing_tx.send(ServerMessage::AgentCreated { topic_id, agent_id });
+            // Subscription and the AgentCreated announcement ride the pool's
+            // creation broadcast (all connections, including this one).
+            let (_topic_id, agent_id, agent) = agents.create(topic_id, mode, start).await?;
             if let Some(content) = content {
                 let text = text_content(&content);
                 // The agent is fresh, so the lanes are equivalent here.

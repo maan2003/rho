@@ -31,7 +31,7 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "2a7f4d91";
+const CURRENT_AGENT_DB_FORMAT: &str = "b4e17c2d";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -39,7 +39,214 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: "2a7f4d91",
+        to: "1e1beb36",
+        migrate: migrate_queued_event_shape,
+    },
+    AgentDbMigration {
+        from: "1e1beb36",
+        to: "b4e17c2d",
+        migrate: migrate_agent_id_table_names,
+    },
+];
+
+/// Temporary: rewrites legacy `AgentEvent::UserMessage`/`CompactionTriggered`
+/// rows (which were delivered at persist time) into `Queued` +
+/// `Dequeued(NextTurn)` pairs, which replay to the identical block sequence.
+/// The temporary `Decoder` impl on [`AgentEvent`] already maps each legacy
+/// row to a `Queued` item, and a `2a7f4d91` database predates the `Queued`
+/// variant, so every `Queued` seen here is a legacy row. The expansion
+/// shifts later seqs within a lineage, so fork cursors pointing into it
+/// move by the same shift. Delete with that `Decoder` impl.
+fn migrate_queued_event_shape(write: &mut WriteTxn) {
+    use std::collections::HashMap;
+
+    use crate::MessageDelivery;
+
+    let events: Vec<(AgentEventPos, AgentEvent<'static>)> = write
+        .open_table(AGENT_EVENTS)
+        .iter()
+        .map(|(pos, event)| (pos.value(), event.value().into_owned()))
+        .collect();
+
+    // Old seqs of legacy events per lineage: any position shifts by the
+    // count of expansions strictly before it.
+    let mut expanded: HashMap<AgentLineageId, Vec<u32>> = HashMap::new();
+    for (pos, event) in &events {
+        if matches!(event, AgentEvent::Queued(_)) {
+            expanded.entry(pos.lineage_id).or_default().push(pos.seq);
+        }
+    }
+    if expanded.is_empty() {
+        return;
+    }
+    let shifted = |pos: AgentEventPos| -> AgentEventPos {
+        let shift = expanded.get(&pos.lineage_id).map_or(0, |seqs| {
+            seqs.iter().filter(|seq| **seq < pos.seq).count() as u32
+        });
+        AgentEventPos {
+            lineage_id: pos.lineage_id,
+            seq: pos.seq + shift,
+        }
+    };
+
+    // Timelines are contiguous from seq 0 and only grow here, so the shifted
+    // re-inserts overwrite every old key; no deletes needed.
+    let mut timeline = write.open_table(AGENT_EVENTS);
+    for (pos, event) in events {
+        let new_pos = shifted(pos);
+        timeline.insert(&new_pos, SenValue::borrowed(&event));
+        if matches!(event, AgentEvent::Queued(_)) {
+            let dequeued = AgentEvent::Dequeued {
+                boundary: MessageDelivery::NextTurn,
+            };
+            timeline.insert(&new_pos.next(), SenValue::borrowed(&dequeued));
+        }
+    }
+    drop(timeline);
+
+    let parents: Vec<(AgentLineageId, AgentEventPos)> = write
+        .open_table(LINEAGE_PARENTS)
+        .iter()
+        .map(|(child, cursor)| (child.value(), cursor.value()))
+        .collect();
+    let mut table = write.open_table(LINEAGE_PARENTS);
+    for (child, cursor) in parents {
+        let new_cursor = shifted(cursor);
+        if new_cursor != cursor {
+            table.insert(&child, &new_cursor);
+        }
+    }
+}
+
+/// Temporary: reads the pre-move `agents` table, whose stored redb key type
+/// name embedded `AgentIdDomain`'s old module path (it has since moved to
+/// rho-core). Same 12 fixed bytes, old name. Delete with the migration.
+#[derive(Clone, Copy, Debug)]
+struct LegacyAgentIdKey([u8; 12]);
+
+impl redb::Value for LegacyAgentIdKey {
+    type SelfType<'a> = Self;
+    type AsBytes<'a> = [u8; 12];
+
+    fn fixed_width() -> Option<usize> {
+        Some(12)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self
+    where
+        Self: 'a,
+    {
+        Self(data.try_into().expect("legacy agent id must be 12 bytes"))
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self) -> [u8; 12]
+    where
+        Self: 'b,
+    {
+        value.0
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("prefix_id::PrefixId<rho_agent::db::AgentIdDomain>")
+    }
+}
+
+impl redb::Key for LegacyAgentIdKey {
+    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
+        data1.cmp(data2)
+    }
+}
+
+/// Temporary: reads the pre-move `topic_agents` table, whose stored redb key
+/// type name embedded `AgentIdDomain`'s old module path. Same bytes (the
+/// derive encoding is unchanged), old name. Delete with the migration.
+#[derive(Clone, Copy)]
+struct LegacyTopicAgentKey([u8; 24]);
+
+impl redb::Value for LegacyTopicAgentKey {
+    type SelfType<'a> = Self;
+    type AsBytes<'a> = [u8; 24];
+
+    fn fixed_width() -> Option<usize> {
+        Some(24)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self
+    where
+        Self: 'a,
+    {
+        Self(data.try_into().expect("legacy topic-agent key must be 24 bytes"))
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self) -> [u8; 24]
+    where
+        Self: 'b,
+    {
+        value.0
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new(
+            "TopicAgentKey {topic_id: prefix_id::PrefixId<rho_agent::db::TopicIdDomain>, \
+             agent_id: prefix_id::PrefixId<rho_agent::db::AgentIdDomain>}",
+        )
+    }
+}
+
+impl redb::Key for LegacyTopicAgentKey {
+    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
+        data1.cmp(data2)
+    }
+}
+
+impl std::fmt::Debug for LegacyTopicAgentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LegacyTopicAgentKey")
+    }
+}
+
+/// Temporary: re-creates the `agents` and `topic_agents` tables, whose redb
+/// key type names embedded `AgentIdDomain`'s old module path before the move
+/// to rho-core. Delete with the legacy key shims once active DBs have
+/// migrated.
+fn migrate_agent_id_table_names(write: &mut WriteTxn) {
+    migrate_agents_table_key_name(write);
+    migrate_topic_agents_table_key_name(write);
+}
+
+fn migrate_topic_agents_table_key_name(write: &mut WriteTxn) {
+    const LEGACY_TOPIC_AGENTS: TableDefinition<LegacyTopicAgentKey, ()> =
+        TableDefinition::new("topic_agents");
+    let keys: Vec<[u8; 24]> = write
+        .open_table(LEGACY_TOPIC_AGENTS)
+        .iter()
+        .map(|(key, _)| key.value().0)
+        .collect();
+    write.delete_table("topic_agents");
+    let mut table = write.open_table(TOPIC_AGENTS);
+    for key in keys {
+        table.insert(<TopicAgentKey as redb::Value>::from_bytes(&key), ());
+    }
+}
+
+fn migrate_agents_table_key_name(write: &mut WriteTxn) {
+    const LEGACY_AGENTS: TableDefinition<LegacyAgentIdKey, Sen<AgentRecord>> =
+        TableDefinition::new("agents");
+    let records: Vec<([u8; 12], AgentRecord)> = write
+        .open_table(LEGACY_AGENTS)
+        .iter()
+        .map(|(key, record)| (key.value().0, record.value().into_owned()))
+        .collect();
+    write.delete_table("agents");
+    let mut agents = write.open_table(AGENTS);
+    for (key, record) in records {
+        let agent_id = <AgentId as redb::Value>::from_bytes(&key);
+        agents.insert(&agent_id, SenValue::borrowed(&record));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -51,19 +258,7 @@ impl CounterKey {
     pub const LAST_WORKSPACE_ID: Self = Self(4);
 }
 
-pub type AgentId = PrefixId<AgentIdDomain>;
-
-/// Keys agent-id encoding with this database's persisted machine seed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AgentIdDomain(pub u64);
-
-impl PrefixIdDomain for AgentIdDomain {
-    const KIND: &'static str = "agent-id";
-
-    fn machine_seed(&self) -> u64 {
-        self.0
-    }
-}
+pub use rho_core::{AgentId, AgentIdDomain};
 
 pub type TopicId = PrefixId<TopicIdDomain>;
 
@@ -252,6 +447,8 @@ pub trait AgentReadTxnExt {
     fn get_topic(&self, topic_id: TopicId) -> TopicRecord;
     fn list_topics(&self) -> Vec<(TopicId, TopicRecord)>;
     fn list_topic_agents(&self, topic_id: TopicId) -> Vec<AgentId>;
+    /// The topic an agent currently belongs to.
+    fn agent_topic(&self, agent_id: AgentId) -> Option<TopicId>;
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
     fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
     fn list_workdirs(&self) -> Vec<(Utf8PathBuf, WorkdirRecord)>;
@@ -293,6 +490,7 @@ pub trait AgentWriteTxnExt {
         workspace: WorkspaceInfo,
         mode: AgentMode,
         runtime: AgentRuntime,
+        parent_agent: Option<AgentId>,
     ) -> AgentEventPos;
 
     /// Re-points the agent's topic membership. Topics are ad-hoc groupings
@@ -359,6 +557,14 @@ impl AgentReadTxnExt for ReadTxn {
             )
             .map(|(key, _)| key.value().agent_id)
             .collect()
+    }
+
+    fn agent_topic(&self, agent_id: AgentId) -> Option<TopicId> {
+        self.open_table(TOPIC_AGENTS)
+            .iter()
+            .map(|(key, _)| key.value())
+            .find(|key| key.agent_id == agent_id)
+            .map(|key| key.topic_id)
     }
 
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord {
@@ -435,6 +641,10 @@ impl AgentReadTxnExt for ReadTxn {
 
 impl AgentWriteTxnExt for WriteTxn {
     fn init_agent_tables(&mut self) {
+        // Migrations run before the typed opens below: a migration may need
+        // to rewrite a table whose stored key/value types no longer match
+        // the current definitions.
+        migrate_agent_db_format(self);
         self.open_table(COUNTERS);
         self.open_table(FORMAT);
         self.open_table(LINEAGE_PARENTS);
@@ -447,8 +657,6 @@ impl AgentWriteTxnExt for WriteTxn {
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
         }
-        drop(machine);
-        migrate_agent_db_format(self);
     }
 
     fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId {
@@ -548,6 +756,7 @@ impl AgentWriteTxnExt for WriteTxn {
         workspace: WorkspaceInfo,
         mode: AgentMode,
         runtime: AgentRuntime,
+        parent_agent: Option<AgentId>,
     ) -> AgentEventPos {
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
@@ -558,7 +767,7 @@ impl AgentWriteTxnExt for WriteTxn {
             created_at: now,
             updated_at: now,
             current_lineage: lineage_id,
-            parent_agent: None,
+            parent_agent,
             mode,
             runtime,
         };

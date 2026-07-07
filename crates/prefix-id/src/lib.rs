@@ -234,6 +234,7 @@ impl<D: PrefixIdDomain> PrefixId<D> {
     }
 }
 
+#[cfg(feature = "redb")]
 impl<D: PrefixIdDomain> redb::Value for PrefixId<D> {
     type SelfType<'a>
         = Self
@@ -273,6 +274,7 @@ impl<D: PrefixIdDomain> redb::Value for PrefixId<D> {
     }
 }
 
+#[cfg(feature = "redb")]
 impl<D: PrefixIdDomain> redb::Key for PrefixId<D> {
     /// Storage order over the scrambled characters — stable, but unrelated
     /// to creation order.

@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
@@ -7,6 +7,31 @@ use rho_inference::PromptCacheKey;
 use rho_workspaces::WorkspaceInfo;
 
 use super::*;
+use crate::{MessageDelivery, MessageSender, QueuedItem, QueuedItemKind};
+
+fn user_event(text: &str) -> AgentEvent<'static> {
+    AgentEvent::Queued(QueuedItem {
+        kind: QueuedItemKind::UserMessage {
+            sender: MessageSender::User,
+            content: Arc::new(vec![ContentPart::Text {
+                text: text.to_owned(),
+            }]),
+        },
+        delivery: MessageDelivery::Immediate,
+    })
+}
+
+fn event_text(event: &AgentEvent<'_>) -> String {
+    match event {
+        AgentEvent::Queued(QueuedItem {
+            kind: QueuedItemKind::UserMessage { content, .. },
+            ..
+        }) => match &content[0] {
+            ContentPart::Text { text } => text.clone(),
+        },
+        _ => unreachable!(),
+    }
+}
 
 /// Tests exercise agent records only; any workspace info will do.
 fn test_workspace() -> WorkspaceInfo {
@@ -75,9 +100,7 @@ async fn agent_event_positions_sort_by_lineage_then_seq() {
                     lineage_id: AgentLineageId(7),
                     seq,
                 },
-                SenValue::owned(AgentEvent::UserMessage {
-                    content: Cow::Owned(Vec::new()),
-                }),
+                SenValue::owned(user_event("seq")),
             );
         }
     }
@@ -142,22 +165,15 @@ async fn create_agent_and_append_events_with_cursor() {
         test_workspace(),
         AgentMode::deep_default(),
         test_agent_runtime(),
+        None,
     );
     let next = write.append_agent_event(
         next,
-        &AgentEvent::UserMessage {
-            content: Cow::Owned(vec![ContentPart::Text {
-                text: "hello".to_owned(),
-            }]),
-        },
+        &user_event("hello"),
     );
     write.append_agent_event(
         next,
-        &AgentEvent::UserMessage {
-            content: Cow::Owned(vec![ContentPart::Text {
-                text: "again".to_owned(),
-            }]),
-        },
+        &user_event("again"),
     );
     write.commit();
 
@@ -171,11 +187,7 @@ async fn create_agent_and_append_events_with_cursor() {
     assert_eq!(events.len(), 2);
     assert_eq!(
         events[0],
-        AgentEvent::UserMessage {
-            content: Cow::Owned(vec![ContentPart::Text {
-                text: "hello".to_owned(),
-            }]),
-        }
+        user_event("hello")
     );
 }
 
@@ -196,22 +208,15 @@ async fn agent_events_read_lineage_parents() {
         test_workspace(),
         AgentMode::deep_default(),
         test_agent_runtime(),
+        None,
     );
     let fork_at = write.append_agent_event(
         next,
-        &AgentEvent::UserMessage {
-            content: Cow::Owned(vec![ContentPart::Text {
-                text: "parent".to_owned(),
-            }]),
-        },
+        &user_event("parent"),
     );
     write.append_agent_event(
         fork_at,
-        &AgentEvent::UserMessage {
-            content: Cow::Owned(vec![ContentPart::Text {
-                text: "sibling".to_owned(),
-            }]),
-        },
+        &user_event("sibling"),
     );
 
     let child_lineage = AgentLineageId(99);
@@ -228,11 +233,7 @@ async fn agent_events_read_lineage_parents() {
     }
     write.append_agent_event(
         AgentEventPos::root(child_lineage),
-        &AgentEvent::UserMessage {
-            content: Cow::Owned(vec![ContentPart::Text {
-                text: "child".to_owned(),
-            }]),
-        },
+        &user_event("child"),
     );
     write.commit();
 
@@ -242,14 +243,81 @@ async fn agent_events_read_lineage_parents() {
     assert_eq!(next.seq, 1);
     let texts = events
         .into_iter()
-        .map(|event| match event {
-            AgentEvent::UserMessage { content } => match &content[0] {
-                ContentPart::Text { text } => text.clone(),
-            },
-            _ => unreachable!(),
-        })
+        .map(|event| event_text(&event))
         .collect::<Vec<_>>();
     assert_eq!(texts, ["parent", "child"]);
+}
+
+/// The migration sees legacy rows through the temporary `Decoder` impl,
+/// which maps them to `Queued` items — so inserting `Queued` rows directly
+/// reproduces exactly what it reads from a `2a7f4d91` database.
+#[tokio::test]
+async fn migration_splits_legacy_events_and_remaps_cursors() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
+    let agent_id = write.alloc_agent_id();
+    let next = write.create_agent(
+        UnixMs(1),
+        agent_id,
+        topic_id,
+        Some("main".to_owned()),
+        test_workspace(),
+        AgentMode::deep_default(),
+        test_agent_runtime(),
+        None,
+    );
+    let next = write.append_agent_event(next, &user_event("a"));
+    // append returns the next free position: `pos_c` is where "c" lands.
+    let pos_c = write.append_agent_event(
+        next,
+        &AgentEvent::InferenceResponse {
+            items: std::borrow::Cow::Owned(Vec::new()),
+            provider_response_id: None,
+            context_used: None,
+        },
+    );
+    let next = write.append_agent_event(pos_c, &user_event("c"));
+    write.append_agent_event(next, &user_event("d"));
+
+    // A fork whose cursor points at the second legacy event ("c"): after
+    // migration it must point at c's `Queued` so the pair is excluded.
+    let child_lineage = AgentLineageId(99);
+    write
+        .open_table(LINEAGE_PARENTS)
+        .insert(&child_lineage, &pos_c);
+
+    migrate_queued_event_shape(&mut write);
+    write.commit();
+
+    let read = db.read();
+    let (_, events) = read.agent_events(agent_id);
+    let expect_pair = |queued: &AgentEvent<'_>, dequeued: &AgentEvent<'_>, body: &str| {
+        assert_eq!(*queued, user_event(body));
+        assert_eq!(
+            *dequeued,
+            AgentEvent::Dequeued {
+                boundary: MessageDelivery::NextTurn,
+            }
+        );
+    };
+    assert_eq!(events.len(), 7, "4 events, 3 of them expanded into pairs");
+    expect_pair(&events[0], &events[1], "a");
+    assert!(matches!(&events[2], AgentEvent::InferenceResponse { .. }));
+    expect_pair(&events[3], &events[4], "c");
+    expect_pair(&events[5], &events[6], "d");
+
+    let remapped = read.open_table(LINEAGE_PARENTS);
+    let cursor = remapped.get(&child_lineage).unwrap().value();
+    assert_eq!(cursor.lineage_id, pos_c.lineage_id);
+    assert_eq!(
+        cursor.seq,
+        pos_c.seq + 1,
+        "one expansion before the cursor shifts it by one"
+    );
 }
 
 #[tokio::test]
@@ -269,44 +337,28 @@ async fn fork_agent_lineage_repoints_current_branch() {
         test_workspace(),
         AgentMode::deep_default(),
         test_agent_runtime(),
+        None,
     );
     let fork_at = write.append_agent_event(
         next,
-        &AgentEvent::UserMessage {
-            content: Cow::Owned(vec![ContentPart::Text {
-                text: "parent".to_owned(),
-            }]),
-        },
+        &user_event("parent"),
     );
     write.append_agent_event(
         fork_at,
-        &AgentEvent::UserMessage {
-            content: Cow::Owned(vec![ContentPart::Text {
-                text: "old branch".to_owned(),
-            }]),
-        },
+        &user_event("old branch"),
     );
 
     let child_next = write.fork_agent_lineage(UnixMs(2), agent_id, fork_at);
     write.append_agent_event(
         child_next,
-        &AgentEvent::UserMessage {
-            content: Cow::Owned(vec![ContentPart::Text {
-                text: "new branch".to_owned(),
-            }]),
-        },
+        &user_event("new branch"),
     );
     write.commit();
 
     let (_, events) = db.read().agent_events(agent_id);
     let texts = events
         .into_iter()
-        .map(|event| match event {
-            AgentEvent::UserMessage { content } => match &content[0] {
-                ContentPart::Text { text } => text.clone(),
-            },
-            _ => unreachable!(),
-        })
+        .map(|event| event_text(&event))
         .collect::<Vec<_>>();
     assert_eq!(texts, ["parent", "new branch"]);
 }
@@ -329,6 +381,7 @@ async fn move_agent_to_topic_repoints_membership() {
         test_workspace(),
         AgentMode::deep_default(),
         test_agent_runtime(),
+        None,
     );
     write.move_agent_to_topic(agent_id, named_topic);
     write.commit();
@@ -361,6 +414,7 @@ async fn topic_and_agent_statuses_are_settable() {
         test_workspace(),
         AgentMode::deep_default(),
         test_agent_runtime(),
+        None,
     );
     write.set_topic_status(UnixMs(2), topic_id, Status::Pinned);
     write.set_topic_name(UnixMs(3), topic_id, "platform".to_owned());
@@ -428,6 +482,7 @@ async fn agent_ids_allocate_before_records_exist() {
         test_workspace(),
         AgentMode::deep_default(),
         test_agent_runtime(),
+        None,
     );
     write.commit();
 

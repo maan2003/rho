@@ -19,7 +19,7 @@ use crate::db::{
     AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, TopicId, UnixMillis,
 };
 use crate::{
-    AgentState, AgentStateKind, FailedInferenceResponse, MessageDelivery, QueuedItem,
+    AgentState, AgentStateKind, FailedInferenceResponse, InputQueues, MessageDelivery, QueuedItem,
     QueuedItemKind, StartWorkspace, system_prompt,
 };
 
@@ -70,14 +70,15 @@ impl ClaudeAgent {
             workspace.info().clone(),
             mode,
             AgentRuntime::Claude { session_id },
+            None,
         );
         write.commit();
 
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
-            system_prompt: system_prompt::prompt(workspace.as_ref()),
-            queued_inputs: Vec::new(),
+            system_prompt: system_prompt::prompt(workspace.as_ref(), None),
+            queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
         };
@@ -123,8 +124,8 @@ impl ClaudeAgent {
         let state = AgentState {
             blocks,
             tool_specs: Arc::from([]),
-            system_prompt: system_prompt::prompt(workspace.as_ref()),
-            queued_inputs: Vec::new(),
+            system_prompt: system_prompt::prompt(workspace.as_ref(), None),
+            queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used,
         };
@@ -312,6 +313,7 @@ impl ClaudeLoop {
                     .queued_inputs
                     .push(QueuedItem {
                         kind: QueuedItemKind::UserMessage {
+                            sender: crate::MessageSender::User,
                             content: Arc::new(content),
                         },
                         delivery,
@@ -379,19 +381,19 @@ impl ClaudeLoop {
     /// queued message and promotes it to history. Anything else (tool
     /// results, CLI-injected user content) passes through.
     fn handle_user_block(&mut self, block: Arc<ContextBlock>) {
-        if let ContextBlock::UserMessage { content } = &*block {
+        if let ContextBlock::UserMessage { content, .. } = &*block {
             let mut state = self.state.write().expect("poison");
-            if let Some(pos) = state.queued_inputs.iter().position(|queued| match queued {
+            let matched = state.queued_inputs.remove_first(|queued| match queued {
                 QueuedItem {
-                    kind: QueuedItemKind::UserMessage { content: queued },
+                    kind: QueuedItemKind::UserMessage { content: queued, .. },
                     ..
                 } => **queued == *content,
                 QueuedItem {
                     kind: QueuedItemKind::Compaction,
                     ..
                 } => false,
-            }) {
-                state.queued_inputs.remove(pos);
+            });
+            if matched.is_some() {
                 state.blocks.push(block);
                 drop(state);
                 self.notify.notify_waiters();
@@ -636,10 +638,10 @@ fn merge_usage(
         .or(base.cache_read_input_tokens);
 }
 
-fn remove_compact_commands(inputs: &mut Vec<QueuedItem>) {
+fn remove_compact_commands(inputs: &mut InputQueues) {
     inputs.retain(|input| match input {
         QueuedItem {
-            kind: QueuedItemKind::UserMessage { content },
+            kind: QueuedItemKind::UserMessage { content, .. },
             ..
         } => !is_compact_command(content),
         QueuedItem {

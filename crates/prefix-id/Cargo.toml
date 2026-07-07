@@ -6,8 +6,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["redb"]
+redb = ["dep:redb"]
+
 [dependencies]
 bytes.workspace = true
 fnv.workspace = true
-redb.workspace = true
+redb = { workspace = true, optional = true }
 senax-encoder.workspace = true

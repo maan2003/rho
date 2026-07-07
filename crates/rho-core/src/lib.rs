@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use prefix_id::{PrefixId, PrefixIdDomain};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,10 +34,33 @@ validated_string_type!(
     crate::util::validate_identifier
 );
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub type AgentId = PrefixId<AgentIdDomain>;
+
+/// Keys agent-id encoding with the owning database's persisted machine seed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentIdDomain(pub u64);
+
+impl PrefixIdDomain for AgentIdDomain {
+    const KIND: &'static str = "agent-id";
+
+    fn machine_seed(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Who authored a message entering an agent's context. Providers render both
+/// as user-role input; UIs render agent mail distinctly from user messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum MessageSender {
+    User,
+    Agent { id: AgentId },
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum ContextBlock {
     // intentionally limiting to prevent misuse
     UserMessage {
+        sender: MessageSender,
         content: Vec<ContentPart>,
     },
     ToolResults {

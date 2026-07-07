@@ -280,7 +280,7 @@ fn streaming_tool_call_keeps_tool_block_live_until_turn_finish() {
     // The tool call seals and finishes; the same index updates in place.
     renderer.handle_state(&agent_state(
         vec![tool_block(UiToolStatus::Success)],
-        UiAgentStatus::ToolCalling,
+        UiAgentStatus::ToolCalling { waiting: None },
     ));
     assert_eq!(renderer.active_blocks.len(), 1);
 
@@ -316,7 +316,7 @@ fn turn_blocks_stay_live_across_tool_call_legs() {
 
     renderer.handle_state(&agent_state(
         vec![tool_block(UiToolStatus::Success), assistant("done")],
-        UiAgentStatus::ToolCalling,
+        UiAgentStatus::ToolCalling { waiting: None },
     ));
     renderer.handle_state(&agent_state(
         vec![

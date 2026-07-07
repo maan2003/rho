@@ -211,12 +211,17 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     let read = db.read();
     let agents = read.list_agents();
+    let mut events = 0usize;
+    for (agent_id, _) in &agents {
+        events += read.agent_events(*agent_id).1.len();
+    }
 
     let mut output = String::new();
     writeln!(output, "source: {}", snapshot.source.display())?;
     writeln!(output, "snapshot: {}", snapshot.path.display())?;
     writeln!(output, "migration on copied database: ok")?;
     writeln!(output, "agents decoded: {}", agents.len())?;
+    writeln!(output, "events decoded: {events}")?;
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
 }

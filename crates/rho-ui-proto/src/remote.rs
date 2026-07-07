@@ -103,11 +103,15 @@ impl UiAgentState {
         blocks.extend(in_flight_blocks(&state.kind));
         blocks.extend(state.queued_inputs.iter().map(|input| match input {
             QueuedItem {
-                kind: QueuedItemKind::UserMessage { content },
+                kind: QueuedItemKind::UserMessage { sender, content },
                 delivery,
             } => UiBlock::QueuedMessage {
                 text: text_content(content),
                 delivery: *delivery,
+                sender: match sender {
+                    rho_agent::MessageSender::User => None,
+                    rho_agent::MessageSender::Agent { id } => Some(id.encoded()),
+                },
             },
             QueuedItem {
                 kind: QueuedItemKind::Compaction,
@@ -140,11 +144,19 @@ pub enum UiBlock {
     Notice {
         text: String,
     },
-    /// A user message waiting in the agent's queue; becomes a `UserMessage`
-    /// block at delivery. Always trails the transcript.
+    /// A message waiting in the agent's queue; becomes a `UserMessage` (or
+    /// `AgentMessage`) block at delivery. Always trails the transcript.
     QueuedMessage {
         text: String,
         delivery: MessageDelivery,
+        /// The sending agent's encoded id; `None` for the user.
+        sender: Option<String>,
+    },
+    /// A delivered message from another agent.
+    AgentMessage {
+        /// The sending agent's encoded id.
+        sender: String,
+        text: String,
     },
 }
 
@@ -245,7 +257,11 @@ impl UiBlockDiff {
 pub enum UiAgentStatus {
     Idle,
     Streaming,
-    ToolCalling,
+    ToolCalling {
+        /// Deadline of the batch's armed `wait` call, if one is parked
+        /// until mail arrives or the wall clock passes it.
+        waiting: Option<UnixMs>,
+    },
     UnfinishedTurn {
         outstanding_calls: usize,
     },
@@ -517,9 +533,15 @@ fn ui_blocks(blocks: &[Arc<ContextBlock>]) -> Vec<UiBlock> {
     let mut ui_blocks = Vec::new();
     for block in blocks {
         match block.as_ref() {
-            ContextBlock::UserMessage { content } => ui_blocks.push(UiBlock::UserMessage {
-                text: text_content(content),
-            }),
+            ContextBlock::UserMessage { sender, content } => match sender {
+                rho_agent::MessageSender::User => ui_blocks.push(UiBlock::UserMessage {
+                    text: text_content(content),
+                }),
+                rho_agent::MessageSender::Agent { id } => ui_blocks.push(UiBlock::AgentMessage {
+                    sender: id.encoded(),
+                    text: text_content(content),
+                }),
+            },
             ContextBlock::CompactionTrigger => ui_blocks.push(UiBlock::Notice {
                 text: "compacting context".to_owned(),
             }),
@@ -544,7 +566,10 @@ fn ui_blocks(blocks: &[Arc<ContextBlock>]) -> Vec<UiBlock> {
 }
 
 fn merge_active_tool_state(blocks: &mut [UiBlock], kind: &AgentStateKind) {
-    let AgentStateKind::ToolCalling { previews, results } = kind else {
+    let AgentStateKind::ToolCalling {
+        previews, results, ..
+    } = kind
+    else {
         return;
     };
 
@@ -618,7 +643,9 @@ fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> 
 fn ui_status(kind: &AgentStateKind) -> UiAgentStatus {
     match kind {
         AgentStateKind::ApiStreaming { .. } => UiAgentStatus::Streaming,
-        AgentStateKind::ToolCalling { .. } => UiAgentStatus::ToolCalling,
+        AgentStateKind::ToolCalling { waiting, .. } => UiAgentStatus::ToolCalling {
+            waiting: waiting.as_ref().map(|wait| wait.until),
+        },
         AgentStateKind::UnfinishedTurn {
             outstanding_calls, ..
         } => UiAgentStatus::UnfinishedTurn {
@@ -752,7 +779,7 @@ mod tests {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_inputs: Vec::new(),
+            queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::ApiStreaming {
                 pending_response: PendingInferenceResponse {
                     items: vec![StreamingContextItemState::Pending(
@@ -789,7 +816,7 @@ mod tests {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_inputs: Vec::new(),
+            queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Error(FailedInferenceResponse {
                 partial_response: PendingInferenceResponse {
                     items: vec![StreamingContextItemState::Pending(
@@ -819,7 +846,7 @@ mod tests {
             })],
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_inputs: Vec::new(),
+            queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
         }
@@ -854,7 +881,7 @@ mod tests {
             ],
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_inputs: Vec::new(),
+            queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
         }
@@ -885,10 +912,11 @@ mod tests {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_inputs: Vec::new(),
+            queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::ToolCalling {
                 previews,
                 results: Vec::new(),
+                waiting: None,
             },
             context_used: None,
         }
@@ -1017,7 +1045,7 @@ mod tests {
     #[test]
     fn tool_calling_maps_to_plain_status() {
         let state = UiAgentState::from_agent_state(&tool_calling_state());
-        assert_eq!(state.status, UiAgentStatus::ToolCalling);
+        assert_eq!(state.status, UiAgentStatus::ToolCalling { waiting: None });
     }
 
     #[test]

@@ -87,6 +87,7 @@ fn assistant_message_with_phase(text: &str, phase: MessagePhase) -> InferenceRes
 /// A `ContextBlock::UserMessage` carrying a single text part.
 fn user_block(text: &str) -> Arc<ContextBlock> {
     Arc::new(ContextBlock::UserMessage {
+        sender: rho_core::MessageSender::User,
         content: content_parts(text),
     })
 }

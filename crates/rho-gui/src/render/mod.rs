@@ -84,8 +84,11 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         }
         UiBlock::QueuedMessage { delivery, .. } => match delivery {
             MessageDelivery::Immediate => BlockKind::User,
-            MessageDelivery::NextRequest | MessageDelivery::NextTurn => BlockKind::QueuedUser,
+            MessageDelivery::NextRequest
+            | MessageDelivery::NextTurn
+            | MessageDelivery::QueueOnly => BlockKind::QueuedUser,
         },
+        UiBlock::AgentMessage { .. } => BlockKind::User,
     }
 }
 
@@ -149,17 +152,34 @@ pub fn render_block(
             }
             spans.push(Span::new(text, StyleClass::SystemInfo));
         }
-        UiBlock::QueuedMessage { text, delivery } => {
+        UiBlock::AgentMessage { sender, text } => {
             if text.is_empty() {
                 return invisible(kind);
             }
             spans.extend(separator(prev, kind));
+            spans.push(Span::new(format!("from {sender}\n"), StyleClass::SystemInfo));
+            gutter_span = Some(spans.len());
+            spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
+        }
+        UiBlock::QueuedMessage {
+            text,
+            delivery,
+            sender,
+        } => {
+            if text.is_empty() {
+                return invisible(kind);
+            }
+            spans.extend(separator(prev, kind));
+            if let Some(sender) = sender {
+                spans.push(Span::new(format!("from {sender}\n"), StyleClass::SystemInfo));
+            }
             gutter_span = Some(spans.len());
             spans.push(Span::new(text.clone(), StyleClass::UserMessage));
             let label = match delivery {
                 MessageDelivery::Immediate => None,
                 MessageDelivery::NextRequest => Some(" (steering)"),
                 MessageDelivery::NextTurn => Some(" (queued)"),
+                MessageDelivery::QueueOnly => Some(" (mail)"),
             };
             if let Some(label) = label {
                 inlay = Some(InlaySpec {
@@ -458,6 +478,7 @@ mod tests {
             block_kind(&UiBlock::QueuedMessage {
                 text: "now".to_owned(),
                 delivery: MessageDelivery::Immediate,
+                sender: None,
             }),
             BlockKind::User
         );
@@ -465,6 +486,7 @@ mod tests {
             block_kind(&UiBlock::QueuedMessage {
                 text: "later".to_owned(),
                 delivery: MessageDelivery::NextRequest,
+                sender: None,
             }),
             BlockKind::QueuedUser
         );
@@ -472,6 +494,7 @@ mod tests {
             block_kind(&UiBlock::QueuedMessage {
                 text: "later".to_owned(),
                 delivery: MessageDelivery::NextTurn,
+                sender: None,
             }),
             BlockKind::QueuedUser
         );

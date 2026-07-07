@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
-pub fn prompt(workspace: &rho_workspaces::Workspace) -> Arc<str> {
+use crate::db::AgentId;
+
+/// `agent_id` is set for pooled agents, which get the multi-agent tools and
+/// the section explaining them.
+pub fn prompt(workspace: &rho_workspaces::Workspace, agent_id: Option<AgentId>) -> Arc<str> {
     let working_directory = workspace.repo();
     let skills = workspace.discovered_skills();
     for diagnostic in &skills.diagnostics {
@@ -12,8 +16,35 @@ pub fn prompt(workspace: &rho_workspaces::Workspace) -> Arc<str> {
         );
     }
     let skills = render_skills_prompt(&skills.skills).unwrap_or_default();
+    let multi_agent = agent_id.map_or_else(String::new, |id| {
+        format!(
+            "## Sub-Agents
+
+Your agent id is {}. You can delegate self-contained work with the \
+`spawn_agent` tool; each sub-agent is a regular agent the user can also see \
+and steer, so give it a short `task_name` and a complete, self-contained \
+prompt (it starts with fresh context). Choose `workspace` by the task: \
+`join` shares your working copy (read-mostly tasks), `fork` gives the child \
+its own jj workspace forked from your current change (parallel edits), \
+`new` starts it from trunk or a `revset`.
+
+Sub-agents report by mail: their finished-turn results arrive in your \
+context as `[message from agent ...]` the next time you run. Mail never \
+interrupts you mid-thought — call `wait` when you are blocked on sub-agent \
+results and have nothing else useful to do, and use `send_message` to steer \
+or follow up with a running agent. If you were spawned by another agent, \
+messages from it define your task; your final responses are mailed back to \
+it automatically.
+
+Delegate when tasks are parallel and separable; do small or tightly coupled \
+work yourself.
+
+",
+            id.encoded()
+        )
+    });
     format!(
-        "{BASE_PROMPT}{skills}## Environment
+        "{BASE_PROMPT}{skills}{multi_agent}## Environment
 
 Working directory: {}
 

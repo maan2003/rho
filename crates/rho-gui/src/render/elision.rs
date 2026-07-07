@@ -117,6 +117,7 @@ fn is_user(block: &UiBlock) -> bool {
     matches!(
         block,
         UiBlock::UserMessage { .. }
+            | UiBlock::AgentMessage { .. }
             | UiBlock::QueuedMessage {
                 delivery: MessageDelivery::Immediate,
                 ..
@@ -144,7 +145,7 @@ fn block_is_working(block: &UiBlock) -> bool {
             None => false,
         },
         UiBlock::Reasoning { .. } | UiBlock::Tool(_) | UiBlock::Notice { .. } => true,
-        UiBlock::QueuedMessage { .. } => false,
+        UiBlock::QueuedMessage { .. } | UiBlock::AgentMessage { .. } => false,
     }
 }
 
@@ -164,6 +165,7 @@ mod tests {
         UiBlock::QueuedMessage {
             text: text.to_owned(),
             delivery,
+            sender: None,
         }
     }
 

@@ -30,7 +30,7 @@ gpui_tokio = { git = "https://github.com/maan2003/zed", branch = "rho" }
 json-stream.workspace = true
 language = { git = "https://github.com/maan2003/zed", branch = "rho" }
 multi_buffer = { git = "https://github.com/maan2003/zed", branch = "rho" }
-prefix-id.workspace = true
+prefix-id = { workspace = true, features = ["redb"] }
 project = { git = "https://github.com/maan2003/zed", branch = "rho" }
 release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
 rho-commands.workspace = true

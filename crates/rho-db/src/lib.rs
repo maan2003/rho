@@ -231,6 +231,14 @@ impl WriteTxn {
         }
     }
 
+    /// Deletes a table by name (no type check), returning whether it
+    /// existed. For migrations that change a table's key/value types.
+    pub fn delete_table(&mut self, name: &str) -> bool {
+        self.inner
+            .delete_table(redb::TableDefinition::<(), ()>::new(name))
+            .expect("delete rho-db table")
+    }
+
     pub fn commit(self) {
         self.inner.commit().expect("commit rho-db write txn");
     }

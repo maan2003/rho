@@ -548,7 +548,12 @@ fn describe_state(state: &rho_agent::AgentState) -> String {
     match &state.kind {
         AgentStateKind::Idle => "idle, waiting for instructions".to_owned(),
         AgentStateKind::ApiStreaming { .. } => "thinking".to_owned(),
-        AgentStateKind::ToolCalling { previews, results } => format!(
+        AgentStateKind::ToolCalling {
+            waiting: Some(_), ..
+        } => "waiting for messages from other agents or the user".to_owned(),
+        AgentStateKind::ToolCalling {
+            previews, results, ..
+        } => format!(
             "running {} tools ({} finished)",
             previews.len() + results.len(),
             results.len()

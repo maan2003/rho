@@ -199,9 +199,23 @@ enum WireTimelineItem {
 
 fn append_block_items(block: &ContextBlock, out: &mut Vec<WireTimelineItem>) {
     match block {
-        ContextBlock::UserMessage { content } => {
-            out.push(WireTimelineItem::UserMessage(content.clone()));
-        }
+        ContextBlock::UserMessage { sender, content } => match sender {
+            rho_core::MessageSender::User => {
+                out.push(WireTimelineItem::UserMessage(content.clone()));
+            }
+            // Agent mail rides the user role; the header identifies the
+            // sender so the model can tell peers from the actual user.
+            rho_core::MessageSender::Agent { id } => {
+                let text = format!(
+                    "[message from agent {}]\n{}",
+                    id.encoded(),
+                    rho_core::text_content(content)
+                );
+                out.push(WireTimelineItem::UserMessage(vec![
+                    rho_core::ContentPart::Text { text },
+                ]));
+            }
+        },
         ContextBlock::CompactionTrigger => {
             out.push(WireTimelineItem::CompactionTrigger);
         }
