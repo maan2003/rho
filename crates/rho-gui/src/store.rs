@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use rho_ui_proto::AgentId;
-use rho_ui_proto::remote::{AgentRemoteFrame, UiAgentState, UiAgentStatus};
+use rho_ui_proto::remote::{AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlockDiff};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameSummary {
@@ -15,12 +15,24 @@ pub struct FrameSummary {
     /// from here to the end of the transcript needs re-rendering. `None`
     /// means nothing visible changed.
     pub first_changed_block: Option<usize>,
+    /// A single protocol block update that may be safe to apply as a targeted
+    /// rendered-text patch. Merged/structural summaries drop this hint and
+    /// fall back to suffix re-rendering.
+    pub incremental: Option<IncrementalUpdate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncrementalUpdate {
+    AssistantText { index: usize },
+    ReasoningText { index: usize },
+    Tool { index: usize },
 }
 
 impl FrameSummary {
     pub fn everything() -> Self {
         Self {
             first_changed_block: Some(0),
+            incremental: None,
         }
     }
 
@@ -32,6 +44,7 @@ impl FrameSummary {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             },
+            incremental: None,
         }
     }
 }
@@ -53,6 +66,7 @@ impl AgentStore {
         if turn_open(old_status) != turn_open(state.status) && !state.blocks.is_empty() {
             summary = summary.merge(FrameSummary {
                 first_changed_block: Some(state.blocks.len() - 1),
+                incremental: None,
             });
         }
         summary
@@ -97,8 +111,26 @@ fn summarize(frame: &AgentRemoteFrame) -> FrameSummary {
             if let Some(truncate_to) = blocks.truncate_to {
                 note(truncate_to);
             }
+            let incremental = if blocks.truncate_to.is_none() && blocks.updates.len() == 1 {
+                let update = &blocks.updates[0];
+                match &update.block {
+                    UiBlockDiff::AssistantText(_) => Some(IncrementalUpdate::AssistantText {
+                        index: update.index,
+                    }),
+                    UiBlockDiff::ReasoningText(_) => Some(IncrementalUpdate::ReasoningText {
+                        index: update.index,
+                    }),
+                    UiBlockDiff::Tool(_) => Some(IncrementalUpdate::Tool {
+                        index: update.index,
+                    }),
+                    UiBlockDiff::Replace(_) => None,
+                }
+            } else {
+                None
+            };
             FrameSummary {
                 first_changed_block: first_changed,
+                incremental,
             }
         }
     }
@@ -106,7 +138,9 @@ fn summarize(frame: &AgentRemoteFrame) -> FrameSummary {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::remote::{UiBlock, UiBlockDiff, UiBlockUpdate, UiBlocksDiff, UiTextDiff};
+    use rho_ui_proto::remote::{
+        UiBlock, UiBlockDiff, UiBlockUpdate, UiBlocksDiff, UiTextDiff, UiToolDiff, UiToolStatus,
+    };
 
     use super::*;
 
@@ -134,6 +168,7 @@ mod tests {
             summarize(&frame),
             FrameSummary {
                 first_changed_block: None,
+                incremental: None,
             }
         );
     }
@@ -154,6 +189,39 @@ mod tests {
             summarize(&frame),
             FrameSummary {
                 first_changed_block: Some(4),
+                incremental: Some(IncrementalUpdate::AssistantText { index: 4 }),
+            }
+        );
+    }
+
+    #[test]
+    fn tool_update_carries_incremental_hint() {
+        let frame = diff_frame(UiBlocksDiff {
+            truncate_to: None,
+            updates: vec![UiBlockUpdate {
+                index: 2,
+                block: UiBlockDiff::Tool(UiToolDiff {
+                    id: "tool-1".to_owned(),
+                    name: "shell_command".to_owned(),
+                    arguments: Some(UiTextDiff {
+                        keep_bytes: 4,
+                        value: " ok".to_owned(),
+                    }),
+                    preview: None,
+                    status: Some(UiToolStatus::Running),
+                    output: None,
+                    error: None,
+                    started_at: None,
+                    finished_at: None,
+                    metadata: None,
+                }),
+            }],
+        });
+        assert_eq!(
+            summarize(&frame),
+            FrameSummary {
+                first_changed_block: Some(2),
+                incremental: Some(IncrementalUpdate::Tool { index: 2 }),
             }
         );
     }
@@ -207,6 +275,7 @@ mod tests {
             summarize(&frame),
             FrameSummary {
                 first_changed_block: Some(2),
+                incremental: None,
             }
         );
     }

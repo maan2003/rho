@@ -31,7 +31,7 @@ use text::{Anchor, ToOffset as _};
 use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::render::elision::ElisionPlan;
 use crate::render::{BlockKind, RenderedBlock, render_block};
-use crate::store::FrameSummary;
+use crate::store::{FrameSummary, IncrementalUpdate};
 use crate::style::{Region, StyleClass};
 
 pub struct TranscriptModel {
@@ -53,6 +53,7 @@ struct BlockRecord {
     range: Range<Anchor>,
     kind: BlockKind,
     visible: bool,
+    text: String,
     gutter: Option<Range<Anchor>>,
     inlay: Option<InlayRecord>,
     styles: Vec<(StyleClass, Range<Anchor>)>,
@@ -89,6 +90,13 @@ impl TranscriptModel {
         let Some(first_changed) = summary.first_changed_block else {
             return;
         };
+
+        if let Some(incremental) = summary.incremental
+            && self.try_incremental_sync(state, first_changed, incremental, now_ms, cx)
+        {
+            return;
+        }
+
         let start = first_changed.min(self.records.len());
 
         // Render changed blocks before any buffer mutation; rendering only
@@ -174,6 +182,99 @@ impl TranscriptModel {
         }
         self.refresh_elisions(state, start, cx);
         cx.notify();
+    }
+
+    fn try_incremental_sync<V: 'static>(
+        &mut self,
+        state: &UiAgentState,
+        first_changed: usize,
+        incremental: IncrementalUpdate,
+        now_ms: u64,
+        cx: &mut Context<V>,
+    ) -> bool {
+        let index = match incremental {
+            IncrementalUpdate::AssistantText { index }
+            | IncrementalUpdate::ReasoningText { index }
+            | IncrementalUpdate::Tool { index } => index,
+        };
+        if index != first_changed || index >= self.records.len() {
+            return false;
+        }
+
+        let prev_kind = last_visible_kind(&self.records[..index]);
+        let Some(block) = state.blocks.get(index) else {
+            return false;
+        };
+        let rendered = render_block(block, prev_kind, now_ms, cx);
+        let old_record = &self.records[index];
+        if index + 1 < self.records.len()
+            && (old_record.kind != rendered.kind || old_record.visible != rendered.visible())
+        {
+            return false;
+        }
+
+        let new_text = rendered_text(&rendered);
+        let Some(edit) = rendered_text_edit(&old_record.text, &new_text) else {
+            return false;
+        };
+
+        let old_boundary = self.turn_boundary;
+        let region = if index < old_boundary {
+            Region::History
+        } else {
+            Region::LiveTurn
+        };
+        let mut changed = HashSet::new();
+        for (class, _) in &old_record.styles {
+            changed.insert(*class);
+        }
+        let stale_inlays = old_record
+            .inlay
+            .as_ref()
+            .and_then(InlayRecord::inlay_id)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let mut gutters_changed = false;
+        self.buffer.clone().update(cx, |buffer, cx| {
+            let block_start = self.records[index].range.start.to_offset(buffer);
+            let edit_start = block_start + edit.old_range.start;
+            let edit_end = block_start + edit.old_range.end;
+            buffer.edit([(edit_start..edit_end, edit.inserted.clone())], None, cx);
+
+            let (span_ranges, inlay, gutter) = spans_for_rendered(buffer, block_start, &rendered);
+            let styles = rendered
+                .spans
+                .iter()
+                .zip(&span_ranges)
+                .filter(|(span, _)| span.class != StyleClass::Default && !span.text.is_empty())
+                .map(|(span, range)| (span.class, range.clone()))
+                .collect::<Vec<_>>();
+            for (class, _) in &styles {
+                changed.insert(*class);
+            }
+
+            let new_end = block_start + new_text.len();
+            gutters_changed = self.records[index].gutter.is_some() || gutter.is_some();
+            self.records[index] = BlockRecord {
+                range: buffer.anchor_before(block_start)..buffer.anchor_before(new_end),
+                kind: rendered.kind,
+                visible: rendered.visible(),
+                text: new_text,
+                gutter,
+                inlay,
+                styles,
+            };
+        });
+
+        self.apply_region_styles(region, &changed, cx);
+        self.refresh_inlays(now_ms, stale_inlays, cx);
+        if gutters_changed {
+            self.refresh_gutters(cx);
+        }
+        self.refresh_elisions(state, index, cx);
+        cx.notify();
+        true
     }
 
     /// Refreshes running tools' duration inlays; buffer text is untouched.
@@ -345,10 +446,58 @@ fn append_block(
         range: buffer.anchor_before(start)..buffer.anchor_before(buffer.len()),
         kind: rendered.kind,
         visible: rendered.visible(),
+        text: rendered_text(&rendered),
         gutter,
         inlay,
         styles,
     }
+}
+
+fn rendered_text(rendered: &RenderedBlock) -> String {
+    rendered
+        .spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect()
+}
+
+struct RenderedTextEdit {
+    old_range: Range<usize>,
+    inserted: String,
+}
+
+fn rendered_text_edit(old: &str, new: &str) -> Option<RenderedTextEdit> {
+    if old == new {
+        return None;
+    }
+
+    let mut prefix = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(old, new)| old == new)
+        .count();
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+
+    let old_tail = &old[prefix..];
+    let new_tail = &new[prefix..];
+    let mut suffix = old_tail
+        .bytes()
+        .rev()
+        .zip(new_tail.bytes().rev())
+        .take_while(|(old, new)| old == new)
+        .count();
+    while suffix > 0
+        && (!old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix))
+    {
+        suffix -= 1;
+    }
+
+    Some(RenderedTextEdit {
+        old_range: prefix..old.len() - suffix,
+        inserted: new[prefix..new.len() - suffix].to_owned(),
+    })
 }
 
 /// Appends a rendered block's text at the end of the buffer and returns the
@@ -373,6 +522,18 @@ fn append_spans(
         buffer.edit([(start..start, text)], None, cx);
     }
 
+    spans_for_rendered(buffer, start, rendered)
+}
+
+fn spans_for_rendered(
+    buffer: &Buffer,
+    start: usize,
+    rendered: &RenderedBlock,
+) -> (
+    Vec<Range<Anchor>>,
+    Option<InlayRecord>,
+    Option<Range<Anchor>>,
+) {
     let mut ranges = Vec::with_capacity(rendered.spans.len());
     let mut inlay = None;
     let mut gutter = None;
@@ -391,4 +552,30 @@ fn append_spans(
         offset = end;
     }
     (ranges, inlay, gutter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rendered_text_edit;
+
+    #[test]
+    fn rendered_text_edit_appends_ascii_suffix() {
+        let edit = rendered_text_edit("hel", "hello").expect("edit");
+        assert_eq!(edit.old_range, 3..3);
+        assert_eq!(edit.inserted, "lo");
+    }
+
+    #[test]
+    fn rendered_text_edit_inserts_before_common_suffix() {
+        let edit = rendered_text_edit("$ …\n", "$ echo …\n").expect("edit");
+        assert_eq!(edit.old_range, 2..2);
+        assert_eq!(edit.inserted, "echo ");
+    }
+
+    #[test]
+    fn rendered_text_edit_is_utf8_boundary_safe() {
+        let edit = rendered_text_edit("a🙂c", "a🙂bc").expect("edit");
+        assert_eq!(edit.old_range, "a🙂".len().."a🙂".len());
+        assert_eq!(edit.inserted, "b");
+    }
 }

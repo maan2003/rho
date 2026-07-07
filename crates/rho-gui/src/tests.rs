@@ -7,7 +7,7 @@ use rho_core::UnixMs;
 use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::{
     AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlock, UiBlockDiff, UiBlockUpdate,
-    UiBlocksDiff, UiMessagePhase, UiTextDiff, UiTool, UiToolStatus,
+    UiBlocksDiff, UiMessagePhase, UiTextDiff, UiTool, UiToolDiff, UiToolStatus,
 };
 use settings::SettingsStore;
 
@@ -223,6 +223,125 @@ fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
     assert!(
         text.contains("hello world"),
         "streamed suffix should append to the frontier: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant("hel", Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("draft", window, cx));
+        })
+        .expect("type prompt");
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 1,
+                    block: UiBlockDiff::AssistantText(UiTextDiff {
+                        keep_bytes: 3,
+                        value: "lo".to_owned(),
+                    }),
+                }],
+            },
+            status: None,
+            context_used: None,
+        },
+    );
+
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("!", window, cx));
+        })
+        .expect("continue typing prompt");
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("hello"),
+        "streaming text should update: {text:?}"
+    );
+    assert!(
+        text.contains("draft!"),
+        "prompt cursor should remain in the prompt after streaming update: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("run")],
+            vec![UiBlock::Tool(UiTool {
+                id: "tool-1".to_owned(),
+                name: "shell_command".to_owned(),
+                arguments: "echo".to_owned(),
+                preview: None,
+                status: UiToolStatus::Running,
+                output: None,
+                error: None,
+                started_at: None,
+                finished_at: None,
+                metadata: None,
+            })],
+        )),
+    );
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 1,
+                    block: UiBlockDiff::Tool(UiToolDiff {
+                        id: "tool-1".to_owned(),
+                        name: "shell_command".to_owned(),
+                        arguments: Some(UiTextDiff {
+                            keep_bytes: 4,
+                            value: " ok".to_owned(),
+                        }),
+                        preview: None,
+                        status: None,
+                        output: None,
+                        error: None,
+                        started_at: None,
+                        finished_at: None,
+                        metadata: None,
+                    }),
+                }],
+            },
+            status: None,
+            context_used: None,
+        },
+    );
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("$ echo ok"),
+        "streamed tool arguments should update the rendered label: {text:?}"
     );
 }
 
