@@ -1,0 +1,18 @@
+[package]
+name = "rho-iroh-auth"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version = "1.91"
+
+[dependencies]
+iroh.workspace = true
+rho-db.workspace = true
+sha2.workspace = true
+redb.workspace = true
+redb-derive.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

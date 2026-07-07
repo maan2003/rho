@@ -13,6 +13,7 @@ members = [
   "crates/rho-daemon",
   "crates/rho-db",
   "crates/rho-gui",
+  "crates/rho-iroh-auth",
   "crates/rho-inference",
   "crates/rho-term-screen",
   "crates/rho-tool-shell",
@@ -47,12 +48,14 @@ crossterm = { version = "0.28", default-features = false, features = [
 ] }
 dirs = { version = "6", default-features = false }
 fnv = "1"
+iroh = { version = "1.0.2", default-features = false }
 futures = "0.3"
 futures-util = "0.3"
 json-stream = { path = "crates/json-stream" }
 prefix-id = { path = "crates/prefix-id" }
 rand = "0.8"
 redb = "4.1.0"
+redb-derive = "0.1.0"
 rho-agent = { path = "crates/rho-agent" }
 rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
 rho-claude = { path = "crates/rho-claude" }
@@ -64,6 +67,7 @@ rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
 rho-inference = { path = "crates/rho-inference" }
+rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-term-screen = { path = "crates/rho-term-screen" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
