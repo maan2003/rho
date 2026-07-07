@@ -7,10 +7,9 @@ use std::time::Duration;
 use futures_util::{Sink, Stream};
 use rho_core::{
     ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
-    InferenceResponseItem, MessagePhase, OpaqueProviderData, PendingInferenceResponse,
-    ProviderResponseId, StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolFormat,
-    ToolGrammarSyntax, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolType,
-    UnixMs, text_content,
+    InferenceResponseItem, MessagePhase, PendingInferenceResponse, ProviderResponseId,
+    StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolFormat, ToolGrammarSyntax,
+    ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolType, UnixMs, text_content,
 };
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
@@ -21,7 +20,9 @@ use super::session::{
     AutoCompaction, ReasoningContext, ResponsesEffort, ResponsesModel, ServiceTier, TextVerbosity,
     is_transient_turn_error, transient_backoff,
 };
-use super::wire::{ResponseState, ResponsesRequest};
+use super::wire::{
+    OpenAiResponsesProviderData, ResponseState, ResponsesRequest, openai_provider_specific_data,
+};
 use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 use crate::config::{DeepConfig, DeepEffort};
@@ -32,7 +33,7 @@ fn first_assistant_message(
     items
         .iter()
         .find_map(|item| match item {
-            InferenceResponseItem::AssistantMessage { content, phase } => {
+            InferenceResponseItem::AssistantMessage { content, phase, .. } => {
                 Some((content.as_slice(), *phase))
             }
             _ => None,
@@ -54,6 +55,7 @@ fn first_tool_call(items: &[InferenceResponseItem]) -> ToolCall {
                 name,
                 tool_type,
                 arguments,
+                ..
             } => Some(ToolCall {
                 id: id.clone(),
                 name: name.clone(),
@@ -73,6 +75,16 @@ fn content_parts(text: &str) -> Vec<ContentPart> {
 
 fn assistant_message(text: &str) -> InferenceResponseItem {
     InferenceResponseItem::AssistantMessage {
+        provider_specific: provider_specific(
+            "message",
+            json!({
+                "type": "message",
+                "id": "msg_test",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": text}],
+            }),
+        ),
         content: content_parts(text),
         phase: None,
     }
@@ -80,9 +92,39 @@ fn assistant_message(text: &str) -> InferenceResponseItem {
 
 fn assistant_message_with_phase(text: &str, phase: MessagePhase) -> InferenceResponseItem {
     InferenceResponseItem::AssistantMessage {
+        provider_specific: provider_specific(
+            "message",
+            json!({
+                "type": "message",
+                "id": "msg_test",
+                "role": "assistant",
+                "phase": match phase {
+                    MessagePhase::Commentary => "commentary",
+                    MessagePhase::FinalAnswer => "final_answer",
+                },
+                "content": [{"type": "output_text", "text": text}],
+            }),
+        ),
         content: content_parts(text),
         phase: Some(phase),
     }
+}
+
+fn provider_specific(_tag: &str, payload: Value) -> Box<dyn rho_core::ProviderSpecificData> {
+    let item_id =
+        rho_core::ProviderResponseItemId::try_from(payload["id"].as_str().unwrap_or("test_item"))
+            .unwrap();
+    Box::new(match payload["type"].as_str().unwrap_or_default() {
+        "message" => OpenAiResponsesProviderData::Message { item_id },
+        "function_call" => OpenAiResponsesProviderData::FunctionCall { item_id },
+        "custom_tool_call" => OpenAiResponsesProviderData::CustomToolCall { item_id },
+        "reasoning" => OpenAiResponsesProviderData::Reasoning {
+            item_id,
+            encrypted_content: payload["encrypted_content"].as_str().map(str::to_owned),
+        },
+        "compaction" => OpenAiResponsesProviderData::Compaction { item_id },
+        other => panic!("unexpected OpenAI test provider item type: {other}"),
+    })
 }
 
 /// A `ContextBlock::UserMessage` carrying a single text part.

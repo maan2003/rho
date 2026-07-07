@@ -579,7 +579,7 @@ fn last_response(label: &str, state: &rho_agent::AgentState) -> String {
             items
                 .iter()
                 .filter_map(|item| match item {
-                    InferenceResponseItem::AssistantMessage { content, phase } => {
+                    InferenceResponseItem::AssistantMessage { content, phase, .. } => {
                         let is_final = *phase == Some(MessagePhase::FinalAnswer);
                         (is_final == wanted_final || !wanted_final).then(|| text_content(content))
                     }

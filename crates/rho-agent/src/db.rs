@@ -31,7 +31,7 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "b4e17c2d";
+const CURRENT_AGENT_DB_FORMAT: &str = "9c4e2a8f";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -49,6 +49,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         from: "1e1beb36",
         to: "b4e17c2d",
         migrate: migrate_agent_id_table_names,
+    },
+    AgentDbMigration {
+        from: "b4e17c2d",
+        to: "9c4e2a8f",
+        migrate: migrate_provider_specific_response_items,
     },
 ];
 
@@ -248,6 +253,18 @@ fn migrate_agents_table_key_name(write: &mut WriteTxn) {
     for (key, record) in records {
         let agent_id = <AgentId as redb::Value>::from_bytes(&key);
         agents.insert(&agent_id, SenValue::borrowed(&record));
+    }
+}
+
+fn migrate_provider_specific_response_items(write: &mut WriteTxn) {
+    let mut events = write.open_table(AGENT_EVENTS);
+    let rows = events
+        .iter()
+        .map(|(pos, event)| (pos.value(), event.value().into_owned()))
+        .collect::<Vec<_>>();
+
+    for (pos, event) in rows {
+        events.insert(&pos, SenValue::borrowed(&event));
     }
 }
 

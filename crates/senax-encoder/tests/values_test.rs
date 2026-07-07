@@ -19,7 +19,7 @@ use ulid::Ulid;
 #[cfg(feature = "uuid")]
 use uuid::Uuid;
 
-#[derive(Debug, PartialEq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 struct RegisteredOpenAiMeta {
     item_id: String,
 }

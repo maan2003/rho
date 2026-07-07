@@ -602,13 +602,15 @@ fn find_tool_block_mut<'a>(blocks: &'a mut [UiBlock], id: &str) -> Option<&'a mu
 
 fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> {
     match item {
-        InferenceResponseItem::AssistantMessage { content, phase } => {
+        InferenceResponseItem::AssistantMessage { content, phase, .. } => {
             Some(UiBlock::AssistantMessage {
                 text: text_content(content),
                 phase: phase.map(Into::into),
             })
         }
-        InferenceResponseItem::RawReasoning { content, summary } => Some(UiBlock::Reasoning {
+        InferenceResponseItem::RawReasoning {
+            content, summary, ..
+        } => Some(UiBlock::Reasoning {
             text: reasoning_text(content, summary),
         }),
         InferenceResponseItem::ToolCall {
@@ -628,7 +630,7 @@ fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> 
             finished_at: None,
             metadata: None,
         })),
-        InferenceResponseItem::Compaction(_) => Some(UiBlock::Notice {
+        InferenceResponseItem::Compaction { .. } => Some(UiBlock::Notice {
             text: "compacting context".to_owned(),
         }),
         InferenceResponseItem::EncryptedReasoning { summary, .. } => {
@@ -636,7 +638,7 @@ fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> 
                 text: summary.join("\n"),
             })
         }
-        InferenceResponseItem::Unknown(_) => None,
+        InferenceResponseItem::Unknown { .. } => None,
     }
 }
 
@@ -696,13 +698,15 @@ fn streaming_block(item: &StreamingContextItemState) -> Option<UiBlock> {
 
 fn block_from_streaming_item(item: &StreamingContextItem) -> Option<UiBlock> {
     match item {
-        StreamingContextItem::AssistantMessage { content, phase } => {
+        StreamingContextItem::AssistantMessage { content, phase, .. } => {
             Some(UiBlock::AssistantMessage {
                 text: content.iter().map(ToString::to_string).collect(),
                 phase: phase.map(Into::into),
             })
         }
-        StreamingContextItem::RawReasoning { content, summary } => Some(UiBlock::Reasoning {
+        StreamingContextItem::RawReasoning {
+            content, summary, ..
+        } => Some(UiBlock::Reasoning {
             text: reasoning_text(content, summary),
         }),
         StreamingContextItem::EncryptedReasoning { summary, .. } => {
@@ -731,10 +735,10 @@ fn block_from_streaming_item(item: &StreamingContextItem) -> Option<UiBlock> {
             finished_at: None,
             metadata: None,
         })),
-        StreamingContextItem::Compaction(_) => Some(UiBlock::Notice {
+        StreamingContextItem::Compaction { .. } => Some(UiBlock::Notice {
             text: "compacting context".to_owned(),
         }),
-        StreamingContextItem::Unknown(_) => None,
+        StreamingContextItem::Unknown { .. } => None,
     }
 }
 
@@ -771,8 +775,26 @@ mod tests {
         AStr, ApplyPatchMetadata, ContentPart, PendingInferenceResponse, ToolCall, ToolCallId,
         ToolFileChange, ToolFileStatus, ToolName, ToolOutput, ToolResult, ToolType,
     };
+    use senax_encoder::{Decode, Encode};
 
     use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    struct UiTestProviderSpecificData {
+        item_id: String,
+    }
+
+    senax_encoder::register_senax_tagged!(
+        trait = ProviderSpecificData,
+        type = UiTestProviderSpecificData,
+        tag = "rho-ui-proto-test.provider-data",
+    );
+
+    fn test_provider_specific_data() -> Box<dyn ProviderSpecificData> {
+        Box::new(UiTestProviderSpecificData {
+            item_id: "ui_item_1".to_owned(),
+        })
+    }
 
     fn streaming_state(text: &str) -> AgentState {
         AgentState {
@@ -784,6 +806,7 @@ mod tests {
                 pending_response: PendingInferenceResponse {
                     items: vec![StreamingContextItemState::Pending(
                         StreamingContextItem::AssistantMessage {
+                            provider_specific: test_provider_specific_data(),
                             content: vec![AStr::from(text)],
                             phase: None,
                         },
@@ -821,6 +844,7 @@ mod tests {
                 partial_response: PendingInferenceResponse {
                     items: vec![StreamingContextItemState::Pending(
                         StreamingContextItem::AssistantMessage {
+                            provider_specific: test_provider_specific_data(),
                             content: vec![AStr::from(partial_text)],
                             phase: None,
                         },
@@ -837,6 +861,7 @@ mod tests {
         AgentState {
             blocks: vec![Arc::new(ContextBlock::InferenceResponse {
                 items: vec![InferenceResponseItem::AssistantMessage {
+                    provider_specific: test_provider_specific_data(),
                     content: vec![ContentPart::Text {
                         text: text.to_owned(),
                     }],
@@ -858,6 +883,7 @@ mod tests {
             blocks: vec![
                 Arc::new(ContextBlock::InferenceResponse {
                     items: vec![InferenceResponseItem::ToolCall {
+                        provider_specific: test_provider_specific_data(),
                         id: call_id.clone(),
                         name: ToolName::try_from("shell_command").unwrap(),
                         tool_type: ToolType::Function,
@@ -930,6 +956,7 @@ mod tests {
         let preview = previews.values().next().unwrap();
         state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
             items: vec![InferenceResponseItem::ToolCall {
+                provider_specific: test_provider_specific_data(),
                 id: preview.call.id.clone(),
                 name: preview.call.name.clone(),
                 tool_type: preview.call.tool_type,

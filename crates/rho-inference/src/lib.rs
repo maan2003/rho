@@ -5,4 +5,4 @@ pub mod config;
 mod responses;
 
 pub use auth_cli::{AuthArgs, run_auth_cli};
-pub use responses::{InferenceAuth, InferenceSession, PromptCacheKey};
+pub use responses::{InferenceAuth, InferenceSession, OpenAiResponsesProviderData, PromptCacheKey};

@@ -17,6 +17,11 @@ mod util;
 pub use crate::append_string::{AStr, AppendString, Diff};
 use crate::util::validated_string_type;
 
+senax_encoder::declare_senax_tagged_trait!(
+    pub trait ProviderSpecificData,
+    unknown = UnknownProviderSpecificData,
+);
+
 validated_string_type!(
     /// Identifies a tool call so its result can be matched back to it.
     pub ToolCallId,
@@ -31,6 +36,11 @@ validated_string_type!(
 
 validated_string_type!(
     pub ProviderResponseId,
+    crate::util::validate_identifier
+);
+
+validated_string_type!(
+    pub ProviderResponseItemId,
     crate::util::validate_identifier
 );
 
@@ -73,13 +83,15 @@ pub enum ContextBlock {
     CompactionTrigger,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum InferenceResponseItem {
     AssistantMessage {
+        provider_specific: Box<dyn ProviderSpecificData>,
         content: Vec<ContentPart>,
         phase: Option<MessagePhase>,
     },
     ToolCall {
+        provider_specific: Box<dyn ProviderSpecificData>,
         id: ToolCallId,
         name: ToolName,
         tool_type: ToolType,
@@ -87,15 +99,20 @@ pub enum InferenceResponseItem {
         arguments: String,
     },
     EncryptedReasoning {
-        payload: OpaqueProviderData,
+        provider_specific: Box<dyn ProviderSpecificData>,
         summary: Vec<String>,
     },
     RawReasoning {
+        provider_specific: Box<dyn ProviderSpecificData>,
         content: String,
         summary: Vec<String>,
     },
-    Compaction(OpaqueProviderData),
-    Unknown(OpaqueProviderData),
+    Compaction {
+        provider_specific: Box<dyn ProviderSpecificData>,
+    },
+    Unknown {
+        provider_specific: Box<dyn ProviderSpecificData>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack)]
@@ -240,36 +257,6 @@ pub enum ToolFileStatus {
     Moved,
 }
 
-/// A provider item captured whole so it can be replayed byte-for-byte. It is
-/// never appended to (unlike streamed text), so the fields are `Arc<str>` for
-/// O(1) cloning rather than [`AStr`]; the same value rides along in both
-/// pending items and finalized history.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpaqueProviderData {
-    pub tag: Arc<str>,
-    pub data: Arc<str>,
-}
-
-impl senax_encoder::Encoder for OpaqueProviderData {
-    fn encode(&self, writer: &mut bytes::BytesMut) -> senax_encoder::Result<()> {
-        (self.tag.to_string(), self.data.to_string()).encode(writer)
-    }
-
-    fn is_default(&self) -> bool {
-        self.tag.is_empty() && self.data.is_empty()
-    }
-}
-
-impl senax_encoder::Decoder for OpaqueProviderData {
-    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
-        let (tag, data) = <(String, String)>::decode(reader)?;
-        Ok(Self {
-            tag: std::sync::Arc::from(tag),
-            data: std::sync::Arc::from(data),
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct InferenceRequest {
     pub instructions: Arc<str>,
@@ -282,73 +269,88 @@ pub struct InferenceRequest {
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum StreamingContextItem {
     AssistantMessage {
+        provider_specific: Box<dyn ProviderSpecificData>,
         content: Vec<AStr>,
         phase: Option<MessagePhase>,
     },
     ToolCall {
+        provider_specific: Box<dyn ProviderSpecificData>,
         id: ToolCallId,
         name: ToolName,
         tool_type: ToolType,
         arguments: AStr,
     },
     RawReasoning {
+        provider_specific: Box<dyn ProviderSpecificData>,
         content: AStr,
         summary: Vec<AStr>,
     },
     EncryptedReasoning {
-        payload: OpaqueProviderData,
+        provider_specific: Box<dyn ProviderSpecificData>,
         summary: Vec<AStr>,
     },
-    Compaction(Option<OpaqueProviderData>),
-    Unknown(OpaqueProviderData),
+    Compaction {
+        provider_specific: Box<dyn ProviderSpecificData>,
+    },
+    Unknown {
+        provider_specific: Box<dyn ProviderSpecificData>,
+    },
 }
 
 impl StreamingContextItem {
     pub fn to_context_item(&self) -> anyhow::Result<InferenceResponseItem> {
         Ok(match self {
-            StreamingContextItem::AssistantMessage { content, phase } => {
-                InferenceResponseItem::AssistantMessage {
-                    content: content
-                        .iter()
-                        .map(|text| ContentPart::Text {
-                            text: text.to_string(),
-                        })
-                        .collect(),
-                    phase: *phase,
-                }
-            }
+            StreamingContextItem::AssistantMessage {
+                provider_specific,
+                content,
+                phase,
+            } => InferenceResponseItem::AssistantMessage {
+                provider_specific: provider_specific.clone(),
+                content: content
+                    .iter()
+                    .map(|text| ContentPart::Text {
+                        text: text.to_string(),
+                    })
+                    .collect(),
+                phase: *phase,
+            },
             StreamingContextItem::ToolCall {
+                provider_specific,
                 id,
                 name,
                 tool_type,
                 arguments,
             } => InferenceResponseItem::ToolCall {
+                provider_specific: provider_specific.clone(),
                 id: id.clone(),
                 name: name.clone(),
                 tool_type: *tool_type,
                 arguments: arguments.to_string(),
             },
-            StreamingContextItem::RawReasoning { content, summary } => {
-                InferenceResponseItem::RawReasoning {
-                    content: content.to_string(),
-                    summary: summary.iter().map(AStr::to_string).collect(),
+            StreamingContextItem::RawReasoning {
+                provider_specific,
+                content,
+                summary,
+            } => InferenceResponseItem::RawReasoning {
+                provider_specific: provider_specific.clone(),
+                content: content.to_string(),
+                summary: summary.iter().map(AStr::to_string).collect(),
+            },
+            StreamingContextItem::EncryptedReasoning {
+                provider_specific,
+                summary,
+            } => InferenceResponseItem::EncryptedReasoning {
+                provider_specific: provider_specific.clone(),
+                summary: summary.iter().map(AStr::to_string).collect(),
+            },
+            StreamingContextItem::Compaction { provider_specific } => {
+                InferenceResponseItem::Compaction {
+                    provider_specific: provider_specific.clone(),
                 }
             }
-            StreamingContextItem::EncryptedReasoning { payload, summary } => {
-                InferenceResponseItem::EncryptedReasoning {
-                    payload: payload.clone(),
-                    summary: summary.iter().map(AStr::to_string).collect(),
-                }
-            }
-            StreamingContextItem::Compaction(Some(payload)) => {
-                InferenceResponseItem::Compaction(payload.clone())
-            }
-            StreamingContextItem::Unknown(payload) => {
-                InferenceResponseItem::Unknown(payload.clone())
-            }
-            StreamingContextItem::Compaction(None) => {
-                anyhow::bail!("compaction never finished")
-            }
+            StreamingContextItem::Unknown { provider_specific } => InferenceResponseItem::Unknown {
+                provider_specific: provider_specific.clone(),
+            },
         })
     }
 }
@@ -472,6 +474,23 @@ pub fn text_content(parts: &[ContentPart]) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    struct TestProviderSpecificData {
+        item_id: String,
+    }
+
+    senax_encoder::register_senax_tagged!(
+        trait = ProviderSpecificData,
+        type = TestProviderSpecificData,
+        tag = "rho-core-test.provider-data",
+    );
+
+    fn test_provider_specific_data() -> Box<dyn ProviderSpecificData> {
+        Box::new(TestProviderSpecificData {
+            item_id: "item_1".to_owned(),
+        })
+    }
+
     #[test]
     fn tool_call_id_converts_and_borrows_as_str() {
         let from_str = ToolCallId::try_from("call-1").unwrap();
@@ -506,6 +525,7 @@ mod tests {
 
     fn pending_message(text: &str) -> StreamingContextItem {
         StreamingContextItem::AssistantMessage {
+            provider_specific: test_provider_specific_data(),
             content: vec![AStr::from(text)],
             phase: None,
         }
@@ -513,6 +533,7 @@ mod tests {
 
     fn message_item(text: &str) -> InferenceResponseItem {
         InferenceResponseItem::AssistantMessage {
+            provider_specific: test_provider_specific_data(),
             content: vec![ContentPart::Text {
                 text: text.to_owned(),
             }],
@@ -555,21 +576,21 @@ mod tests {
 
     #[test]
     fn finalizes_unknown_provider_item() {
-        let payload = OpaqueProviderData {
-            tag: "provider.event".into(),
-            data: "{}".into(),
-        };
         let mut response = PendingInferenceResponse::default();
 
         response.apply(
             0,
-            ContextItemEvent::Update(StreamingContextItem::Unknown(payload.clone())),
+            ContextItemEvent::Update(StreamingContextItem::Unknown {
+                provider_specific: test_provider_specific_data(),
+            }),
         );
         response.apply(0, ContextItemEvent::Finish);
 
         assert_eq!(
             response.finish().unwrap(),
-            vec![InferenceResponseItem::Unknown(payload)]
+            vec![InferenceResponseItem::Unknown {
+                provider_specific: test_provider_specific_data()
+            }]
         );
     }
 
@@ -581,6 +602,7 @@ mod tests {
         response.apply(
             1,
             ContextItemEvent::Update(StreamingContextItem::ToolCall {
+                provider_specific: test_provider_specific_data(),
                 id: ToolCallId::try_from("call-1").unwrap(),
                 name: ToolName::try_from("shell").unwrap(),
                 tool_type: ToolType::Function,
@@ -595,6 +617,7 @@ mod tests {
             vec![
                 message_item("hi"),
                 InferenceResponseItem::ToolCall {
+                    provider_specific: test_provider_specific_data(),
                     id: ToolCallId::try_from("call-1").unwrap(),
                     name: ToolName::try_from("shell").unwrap(),
                     tool_type: ToolType::Function,
@@ -625,7 +648,9 @@ mod tests {
         // Compaction was marked finished but its payload never arrived.
         response.apply(
             0,
-            ContextItemEvent::Update(StreamingContextItem::Compaction(None)),
+            ContextItemEvent::Update(StreamingContextItem::Compaction {
+                provider_specific: test_provider_specific_data(),
+            }),
         );
         response.apply(0, ContextItemEvent::Finish);
 
@@ -635,16 +660,14 @@ mod tests {
 
     #[test]
     fn finish_rejects_absent_gap() {
-        let payload = OpaqueProviderData {
-            tag: "provider.event".into(),
-            data: "{}".into(),
-        };
         let mut response = PendingInferenceResponse::default();
 
         // Only index 1 is filled; index 0 stays a gap.
         response.apply(
             1,
-            ContextItemEvent::Update(StreamingContextItem::Unknown(payload)),
+            ContextItemEvent::Update(StreamingContextItem::Unknown {
+                provider_specific: test_provider_specific_data(),
+            }),
         );
 
         let error = response.finish().unwrap_err();

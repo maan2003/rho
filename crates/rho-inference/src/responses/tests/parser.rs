@@ -3,10 +3,10 @@ use super::*;
 #[test]
 fn parses_text_delta_stream() {
     let parsed = parse_response_events([
-        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
         r#"{"type":"response.output_text.delta","delta":"hel","output_index":0}"#,
         r#"{"type":"response.output_text.delta","delta":"lo","output_index":0}"#,
-        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
         r#"{"type":"response.completed","response":{"id":"resp_1"}}"#,
     ])
     .unwrap();
@@ -23,12 +23,12 @@ fn parses_text_delta_stream() {
 #[test]
 fn parses_text_deltas_by_output_index() {
     let parsed = parse_response_events([
-        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
         r#"{"type":"response.output_text.delta","delta":"first","output_index":0}"#,
-        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
-        r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
+        r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1"}}"#,
         r#"{"type":"response.output_text.delta","delta":"second","output_index":1}"#,
-        r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_1"}}"#,
         r#"{"type":"response.completed"}"#,
     ])
     .unwrap();
@@ -48,11 +48,11 @@ fn parses_text_deltas_by_output_index() {
 #[test]
 fn preserves_output_item_order() {
     let parsed = parse_response_events([
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#,
             r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"ciphertext","summary":[]}}"#,
-            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1"}}"#,
             r#"{"type":"response.output_text.delta","delta":"after reasoning","output_index":1}"#,
-            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_1"}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
@@ -70,10 +70,10 @@ fn preserves_output_item_order() {
 #[test]
 fn streaming_parser_emits_context_item_events() {
     let parsed = parse_response_events([
-        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
         r#"{"type":"response.output_text.delta","delta":"hel","output_index":0}"#,
         r#"{"type":"response.output_text.delta","delta":"lo","output_index":0}"#,
-        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
         r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":2,"output_tokens":3}}}"#,
     ])
     .unwrap();
@@ -109,10 +109,10 @@ fn streaming_parser_emits_context_item_events() {
 #[test]
 fn parses_function_call_stream() {
     let parsed = parse_response_events([
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"shell"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_call_1","call_id":"call_1","name":"shell"}}"#,
             r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"command\":\"p"}"#,
             r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"wd\"}"}"#,
-            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"shell"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_call_1","call_id":"call_1","name":"shell"}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
@@ -127,9 +127,9 @@ fn parses_function_call_stream() {
 #[test]
 fn parses_custom_tool_call_stream() {
     let parsed = parse_response_events([
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"patch"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_call_1","call_id":"call_1","name":"patch"}}"#,
             r#"{"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"*** Begin Patch\n*** End Patch"}"#,
-            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"patch"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_call_1","call_id":"call_1","name":"patch"}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
@@ -143,9 +143,9 @@ fn parses_custom_tool_call_stream() {
 #[test]
 fn parses_message_phase_from_added_item() {
     let parsed = parse_response_events([
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","phase":"commentary"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","phase":"commentary"}}"#,
             r#"{"type":"response.output_text.delta","delta":"draft","output_index":0}"#,
-            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","phase":"commentary"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","phase":"commentary"}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
@@ -157,9 +157,9 @@ fn parses_message_phase_from_added_item() {
 #[test]
 fn parses_message_phase_from_done_item() {
     let parsed = parse_response_events([
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
             r#"{"type":"response.output_text.delta","delta":"draft","output_index":0}"#,
-            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","phase":"final_answer"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","phase":"final_answer"}}"#,
             r#"{"type":"response.completed"}"#,
         ])
         .unwrap();
@@ -171,7 +171,7 @@ fn parses_message_phase_from_done_item() {
 #[test]
 fn errors_when_stream_ends_without_terminal_event() {
     let error = parse_response_events([
-        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
         r#"{"type":"response.output_text.delta","delta":"partial","output_index":0}"#,
     ])
     .unwrap_err();
@@ -198,7 +198,7 @@ fn captures_response_id_and_usage() {
 #[test]
 fn unifies_reasoning_summary_and_encrypted_content_into_one_item() {
     let parsed = parse_response_events([
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#,
             r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"thinking"}"#,
             r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"ciphertext","summary":["thinking"]}}"#,
             r#"{"type":"response.completed"}"#,
@@ -207,38 +207,37 @@ fn unifies_reasoning_summary_and_encrypted_content_into_one_item() {
 
     match &parsed.items[0] {
         InferenceResponseItem::EncryptedReasoning {
-            payload: opaque,
+            provider_specific,
             summary,
         } => {
             assert_eq!(summary, &["thinking".to_owned()]);
-            assert!(opaque.data.contains("ciphertext"));
+            let OpenAiResponsesProviderData::Reasoning {
+                encrypted_content, ..
+            } = openai_provider_specific_data(&**provider_specific).unwrap()
+            else {
+                panic!("expected OpenAI reasoning provider data");
+            };
+            assert_eq!(encrypted_content.as_deref(), Some("ciphertext"));
         }
         other => panic!("expected encrypted reasoning, got {other:?}"),
     }
 }
 
 #[test]
-fn preserves_unknown_completed_provider_items() {
+fn ignores_unknown_completed_provider_items() {
     let parsed = parse_response_events([
         r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"computer_call","id":"cc_1","action":{"type":"screenshot"}}}"#,
         r#"{"type":"response.completed"}"#,
     ])
     .unwrap();
 
-    match &parsed.items[0] {
-        InferenceResponseItem::Unknown(opaque) => {
-            assert_eq!(&*opaque.tag, "computer_call");
-            assert!(opaque.data.contains("cc_1"));
-        }
-        other => panic!("expected unknown provider item, got {other:?}"),
-    }
-    assert!(parsed.events.iter().any(|(index, event)| {
-        *index == 0
-            && matches!(
-                event,
-                ContextItemEvent::Update(StreamingContextItem::Unknown(_))
-            )
-    }));
+    assert!(parsed.items.is_empty());
+    assert!(
+        !parsed
+            .events
+            .iter()
+            .any(|(_, event)| matches!(event, ContextItemEvent::Update(_)))
+    );
 }
 
 #[test]

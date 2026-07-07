@@ -2,11 +2,37 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use rho_core::{
-    ContentPart, ContextBlock, InferenceResponseItem, StreamingContextItem, ToolCallId, ToolName,
-    ToolOutput, ToolOutputStatus, ToolResult, ToolType, UnixMs,
+    ContentPart, ContextBlock, InferenceResponseItem, ProviderSpecificData, StreamingContextItem,
+    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, UnixMs,
 };
+use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde_json::Value;
 use uuid::Uuid;
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct ClaudeProviderSpecificData;
+
+impl TaggedSenax for ClaudeProviderSpecificData {
+    const TAG: &'static str = "claude.projected";
+}
+
+senax_encoder::__private::inventory::submit! {
+    rho_core::__SenaxProviderSpecificDataEntry::new(
+        ClaudeProviderSpecificData::TAG,
+        |mut body: bytes::Bytes| -> senax_encoder::Result<Box<dyn ProviderSpecificData>> {
+            use bytes::Buf as _;
+            let value = ClaudeProviderSpecificData::decode(&mut body)?;
+            if body.remaining() != 0 {
+                return Err(senax_encoder::EncoderError::Decode(format!(
+                    "Trailing bytes while decoding registered tagged senax value '{}': {}",
+                    ClaudeProviderSpecificData::TAG,
+                    body.remaining()
+                )));
+            }
+            Ok(Box::new(value) as Box<dyn ProviderSpecificData>)
+        },
+    )
+}
 
 pub(super) enum ClaudeStreamItem {
     Text(String),
@@ -80,10 +106,12 @@ impl ClaudeStreamItem {
     pub(super) fn to_streaming_context_item(&self) -> anyhow::Result<StreamingContextItem> {
         Ok(match self {
             Self::Text(text) => StreamingContextItem::AssistantMessage {
+                provider_specific: Box::new(ClaudeProviderSpecificData),
                 content: vec![text.as_str().into()],
                 phase: None,
             },
             Self::Thinking(thinking) => StreamingContextItem::RawReasoning {
+                provider_specific: Box::new(ClaudeProviderSpecificData),
                 content: thinking.as_str().into(),
                 summary: Vec::new(),
             },
@@ -92,6 +120,7 @@ impl ClaudeStreamItem {
                 name,
                 arguments,
             } => StreamingContextItem::ToolCall {
+                provider_specific: Box::new(ClaudeProviderSpecificData),
                 id: ToolCallId::try_from(id.as_str())?,
                 name: ToolName::try_from(name.as_str())?,
                 tool_type: ToolType::Function,
@@ -198,6 +227,7 @@ fn project_assistant_message(
                 flush_text(&mut text, &mut items);
                 if let Some(thinking) = content.get("thinking").and_then(Value::as_str) {
                     items.push(InferenceResponseItem::RawReasoning {
+                        provider_specific: Box::new(ClaudeProviderSpecificData),
                         content: thinking.to_owned(),
                         summary: Vec::new(),
                     });
@@ -240,6 +270,7 @@ fn flush_text(text: &mut String, items: &mut Vec<InferenceResponseItem>) {
         return;
     }
     items.push(InferenceResponseItem::AssistantMessage {
+        provider_specific: Box::new(ClaudeProviderSpecificData),
         content: vec![ContentPart::Text {
             text: std::mem::take(text),
         }],
@@ -258,6 +289,7 @@ fn project_tool_call(content: &Value) -> anyhow::Result<InferenceResponseItem> {
         .context("Claude tool_use missing name")?;
     let input = content.get("input").cloned().unwrap_or(Value::Null);
     Ok(InferenceResponseItem::ToolCall {
+        provider_specific: Box::new(ClaudeProviderSpecificData),
         id: ToolCallId::try_from(id)?,
         name: ToolName::try_from(name)?,
         tool_type: ToolType::Function,

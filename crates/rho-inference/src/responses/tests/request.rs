@@ -15,13 +15,6 @@ fn inference_response(
     })
 }
 
-fn opaque(tag: &str, payload: Value) -> OpaqueProviderData {
-    OpaqueProviderData {
-        tag: tag.into(),
-        data: payload.to_string().into(),
-    }
-}
-
 #[test]
 fn builds_responses_request_with_tools_and_item_timeline() {
     let (_temp, auth) = test_oauth_file("token", None);
@@ -37,6 +30,16 @@ fn builds_responses_request_with_tools_and_item_timeline() {
             inference_response(
                 None,
                 vec![InferenceResponseItem::ToolCall {
+                    provider_specific: provider_specific(
+                        "function_call",
+                        json!({
+                            "type": "function_call",
+                            "id": "fc_call-1",
+                            "call_id": "call-1",
+                            "name": "shell_run",
+                            "arguments": r#"{"command":"pwd"}"#,
+                        }),
+                    ),
                     id: tool_call_id("call-1"),
                     name: tool_name("shell_run"),
                     tool_type: ToolType::Function,
@@ -414,10 +417,12 @@ fn compaction_replay_trims_before_latest_compaction_item() {
             user_block("before"),
             inference_response(
                 Some("resp_compaction"),
-                vec![InferenceResponseItem::Compaction(opaque(
-                    "compaction",
-                    json!({"type": "compaction", "id": "cmp_1"}),
-                ))],
+                vec![InferenceResponseItem::Compaction {
+                    provider_specific: provider_specific(
+                        "compaction",
+                        json!({"type": "compaction", "id": "cmp_1"}),
+                    ),
+                }],
             ),
             user_block("after"),
         ],
@@ -440,7 +445,7 @@ fn compaction_replay_trims_before_latest_compaction_item() {
 #[test]
 fn replays_reasoning_provider_item() {
     let reasoning = InferenceResponseItem::EncryptedReasoning {
-        payload: opaque(
+        provider_specific: provider_specific(
             "reasoning",
             json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed"}),
         ),
@@ -465,33 +470,6 @@ fn replays_reasoning_provider_item() {
 }
 
 #[test]
-fn does_not_replay_unknown_provider_items() {
-    let request = inference_request(
-        vec![
-            inference_response(
-                None,
-                vec![InferenceResponseItem::Unknown(opaque(
-                    "computer_call",
-                    json!({"type": "computer_call", "id": "cc_1"}),
-                ))],
-            ),
-            user_block("after"),
-        ],
-        Vec::new(),
-    );
-
-    let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
-        request,
-        None,
-    );
-    let json = serde_json::to_value(body).unwrap();
-
-    assert_eq!(json["input"].as_array().unwrap().len(), 1);
-    assert_eq!(json["input"][0]["content"][0]["text"], "after");
-}
-
-#[test]
 fn serializes_custom_tool_calls_and_results() {
     let result = ToolResult {
         call_id: tool_call_id("call-1"),
@@ -509,6 +487,16 @@ fn serializes_custom_tool_calls_and_results() {
             inference_response(
                 None,
                 vec![InferenceResponseItem::ToolCall {
+                    provider_specific: provider_specific(
+                        "custom_tool_call",
+                        json!({
+                            "type": "custom_tool_call",
+                            "id": "ctc_call-1",
+                            "call_id": "call-1",
+                            "name": "patch",
+                            "input": "*** Begin Patch\n*** End Patch",
+                        }),
+                    ),
                     id: tool_call_id("call-1"),
                     name: tool_name("patch"),
                     tool_type: ToolType::Custom,

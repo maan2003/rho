@@ -61,17 +61,15 @@ pub enum AgentEvent<'a> {
     QueueCleared,
 }
 
-/// Temporary: accepts the pre-queue event shape (`UserMessage`,
-/// `CompactionTriggered`) so `migrate_queued_event_shape` can read old rows.
-/// Delete with the migration and restore `derive(Decode)`.
+/// Temporary: accepts pre-queue event rows and response items written before
+/// provider-specific data was required. Delete with the db migrations and
+/// restore `derive(Decode)`.
 impl senax_encoder::Decoder for AgentEvent<'static> {
     fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        use bytes::Buf as _;
+
         #[derive(Decode)]
-        enum Shadow {
-            UserMessage {
-                content: Vec<ContentPart>,
-            },
-            CompactionTriggered,
+        enum CurrentShadow {
             InferenceResponse {
                 items: Vec<InferenceResponseItem>,
                 provider_response_id: Option<ProviderResponseId>,
@@ -87,34 +85,259 @@ impl senax_encoder::Decoder for AgentEvent<'static> {
             QueueCleared,
         }
 
-        Ok(match Shadow::decode(reader)? {
-            Shadow::UserMessage { content } => AgentEvent::Queued(QueuedItem {
-                kind: QueuedItemKind::UserMessage {
-                    sender: MessageSender::User,
-                    content: Arc::new(content),
+        #[derive(Decode)]
+        enum MigrationShadow {
+            UserMessage {
+                content: Vec<ContentPart>,
+            },
+            CompactionTriggered,
+            InferenceResponse {
+                items: Vec<ProviderSpecificMigrationItem>,
+                provider_response_id: Option<ProviderResponseId>,
+                context_used: Option<u64>,
+            },
+            ToolResult {
+                result: ToolResult,
+            },
+            Queued(QueuedItem),
+            Dequeued {
+                boundary: MessageDelivery,
+            },
+            QueueCleared,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Decode)]
+        enum ProviderSpecificMigrationItem {
+            AssistantMessage {
+                content: Vec<ContentPart>,
+                phase: Option<rho_core::MessagePhase>,
+            },
+            ToolCall {
+                id: ToolCallId,
+                name: rho_core::ToolName,
+                tool_type: rho_core::ToolType,
+                arguments: String,
+            },
+            EncryptedReasoning {
+                payload: ProviderSpecificMigrationRawItem,
+                summary: Vec<String>,
+            },
+            RawReasoning {
+                content: String,
+                summary: Vec<String>,
+            },
+            Compaction(ProviderSpecificMigrationRawItem),
+            Unknown(ProviderSpecificMigrationRawItem),
+        }
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct ProviderSpecificMigrationRawItem {
+            tag: String,
+            data: String,
+        }
+
+        impl senax_encoder::Decoder for ProviderSpecificMigrationRawItem {
+            fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+                let (tag, data) = <(String, String)>::decode(reader)?;
+                Ok(Self { tag, data })
+            }
+        }
+
+        fn migration_raw_item(payload: ProviderSpecificMigrationRawItem) -> serde_json::Value {
+            serde_json::from_str(&payload.data).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "type": payload.tag,
+                    "data": payload.data,
+                })
+            })
+        }
+
+        fn migrated_item_id(prefix: &str, seed: &str) -> rho_core::ProviderResponseItemId {
+            let mut hash = 0xcbf29ce484222325_u64;
+            for byte in seed.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            rho_core::ProviderResponseItemId::try_from(format!("{prefix}_{hash:016x}"))
+                .expect("generated migration item id is valid")
+        }
+
+        fn migrate_item(item: ProviderSpecificMigrationItem) -> InferenceResponseItem {
+            match item {
+                ProviderSpecificMigrationItem::AssistantMessage { content, phase } => {
+                    let item = serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": match phase {
+                            Some(rho_core::MessagePhase::Commentary) => "commentary",
+                            Some(rho_core::MessagePhase::FinalAnswer) | None => "final_answer",
+                        },
+                        "content": [{"type": "output_text", "text": rho_core::text_content(&content)}],
+                    });
+                    InferenceResponseItem::AssistantMessage {
+                        provider_specific: Box::new(
+                            rho_inference::OpenAiResponsesProviderData::Message {
+                                item_id: migrated_item_id("msg", &item.to_string()),
+                            },
+                        ),
+                        content,
+                        phase,
+                    }
+                }
+                ProviderSpecificMigrationItem::ToolCall {
+                    id,
+                    name,
+                    tool_type,
+                    arguments,
+                } => InferenceResponseItem::ToolCall {
+                    provider_specific: match tool_type {
+                        rho_core::ToolType::Function => {
+                            Box::new(rho_inference::OpenAiResponsesProviderData::FunctionCall {
+                                item_id: rho_core::ProviderResponseItemId::try_from(format!(
+                                    "fc_{}",
+                                    id.as_str()
+                                ))
+                                .expect("generated function call item id is valid"),
+                            })
+                        }
+                        rho_core::ToolType::Custom => {
+                            Box::new(rho_inference::OpenAiResponsesProviderData::CustomToolCall {
+                                item_id: rho_core::ProviderResponseItemId::try_from(format!(
+                                    "ctc_{}",
+                                    id.as_str()
+                                ))
+                                .expect("generated custom tool call item id is valid"),
+                            })
+                        }
+                    },
+                    id,
+                    name,
+                    tool_type,
+                    arguments,
                 },
-                delivery: MessageDelivery::Immediate,
-            }),
-            Shadow::CompactionTriggered => AgentEvent::Queued(QueuedItem {
-                kind: QueuedItemKind::Compaction,
-                delivery: MessageDelivery::Immediate,
-            }),
-            Shadow::InferenceResponse {
-                items,
-                provider_response_id,
-                context_used,
-            } => AgentEvent::InferenceResponse {
-                items: Cow::Owned(items),
-                provider_response_id,
-                context_used,
-            },
-            Shadow::ToolResult { result } => AgentEvent::ToolResult {
-                result: Cow::Owned(result),
-            },
-            Shadow::Queued(item) => AgentEvent::Queued(item),
-            Shadow::Dequeued { boundary } => AgentEvent::Dequeued { boundary },
-            Shadow::QueueCleared => AgentEvent::QueueCleared,
-        })
+                ProviderSpecificMigrationItem::EncryptedReasoning { payload, summary } => {
+                    let item = migration_raw_item(payload);
+                    InferenceResponseItem::EncryptedReasoning {
+                        provider_specific: Box::new(
+                            rho_inference::OpenAiResponsesProviderData::Reasoning {
+                                item_id: item["id"]
+                                    .as_str()
+                                    .and_then(|id| {
+                                        rho_core::ProviderResponseItemId::try_from(id).ok()
+                                    })
+                                    .unwrap_or_else(|| migrated_item_id("rs", &item.to_string())),
+                                encrypted_content: item["encrypted_content"]
+                                    .as_str()
+                                    .map(str::to_owned),
+                            },
+                        ),
+                        summary,
+                    }
+                }
+                ProviderSpecificMigrationItem::RawReasoning { content, summary } => {
+                    let item = serde_json::json!({
+                        "type": "reasoning",
+                        "content": content.clone(),
+                        "summary": summary.clone(),
+                    });
+                    InferenceResponseItem::RawReasoning {
+                        provider_specific: Box::new(
+                            rho_inference::OpenAiResponsesProviderData::Reasoning {
+                                item_id: migrated_item_id("rs", &item.to_string()),
+                                encrypted_content: None,
+                            },
+                        ),
+                        content,
+                        summary,
+                    }
+                }
+                ProviderSpecificMigrationItem::Compaction(payload) => {
+                    let item = migration_raw_item(payload);
+                    InferenceResponseItem::Compaction {
+                        provider_specific: Box::new(
+                            rho_inference::OpenAiResponsesProviderData::Compaction {
+                                item_id: item["id"]
+                                    .as_str()
+                                    .and_then(|id| {
+                                        rho_core::ProviderResponseItemId::try_from(id).ok()
+                                    })
+                                    .unwrap_or_else(|| migrated_item_id("cmp", &item.to_string())),
+                            },
+                        ),
+                    }
+                }
+                ProviderSpecificMigrationItem::Unknown(payload) => InferenceResponseItem::Unknown {
+                    provider_specific: Box::new(rho_core::UnknownProviderSpecificData {
+                        tag: migration_raw_item(payload)["type"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                    }),
+                },
+            }
+        }
+
+        fn current_event(event: CurrentShadow) -> AgentEvent<'static> {
+            match event {
+                CurrentShadow::InferenceResponse {
+                    items,
+                    provider_response_id,
+                    context_used,
+                } => AgentEvent::InferenceResponse {
+                    items: Cow::Owned(items),
+                    provider_response_id,
+                    context_used,
+                },
+                CurrentShadow::ToolResult { result } => AgentEvent::ToolResult {
+                    result: Cow::Owned(result),
+                },
+                CurrentShadow::Queued(item) => AgentEvent::Queued(item),
+                CurrentShadow::Dequeued { boundary } => AgentEvent::Dequeued { boundary },
+                CurrentShadow::QueueCleared => AgentEvent::QueueCleared,
+            }
+        }
+
+        fn migration_event(event: MigrationShadow) -> AgentEvent<'static> {
+            match event {
+                MigrationShadow::UserMessage { content } => AgentEvent::Queued(QueuedItem {
+                    kind: QueuedItemKind::UserMessage {
+                        sender: MessageSender::User,
+                        content: Arc::new(content),
+                    },
+                    delivery: MessageDelivery::Immediate,
+                }),
+                MigrationShadow::CompactionTriggered => AgentEvent::Queued(QueuedItem {
+                    kind: QueuedItemKind::Compaction,
+                    delivery: MessageDelivery::Immediate,
+                }),
+                MigrationShadow::InferenceResponse {
+                    items,
+                    provider_response_id,
+                    context_used,
+                } => AgentEvent::InferenceResponse {
+                    items: Cow::Owned(items.into_iter().map(migrate_item).collect()),
+                    provider_response_id,
+                    context_used,
+                },
+                MigrationShadow::ToolResult { result } => AgentEvent::ToolResult {
+                    result: Cow::Owned(result),
+                },
+                MigrationShadow::Queued(item) => AgentEvent::Queued(item),
+                MigrationShadow::Dequeued { boundary } => AgentEvent::Dequeued { boundary },
+                MigrationShadow::QueueCleared => AgentEvent::QueueCleared,
+            }
+        }
+
+        let bytes = reader.copy_to_bytes(reader.remaining());
+        let mut current = bytes.clone();
+        if let Ok(event) = CurrentShadow::decode(&mut current) {
+            if current.remaining() == 0 {
+                return Ok(current_event(event));
+            }
+        }
+
+        let mut migration = bytes;
+        MigrationShadow::decode(&mut migration).map(migration_event)
     }
 }
 
@@ -352,6 +575,7 @@ fn restore_events(events: Vec<AgentEvent<'static>>) -> RestoredAgent {
                             name,
                             tool_type,
                             arguments,
+                            ..
                         } => Some(ToolCall {
                             id: id.clone(),
                             name: name.clone(),
@@ -1082,6 +1306,7 @@ impl AgentLoop {
                                             name,
                                             tool_type,
                                             arguments,
+                                            ..
                                         } => Some(ToolCall {
                                             id: id.clone(),
                                             name: name.clone(),
@@ -1467,7 +1692,7 @@ fn final_answer_text(items: &[InferenceResponseItem]) -> String {
         items
             .iter()
             .filter_map(|item| match item {
-                InferenceResponseItem::AssistantMessage { content, phase }
+                InferenceResponseItem::AssistantMessage { content, phase, .. }
                     if !want_final || *phase == Some(rho_core::MessagePhase::FinalAnswer) =>
                 {
                     Some(content.iter().filter_map(|part| match part {
@@ -1520,6 +1745,21 @@ mod tests {
     use super::*;
     use crate::db::AgentIdDomain;
 
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    struct AgentTestProviderSpecificData {
+        item_id: String,
+    }
+
+    impl senax_encoder::TaggedSenax for AgentTestProviderSpecificData {
+        const TAG: &'static str = "rho-agent-test.provider-data";
+    }
+
+    fn test_provider_specific_data() -> Box<dyn rho_core::ProviderSpecificData> {
+        Box::new(AgentTestProviderSpecificData {
+            item_id: "agent_test_item".to_owned(),
+        })
+    }
+
     fn agent_id(counter: u64) -> AgentId {
         AgentId::from_counter(counter, &AgentIdDomain(7)).expect("counter fits")
     }
@@ -1554,6 +1794,7 @@ mod tests {
 
     fn tool_call(id: &str) -> InferenceResponseItem {
         InferenceResponseItem::ToolCall {
+            provider_specific: test_provider_specific_data(),
             id: ToolCallId::try_from(id).unwrap(),
             name: ToolName::try_from("shell_command").unwrap(),
             tool_type: rho_core::ToolType::Function,

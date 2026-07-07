@@ -6,10 +6,11 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use rho_core::{
     AppendString, ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
-    InferenceResponseItem, MessagePhase, OpaqueProviderData, ProviderResponseId,
-    StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolFormat, ToolGrammarSyntax,
-    ToolName, ToolResult, ToolSpec, ToolType, text_content,
+    InferenceResponseItem, MessagePhase, ProviderResponseId, ProviderResponseItemId,
+    ProviderSpecificData, StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolFormat,
+    ToolGrammarSyntax, ToolName, ToolResult, ToolSpec, ToolType, text_content,
 };
+use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -17,6 +18,47 @@ use super::InferenceSession;
 use super::session::{
     AutoCompaction, ReasoningContext, ResponsesEffort, ServiceTier, TextVerbosity,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum OpenAiResponsesProviderData {
+    Message {
+        item_id: ProviderResponseItemId,
+    },
+    FunctionCall {
+        item_id: ProviderResponseItemId,
+    },
+    CustomToolCall {
+        item_id: ProviderResponseItemId,
+    },
+    Reasoning {
+        item_id: ProviderResponseItemId,
+        encrypted_content: Option<String>,
+    },
+    Compaction {
+        item_id: ProviderResponseItemId,
+    },
+}
+
+impl senax_encoder::TaggedSenax for OpenAiResponsesProviderData {
+    const TAG: &'static str = "openai.responses.item";
+}
+
+senax_encoder::__private::inventory::submit! {
+    rho_core::__SenaxProviderSpecificDataEntry::new(
+        OpenAiResponsesProviderData::TAG,
+        |mut body: bytes::Bytes| -> senax_encoder::Result<Box<dyn ProviderSpecificData>> {
+            use bytes::Buf as _;
+            let value = OpenAiResponsesProviderData::decode(&mut body)?;
+            if body.remaining() != 0 {
+                return Err(senax_encoder::EncoderError::Decode(format!(
+                    "Trailing bytes while decoding OpenAI Responses provider data: {}",
+                    body.remaining()
+                )));
+            }
+            Ok(Box::new(value))
+        },
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ResponsesRequest {
@@ -83,7 +125,7 @@ impl ResponsesRequest {
 
                 let has_compaction = items
                     .iter()
-                    .any(|item| matches!(item, InferenceResponseItem::Compaction(_)));
+                    .any(|item| matches!(item, InferenceResponseItem::Compaction { .. }));
 
                 if has_compaction {
                     previous_response = None;
@@ -247,45 +289,153 @@ fn convert_timeline_item(item: WireTimelineItem, out: &mut Vec<Value>) {
 
 fn convert_response_item(item: InferenceResponseItem, out: &mut Vec<Value>) {
     match item {
-        InferenceResponseItem::AssistantMessage { content, phase } => {
-            convert_assistant_message(&content, phase, out);
+        InferenceResponseItem::AssistantMessage {
+            provider_specific,
+            content,
+            phase,
+        } => {
+            if let Some(OpenAiResponsesProviderData::Message { item_id }) = provider_specific
+                .as_any()
+                .downcast_ref::<OpenAiResponsesProviderData>()
+            {
+                let mut item = assistant_message_value(&content, phase);
+                item["id"] = json!(item_id.as_str());
+                out.push(item);
+            } else {
+                convert_assistant_message(&content, phase, out);
+            }
         }
         InferenceResponseItem::ToolCall {
+            provider_specific,
             id,
             name,
             tool_type,
             arguments,
-        } => convert_tool_call(
-            ToolCall {
-                id,
-                name,
-                tool_type,
-                arguments,
-            },
-            out,
-        ),
-        InferenceResponseItem::EncryptedReasoning { payload, .. } => push_opaque(payload, out),
+        } => {
+            if let Some(data) = provider_specific
+                .as_any()
+                .downcast_ref::<OpenAiResponsesProviderData>()
+            {
+                match (data, tool_type) {
+                    (OpenAiResponsesProviderData::FunctionCall { item_id }, ToolType::Function)
+                    | (OpenAiResponsesProviderData::CustomToolCall { item_id }, ToolType::Custom) => {
+                        convert_tool_call_with_item_id(
+                            ToolCall {
+                                id,
+                                name,
+                                tool_type,
+                                arguments,
+                            },
+                            item_id,
+                            out,
+                        )
+                    }
+                    _ => convert_tool_call(
+                        ToolCall {
+                            id,
+                            name,
+                            tool_type,
+                            arguments,
+                        },
+                        out,
+                    ),
+                }
+            } else {
+                convert_tool_call(
+                    ToolCall {
+                        id,
+                        name,
+                        tool_type,
+                        arguments,
+                    },
+                    out,
+                );
+            }
+        }
+        InferenceResponseItem::EncryptedReasoning {
+            provider_specific, ..
+        }
+        | InferenceResponseItem::Compaction {
+            provider_specific, ..
+        }
+        | InferenceResponseItem::Unknown {
+            provider_specific, ..
+        } => {
+            push_provider_specific(provider_specific, out);
+        }
         InferenceResponseItem::RawReasoning { .. } => {}
-        InferenceResponseItem::Compaction(opaque) => push_opaque(opaque, out),
-        InferenceResponseItem::Unknown(_) => {}
     }
 }
 
-fn push_opaque(opaque: OpaqueProviderData, out: &mut Vec<Value>) {
-    if let Ok(value) = serde_json::from_str::<Value>(&opaque.data) {
-        out.push(value);
+fn push_provider_specific(
+    provider_specific: Box<dyn ProviderSpecificData>,
+    out: &mut Vec<Value>,
+) -> bool {
+    let Some(data) = provider_specific
+        .as_any()
+        .downcast_ref::<OpenAiResponsesProviderData>()
+    else {
+        return false;
+    };
+    match data {
+        OpenAiResponsesProviderData::Reasoning {
+            item_id,
+            encrypted_content: Some(encrypted_content),
+        } => out.push(json!({
+            "type": "reasoning",
+            "id": item_id.as_str(),
+            "encrypted_content": encrypted_content,
+        })),
+        OpenAiResponsesProviderData::Compaction { item_id } => out.push(json!({
+            "type": "compaction",
+            "id": item_id.as_str(),
+        })),
+        _ => return false,
     }
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn openai_provider_specific_data(
+    provider_specific: &dyn ProviderSpecificData,
+) -> Option<&OpenAiResponsesProviderData> {
+    provider_specific
+        .as_any()
+        .downcast_ref::<OpenAiResponsesProviderData>()
 }
 
 fn convert_tool_call(call: ToolCall, out: &mut Vec<Value>) {
+    let item_id = if call.id.as_str().starts_with(match call.tool_type {
+        ToolType::Function => "fc_",
+        ToolType::Custom => "ctc_",
+    }) {
+        ProviderResponseItemId::try_from(call.id.as_str()).ok()
+    } else {
+        None
+    };
+    convert_tool_call_with_optional_item_id(call, item_id.as_ref(), out)
+}
+
+fn convert_tool_call_with_item_id(
+    call: ToolCall,
+    item_id: &ProviderResponseItemId,
+    out: &mut Vec<Value>,
+) {
+    convert_tool_call_with_optional_item_id(call, Some(item_id), out)
+}
+
+fn convert_tool_call_with_optional_item_id(
+    call: ToolCall,
+    item_id: Option<&ProviderResponseItemId>,
+    out: &mut Vec<Value>,
+) {
     let call_id = call.id.as_str();
     match call.tool_type {
         ToolType::Function => {
-            let id = if call_id.starts_with("fc_") {
-                call_id.to_owned()
-            } else {
-                format!("fc_{call_id}")
-            };
+            let id = item_id
+                .map(ProviderResponseItemId::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("fc_{call_id}"));
             out.push(json!({
                 "type": "function_call",
                 "id": id,
@@ -295,11 +445,10 @@ fn convert_tool_call(call: ToolCall, out: &mut Vec<Value>) {
             }));
         }
         ToolType::Custom => {
-            let id = if call_id.starts_with("ctc_") {
-                call_id.to_owned()
-            } else {
-                format!("ctc_{call_id}")
-            };
+            let id = item_id
+                .map(ProviderResponseItemId::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("ctc_{call_id}"));
             out.push(json!({
                 "type": "custom_tool_call",
                 "id": id,
@@ -326,6 +475,10 @@ fn convert_assistant_message(
     phase: Option<MessagePhase>,
     out: &mut Vec<Value>,
 ) {
+    out.push(assistant_message_value(content, phase));
+}
+
+fn assistant_message_value(content: &[ContentPart], phase: Option<MessagePhase>) -> Value {
     let mut item = json!({
         "type": "message",
         "role": "assistant",
@@ -338,7 +491,7 @@ fn convert_assistant_message(
     item["phase"] = json!(message_phase_wire(
         phase.unwrap_or(MessagePhase::FinalAnswer)
     ));
-    out.push(item);
+    item
 }
 
 fn message_phase_wire(phase: MessagePhase) -> &'static str {
@@ -409,7 +562,7 @@ fn trim_before_latest_compaction(timeline: &[WireTimelineItem]) -> &[WireTimelin
         .rposition(|item| {
             matches!(
                 item,
-                WireTimelineItem::ResponseItem(InferenceResponseItem::Compaction(_))
+                WireTimelineItem::ResponseItem(InferenceResponseItem::Compaction { .. })
             )
         })
         .map_or(timeline, |index| &timeline[index..])
@@ -431,48 +584,67 @@ pub(crate) struct ResponseState {
 /// growing [`AppendString`] buffers each snapshot is taken from.
 enum ItemBuilder {
     Message {
+        provider_specific: Box<dyn ProviderSpecificData>,
         phase: Option<MessagePhase>,
         content: Vec<AppendString>,
     },
     ToolCall {
+        provider_specific: Box<dyn ProviderSpecificData>,
         id: ToolCallId,
         name: ToolName,
         tool_type: ToolType,
         arguments: AppendString,
     },
     Reasoning {
+        provider_specific: Box<dyn ProviderSpecificData>,
         content: Option<AppendString>,
         summary: Vec<AppendString>,
     },
-    Compaction,
+    Compaction {
+        provider_specific: Box<dyn ProviderSpecificData>,
+    },
 }
 
 impl ItemBuilder {
     fn snapshot(&self) -> StreamingContextItem {
         match self {
-            ItemBuilder::Message { phase, content } => StreamingContextItem::AssistantMessage {
+            ItemBuilder::Message {
+                provider_specific,
+                phase,
+                content,
+            } => StreamingContextItem::AssistantMessage {
+                provider_specific: provider_specific.clone(),
                 content: content.iter().map(AppendString::snapshot).collect(),
                 phase: *phase,
             },
             ItemBuilder::ToolCall {
+                provider_specific,
                 id,
                 name,
                 tool_type,
                 arguments,
             } => StreamingContextItem::ToolCall {
+                provider_specific: provider_specific.clone(),
                 id: id.clone(),
                 name: name.clone(),
                 tool_type: *tool_type,
                 arguments: arguments.snapshot(),
             },
-            ItemBuilder::Reasoning { content, summary } => StreamingContextItem::RawReasoning {
+            ItemBuilder::Reasoning {
+                provider_specific,
+                content,
+                summary,
+            } => StreamingContextItem::RawReasoning {
+                provider_specific: provider_specific.clone(),
                 content: content
                     .as_ref()
                     .map(AppendString::snapshot)
                     .unwrap_or_else(|| AppendString::new().snapshot()),
                 summary: summary.iter().map(AppendString::snapshot).collect(),
             },
-            ItemBuilder::Compaction => StreamingContextItem::Compaction(None),
+            ItemBuilder::Compaction { provider_specific } => StreamingContextItem::Compaction {
+                provider_specific: provider_specific.clone(),
+            },
         }
     }
 }
@@ -626,6 +798,36 @@ impl ResponseState {
             self.emit_update(index, updates);
         }
 
+        match item["type"].as_str().unwrap_or_default() {
+            "message" => {
+                if let Some(ItemBuilder::Message {
+                    provider_specific, ..
+                }) = self.builder_mut(index)
+                {
+                    *provider_specific = Box::new(openai_provider_data_from_item(item));
+                    self.emit_update(index, updates);
+                }
+            }
+            "function_call" | "custom_tool_call" => {
+                if let Some(ItemBuilder::ToolCall {
+                    provider_specific, ..
+                }) = self.builder_mut(index)
+                {
+                    *provider_specific = Box::new(openai_provider_data_from_item(item));
+                    self.emit_update(index, updates);
+                }
+            }
+            "reasoning" => {
+                if let Some(ItemBuilder::Reasoning {
+                    provider_specific, ..
+                }) = self.builder_mut(index)
+                {
+                    *provider_specific = Box::new(openai_provider_data_from_item(item));
+                }
+            }
+            _ => {}
+        }
+
         let terminal = match item["type"].as_str().unwrap_or_default() {
             "message" | "function_call" | "custom_tool_call" => None,
             "reasoning" if item["encrypted_content"].is_string() => {
@@ -636,16 +838,15 @@ impl ResponseState {
                     _ => Vec::new(),
                 };
                 Some(StreamingContextItem::EncryptedReasoning {
-                    payload: opaque_from_item("reasoning", item),
+                    provider_specific: Box::new(openai_provider_data_from_item(item)),
                     summary,
                 })
             }
             "reasoning" => None,
-            "compaction" => Some(StreamingContextItem::Compaction(Some(opaque_from_item(
-                "compaction",
-                item,
-            )))),
-            other => Some(StreamingContextItem::Unknown(opaque_from_item(other, item))),
+            "compaction" => Some(StreamingContextItem::Compaction {
+                provider_specific: Box::new(openai_provider_data_from_item(item)),
+            }),
+            _other => None,
         };
         if let Some(snapshot) = terminal {
             updates.push(InferenceEvent::ContextItem {
@@ -664,6 +865,30 @@ fn output_index(event: &Value) -> usize {
     event["output_index"].as_u64().unwrap_or(0) as usize
 }
 
+fn openai_item_id(item: &Value) -> ProviderResponseItemId {
+    ProviderResponseItemId::try_from(
+        item["id"]
+            .as_str()
+            .expect("OpenAI output item missing required id"),
+    )
+    .expect("OpenAI output item has invalid id")
+}
+
+fn openai_provider_data_from_item(item: &Value) -> OpenAiResponsesProviderData {
+    let item_id = openai_item_id(item);
+    match item["type"].as_str().unwrap_or_default() {
+        "message" => OpenAiResponsesProviderData::Message { item_id },
+        "function_call" => OpenAiResponsesProviderData::FunctionCall { item_id },
+        "custom_tool_call" => OpenAiResponsesProviderData::CustomToolCall { item_id },
+        "reasoning" => OpenAiResponsesProviderData::Reasoning {
+            item_id,
+            encrypted_content: item["encrypted_content"].as_str().map(str::to_owned),
+        },
+        "compaction" => OpenAiResponsesProviderData::Compaction { item_id },
+        other => panic!("unexpected OpenAI output item type: {other}"),
+    }
+}
+
 /// Appends `delta` to the `part`th buffer, growing the vec with empty buffers
 /// to cover any skipped indices.
 fn push_part(parts: &mut Vec<AppendString>, part: usize, delta: &str) {
@@ -680,16 +905,20 @@ fn push_part(parts: &mut Vec<AppendString>, part: usize, delta: &str) {
 fn builder_from_added(item: &Value) -> Result<Option<ItemBuilder>> {
     let builder = match item["type"].as_str().unwrap_or_default() {
         "message" => ItemBuilder::Message {
+            provider_specific: Box::new(openai_provider_data_from_item(item)),
             phase: message_phase_from_output_item(item),
             content: Vec::new(),
         },
         "function_call" => tool_call_builder(item, ToolType::Function)?,
         "custom_tool_call" => tool_call_builder(item, ToolType::Custom)?,
         "reasoning" => ItemBuilder::Reasoning {
+            provider_specific: Box::new(openai_provider_data_from_item(item)),
             content: None,
             summary: Vec::new(),
         },
-        "compaction" => ItemBuilder::Compaction,
+        "compaction" => ItemBuilder::Compaction {
+            provider_specific: Box::new(openai_provider_data_from_item(item)),
+        },
         _ => return Ok(None),
     };
     Ok(Some(builder))
@@ -697,19 +926,12 @@ fn builder_from_added(item: &Value) -> Result<Option<ItemBuilder>> {
 
 fn tool_call_builder(item: &Value, tool_type: ToolType) -> Result<ItemBuilder> {
     Ok(ItemBuilder::ToolCall {
+        provider_specific: Box::new(openai_provider_data_from_item(item)),
         id: ToolCallId::try_from(item["call_id"].as_str().unwrap_or_default())?,
         name: ToolName::try_from(item["name"].as_str().unwrap_or_default())?,
         tool_type,
         arguments: AppendString::new(),
     })
-}
-
-/// Captures a whole wire item verbatim so it can be replayed byte-for-byte.
-fn opaque_from_item(tag: &str, item: &Value) -> OpaqueProviderData {
-    OpaqueProviderData {
-        tag: tag.into(),
-        data: item.to_string().into(),
-    }
 }
 
 fn message_phase_from_output_item(item: &Value) -> Option<MessagePhase> {

@@ -75,6 +75,7 @@ pub use senax_encoder_derive::{Decode, Encode, Pack, Unpack};
 
 #[doc(hidden)]
 pub mod __private {
+    pub use inventory;
     pub use paste;
 }
 
@@ -380,11 +381,13 @@ macro_rules! declare_senax_tagged_trait {
                     writer: &mut bytes::BytesMut,
                 ) -> $crate::Result<()>;
                 fn as_any(&self) -> &dyn std::any::Any;
+                fn clone_box(&self) -> Box<dyn $trait_name>;
+                fn dyn_eq(&self, other: &dyn $trait_name) -> bool;
             }
 
             impl<T> $trait_name for T
             where
-                T: $crate::TaggedSenax + std::fmt::Debug + Send + Sync + 'static,
+                T: $crate::TaggedSenax + Clone + PartialEq + std::fmt::Debug + Send + Sync + 'static,
             {
                 fn tag(&self) -> &str {
                     <T as $crate::TaggedSenax>::TAG
@@ -399,6 +402,14 @@ macro_rules! declare_senax_tagged_trait {
 
                 fn as_any(&self) -> &dyn std::any::Any {
                     self
+                }
+
+                fn clone_box(&self) -> Box<dyn $trait_name> {
+                    Box::new(self.clone())
+                }
+
+                fn dyn_eq(&self, other: &dyn $trait_name) -> bool {
+                    other.as_any().downcast_ref::<T>() == Some(self)
                 }
             }
 
@@ -422,6 +433,14 @@ macro_rules! declare_senax_tagged_trait {
                 fn as_any(&self) -> &dyn std::any::Any {
                     self
                 }
+
+                fn clone_box(&self) -> Box<dyn $trait_name> {
+                    Box::new(self.clone())
+                }
+
+                fn dyn_eq(&self, other: &dyn $trait_name) -> bool {
+                    other.as_any().downcast_ref::<Self>() == Some(self)
+                }
             }
 
             #[doc(hidden)]
@@ -439,7 +458,7 @@ macro_rules! declare_senax_tagged_trait {
                 }
             }
 
-            inventory::collect!([<__Senax $trait_name Entry>]);
+            $crate::__private::inventory::collect!([<__Senax $trait_name Entry>]);
 
             impl $crate::Encoder for Box<dyn $trait_name> {
                 fn encode(&self, writer: &mut bytes::BytesMut) -> $crate::Result<()> {
@@ -451,6 +470,18 @@ macro_rules! declare_senax_tagged_trait {
 
                 fn is_default(&self) -> bool {
                     false
+                }
+            }
+
+            impl Clone for Box<dyn $trait_name> {
+                fn clone(&self) -> Self {
+                    self.clone_box()
+                }
+            }
+
+            impl PartialEq for Box<dyn $trait_name> {
+                fn eq(&self, other: &Self) -> bool {
+                    self.dyn_eq(&**other)
                 }
             }
 
@@ -484,7 +515,7 @@ macro_rules! register_senax_tagged {
         }
 
         $crate::__private::paste::paste! {
-            inventory::submit! {
+            $crate::__private::inventory::submit! {
                 [<__Senax $trait_name Entry>]::new(
                     $tag,
                     |mut body: bytes::Bytes| -> $crate::Result<Box<dyn $trait_name>> {

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 bytes = "1"
+inventory = "0.3"
 prefix-id = { workspace = true, default-features = false }
 senax-encoder = { workspace = true, features = ["serde_json"] }
 serde = { workspace = true, features = ["rc"] }
