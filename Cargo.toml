@@ -12,10 +12,10 @@ members = [
   "crates/rho-core",
   "crates/rho-daemon",
   "crates/rho-db",
+  "crates/rho-context-config",
   "crates/rho-gui",
   "crates/rho-iroh-auth",
   "crates/rho-inference",
-  "crates/rho-skills",
   "crates/rho-term-screen",
   "crates/rho-tool-shell",
   "crates/rho-ui-proto",
@@ -67,9 +67,9 @@ rho-commands = { path = "crates/rho-commands" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
+rho-context-config = { path = "crates/rho-context-config" }
 rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
-rho-skills = { path = "crates/rho-skills" }
 rho-term-screen = { path = "crates/rho-term-screen" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }

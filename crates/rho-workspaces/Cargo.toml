@@ -11,7 +11,7 @@ anyhow.workspace = true
 bytes = "1"
 camino.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
-rho-skills.workspace = true
+rho-context-config.workspace = true
 rustix = { version = "1", features = ["fs", "mount", "process", "thread"] }
 senax-encoder.workspace = true
 tokio.workspace = true

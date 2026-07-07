@@ -220,7 +220,7 @@ impl Repo {
             repo: Arc::clone(self),
             slot,
             mnt_ns: OnceCell::new(),
-            skills: OnceLock::new(),
+            context_config: OnceLock::new(),
         });
         self.workspaces
             .lock()
@@ -335,7 +335,7 @@ pub struct Workspace {
     repo: Arc<Repo>,
     slot: Utf8PathBuf,
     mnt_ns: OnceCell<OwnedFd>,
-    skills: OnceLock<Arc<rho_skills::DiscoveredSkills>>,
+    context_config: OnceLock<Arc<rho_context_config::DiscoveredContext>>,
 }
 
 impl Workspace {
@@ -353,11 +353,13 @@ impl Workspace {
         self.repo.root()
     }
 
-    pub fn discovered_skills(&self) -> Arc<rho_skills::DiscoveredSkills> {
-        Arc::clone(
-            self.skills
-                .get_or_init(|| Arc::new(rho_skills::discover_for_repo(self.repo().as_std_path()))),
-        )
+    pub fn discovered_context(&self) -> Arc<rho_context_config::DiscoveredContext> {
+        Arc::clone(self.context_config.get_or_init(|| {
+            Arc::new(rho_context_config::DiscoveredContext::discover(
+                self.repo(),
+                self.slot(),
+            ))
+        }))
     }
 
     /// The checkout directory in the daemon/host namespace. In-process file

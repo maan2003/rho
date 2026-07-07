@@ -20,7 +20,7 @@ rho-claude.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
-rho-skills.workspace = true
+rho-context-config.workspace = true
 rho-tool-shell.workspace = true
 rho-workspaces.workspace = true
 senax-encoder = { workspace = true, features = ["uuid"] }

@@ -10,16 +10,17 @@ pub fn prompt(
     parent: Option<AgentId>,
 ) -> Arc<str> {
     let working_directory = workspace.repo();
-    let skills = workspace.discovered_skills();
-    for diagnostic in &skills.diagnostics {
+    let context = workspace.discovered_context();
+    for diagnostic in &context.diagnostics {
         eprintln!(
-            "rho-agent: skill {:?}: {}: {}",
+            "rho-agent: context config {:?}: {}: {}",
             diagnostic.kind,
             diagnostic.path.display(),
             diagnostic.message
         );
     }
-    let skills = render_skills_prompt(&skills.skills).unwrap_or_default();
+    let agents_md = render_agents_md_prompt(&context.agents_files).unwrap_or_default();
+    let skills = render_skills_prompt(&context.skills).unwrap_or_default();
     let multi_agent = agent_id.map_or_else(String::new, |id| {
         let agent_id = format!("ag-{}", id.encoded());
         let role = match parent {
@@ -71,7 +72,7 @@ tightly coupled work yourself.
         )
     });
     format!(
-        "{BASE_PROMPT}{skills}{multi_agent}## Environment
+        "{BASE_PROMPT}{agents_md}{skills}{multi_agent}## Environment
 
 Working directory: {}
 
@@ -83,7 +84,28 @@ within it unless the user points you elsewhere.
     .into()
 }
 
-fn render_skills_prompt(skills: &[rho_skills::Skill]) -> Option<String> {
+fn render_agents_md_prompt(files: &[rho_context_config::AgentsFile]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str("## AGENTS.md instructions\n");
+    out.push_str("The following instructions were loaded from AGENTS.md files. They are user/project instructions: follow them unless they conflict with higher-priority system or developer instructions. More specific files appear later and usually override broader ones.\n\n");
+    for file in files {
+        out.push_str("<AGENTS_FILE path=\"");
+        out.push_str(file.file_path.as_str());
+        out.push_str("\">\n");
+        out.push_str(&file.content);
+        if !file.content.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("</AGENTS_FILE>\n\n");
+    }
+    Some(out)
+}
+
+fn render_skills_prompt(skills: &[rho_context_config::Skill]) -> Option<String> {
     let mut skills = skills.iter().collect::<Vec<_>>();
     skills.sort_by(|left, right| left.name.cmp(&right.name));
     if skills.is_empty() {
@@ -194,7 +216,7 @@ Before finalizing after an interrupt or context compaction, verify your answer a
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
-    use rho_skills::Skill;
+    use rho_context_config::{AgentsFile, Skill};
 
     use super::*;
 
@@ -206,6 +228,13 @@ mod tests {
         }
     }
 
+    fn agents_file(path: &str, content: &str) -> AgentsFile {
+        AgentsFile {
+            file_path: Utf8PathBuf::from(path),
+            content: content.to_owned(),
+        }
+    }
+
     #[test]
     fn renders_big_skill_guidance_with_file_paths() {
         let prompt = render_skills_prompt(&[skill("demo", "Demo skill")]).unwrap();
@@ -213,5 +242,17 @@ mod tests {
         assert!(prompt.contains("If a skill exists for a task, you must do it"));
         assert!(prompt.contains("- demo: Demo skill (file: /repo/.agents/skills/demo/SKILL.md)"));
         assert!(prompt.contains("open and read its SKILL.md file"));
+    }
+
+    #[test]
+    fn renders_agents_md_guidance_with_file_boundaries() {
+        let prompt =
+            render_agents_md_prompt(&[agents_file("/repo/AGENTS.md", "Read the docs.")]).unwrap();
+        assert!(prompt.contains("## AGENTS.md instructions"));
+        assert!(
+            prompt
+                .contains("<AGENTS_FILE path=\"/repo/AGENTS.md\">\nRead the docs.\n</AGENTS_FILE>")
+        );
+        assert!(prompt.contains("follow them unless they conflict"));
     }
 }

@@ -18,9 +18,9 @@ AI APIs.
   transcripts.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
   explicit user-facing capabilities.
-- Local/project Markdown skills are trusted prompt input when discovered or
-  explicitly invoked. Treat them like AGENTS.md-style instructions: useful local
-  guidance, not a sandbox or permission boundary.
+- User/repo `AGENTS.md` files and local/project Markdown skills are trusted
+  prompt input when discovered. Treat them as useful local guidance, not a
+  sandbox or permission boundary.
 
 ## Runtime assumptions
 
@@ -58,6 +58,17 @@ AI APIs.
   every 25 seconds, and the smoke binary bounds its whole run by a
   per-event timeout.
 
+## AGENTS.md
+
+Rho loads `AGENTS.md` instructions from user `~/.config/agents/AGENTS.md` and
+the workspace repo root `AGENTS.md`. These files are included in the agent
+prompt with explicit file boundaries. They are trusted prompt input and do not
+grant or restrict tool permissions.
+
+AGENTS.md reads are bounded to 32 KiB per file and truncated with a diagnostic.
+Rho follows symlinks with cycle detection for `AGENTS.md` files and does not
+load legacy `~/.agents`, `.agents.local`, or `AGENTS.*.md` variants.
+
 ## Skills
 
 Rho skills are local Markdown files discovered from project `.agents/skills`
@@ -66,10 +77,9 @@ file paths to the agent system prompt; the model reads the referenced files
 with normal shell tools when it needs their instructions.
 
 Discovery uses bounded 64 KiB reads and rejects a skill whose YAML frontmatter
-is truncated before the closing fence. Discovery follows
-symlinked roots/directories/files while tracking canonical directories to avoid
-cycles. Skill files are prompt input only; they do not restrict filesystem
-access or grant tools.
+is truncated before the closing fence. Discovery follows symlinks with cycle
+detection for roots/directories/files. Skill files are prompt input only; they
+do not restrict filesystem access or grant tools.
 
 ## Future review notes
 

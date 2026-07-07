@@ -15,10 +15,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   scheduling, streamed transcript handling, inference response block recording,
   and persistence hooks. It depends directly on the concrete `rho-inference`
   session.
-- `rho-skills` owns local Markdown skill discovery, frontmatter parsing,
-  and bounded skill-file metadata reads. Discovery is cached per
-  `rho-workspaces::Repo`; `rho-agent` owns system prompt rendering. Clients have
-  no special skill command path.
+- `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
+  skill discovery/frontmatter parsing. Results are cached per
+  `rho-workspaces::Workspace`; `rho-agent` owns system prompt rendering.
+  Clients have no special skill or AGENTS.md command path.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
   rendering. They should not own inference protocol details.
 - `rho-voice` is a provider-protocol crate outside the inference contract: it

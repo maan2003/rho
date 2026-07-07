@@ -23,8 +23,8 @@ are local edits to crates, structs, enums, futures, and streams.
   tool scheduling, persistence hooks, streamed transcript handling, and
   inference response block persistence while depending only on the core
   inference-service trait.
-- `rho-skills`: local Markdown skill discovery support shared by repo caches
-  and agent prompts.
+- `rho-context-config`: bounded `AGENTS.md` loading and local Markdown skill
+  discovery support shared by workspace caches and agent prompts.
 - `rho-cli`: an interactive terminal chat agent assembled from `rho-agent`, the
   inference service, shell/apply_patch tools, CBOR persistence, and copied Tau
   terminal rendering building blocks.
@@ -81,6 +81,10 @@ surface is intentionally small: `shell_command` and `apply_patch`.
 In the interactive chat UI, `Enter` sends the prompt, `Shift-Enter` or
 `Alt-Enter` inserts a newline, double `Ctrl-C` cancels the running response, and
 `Ctrl-D` exits from an empty prompt.
+
+Rho loads `AGENTS.md` instructions from user `~/.config/agents/AGENTS.md` and
+the workspace repo root `AGENTS.md`, then includes them in the agent prompt with
+file boundaries. User config instructions are listed before repo instructions.
 
 Rho discovers Markdown skills from project `.agents/skills` plus user
 `~/.config/agents/skills`. Skills are listed in the agent system prompt with

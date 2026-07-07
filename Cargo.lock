@@ -9715,10 +9715,10 @@ dependencies = [
  "redb",
  "redb-derive",
  "rho-claude",
+ "rho-context-config",
  "rho-core",
  "rho-db",
  "rho-inference",
- "rho-skills",
  "rho-tool-shell",
  "rho-workspaces",
  "senax-encoder",
@@ -9808,6 +9808,16 @@ version = "0.1.0"
 dependencies = [
  "camino",
  "rho-ui-proto",
+]
+
+[[package]]
+name = "rho-context-config"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "dirs",
+ "serde_yaml",
+ "tempfile",
 ]
 
 [[package]]
@@ -9934,16 +9944,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-skills"
-version = "0.1.0"
-dependencies = [
- "camino",
- "dirs",
- "serde_yaml",
- "tempfile",
-]
-
-[[package]]
 name = "rho-term-screen"
 version = "0.1.0"
 dependencies = [
@@ -10012,7 +10012,7 @@ dependencies = [
  "bytes",
  "camino",
  "prefix-id",
- "rho-skills",
+ "rho-context-config",
  "rustix 1.1.4",
  "senax-encoder",
  "tempfile",
