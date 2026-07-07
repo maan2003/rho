@@ -94,6 +94,9 @@ impl ClaudeCodeOptions {
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
             CLAUDE_CODE_AUTO_COMPACT_WINDOW,
         );
+        command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
+        command.env("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", "1");
+        command.env("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1");
         command.env_remove("NODE_OPTIONS");
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
