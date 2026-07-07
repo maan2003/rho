@@ -277,6 +277,15 @@ impl ChatApp {
                     self.term.handle.clone(),
                 ));
             }
+            rho_commands::Command::Compact => {
+                let Some(agent_id) = primary_agent_id(&self.agent) else {
+                    self.term.print_system(":compact: no agent yet");
+                    return Ok(true);
+                };
+                self.term.print_system("compacting context");
+                self.agent
+                    .compact_agent(agent_id, MessageDelivery::NextTurn);
+            }
             rho_commands::Command::AgentNew { working_directory } => {
                 let topic_id = self.agent.default_topic_id();
                 let Some(working_directory) =

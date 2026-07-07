@@ -192,6 +192,7 @@ impl ResponsesRequest {
 #[derive(Clone)]
 enum WireTimelineItem {
     UserMessage(Vec<ContentPart>),
+    CompactionTrigger,
     ToolResult(ToolResult),
     ResponseItem(InferenceResponseItem),
 }
@@ -200,6 +201,9 @@ fn append_block_items(block: &ContextBlock, out: &mut Vec<WireTimelineItem>) {
     match block {
         ContextBlock::UserMessage { content } => {
             out.push(WireTimelineItem::UserMessage(content.clone()));
+        }
+        ContextBlock::CompactionTrigger => {
+            out.push(WireTimelineItem::CompactionTrigger);
         }
         ContextBlock::ToolResults { results } => {
             out.extend(results.iter().cloned().map(WireTimelineItem::ToolResult));
@@ -213,6 +217,9 @@ fn append_block_items(block: &ContextBlock, out: &mut Vec<WireTimelineItem>) {
 fn convert_timeline_item(item: WireTimelineItem, out: &mut Vec<Value>) {
     match item {
         WireTimelineItem::UserMessage(content) => convert_user_message(&content, out),
+        WireTimelineItem::CompactionTrigger => out.push(json!({
+            "type": "compaction_trigger",
+        })),
         WireTimelineItem::ToolResult(result) => out.push(convert_tool_result(result)),
         WireTimelineItem::ResponseItem(item) => convert_response_item(item, out),
     }

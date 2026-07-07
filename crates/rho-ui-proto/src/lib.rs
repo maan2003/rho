@@ -87,6 +87,10 @@ pub enum ClientMessage {
         content: Vec<ContentPart>,
         delivery: MessageDelivery,
     },
+    CompactAgent {
+        agent_id: AgentId,
+        delivery: MessageDelivery,
+    },
     RenameAgent {
         agent_id: AgentId,
         name: String,

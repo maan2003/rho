@@ -395,6 +395,12 @@ impl AgentClient {
         });
     }
 
+    pub fn compact_agent(&self, agent_id: AgentId, delivery: MessageDelivery) {
+        let _ = self
+            .commands
+            .send(ClientMessage::CompactAgent { agent_id, delivery });
+    }
+
     pub fn cancel(&self, agent_id: AgentId) {
         let _ = self.commands.send(ClientMessage::CancelTurn { agent_id });
     }

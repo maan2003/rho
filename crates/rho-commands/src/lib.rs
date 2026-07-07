@@ -108,6 +108,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Continue an unfinished turn after daemon restart",
     },
     CommandSpec {
+        name: "compact",
+        usage: ":compact",
+        description: "Compact the current agent's context",
+    },
+    CommandSpec {
         name: "clear",
         usage: ":clear",
         description: "Clear rendered output",
@@ -173,6 +178,7 @@ pub enum Command {
         turns: u32,
     },
     Continue,
+    Compact,
 
     Quit,
     Clear,
@@ -247,6 +253,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
         "cancel" => Parsed::Command(Command::AgentCancel),
         "rewind" => parse_rewind(&mut tokens),
         "continue" => Parsed::Command(Command::Continue),
+        "compact" => Parsed::Command(Command::Compact),
         "quit" | "exit" => Parsed::Command(Command::Quit),
         "clear" => Parsed::Command(Command::Clear),
         "help" => Parsed::Command(Command::Help),

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
+use rho_agent::{AgentState, AgentStateKind, MessageDelivery, QueuedItem, QueuedItemKind};
 use rho_core::{
     ApplyPatchMetadata, ContextBlock, InferenceResponseItem, MessagePhase, StreamingContextItem,
     StreamingContextItemState, ToolFileStatus, ToolOutputStatus, ToolResultMetadata, UnixMs,
@@ -101,15 +101,21 @@ impl UiAgentState {
         let mut blocks = ui_blocks(&state.blocks);
         merge_active_tool_state(&mut blocks, &state.kind);
         blocks.extend(in_flight_blocks(&state.kind));
-        blocks.extend(
-            state
-                .queued_messages
-                .iter()
-                .map(|message| UiBlock::QueuedMessage {
-                    text: text_content(&message.content),
-                    delivery: message.delivery,
-                }),
-        );
+        blocks.extend(state.queued_inputs.iter().map(|input| match input {
+            QueuedItem {
+                kind: QueuedItemKind::UserMessage { content },
+                delivery,
+            } => UiBlock::QueuedMessage {
+                text: text_content(content),
+                delivery: *delivery,
+            },
+            QueuedItem {
+                kind: QueuedItemKind::Compaction,
+                ..
+            } => UiBlock::Notice {
+                text: "compacting context".to_owned(),
+            },
+        }));
         Self {
             blocks,
             status: ui_status(&state.kind),
@@ -514,6 +520,9 @@ fn ui_blocks(blocks: &[Arc<ContextBlock>]) -> Vec<UiBlock> {
             ContextBlock::UserMessage { content } => ui_blocks.push(UiBlock::UserMessage {
                 text: text_content(content),
             }),
+            ContextBlock::CompactionTrigger => ui_blocks.push(UiBlock::Notice {
+                text: "compacting context".to_owned(),
+            }),
             ContextBlock::InferenceResponse { items, .. } => {
                 ui_blocks.extend(items.iter().filter_map(ui_block_from_response_item));
             }
@@ -743,7 +752,7 @@ mod tests {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_messages: Vec::new(),
+            queued_inputs: Vec::new(),
             kind: AgentStateKind::ApiStreaming {
                 pending_response: PendingInferenceResponse {
                     items: vec![StreamingContextItemState::Pending(
@@ -780,7 +789,7 @@ mod tests {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_messages: Vec::new(),
+            queued_inputs: Vec::new(),
             kind: AgentStateKind::Error(FailedInferenceResponse {
                 partial_response: PendingInferenceResponse {
                     items: vec![StreamingContextItemState::Pending(
@@ -810,7 +819,7 @@ mod tests {
             })],
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_messages: Vec::new(),
+            queued_inputs: Vec::new(),
             kind: AgentStateKind::Idle,
             context_used: None,
         }
@@ -845,7 +854,7 @@ mod tests {
             ],
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_messages: Vec::new(),
+            queued_inputs: Vec::new(),
             kind: AgentStateKind::Idle,
             context_used: None,
         }
@@ -876,7 +885,7 @@ mod tests {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: Arc::from(""),
-            queued_messages: Vec::new(),
+            queued_inputs: Vec::new(),
             kind: AgentStateKind::ToolCalling {
                 previews,
                 results: Vec::new(),

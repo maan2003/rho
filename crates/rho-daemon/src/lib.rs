@@ -573,6 +573,19 @@ impl RunningAgent {
         }
     }
 
+    fn compact(&self, delivery: MessageDelivery) -> anyhow::Result<()> {
+        match self {
+            Self::Claude(agent) => {
+                agent.compact();
+                Ok(())
+            }
+            Self::Rho(agent) => {
+                agent.compact(delivery);
+                Ok(())
+            }
+        }
+    }
+
     fn cancel(&self) {
         match self {
             Self::Rho(agent) => agent.cancel(),
@@ -773,6 +786,14 @@ async fn handle_message(
             agents
                 .maybe_generate_title(agent_id, text, outgoing_tx.clone())
                 .await;
+            Ok(Refresh::None)
+        }
+        ClientMessage::CompactAgent { agent_id, delivery } => {
+            let agent = agents
+                .get(agent_id)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
+            agent.compact(delivery)?;
             Ok(Refresh::None)
         }
         ClientMessage::MoveAgent { agent_id, topic } => {

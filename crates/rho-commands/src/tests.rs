@@ -34,6 +34,7 @@ fn parses_agent_commands() {
         Some(Parsed::Command(Command::AgentCancel))
     );
     assert_eq!(parse(":continue"), Some(Parsed::Command(Command::Continue)));
+    assert_eq!(parse(":compact"), Some(Parsed::Command(Command::Compact)));
     assert_eq!(
         parse(":agent rename build fixer"),
         Some(Parsed::Command(Command::AgentRename {

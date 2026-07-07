@@ -594,6 +594,29 @@ impl Workspace {
                     ),
                 }
             }
+            Command::Compact => {
+                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
+                match target {
+                    Some(agent_id) => {
+                        self.connection.send(ClientMessage::CompactAgent {
+                            agent_id,
+                            delivery: rho_ui_proto::MessageDelivery::NextTurn,
+                        });
+                        self.notice_on(
+                            source_agent.as_ref(),
+                            "compacting context",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                    None => self.notice_on(
+                        None,
+                        ":compact: no agent selected",
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            }
             Command::AgentRename { name } => {
                 let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
                 match target {

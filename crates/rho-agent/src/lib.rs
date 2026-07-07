@@ -48,6 +48,7 @@ pub enum AgentEvent<'a> {
     ToolResult {
         result: Cow<'a, ToolResult>,
     },
+    CompactionTriggered,
 }
 
 /// Live runtime state of an agent turn.
@@ -63,11 +64,11 @@ pub struct AgentState {
     pub tool_specs: Arc<[ToolSpec]>,
     /// Invariant: immutable
     pub system_prompt: Arc<str>,
-    /// Messages waiting to enter model context. Not persisted: a queued
-    /// message only becomes an `AgentEvent::UserMessage` at delivery, so the
-    /// event log stays exactly what the model saw. Queued messages are lost
-    /// if the process dies before delivery.
-    pub queued_messages: Vec<QueuedUserMessage>,
+    /// Inputs waiting to enter model context. Not persisted: a queued input
+    /// only becomes an [`AgentEvent`] at delivery, so the event log stays
+    /// exactly what the model saw. Queued inputs are lost if the process dies
+    /// before delivery.
+    pub queued_inputs: Vec<QueuedItem>,
     pub kind: AgentStateKind,
     /// Tokens occupying the model's context window after the latest
     /// response (all input, cached or not, plus that response's output).
@@ -77,12 +78,18 @@ pub struct AgentState {
     pub context_used: Option<u64>,
 }
 
-/// A user message waiting in the agent's queue.
+/// One input waiting in the agent's queue.
 #[derive(Clone, Debug, PartialEq)]
-// content is Arc'd because the queue rides AgentState, which is cloned a lot
-pub struct QueuedUserMessage {
-    pub content: Arc<Vec<ContentPart>>,
+pub struct QueuedItem {
+    pub kind: QueuedItemKind,
     pub delivery: MessageDelivery,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum QueuedItemKind {
+    // content is Arc'd because the queue rides AgentState, which is cloned a lot
+    UserMessage { content: Arc<Vec<ContentPart>> },
+    Compaction,
 }
 
 /// When a message sent while the agent is busy enters model context.
@@ -159,6 +166,10 @@ fn restore_events(
                 blocks.push(Arc::new(ContextBlock::UserMessage {
                     content: content.into_owned(),
                 }));
+            }
+            AgentEvent::CompactionTriggered => {
+                commit_finished_turn(&mut turn, &mut blocks);
+                blocks.push(Arc::new(ContextBlock::CompactionTrigger));
             }
             AgentEvent::InferenceResponse {
                 items,
@@ -309,7 +320,7 @@ impl Agent {
             blocks: Vec::new(),
             tool_specs: shell_tools.specs().into(),
             system_prompt: system_prompt::prompt(workspace.repo()),
-            queued_messages: Vec::new(),
+            queued_inputs: Vec::new(),
             kind: AgentStateKind::Idle,
             context_used: None,
         };
@@ -352,7 +363,7 @@ impl Agent {
             blocks,
             tool_specs: shell_tools.specs().into(),
             system_prompt: system_prompt::prompt(workspace.repo()),
-            queued_messages: Vec::new(),
+            queued_inputs: Vec::new(),
             kind,
             context_used,
         };
@@ -414,7 +425,11 @@ impl Agent {
         });
     }
 
-    /// Stop the current turn and drop all queued messages.
+    pub fn compact(&self, delivery: MessageDelivery) {
+        let _ = self.control.send(AgentControl::Compact { delivery });
+    }
+
+    /// Stop the current turn and drop all queued inputs.
     pub fn cancel(&self) {
         let _ = self.control.send(AgentControl::Cancel);
     }
@@ -466,6 +481,9 @@ enum AgentControl {
         content: Vec<ContentPart>,
         delivery: MessageDelivery,
     },
+    Compact {
+        delivery: MessageDelivery,
+    },
     SetDeepConfig(DeepConfig),
     Rewind {
         turns: u32,
@@ -513,10 +531,14 @@ impl AgentLoop {
                     };
                     match control {
                         AgentControl::UserMessage { content, delivery } => {
-                            state.queued_messages.push(QueuedUserMessage {
-                                content: Arc::new(content),
-                                delivery,
-                            });
+                            state
+                                .queued_inputs
+                                .push(QueuedItem {
+                                    kind: QueuedItemKind::UserMessage {
+                                        content: Arc::new(content),
+                                    },
+                                    delivery,
+                                });
                             match &state.kind {
                                 // Busy: the message waits in the queue for its
                                 // delivery point.
@@ -570,10 +592,32 @@ impl AgentLoop {
                                 }
                             }
                         }
+                        AgentControl::Compact { delivery } => {
+                            state.queued_inputs.push(QueuedItem {
+                                kind: QueuedItemKind::Compaction,
+                                delivery,
+                            });
+                            match &state.kind {
+                                AgentStateKind::Idle | AgentStateKind::Error(_) => {
+                                    assert!(!self.inference_session.has_active_request());
+                                    assert!(self.pending_tools.is_empty());
+                                    self.deliver_queued(&mut state, MessageDelivery::NextTurn)
+                                        .await;
+                                    self.send_request(&state);
+                                    state.kind = AgentStateKind::ApiStreaming {
+                                        pending_response: PendingInferenceResponse::default(),
+                                        previous_attempt: None,
+                                    };
+                                }
+                                AgentStateKind::ApiStreaming { .. }
+                                | AgentStateKind::ToolCalling { .. }
+                                | AgentStateKind::UnfinishedTurn { .. } => {}
+                            }
+                        }
                         AgentControl::Cancel => {
                             self.inference_session.abort();
                             self.pending_tools.clear();
-                            state.queued_messages.clear();
+                            state.queued_inputs.clear();
 
                             state.kind = AgentStateKind::Idle;
                         }
@@ -600,6 +644,8 @@ impl AgentLoop {
                                             results,
                                         }));
                                     }
+                                    self.deliver_queued(&mut state, MessageDelivery::NextTurn)
+                                        .await;
                                     self.send_request(&state);
                                     state.kind = AgentStateKind::ApiStreaming {
                                         pending_response: PendingInferenceResponse::default(),
@@ -634,9 +680,9 @@ impl AgentLoop {
                                 Err(anyhow::anyhow!(
                                     ":rewind is only available while idle or errored; use :cancel first"
                                 ))
-                            } else if !state.queued_messages.is_empty() {
+                            } else if !state.queued_inputs.is_empty() {
                                 Err(anyhow::anyhow!(
-                                    ":rewind is not available with queued messages"
+                                    ":rewind is not available with queued inputs"
                                 ))
                             } else if !self.pending_tools.is_empty()
                                 || self.inference_session.has_active_request()
@@ -683,7 +729,7 @@ impl AgentLoop {
                                         state.blocks = blocks;
                                         state.kind = kind;
                                         state.context_used = context_used;
-                                        state.queued_messages.clear();
+                                        state.queued_inputs.clear();
                                         self.inference_session.abort();
                                         if let Some(persistence) = &mut self.persistence {
                                             persistence.next_event = next_event;
@@ -802,9 +848,7 @@ impl AgentLoop {
                                             }
                                         });
                                     }
-                                    if state.queued_messages.is_empty() {
-                                        state.kind = AgentStateKind::Idle;
-                                    } else {
+                                    if !state.queued_inputs.is_empty() {
                                         self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                             .await;
                                         self.send_request(&state);
@@ -812,6 +856,8 @@ impl AgentLoop {
                                             pending_response: PendingInferenceResponse::default(),
                                             previous_attempt: None,
                                         };
+                                    } else {
+                                        state.kind = AgentStateKind::Idle;
                                     }
                                 } else {
                                     let mut previews = BTreeMap::new();
@@ -895,31 +941,56 @@ impl AgentLoop {
         }
     }
 
-    /// Move queued messages into model context at a delivery boundary.
+    /// Move queued inputs into model context at a delivery boundary.
     /// `boundary` is the point the loop has reached: `NextRequest` (about to
     /// issue a mid-turn inference request) delivers only the steering lane;
-    /// `NextTurn` (the turn is over) delivers both lanes. Relative order of
-    /// delivered messages is preserved.
+    /// `NextTurn` (the turn is over) delivers both lanes and compaction.
+    /// Relative order is preserved: a compaction item is delivered as its own
+    /// provider request and blocks later queued inputs until it finishes.
     async fn deliver_queued(&mut self, state: &mut AgentState, boundary: MessageDelivery) {
         let mut held = Vec::new();
-        for message in std::mem::take(&mut state.queued_messages) {
-            if boundary == MessageDelivery::NextTurn
-                || message.delivery != MessageDelivery::NextTurn
-            {
-                self.persist_event(AgentEvent::UserMessage {
-                    content: Cow::Borrowed(message.content.as_slice()),
-                })
-                .await;
-                let content =
-                    Arc::try_unwrap(message.content).unwrap_or_else(|content| (*content).clone());
-                state
-                    .blocks
-                    .push(Arc::new(ContextBlock::UserMessage { content }));
-            } else {
-                held.push(message);
+        let mut delivered_any = false;
+        let mut delivered_compaction = false;
+        for input in std::mem::take(&mut state.queued_inputs) {
+            match input {
+                QueuedItem {
+                    kind: QueuedItemKind::UserMessage { content },
+                    delivery,
+                } if !delivered_compaction
+                    && (boundary == MessageDelivery::NextTurn
+                        || delivery != MessageDelivery::NextTurn) =>
+                {
+                    self.persist_event(AgentEvent::UserMessage {
+                        content: Cow::Borrowed(content.as_slice()),
+                    })
+                    .await;
+                    let content =
+                        Arc::try_unwrap(content).unwrap_or_else(|content| (*content).clone());
+                    state
+                        .blocks
+                        .push(Arc::new(ContextBlock::UserMessage { content }));
+                    delivered_any = true;
+                }
+                QueuedItem {
+                    kind: QueuedItemKind::Compaction,
+                    delivery,
+                } if !delivered_any
+                    && (boundary == MessageDelivery::NextTurn
+                        || delivery != MessageDelivery::NextTurn) =>
+                {
+                    self.persist_event(AgentEvent::CompactionTriggered).await;
+                    state.blocks.push(Arc::new(ContextBlock::CompactionTrigger));
+                    delivered_any = true;
+                    delivered_compaction = true;
+                }
+                other => {
+                    held.push(other);
+                    held.extend(std::mem::take(&mut state.queued_inputs));
+                    break;
+                }
             }
         }
-        state.queued_messages = held;
+        state.queued_inputs = held;
     }
 
     fn send_request(&mut self, state: &AgentState) {

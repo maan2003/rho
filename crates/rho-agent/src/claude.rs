@@ -19,8 +19,8 @@ use crate::db::{
     AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, TopicId, UnixMillis,
 };
 use crate::{
-    AgentState, AgentStateKind, FailedInferenceResponse, MessageDelivery, QueuedUserMessage,
-    StartWorkspace, system_prompt,
+    AgentState, AgentStateKind, FailedInferenceResponse, MessageDelivery, QueuedItem,
+    QueuedItemKind, StartWorkspace, system_prompt,
 };
 
 mod projection;
@@ -77,7 +77,7 @@ impl ClaudeAgent {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
             system_prompt: system_prompt::prompt(workspace.repo()),
-            queued_messages: Vec::new(),
+            queued_inputs: Vec::new(),
             kind: AgentStateKind::Idle,
             context_used: None,
         };
@@ -124,7 +124,7 @@ impl ClaudeAgent {
             blocks,
             tool_specs: Arc::from([]),
             system_prompt: system_prompt::prompt(workspace.repo()),
-            queued_messages: Vec::new(),
+            queued_inputs: Vec::new(),
             kind: AgentStateKind::Idle,
             context_used,
         };
@@ -177,6 +177,10 @@ impl ClaudeAgent {
 
     pub fn send_user_message(&self, text: impl Into<String>) {
         let _ = self.control.send(ClaudeControl::UserMessage(text.into()));
+    }
+
+    pub fn compact(&self) {
+        self.send_user_message("/compact");
     }
 
     pub async fn set_effort(&self, effort: Effort) -> anyhow::Result<()> {
@@ -305,9 +309,11 @@ impl ClaudeLoop {
                 self.state
                     .write()
                     .expect("poison")
-                    .queued_messages
-                    .push(QueuedUserMessage {
-                        content: Arc::new(content),
+                    .queued_inputs
+                    .push(QueuedItem {
+                        kind: QueuedItemKind::UserMessage {
+                            content: Arc::new(content),
+                        },
                         delivery,
                     });
                 self.notify.notify_waiters();
@@ -324,7 +330,7 @@ impl ClaudeLoop {
                         let _ = process.close().await;
                     });
                 }
-                self.state.write().expect("poison").queued_messages.clear();
+                self.state.write().expect("poison").queued_inputs.clear();
                 self.set_kind(AgentStateKind::Idle);
             }
         }
@@ -375,12 +381,17 @@ impl ClaudeLoop {
     fn handle_user_block(&mut self, block: Arc<ContextBlock>) {
         if let ContextBlock::UserMessage { content } = &*block {
             let mut state = self.state.write().expect("poison");
-            if let Some(pos) = state
-                .queued_messages
-                .iter()
-                .position(|queued| *queued.content == *content)
-            {
-                state.queued_messages.remove(pos);
+            if let Some(pos) = state.queued_inputs.iter().position(|queued| match queued {
+                QueuedItem {
+                    kind: QueuedItemKind::UserMessage { content: queued },
+                    ..
+                } => **queued == *content,
+                QueuedItem {
+                    kind: QueuedItemKind::Compaction,
+                    ..
+                } => false,
+            }) {
+                state.queued_inputs.remove(pos);
                 state.blocks.push(block);
                 drop(state);
                 self.notify.notify_waiters();
@@ -473,7 +484,7 @@ impl ClaudeLoop {
 
         {
             let mut state = self.state.write().expect("poison");
-            remove_compact_commands(&mut state.queued_messages);
+            remove_compact_commands(&mut state.queued_inputs);
             if let Some(post_tokens) = compact_metadata.and_then(|metadata| metadata.post_tokens) {
                 state.context_used = Some(post_tokens);
             }
@@ -625,8 +636,17 @@ fn merge_usage(
         .or(base.cache_read_input_tokens);
 }
 
-fn remove_compact_commands(messages: &mut Vec<QueuedUserMessage>) {
-    messages.retain(|message| !is_compact_command(&message.content));
+fn remove_compact_commands(inputs: &mut Vec<QueuedItem>) {
+    inputs.retain(|input| match input {
+        QueuedItem {
+            kind: QueuedItemKind::UserMessage { content },
+            ..
+        } => !is_compact_command(content),
+        QueuedItem {
+            kind: QueuedItemKind::Compaction,
+            ..
+        } => true,
+    });
 }
 
 fn is_compact_command(content: &[ContentPart]) -> bool {

@@ -46,6 +46,7 @@ pub enum ContextBlock {
         items: Vec<InferenceResponseItem>,
         provider_response_id: Option<ProviderResponseId>,
     },
+    CompactionTrigger,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
