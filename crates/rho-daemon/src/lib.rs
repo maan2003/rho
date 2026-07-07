@@ -18,8 +18,8 @@ use rho_inference::InferenceAuth;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, JoinTarget, LandStatus, ServerMessage, StartMode, UiAgentSummary, UiTopic,
-    UiWorkdir, read_frame_counted, write_frame_counted,
+    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, ServerMessage, StartMode,
+    UiAgentSummary, UiTopic, UiWorkdir, read_frame_counted, write_frame_counted,
 };
 use rho_workspaces::{Repo, WorkspaceInfo};
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, mpsc};
@@ -122,6 +122,7 @@ struct AgentRegistry {
     /// untitled agent starts at most one task.
     title_tasks: Mutex<HashSet<AgentId>>,
     land_locks: Mutex<HashMap<Utf8PathBuf, Arc<TokioMutex<()>>>>,
+    land_holders: Mutex<HashMap<Utf8PathBuf, LandLeaseHolder>>,
     land_statuses: Mutex<HashMap<Utf8PathBuf, LandStatus>>,
     /// At most one realtime voice session per daemon (see [`voice`]).
     voice_active: Arc<std::sync::atomic::AtomicBool>,
@@ -162,6 +163,7 @@ impl AgentRegistry {
             repos: Mutex::new(HashMap::new()),
             title_tasks: Mutex::new(HashSet::new()),
             land_locks: Mutex::new(HashMap::new()),
+            land_holders: Mutex::new(HashMap::new()),
             land_statuses: Mutex::new(HashMap::new()),
             voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -266,20 +268,25 @@ impl AgentRegistry {
         self.agents.lock().await.get(&agent_id).cloned()
     }
 
-    async fn acquire_land_lease(&self, repo: Utf8PathBuf) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self.land_locks.lock().await;
-            Arc::clone(
-                locks
-                    .entry(repo.clone())
-                    .or_insert_with(|| Arc::new(TokioMutex::new(()))),
-            )
-        };
-        self.land_statuses
-            .lock()
-            .await
-            .insert(repo, LandStatus::Queued);
-        lock.lock_owned().await
+    async fn land_lock(&self, repo: Utf8PathBuf) -> Arc<TokioMutex<()>> {
+        let mut locks = self.land_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(repo)
+                .or_insert_with(|| Arc::new(TokioMutex::new(()))),
+        )
+    }
+
+    async fn land_holder(&self, repo: &Utf8PathBuf) -> Option<LandLeaseHolder> {
+        self.land_holders.lock().await.get(repo).cloned()
+    }
+
+    async fn set_land_holder(&self, repo: Utf8PathBuf, holder: LandLeaseHolder) {
+        self.land_holders.lock().await.insert(repo, holder);
+    }
+
+    async fn clear_land_holder(&self, repo: &Utf8PathBuf) {
+        self.land_holders.lock().await.remove(repo);
     }
 
     async fn set_land_status(&self, repo: Utf8PathBuf, status: LandStatus) {
@@ -640,6 +647,11 @@ async fn serve_connection(
     connection: ServerConnection,
 ) -> anyhow::Result<()> {
     let counters = connection.io_counters();
+    let land_holder = connection.peer_cred().ok().map(|cred| LandLeaseHolder {
+        pid: cred.pid().and_then(|pid| u32::try_from(pid).ok()),
+        uid: cred.uid(),
+        gid: cred.gid(),
+    });
     let stream = connection.into_stream();
     let (reader, writer) = stream.into_split();
 
@@ -669,7 +681,16 @@ async fn serve_connection(
     // the handle on disconnect ends the session task.
     let mut voice: Option<voice::VoiceHandle> = None;
     loop {
-        let message = read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await?;
+        let message =
+            match read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await {
+                Ok(message) => message,
+                Err(error) => {
+                    for (repo, _) in &land_leases {
+                        agents.clear_land_holder(repo).await;
+                    }
+                    return Err(error);
+                }
+            };
         match voice::handle_client_message(&agents, &outgoing_tx, &mut voice, &message) {
             Ok(true) => continue,
             Ok(false) => {}
@@ -680,7 +701,15 @@ async fn serve_connection(
                 continue;
             }
         }
-        match handle_message(&agents, &outgoing_tx, &mut land_leases, message).await {
+        match handle_message(
+            &agents,
+            &outgoing_tx,
+            &mut land_leases,
+            land_holder.clone(),
+            message,
+        )
+        .await
+        {
             Ok(Refresh::Ready) => {
                 let _ = outgoing_tx.send(agents.ready_message());
             }
@@ -707,6 +736,7 @@ async fn handle_message(
     agents: &Arc<AgentRegistry>,
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
     land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
+    land_holder: Option<LandLeaseHolder>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
     match message {
@@ -748,7 +778,24 @@ async fn handle_message(
             Ok(Refresh::Ready)
         }
         ClientMessage::AcquireLandLease { repo } => {
-            let lease = agents.acquire_land_lease(repo.clone()).await;
+            let lock = agents.land_lock(repo.clone()).await;
+            let lease = match lock.clone().try_lock_owned() {
+                Ok(lease) => lease,
+                Err(_) => {
+                    agents
+                        .set_land_status(repo.clone(), LandStatus::Queued)
+                        .await;
+                    let holder = agents.land_holder(&repo).await;
+                    let _ = outgoing_tx.send(ServerMessage::LandLeaseQueued {
+                        repo: repo.clone(),
+                        holder,
+                    });
+                    lock.lock_owned().await
+                }
+            };
+            if let Some(holder) = land_holder {
+                agents.set_land_holder(repo.clone(), holder).await;
+            }
             land_leases.push((repo.clone(), lease));
             let _ = outgoing_tx.send(ServerMessage::LandLeaseGranted { repo });
             Ok(Refresh::None)
@@ -764,6 +811,7 @@ async fn handle_message(
                 .position(|(leased_repo, _)| *leased_repo == repo)
             {
                 land_leases.swap_remove(index);
+                agents.clear_land_holder(&repo).await;
             }
             Ok(Refresh::None)
         }

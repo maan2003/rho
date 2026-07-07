@@ -55,6 +55,10 @@ impl ServerConnection {
         self.counters.clone()
     }
 
+    pub fn peer_cred(&self) -> std::io::Result<tokio::net::unix::UCred> {
+        self.stream.peer_cred()
+    }
+
     pub fn into_stream(self) -> UnixStream {
         self.stream
     }

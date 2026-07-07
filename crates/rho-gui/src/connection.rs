@@ -171,6 +171,7 @@ async fn run(
             }
             ServerMessage::VoiceUiAction(action) => Some(ConnEvent::VoiceUiAction(action)),
             ServerMessage::Pong
+            | ServerMessage::LandLeaseQueued { .. }
             | ServerMessage::LandLeaseGranted { .. }
             | ServerMessage::LandStatus { .. } => None,
         };

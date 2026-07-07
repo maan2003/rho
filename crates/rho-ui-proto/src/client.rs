@@ -221,6 +221,7 @@ impl AgentClient {
                     // audio path.
                     ServerMessage::Pong
                     | ServerMessage::TurnCancelled { .. }
+                    | ServerMessage::LandLeaseQueued { .. }
                     | ServerMessage::LandLeaseGranted { .. }
                     | ServerMessage::LandStatus { .. }
                     | ServerMessage::VoiceAudio { .. }

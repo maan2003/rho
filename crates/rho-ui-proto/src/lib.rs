@@ -234,6 +234,13 @@ pub enum LandStatus {
     Bounced,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct LandLeaseHolder {
+    pub pid: Option<u32>,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// Message sent from the rho daemon to a UI client.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum ServerMessage {
@@ -274,6 +281,10 @@ pub enum ServerMessage {
     },
     TurnCancelled {
         agent_id: AgentId,
+    },
+    LandLeaseQueued {
+        repo: Utf8PathBuf,
+        holder: Option<LandLeaseHolder>,
     },
     LandLeaseGranted {
         repo: Utf8PathBuf,

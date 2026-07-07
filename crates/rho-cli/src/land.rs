@@ -122,6 +122,27 @@ impl LandLease {
                     eprintln!("land lease granted");
                     return Ok(Self { client, repo });
                 }
+                ServerMessage::LandLeaseQueued {
+                    repo: queued,
+                    holder,
+                } if queued == repo => match holder {
+                    Some(holder) => {
+                        if let Some(pid) = holder.pid {
+                            eprintln!(
+                                "land lease held by pid {pid} uid {} gid {}; waiting",
+                                holder.uid, holder.gid
+                            );
+                        } else {
+                            eprintln!(
+                                "land lease held by uid {} gid {}; waiting",
+                                holder.uid, holder.gid
+                            );
+                        }
+                    }
+                    None => {
+                        eprintln!("land lease is currently held; waiting");
+                    }
+                },
                 ServerMessage::Error { message } => anyhow::bail!("{message}"),
                 _ => {}
             }
