@@ -230,12 +230,11 @@ impl Workspace {
                 self.ensure_duration_timer(cx);
                 cx.notify();
             }
-            ConnEvent::TurnCancelled(agent_id) => {
-                if let Some(view) = self.views.get(&agent_id).cloned() {
-                    view.update(cx, |view, cx| {
-                        view.system_notice("[turn cancelled]", StyleClass::SystemInfo, cx);
-                    });
-                }
+            ConnEvent::TurnCancelled(_) => {
+                // Cancellation is an acknowledgement for an in-flight action,
+                // not transcript content. The system notice buffer is
+                // intentionally persistent, so rendering it there leaves
+                // "[turn cancelled]" visible forever.
             }
             ConnEvent::ServerError(message) => {
                 // A failed creation keeps the draft buffers; the user fixes

@@ -703,6 +703,28 @@ fn system_notices_survive_transcript_rerenders(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn turn_cancelled_ack_is_not_persisted_as_notice(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("first")], Vec::new())),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(ConnEvent::TurnCancelled(agent(1)), window, cx);
+        })
+        .expect("handle cancellation acknowledgement");
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        !text.contains("[turn cancelled]"),
+        "turn cancellation acknowledgement should not become persistent transcript text: {text:?}"
+    );
+}
+
+#[gpui::test]
 fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     cx.update(bind_test_keymaps);
