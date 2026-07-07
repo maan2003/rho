@@ -14,6 +14,7 @@ use theme::ActiveTheme as _;
 pub enum ModeFamily {
     Deep,
     Fable,
+    Opus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -146,6 +147,7 @@ pub fn mode_chip_style(family: ModeFamily, cx: &App) -> HighlightStyle {
     let color = match family {
         ModeFamily::Deep => colors.terminal_ansi_cyan,
         ModeFamily::Fable => colors.terminal_ansi_magenta,
+        ModeFamily::Opus => colors.terminal_ansi_yellow,
     };
     HighlightStyle {
         color: Some(color),

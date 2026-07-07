@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use rho_agent::db::{
     AgentMode, AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, DeepEffort, FableEffort,
-    Status,
+    OpusEffort, Status,
 };
 use rho_db::RhoDb;
 use rho_workspaces::WorkspaceInfo;
@@ -238,6 +238,7 @@ fn mode_name(mode: AgentMode) -> String {
             format!("deep{fast} {}", deep_effort_name(effort))
         }
         AgentMode::Fable { effort } => format!("fable {}", fable_effort_name(effort)),
+        AgentMode::Opus { effort } => format!("opus {}", opus_effort_name(effort)),
     }
 }
 
@@ -253,6 +254,13 @@ fn fable_effort_name(effort: FableEffort) -> &'static str {
     match effort {
         FableEffort::Medium => "medium",
         FableEffort::Xhigh => "xhigh",
+    }
+}
+
+fn opus_effort_name(effort: OpusEffort) -> &'static str {
+    match effort {
+        OpusEffort::Medium => "medium",
+        OpusEffort::Xhigh => "xhigh",
     }
 }
 

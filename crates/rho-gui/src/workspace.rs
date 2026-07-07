@@ -16,7 +16,7 @@ use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
 use rho_ui_proto::{
     AgentId, AgentMode, ClientMessage, DeepConfig, DeepEffort, FableEffort, MessageDelivery,
-    VoiceRole, VoiceState, VoiceUiAction,
+    OpusEffort, VoiceRole, VoiceState, VoiceUiAction,
 };
 use theme::ActiveTheme as _;
 
@@ -940,7 +940,7 @@ impl Workspace {
                 config.effort = effort;
                 AgentMode::Deep(config)
             }
-            AgentMode::Fable { .. } => {
+            AgentMode::Fable { .. } | AgentMode::Opus { .. } => {
                 let effort = match effort {
                     DeepEffort::Low => {
                         self.notice_on(
@@ -954,7 +954,16 @@ impl Workspace {
                     DeepEffort::Medium => FableEffort::Medium,
                     DeepEffort::Xhigh => FableEffort::Xhigh,
                 };
-                AgentMode::Fable { effort }
+                match mode {
+                    AgentMode::Fable { .. } => AgentMode::Fable { effort },
+                    AgentMode::Opus { .. } => AgentMode::Opus {
+                        effort: match effort {
+                            FableEffort::Medium => OpusEffort::Medium,
+                            FableEffort::Xhigh => OpusEffort::Xhigh,
+                        },
+                    },
+                    AgentMode::Deep(_) => unreachable!(),
+                }
             }
         };
         self.connection
@@ -1370,7 +1379,10 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
     let kind = words.next().unwrap_or("deep").to_ascii_lowercase();
     let effort = words.next().unwrap_or("medium").to_ascii_lowercase();
     if words.next().is_some() {
-        return Err("mode must be `deep [low|medium|xhigh]` or `fable [medium|xhigh]`".to_owned());
+        return Err(
+            "mode must be `deep [low|medium|xhigh]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
+                .to_owned(),
+        );
     }
     match kind.as_str() {
         "deep" => Ok(AgentMode::Deep(DeepConfig {
@@ -1397,7 +1409,18 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
                 }
             },
         }),
-        _ => Err(format!("unknown mode `{kind}`; use deep or fable")),
+        "opus" => Ok(AgentMode::Opus {
+            effort: match effort.as_str() {
+                "medium" => OpusEffort::Medium,
+                "xhigh" => OpusEffort::Xhigh,
+                _ => {
+                    return Err(format!(
+                        "unknown opus effort `{effort}`; use medium or xhigh"
+                    ));
+                }
+            },
+        }),
+        _ => Err(format!("unknown mode `{kind}`; use deep, fable, or opus")),
     }
 }
 
@@ -1420,6 +1443,12 @@ fn cycle_agent_mode_text(current: &str) -> &'static str {
         } => "fable xhigh",
         AgentMode::Fable {
             effort: FableEffort::Xhigh,
+        } => "opus medium",
+        AgentMode::Opus {
+            effort: OpusEffort::Medium,
+        } => "opus xhigh",
+        AgentMode::Opus {
+            effort: OpusEffort::Xhigh,
         } => "deep low",
     }
 }
@@ -1453,6 +1482,16 @@ fn agent_mode_label(mode: AgentMode) -> ModeLabel {
             ModeLabel {
                 text: format!("fable{suffix}"),
                 family: ModeFamily::Fable,
+            }
+        }
+        AgentMode::Opus { effort } => {
+            let suffix = match effort {
+                OpusEffort::Medium => "",
+                OpusEffort::Xhigh => "²",
+            };
+            ModeLabel {
+                text: format!("opus{suffix}"),
+                family: ModeFamily::Opus,
             }
         }
     }
@@ -1591,7 +1630,14 @@ mod tests {
                 effort: FableEffort::Xhigh,
             }
         );
+        assert_eq!(
+            parse_agent_mode("opus xhigh").unwrap(),
+            AgentMode::Opus {
+                effort: OpusEffort::Xhigh,
+            }
+        );
         assert!(parse_agent_mode("fable low").is_err());
+        assert!(parse_agent_mode("opus low").is_err());
         assert!(parse_agent_mode("sonnet medium").is_err());
     }
 
@@ -1636,5 +1682,17 @@ mod tests {
         });
         assert_eq!(fable_xhigh.text, "fable²");
         assert_eq!(fable_xhigh.family, ModeFamily::Fable);
+
+        let opus = agent_mode_label(AgentMode::Opus {
+            effort: OpusEffort::Medium,
+        });
+        assert_eq!(opus.text, "opus");
+        assert_eq!(opus.family, ModeFamily::Opus);
+
+        let opus_xhigh = agent_mode_label(AgentMode::Opus {
+            effort: OpusEffort::Xhigh,
+        });
+        assert_eq!(opus_xhigh.text, "opus²");
+        assert_eq!(opus_xhigh.family, ModeFamily::Opus);
     }
 }

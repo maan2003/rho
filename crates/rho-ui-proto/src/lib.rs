@@ -11,8 +11,8 @@ use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
 pub use rho_agent::MessageDelivery;
 pub use rho_agent::db::{
-    AgentId, AgentIdDomain, AgentMode, DeepConfig, DeepEffort, FableEffort, Status, TopicId,
-    TopicIdDomain,
+    AgentId, AgentIdDomain, AgentMode, DeepConfig, DeepEffort, FableEffort, OpusEffort, Status,
+    TopicId, TopicIdDomain,
 };
 use rho_core::ContentPart;
 pub use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};

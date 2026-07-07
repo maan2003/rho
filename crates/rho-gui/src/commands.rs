@@ -121,7 +121,7 @@ pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
         .is_none_or(char::is_whitespace);
     let words = trimmed.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() || (words.len() == 1 && !typing_new_token) {
-        return ["deep", "fable"]
+        return ["deep", "fable", "opus"]
             .into_iter()
             .filter(|mode| fuzzy_contains(mode, token))
             .map(|mode| Candidate {
@@ -129,6 +129,7 @@ pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
                 description: match mode {
                     "deep" => "rho deep agent".to_owned(),
                     "fable" => "Claude Fable agent".to_owned(),
+                    "opus" => "Claude Opus agent".to_owned(),
                     _ => unreachable!(),
                 },
             })
@@ -141,7 +142,9 @@ pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
             ("medium", "medium effort"),
             ("xhigh", "extra-high effort"),
         ],
-        Some("fable") => &[("medium", "medium effort"), ("xhigh", "extra-high effort")],
+        Some("fable") | Some("opus") => {
+            &[("medium", "medium effort"), ("xhigh", "extra-high effort")]
+        }
         _ => return Vec::new(),
     };
     efforts

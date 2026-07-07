@@ -333,7 +333,7 @@ impl AgentRegistry {
                 .await?;
                 (agent_id, RunningAgent::Rho(agent))
             }
-            AgentMode::Fable { .. } => {
+            AgentMode::Fable { .. } | AgentMode::Opus { .. } => {
                 let (agent_id, agent) =
                     ClaudeAgent::create(self.db.clone(), topic_id, None, start, mode).await?;
                 (agent_id, RunningAgent::Claude(agent))
@@ -409,16 +409,19 @@ impl AgentRegistry {
                 write.commit();
                 Ok(())
             }
-            (AgentRuntime::Rho { .. }, AgentMode::Fable { .. }) => {
-                anyhow::bail!("cannot switch a Rho agent to a Fable runtime")
+            (AgentRuntime::Rho { .. }, AgentMode::Fable { .. } | AgentMode::Opus { .. }) => {
+                anyhow::bail!("cannot switch a Rho agent to a Claude runtime")
             }
             (AgentRuntime::Claude { .. }, AgentMode::Deep(_)) => {
                 anyhow::bail!("cannot switch a Claude agent to a Deep runtime")
             }
-            (AgentRuntime::Claude { .. }, AgentMode::Fable { .. }) => {
+            (AgentRuntime::Claude { .. }, AgentMode::Fable { .. } | AgentMode::Opus { .. }) => {
+                if record.mode.claude_model() != mode.claude_model() {
+                    anyhow::bail!("cannot switch a Claude agent model")
+                }
                 let effort = mode
                     .claude_effort()
-                    .ok_or_else(|| anyhow::anyhow!("Fable mode missing Claude effort"))?;
+                    .ok_or_else(|| anyhow::anyhow!("Claude mode missing effort"))?;
                 if let Some(agent) = self.get(agent_id).await {
                     agent.set_claude_effort(effort).await?;
                 }

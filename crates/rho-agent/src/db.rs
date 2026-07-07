@@ -177,12 +177,14 @@ pub enum AgentRuntime {
 pub enum AgentMode {
     Deep(DeepConfig),
     Fable { effort: FableEffort },
+    Opus { effort: OpusEffort },
 }
 
 impl senax_encoder::Decoder for AgentMode {
     fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
         const DEEP_ID: u64 = 0x8e6fe05daf9b4e5c;
         const FABLE_ID: u64 = 0x2324b4411e2d6595;
+        const OPUS_ID: u64 = 0x7764ef1f22a34870;
         const EFFORT_ID: u64 = 0xae8c1bc4a13b4c9c;
         const FAST_MODE_ID: u64 = 0xdfdfaae5d197e253;
 
@@ -264,6 +266,27 @@ impl senax_encoder::Decoder for AgentMode {
                             })?,
                         })
                     }
+                    OPUS_ID => {
+                        let mut effort = None;
+                        loop {
+                            match senax_encoder::core::read_field_id_optimized(reader)? {
+                                0 => break,
+                                EFFORT_ID => effort = Some(OpusEffort::decode(reader)?),
+                                _ => senax_encoder::core::skip_value(reader)?,
+                            }
+                        }
+                        Ok(Self::Opus {
+                            effort: effort.ok_or_else(|| {
+                                senax_encoder::EncoderError::EnumDecode(
+                                    senax_encoder::EnumDecodeError::MissingRequiredField {
+                                        field: "effort",
+                                        enum_name: "AgentMode",
+                                        variant_name: "Opus",
+                                    },
+                                )
+                            })?,
+                        })
+                    }
                     _ => Err(senax_encoder::EncoderError::EnumDecode(
                         senax_encoder::EnumDecodeError::UnknownVariantId {
                             variant_id,
@@ -288,6 +311,12 @@ pub enum FableEffort {
     Xhigh,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum OpusEffort {
+    Medium,
+    Xhigh,
+}
+
 impl AgentMode {
     pub fn deep_default() -> Self {
         Self::Deep(DeepConfig::default())
@@ -296,13 +325,14 @@ impl AgentMode {
     pub fn deep_config(self) -> Option<DeepConfig> {
         match self {
             Self::Deep(config) => Some(config),
-            Self::Fable { .. } => None,
+            Self::Fable { .. } | Self::Opus { .. } => None,
         }
     }
 
     pub fn claude_model(self) -> Option<rho_claude::Model> {
         match self {
             Self::Fable { .. } => Some(rho_claude::Model::Fable),
+            Self::Opus { .. } => Some(rho_claude::Model::Opus),
             Self::Deep(_) => None,
         }
     }
@@ -310,16 +340,26 @@ impl AgentMode {
     pub fn claude_effort(self) -> Option<rho_claude::Effort> {
         match self {
             Self::Fable { effort } => Some(effort.to_claude_effort()),
+            Self::Opus { effort } => Some(effort.to_claude_effort()),
             Self::Deep(_) => None,
         }
     }
 
     pub fn is_claude(self) -> bool {
-        matches!(self, Self::Fable { .. })
+        matches!(self, Self::Fable { .. } | Self::Opus { .. })
     }
 }
 
 impl FableEffort {
+    fn to_claude_effort(self) -> rho_claude::Effort {
+        match self {
+            Self::Medium => rho_claude::Effort::Medium,
+            Self::Xhigh => rho_claude::Effort::Xhigh,
+        }
+    }
+}
+
+impl OpusEffort {
     fn to_claude_effort(self) -> rho_claude::Effort {
         match self {
             Self::Medium => rho_claude::Effort::Medium,
