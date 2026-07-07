@@ -73,6 +73,11 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 pub use senax_encoder_derive::{Decode, Encode, Pack, Unpack};
 
+#[doc(hidden)]
+pub mod __private {
+    pub use paste;
+}
+
 /// Errors that can occur during encoding or decoding operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EncoderError {
@@ -331,6 +336,173 @@ pub trait Decoder: Sized {
     /// # Arguments
     /// * `reader` - The buffer to read the encoded bytes from.
     fn decode(reader: &mut impl Buf) -> Result<Self>;
+}
+
+/// A senax-encoded dynamically tagged value.
+///
+/// This is a small typetag-like building block for extension points. The wire
+/// shape is:
+///
+/// ```text
+/// [tag: String] [body: Bytes]
+/// ```
+///
+/// `body` is length-delimited, so decoders can skip unknown tags without
+/// preserving their bytes.
+pub trait TaggedSenax: Encoder + Decoder {
+    /// Stable type tag for this payload inside its extension point.
+    const TAG: &'static str;
+}
+
+/// Declares a separate inventory-backed senax tagged trait-object extension
+/// point.
+///
+/// Each invocation creates an independent trait, registry entry type, unknown
+/// fallback type, and `Encoder`/`Decoder` impls for `Box<dyn Trait>`.
+///
+/// ```ignore
+/// senax_encoder::declare_senax_tagged_trait!(
+///     pub trait ProviderData,
+///     unknown = UnknownProviderData
+/// );
+/// ```
+#[macro_export]
+macro_rules! declare_senax_tagged_trait {
+    (
+        $vis:vis trait $trait_name:ident,
+        unknown = $unknown_name:ident $(,)?
+    ) => {
+        $crate::__private::paste::paste! {
+            $vis trait $trait_name: std::fmt::Debug + Send + Sync + 'static {
+                fn tag(&self) -> &str;
+                fn encode_tagged_body(
+                    &self,
+                    writer: &mut bytes::BytesMut,
+                ) -> $crate::Result<()>;
+                fn as_any(&self) -> &dyn std::any::Any;
+            }
+
+            impl<T> $trait_name for T
+            where
+                T: $crate::TaggedSenax + std::fmt::Debug + Send + Sync + 'static,
+            {
+                fn tag(&self) -> &str {
+                    <T as $crate::TaggedSenax>::TAG
+                }
+
+                fn encode_tagged_body(
+                    &self,
+                    writer: &mut bytes::BytesMut,
+                ) -> $crate::Result<()> {
+                    $crate::Encoder::encode(self, writer)
+                }
+
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+
+            #[derive(Debug, Clone, PartialEq, Eq)]
+            $vis struct $unknown_name {
+                pub tag: String,
+            }
+
+            impl $trait_name for $unknown_name {
+                fn tag(&self) -> &str {
+                    &self.tag
+                }
+
+                fn encode_tagged_body(
+                    &self,
+                    _writer: &mut bytes::BytesMut,
+                ) -> $crate::Result<()> {
+                    Ok(())
+                }
+
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+
+            #[doc(hidden)]
+            pub struct [<__Senax $trait_name Entry>] {
+                pub tag: &'static str,
+                pub decode: fn(bytes::Bytes) -> $crate::Result<Box<dyn $trait_name>>,
+            }
+
+            impl [<__Senax $trait_name Entry>] {
+                pub const fn new(
+                    tag: &'static str,
+                    decode: fn(bytes::Bytes) -> $crate::Result<Box<dyn $trait_name>>,
+                ) -> Self {
+                    Self { tag, decode }
+                }
+            }
+
+            inventory::collect!([<__Senax $trait_name Entry>]);
+
+            impl $crate::Encoder for Box<dyn $trait_name> {
+                fn encode(&self, writer: &mut bytes::BytesMut) -> $crate::Result<()> {
+                    self.tag().to_owned().encode(writer)?;
+                    let mut body = bytes::BytesMut::new();
+                    self.encode_tagged_body(&mut body)?;
+                    body.freeze().encode(writer)
+                }
+
+                fn is_default(&self) -> bool {
+                    false
+                }
+            }
+
+            impl $crate::Decoder for Box<dyn $trait_name> {
+                fn decode(reader: &mut impl bytes::Buf) -> $crate::Result<Self> {
+                    let tag = String::decode(reader)?;
+                    let body = bytes::Bytes::decode(reader)?;
+                    for entry in inventory::iter::<[<__Senax $trait_name Entry>]> {
+                        if entry.tag == tag {
+                            return (entry.decode)(body);
+                        }
+                    }
+                    Ok(Box::new($unknown_name { tag }))
+                }
+            }
+        }
+    };
+}
+
+/// Registers one concrete type with a trait-specific registry declared by
+/// [`declare_senax_tagged_trait!`], and implements [`TaggedSenax`] for it.
+#[macro_export]
+macro_rules! register_senax_tagged {
+    (
+        trait = $trait_name:ident,
+        type = $ty:ty,
+        tag = $tag:expr $(,)?
+    ) => {
+        impl $crate::TaggedSenax for $ty {
+            const TAG: &'static str = $tag;
+        }
+
+        $crate::__private::paste::paste! {
+            inventory::submit! {
+                [<__Senax $trait_name Entry>]::new(
+                    $tag,
+                    |mut body: bytes::Bytes| -> $crate::Result<Box<dyn $trait_name>> {
+                        use bytes::Buf as _;
+                        let value = <$ty as $crate::Decoder>::decode(&mut body)?;
+                        if body.remaining() != 0 {
+                            return Err($crate::EncoderError::Decode(format!(
+                                "Trailing bytes while decoding registered tagged senax value '{}': {}",
+                                $tag,
+                                body.remaining()
+                            )));
+                        }
+                        Ok(Box::new(value) as Box<dyn $trait_name>)
+                    },
+                )
+            }
+        }
+    };
 }
 
 /// Trait for types that can be unpacked from a compact binary format.

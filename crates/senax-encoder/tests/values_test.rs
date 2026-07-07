@@ -19,6 +19,27 @@ use ulid::Ulid;
 #[cfg(feature = "uuid")]
 use uuid::Uuid;
 
+#[derive(Debug, PartialEq, Encode, Decode)]
+struct RegisteredOpenAiMeta {
+    item_id: String,
+}
+
+senax_encoder::declare_senax_tagged_trait!(
+    trait ProviderData,
+    unknown = UnknownProviderData,
+);
+
+senax_encoder::declare_senax_tagged_trait!(
+    trait OtherProviderData,
+    unknown = UnknownOtherProviderData,
+);
+
+senax_encoder::register_senax_tagged!(
+    trait = ProviderData,
+    type = RegisteredOpenAiMeta,
+    tag = "registered.openai.responses.item",
+);
+
 #[derive(Encode, Decode, Debug, PartialEq)]
 struct TestStruct {
     a: Option<i32>,
@@ -2204,6 +2225,37 @@ fn test_various_tuple_sizes() {
         <(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)>::decode(&mut reader)
             .unwrap();
     assert_eq!(tuple_12, decoded_12);
+}
+
+#[test]
+fn test_declared_senax_tagged_traits_have_separate_registries() {
+    let value: Box<dyn ProviderData> = Box::new(RegisteredOpenAiMeta {
+        item_id: "fc_123".to_owned(),
+    });
+    let mut encoded = bytes::BytesMut::new();
+    value.encode(&mut encoded).unwrap();
+
+    let decoded = Box::<dyn ProviderData>::decode(&mut encoded.clone().freeze()).unwrap();
+    assert_eq!(
+        decoded
+            .as_any()
+            .downcast_ref::<RegisteredOpenAiMeta>()
+            .expect("provider data"),
+        &RegisteredOpenAiMeta {
+            item_id: "fc_123".to_owned()
+        }
+    );
+
+    let decoded = Box::<dyn OtherProviderData>::decode(&mut encoded.freeze()).unwrap();
+    assert_eq!(
+        decoded
+            .as_any()
+            .downcast_ref::<UnknownOtherProviderData>()
+            .expect("unknown other provider data"),
+        &UnknownOtherProviderData {
+            tag: <RegisteredOpenAiMeta as senax_encoder::TaggedSenax>::TAG.to_owned()
+        }
+    );
 }
 
 #[test]
