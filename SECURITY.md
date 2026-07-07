@@ -18,6 +18,9 @@ AI APIs.
   transcripts.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
   explicit user-facing capabilities.
+- Local/project Markdown skills are trusted prompt input when discovered or
+  explicitly invoked. Treat them like AGENTS.md-style instructions: useful local
+  guidance, not a sandbox or permission boundary.
 
 ## Runtime assumptions
 
@@ -54,6 +57,19 @@ AI APIs.
 - Bounded waits: socket reads take a per-event timeout, keepalive pings run
   every 25 seconds, and the smoke binary bounds its whole run by a
   per-event timeout.
+
+## Skills
+
+Rho skills are local Markdown files discovered from project `.agents/skills`
+and user `~/.config/agents/skills`. Skills contribute names, descriptions, and
+file paths to the agent system prompt; the model reads the referenced files
+with normal shell tools when it needs their instructions.
+
+Discovery uses bounded 64 KiB reads and rejects a skill whose YAML frontmatter
+is truncated before the closing fence. Discovery follows
+symlinked roots/directories/files while tracking canonical directories to avoid
+cycles. Skill files are prompt input only; they do not restrict filesystem
+access or grant tools.
 
 ## Future review notes
 

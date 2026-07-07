@@ -9718,6 +9718,7 @@ dependencies = [
  "rho-core",
  "rho-db",
  "rho-inference",
+ "rho-skills",
  "rho-tool-shell",
  "rho-workspaces",
  "senax-encoder",
@@ -9931,6 +9932,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-skills"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "dirs",
+ "serde_yaml",
+ "tempfile",
+]
+
+[[package]]
 name = "rho-term-screen"
 version = "0.1.0"
 dependencies = [
@@ -9999,6 +10010,7 @@ dependencies = [
  "bytes",
  "camino",
  "prefix-id",
+ "rho-skills",
  "rustix 1.1.4",
  "senax-encoder",
  "tempfile",

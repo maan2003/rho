@@ -1,10 +1,19 @@
 use std::sync::Arc;
 
-use camino::Utf8Path;
-
-pub fn prompt(working_directory: &Utf8Path) -> Arc<str> {
+pub fn prompt(workspace: &rho_workspaces::Workspace) -> Arc<str> {
+    let working_directory = workspace.repo();
+    let skills = workspace.discovered_skills();
+    for diagnostic in &skills.diagnostics {
+        eprintln!(
+            "rho-agent: skill {:?}: {}: {}",
+            diagnostic.kind,
+            diagnostic.path.display(),
+            diagnostic.message
+        );
+    }
+    let skills = render_skills_prompt(&skills.skills).unwrap_or_default();
     format!(
-        "{BASE_PROMPT}## Environment
+        "{BASE_PROMPT}{skills}## Environment
 
 Working directory: {}
 
@@ -14,6 +23,46 @@ within it unless the user points you elsewhere.
         working_directory
     )
     .into()
+}
+
+fn render_skills_prompt(skills: &[rho_skills::Skill]) -> Option<String> {
+    let mut skills = skills.iter().collect::<Vec<_>>();
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    if skills.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str("## Skills\n");
+    out.push_str("In your workspace you have skills the user created. A **skill** is a guide for proven techniques, patterns, or tools. If a skill exists for a task, you must do it. The following skills provide specialized instructions for specific tasks.\n");
+    out.push_str("### Available skills\n");
+    for skill in skills {
+        out.push_str("- ");
+        out.push_str(&skill.name);
+        out.push_str(": ");
+        out.push_str(&skill.description);
+        out.push_str(" (file: ");
+        out.push_str(skill.file_path.as_str());
+        out.push_str(")\n");
+    }
+    out.push_str("\n### How to use skills\n");
+    out.push_str("- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths. Read the listed file path before using a skill; do not assume the description is enough.\n");
+    out.push_str("- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n");
+    out.push_str("- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.\n");
+    out.push_str("- How to use a skill (progressive disclosure):\n");
+    out.push_str("  1) After deciding to use a skill, open and read its SKILL.md file before taking task actions.\n");
+    out.push_str("  2) When `SKILL.md` references relative paths (e.g., `scripts/foo.py`), resolve them relative to the skill directory listed above first.\n");
+    out.push_str("  3) If `SKILL.md` points to extra folders such as `references/`, load only the specific files needed for the request; don't bulk-load everything.\n");
+    out.push_str("  4) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.\n");
+    out.push_str(
+        "  5) If `assets/` or templates exist, reuse them instead of recreating from scratch.\n",
+    );
+    out.push_str("- Context hygiene:\n");
+    out.push_str("  - Keep context small: summarize long sections instead of pasting them; only load extra files when needed.\n");
+    out.push_str("  - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.\n");
+    out.push_str("- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.\n");
+    out.push('\n');
+    Some(out)
 }
 
 const BASE_PROMPT: &str = "\
@@ -83,3 +132,28 @@ New user messages during a turn refine the work; the newest message wins on conf
 Before finalizing after an interrupt or context compaction, verify your answer addresses the newest request, not an older one still in flight. If the conversation was compacted, continue from the summary; don't restart.
 
 ";
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+    use rho_skills::Skill;
+
+    use super::*;
+
+    fn skill(name: &str, description: &str) -> Skill {
+        Skill {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            file_path: Utf8PathBuf::from(format!("/repo/.agents/skills/{name}/SKILL.md")),
+        }
+    }
+
+    #[test]
+    fn renders_big_skill_guidance_with_file_paths() {
+        let prompt = render_skills_prompt(&[skill("demo", "Demo skill")]).unwrap();
+        assert!(prompt.contains("## Skills"));
+        assert!(prompt.contains("If a skill exists for a task, you must do it"));
+        assert!(prompt.contains("- demo: Demo skill (file: /repo/.agents/skills/demo/SKILL.md)"));
+        assert!(prompt.contains("open and read its SKILL.md file"));
+    }
+}

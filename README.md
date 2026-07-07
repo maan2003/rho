@@ -23,6 +23,8 @@ are local edits to crates, structs, enums, futures, and streams.
   tool scheduling, persistence hooks, streamed transcript handling, and
   inference response block persistence while depending only on the core
   inference-service trait.
+- `rho-skills`: local Markdown skill discovery support shared by repo caches
+  and agent prompts.
 - `rho-cli`: an interactive terminal chat agent assembled from `rho-agent`, the
   inference service, shell/apply_patch tools, CBOR persistence, and copied Tau
   terminal rendering building blocks.
@@ -80,6 +82,11 @@ In the interactive chat UI, `Enter` sends the prompt, `Shift-Enter` or
 `Alt-Enter` inserts a newline, double `Ctrl-C` cancels the running response, and
 `Ctrl-D` exits from an empty prompt.
 
+Rho discovers Markdown skills from project `.agents/skills` plus user
+`~/.config/agents/skills`. Skills are listed in the agent system prompt with
+names, descriptions, and file paths; the model reads the referenced files with
+normal shell tools when a task calls for them.
+
 For one-shot use:
 
 ```sh
@@ -115,7 +122,7 @@ Intentional differences from Tau:
 
 - No process protocol or supervisor.
 - No extension runtime or plugin protocol.
-- No socket server, config system, skills, site, or e2e harness.
+- No socket server, config system, site, or e2e harness.
 - CLI/TUI support is intentionally direct and Rust-local: it uses copied Tau
   terminal rendering pieces, not Tau's harness protocol or daemon.
 - No Chat Completions inference service.

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -220,6 +220,7 @@ impl Repo {
             repo: Arc::clone(self),
             slot,
             mnt_ns: OnceCell::new(),
+            skills: OnceLock::new(),
         });
         self.workspaces
             .lock()
@@ -334,6 +335,7 @@ pub struct Workspace {
     repo: Arc<Repo>,
     slot: Utf8PathBuf,
     mnt_ns: OnceCell<OwnedFd>,
+    skills: OnceLock<Arc<rho_skills::DiscoveredSkills>>,
 }
 
 impl Workspace {
@@ -349,6 +351,13 @@ impl Workspace {
     /// reports (the slot is mounted over it in the agent's namespace).
     pub fn repo(&self) -> &Utf8Path {
         self.repo.root()
+    }
+
+    pub fn discovered_skills(&self) -> Arc<rho_skills::DiscoveredSkills> {
+        Arc::clone(
+            self.skills
+                .get_or_init(|| Arc::new(rho_skills::discover_for_repo(self.repo().as_std_path()))),
+        )
     }
 
     /// The checkout directory in the daemon/host namespace. In-process file

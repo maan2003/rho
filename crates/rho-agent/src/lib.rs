@@ -319,7 +319,7 @@ impl Agent {
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: shell_tools.specs().into(),
-            system_prompt: system_prompt::prompt(workspace.repo()),
+            system_prompt: system_prompt::prompt(workspace.as_ref()),
             queued_inputs: Vec::new(),
             kind: AgentStateKind::Idle,
             context_used: None,
@@ -362,7 +362,7 @@ impl Agent {
         let state = AgentState {
             blocks,
             tool_specs: shell_tools.specs().into(),
-            system_prompt: system_prompt::prompt(workspace.repo()),
+            system_prompt: system_prompt::prompt(workspace.as_ref()),
             queued_inputs: Vec::new(),
             kind,
             context_used,

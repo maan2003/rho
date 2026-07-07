@@ -11,6 +11,7 @@ anyhow.workspace = true
 bytes = "1"
 camino.workspace = true
 prefix-id = { path = "../prefix-id" }
+rho-skills.workspace = true
 rustix = { version = "1", features = ["fs", "mount", "process", "thread"] }
 senax-encoder.workspace = true
 tokio.workspace = true
