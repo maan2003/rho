@@ -90,12 +90,22 @@ pub(crate) async fn run(args: LandArgs) -> Result<()> {
             &format!("{error:#}"),
         );
     }
+    let final_state = land_success_state(&workspace_root, &prepared).await;
     lease.status(LandStatus::Landed).await.ok();
     lease.release().await.ok();
     println!(
         "landed {} commit(s) on {}: {}",
         prepared.commits, prepared.base_branch, prepared.top_commit
     );
+    match final_state {
+        Ok(state) => {
+            println!("{}: {}", prepared.base_branch, state.base);
+            println!("working copy @: {}", state.working_copy);
+        }
+        Err(error) => {
+            eprintln!("warning: could not read final jj state: {error:#}");
+        }
+    }
     Ok(())
 }
 
@@ -173,6 +183,11 @@ struct LocalPreparedLand {
     top_commit: String,
     top_change: String,
     commits: usize,
+}
+
+struct LandSuccessState {
+    base: String,
+    working_copy: String,
 }
 
 async fn prepare_local_land(checkout: &Path, base_branch: &str) -> Result<LocalPreparedLand> {
@@ -363,6 +378,35 @@ async fn publish_local_land(checkout: &Path, prepared: &LocalPreparedLand) -> Re
     .await
     .context("move base bookmark")?;
     Ok(())
+}
+
+async fn land_success_state(
+    checkout: &Path,
+    prepared: &LocalPreparedLand,
+) -> Result<LandSuccessState> {
+    let base = jj_lines(
+        checkout,
+        &format!("present({})", prepared.base_branch),
+        r#"commit_id.short() ++ " " ++ description.first_line() ++ "\n""#,
+        true,
+    )
+    .await
+    .context("read landed bookmark state")?
+    .into_iter()
+    .next()
+    .context("landed bookmark is missing")?;
+    let working_copy = jj_lines(
+        checkout,
+        "@",
+        r#"commit_id.short() ++ " " ++ if(empty, "(empty) ", "") ++ if(description, description.first_line(), "(no description)") ++ "\n""#,
+        true,
+    )
+    .await
+    .context("read working-copy state")?
+    .into_iter()
+    .next()
+    .context("working copy is missing")?;
+    Ok(LandSuccessState { base, working_copy })
 }
 
 async fn jj_lines(

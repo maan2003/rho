@@ -35,12 +35,10 @@ rho land
 3. If land fails, read `.rho/log/land-failure.txt` and fix the underlying
    issue. Do not report success unless the land command exits successfully.
 
-4. After a successful land, verify jj state if useful:
-
-```sh
-jj status
-jj log -r 'main|@|@-' --no-graph --template 'commit_id.short() ++ " " ++ bookmarks ++ " | " ++ description.first_line() ++ "\n"'
-```
+4. After a successful land, trust the command's success output. It prints the
+   landed commit, the base bookmark's final target, and the current working
+   copy state. Do not run extra `jj status`/`jj log` commands unless the
+   output is missing, surprising, or the user explicitly asks for more detail.
 
 ## Notes
 
