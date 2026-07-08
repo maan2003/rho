@@ -396,7 +396,7 @@ fn latest_context_used(entries: &[TranscriptEntry]) -> Option<u64> {
         .iter()
         .filter(|entry| entry.visible(true))
         .filter_map(entry_context_used)
-        .last()
+        .next_back()
 }
 
 fn entry_context_used(entry: &TranscriptEntry) -> Option<u64> {

@@ -184,7 +184,7 @@ impl PendingEnrollments {
     ) -> Result<PendingApproval, BeginEnrollmentError> {
         self.prune();
         if let Some(existing_code) = self.active.iter().find_map(|(active_code, pending)| {
-            (pending.client_endpoint_id == client_endpoint_id).then_some(active_code.clone())
+            (pending.client_endpoint_id == client_endpoint_id).then_some(*active_code)
         }) {
             if let Some(existing) = self.active.remove(&existing_code) {
                 existing.approved.notify_waiters();

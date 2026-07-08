@@ -277,17 +277,17 @@ fn test_primitive_pack_unpack() {
     writer.put_u8(42); // Non-standard true value
     let mut reader = writer.freeze();
     let unpacked_bool: bool = bool::unpack(&mut reader).unwrap();
-    assert_eq!(true, unpacked_bool);
+    assert!(unpacked_bool);
 
     // Test f32 without tag
-    let f32_val = 3.14159f32;
+    let f32_val = 3.125f32;
     let packed_f32 = pack(&f32_val).unwrap();
     let mut reader = packed_f32;
     let unpacked_f32: f32 = unpack(&mut reader).unwrap();
     assert_eq!(f32_val, unpacked_f32);
 
     // Test f64 without tag
-    let f64_val = 2.718281828459045f64;
+    let f64_val = 2.625f64;
     let packed_f64 = pack(&f64_val).unwrap();
     let mut reader = packed_f64;
     let unpacked_f64: f64 = unpack(&mut reader).unwrap();
@@ -688,8 +688,8 @@ fn test_deeply_nested_struct_pack_unpack() {
                 },
                 optional_data: Some({
                     let mut map = HashMap::new();
-                    map.insert("pi".to_string(), 3.14159);
-                    map.insert("e".to_string(), 2.71828);
+                    map.insert("pi".to_string(), 3.125);
+                    map.insert("e".to_string(), 2.625);
                     map
                 }),
             },
@@ -1171,13 +1171,13 @@ fn test_all_primitive_types_pack_unpack() {
     assert_eq!(isize_val, unpacked_isize);
 
     // Test floating point types
-    let f32_val: f32 = 3.14159265;
+    let f32_val: f32 = 3.125;
     let packed_f32 = pack(&f32_val).unwrap();
     let mut reader = packed_f32;
     let unpacked_f32: f32 = unpack(&mut reader).unwrap();
     assert_eq!(f32_val, unpacked_f32);
 
-    let f64_val: f64 = 2.718281828459045;
+    let f64_val: f64 = 2.625;
     let packed_f64 = pack(&f64_val).unwrap();
     let mut reader = packed_f64;
     let unpacked_f64: f64 = unpack(&mut reader).unwrap();
@@ -1324,7 +1324,7 @@ fn test_primitive_arrays_pack_unpack() {
     let unpacked_i32_array: [i32; 3] = unpack(&mut reader).unwrap();
     assert_eq!(i32_array, unpacked_i32_array);
 
-    let f64_array: [f64; 2] = [3.14159, 2.71828];
+    let f64_array: [f64; 2] = [3.125, 2.625];
     let packed_f64_array = pack(&f64_array).unwrap();
     let mut reader = packed_f64_array;
     let unpacked_f64_array: [f64; 2] = unpack(&mut reader).unwrap();

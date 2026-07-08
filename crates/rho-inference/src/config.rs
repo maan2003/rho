@@ -46,14 +46,12 @@ impl senax_encoder::Decoder for DeepConfig {
         }
 
         Ok(Self {
-            effort: effort.ok_or_else(|| {
-                senax_encoder::EncoderError::StructDecode(
-                    senax_encoder::StructDecodeError::MissingRequiredField {
-                        field: "effort",
-                        struct_name: "DeepConfig",
-                    },
-                )
-            })?,
+            effort: effort.ok_or(senax_encoder::EncoderError::StructDecode(
+                senax_encoder::StructDecodeError::MissingRequiredField {
+                    field: "effort",
+                    struct_name: "DeepConfig",
+                },
+            ))?,
             fast_mode: fast_mode.unwrap_or(true),
         })
     }

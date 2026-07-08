@@ -326,21 +326,13 @@ fn is_option_type(ty: &Type) -> bool {
 /// This helper function extracts the wrapped type from an `Option` type.
 /// Returns `None` if the type is not an `Option`.
 fn extract_inner_type_from_option(ty: &Type) -> Option<&Type> {
-    if let Type::Path(type_path) = ty {
-        if type_path
-            .path
-            .segments
-            .last()
-            .is_some_and(|seg| seg.ident == "Option")
-        {
-            if let PathArguments::AngleBracketed(args) =
-                &type_path.path.segments.last().unwrap().arguments
-            {
-                if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
-                    return Some(inner_ty);
-                }
-            }
-        }
+    if let Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+        && segment.ident == "Option"
+        && let PathArguments::AngleBracketed(args) = &segment.arguments
+        && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+    {
+        return Some(inner_ty);
     }
     None
 }
@@ -364,7 +356,9 @@ fn extract_inner_type_from_option(ty: &Type) -> Option<&Type> {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
+/// use senax_encoder_derive::{Decode, Encode};
+///
 /// #[derive(Encode)]
 /// struct MyStruct {
 ///     #[senax(id = 1)]
@@ -712,7 +706,9 @@ pub fn derive_encode(input: TokenStream) -> TokenStream {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
+/// use senax_encoder_derive::{Decode, Encode};
+///
 /// #[derive(Decode)]
 /// struct MyStruct {
 ///     #[senax(id = 1)]
@@ -1199,7 +1195,9 @@ pub fn derive_decode(input: TokenStream) -> TokenStream {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
+/// use senax_encoder_derive::{Pack, Unpack};
+///
 /// #[derive(Pack)]
 /// struct MyStruct {
 ///     field1: i32,
@@ -1351,7 +1349,9 @@ pub fn derive_pack(input: TokenStream) -> TokenStream {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
+/// use senax_encoder_derive::{Pack, Unpack};
+///
 /// #[derive(Unpack)]
 /// struct MyStruct {
 ///     field1: i32,

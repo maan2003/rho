@@ -103,7 +103,7 @@ fn command_path_argument_completion_is_filesystem() {
 #[test]
 fn command_parse_known_and_unknown() {
     use rho_commands::{Command, Parsed, parse};
-    assert!(matches!(parse("hello"), None));
+    assert!(parse("hello").is_none());
     assert!(matches!(
         parse(":quit"),
         Some(Parsed::Command(Command::Quit))

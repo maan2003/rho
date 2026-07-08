@@ -246,7 +246,7 @@ impl Workspace {
                 self.registry.set_attention(agent_id, attention);
                 cx.notify();
             }
-            ConnEvent::TurnCancelled(_) => {
+            ConnEvent::TurnCancelled => {
                 // Cancellation is an acknowledgement for an in-flight action,
                 // not transcript content. The system notice buffer is
                 // intentionally persistent, so rendering it there leaves

@@ -413,6 +413,7 @@ pub enum StartWorkspace {
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         db: RhoDb,
         auth: InferenceAuth,
@@ -1415,8 +1416,8 @@ fn final_answer_text(items: &[InferenceResponseItem]) -> String {
                 InferenceResponseItem::AssistantMessage { content, phase, .. }
                     if !want_final || *phase == Some(rho_core::MessagePhase::FinalAnswer) =>
                 {
-                    Some(content.iter().filter_map(|part| match part {
-                        ContentPart::Text { text } => Some(text.as_str()),
+                    Some(content.iter().map(|part| match part {
+                        ContentPart::Text { text } => text.as_str(),
                     }))
                 }
                 _ => None,

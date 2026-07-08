@@ -713,7 +713,7 @@ fn turn_cancelled_ack_is_not_persisted_as_notice(cx: &mut TestAppContext) {
     );
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(ConnEvent::TurnCancelled(agent(1)), window, cx);
+            workspace.handle_event(ConnEvent::TurnCancelled, window, cx);
         })
         .expect("handle cancellation acknowledgement");
 

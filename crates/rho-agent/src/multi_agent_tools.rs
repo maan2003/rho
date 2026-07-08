@@ -371,8 +371,8 @@ async fn send_message(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Resul
     )
     .await?;
     Ok(format!(
-        "Message sent to agent {}.",
-        format!("ag-{}", pool.agent_id_prefix(recipient))
+        "Message sent to agent ag-{}.",
+        pool.agent_id_prefix(recipient)
     ))
 }
 
@@ -407,8 +407,8 @@ async fn interrupt_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Re
     let (_, agent, _) = pool.load(target).await?;
     agent.cancel();
     Ok(format!(
-        "Agent {} interrupted. It remains available for follow-up messages.",
-        format!("ag-{}", pool.agent_id_prefix(target))
+        "Agent ag-{} interrupted. It remains available for follow-up messages.",
+        pool.agent_id_prefix(target)
     ))
 }
 

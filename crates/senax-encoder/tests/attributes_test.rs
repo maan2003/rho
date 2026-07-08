@@ -108,7 +108,7 @@ fn test_skip_encode_attribute() {
     let original = StructWithSkipEncode {
         normal_field: 42,
         another_normal_field: "test".to_string(),
-        skip_encode_field: 3.14, // Not encoded
+        skip_encode_field: 3.125, // Not encoded
         last_field: true,
     };
 
@@ -122,7 +122,7 @@ fn test_skip_encode_attribute() {
     assert_eq!(decoded.normal_field, 42);
     assert_eq!(decoded.another_normal_field, "test");
     assert_eq!(decoded.skip_encode_field, 0.0); // Default value (skip_encode+default)
-    assert_eq!(decoded.last_field, true);
+    assert!(decoded.last_field);
 }
 
 // =============================================================================
@@ -156,14 +156,14 @@ fn test_skip_encode_with_option() {
 
     assert_eq!(decoded.normal_field, 42);
     assert_eq!(decoded.skip_encode_optional, None);
-    assert_eq!(decoded.last_field, true);
+    assert!(decoded.last_field);
 }
 
 // =============================================================================
 // #[senax(skip_decode)] test
 // =============================================================================
 
-#[derive(Encode, Decode, Debug, PartialEq)]
+#[derive(Encode, Decode, Debug, Default, PartialEq)]
 struct StructWithSkipDecode {
     #[senax(id = 1)]
     normal_field: i32,
@@ -171,16 +171,6 @@ struct StructWithSkipDecode {
     skip_decode_field: String,
     #[senax(id = 3)]
     last_field: bool,
-}
-
-impl Default for StructWithSkipDecode {
-    fn default() -> Self {
-        Self {
-            normal_field: 0,
-            skip_decode_field: String::new(),
-            last_field: false,
-        }
-    }
 }
 
 #[derive(Encode, Decode, Debug, PartialEq)]
@@ -211,7 +201,7 @@ fn test_skip_decode_attribute() {
 
     assert_eq!(decoded.normal_field, 42);
     assert_eq!(decoded.skip_decode_field, String::new()); // Default::default() = ""
-    assert_eq!(decoded.last_field, true);
+    assert!(decoded.last_field);
 }
 
 // =============================================================================
@@ -264,7 +254,7 @@ fn test_multiple_attributes_combination() {
     assert_eq!(decoded.default_field, "custom");
     assert_eq!(decoded.skip_encode_field, 0.0); // Default value (skip_encode+default)
     assert_eq!(decoded.skip_decode_with_default, Vec::<u8>::new()); // Default value (skip_decode+default)
-    assert_eq!(decoded.last_normal_field, true);
+    assert!(decoded.last_normal_field);
 }
 
 // =============================================================================
@@ -293,7 +283,7 @@ fn test_enum_with_attributes() {
     let original = EnumWithAttributes::VariantA {
         normal_field: 42,
         default_field: "test".to_string(),
-        _skip_encode_field: 3.14, // Not encoded
+        _skip_encode_field: 3.125, // Not encoded
     };
 
     let mut buffer = BytesMut::new();
@@ -451,7 +441,7 @@ fn test_custom_id_with_attributes() {
     assert_eq!(decoded.field_a, 123);
     assert_eq!(decoded.field_b, "custom");
     assert_eq!(decoded.field_c, 0.0); // Default value
-    assert_eq!(decoded.field_d, false); // Default value
+    assert!(!decoded.field_d); // Default value
 }
 
 // =============================================================================
@@ -757,7 +747,7 @@ fn test_enum_with_u8_id() {
     let original = EnumWithU8Id::VariantA {
         normal_field: 42,
         default_field: "test".to_string(),
-        _skip_encode_field: 3.14, // Not encoded
+        _skip_encode_field: 3.125, // Not encoded
     };
 
     let mut buffer = BytesMut::new();

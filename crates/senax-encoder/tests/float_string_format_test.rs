@@ -4,7 +4,7 @@ use senax_encoder::{decode, encode};
 #[test]
 fn test_f32_scientific_notation_format() {
     // Test that f32 is encoded as scientific notation string
-    let value: f32 = 3.14159;
+    let value: f32 = 3.125;
     let mut bytes = encode(&value).unwrap();
     let decoded: f32 = decode(&mut bytes).unwrap();
     assert!((decoded - value).abs() < 1e-6);
@@ -25,7 +25,7 @@ fn test_f32_scientific_notation_format() {
 #[test]
 fn test_f64_scientific_notation_format() {
     // Test that f64 is encoded as scientific notation string
-    let value: f64 = 3.141592653589793;
+    let value: f64 = 3.125;
     let mut bytes = encode(&value).unwrap();
     let decoded: f64 = decode(&mut bytes).unwrap();
     assert!((decoded - value).abs() < 1e-15);
@@ -76,12 +76,12 @@ fn test_f64_backward_compatibility() {
 #[test]
 fn test_f32_f64_cross_decode_string_format() {
     // Test cross-decoding with new string format
-    let v32: f32 = 3.14159;
+    let v32: f32 = 3.125;
     let mut bytes = encode(&v32).unwrap();
     let v64: f64 = decode(&mut bytes).unwrap();
     assert!((v64 - v32 as f64).abs() < 1e-6);
 
-    let v64_orig: f64 = 2.71828;
+    let v64_orig: f64 = 2.625;
     let mut bytes = encode(&v64_orig).unwrap();
     let v32_decoded: f32 = decode(&mut bytes).unwrap();
     assert!((v32_decoded as f64 - v64_orig).abs() < 1e-5);

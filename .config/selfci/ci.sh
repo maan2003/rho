@@ -13,12 +13,12 @@ function job_cargo() {
   fi
 
   selfci step start "clippy"
-  if ! cargo clippy --locked --workspace --all-targets -- --allow deprecated --allow clippy::approx_constant; then
+  if ! cargo clippy --locked --workspace --all-targets -- --deny warnings --allow deprecated; then
     selfci step fail
   fi
 
   selfci step start "test"
-  if ! cargo test --locked --workspace --lib --bins --tests; then
+  if ! cargo test --locked --workspace; then
     selfci step fail
   fi
 }

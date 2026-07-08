@@ -34,7 +34,7 @@ pub enum ConnEvent {
         agent_id: AgentId,
         frame: AgentRemoteFrame,
     },
-    TurnCancelled(AgentId),
+    TurnCancelled,
     AgentAttention {
         agent_id: AgentId,
         attention: rho_ui_proto::UiAttention,
@@ -165,7 +165,7 @@ async fn run(
             ServerMessage::AgentCreated { agent_id, .. } => Some(ConnEvent::AgentCreated(agent_id)),
             ServerMessage::AgentLoaded { agent_id } => Some(ConnEvent::AgentLoaded(agent_id)),
             ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame { agent_id, frame }),
-            ServerMessage::TurnCancelled { agent_id } => Some(ConnEvent::TurnCancelled(agent_id)),
+            ServerMessage::TurnCancelled { .. } => Some(ConnEvent::TurnCancelled),
             ServerMessage::AgentAttention {
                 agent_id,
                 attention,

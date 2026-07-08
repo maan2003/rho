@@ -92,7 +92,7 @@ enum CustomIdEnum {
 fn test_primitive_encode() {
     let u32_value: u32 = 42;
     let i32_value: i32 = -42;
-    let f64_value: f64 = 3.14;
+    let f64_value: f64 = 3.125;
     let bool_value: bool = true;
 
     let mut buffer = BytesMut::new();
@@ -104,8 +104,8 @@ fn test_primitive_encode() {
     let mut reader = buffer.freeze();
     assert_eq!(u32::decode(&mut reader).unwrap(), 42);
     assert_eq!(i32::decode(&mut reader).unwrap(), -42);
-    assert!((f64::decode(&mut reader).unwrap() - 3.14).abs() < 1e-10);
-    assert_eq!(bool::decode(&mut reader).unwrap(), true);
+    assert!((f64::decode(&mut reader).unwrap() - 3.125).abs() < 1e-10);
+    assert!(bool::decode(&mut reader).unwrap());
 }
 
 #[test]
@@ -578,7 +578,7 @@ fn test_signed_integer_compact_encoding() {
 #[test]
 fn test_float_cross_decode() {
     // f32→f64 cross-decoding is now supported (both use string format)
-    let v32: f32 = 3.1415927;
+    let v32: f32 = 3.125;
     let mut buf = BytesMut::new();
     v32.encode(&mut buf).unwrap();
     let mut cur = buf.freeze();
@@ -591,7 +591,7 @@ fn test_float_cross_decode() {
     );
 
     // f64→f32 (with precision loss)
-    let v64: f64 = 2.718281828459045;
+    let v64: f64 = 2.625;
     let mut buf = BytesMut::new();
     v64.encode(&mut buf).unwrap();
     let mut cur = buf.freeze();
@@ -899,6 +899,7 @@ fn test_bytes_string_compatibility() {
 }
 
 // For complex data structure tests (Option<u16> removed)
+#[allow(dead_code)]
 #[derive(Encode, Decode, Debug, PartialEq)]
 struct Address {
     street: String,
@@ -907,6 +908,7 @@ struct Address {
     coordinates: Option<(f64, f64)>,
 }
 
+#[allow(dead_code)]
 #[derive(Encode, Decode, Debug, PartialEq)]
 struct PersonalInfo {
     first_name: String,
@@ -932,6 +934,7 @@ enum PaymentMethod {
     },
 }
 
+#[allow(dead_code)]
 #[derive(Encode, Decode, Debug, PartialEq)]
 struct OrderItem {
     product_id: u64,
@@ -1050,10 +1053,10 @@ fn test_complex_struct_encode() {
             let mut outer_map = HashMap::new();
             let mut inner_vec = Vec::new();
             let mut inner_map1 = HashMap::new();
-            inner_map1.insert("key1".to_string(), Some((42, 3.14159, true)));
+            inner_map1.insert("key1".to_string(), Some((42, 3.125, true)));
             inner_map1.insert("key2".to_string(), None);
             let mut inner_map2 = HashMap::new();
-            inner_map2.insert("nested".to_string(), Some((-123, 2.71828, false)));
+            inner_map2.insert("nested".to_string(), Some((-123, 2.625, false)));
             inner_vec.push(inner_map1);
             inner_vec.push(inner_map2);
             outer_map.insert("category_a".to_string(), inner_vec);
@@ -1086,7 +1089,7 @@ fn test_complex_struct_encode() {
         decoded.payment_methods[0],
         PaymentMethod::CreditCard { .. }
     ));
-    assert_eq!(decoded.binary_attachment.is_some(), true);
+    assert!(decoded.binary_attachment.is_some());
     assert_eq!(decoded.discount_codes.len(), 2);
     assert_eq!(decoded.order_notes.len(), 3);
     assert_eq!(decoded.nested_data.len(), 1);
@@ -1278,7 +1281,7 @@ fn test_decimal_encode() {
         Decimal::new(-456, 0),                                               // -456
         Decimal::new(12345, 2),                                              // 123.45
         Decimal::new(-67890, 3),                                             // -67.890
-        Decimal::from_str("3.14159").unwrap(),                               // π approximation
+        Decimal::from_str("3.125").unwrap(),                                 // π approximation
         Decimal::from_str("999999999999999999999999999.999999999").unwrap(), // Large value
         Decimal::from_str("-999999999999999999999999999.999999999").unwrap(), /* Large negative
                                                                               * value */
@@ -1862,7 +1865,7 @@ fn test_serde_json_value_encode() {
         Value::Bool(true),
         Value::Bool(false),
         json!(42),
-        json!(3.14159),
+        json!(3.125),
         json!("hello world"),
         json!([1, 2, 3, "four", null]),
         json!({
@@ -2016,7 +2019,7 @@ fn test_is_default_method() {
     assert!(false.is_default());
     assert!(!true.is_default());
     assert!(0.0f64.is_default());
-    assert!(!3.14f64.is_default());
+    assert!(!3.125f64.is_default());
 
     // Test String
     assert!("".to_string().is_default());
@@ -2321,7 +2324,7 @@ fn test_unnamed_struct_with_complex_types() {
         Some("hello".to_string()),
         vec![1, 2, 3, 4, 5],
         map,
-        (3.14, 2.71),
+        (3.125, 2.625),
     );
 
     let mut buffer = BytesMut::new();
@@ -2832,12 +2835,13 @@ fn test_box_generic_encode_decode() {
     }
 }
 
+#[allow(clippy::box_collection)]
 #[derive(Encode, Decode, Debug, PartialEq)]
 struct BoxGenericStruct {
     name: Box<String>,
     id: Box<i32>,
     data: Box<Vec<u8>>,
-    nickname: Option<Box<String>>,
+    nickname: Option<Box<i32>>,
 }
 
 #[test]
@@ -2847,7 +2851,7 @@ fn test_struct_with_box_generic_fields() {
             name: Box::new("Alice".to_string()),
             id: Box::new(42),
             data: Box::new(vec![1, 2, 3]),
-            nickname: Some(Box::new("Ally".to_string())),
+            nickname: Some(Box::new(7)),
         },
         BoxGenericStruct {
             name: Box::new("Bob".to_string()),
@@ -2859,13 +2863,13 @@ fn test_struct_with_box_generic_fields() {
             name: Box::new("".to_string()),
             id: Box::new(-999),
             data: Box::new(vec![0xFF]),
-            nickname: Some(Box::new("".to_string())),
+            nickname: Some(Box::new(-7)),
         },
         BoxGenericStruct {
             name: Box::new("こんにちは".to_string()),
             id: Box::new(i32::MAX),
             data: Box::new(vec![0x00, 0x01, 0x02]),
-            nickname: Some(Box::new("世界".to_string())),
+            nickname: Some(Box::new(i32::MIN)),
         },
     ];
     for original in cases {

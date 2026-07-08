@@ -64,13 +64,13 @@ pub fn elision_plans_from(
             LIMITED_TAIL_ROWS
         };
 
-        for offset in 0..turn.len() {
+        for (offset, block) in turn.iter().enumerate() {
             let index = turn_start + offset;
             if !visible.get(index).copied().unwrap_or(false) {
                 continue;
             }
-            if block_is_working(&turn[offset]) {
-                let is_tool = matches!(turn[offset], UiBlock::Tool(_));
+            if block_is_working(block) {
+                let is_tool = matches!(block, UiBlock::Tool(_));
                 match current.as_mut() {
                     Some(plan) if plan.tail_rows == tail_rows => {
                         plan.end_block = index;

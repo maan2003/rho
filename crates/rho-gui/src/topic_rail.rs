@@ -327,6 +327,7 @@ impl LampColors {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_topic_rows(
     topic: &UiTopic,
     agents: Vec<&UiAgentSummary>,

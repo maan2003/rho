@@ -670,10 +670,10 @@ impl JsonStreamParser {
 
         add_char_into_object(&mut self.stack, current_char)?;
 
-        if let Some(max_depth) = self.max_depth {
-            if self.stack.len() > max_depth {
-                return Err("max depth exceeded".to_string());
-            }
+        if let Some(max_depth) = self.max_depth
+            && self.stack.len() > max_depth
+        {
+            return Err("max depth exceeded".to_string());
         }
 
         Ok(())

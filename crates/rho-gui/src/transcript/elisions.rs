@@ -42,6 +42,7 @@ impl ElisionSync {
     /// Recomputes plans from the changed turn onward and reconciles the
     /// editor's display elisions with them. `plan_range` resolves a plan to
     /// its buffer anchor range.
+    #[allow(clippy::too_many_arguments)]
     pub fn refresh<V: 'static>(
         &mut self,
         blocks: &[UiBlock],

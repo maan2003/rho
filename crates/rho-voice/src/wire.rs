@@ -174,7 +174,7 @@ pub enum ServerEvent {
     InputAudioSpeechStopped(InputAudioSpeechStoppedEvent),
     InputAudioBufferCommitted(InputAudioBufferCommittedEvent),
     InputAudioBufferCleared(InputAudioBufferClearedEvent),
-    ResponseCreated(ResponseCreatedEvent),
+    ResponseCreated(Box<ResponseCreatedEvent>),
     ResponseOutputItemAdded(ResponseOutputItemEvent),
     ResponseOutputItemDone(ResponseOutputItemEvent),
     ResponseContentPartAdded(ResponseContentPartAddedEvent),
@@ -188,7 +188,7 @@ pub enum ServerEvent {
     TextDone(TextDoneEvent),
     FunctionCallArgumentsDelta(FunctionCallArgumentsDeltaEvent),
     FunctionCallArgumentsDone(FunctionCallArgumentsDoneEvent),
-    ResponseDone(ResponseDoneEvent),
+    ResponseDone(Box<ResponseDoneEvent>),
     Error(ErrorEvent),
     Unknown {
         event_type: String,
@@ -566,7 +566,9 @@ pub fn parse_server_event(text: &str) -> Result<ServerEvent> {
         "input_audio_buffer.cleared" => {
             ServerEvent::InputAudioBufferCleared(parse_event(raw, "input_audio_buffer.cleared")?)
         }
-        "response.created" => ServerEvent::ResponseCreated(parse_event(raw, "response.created")?),
+        "response.created" => {
+            ServerEvent::ResponseCreated(Box::new(parse_event(raw, "response.created")?))
+        }
         "response.output_item.added" => {
             ServerEvent::ResponseOutputItemAdded(parse_event(raw, "response.output_item.added")?)
         }
@@ -610,7 +612,7 @@ pub fn parse_server_event(text: &str) -> Result<ServerEvent> {
         "response.function_call_arguments.done" => ServerEvent::FunctionCallArgumentsDone(
             parse_event(raw, "response.function_call_arguments.done")?,
         ),
-        "response.done" => ServerEvent::ResponseDone(parse_event(raw, "response.done")?),
+        "response.done" => ServerEvent::ResponseDone(Box::new(parse_event(raw, "response.done")?)),
         "error" => ServerEvent::Error(parse_event(raw, "error")?),
         _ => ServerEvent::Unknown { event_type, raw },
     })
