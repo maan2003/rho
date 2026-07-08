@@ -320,6 +320,12 @@ impl ChatApp {
                 self.term
                     .print_system("runtime mode changes are only available in rho-gui");
             }
+            rho_commands::Command::AgentDone | rho_commands::Command::AgentSnooze { .. } => {
+                // Attention triage lives in the GUI rail; the CLI fronts a
+                // single agent and has nothing to clear.
+                self.term
+                    .print_system(":done and :snooze are only available in rho-gui");
+            }
             rho_commands::Command::Rewind { turns } => {
                 if self.turn_is_running() {
                     self.term

@@ -28,7 +28,8 @@ use crate::store::{AgentStore, FrameSummary};
 use crate::style::{ModeFamily, StyleClass};
 use crate::voice_audio::VoiceAudio;
 use crate::{
-    AgentNew, AgentNext, AgentPrevious, RoleCycle, RoleCycleGroup, SubmitPrompt, TaskBoard,
+    AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, RoleCycle, RoleCycleGroup,
+    SubmitPrompt, TaskBoard,
 };
 
 const MAX_VOICE_TRANSCRIPT_LINES: usize = 12;
@@ -236,6 +237,13 @@ impl Workspace {
                         .or_insert(summary);
                 }
                 self.ensure_duration_timer(cx);
+                cx.notify();
+            }
+            ConnEvent::AgentAttention {
+                agent_id,
+                attention,
+            } => {
+                self.registry.set_attention(agent_id, attention);
                 cx.notify();
             }
             ConnEvent::TurnCancelled(_) => {
@@ -650,6 +658,23 @@ impl Workspace {
                 self.connection
                     .send(ClientMessage::RenameTopic { topic_id, name });
             }
+            Command::AgentDone => {
+                self.set_agent_disposition(
+                    source_agent,
+                    ":done",
+                    rho_ui_proto::AgentDisposition::Done,
+                    cx,
+                );
+            }
+            Command::AgentSnooze { duration_ms } => {
+                let until = rho_core::UnixMs(now_ms().saturating_add(duration_ms));
+                self.set_agent_disposition(
+                    source_agent,
+                    ":snooze",
+                    rho_ui_proto::AgentDisposition::Snoozed { until },
+                    cx,
+                );
+            }
             Command::AgentPin => {
                 self.toggle_agent_status(source_agent, rho_ui_proto::Status::Pinned, window, cx);
             }
@@ -820,6 +845,43 @@ impl Workspace {
         {
             self.select_agent(None, window, cx);
         }
+    }
+
+    /// Clears (or snoozes) an agent's claim on the user's attention. The
+    /// daemon echoes the resulting attention level back as a broadcast, so
+    /// the rail updates through the normal event path.
+    fn set_agent_disposition(
+        &mut self,
+        source_agent: Option<AgentId>,
+        command: &str,
+        disposition: rho_ui_proto::AgentDisposition,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
+        else {
+            let message = format!("{command}: no agent selected");
+            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+            return;
+        };
+        self.connection.send(ClientMessage::SetAgentDisposition {
+            agent_id,
+            disposition,
+        });
+    }
+
+    /// Jumps to the rail's most urgent agent (excluding the current one), so
+    /// working through a backlog is one keystroke per agent.
+    pub fn jump_to_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.registry.next_attention_agent() else {
+            self.notice_on(
+                None,
+                "attention-jump: nothing is waiting on you",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        self.open_agent(agent_id, window, cx);
     }
 
     /// Pin/archive toggle for a topic named by argument, defaulting to the
@@ -1587,6 +1649,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &AgentNew, window, cx| {
                 this.enter_draft(None, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AgentJumpAttention, window, cx| {
+                this.jump_to_attention(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AgentDone, _window, cx| {
+                this.set_agent_disposition(None, ":done", rho_ui_proto::AgentDisposition::Done, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(

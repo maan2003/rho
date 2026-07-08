@@ -30,6 +30,13 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// Keyed by the workdir's absolute path (UTF-8; paths are strings on disk
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
+/// Attention bookkeeping per agent: when it last finished a turn, whether
+/// that turn ended blocked on the user, and what the user did about it.
+/// Rows appear on an agent's first turn end; absence means "never finished
+/// a turn". Kept out of [`AgentRecord`] so the hot turn-end write never
+/// rewrites agent metadata.
+const AGENT_ATTENTION: TableDefinition<AgentId, Sen<AgentAttentionRecord>> =
+    TableDefinition::new("agent_attention");
 
 const CURRENT_AGENT_DB_FORMAT: &str = "9c4e2a8f";
 
@@ -314,6 +321,33 @@ pub enum Status {
     Archived,
 }
 
+/// What the user did about an agent's last finished turn. Attention is
+/// action-cleared (the email-triage model): a turn end always demands a
+/// disposition, and merely looking at the agent never provides one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum AgentDisposition {
+    /// No disposition yet: the ball is in the user's court.
+    #[default]
+    Pending,
+    /// Acknowledged; nothing more needed until the next turn end.
+    Done,
+    /// Deferred: quiet until `until`, then pending again (the Slack-reminder
+    /// move for "I'll get back to this").
+    Snoozed { until: UnixMillis },
+}
+
+/// See [`AGENT_ATTENTION`]. Replying needs no record change: sending a
+/// message puts the agent back to work, and the next turn end overwrites
+/// the disposition with `Pending`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AgentAttentionRecord {
+    /// When the agent last finished a turn.
+    pub last_turn_end: UnixMillis,
+    /// That turn ended blocked on the user (error or unfinished calls).
+    pub needs_input: bool,
+    pub disposition: AgentDisposition,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct TopicRecord {
     pub name: String,
@@ -477,6 +511,11 @@ pub trait AgentReadTxnExt {
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
+    /// `None` until the agent finishes its first turn.
+    fn agent_attention(&self, agent_id: AgentId) -> Option<AgentAttentionRecord>;
+    /// Every attention row; the daemon scans this at startup to re-arm
+    /// snooze timers.
+    fn list_agent_attention(&self) -> Vec<(AgentId, AgentAttentionRecord)>;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -530,6 +569,12 @@ pub trait AgentWriteTxnExt {
         agent_id: AgentId,
         parent: AgentEventPos,
     ) -> AgentEventPos;
+
+    /// Records a turn end for attention purposes; resets the disposition to
+    /// `Pending` — every finished turn demands a fresh disposition.
+    fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId, needs_input: bool);
+
+    fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
 }
 
 impl AgentReadTxnExt for ReadTxn {
@@ -657,6 +702,19 @@ impl AgentReadTxnExt for ReadTxn {
         }
         (next, events)
     }
+
+    fn agent_attention(&self, agent_id: AgentId) -> Option<AgentAttentionRecord> {
+        self.open_table(AGENT_ATTENTION)
+            .get(&agent_id)
+            .map(|record| record.value().into_owned())
+    }
+
+    fn list_agent_attention(&self) -> Vec<(AgentId, AgentAttentionRecord)> {
+        self.open_table(AGENT_ATTENTION)
+            .iter()
+            .map(|(key, value)| (key.value(), value.value().into_owned()))
+            .collect()
+    }
 }
 
 impl AgentWriteTxnExt for WriteTxn {
@@ -673,6 +731,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(TOPICS);
         self.open_table(TOPIC_AGENTS);
         self.open_table(WORKDIRS);
+        self.open_table(AGENT_ATTENTION);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
@@ -831,6 +890,31 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENT_EVENTS)
             .insert(&at, SenValue::borrowed(event));
         at.next()
+    }
+
+    fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId, needs_input: bool) {
+        self.open_table(AGENT_ATTENTION).insert(
+            &agent_id,
+            SenValue::borrowed(&AgentAttentionRecord {
+                last_turn_end: now,
+                needs_input,
+                disposition: AgentDisposition::Pending,
+            }),
+        );
+    }
+
+    fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition) {
+        let mut table = self.open_table(AGENT_ATTENTION);
+        let mut record = table
+            .get(&agent_id)
+            .map(|record| record.value().into_owned())
+            .unwrap_or(AgentAttentionRecord {
+                last_turn_end: UnixMs(0),
+                needs_input: false,
+                disposition,
+            });
+        record.disposition = disposition;
+        table.insert(&agent_id, SenValue::borrowed(&record));
     }
 
     fn fork_agent_lineage(

@@ -771,9 +771,12 @@ mod tests {
     use std::num::NonZeroU64;
 
     use rho_agent::{FailedInferenceResponse, ToolPreview, ToolPreviewMetadata};
+    // `register_senax_tagged!` names the trait and its registry entry type
+    // unqualified, so both must be imported from the declaring crate.
     use rho_core::{
-        AStr, ApplyPatchMetadata, ContentPart, PendingInferenceResponse, ToolCall, ToolCallId,
-        ToolFileChange, ToolFileStatus, ToolName, ToolOutput, ToolResult, ToolType,
+        AStr, ApplyPatchMetadata, ContentPart, PendingInferenceResponse, ProviderSpecificData,
+        ToolCall, ToolCallId, ToolFileChange, ToolFileStatus, ToolName, ToolOutput, ToolResult,
+        ToolType, __SenaxProviderSpecificDataEntry,
     };
     use senax_encoder::{Decode, Encode};
 

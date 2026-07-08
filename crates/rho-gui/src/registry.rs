@@ -31,6 +31,9 @@ pub enum ActivePane {
 #[derive(Default)]
 pub struct AgentRegistry {
     agents: BTreeMap<AgentId, AgentLife>,
+    /// Live attention overlay: broadcasts land here between topic refreshes,
+    /// which re-seed it from the summaries' snapshot.
+    attention: BTreeMap<AgentId, rho_ui_proto::UiAttention>,
     topics: Vec<UiTopic>,
     active: ActivePane,
     /// The daemon database's machine seed, from `Ready`; kept for consumers
@@ -58,12 +61,39 @@ impl AgentRegistry {
     }
 
     pub fn set_topics(&mut self, topics: Vec<UiTopic>) {
+        self.attention.clear();
         for topic in &topics {
-            for agent_id in topic.agent_ids() {
-                self.agents.entry(agent_id).or_insert(AgentLife::Known);
+            for agent in &topic.agents {
+                self.agents
+                    .entry(agent.agent_id)
+                    .or_insert(AgentLife::Known);
+                self.attention.insert(agent.agent_id, agent.attention);
             }
         }
         self.topics = topics;
+    }
+
+    pub fn set_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
+        self.attention.insert(agent_id, attention);
+    }
+
+    pub fn attention(&self, agent_id: AgentId) -> rho_ui_proto::UiAttention {
+        self.attention.get(&agent_id).copied().unwrap_or_default()
+    }
+
+    /// The rail-visible agent most in need of the user, excluding the one
+    /// already on screen: highest attention wins, rail order breaks ties.
+    /// Only Pending and above count — jumping to a quiet or merely working
+    /// agent would be noise.
+    pub fn next_attention_agent(&self) -> Option<AgentId> {
+        let selected = self.selected_agent().copied();
+        self.rail_order()
+            .into_iter()
+            .filter(|agent_id| Some(*agent_id) != selected && !self.agent_hidden(*agent_id))
+            .map(|agent_id| (agent_id, self.attention(agent_id)))
+            .filter(|(_, attention)| *attention >= rho_ui_proto::UiAttention::Pending)
+            .min_by_key(|(_, attention)| Reverse(*attention))
+            .map(|(agent_id, _)| agent_id)
     }
 
     /// Where a new agent should work: the newest agent in the topic sets the
@@ -201,33 +231,8 @@ impl AgentRegistry {
     /// the current selection. Cycling follows rail order (topics, then
     /// agents within each topic); agent id order is meaningless.
     pub fn next_live_agent(&self, delta: isize) -> Option<AgentId> {
-        let mut topics = self.topics.iter().collect::<Vec<_>>();
-        topics.sort_by_key(|topic| topic.status != rho_ui_proto::Status::Pinned);
-
-        let mut candidates = Vec::new();
-        for topic in topics {
-            if topic.status == rho_ui_proto::Status::Archived {
-                continue;
-            }
-            let mut agents = topic
-                .agents
-                .iter()
-                .filter(|agent| agent.status != rho_ui_proto::Status::Archived)
-                .collect::<Vec<_>>();
-            agents.sort_by_key(|agent| {
-                (
-                    agent.status != rho_ui_proto::Status::Pinned,
-                    Reverse(agent.created_at),
-                )
-            });
-            candidates.extend(agents.into_iter().map(|agent| agent.agent_id));
-        }
-        for agent_id in self.agents.keys() {
-            if !candidates.contains(agent_id) {
-                candidates.push(*agent_id);
-            }
-        }
-        let live = candidates
+        let live = self
+            .rail_order()
             .into_iter()
             .filter(|agent_id| {
                 self.agents.get(agent_id) == Some(&AgentLife::Live) && !self.agent_hidden(*agent_id)
@@ -243,6 +248,40 @@ impl AgentRegistry {
             .map(|index| (index as isize + delta).rem_euclid(len) as usize)
             .unwrap_or_else(|| if delta < 0 { live.len() - 1 } else { 0 });
         live.get(index).copied()
+    }
+
+    /// All agents in rail display order: pinned topics first, and within a
+    /// topic attention-first, then pins, then newest. Agents known outside
+    /// any topic summary trail at the end.
+    fn rail_order(&self) -> Vec<AgentId> {
+        let mut topics = self.topics.iter().collect::<Vec<_>>();
+        topics.sort_by_key(|topic| topic.status != rho_ui_proto::Status::Pinned);
+
+        let mut candidates = Vec::new();
+        for topic in topics {
+            if topic.status == rho_ui_proto::Status::Archived {
+                continue;
+            }
+            let mut agents = topic
+                .agents
+                .iter()
+                .filter(|agent| agent.status != rho_ui_proto::Status::Archived)
+                .collect::<Vec<_>>();
+            agents.sort_by_key(|agent| {
+                (
+                    Reverse(self.attention(agent.agent_id)),
+                    agent.status != rho_ui_proto::Status::Pinned,
+                    Reverse(agent.created_at),
+                )
+            });
+            candidates.extend(agents.into_iter().map(|agent| agent.agent_id));
+        }
+        for agent_id in self.agents.keys() {
+            if !candidates.contains(agent_id) {
+                candidates.push(*agent_id);
+            }
+        }
+        candidates
     }
 
     /// Resolves an agent label (as produced by [`Self::agent_id_label`],
@@ -291,6 +330,7 @@ mod tests {
                 repo: "/tmp".into(),
             },
             status,
+            attention: rho_ui_proto::UiAttention::Quiet,
         }
     }
 
@@ -313,6 +353,7 @@ mod tests {
                 id: workspace_id,
             },
             status: Status::Normal,
+            attention: rho_ui_proto::UiAttention::Quiet,
         }
     }
 
@@ -373,6 +414,57 @@ mod tests {
         assert_eq!(registry.next_live_agent(-1), Some(visible));
         assert!(registry.agent_hidden(agent_id(2)));
         assert!(registry.agent_hidden(agent_id(3)));
+    }
+
+    #[test]
+    fn attention_jump_picks_most_urgent_excluding_selected() {
+        use rho_ui_proto::UiAttention;
+
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic(
+            1,
+            Status::Normal,
+            vec![
+                agent(1, Status::Normal),
+                agent(2, Status::Normal),
+                agent(3, Status::Normal),
+            ],
+        )]);
+        assert_eq!(registry.next_attention_agent(), None);
+
+        registry.set_attention(agent_id(1), UiAttention::Pending);
+        registry.set_attention(agent_id(2), UiAttention::NeedsInput);
+        registry.set_attention(agent_id(3), UiAttention::Working);
+        assert_eq!(registry.next_attention_agent(), Some(agent_id(2)));
+
+        // The agent already on screen never wins the jump; the next-most
+        // urgent one does. Working alone never qualifies.
+        registry.select_agent(agent_id(2));
+        assert_eq!(registry.next_attention_agent(), Some(agent_id(1)));
+        registry.set_attention(agent_id(1), UiAttention::Quiet);
+        assert_eq!(registry.next_attention_agent(), None);
+    }
+
+    #[test]
+    fn attention_outranks_pins_in_rail_order() {
+        use rho_ui_proto::UiAttention;
+
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic(
+            1,
+            Status::Normal,
+            vec![agent(1, Status::Normal), agent(2, Status::Pinned)],
+        )]);
+        for id in 1..=2 {
+            registry.mark_live(agent_id(id));
+        }
+        registry.set_attention(agent_id(1), UiAttention::NeedsInput);
+
+        // Pinned agent 2 would lead by status, but agent 1's attention
+        // pushes it to the top of the rail (and thus of cycling).
+        registry.select_agent(agent_id(1));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
+        assert_eq!(registry.next_live_agent(-1), Some(agent_id(2)));
     }
 
     #[test]

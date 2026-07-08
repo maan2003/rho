@@ -11,8 +11,8 @@ use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
 pub use rho_agent::MessageDelivery;
 pub use rho_agent::db::{
-    AgentId, AgentIdDomain, AgentMode, DeepConfig, DeepEffort, FableEffort, OpusEffort, Status,
-    TopicId, TopicIdDomain,
+    AgentDisposition, AgentId, AgentIdDomain, AgentMode, DeepConfig, DeepEffort, FableEffort,
+    OpusEffort, Status, TopicId, TopicIdDomain,
 };
 use rho_core::ContentPart;
 pub use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
@@ -129,6 +129,13 @@ pub enum ClientMessage {
     SetTopicStatus {
         topic_id: TopicId,
         status: Status,
+    },
+    /// The user's verdict on an agent's last finished turn. Attention is
+    /// action-cleared: viewing an agent never clears it; `Done`, snoozing,
+    /// replying, landing, or archiving do.
+    SetAgentDisposition {
+        agent_id: AgentId,
+        disposition: AgentDisposition,
     },
     /// Registers a workdir, or renames it if `path` is already registered.
     /// `name` defaults to the path's basename.
@@ -321,6 +328,12 @@ pub enum ServerMessage {
     TurnCancelled {
         agent_id: AgentId,
     },
+    /// An agent's attention level changed; broadcast to every connection so
+    /// rails stay truthful without loading the agent.
+    AgentAttention {
+        agent_id: AgentId,
+        attention: UiAttention,
+    },
     LandLeaseQueued {
         repo: Utf8PathBuf,
         holder: Option<LandLeaseHolder>,
@@ -381,6 +394,29 @@ pub struct UiAgentSummary {
     /// joining sends the info back verbatim.
     pub workspace: WorkspaceInfo,
     pub status: Status,
+    /// Attention level at summary time; kept current afterwards by
+    /// [`ServerMessage::AgentAttention`].
+    pub attention: UiAttention,
+}
+
+/// How urgently an agent wants the user, in ascending order — the rail's
+/// whole vocabulary for "which agent needs my focus". Derived by the daemon
+/// from agent state × the persisted disposition; never sent finer-grained
+/// than this (Streaming vs ToolCalling is transcript detail, not attention).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Pack, Unpack,
+)]
+pub enum UiAttention {
+    /// Done, snoozed, never finished a turn, or a sub-agent (whose turns are
+    /// its parent's court, not the user's).
+    #[default]
+    Quiet,
+    /// A turn is running; the agent's court.
+    Working,
+    /// A turn finished and awaits the user's disposition.
+    Pending,
+    /// Blocked on the user: the turn errored or stopped unfinished.
+    NeedsInput,
 }
 
 /// A registered directory agents can be started in; selection vocabulary

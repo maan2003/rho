@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
-use rho_agent::MessageDelivery;
 use rho_agent::db::{
-    AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, Status, TopicId,
+    AgentAttentionRecord, AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
+    AgentWriteTxnExt as _, Status, TopicId,
 };
 use rho_agent::pool::{AgentPool, RunningAgent, SpawnWorkspace};
+use rho_agent::{AgentStateKind, MessageDelivery};
 use rho_core::text_content;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
@@ -18,8 +19,8 @@ use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
-    McpAgentToolResponse, McpSpawnWorkspace, ServerMessage, StartMode, UiAgentSummary, UiTopic,
-    UiWorkdir, read_frame_counted, write_frame_counted,
+    McpAgentToolResponse, McpSpawnWorkspace, ServerMessage, StartMode, UiAgentSummary, UiAttention,
+    UiTopic, UiWorkdir, read_frame_counted, write_frame_counted,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc};
 
@@ -70,6 +71,41 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let db = RhoDb::open(default_db_path()?);
     let auth = InferenceAuth::named(&args.auth)?;
     let agents = Arc::new(AgentRegistry::new(db, auth).await);
+
+    // Attention watchers: one per loaded agent, daemon-owned (not tied to
+    // any connection). Preloaded agents are covered here; later creations
+    // ride the pool's `created` broadcast, and late loads the LoadAgent
+    // handler.
+    for (agent_id, agent) in agents.loaded().await {
+        spawn_attention_watcher(agents.db.clone(), agents.events.clone(), agent_id, agent);
+    }
+    {
+        let mut created_rx = agents.pool.subscribe_created();
+        let db = agents.db.clone();
+        let events = agents.events.clone();
+        tokio::spawn(async move {
+            loop {
+                match created_rx.recv().await {
+                    Ok(created) => spawn_attention_watcher(
+                        db.clone(),
+                        events.clone(),
+                        created.agent_id,
+                        created.agent,
+                    ),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+    // Re-arm snooze wake-ups that were pending when the daemon last stopped.
+    for (agent_id, record) in agents.db.read().list_agent_attention() {
+        if let AgentDisposition::Snoozed { until } = record.disposition
+            && until > rho_core::UnixMs::now()
+        {
+            spawn_snooze_timer(agents.db.clone(), agents.events.clone(), agent_id, until);
+        }
+    }
 
     let active_connections = Arc::new(AtomicUsize::new(0));
     let connection_closed = Arc::new(Notify::new());
@@ -122,6 +158,10 @@ struct AgentRegistry {
     land_statuses: Mutex<HashMap<Utf8PathBuf, LandStatus>>,
     /// At most one realtime voice session per daemon (see [`voice`]).
     voice_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Daemon-wide fanout for messages every client must hear regardless of
+    /// which connection caused them (attention changes); each connection
+    /// forwards this onto its own outgoing channel.
+    events: broadcast::Sender<ServerMessage>,
 }
 
 impl AgentRegistry {
@@ -159,12 +199,50 @@ impl AgentRegistry {
             land_holders: Mutex::new(HashMap::new()),
             land_statuses: Mutex::new(HashMap::new()),
             voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            events: broadcast::channel(1024).0,
         };
         registry.pool.load_non_archived_agents().await;
         registry
     }
 
-    fn topics(&self) -> Vec<UiTopic> {
+    /// Attention for an agent that is not mid-turn: pending turn ends demand
+    /// the user, dispositions and unexpired snoozes silence them, and
+    /// sub-agents are always quiet (their turns are the parent's court).
+    fn settled_attention(&self, agent_id: AgentId) -> UiAttention {
+        settled_attention(&self.db, agent_id)
+    }
+
+    /// Agents currently mid-turn, for summary building.
+    async fn working_agents(&self) -> HashSet<AgentId> {
+        self.pool
+            .loaded()
+            .await
+            .into_iter()
+            .filter(|(_, agent)| is_working(&agent.state().kind))
+            .map(|(agent_id, _)| agent_id)
+            .collect()
+    }
+
+    /// Applies the user's verdict and tells every client the new level; for
+    /// snoozes, arms the wake-up timer.
+    async fn set_disposition(&self, agent_id: AgentId, disposition: AgentDisposition) {
+        let mut write = self.db.write().await;
+        write.set_agent_disposition(agent_id, disposition);
+        write.commit();
+        if let AgentDisposition::Snoozed { until } = disposition {
+            spawn_snooze_timer(self.db.clone(), self.events.clone(), agent_id, until);
+        }
+        let attention = match self.get(agent_id).await {
+            Some(agent) if is_working(&agent.state().kind) => UiAttention::Working,
+            _ => self.settled_attention(agent_id),
+        };
+        let _ = self.events.send(ServerMessage::AgentAttention {
+            agent_id,
+            attention,
+        });
+    }
+
+    fn topics(&self, working: &HashSet<AgentId>) -> Vec<UiTopic> {
         let read = self.db.read();
         // Key order over ids is meaningless (scrambled characters); creation
         // order comes from the timestamps.
@@ -193,6 +271,11 @@ impl AgentRegistry {
                             mode: agent.mode,
                             workspace: agent.workspace,
                             status: agent.status,
+                            attention: if working.contains(&agent_id) {
+                                UiAttention::Working
+                            } else {
+                                self.settled_attention(agent_id)
+                            },
                         })
                         .collect(),
                 }
@@ -215,9 +298,9 @@ impl AgentRegistry {
         workdirs
     }
 
-    fn ready_message(&self) -> ServerMessage {
+    async fn ready_message(&self) -> ServerMessage {
         ServerMessage::Ready {
-            topics: self.topics(),
+            topics: self.topics(&self.working_agents().await),
             workdirs: self.workdirs(),
             default_topic_id: self.default_topic_id,
             machine_seed: self.machine_seed,
@@ -527,7 +610,7 @@ impl AgentRegistry {
                     {
                         write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, title);
                         write.commit();
-                        let _ = outgoing_tx.send(registry.ready_message());
+                        let _ = outgoing_tx.send(registry.ready_message().await);
                     }
                 }
                 Ok(Err(error)) => eprintln!("rho-daemon: title generation failed: {error:#}"),
@@ -623,7 +706,7 @@ async fn serve_connection(
         }
     });
 
-    let _ = outgoing_tx.send(agents.ready_message());
+    let _ = outgoing_tx.send(agents.ready_message().await);
 
     // Subscribe to creations before snapshotting the loaded set so no agent
     // slips between the two.
@@ -648,7 +731,7 @@ async fn serve_connection(
                                 agent_id: created.agent_id,
                             })
                             .is_err()
-                            || outgoing_tx.send(agents.ready_message()).is_err()
+                            || outgoing_tx.send(agents.ready_message().await).is_err()
                         {
                             break;
                         }
@@ -656,7 +739,7 @@ async fn serve_connection(
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // Missed creations still appear in the refreshed
                         // agent list.
-                        if outgoing_tx.send(agents.ready_message()).is_err() {
+                        if outgoing_tx.send(agents.ready_message().await).is_err() {
                             break;
                         }
                     }
@@ -667,11 +750,29 @@ async fn serve_connection(
     }
 
     let mut reader = reader;
+    // Attention changes fan out to every client, not just the one whose
+    // agent turned; aborted on disconnect so the writer channel can close.
+    let mut events_rx = agents.events.subscribe();
+    let events_tx = outgoing_tx.clone();
+    let events_task = tokio::spawn(async move {
+        loop {
+            match events_rx.recv().await {
+                Ok(message) => {
+                    if events_tx.send(message).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
     let mut land_leases: Vec<(Utf8PathBuf, OwnedMutexGuard<()>)> = Vec::new();
     // The voice session (at most one) is owned by this connection: dropping
     // the handle on disconnect ends the session task.
     let mut voice: Option<voice::VoiceHandle> = None;
-    loop {
+    let result = loop {
         let message =
             match read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await {
                 Ok(message) => message,
@@ -679,7 +780,7 @@ async fn serve_connection(
                     for (repo, _) in &land_leases {
                         agents.clear_land_holder(repo).await;
                     }
-                    return Err(error);
+                    break Err(error);
                 }
             };
         match voice::handle_client_message(&agents, &outgoing_tx, &mut voice, &message) {
@@ -702,7 +803,7 @@ async fn serve_connection(
         .await
         {
             Ok(Refresh::Ready) => {
-                let _ = outgoing_tx.send(agents.ready_message());
+                let _ = outgoing_tx.send(agents.ready_message().await);
             }
             Ok(Refresh::None) => {}
             Err(error) => {
@@ -711,7 +812,110 @@ async fn serve_connection(
                 });
             }
         }
+    };
+    events_task.abort();
+    result
+}
+
+/// Mid-turn from the rail's point of view: the states that render as a
+/// running lamp rather than a settled one.
+fn is_working(kind: &AgentStateKind) -> bool {
+    matches!(
+        kind,
+        AgentStateKind::ApiStreaming { .. } | AgentStateKind::ToolCalling { .. }
+    )
+}
+
+/// Attention for an agent that is not mid-turn, from its persisted record.
+/// Sub-agent turn ends never reach the record (see the watcher), so children
+/// stay quiet here by construction.
+fn settled_attention(db: &RhoDb, agent_id: AgentId) -> UiAttention {
+    match db.read().agent_attention(agent_id) {
+        Some(AgentAttentionRecord {
+            needs_input,
+            disposition,
+            ..
+        }) => {
+            let pending = match disposition {
+                AgentDisposition::Pending => true,
+                AgentDisposition::Done => false,
+                // An expired snooze is pending again; the timer only exists
+                // to broadcast that moment.
+                AgentDisposition::Snoozed { until } => until <= rho_core::UnixMs::now(),
+            };
+            match (pending, needs_input) {
+                (false, _) => UiAttention::Quiet,
+                (true, true) => UiAttention::NeedsInput,
+                (true, false) => UiAttention::Pending,
+            }
+        }
+        None => UiAttention::Quiet,
     }
+}
+
+/// Watches one running agent for the daemon itself (not any particular
+/// connection): records turn ends and broadcasts attention level changes to
+/// every client. Spawned exactly once per loaded agent.
+///
+/// Sub-agents (a parent spawned them) get Working broadcasts but no turn-end
+/// records: their finished turns are the parent's court, not the user's.
+fn spawn_attention_watcher(
+    db: RhoDb,
+    events: broadcast::Sender<ServerMessage>,
+    agent_id: AgentId,
+    agent: RunningAgent,
+) {
+    tokio::spawn(async move {
+        let is_child = db.read().get_agent(agent_id).parent_agent.is_some();
+        let changes = agent.subscribe();
+        futures::pin_mut!(changes);
+        let mut was_working = is_working(&agent.state().kind);
+        let mut last_sent = None;
+        while let Some(state) = changes.next().await {
+            let working = is_working(&state.kind);
+            let attention = if working {
+                UiAttention::Working
+            } else {
+                if was_working && !is_child {
+                    let needs_input = matches!(
+                        state.kind,
+                        AgentStateKind::Error(_) | AgentStateKind::UnfinishedTurn { .. }
+                    );
+                    let mut write = db.write().await;
+                    write.record_agent_turn_end(rho_core::UnixMs::now(), agent_id, needs_input);
+                    write.commit();
+                }
+                settled_attention(&db, agent_id)
+            };
+            was_working = working;
+            if last_sent != Some(attention) {
+                let _ = events.send(ServerMessage::AgentAttention {
+                    agent_id,
+                    attention,
+                });
+                last_sent = Some(attention);
+            }
+        }
+    });
+}
+
+/// Wakes a snoozed agent: at `until`, rebroadcasts its (by then pending)
+/// level. Harmless if the disposition changed meanwhile — it just sends the
+/// then-current level.
+fn spawn_snooze_timer(
+    db: RhoDb,
+    events: broadcast::Sender<ServerMessage>,
+    agent_id: AgentId,
+    until: rho_core::UnixMs,
+) {
+    tokio::spawn(async move {
+        let delay = until.saturating_duration_since(rho_core::UnixMs::now());
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        let _ = events.send(ServerMessage::AgentAttention {
+            agent_id,
+            attention: settled_attention(&db, agent_id),
+        });
+    });
 }
 
 /// Whether a handled message changed registry state that clients see through
@@ -809,6 +1013,12 @@ async fn handle_message(
         ClientMessage::LoadAgent { agent_id } => {
             let (agent_id, agent, loaded_now) = agents.load(agent_id).await?;
             if loaded_now {
+                spawn_attention_watcher(
+                    agents.db.clone(),
+                    agents.events.clone(),
+                    agent_id,
+                    agent.clone(),
+                );
                 subscribe_agent(agent_id, agent, outgoing_tx.clone());
             }
             let _ = outgoing_tx.send(ServerMessage::AgentLoaded { agent_id });
@@ -857,6 +1067,13 @@ async fn handle_message(
         ClientMessage::RenameTopic { topic_id, name } => {
             agents.rename_topic(topic_id, name).await?;
             Ok(Refresh::Ready)
+        }
+        ClientMessage::SetAgentDisposition {
+            agent_id,
+            disposition,
+        } => {
+            agents.set_disposition(agent_id, disposition).await;
+            Ok(Refresh::None)
         }
         ClientMessage::SetTopicStatus { topic_id, status } => {
             agents.set_topic_status(topic_id, status).await?;

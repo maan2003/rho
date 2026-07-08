@@ -37,6 +37,8 @@ actions!(
         AgentPrevious,
         AgentNext,
         AgentNew,
+        AgentJumpAttention,
+        AgentDone,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard
@@ -128,6 +130,11 @@ fn bind_rho_key_overrides(cx: &mut App) {
     // vim keymap only binds the rho prompt keys for insert mode, while the
     // default keymap's Tab binding can lose to vim's normal-mode handling.
     cx.bind_keys([
+        // Attention triage: jump to the most urgent agent, clear the current
+        // one. The bundled zed keymaps don't know these actions, so they are
+        // bound here rather than in an asset.
+        KeyBinding::new("ctrl-shift-j", AgentJumpAttention, Some("RhoGui")),
+        KeyBinding::new("ctrl-shift-d", AgentDone, Some("RhoGui")),
         KeyBinding::new(
             "tab",
             RoleCycle,

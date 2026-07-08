@@ -219,6 +219,22 @@ impl AgentClient {
                     // Voice frames are only meaningful to the client that
                     // started the session (the GUI); this CLI client has no
                     // audio path.
+                    ServerMessage::AgentAttention {
+                        agent_id,
+                        attention,
+                    } => {
+                        let mut topics = topics_tx.borrow().clone();
+                        for topic in &mut topics {
+                            for agent in &mut topic.agents {
+                                if agent.agent_id == agent_id {
+                                    agent.attention = attention;
+                                }
+                            }
+                        }
+                        if topics_tx.send(topics).is_err() {
+                            break;
+                        }
+                    }
                     ServerMessage::Pong
                     | ServerMessage::TurnCancelled { .. }
                     | ServerMessage::LandLeaseQueued { .. }

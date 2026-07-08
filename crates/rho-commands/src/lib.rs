@@ -113,6 +113,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Compact the current agent's context",
     },
     CommandSpec {
+        name: "done",
+        usage: ":done",
+        description: "Mark the current agent's finished turn as handled",
+    },
+    CommandSpec {
+        name: "snooze",
+        usage: ":snooze <duration>",
+        description: "Silence the current agent until later, e.g. :snooze 2h (m/h/d)",
+    },
+    CommandSpec {
         name: "clear",
         usage: ":clear",
         description: "Clear rendered output",
@@ -179,6 +189,10 @@ pub enum Command {
     },
     Continue,
     Compact,
+    AgentDone,
+    AgentSnooze {
+        duration_ms: u64,
+    },
 
     Quit,
     Clear,
@@ -254,6 +268,8 @@ pub fn parse(line: &str) -> Option<Parsed> {
         "rewind" => parse_rewind(&mut tokens),
         "continue" => Parsed::Command(Command::Continue),
         "compact" => Parsed::Command(Command::Compact),
+        "done" => Parsed::Command(Command::AgentDone),
+        "snooze" => parse_snooze(&mut tokens),
         "quit" | "exit" => Parsed::Command(Command::Quit),
         "clear" => Parsed::Command(Command::Clear),
         "help" => Parsed::Command(Command::Help),
@@ -289,6 +305,29 @@ fn parse_agent_effort<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed 
         }),
         _ => Parsed::Invalid(":agent effort <low|medium|xhigh>".to_owned()),
     }
+}
+
+fn parse_snooze<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed {
+    match (tokens.next().and_then(parse_duration_ms), tokens.next()) {
+        (Some(duration_ms), None) => Parsed::Command(Command::AgentSnooze { duration_ms }),
+        _ => Parsed::Invalid(":snooze <duration> (e.g. 30m, 2h, 1d)".to_owned()),
+    }
+}
+
+/// `30m`, `2h`, `1d`; a bare number means minutes.
+pub fn parse_duration_ms(text: &str) -> Option<u64> {
+    let (digits, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => text.split_at(at),
+        None => (text, "m"),
+    };
+    let count: u64 = digits.parse().ok()?;
+    let minutes = match unit {
+        "m" | "min" => count,
+        "h" | "hr" => count.checked_mul(60)?,
+        "d" => count.checked_mul(60 * 24)?,
+        _ => return None,
+    };
+    minutes.checked_mul(60 * 1000)
 }
 
 /// The words after `:topic <sub>` as one name, `None` when absent.

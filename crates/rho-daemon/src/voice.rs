@@ -327,7 +327,7 @@ async fn execute_tool(
             Ok((agent_id, label)) => match registry.rename_agent(agent_id, name.clone()).await {
                 Err(error) => format!("rename failed: {error:#}"),
                 Ok(()) => {
-                    let _ = outgoing.send(registry.ready_message());
+                    let _ = outgoing.send(registry.ready_message().await);
                     format!("renamed {label} to {name}")
                 }
             },
@@ -341,7 +341,7 @@ async fn execute_tool(
                 {
                     Err(error) => format!("move failed: {error:#}"),
                     Ok(()) => {
-                        let _ = outgoing.send(registry.ready_message());
+                        let _ = outgoing.send(registry.ready_message().await);
                         format!("moved {label} to topic {topic}")
                     }
                 }
@@ -353,7 +353,7 @@ async fn execute_tool(
                 match registry.set_agent_status(agent_id, Status::Archived).await {
                     Err(error) => format!("archive failed: {error:#}"),
                     Ok(()) => {
-                        let _ = outgoing.send(registry.ready_message());
+                        let _ = outgoing.send(registry.ready_message().await);
                         format!("archived {label}; it is hidden, not deleted")
                     }
                 }
@@ -383,7 +383,7 @@ async fn execute_tool(
 
 async fn list_agents(registry: &Arc<AgentRegistry>, focus: &Option<AgentId>) -> String {
     let mut lines = Vec::new();
-    for topic in registry.topics() {
+    for topic in registry.topics(&registry.working_agents().await) {
         if topic.status == Status::Archived {
             continue;
         }
@@ -481,7 +481,7 @@ async fn new_agent(
     if let Some(message) = message {
         agent.send_user_message(message, MessageDelivery::NextRequest);
     }
-    let _ = outgoing.send(registry.ready_message());
+    let _ = outgoing.send(registry.ready_message().await);
     match topic {
         Some(topic) => format!("created a new agent in topic '{topic}' and started it"),
         None => "created a new agent".to_owned(),
@@ -496,7 +496,9 @@ fn resolve(
     agent: &Option<String>,
 ) -> Result<(AgentId, String), String> {
     let all: Vec<(AgentId, String)> = registry
-        .topics()
+        // Only ids and labels are read here; attention (the `working` set)
+        // is irrelevant, so an empty set keeps this resolver synchronous.
+        .topics(&Default::default())
         .iter()
         .flat_map(|topic| topic.agents.iter())
         .map(|agent| (agent.agent_id, label(agent)))

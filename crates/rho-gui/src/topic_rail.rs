@@ -11,8 +11,8 @@
 use std::cmp::Reverse;
 
 use gpui::prelude::*;
-use gpui::{Context, Div, MouseButton, TextStyle, div, px};
-use rho_ui_proto::{AgentId, Status, UiAgentSummary, UiTopic};
+use gpui::{Context, Div, FontWeight, MouseButton, TextStyle, div, px};
+use rho_ui_proto::{AgentId, Status, UiAgentSummary, UiAttention, UiTopic};
 use theme::ActiveTheme as _;
 use ui::{Color, Icon, IconName, IconSize};
 
@@ -25,11 +25,16 @@ pub fn render_topic_rail(
     text_style: &TextStyle,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
-    let (selected_color, border_color) = {
+    let (selected_color, border_color, lamps) = {
         let colors = cx.theme().colors();
         (
             colors.terminal_ansi_magenta,
             colors.border_variant.opacity(0.6),
+            LampColors {
+                needs_input: colors.terminal_ansi_red,
+                pending: colors.terminal_ansi_yellow,
+                working: colors.terminal_ansi_cyan,
+            },
         )
     };
     let selected_agent = registry.selected_agent().cloned();
@@ -38,7 +43,7 @@ pub fn render_topic_rail(
         .topics()
         .iter()
         .filter_map(|topic| {
-            let agents = visible_agents(topic, show_archived);
+            let agents = visible_agents(topic, registry, show_archived);
             (!agents.is_empty() || (topic.status == Status::Archived) == show_archived)
                 .then_some((topic, agents))
         })
@@ -54,6 +59,7 @@ pub fn render_topic_rail(
                 registry,
                 text_style,
                 selected_color,
+                lamps,
                 cx,
             )
         })
@@ -157,6 +163,7 @@ mod tests {
                 repo: "/tmp".into(),
             },
             status,
+            attention: UiAttention::Quiet,
         }
     }
 
@@ -176,12 +183,37 @@ mod tests {
         let middle = agent(3, Status::Archived, 20);
         let topic = topic(Status::Normal, vec![old, new, middle]);
 
-        let visible = visible_agents(&topic, true)
+        let registry = AgentRegistry::default();
+        let visible = visible_agents(&topic, &registry, true)
             .into_iter()
             .map(|summary| summary.updated_at)
             .collect::<Vec<_>>();
 
         assert_eq!(visible, [UnixMs(30), UnixMs(20), UnixMs(10)]);
+    }
+
+    #[test]
+    fn attention_sorts_above_pins_in_active_view() {
+        let quiet_pinned = agent(1, Status::Pinned, 10);
+        let urgent = agent(2, Status::Normal, 10);
+        let topic = topic(Status::Normal, vec![quiet_pinned, urgent.clone()]);
+
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic.clone()]);
+        registry.set_attention(urgent.agent_id, UiAttention::NeedsInput);
+
+        let visible = visible_agents(&topic, &registry, false)
+            .into_iter()
+            .map(|summary| summary.agent_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible,
+            [
+                AgentId::from_counter(2, &AgentIdDomain(0)).unwrap(),
+                AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
+            ]
+        );
     }
 
     #[test]
@@ -191,7 +223,8 @@ mod tests {
         let new = agent(3, Status::Normal, 10);
         let topic = topic(Status::Normal, vec![old, pinned, new]);
 
-        let visible = visible_agents(&topic, false)
+        let registry = AgentRegistry::default();
+        let visible = visible_agents(&topic, &registry, false)
             .into_iter()
             .map(|summary| summary.agent_id)
             .collect::<Vec<_>>();
@@ -244,7 +277,11 @@ fn new_agent_row(
 /// Which of a topic's agents the current view mode shows. The archived view
 /// is the exact complement of the normal one: an agent is archived-visible
 /// when it is archived itself or its whole topic is.
-fn visible_agents(topic: &UiTopic, show_archived: bool) -> Vec<&UiAgentSummary> {
+fn visible_agents<'a>(
+    topic: &'a UiTopic,
+    registry: &AgentRegistry,
+    show_archived: bool,
+) -> Vec<&'a UiAgentSummary> {
     let mut agents = topic
         .agents
         .iter()
@@ -258,12 +295,32 @@ fn visible_agents(topic: &UiTopic, show_archived: bool) -> Vec<&UiAgentSummary> 
     } else {
         agents.sort_by_key(|summary| {
             (
+                Reverse(registry.attention(summary.agent_id)),
                 summary.status != Status::Pinned,
                 Reverse(summary.created_at),
             )
         });
     }
     agents
+}
+
+/// Lamp palette for attention levels; Quiet has no lamp.
+#[derive(Clone, Copy)]
+struct LampColors {
+    needs_input: gpui::Hsla,
+    pending: gpui::Hsla,
+    working: gpui::Hsla,
+}
+
+impl LampColors {
+    fn color(&self, attention: UiAttention) -> Option<gpui::Hsla> {
+        match attention {
+            UiAttention::Quiet => None,
+            UiAttention::Working => Some(self.working),
+            UiAttention::Pending => Some(self.pending),
+            UiAttention::NeedsInput => Some(self.needs_input),
+        }
+    }
 }
 
 fn render_topic_rows(
@@ -273,9 +330,19 @@ fn render_topic_rows(
     registry: &AgentRegistry,
     text_style: &TextStyle,
     selected_color: gpui::Hsla,
+    lamps: LampColors,
     cx: &mut Context<Workspace>,
 ) -> Div {
     let name = topic.name.clone();
+    // Roll the topic's most urgent agent up into the header, so a collapsed
+    // or scrolled-away topic still shows that something inside wants the
+    // user. Working alone doesn't qualify: the header lamp means "act here".
+    let rollup = agents
+        .iter()
+        .map(|summary| registry.attention(summary.agent_id))
+        .max()
+        .filter(|attention| *attention >= UiAttention::Pending)
+        .and_then(|attention| lamps.color(attention));
     div()
         .w_full()
         .flex()
@@ -297,6 +364,13 @@ fn render_topic_rows(
                             .size(IconSize::XSmall)
                             .color(Color::Custom(text_style.color.opacity(0.65))),
                     )
+                })
+                .when_some(rollup, |this, lamp| {
+                    this.child(
+                        Icon::new(IconName::Circle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Custom(lamp)),
+                    )
                 }),
         )
         .children(agents.into_iter().map(|summary| {
@@ -307,6 +381,8 @@ fn render_topic_rows(
                 .unwrap_or_else(|| registry.agent_id_label(summary.agent_id));
             let selected = selected_agent == Some(agent_id);
             let pinned = summary.status == Status::Pinned;
+            let attention = registry.attention(summary.agent_id);
+            let lamp = lamps.color(attention);
             let text_color = if selected {
                 selected_color
             } else {
@@ -314,6 +390,8 @@ fn render_topic_rows(
             };
             let icon_color = if selected {
                 selected_color
+            } else if let Some(lamp) = lamp {
+                lamp
             } else if pinned {
                 text_style.color.opacity(0.9)
             } else {
@@ -354,6 +432,9 @@ fn render_topic_rows(
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_color(text_color)
+                        .when(attention >= UiAttention::Pending, |this| {
+                            this.font_weight(FontWeight::BOLD)
+                        })
                         .child(label),
                 )
         }))

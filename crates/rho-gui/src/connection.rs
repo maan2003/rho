@@ -35,6 +35,10 @@ pub enum ConnEvent {
         frame: AgentRemoteFrame,
     },
     TurnCancelled(AgentId),
+    AgentAttention {
+        agent_id: AgentId,
+        attention: rho_ui_proto::UiAttention,
+    },
     ServerError(String),
     Disconnected(String),
     /// Assistant audio (wire-format PCM16) for immediate playback.
@@ -162,6 +166,13 @@ async fn run(
             ServerMessage::AgentLoaded { agent_id } => Some(ConnEvent::AgentLoaded(agent_id)),
             ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame { agent_id, frame }),
             ServerMessage::TurnCancelled { agent_id } => Some(ConnEvent::TurnCancelled(agent_id)),
+            ServerMessage::AgentAttention {
+                agent_id,
+                attention,
+            } => Some(ConnEvent::AgentAttention {
+                agent_id,
+                attention,
+            }),
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
             ServerMessage::VoiceAudio { pcm } => Some(ConnEvent::VoiceAudio(pcm)),
             ServerMessage::VoiceFlushPlayback => Some(ConnEvent::VoiceFlushPlayback),
