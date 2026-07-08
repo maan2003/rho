@@ -132,9 +132,12 @@ fn bind_rho_key_overrides(cx: &mut App) {
     cx.bind_keys([
         // Attention triage: jump to the most urgent agent, clear the current
         // one. The bundled zed keymaps don't know these actions, so they are
-        // bound here rather than in an asset.
-        KeyBinding::new("ctrl-shift-j", AgentJumpAttention, Some("RhoGui")),
-        KeyBinding::new("ctrl-shift-d", AgentDone, Some("RhoGui")),
+        // bound here rather than in an asset. The context must be at least as
+        // deep as `Editor`: the bundled keymap binds these keys under plain
+        // `Editor` (JoinLines, git::Diff), and gpui prefers the deeper match,
+        // so a root-level `RhoGui` binding would lose while typing.
+        KeyBinding::new("ctrl-shift-j", AgentJumpAttention, Some("RhoGui > Editor")),
+        KeyBinding::new("ctrl-shift-d", AgentDone, Some("RhoGui > Editor")),
         KeyBinding::new(
             "tab",
             RoleCycle,
