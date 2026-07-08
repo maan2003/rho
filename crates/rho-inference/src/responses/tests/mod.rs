@@ -19,6 +19,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use super::oauth::{InferenceAuth, OAuthFile, ResponsesOAuthCredentials};
 use super::session::{
     AutoCompaction, ReasoningContext, ResponsesEffort, ResponsesModel, ServiceTier, TextVerbosity,
+    is_transient_turn_error, transient_backoff,
 };
 use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};

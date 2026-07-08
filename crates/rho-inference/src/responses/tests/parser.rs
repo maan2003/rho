@@ -251,3 +251,41 @@ fn surfaces_stream_error() {
     assert!(error.to_string().contains("rate limit"));
     assert!(error.to_string().contains("type=rate_limit_exceeded"));
 }
+
+#[test]
+fn classifies_transient_stream_errors_for_retry() {
+    let error = parse_response_events([
+        r#"{"type":"error","error":{"message":"The server is overloaded","code":"server_is_overloaded"}}"#,
+    ])
+    .unwrap_err();
+
+    assert!(super::is_transient_turn_error(&error));
+
+    let error = parse_response_events([
+        r#"{"type":"error","error":{"message":"Slow down","code":"slow_down"}}"#,
+    ])
+    .unwrap_err();
+
+    assert!(super::is_transient_turn_error(&error));
+}
+
+#[test]
+fn does_not_classify_user_actionable_stream_errors_for_retry() {
+    let error = parse_response_events([
+        r#"{"type":"error","error":{"message":"Invalid model","code":"invalid_request_error"}}"#,
+    ])
+    .unwrap_err();
+
+    assert!(!super::is_transient_turn_error(&error));
+}
+
+#[test]
+fn transient_retry_backoff_matches_codex_jittered_exponential() {
+    let first = super::transient_backoff(1);
+    let second = super::transient_backoff(2);
+    let third = super::transient_backoff(3);
+
+    assert!((Duration::from_millis(180)..Duration::from_millis(220)).contains(&first));
+    assert!((Duration::from_millis(360)..Duration::from_millis(440)).contains(&second));
+    assert!((Duration::from_millis(720)..Duration::from_millis(880)).contains(&third));
+}

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rho_core::{InferenceEvent, InferenceRequest};
@@ -88,12 +88,17 @@ struct Turn {
     debug_sequence: Option<u64>,
     /// Raw provider text frames observed for the in-flight send attempt.
     raw_events: Vec<serde_json::Value>,
+    /// Transient provider/transport retry count for this turn.
+    retry_attempts: u32,
 }
 
 enum TurnPhase {
     /// A request is waiting to be sent. `replay` means the previous attempt hit
     /// a stale `previous_response_id`, so this send must be a full replay.
-    Queued { replay: bool },
+    Queued {
+        replay: bool,
+        not_before: Option<Instant>,
+    },
     /// A request is on the wire and we are reading its response.
     InFlight {
         replay: bool,
@@ -280,11 +285,15 @@ impl InferenceSession {
         self.buffered.clear();
         self.turn = Some(Turn {
             request,
-            phase: TurnPhase::Queued { replay: false },
+            phase: TurnPhase::Queued {
+                replay: false,
+                not_before: None,
+            },
             response: ResponseState::new(),
             streaming_started: false,
             debug_sequence: None,
             raw_events: Vec::new(),
+            retry_attempts: 0,
         });
     }
 
@@ -310,12 +319,28 @@ impl InferenceSession {
                 .as_ref()
                 .is_some_and(|turn| matches!(turn.phase, TurnPhase::Queued { .. }))
             {
+                let not_before = self.turn.as_ref().and_then(|turn| match turn.phase {
+                    TurnPhase::Queued { not_before, .. } => not_before,
+                    TurnPhase::InFlight { .. } => None,
+                });
+                if let Some(not_before) = not_before {
+                    let now = Instant::now();
+                    if not_before > now {
+                        tokio::time::sleep(not_before - now).await;
+                    }
+                }
                 if let Err(error) = self.ensure_connection().await {
-                    self.turn = None;
                     self.connection = None;
-                    return InferenceEvent::Failed {
-                        error: error.into(),
-                    };
+                    match self.on_turn_error(error) {
+                        ErrorAction::Retry { error, retrying_at } => {
+                            return temporary_failure(error, retrying_at);
+                        }
+                        ErrorAction::Fail(error) => {
+                            return InferenceEvent::Failed {
+                                error: error.into(),
+                            };
+                        }
+                    }
                 }
                 let debug_sequence = self.next_debug_sequence();
                 let cached_response_id = self
@@ -326,7 +351,7 @@ impl InferenceSession {
                 let (replay, request) = {
                     let turn = self.turn.as_ref().unwrap();
                     let replay = match turn.phase {
-                        TurnPhase::Queued { replay } => replay,
+                        TurnPhase::Queued { replay, .. } => replay,
                         TurnPhase::InFlight { .. } => unreachable!("checked above"),
                     };
                     (replay, turn.request.clone())
@@ -422,7 +447,9 @@ impl InferenceSession {
         };
         match outcome {
             Err(error) => match self.on_turn_error(error) {
-                ErrorAction::Retry(error) => ControlFlow::Break(temporary_failure(error)),
+                ErrorAction::Retry { error, retrying_at } => {
+                    ControlFlow::Break(temporary_failure(error, retrying_at))
+                }
                 ErrorAction::Fail(error) => ControlFlow::Break(InferenceEvent::Failed {
                     error: error.into(),
                 }),
@@ -472,7 +499,9 @@ impl InferenceSession {
     fn on_socket_failure(&mut self, error: anyhow::Error) -> ControlFlow<InferenceEvent> {
         if self.turn.is_some() {
             match self.on_turn_error(error) {
-                ErrorAction::Retry(error) => ControlFlow::Break(temporary_failure(error)),
+                ErrorAction::Retry { error, retrying_at } => {
+                    ControlFlow::Break(temporary_failure(error, retrying_at))
+                }
                 ErrorAction::Fail(error) => ControlFlow::Break(InferenceEvent::Failed {
                     error: error.into(),
                 }),
@@ -483,8 +512,10 @@ impl InferenceSession {
         }
     }
 
-    /// Decide whether a failed active turn should be replayed in full (a stale
-    /// `previous_response_id` we can drop) or surfaced to the caller.
+    /// Decide whether a failed active turn should be retried or surfaced to the
+    /// caller. Stale `previous_response_id` failures are retried once as a full
+    /// replay; transient provider/transport failures are retried with bounded
+    /// exponential backoff.
     fn on_turn_error(&mut self, error: anyhow::Error) -> ErrorAction {
         if let Some(turn) = &self.turn
             && let Some(sequence) = turn.debug_sequence
@@ -496,7 +527,7 @@ impl InferenceSession {
                 Some(error_message.as_str()),
             );
         }
-        let replayable = matches!(
+        let stale_previous_response = matches!(
             &self.turn,
             Some(Turn {
                 phase: TurnPhase::InFlight { replay: false, .. },
@@ -504,16 +535,46 @@ impl InferenceSession {
             })
         ) && super::is_stale_previous_response_error(&error)
             && self.turn_has_previous_response_id();
-        if replayable {
+        if stale_previous_response {
             let turn = self.turn.as_mut().unwrap();
-            turn.phase = TurnPhase::Queued { replay: true };
+            turn.phase = TurnPhase::Queued {
+                replay: true,
+                not_before: None,
+            };
             turn.streaming_started = false;
             turn.debug_sequence = None;
             turn.raw_events.clear();
             turn.response = ResponseState::new();
             // Replay on a clean socket.
             self.connection = None;
-            ErrorAction::Retry(error)
+            ErrorAction::Retry {
+                error,
+                retrying_at: Instant::now(),
+            }
+        } else if self.turn.is_some()
+            && is_transient_turn_error(&error)
+            && self
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.retry_attempts < MAX_TRANSIENT_RETRIES)
+        {
+            let turn = self.turn.as_mut().unwrap();
+            turn.retry_attempts += 1;
+            let delay = transient_backoff(turn.retry_attempts);
+            let retrying_at = Instant::now() + delay;
+            let replay = match turn.phase {
+                TurnPhase::Queued { replay, .. } | TurnPhase::InFlight { replay, .. } => replay,
+            };
+            turn.phase = TurnPhase::Queued {
+                replay,
+                not_before: Some(retrying_at),
+            };
+            turn.streaming_started = false;
+            turn.debug_sequence = None;
+            turn.raw_events.clear();
+            turn.response = ResponseState::new();
+            self.connection = None;
+            ErrorAction::Retry { error, retrying_at }
         } else {
             self.turn = None;
             self.connection = None;
@@ -653,15 +714,51 @@ enum Read {
 enum ErrorAction {
     /// The turn is being replayed internally; surface a recoverable failure
     /// carrying the error that triggered it.
-    Retry(anyhow::Error),
+    Retry {
+        error: anyhow::Error,
+        retrying_at: Instant,
+    },
     /// The turn is dead; surface a terminal failure.
     Fail(anyhow::Error),
 }
 
-fn temporary_failure(error: anyhow::Error) -> InferenceEvent {
+const MAX_TRANSIENT_RETRIES: u32 = 5;
+const TRANSIENT_INITIAL_DELAY_MS: u64 = 200;
+const TRANSIENT_BACKOFF_FACTOR: f64 = 2.0;
+
+pub(crate) fn transient_backoff(attempt: u32) -> Duration {
+    let exp = TRANSIENT_BACKOFF_FACTOR.powi(attempt.saturating_sub(1) as i32);
+    let base = (TRANSIENT_INITIAL_DELAY_MS as f64 * exp) as u64;
+    let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), 0.9..1.1);
+    Duration::from_millis((base as f64 * jitter) as u64)
+}
+
+pub(crate) fn is_transient_turn_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "server_is_overloaded",
+        "slow_down",
+        "overloaded",
+        "rate_limit_exceeded",
+        "service_unavailable",
+        "server_error",
+        "internal_server_error",
+        "temporarily unavailable",
+        "try again",
+        "timed out",
+        "timeout",
+        "websocket ended before response.completed",
+        "websocket closed mid-stream",
+        "connection reset",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn temporary_failure(error: anyhow::Error, retrying_at: Instant) -> InferenceEvent {
     InferenceEvent::TemporaryFailure {
         error: error.into(),
-        retrying_at: Instant::now(),
+        retrying_at,
     }
 }
 
