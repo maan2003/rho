@@ -43,18 +43,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: "e7f3a9c2",
-        to: "b8c0d4e1",
-        migrate: backfill_agent_last_user_message,
-    },
-    AgentDbMigration {
-        from: "b8c0d4e1",
-        to: "4d91a2f7",
-        migrate: rewrite_agent_events,
-    },
-];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -746,31 +735,6 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
-}
-
-fn backfill_agent_last_user_message(write: &mut WriteTxn) {
-    let mut agents = write.open_table(AGENTS);
-    let records = agents
-        .iter()
-        .map(|(key, value)| (key.value(), value.value().into_owned()))
-        .collect::<Vec<_>>();
-    for (agent_id, mut agent) in records {
-        if agent.last_user_message == UnixMs(0) {
-            agent.last_user_message = agent.created_at;
-            agents.insert(&agent_id, SenValue::borrowed(&agent));
-        }
-    }
-}
-
-fn rewrite_agent_events(write: &mut WriteTxn) {
-    let mut events = write.open_table(AGENT_EVENTS);
-    let records = events
-        .iter()
-        .map(|(key, value)| (key.value(), value.value().into_owned()))
-        .collect::<Vec<_>>();
-    for (pos, event) in records {
-        events.insert(&pos, SenValue::borrowed(&event));
-    }
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

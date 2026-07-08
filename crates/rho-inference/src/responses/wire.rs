@@ -19,7 +19,7 @@ use super::session::{
     AutoCompaction, ReasoningContext, ResponsesEffort, ServiceTier, TextVerbosity,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum OpenAiResponsesProviderData {
     Message {
         item_id: ProviderResponseItemId,
@@ -38,73 +38,6 @@ pub enum OpenAiResponsesProviderData {
         item_id: ProviderResponseItemId,
         encrypted_content: String,
     },
-}
-
-impl Decoder for OpenAiResponsesProviderData {
-    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
-        // Temporary migration compatibility: old dev databases encoded the
-        // encrypted reasoning provider item as `Reasoning`. Decode that old
-        // variant into the current enum, but do not keep it in the real
-        // runtime representation. Remove this shim with the 4d91a2f7 agent DB
-        // migration.
-        #[derive(Decode)]
-        enum TemporaryOpenAiResponsesProviderDataDecode {
-            Message {
-                item_id: ProviderResponseItemId,
-            },
-            FunctionCall {
-                item_id: ProviderResponseItemId,
-            },
-            CustomToolCall {
-                item_id: ProviderResponseItemId,
-            },
-            EncryptedReasoning {
-                item_id: ProviderResponseItemId,
-                encrypted_content: String,
-            },
-            #[senax(rename = "Reasoning")]
-            LegacyReasoning {
-                item_id: ProviderResponseItemId,
-                encrypted_content: String,
-            },
-            Compaction {
-                item_id: ProviderResponseItemId,
-                encrypted_content: String,
-            },
-        }
-
-        Ok(
-            match TemporaryOpenAiResponsesProviderDataDecode::decode(reader)? {
-                TemporaryOpenAiResponsesProviderDataDecode::Message { item_id } => {
-                    Self::Message { item_id }
-                }
-                TemporaryOpenAiResponsesProviderDataDecode::FunctionCall { item_id } => {
-                    Self::FunctionCall { item_id }
-                }
-                TemporaryOpenAiResponsesProviderDataDecode::CustomToolCall { item_id } => {
-                    Self::CustomToolCall { item_id }
-                }
-                TemporaryOpenAiResponsesProviderDataDecode::EncryptedReasoning {
-                    item_id,
-                    encrypted_content,
-                }
-                | TemporaryOpenAiResponsesProviderDataDecode::LegacyReasoning {
-                    item_id,
-                    encrypted_content,
-                } => Self::EncryptedReasoning {
-                    item_id,
-                    encrypted_content,
-                },
-                TemporaryOpenAiResponsesProviderDataDecode::Compaction {
-                    item_id,
-                    encrypted_content,
-                } => Self::Compaction {
-                    item_id,
-                    encrypted_content,
-                },
-            },
-        )
-    }
 }
 
 impl senax_encoder::TaggedSenax for OpenAiResponsesProviderData {
