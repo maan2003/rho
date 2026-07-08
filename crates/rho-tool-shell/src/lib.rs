@@ -6,8 +6,10 @@
 //! failures are surfaced as tool errors.
 
 mod apply_patch;
+#[cfg(test)]
 mod truncate;
 
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,13 +23,17 @@ use rho_core::{
 use rho_workspaces::{PathOverrides, Workspace};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time;
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
 pub const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
+const MAX_OUTPUT_TOKENS: usize = 10_000;
+const MAX_OUTPUT_BYTES: usize = MAX_OUTPUT_TOKENS * APPROX_BYTES_PER_TOKEN as usize;
+const APPROX_BYTES_PER_TOKEN: u64 = 4;
 
 #[derive(Clone, Debug)]
 pub struct ShellTools {
@@ -234,22 +240,17 @@ impl ShellTools {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
-        let mut stdout = child
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
-        let stdout_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-        });
-        let stderr_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
-        });
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let stdout_task = tokio::spawn(read_output_chunks(stdout, output_tx.clone()));
+        let stderr_task = tokio::spawn(read_output_chunks(stderr, output_tx));
 
         let status = match time::timeout(timeout, child.wait()).await {
             Ok(status) => status?,
@@ -261,12 +262,16 @@ impl ShellTools {
                 return Ok((timeout_output_text(timeout), None));
             }
         };
-        let stdout = stdout_task
+        stdout_task
             .await
             .map_err(|error| anyhow!("stdout task failed: {error}"))??;
-        let stderr = stderr_task
+        stderr_task
             .await
             .map_err(|error| anyhow!("stderr task failed: {error}"))??;
+        let mut output = BoundedOutput::new(MAX_OUTPUT_BYTES);
+        while let Some(chunk) = output_rx.recv().await {
+            output.push(&chunk);
+        }
 
         let elapsed = started.elapsed();
         let status_code = status.code();
@@ -275,19 +280,23 @@ impl ShellTools {
         #[cfg(not(unix))]
         let signal = None;
 
-        let (stdout, stdout_valid_utf8) = decode_output(stdout);
-        let (stderr, stderr_valid_utf8) = decode_output(stderr);
-        let output = combine_output(&stdout, &stderr);
-        let valid_utf8 = stdout_valid_utf8 && stderr_valid_utf8;
-
-        let truncated = truncate::formatted_truncate_text(&output);
+        let output = output.finish();
+        let (mut content, valid_utf8) = decode_output(output.bytes);
+        if let Some(stats) = output.truncated {
+            content = format!(
+                "Warning: truncated output (original token count: {})\nTotal output lines: {}\n\n{}",
+                approx_tokens_from_byte_count(stats.total_bytes),
+                stats.total_lines,
+                content,
+            );
+        }
 
         Ok((
             command_output_text(CommandOutputText {
                 status: status_code,
                 signal,
                 elapsed,
-                output: truncated.content,
+                output: content,
                 valid_utf8,
             }),
             None,
@@ -319,12 +328,108 @@ fn decode_output(bytes: Vec<u8>) -> (String, bool) {
     }
 }
 
-fn combine_output(stdout: &str, stderr: &str) -> String {
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => stdout.to_owned(),
-        (true, false) => stderr.to_owned(),
-        (false, false) => format!("{stdout}{stderr}"),
+struct BoundedOutput {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    head_limit: usize,
+    tail_limit: usize,
+    total_bytes: u64,
+    newline_count: u64,
+    last_byte: Option<u8>,
+}
+
+struct FinishedOutput {
+    bytes: Vec<u8>,
+    truncated: Option<OutputStats>,
+}
+
+struct OutputStats {
+    total_bytes: u64,
+    total_lines: u64,
+}
+
+impl BoundedOutput {
+    fn new(limit: usize) -> Self {
+        let head_limit = limit / 2;
+        let tail_limit = limit - head_limit;
+        Self {
+            head: Vec::with_capacity(head_limit),
+            tail: std::collections::VecDeque::with_capacity(tail_limit),
+            head_limit,
+            tail_limit,
+            total_bytes: 0,
+            newline_count: 0,
+            last_byte: None,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
+        self.newline_count = self
+            .newline_count
+            .saturating_add(chunk.iter().filter(|byte| **byte == b'\n').count() as u64);
+        self.last_byte = chunk.last().copied().or(self.last_byte);
+
+        let mut rest = chunk;
+        let head_remaining = self.head_limit.saturating_sub(self.head.len());
+        if head_remaining > 0 {
+            let keep = head_remaining.min(rest.len());
+            self.head.extend_from_slice(&rest[..keep]);
+            rest = &rest[keep..];
+        }
+        for byte in rest {
+            if self.tail.len() == self.tail_limit {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(*byte);
+        }
+    }
+
+    fn finish(self) -> FinishedOutput {
+        let limit = self.head_limit + self.tail_limit;
+        let truncated = (self.total_bytes as usize > limit).then(|| OutputStats {
+            total_bytes: self.total_bytes,
+            total_lines: self.total_lines(),
+        });
+        let mut bytes = self.head;
+        if let Some(stats) = &truncated {
+            bytes.extend_from_slice(
+                format!(
+                    "\n…{} tokens truncated…\n",
+                    approx_tokens_from_byte_count(stats.total_bytes.saturating_sub(limit as u64))
+                )
+                .as_bytes(),
+            );
+        }
+        bytes.extend(self.tail);
+        FinishedOutput { bytes, truncated }
+    }
+
+    fn total_lines(&self) -> u64 {
+        self.newline_count + u64::from(self.total_bytes > 0 && self.last_byte != Some(b'\n'))
+    }
+}
+
+fn approx_tokens_from_byte_count(bytes: u64) -> u64 {
+    bytes.saturating_add(APPROX_BYTES_PER_TOKEN.saturating_sub(1)) / APPROX_BYTES_PER_TOKEN
+}
+
+async fn read_output_chunks<R>(
+    mut reader: R,
+    output: mpsc::UnboundedSender<Vec<u8>>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let len = reader.read(&mut buffer).await?;
+        if len == 0 {
+            return Ok(());
+        }
+        if output.send(buffer[..len].to_vec()).is_err() {
+            return Ok(());
+        }
     }
 }
 

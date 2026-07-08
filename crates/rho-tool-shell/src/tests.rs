@@ -68,14 +68,16 @@ async fn nonzero_exit_is_structured_result_not_tool_error() {
 }
 
 #[tokio::test]
-async fn concatenates_stdout_then_stderr() {
+async fn interleaves_stdout_and_stderr_in_read_order() {
     let tools = test_tools(2);
     let result = tools
-        .call(shell_call(json!({"command": "printf out; printf err >&2"})))
+        .call(shell_call(json!({
+            "command": "printf out; sleep 0.05; printf err >&2; sleep 0.05; printf out2"
+        })))
         .await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
-    assert!(result.output.as_ref().contains("Output:\nouterr"));
+    assert!(result.output.as_ref().contains("Output:\nouterrout2"));
 }
 
 #[tokio::test]
@@ -95,7 +97,7 @@ async fn truncates_concatenated_output() {
     );
     assert!(result.output.as_ref().contains("Total output lines: 20000"));
     assert!(result.output.as_ref().contains("tokens truncated"));
-    assert!(result.output.len() < truncate::MAX_OUTPUT_BYTES + 2048);
+    assert!(result.output.len() < MAX_OUTPUT_BYTES + 2048);
 }
 
 #[tokio::test]
