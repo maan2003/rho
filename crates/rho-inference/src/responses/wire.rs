@@ -45,7 +45,7 @@ impl Decoder for OpenAiResponsesProviderData {
         // Temporary migration compatibility: old dev databases encoded the
         // encrypted reasoning provider item as `Reasoning`. Decode that old
         // variant into the current enum, but do not keep it in the real
-        // runtime representation. Remove this shim with the b8c0d4e1 agent DB
+        // runtime representation. Remove this shim with the 4d91a2f7 agent DB
         // migration.
         #[derive(Decode)]
         enum TemporaryOpenAiResponsesProviderDataDecode {
