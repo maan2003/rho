@@ -411,6 +411,24 @@ impl RunningAgent {
         }
     }
 
+    pub async fn wait_for_input(&self, timeout: std::time::Duration) -> bool {
+        match self {
+            Self::Claude(agent) => agent.wait_for_input(timeout).await,
+            Self::Rho(agent) => {
+                let deadline = tokio::time::Instant::now() + timeout;
+                loop {
+                    if !agent.state().queued_inputs.is_empty() {
+                        return true;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+
     pub fn set_deep_config(&self, config: DeepConfig) -> anyhow::Result<()> {
         match self {
             Self::Rho(agent) => {

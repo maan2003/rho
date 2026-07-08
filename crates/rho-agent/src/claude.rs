@@ -3,9 +3,10 @@
 //! `rho-claude` owns the Claude Code protocol. This module owns the projection
 //! from Claude protocol/transcript messages into Rho agent vocabulary.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write as _;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context as _;
@@ -37,6 +38,9 @@ pub struct ClaudeAgent {
     state: Arc<RwLock<AgentState>>,
     control: mpsc::UnboundedSender<ClaudeControl>,
     notify: Arc<Notify>,
+    input_seq: Arc<AtomicU64>,
+    wait_baseline_seq: Arc<AtomicU64>,
+    input_notify: Arc<Notify>,
 }
 
 impl ClaudeAgent {
@@ -168,6 +172,9 @@ impl ClaudeAgent {
     ) -> Self {
         let state = Arc::new(RwLock::new(state));
         let notify = Arc::new(Notify::new());
+        let input_seq = Arc::new(AtomicU64::new(0));
+        let wait_baseline_seq = Arc::new(AtomicU64::new(0));
+        let input_notify = Arc::new(Notify::new());
         let (control, control_rx) = mpsc::unbounded_channel();
         let loop_state = ClaudeLoop {
             workspace,
@@ -179,9 +186,12 @@ impl ClaudeAgent {
             claude_prompt_path: None,
             pending_response: PendingInferenceResponse::default(),
             stream_items: BTreeMap::new(),
+            queued_turns: VecDeque::new(),
             turn_usage: None,
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
+            wait_baseline_seq: Arc::clone(&wait_baseline_seq),
+            input_notify: Arc::clone(&input_notify),
             control_rx,
             multi_agent,
         };
@@ -190,6 +200,9 @@ impl ClaudeAgent {
             state,
             control,
             notify,
+            input_seq,
+            wait_baseline_seq,
+            input_notify,
         }
     }
 
@@ -198,7 +211,31 @@ impl ClaudeAgent {
     }
 
     pub fn send_user_message(&self, text: impl Into<String>) {
-        let _ = self.control.send(ClaudeControl::UserMessage(text.into()));
+        let seq = self.input_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let uuid = Uuid::new_v4().to_string();
+        self.input_notify.notify_waiters();
+        let _ = self.control.send(ClaudeControl::UserMessage {
+            text: text.into(),
+            seq,
+            uuid,
+        });
+    }
+
+    pub async fn wait_for_input(&self, timeout: std::time::Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.input_notify.notified();
+                let baseline = self.wait_baseline_seq.load(Ordering::Acquire);
+                let current = self.input_seq.load(Ordering::Acquire);
+                if baseline != 0 && current != baseline {
+                    self.wait_baseline_seq.store(current, Ordering::Release);
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
     }
 
     pub fn compact(&self) {
@@ -244,7 +281,11 @@ enum ClaudeStartMode {
 }
 
 enum ClaudeControl {
-    UserMessage(String),
+    UserMessage {
+        text: String,
+        seq: u64,
+        uuid: String,
+    },
     SetEffort {
         effort: Effort,
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -262,6 +303,7 @@ struct ClaudeLoop {
     claude_prompt_path: Option<tempfile::TempPath>,
     pending_response: PendingInferenceResponse,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
+    queued_turns: VecDeque<ClaudeTurn>,
     /// Usage of the in-flight message: `message_start` seeds it,
     /// `message_delta` overlays the final counts (`message_start`'s
     /// `input_tokens` is a streaming placeholder). Snapshots are taken as-is,
@@ -269,8 +311,15 @@ struct ClaudeLoop {
     turn_usage: Option<rho_claude::protocol::TokenUsage>,
     state: Arc<RwLock<AgentState>>,
     notify: Arc<Notify>,
+    wait_baseline_seq: Arc<AtomicU64>,
+    input_notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
     multi_agent: Option<MultiAgentTools>,
+}
+
+struct ClaudeTurn {
+    uuid: String,
+    input_seq: u64,
 }
 
 impl ClaudeLoop {
@@ -317,7 +366,7 @@ impl ClaudeLoop {
 
     async fn handle_control(&mut self, control: ClaudeControl) {
         match control {
-            ClaudeControl::UserMessage(text) => {
+            ClaudeControl::UserMessage { text, seq, uuid } => {
                 if let Err(error) = self.ensure_process().await {
                     self.fail(error);
                     return;
@@ -338,6 +387,10 @@ impl ClaudeLoop {
                     MessageDelivery::Immediate
                 };
                 let content = vec![ContentPart::Text { text: text.clone() }];
+                self.queued_turns.push_back(ClaudeTurn {
+                    uuid: uuid.clone(),
+                    input_seq: seq,
+                });
                 self.state
                     .write()
                     .expect("poison")
@@ -350,7 +403,13 @@ impl ClaudeLoop {
                         delivery,
                     });
                 self.notify.notify_waiters();
-                if let Err(error) = self.process.as_mut().unwrap().send_user_message(text).await {
+                if let Err(error) = self
+                    .process
+                    .as_mut()
+                    .unwrap()
+                    .send_user_message_with_uuid(text, uuid)
+                    .await
+                {
                     self.fail(error);
                 }
             }
@@ -567,11 +626,14 @@ impl ClaudeLoop {
                     Err(error) => self.fail(error),
                 }
             }
-            rho_claude::ClaudeEvent::User(message) => match user_output_to_block(message) {
-                Ok(Some(block)) => self.handle_user_block(block),
-                Ok(None) => {}
-                Err(error) => self.fail(error),
-            },
+            rho_claude::ClaudeEvent::User(message) => {
+                self.activate_turn_from_user_echo(message.uuid.as_deref());
+                match user_output_to_block(message) {
+                    Ok(Some(block)) => self.handle_user_block(block),
+                    Ok(None) => {}
+                    Err(error) => self.fail(error),
+                }
+            }
             rho_claude::ClaudeEvent::Result(message) => {
                 if message.is_error {
                     self.fail(anyhow::anyhow!("{}", message.errors.join("\n")));
@@ -595,6 +657,20 @@ impl ClaudeLoop {
     }
 
     async fn persist_inference_block(&self, _block: &Arc<ContextBlock>) {}
+
+    fn activate_turn_from_user_echo(&mut self, uuid: Option<&str>) {
+        let Some(uuid) = uuid else { return };
+        let Some(index) = self.queued_turns.iter().position(|turn| turn.uuid == uuid) else {
+            return;
+        };
+        let turn = self
+            .queued_turns
+            .remove(index)
+            .expect("index came from position");
+        self.wait_baseline_seq
+            .store(turn.input_seq, Ordering::Release);
+        self.input_notify.notify_waiters();
+    }
 
     async fn handle_system_message(&mut self, message: rho_claude::protocol::SystemMessage) {
         let rho_claude::protocol::SystemMessage::CompactBoundary {

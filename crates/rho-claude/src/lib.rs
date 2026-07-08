@@ -136,6 +136,15 @@ impl ClaudeCode {
             .await
     }
 
+    pub async fn send_user_message_with_uuid(
+        &mut self,
+        text: impl Into<String>,
+        uuid: String,
+    ) -> Result<()> {
+        self.write_message(&protocol::InputMessage::user_with_uuid(text, uuid))
+            .await
+    }
+
     pub async fn apply_effort(&mut self, effort: Effort) -> Result<String> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.write_json(&serde_json::json!({
@@ -259,7 +268,20 @@ mod tests {
                     "content": [{"type": "text", "text": "hello"}],
                 },
                 "parent_tool_use_id": null,
+                "uuid": null,
             })
+        );
+    }
+
+    #[test]
+    fn builds_user_message_with_uuid() {
+        assert_eq!(
+            serde_json::to_value(protocol::InputMessage::user_with_uuid(
+                "hello",
+                "prompt-1".to_owned()
+            ))
+            .unwrap()["uuid"],
+            "prompt-1"
         );
     }
 

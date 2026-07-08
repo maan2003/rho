@@ -469,17 +469,14 @@ impl AgentRegistry {
             }
             McpAgentToolRequest::Wait { timeout_seconds } => {
                 let timeout_seconds = timeout_seconds.unwrap_or(300).clamp(1, 3600);
-                let deadline =
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
-                loop {
-                    let (_, agent, _) = self.pool.load(self_agent_id).await?;
-                    if !agent.state().queued_inputs.is_empty() {
-                        return Ok("Message(s) are waiting in your queue.".to_owned());
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Ok("Timed out waiting for agent messages or user input.".to_owned());
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let (_, agent, _) = self.pool.load(self_agent_id).await?;
+                if agent
+                    .wait_for_input(std::time::Duration::from_secs(timeout_seconds))
+                    .await
+                {
+                    Ok("Message(s) arrived for this agent.".to_owned())
+                } else {
+                    Ok("Timed out waiting for agent messages or user input.".to_owned())
                 }
             }
         }

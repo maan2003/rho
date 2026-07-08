@@ -55,7 +55,11 @@ pub(crate) enum InputMessage {
 
 impl InputMessage {
     pub(crate) fn user(text: impl Into<String>) -> Self {
-        Self::User(UserInput::text(text))
+        Self::User(UserInput::text(text, None))
+    }
+
+    pub(crate) fn user_with_uuid(text: impl Into<String>, uuid: String) -> Self {
+        Self::User(UserInput::text(text, Some(uuid)))
     }
 }
 
@@ -64,14 +68,16 @@ pub(crate) struct UserInput {
     session_id: String,
     message: ConversationMessage,
     parent_tool_use_id: Option<String>,
+    uuid: Option<String>,
 }
 
 impl UserInput {
-    fn text(text: impl Into<String>) -> Self {
+    fn text(text: impl Into<String>, uuid: Option<String>) -> Self {
         Self {
             session_id: String::new(),
             message: ConversationMessage::user_text(text),
             parent_tool_use_id: None,
+            uuid,
         }
     }
 }
