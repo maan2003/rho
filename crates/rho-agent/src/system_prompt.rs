@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
-use crate::db::AgentId;
+use crate::multi_agent_tools::MultiAgentTools;
 
-/// `agent_id` is set for pooled agents, which get the multi-agent tools and
+/// `multi_agent` is set for pooled agents, which get the multi-agent tools and
 /// the section explaining them.
 pub fn prompt(
     workspace: &rho_workspaces::Workspace,
-    agent_id: Option<AgentId>,
-    parent: Option<AgentId>,
+    multi_agent: Option<&MultiAgentTools>,
 ) -> Arc<str> {
     let working_directory = workspace.repo();
     let context = workspace.discovered_context();
@@ -21,9 +20,9 @@ pub fn prompt(
     }
     let agents_md = render_agents_md_prompt(&context.agents_files).unwrap_or_default();
     let skills = render_skills_prompt(&context.skills).unwrap_or_default();
-    let multi_agent = agent_id.map_or_else(String::new, |id| {
-        let agent_id = format!("ag-{}", id.encoded());
-        let role = match parent {
+    let multi_agent = multi_agent.map_or_else(String::new, |tools| {
+        let agent_id = format!("ag-{}", tools.self_id().encoded());
+        let role = match tools.parent() {
             Some(parent) => format!(
                 "You are an agent in a team of agents collaborating to complete a task. Your \
                  agent id is {agent_id}; your parent agent is ag-{}.\n\nMessages from your \

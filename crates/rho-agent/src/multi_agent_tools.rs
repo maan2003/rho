@@ -46,6 +46,14 @@ impl MultiAgentTools {
         }
     }
 
+    pub(crate) fn self_id(&self) -> AgentId {
+        self.self_id
+    }
+
+    pub(crate) fn parent(&self) -> Option<AgentId> {
+        self.parent
+    }
+
     fn pool(&self) -> anyhow::Result<Arc<AgentPool>> {
         self.pool
             .upgrade()
@@ -107,7 +115,7 @@ fn spawn_agent_spec() -> ToolSpec {
             "properties": {
                 "task_name": {
                     "type": "string",
-                    "description": "Short user-visible label for the sub-task (a few words)."
+                    "description": "Short user-visible kebab-case label for the sub-task."
                 },
                 "prompt": {
                     "type": "string",

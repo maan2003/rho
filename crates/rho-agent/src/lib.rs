@@ -589,11 +589,7 @@ impl Agent {
         let state = Arc::new(RwLock::new(AgentState {
             blocks: restored.blocks,
             tool_specs: agent_tool_specs(&shell_tools, multi_agent.is_some()),
-            system_prompt: system_prompt::prompt(
-                workspace.as_ref(),
-                multi_agent.is_some().then_some(agent_id),
-                parent,
-            ),
+            system_prompt: system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref()),
             queued_inputs: restored.queued_inputs,
             kind: restored.kind,
             context_used: restored.context_used,

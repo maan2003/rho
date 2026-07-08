@@ -77,7 +77,7 @@ impl ClaudeAgent {
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
-            system_prompt: system_prompt::prompt(workspace.as_ref(), None, None),
+            system_prompt: system_prompt::prompt(workspace.as_ref(), None),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
@@ -124,7 +124,7 @@ impl ClaudeAgent {
         let state = AgentState {
             blocks,
             tool_specs: Arc::from([]),
-            system_prompt: system_prompt::prompt(workspace.as_ref(), None, None),
+            system_prompt: system_prompt::prompt(workspace.as_ref(), None),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used,
