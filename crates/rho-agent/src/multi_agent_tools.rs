@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::MessageDelivery;
-use crate::db::AgentId;
+use crate::db::{AgentId, AgentReadTxnExt as _};
 use crate::pool::{AgentPool, SpawnWorkspace};
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
@@ -277,11 +277,21 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     let child_id = pool
         .spawn_child(tools.self_id, args.task_name, args.prompt, workspace)
         .await?;
+    let child_workspace = pool.db().read().get_agent(child_id).workspace;
+    let workspace_note = match child_workspace.workspace_name() {
+        Some(workspace) => format!(
+            " Its jj workspace is `{workspace}`; inspect its working-copy commit with `jj diff -r \
+             '{workspace}@' --stat`."
+        ),
+        None => " It is running in the shared user checkout workspace; there is no separate \
+                 `<workspace>@` handle."
+            .to_owned(),
+    };
     let child_id = format!("ag-{}", pool.agent_id_prefix(child_id));
     Ok(format!(
         "Spawned agent {} for task \"{}\". It is working now; its results will arrive as mail \
-         from that agent. Use send_message to follow up and wait to block for its results.",
-        child_id, task_name,
+         from that agent.{} Use send_message to follow up and wait to block for its results.",
+        child_id, task_name, workspace_note,
     ))
 }
 

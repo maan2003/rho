@@ -9,6 +9,7 @@ pub fn prompt(
     multi_agent: Option<&MultiAgentTools>,
 ) -> Arc<str> {
     let working_directory = workspace.repo();
+    let workspace_name = workspace.info().workspace_name();
     let context = workspace.discovered_context();
     for diagnostic in &context.diagnostics {
         eprintln!(
@@ -22,6 +23,7 @@ pub fn prompt(
     let skills = render_skills_prompt(&context.skills).unwrap_or_default();
     let multi_agent = multi_agent.map_or_else(String::new, |tools| {
         let agent_id = tools.display_id(tools.self_id());
+        let workspace_prompt = render_multi_agent_workspace_prompt(workspace_name.as_deref());
         let role = match tools.parent() {
             Some(parent) => format!(
                 "You are an agent in a team of agents collaborating to complete a task. Your \
@@ -67,20 +69,12 @@ Mail does not interrupt an in-flight request, but it can start or continue \
 your next request. Delegate when tasks are parallel and separable; do small or \
 tightly coupled work yourself.
 
+{workspace_prompt}
 "
         )
     });
-    format!(
-        "{BASE_PROMPT}{agents_md}{skills}{multi_agent}## Environment
-
-Working directory: {}
-
-Relative paths in commands and patches resolve against this directory. Stay \
-within it unless the user points you elsewhere.
-",
-        working_directory
-    )
-    .into()
+    let environment = render_environment_prompt(working_directory.as_str());
+    format!("{BASE_PROMPT}{agents_md}{skills}{multi_agent}{environment}").into()
 }
 
 fn render_agents_md_prompt(files: &[rho_context_config::AgentsFile]) -> Option<String> {
@@ -142,6 +136,18 @@ fn render_skills_prompt(skills: &[rho_context_config::Skill]) -> Option<String> 
     out.push_str("- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.\n");
     out.push('\n');
     Some(out)
+}
+
+fn render_environment_prompt(working_directory: &str) -> String {
+    format!(
+        "## Environment
+
+Working directory: {working_directory}
+
+Relative paths in commands and patches resolve against this directory. Stay \
+within it unless the user points you elsewhere.
+"
+    )
 }
 
 const BASE_PROMPT: &str = "\
@@ -212,6 +218,34 @@ Before finalizing after an interrupt or context compaction, verify your answer a
 
 ";
 
+fn render_multi_agent_workspace_prompt(workspace_name: Option<&str>) -> String {
+    let own_workspace = match workspace_name {
+        Some(name) => format!(
+            "Your jj workspace id is `{name}`. In your own workspace, your current working-copy \
+             commit is `@`; other workspaces can refer to that same working-copy commit as \
+             `{name}@`.\n\n"
+        ),
+        None => "You are running in the user's checkout. Your current working-copy commit is `@`; \
+                 there is no separate jj workspace id for other workspaces to reference.\n\n"
+            .to_owned(),
+    };
+    format!(
+        "\
+## Working With Workspaces
+
+This repository uses Jujutsu (`jj`) workspaces. Separate agents may run in separate jj workspaces that present the same working-directory path but do not share live filesystem edits. Use the workspace/revset handle rather than the path to inspect or transfer work.
+
+{own_workspace}
+
+- A workspace working-copy commit is addressable as `<workspace>@`.
+- Inspect another workspace with commands such as `jj status --workspace <workspace>`, `jj log -r '<workspace>@'`, or `jj diff -r '<workspace>@' --stat`.
+- To take over another workspace's change, prefer explicit jj operations such as `jj edit '<workspace>@'` or `jj squash --from '<workspace>@' --into @`, depending on whether you want to move your workspace to that change or steal its diff into your current change.
+- Do not take, squash, abandon, or otherwise rewrite another agent's work unless the user or owning agent asked you to.
+
+"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
@@ -253,5 +287,32 @@ mod tests {
                 .contains("<AGENTS_FILE path=\"/repo/AGENTS.md\">\nRead the docs.\n</AGENTS_FILE>")
         );
         assert!(prompt.contains("follow them unless they conflict"));
+    }
+
+    #[test]
+    fn workspace_handoff_guidance_is_multi_agent_only() {
+        assert!(!BASE_PROMPT.contains("## Working With Workspaces"));
+        let prompt = render_multi_agent_workspace_prompt(Some("agentws"));
+        assert!(prompt.contains("## Working With Workspaces"));
+        assert!(prompt.contains("Your jj workspace id is `agentws`"));
+        assert!(prompt.contains("current working-copy commit is `@`"));
+        assert!(prompt.contains("`agentws@`"));
+        assert!(prompt.contains("jj diff -r '<workspace>@' --stat"));
+        assert!(prompt.contains("jj squash --from '<workspace>@' --into @"));
+    }
+
+    #[test]
+    fn workspace_prompt_mentions_user_checkout_without_workspace_id() {
+        let prompt = render_multi_agent_workspace_prompt(None);
+        assert!(prompt.contains("user's checkout"));
+        assert!(prompt.contains("current working-copy commit is `@`"));
+        assert!(prompt.contains("no separate jj workspace id"));
+    }
+
+    #[test]
+    fn environment_prompt_mentions_working_directory() {
+        let prompt = render_environment_prompt("/repo");
+        assert!(prompt.contains("Working directory: /repo"));
+        assert!(!prompt.contains("jj workspace id"));
     }
 }
