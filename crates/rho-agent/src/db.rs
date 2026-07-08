@@ -35,10 +35,7 @@ const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::n
 /// Rows appear on an agent's first turn end; absence means "never finished
 /// a turn". Kept out of [`AgentRecord`] so the hot turn-end write never
 /// rewrites agent metadata.
-const AGENT_ATTENTION: TableDefinition<AgentId, Sen<AgentAttentionRecord>> =
-    TableDefinition::new("agent_attention");
-
-const CURRENT_AGENT_DB_FORMAT: &str = "9c4e2a8f";
+const CURRENT_AGENT_DB_FORMAT: &str = "d3a90b71";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -61,6 +58,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         from: "b4e17c2d",
         to: "9c4e2a8f",
         migrate: migrate_provider_specific_response_items,
+    },
+    AgentDbMigration {
+        from: "9c4e2a8f",
+        to: "d3a90b71",
+        migrate: migrate_attention_into_agent_record,
     },
 ];
 
@@ -232,6 +234,13 @@ fn migrate_agent_id_table_names(write: &mut WriteTxn) {
     migrate_topic_agents_table_key_name(write);
 }
 
+/// Temporary: drops the short-lived `agent_attention` side table; its
+/// fields moved into [`AgentRecord`] and the data was throwaway (dispositions
+/// and recency seeds reset). Delete once no database is on format 9c4e2a8f.
+fn migrate_attention_into_agent_record(write: &mut WriteTxn) {
+    write.delete_table("agent_attention");
+}
+
 fn migrate_topic_agents_table_key_name(write: &mut WriteTxn) {
     const LEGACY_TOPIC_AGENTS: TableDefinition<LegacyTopicAgentKey, ()> =
         TableDefinition::new("topic_agents");
@@ -327,28 +336,15 @@ pub enum Status {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum AgentDisposition {
     /// No disposition yet: the ball is in the user's court.
-    #[default]
     Pending,
-    /// Acknowledged; nothing more needed until the next turn end.
+    /// Acknowledged; nothing more needed until the next turn end. The
+    /// default so an agent that never finished a turn has nothing to act
+    /// on (and so pre-disposition records decode that way).
+    #[default]
     Done,
     /// Deferred: quiet until `until`, then pending again (the Slack-reminder
     /// move for "I'll get back to this").
     Snoozed { until: UnixMillis },
-}
-
-/// See [`AGENT_ATTENTION`]. Replying needs no record change: sending a
-/// message puts the agent back to work, and the next turn end overwrites
-/// the disposition with `Pending`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct AgentAttentionRecord {
-    /// When the user last sent this agent a message; rail recency seed.
-    /// Defaulted so records written before the rename from `last_turn_end`
-    /// still decode (they just lose their seed).
-    #[senax(default)]
-    pub last_user_message: UnixMillis,
-    /// That turn ended blocked on the user (error or unfinished calls).
-    pub needs_input: bool,
-    pub disposition: AgentDisposition,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -417,6 +413,13 @@ pub struct AgentRecord {
     pub parent_agent: Option<AgentId>,
     pub mode: AgentMode,
     pub runtime: AgentRuntime,
+    /// When the user last sent this agent a message; rail recency seed.
+    /// Turn ends reset the disposition but leave this alone — replying is
+    /// the engagement signal, finishing is the agent's schedule.
+    #[senax(default)]
+    pub last_user_message: UnixMillis,
+    #[senax(default)]
+    pub disposition: AgentDisposition,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -514,11 +517,6 @@ pub trait AgentReadTxnExt {
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
-    /// `None` until the agent finishes its first turn.
-    fn agent_attention(&self, agent_id: AgentId) -> Option<AgentAttentionRecord>;
-    /// Every attention row; the daemon scans this at startup to re-arm
-    /// snooze timers.
-    fn list_agent_attention(&self) -> Vec<(AgentId, AgentAttentionRecord)>;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -575,9 +573,10 @@ pub trait AgentWriteTxnExt {
 
     /// Records a turn end for attention purposes; resets the disposition to
     /// `Pending` — every finished turn demands a fresh disposition.
-    fn record_agent_turn_end(&mut self, agent_id: AgentId, needs_input: bool);
+    fn record_agent_turn_end(&mut self, agent_id: AgentId);
 
-    /// Stamps the user's engagement with an agent, for rail recency.
+    /// Stamps the user's engagement with an agent (rail recency) and clears
+    /// its disposition: replying is as much a verdict as :done.
     fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId);
 
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
@@ -708,19 +707,6 @@ impl AgentReadTxnExt for ReadTxn {
         }
         (next, events)
     }
-
-    fn agent_attention(&self, agent_id: AgentId) -> Option<AgentAttentionRecord> {
-        self.open_table(AGENT_ATTENTION)
-            .get(&agent_id)
-            .map(|record| record.value().into_owned())
-    }
-
-    fn list_agent_attention(&self) -> Vec<(AgentId, AgentAttentionRecord)> {
-        self.open_table(AGENT_ATTENTION)
-            .iter()
-            .map(|(key, value)| (key.value(), value.value().into_owned()))
-            .collect()
-    }
 }
 
 impl AgentWriteTxnExt for WriteTxn {
@@ -737,7 +723,6 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(TOPICS);
         self.open_table(TOPIC_AGENTS);
         self.open_table(WORKDIRS);
-        self.open_table(AGENT_ATTENTION);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
@@ -855,6 +840,9 @@ impl AgentWriteTxnExt for WriteTxn {
             parent_agent,
             mode,
             runtime,
+            // Creating an agent is engagement; there is no turn to act on.
+            last_user_message: now,
+            disposition: AgentDisposition::Done,
         };
         self.open_table(AGENTS)
             .insert(&agent_id, SenValue::borrowed(&agent));
@@ -898,51 +886,43 @@ impl AgentWriteTxnExt for WriteTxn {
         at.next()
     }
 
-    fn record_agent_turn_end(&mut self, agent_id: AgentId, needs_input: bool) {
-        let mut table = self.open_table(AGENT_ATTENTION);
-        // Turn ends reset the disposition (the ball is back in the user's
-        // court) but say nothing about user engagement, so the message
-        // timestamp survives.
-        let last_user_message = table
+    fn record_agent_turn_end(&mut self, agent_id: AgentId) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
             .get(&agent_id)
-            .map(|record| record.value().into_owned().last_user_message)
-            .unwrap_or(UnixMs(0));
-        table.insert(
-            &agent_id,
-            SenValue::borrowed(&AgentAttentionRecord {
-                last_user_message,
-                needs_input,
-                disposition: AgentDisposition::Pending,
-            }),
-        );
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        // A turn end puts the ball back in the user's court; it says
+        // nothing about engagement, so `last_user_message` stays.
+        agent.disposition = AgentDisposition::Pending;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
     fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId) {
-        let mut table = self.open_table(AGENT_ATTENTION);
-        let mut record = table
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
             .get(&agent_id)
-            .map(|record| record.value().into_owned())
-            .unwrap_or(AgentAttentionRecord {
-                last_user_message: now,
-                needs_input: false,
-                disposition: AgentDisposition::Pending,
-            });
-        record.last_user_message = now;
-        table.insert(&agent_id, SenValue::borrowed(&record));
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.last_user_message = now;
+        // Replying is a verdict like :done or :snooze — the ball moves to
+        // the agent's court even if the turn hasn't started yet (queued
+        // delivery), so a pending lamp must not linger.
+        agent.disposition = AgentDisposition::Done;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition) {
-        let mut table = self.open_table(AGENT_ATTENTION);
-        let mut record = table
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
             .get(&agent_id)
-            .map(|record| record.value().into_owned())
-            .unwrap_or(AgentAttentionRecord {
-                last_user_message: UnixMs(0),
-                needs_input: false,
-                disposition,
-            });
-        record.disposition = disposition;
-        table.insert(&agent_id, SenValue::borrowed(&record));
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.disposition = disposition;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
     fn fork_agent_lineage(

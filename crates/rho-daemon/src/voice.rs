@@ -383,7 +383,7 @@ async fn execute_tool(
 
 async fn list_agents(registry: &Arc<AgentRegistry>, focus: &Option<AgentId>) -> String {
     let mut lines = Vec::new();
-    for topic in registry.topics(&registry.working_agents().await) {
+    for topic in registry.topics(&registry.agent_state_kinds().await) {
         if topic.status == Status::Archived {
             continue;
         }

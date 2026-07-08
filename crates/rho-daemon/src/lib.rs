@@ -8,7 +8,7 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use rho_agent::db::{
-    AgentAttentionRecord, AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
+    AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
     AgentWriteTxnExt as _, Status, TopicId,
 };
 use rho_agent::pool::{AgentPool, RunningAgent, SpawnWorkspace};
@@ -114,11 +114,17 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         });
     }
     // Re-arm snooze wake-ups that were pending when the daemon last stopped.
-    for (agent_id, record) in agents.db.read().list_agent_attention() {
-        if let AgentDisposition::Snoozed { until } = record.disposition
+    for (agent_id, agent) in agents.db.read().list_agents() {
+        if let AgentDisposition::Snoozed { until } = agent.disposition
             && until > rho_core::UnixMs::now()
         {
-            spawn_snooze_timer(agents.db.clone(), agents.events.clone(), agent_id, until);
+            spawn_snooze_timer(
+                agents.db.clone(),
+                agents.pool.clone(),
+                agents.events.clone(),
+                agent_id,
+                until,
+            );
         }
     }
 
@@ -220,21 +226,15 @@ impl AgentRegistry {
         registry
     }
 
-    /// Attention for an agent that is not mid-turn: pending turn ends demand
-    /// the user, dispositions and unexpired snoozes silence them, and
-    /// sub-agents are always quiet (their turns are the parent's court).
-    fn settled_attention(&self, agent_id: AgentId) -> UiAttention {
-        settled_attention(&self.db, agent_id)
-    }
-
-    /// Agents currently mid-turn, for summary building.
-    async fn working_agents(&self) -> HashSet<AgentId> {
+    /// Live state kinds of every loaded agent, for attention derivation.
+    /// Blocked/working are read off the running agent, never persisted; only
+    /// the disposition (the user's verdict) lives in the database.
+    async fn agent_state_kinds(&self) -> HashMap<AgentId, AgentStateKind> {
         self.pool
             .loaded()
             .await
             .into_iter()
-            .filter(|(_, agent)| is_working(&agent.state().kind))
-            .map(|(agent_id, _)| agent_id)
+            .map(|(agent_id, agent)| (agent_id, agent.state().kind))
             .collect()
     }
 
@@ -245,19 +245,22 @@ impl AgentRegistry {
         write.set_agent_disposition(agent_id, disposition);
         write.commit();
         if let AgentDisposition::Snoozed { until } = disposition {
-            spawn_snooze_timer(self.db.clone(), self.events.clone(), agent_id, until);
+            spawn_snooze_timer(
+                self.db.clone(),
+                self.pool.clone(),
+                self.events.clone(),
+                agent_id,
+                until,
+            );
         }
-        let attention = match self.get(agent_id).await {
-            Some(agent) if is_working(&agent.state().kind) => UiAttention::Working,
-            _ => self.settled_attention(agent_id),
-        };
+        let kind = self.get(agent_id).await.map(|agent| agent.state().kind);
         let _ = self.events.send(ServerMessage::AgentAttention {
             agent_id,
-            attention,
+            attention: attention_level(kind.as_ref(), disposition),
         });
     }
 
-    fn topics(&self, working: &HashSet<AgentId>) -> Vec<UiTopic> {
+    fn topics(&self, kinds: &HashMap<AgentId, AgentStateKind>) -> Vec<UiTopic> {
         let read = self.db.read();
         // Key order over ids is meaningless (scrambled characters); creation
         // order comes from the timestamps.
@@ -286,15 +289,8 @@ impl AgentRegistry {
                             mode: agent.mode,
                             workspace: agent.workspace,
                             status: agent.status,
-                            attention: if working.contains(&agent_id) {
-                                UiAttention::Working
-                            } else {
-                                self.settled_attention(agent_id)
-                            },
-                            last_active: read
-                                .agent_attention(agent_id)
-                                .map(|record| record.last_user_message)
-                                .unwrap_or(agent.created_at),
+                            attention: attention_level(kinds.get(&agent_id), agent.disposition),
+                            last_active: agent.last_user_message.max(agent.created_at),
                         })
                         .collect(),
                 }
@@ -319,7 +315,7 @@ impl AgentRegistry {
 
     async fn ready_message(&self) -> ServerMessage {
         ServerMessage::Ready {
-            topics: self.topics(&self.working_agents().await),
+            topics: self.topics(&self.agent_state_kinds().await),
             workdirs: self.workdirs(),
             default_topic_id: self.default_topic_id,
             machine_seed: self.machine_seed,
@@ -842,30 +838,34 @@ fn is_working(kind: &AgentStateKind) -> bool {
     )
 }
 
-/// Attention for an agent that is not mid-turn, from its persisted record.
-/// Sub-agent turn ends never reach the record (see the watcher), so children
-/// stay quiet here by construction.
-fn settled_attention(db: &RhoDb, agent_id: AgentId) -> UiAttention {
-    match db.read().agent_attention(agent_id) {
-        Some(AgentAttentionRecord {
-            needs_input,
-            disposition,
-            ..
-        }) => {
-            let pending = match disposition {
-                AgentDisposition::Pending => true,
-                AgentDisposition::Done => false,
-                // An expired snooze is pending again; the timer only exists
-                // to broadcast that moment.
-                AgentDisposition::Snoozed { until } => until <= rho_core::UnixMs::now(),
-            };
-            match (pending, needs_input) {
-                (false, _) => UiAttention::Quiet,
-                (true, true) => UiAttention::NeedsInput,
-                (true, false) => UiAttention::Pending,
-            }
-        }
-        None => UiAttention::Quiet,
+/// Stuck rather than finished: the agent cannot proceed without the user.
+fn is_blocked(kind: &AgentStateKind) -> bool {
+    matches!(
+        kind,
+        AgentStateKind::Error(_) | AgentStateKind::UnfinishedTurn { .. }
+    )
+}
+
+/// Attention = f(live state, disposition). The live half (working, blocked)
+/// is read off the running agent — `None` for unloaded agents, which render
+/// as idle. The persisted half is the user's verdict on the last turn end;
+/// sub-agent turn ends never set it to Pending (see the watcher), so
+/// children stay quiet by construction.
+fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition) -> UiAttention {
+    if kind.is_some_and(is_working) {
+        return UiAttention::Working;
+    }
+    let pending = match disposition {
+        AgentDisposition::Pending => true,
+        AgentDisposition::Done => false,
+        // An expired snooze is pending again; the timer only exists to
+        // broadcast that moment.
+        AgentDisposition::Snoozed { until } => until <= rho_core::UnixMs::now(),
+    };
+    match (pending, kind.is_some_and(is_blocked)) {
+        (false, _) => UiAttention::Quiet,
+        (true, true) => UiAttention::NeedsInput,
+        (true, false) => UiAttention::Pending,
     }
 }
 
@@ -889,21 +889,14 @@ fn spawn_attention_watcher(
         let mut last_sent = None;
         while let Some(state) = changes.next().await {
             let working = is_working(&state.kind);
-            let attention = if working {
-                UiAttention::Working
-            } else {
-                if was_working && !is_child {
-                    let needs_input = matches!(
-                        state.kind,
-                        AgentStateKind::Error(_) | AgentStateKind::UnfinishedTurn { .. }
-                    );
-                    let mut write = db.write().await;
-                    write.record_agent_turn_end(agent_id, needs_input);
-                    write.commit();
-                }
-                settled_attention(&db, agent_id)
-            };
+            if !working && was_working && !is_child {
+                let mut write = db.write().await;
+                write.record_agent_turn_end(agent_id);
+                write.commit();
+            }
             was_working = working;
+            let disposition = db.read().get_agent(agent_id).disposition;
+            let attention = attention_level(Some(&state.kind), disposition);
             if last_sent != Some(attention) {
                 let _ = events.send(ServerMessage::AgentAttention {
                     agent_id,
@@ -920,6 +913,7 @@ fn spawn_attention_watcher(
 /// then-current level.
 fn spawn_snooze_timer(
     db: RhoDb,
+    pool: Arc<AgentPool>,
     events: broadcast::Sender<ServerMessage>,
     agent_id: AgentId,
     until: rho_core::UnixMs,
@@ -927,9 +921,11 @@ fn spawn_snooze_timer(
     tokio::spawn(async move {
         let delay = until.saturating_duration_since(rho_core::UnixMs::now());
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        let kind = pool.get(agent_id).await.map(|agent| agent.state().kind);
+        let disposition = db.read().get_agent(agent_id).disposition;
         let _ = events.send(ServerMessage::AgentAttention {
             agent_id,
-            attention: settled_attention(&db, agent_id),
+            attention: attention_level(kind.as_ref(), disposition),
         });
     });
 }
@@ -1056,6 +1052,13 @@ async fn handle_message(
                 write.record_agent_user_message(rho_core::UnixMs::now(), agent_id);
                 write.commit();
             }
+            // Replying cleared the disposition; say so even when the turn
+            // doesn't start immediately (queued delivery), or the pending
+            // lamp would linger until the watcher's next state change.
+            let _ = agents.events.send(ServerMessage::AgentAttention {
+                agent_id,
+                attention: attention_level(Some(&agent.state().kind), AgentDisposition::Done),
+            });
             agents
                 .maybe_generate_title(agent_id, text, outgoing_tx.clone())
                 .await;

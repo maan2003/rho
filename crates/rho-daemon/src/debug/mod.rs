@@ -83,6 +83,12 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
             writeln!(output, "  name: {name}")?;
         }
         writeln!(output, "  status: {}", status_name(agent.status))?;
+        writeln!(
+            output,
+            "  disposition: {}",
+            disposition_name(agent.disposition)
+        )?;
+        writeln!(output, "  last_user_message: {}", agent.last_user_message.0)?;
         writeln!(output, "  mode: {}", mode_name(agent.mode))?;
         writeln!(output, "  workspace: {}", workspace_name(&agent.workspace))?;
         match agent.runtime {
@@ -224,6 +230,15 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "events decoded: {events}")?;
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
+}
+
+fn disposition_name(disposition: rho_agent::db::AgentDisposition) -> String {
+    use rho_agent::db::AgentDisposition;
+    match disposition {
+        AgentDisposition::Pending => "pending".to_owned(),
+        AgentDisposition::Done => "done".to_owned(),
+        AgentDisposition::Snoozed { until } => format!("snoozed until {}", until.0),
+    }
 }
 
 fn status_name(status: Status) -> &'static str {

@@ -774,9 +774,9 @@ mod tests {
     // `register_senax_tagged!` names the trait and its registry entry type
     // unqualified, so both must be imported from the declaring crate.
     use rho_core::{
-        AStr, ApplyPatchMetadata, ContentPart, PendingInferenceResponse, ProviderSpecificData,
-        ToolCall, ToolCallId, ToolFileChange, ToolFileStatus, ToolName, ToolOutput, ToolResult,
-        ToolType, __SenaxProviderSpecificDataEntry,
+        __SenaxProviderSpecificDataEntry, AStr, ApplyPatchMetadata, ContentPart,
+        PendingInferenceResponse, ProviderSpecificData, ToolCall, ToolCallId, ToolFileChange,
+        ToolFileStatus, ToolName, ToolOutput, ToolResult, ToolType,
     };
     use senax_encoder::{Decode, Encode};
 
