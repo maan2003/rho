@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use rho_core::{ContentPart, UnixMs};
+use rho_core::{ContentPart, InferenceResponseItem, ProviderResponseItemId, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
 use rho_workspaces::WorkspaceInfo;
@@ -230,75 +230,176 @@ async fn agent_events_read_lineage_parents() {
     assert_eq!(texts, ["parent", "child"]);
 }
 
-/// The migration sees legacy rows through the temporary `Decoder` impl,
-/// which maps them to `Queued` items — so inserting `Queued` rows directly
-/// reproduces exactly what it reads from a `2a7f4d91` database.
+#[test]
+fn compaction_repair_fills_missing_encrypted_content() {
+    let item_id = ProviderResponseItemId::try_from("cmp_1").unwrap();
+    let mut event = AgentEvent::InferenceResponse {
+        items: std::borrow::Cow::Owned(vec![InferenceResponseItem::Compaction {
+            provider_specific: Box::new(rho_inference::OpenAiResponsesProviderData::Compaction {
+                item_id: item_id.clone(),
+                encrypted_content: String::new(),
+            }),
+        }]),
+        provider_response_id: None,
+        context_used: None,
+    };
+    let provider_items = DebugProviderItems {
+        compactions: [(item_id.as_str().to_owned(), "sealed".to_owned())]
+            .into_iter()
+            .collect(),
+        reasonings: HashMap::new(),
+    };
+
+    let mut stats = ProviderRepairStats::default();
+    assert!(repair_event_provider_items(
+        &mut event,
+        &provider_items,
+        &mut stats
+    ));
+
+    let AgentEvent::InferenceResponse { items, .. } = event else {
+        panic!("wrong event");
+    };
+    let InferenceResponseItem::Compaction { provider_specific } = &items[0] else {
+        panic!("wrong item");
+    };
+    let Some(rho_inference::OpenAiResponsesProviderData::Compaction {
+        encrypted_content, ..
+    }) = provider_specific
+        .as_any()
+        .downcast_ref::<rho_inference::OpenAiResponsesProviderData>()
+    else {
+        panic!("wrong provider data");
+    };
+    assert_eq!(encrypted_content, "sealed");
+    assert_eq!(stats.compactions_repaired, 1);
+}
+
+#[test]
+fn reasoning_repair_fills_missing_summary_from_response_debug_events() {
+    let item_id = ProviderResponseItemId::try_from("rs_1").unwrap();
+    let mut event = AgentEvent::InferenceResponse {
+        items: std::borrow::Cow::Owned(vec![InferenceResponseItem::EncryptedReasoning {
+            provider_specific: Box::new(
+                rho_inference::OpenAiResponsesProviderData::EncryptedReasoning {
+                    item_id: item_id.clone(),
+                    encrypted_content: "ciphertext".to_owned(),
+                },
+            ),
+            summary: Vec::new(),
+        }]),
+        provider_response_id: None,
+        context_used: None,
+    };
+    let mut provider_items = DebugProviderItems::default();
+    collect_response_summary_deltas(
+        &serde_json::json!({
+            "raw_events": [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "rs_1"}
+                },
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "think"
+                },
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "ing"
+                }
+            ]
+        }),
+        &mut provider_items,
+    );
+
+    let mut stats = ProviderRepairStats::default();
+    assert!(repair_event_provider_items(
+        &mut event,
+        &provider_items,
+        &mut stats
+    ));
+
+    let AgentEvent::InferenceResponse { items, .. } = event else {
+        panic!("wrong event");
+    };
+    let InferenceResponseItem::EncryptedReasoning { summary, .. } = &items[0] else {
+        panic!("wrong item");
+    };
+    assert_eq!(summary, &["thinking".to_owned()]);
+    assert_eq!(stats.reasoning_summaries_repaired, 1);
+}
+
 #[tokio::test]
-async fn migration_splits_legacy_events_and_remaps_cursors() {
+#[ignore = "diagnostic for a developer's local rho DB and provider debug logs"]
+async fn local_db_copy_migration_reports_missing_debug_payloads() {
+    let source = dirs::state_dir()
+        .expect("state directory must be available")
+        .join("rho")
+        .join("rho.redb");
     let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let snapshot = temp.path().join("rho.redb");
+    std::fs::copy(&source, &snapshot)
+        .unwrap_or_else(|error| panic!("copy {}: {error}", source.display()));
 
+    let db = RhoDb::open(&snapshot);
     let mut write = db.write().await;
-    write.init_agent_tables();
-    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
-    let agent_id = write.alloc_agent_id();
-    let next = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        topic_id,
-        Some("main".to_owned()),
-        test_workspace(),
-        AgentMode::deep_default(),
-        test_agent_runtime(),
-        None,
-    );
-    let next = write.append_agent_event(next, &user_event("a"));
-    // append returns the next free position: `pos_c` is where "c" lands.
-    let pos_c = write.append_agent_event(
-        next,
-        &AgentEvent::InferenceResponse {
-            items: std::borrow::Cow::Owned(Vec::new()),
-            provider_response_id: None,
-            context_used: None,
-        },
-    );
-    let next = write.append_agent_event(pos_c, &user_event("c"));
-    write.append_agent_event(next, &user_event("d"));
-
-    // A fork whose cursor points at the second legacy event ("c"): after
-    // migration it must point at c's `Queued` so the pair is excluded.
-    let child_lineage = AgentLineageId(99);
+    let before_format = write
+        .open_table(FORMAT)
+        .get(&())
+        .map(|value| value.value())
+        .unwrap_or_else(|| "<missing>".to_owned());
+    let stats = repair_provider_items_from_debug_logs(&mut write);
     write
-        .open_table(LINEAGE_PARENTS)
-        .insert(&child_lineage, &pos_c);
-
-    migrate_queued_event_shape(&mut write);
+        .open_table(FORMAT)
+        .insert(&(), &CURRENT_AGENT_DB_FORMAT.to_owned());
     write.commit();
 
     let read = db.read();
-    let (_, events) = read.agent_events(agent_id);
-    let expect_pair = |queued: &AgentEvent<'_>, dequeued: &AgentEvent<'_>, body: &str| {
-        assert_eq!(*queued, user_event(body));
-        assert_eq!(
-            *dequeued,
-            AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextTurn,
-            }
-        );
-    };
-    assert_eq!(events.len(), 7, "4 events, 3 of them expanded into pairs");
-    expect_pair(&events[0], &events[1], "a");
-    assert!(matches!(&events[2], AgentEvent::InferenceResponse { .. }));
-    expect_pair(&events[3], &events[4], "c");
-    expect_pair(&events[5], &events[6], "d");
+    let agents = read.list_agents();
+    let mut events = 0usize;
+    for (agent_id, _) in &agents {
+        events += read.agent_events(*agent_id).1.len();
+    }
 
-    let remapped = read.open_table(LINEAGE_PARENTS);
-    let cursor = remapped.get(&child_lineage).unwrap().value();
-    assert_eq!(cursor.lineage_id, pos_c.lineage_id);
-    assert_eq!(
-        cursor.seq,
-        pos_c.seq + 1,
-        "one expansion before the cursor shifts it by one"
+    eprintln!("source: {}", source.display());
+    eprintln!("snapshot: {}", snapshot.display());
+    eprintln!("format: {before_format} -> {CURRENT_AGENT_DB_FORMAT}");
+    eprintln!("agents decoded: {}", agents.len());
+    eprintln!("events decoded: {events}");
+    eprintln!("events changed: {}", stats.events_changed);
+    eprintln!("compactions repaired: {}", stats.compactions_repaired);
+    eprintln!(
+        "compactions missing debug logs: {}",
+        stats.compactions_missing_debug
+    );
+    eprintln!(
+        "reasoning encrypted_content repaired: {}",
+        stats.reasoning_encrypted_repaired
+    );
+    eprintln!(
+        "reasoning encrypted_content not found in debug logs: {}",
+        stats.reasoning_encrypted_not_found_in_debug
+    );
+    eprintln!(
+        "reasoning encrypted_content missing debug logs: {}",
+        stats.reasoning_encrypted_missing_debug
+    );
+    eprintln!(
+        "reasoning summaries repaired: {}",
+        stats.reasoning_summaries_repaired
+    );
+    eprintln!(
+        "reasoning summaries not found in debug logs: {}",
+        stats.reasoning_summaries_not_found_in_debug
+    );
+    eprintln!(
+        "reasoning summaries missing debug logs: {}",
+        stats.reasoning_summaries_missing_debug
     );
 }
 

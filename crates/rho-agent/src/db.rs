@@ -1,10 +1,13 @@
 //! Raw redb schema for persisted agents.
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
+
 use camino::Utf8PathBuf;
 use prefix_id::{PrefixId, PrefixIdDomain};
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
-use rho_core::UnixMs;
+use rho_core::{InferenceResponseItem, UnixMs};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
 pub use rho_inference::config::{DeepConfig, DeepEffort};
@@ -35,7 +38,7 @@ const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::n
 /// Rows appear on an agent's first turn end; absence means "never finished
 /// a turn". Kept out of [`AgentRecord`] so the hot turn-end write never
 /// rewrites agent metadata.
-const CURRENT_AGENT_DB_FORMAT: &str = "d3a90b71";
+const CURRENT_AGENT_DB_FORMAT: &str = "e7f3a9c2";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -43,245 +46,309 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: "2a7f4d91",
-        to: "1e1beb36",
-        migrate: migrate_queued_event_shape,
-    },
-    AgentDbMigration {
-        from: "1e1beb36",
-        to: "b4e17c2d",
-        migrate: migrate_agent_id_table_names,
-    },
-    AgentDbMigration {
-        from: "b4e17c2d",
-        to: "9c4e2a8f",
-        migrate: migrate_provider_specific_response_items,
-    },
-    AgentDbMigration {
-        from: "9c4e2a8f",
-        to: "d3a90b71",
-        migrate: migrate_attention_into_agent_record,
-    },
-];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "d3a90b71",
+    to: "e7f3a9c2",
+    migrate: migrate_compaction_encrypted_content_from_debug_logs,
+}];
 
-/// Temporary: rewrites legacy `AgentEvent::UserMessage`/`CompactionTriggered`
-/// rows (which were delivered at persist time) into `Queued` +
-/// `Dequeued(NextTurn)` pairs, which replay to the identical block sequence.
-/// The temporary `Decoder` impl on [`AgentEvent`] already maps each legacy
-/// row to a `Queued` item, and a `2a7f4d91` database predates the `Queued`
-/// variant, so every `Queued` seen here is a legacy row. The expansion
-/// shifts later seqs within a lineage, so fork cursors pointing into it
-/// move by the same shift. Delete with that `Decoder` impl.
-fn migrate_queued_event_shape(write: &mut WriteTxn) {
-    use std::collections::HashMap;
-
-    use crate::MessageDelivery;
-
-    let events: Vec<(AgentEventPos, AgentEvent<'static>)> = write
-        .open_table(AGENT_EVENTS)
-        .iter()
-        .map(|(pos, event)| (pos.value(), event.value().into_owned()))
-        .collect();
-
-    // Old seqs of legacy events per lineage: any position shifts by the
-    // count of expansions strictly before it.
-    let mut expanded: HashMap<AgentLineageId, Vec<u32>> = HashMap::new();
-    for (pos, event) in &events {
-        if matches!(event, AgentEvent::Queued(_)) {
-            expanded.entry(pos.lineage_id).or_default().push(pos.seq);
-        }
-    }
-    if expanded.is_empty() {
-        return;
-    }
-    let shifted = |pos: AgentEventPos| -> AgentEventPos {
-        let shift = expanded.get(&pos.lineage_id).map_or(0, |seqs| {
-            seqs.iter().filter(|seq| **seq < pos.seq).count() as u32
-        });
-        AgentEventPos {
-            lineage_id: pos.lineage_id,
-            seq: pos.seq + shift,
-        }
-    };
-
-    // Timelines are contiguous from seq 0 and only grow here, so the shifted
-    // re-inserts overwrite every old key; no deletes needed.
-    let mut timeline = write.open_table(AGENT_EVENTS);
-    for (pos, event) in events {
-        let new_pos = shifted(pos);
-        timeline.insert(&new_pos, SenValue::borrowed(&event));
-        if matches!(event, AgentEvent::Queued(_)) {
-            let dequeued = AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextTurn,
-            };
-            timeline.insert(&new_pos.next(), SenValue::borrowed(&dequeued));
-        }
-    }
-    drop(timeline);
-
-    let parents: Vec<(AgentLineageId, AgentEventPos)> = write
-        .open_table(LINEAGE_PARENTS)
-        .iter()
-        .map(|(child, cursor)| (child.value(), cursor.value()))
-        .collect();
-    let mut table = write.open_table(LINEAGE_PARENTS);
-    for (child, cursor) in parents {
-        let new_cursor = shifted(cursor);
-        if new_cursor != cursor {
-            table.insert(&child, &new_cursor);
-        }
-    }
+/// Temporary: repairs provider data dropped by the previous provider-specific
+/// data migration. The old DB rows have only provider item ids, so this
+/// best-effort migration reads rho's provider debug request/response logs and
+/// patches rows with matching item ids.
+fn migrate_compaction_encrypted_content_from_debug_logs(write: &mut WriteTxn) {
+    let _stats = repair_provider_items_from_debug_logs(write);
 }
 
-/// Temporary: reads the pre-move `agents` table, whose stored redb key type
-/// name embedded `AgentIdDomain`'s old module path (it has since moved to
-/// rho-core). Same 12 fixed bytes, old name. Delete with the migration.
-#[derive(Clone, Copy, Debug)]
-struct LegacyAgentIdKey([u8; 12]);
-
-impl redb::Value for LegacyAgentIdKey {
-    type SelfType<'a> = Self;
-    type AsBytes<'a> = [u8; 12];
-
-    fn fixed_width() -> Option<usize> {
-        Some(12)
+fn repair_provider_items_from_debug_logs(write: &mut WriteTxn) -> ProviderRepairStats {
+    let provider_items = debug_log_provider_items();
+    if provider_items.is_empty() {
+        return ProviderRepairStats::default();
     }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> Self
-    where
-        Self: 'a,
-    {
-        Self(data.try_into().expect("legacy agent id must be 12 bytes"))
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &'a Self) -> [u8; 12]
-    where
-        Self: 'b,
-    {
-        value.0
-    }
-
-    fn type_name() -> redb::TypeName {
-        redb::TypeName::new("prefix_id::PrefixId<rho_agent::db::AgentIdDomain>")
-    }
-}
-
-impl redb::Key for LegacyAgentIdKey {
-    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
-        data1.cmp(data2)
-    }
-}
-
-/// Temporary: reads the pre-move `topic_agents` table, whose stored redb key
-/// type name embedded `AgentIdDomain`'s old module path. Same bytes (the
-/// derive encoding is unchanged), old name. Delete with the migration.
-#[derive(Clone, Copy)]
-struct LegacyTopicAgentKey([u8; 24]);
-
-impl redb::Value for LegacyTopicAgentKey {
-    type SelfType<'a> = Self;
-    type AsBytes<'a> = [u8; 24];
-
-    fn fixed_width() -> Option<usize> {
-        Some(24)
-    }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> Self
-    where
-        Self: 'a,
-    {
-        Self(
-            data.try_into()
-                .expect("legacy topic-agent key must be 24 bytes"),
-        )
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &'a Self) -> [u8; 24]
-    where
-        Self: 'b,
-    {
-        value.0
-    }
-
-    fn type_name() -> redb::TypeName {
-        redb::TypeName::new(
-            "TopicAgentKey {topic_id: prefix_id::PrefixId<rho_agent::db::TopicIdDomain>, \
-             agent_id: prefix_id::PrefixId<rho_agent::db::AgentIdDomain>}",
-        )
-    }
-}
-
-impl redb::Key for LegacyTopicAgentKey {
-    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
-        data1.cmp(data2)
-    }
-}
-
-impl std::fmt::Debug for LegacyTopicAgentKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("LegacyTopicAgentKey")
-    }
-}
-
-/// Temporary: re-creates the `agents` and `topic_agents` tables, whose redb
-/// key type names embedded `AgentIdDomain`'s old module path before the move
-/// to rho-core. Delete with the legacy key shims once active DBs have
-/// migrated.
-fn migrate_agent_id_table_names(write: &mut WriteTxn) {
-    migrate_agents_table_key_name(write);
-    migrate_topic_agents_table_key_name(write);
-}
-
-/// Temporary: drops the short-lived `agent_attention` side table; its
-/// fields moved into [`AgentRecord`] and the data was throwaway (dispositions
-/// and recency seeds reset). Delete once no database is on format 9c4e2a8f.
-fn migrate_attention_into_agent_record(write: &mut WriteTxn) {
-    write.delete_table("agent_attention");
-}
-
-fn migrate_topic_agents_table_key_name(write: &mut WriteTxn) {
-    const LEGACY_TOPIC_AGENTS: TableDefinition<LegacyTopicAgentKey, ()> =
-        TableDefinition::new("topic_agents");
-    let keys: Vec<[u8; 24]> = write
-        .open_table(LEGACY_TOPIC_AGENTS)
-        .iter()
-        .map(|(key, _)| key.value().0)
-        .collect();
-    write.delete_table("topic_agents");
-    let mut table = write.open_table(TOPIC_AGENTS);
-    for key in keys {
-        table.insert(<TopicAgentKey as redb::Value>::from_bytes(&key), ());
-    }
-}
-
-fn migrate_agents_table_key_name(write: &mut WriteTxn) {
-    const LEGACY_AGENTS: TableDefinition<LegacyAgentIdKey, Sen<AgentRecord>> =
-        TableDefinition::new("agents");
-    let records: Vec<([u8; 12], AgentRecord)> = write
-        .open_table(LEGACY_AGENTS)
-        .iter()
-        .map(|(key, record)| (key.value().0, record.value().into_owned()))
-        .collect();
-    write.delete_table("agents");
-    let mut agents = write.open_table(AGENTS);
-    for (key, record) in records {
-        let agent_id = <AgentId as redb::Value>::from_bytes(&key);
-        agents.insert(&agent_id, SenValue::borrowed(&record));
-    }
-}
-
-fn migrate_provider_specific_response_items(write: &mut WriteTxn) {
     let mut events = write.open_table(AGENT_EVENTS);
     let rows = events
         .iter()
         .map(|(pos, event)| (pos.value(), event.value().into_owned()))
         .collect::<Vec<_>>();
 
-    for (pos, event) in rows {
-        events.insert(&pos, SenValue::borrowed(&event));
+    let mut stats = ProviderRepairStats::default();
+    for (pos, mut event) in rows {
+        if repair_event_provider_items(&mut event, &provider_items, &mut stats) {
+            events.insert(&pos, SenValue::borrowed(&event));
+            stats.events_changed += 1;
+        }
     }
+    stats
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderRepairStats {
+    events_changed: usize,
+    compactions_repaired: usize,
+    compactions_missing_debug: usize,
+    reasoning_encrypted_repaired: usize,
+    reasoning_encrypted_not_found_in_debug: usize,
+    reasoning_encrypted_missing_debug: usize,
+    reasoning_summaries_repaired: usize,
+    reasoning_summaries_not_found_in_debug: usize,
+    reasoning_summaries_missing_debug: usize,
+}
+
+#[derive(Default)]
+struct DebugProviderItems {
+    compactions: HashMap<String, String>,
+    reasonings: HashMap<String, DebugReasoningItem>,
+}
+
+impl DebugProviderItems {
+    fn is_empty(&self) -> bool {
+        self.compactions.is_empty() && self.reasonings.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct DebugReasoningItem {
+    encrypted_content: Option<String>,
+    summary: Option<Vec<String>>,
+}
+
+fn repair_event_provider_items(
+    event: &mut AgentEvent<'static>,
+    provider_items: &DebugProviderItems,
+    stats: &mut ProviderRepairStats,
+) -> bool {
+    let AgentEvent::InferenceResponse { items, .. } = event else {
+        return false;
+    };
+    let mut changed = false;
+    let mut repaired = items.to_vec();
+    repaired.retain_mut(|item| {
+        match item {
+            InferenceResponseItem::Compaction { provider_specific } => {
+                let Some(rho_inference::OpenAiResponsesProviderData::Compaction {
+                    item_id,
+                    encrypted_content,
+                }) = provider_specific
+                    .as_any()
+                    .downcast_ref::<rho_inference::OpenAiResponsesProviderData>()
+                else {
+                    return true;
+                };
+                if !encrypted_content.is_empty() {
+                    return true;
+                }
+                let Some(encrypted_content) = provider_items.compactions.get(item_id.as_str())
+                else {
+                    stats.compactions_missing_debug += 1;
+                    changed = true;
+                    return false;
+                };
+                *provider_specific =
+                    Box::new(rho_inference::OpenAiResponsesProviderData::Compaction {
+                        item_id: item_id.clone(),
+                        encrypted_content: encrypted_content.clone(),
+                    });
+                stats.compactions_repaired += 1;
+                changed = true;
+            }
+            InferenceResponseItem::EncryptedReasoning {
+                provider_specific,
+                summary,
+            } => {
+                let Some(rho_inference::OpenAiResponsesProviderData::EncryptedReasoning {
+                    item_id,
+                    encrypted_content,
+                }) = provider_specific
+                    .as_any()
+                    .downcast_ref::<rho_inference::OpenAiResponsesProviderData>()
+                else {
+                    return true;
+                };
+                let Some(debug) = provider_items.reasonings.get(item_id.as_str()) else {
+                    if encrypted_content.is_empty() {
+                        stats.reasoning_encrypted_not_found_in_debug += 1;
+                    }
+                    if summary.is_empty() {
+                        stats.reasoning_summaries_not_found_in_debug += 1;
+                    }
+                    return true;
+                };
+                if encrypted_content.is_empty()
+                    && let Some(debug_encrypted_content) = &debug.encrypted_content
+                {
+                    *provider_specific = Box::new(
+                        rho_inference::OpenAiResponsesProviderData::EncryptedReasoning {
+                            item_id: item_id.clone(),
+                            encrypted_content: debug_encrypted_content.clone(),
+                        },
+                    );
+                    stats.reasoning_encrypted_repaired += 1;
+                    changed = true;
+                } else if encrypted_content.is_empty() {
+                    stats.reasoning_encrypted_missing_debug += 1;
+                }
+                if summary.is_empty()
+                    && let Some(debug_summary) = &debug.summary
+                    && !debug_summary.is_empty()
+                {
+                    *summary = debug_summary.clone();
+                    stats.reasoning_summaries_repaired += 1;
+                    changed = true;
+                } else if summary.is_empty() {
+                    stats.reasoning_summaries_missing_debug += 1;
+                }
+            }
+            _ => {}
+        }
+        true
+    });
+    if changed {
+        *items = std::borrow::Cow::Owned(repaired);
+    }
+    changed
+}
+
+fn debug_log_provider_items() -> DebugProviderItems {
+    let Some(dir) = dirs::state_dir().map(|dir| dir.join("rho/debug/provider-requests")) else {
+        return DebugProviderItems::default();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return DebugProviderItems::default();
+    };
+    let mut provider_items = DebugProviderItems::default();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        collect_provider_items(&value, &mut provider_items);
+        collect_response_summary_deltas(&value, &mut provider_items);
+    }
+    provider_items
+}
+
+fn collect_provider_items(value: &serde_json::Value, provider_items: &mut DebugProviderItems) {
+    match value {
+        serde_json::Value::Object(map) => {
+            match map.get("type").and_then(serde_json::Value::as_str) {
+                Some("compaction") => {
+                    if let (Some(id), Some(encrypted_content)) = (
+                        map.get("id").and_then(serde_json::Value::as_str),
+                        map.get("encrypted_content")
+                            .and_then(serde_json::Value::as_str),
+                    ) {
+                        provider_items
+                            .compactions
+                            .insert(id.to_owned(), encrypted_content.to_owned());
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(id) = map.get("id").and_then(serde_json::Value::as_str) {
+                        merge_reasoning_item(
+                            provider_items.reasonings.entry(id.to_owned()).or_default(),
+                            map.get("encrypted_content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
+                            map.get("summary").and_then(summary_strings),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            for value in map.values() {
+                collect_provider_items(value, provider_items);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_provider_items(value, provider_items);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_response_summary_deltas(
+    value: &serde_json::Value,
+    provider_items: &mut DebugProviderItems,
+) {
+    let Some(raw_events) = value
+        .get("raw_events")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    let mut ids_by_index = HashMap::<usize, String>::new();
+    let mut summaries_by_index = HashMap::<usize, Vec<String>>::new();
+    for event in raw_events {
+        let index = event["output_index"].as_u64().unwrap_or(0) as usize;
+        match event["type"].as_str().unwrap_or_default() {
+            "response.output_item.added" | "response.output_item.done" => {
+                let item = &event["item"];
+                if item["type"].as_str() == Some("reasoning")
+                    && let Some(id) = item["id"].as_str()
+                {
+                    ids_by_index.insert(index, id.to_owned());
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(delta) = event["delta"].as_str() {
+                    let part = event["summary_index"].as_u64().unwrap_or(0) as usize;
+                    let summary = summaries_by_index.entry(index).or_default();
+                    if summary.len() <= part {
+                        summary.resize(part + 1, String::new());
+                    }
+                    summary[part].push_str(delta);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (index, summary) in summaries_by_index {
+        if let Some(id) = ids_by_index.get(&index) {
+            merge_reasoning_item(
+                provider_items.reasonings.entry(id.clone()).or_default(),
+                None,
+                Some(summary),
+            );
+        }
+    }
+}
+
+fn merge_reasoning_item(
+    item: &mut DebugReasoningItem,
+    encrypted_content: Option<String>,
+    summary: Option<Vec<String>>,
+) {
+    if item.encrypted_content.is_none() {
+        item.encrypted_content = encrypted_content;
+    }
+    if item.summary.as_ref().is_none_or(Vec::is_empty) {
+        item.summary = summary;
+    }
+}
+
+fn summary_strings(value: &serde_json::Value) -> Option<Vec<String>> {
+    let summary = value.as_array()?;
+    Some(
+        summary
+            .iter()
+            .filter_map(|value| {
+                value.as_str().map(str::to_owned).or_else(|| {
+                    value
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]

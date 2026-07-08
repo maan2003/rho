@@ -211,13 +211,13 @@ fn unifies_reasoning_summary_and_encrypted_content_into_one_item() {
             summary,
         } => {
             assert_eq!(summary, &["thinking".to_owned()]);
-            let OpenAiResponsesProviderData::Reasoning {
+            let OpenAiResponsesProviderData::EncryptedReasoning {
                 encrypted_content, ..
             } = openai_provider_specific_data(&**provider_specific).unwrap()
             else {
                 panic!("expected OpenAI reasoning provider data");
             };
-            assert_eq!(encrypted_content.as_deref(), Some("ciphertext"));
+            assert_eq!(encrypted_content, "ciphertext");
         }
         other => panic!("expected encrypted reasoning, got {other:?}"),
     }

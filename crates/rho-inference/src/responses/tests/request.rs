@@ -420,7 +420,11 @@ fn compaction_replay_trims_before_latest_compaction_item() {
                 vec![InferenceResponseItem::Compaction {
                     provider_specific: provider_specific(
                         "compaction",
-                        json!({"type": "compaction", "id": "cmp_1"}),
+                        json!({
+                            "type": "compaction",
+                            "id": "cmp_1",
+                            "encrypted_content": "compacted",
+                        }),
                     ),
                 }],
             ),
@@ -438,8 +442,38 @@ fn compaction_replay_trims_before_latest_compaction_item() {
 
     assert_eq!(json["input"].as_array().unwrap().len(), 2);
     assert_eq!(json["input"][0]["type"], "compaction");
+    assert_eq!(json["input"][0]["encrypted_content"], "compacted");
     assert_eq!(json["input"][1]["content"][0]["text"], "after");
     assert!(json.get("context_management").is_none());
+}
+
+#[test]
+fn skips_legacy_compaction_without_encrypted_content() {
+    let request = inference_request(
+        vec![
+            inference_response(
+                Some("resp_compaction"),
+                vec![InferenceResponseItem::Compaction {
+                    provider_specific: Box::new(OpenAiResponsesProviderData::Compaction {
+                        item_id: rho_core::ProviderResponseItemId::try_from("cmp_1").unwrap(),
+                        encrypted_content: String::new(),
+                    }),
+                }],
+            ),
+            user_block("after"),
+        ],
+        Vec::new(),
+    );
+
+    let body = ResponsesRequest::from_inference_request(
+        &test_inference_service("gpt-test"),
+        request,
+        None,
+    );
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["input"].as_array().unwrap().len(), 1);
+    assert_eq!(json["input"][0]["content"][0]["text"], "after");
 }
 
 #[test]
@@ -449,7 +483,7 @@ fn replays_reasoning_provider_item() {
             "reasoning",
             json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "sealed"}),
         ),
-        summary: Vec::new(),
+        summary: vec!["kept".to_owned()],
     };
     let request = inference_request(
         vec![
@@ -467,6 +501,7 @@ fn replays_reasoning_provider_item() {
     .unwrap();
     assert_eq!(body["input"].as_array().unwrap().len(), 2);
     assert_eq!(body["input"][0]["encrypted_content"], "sealed");
+    assert_eq!(body["input"][0]["summary"], json!(["kept"]));
 }
 
 #[test]

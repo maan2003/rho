@@ -118,11 +118,20 @@ fn provider_specific(_tag: &str, payload: Value) -> Box<dyn rho_core::ProviderSp
         "message" => OpenAiResponsesProviderData::Message { item_id },
         "function_call" => OpenAiResponsesProviderData::FunctionCall { item_id },
         "custom_tool_call" => OpenAiResponsesProviderData::CustomToolCall { item_id },
-        "reasoning" => OpenAiResponsesProviderData::Reasoning {
+        "reasoning" => OpenAiResponsesProviderData::EncryptedReasoning {
             item_id,
-            encrypted_content: payload["encrypted_content"].as_str().map(str::to_owned),
+            encrypted_content: payload["encrypted_content"]
+                .as_str()
+                .expect("reasoning test item missing encrypted_content")
+                .to_owned(),
         },
-        "compaction" => OpenAiResponsesProviderData::Compaction { item_id },
+        "compaction" => OpenAiResponsesProviderData::Compaction {
+            item_id,
+            encrypted_content: payload["encrypted_content"]
+                .as_str()
+                .expect("compaction test item missing encrypted_content")
+                .to_owned(),
+        },
         other => panic!("unexpected OpenAI test provider item type: {other}"),
     })
 }

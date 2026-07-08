@@ -19,7 +19,7 @@ use super::session::{
     AutoCompaction, ReasoningContext, ResponsesEffort, ServiceTier, TextVerbosity,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode)]
 pub enum OpenAiResponsesProviderData {
     Message {
         item_id: ProviderResponseItemId,
@@ -30,13 +30,70 @@ pub enum OpenAiResponsesProviderData {
     CustomToolCall {
         item_id: ProviderResponseItemId,
     },
-    Reasoning {
+    EncryptedReasoning {
         item_id: ProviderResponseItemId,
-        encrypted_content: Option<String>,
+        encrypted_content: String,
     },
     Compaction {
         item_id: ProviderResponseItemId,
+        encrypted_content: String,
     },
+}
+
+impl Decoder for OpenAiResponsesProviderData {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        #[derive(Decode)]
+        enum Shadow {
+            Message {
+                item_id: ProviderResponseItemId,
+            },
+            FunctionCall {
+                item_id: ProviderResponseItemId,
+            },
+            CustomToolCall {
+                item_id: ProviderResponseItemId,
+            },
+            Reasoning {
+                item_id: ProviderResponseItemId,
+                encrypted_content: Option<String>,
+            },
+            EncryptedReasoning {
+                item_id: ProviderResponseItemId,
+                encrypted_content: String,
+            },
+            Compaction {
+                item_id: ProviderResponseItemId,
+                encrypted_content: Option<String>,
+            },
+        }
+
+        Ok(match Shadow::decode(reader)? {
+            Shadow::Message { item_id } => Self::Message { item_id },
+            Shadow::FunctionCall { item_id } => Self::FunctionCall { item_id },
+            Shadow::CustomToolCall { item_id } => Self::CustomToolCall { item_id },
+            Shadow::Reasoning {
+                item_id,
+                encrypted_content,
+            } => Self::EncryptedReasoning {
+                item_id,
+                encrypted_content: encrypted_content.unwrap_or_default(),
+            },
+            Shadow::EncryptedReasoning {
+                item_id,
+                encrypted_content,
+            } => Self::EncryptedReasoning {
+                item_id,
+                encrypted_content,
+            },
+            Shadow::Compaction {
+                item_id,
+                encrypted_content,
+            } => Self::Compaction {
+                item_id,
+                encrypted_content: encrypted_content.unwrap_or_default(),
+            },
+        })
+    }
 }
 
 impl senax_encoder::TaggedSenax for OpenAiResponsesProviderData {
@@ -353,9 +410,12 @@ fn convert_response_item(item: InferenceResponseItem, out: &mut Vec<Value>) {
             }
         }
         InferenceResponseItem::EncryptedReasoning {
-            provider_specific, ..
+            provider_specific,
+            summary,
+        } => {
+            push_reasoning_provider_specific(provider_specific, &summary, out);
         }
-        | InferenceResponseItem::Compaction {
+        InferenceResponseItem::Compaction {
             provider_specific, ..
         }
         | InferenceResponseItem::Unknown {
@@ -365,6 +425,33 @@ fn convert_response_item(item: InferenceResponseItem, out: &mut Vec<Value>) {
         }
         InferenceResponseItem::RawReasoning { .. } => {}
     }
+}
+
+fn push_reasoning_provider_specific(
+    provider_specific: Box<dyn ProviderSpecificData>,
+    summary: &[String],
+    out: &mut Vec<Value>,
+) -> bool {
+    let Some(OpenAiResponsesProviderData::EncryptedReasoning {
+        item_id,
+        encrypted_content,
+    }) = provider_specific
+        .as_any()
+        .downcast_ref::<OpenAiResponsesProviderData>()
+    else {
+        return false;
+    };
+    if encrypted_content.is_empty() {
+        return false;
+    }
+    let summary = summary.to_vec();
+    out.push(json!({
+        "type": "reasoning",
+        "id": item_id.as_str(),
+        "encrypted_content": encrypted_content,
+        "summary": summary,
+    }));
+    true
 }
 
 fn push_provider_specific(
@@ -378,17 +465,13 @@ fn push_provider_specific(
         return false;
     };
     match data {
-        OpenAiResponsesProviderData::Reasoning {
+        OpenAiResponsesProviderData::Compaction {
             item_id,
-            encrypted_content: Some(encrypted_content),
-        } => out.push(json!({
-            "type": "reasoning",
-            "id": item_id.as_str(),
-            "encrypted_content": encrypted_content,
-        })),
-        OpenAiResponsesProviderData::Compaction { item_id } => out.push(json!({
+            encrypted_content,
+        } if !encrypted_content.is_empty() => out.push(json!({
             "type": "compaction",
             "id": item_id.as_str(),
+            "encrypted_content": encrypted_content,
         })),
         _ => return false,
     }
@@ -818,9 +901,18 @@ impl ResponseState {
                 }
             }
             "reasoning" => {
-                if let Some(ItemBuilder::Reasoning {
-                    provider_specific, ..
-                }) = self.builder_mut(index)
+                if item["encrypted_content"].is_string()
+                    && let Some(ItemBuilder::Reasoning {
+                        provider_specific, ..
+                    }) = self.builder_mut(index)
+                {
+                    *provider_specific = Box::new(openai_provider_data_from_item(item));
+                }
+            }
+            "compaction" => {
+                if item["encrypted_content"].is_string()
+                    && let Some(ItemBuilder::Compaction { provider_specific }) =
+                        self.builder_mut(index)
                 {
                     *provider_specific = Box::new(openai_provider_data_from_item(item));
                 }
@@ -843,9 +935,12 @@ impl ResponseState {
                 })
             }
             "reasoning" => None,
-            "compaction" => Some(StreamingContextItem::Compaction {
-                provider_specific: Box::new(openai_provider_data_from_item(item)),
-            }),
+            "compaction" if item["encrypted_content"].is_string() => {
+                Some(StreamingContextItem::Compaction {
+                    provider_specific: Box::new(openai_provider_data_from_item(item)),
+                })
+            }
+            "compaction" => None,
             _other => None,
         };
         if let Some(snapshot) = terminal {
@@ -880,13 +975,28 @@ fn openai_provider_data_from_item(item: &Value) -> OpenAiResponsesProviderData {
         "message" => OpenAiResponsesProviderData::Message { item_id },
         "function_call" => OpenAiResponsesProviderData::FunctionCall { item_id },
         "custom_tool_call" => OpenAiResponsesProviderData::CustomToolCall { item_id },
-        "reasoning" => OpenAiResponsesProviderData::Reasoning {
+        "reasoning" => OpenAiResponsesProviderData::EncryptedReasoning {
             item_id,
-            encrypted_content: item["encrypted_content"].as_str().map(str::to_owned),
+            encrypted_content: item["encrypted_content"]
+                .as_str()
+                .expect("OpenAI reasoning item missing encrypted_content")
+                .to_owned(),
         },
-        "compaction" => OpenAiResponsesProviderData::Compaction { item_id },
+        "compaction" => OpenAiResponsesProviderData::Compaction {
+            item_id,
+            encrypted_content: item["encrypted_content"]
+                .as_str()
+                .expect("OpenAI compaction item missing encrypted_content")
+                .to_owned(),
+        },
         other => panic!("unexpected OpenAI output item type: {other}"),
     }
+}
+
+fn pending_openai_provider_data() -> Box<dyn ProviderSpecificData> {
+    Box::new(rho_core::UnknownProviderSpecificData {
+        tag: "openai.responses.pending".to_owned(),
+    })
 }
 
 /// Appends `delta` to the `part`th buffer, growing the vec with empty buffers
@@ -912,12 +1022,20 @@ fn builder_from_added(item: &Value) -> Result<Option<ItemBuilder>> {
         "function_call" => tool_call_builder(item, ToolType::Function)?,
         "custom_tool_call" => tool_call_builder(item, ToolType::Custom)?,
         "reasoning" => ItemBuilder::Reasoning {
-            provider_specific: Box::new(openai_provider_data_from_item(item)),
+            provider_specific: if item["encrypted_content"].is_string() {
+                Box::new(openai_provider_data_from_item(item))
+            } else {
+                pending_openai_provider_data()
+            },
             content: None,
             summary: Vec::new(),
         },
         "compaction" => ItemBuilder::Compaction {
-            provider_specific: Box::new(openai_provider_data_from_item(item)),
+            provider_specific: if item["encrypted_content"].is_string() {
+                Box::new(openai_provider_data_from_item(item))
+            } else {
+                pending_openai_provider_data()
+            },
         },
         _ => return Ok(None),
     };
