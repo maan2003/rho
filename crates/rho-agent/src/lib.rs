@@ -164,8 +164,9 @@ pub enum QueuedItemKind {
 }
 
 /// Pending inputs in arrival order. Delivery filters by eligibility at the
-/// boundary (only `NextTurn` items wait for the turn to end), so the live
-/// loop and event replay trivially agree and no message overtakes another.
+/// boundary: `NextTurn` items wait for the turn to end, while later
+/// deliverable items may enter context earlier. Replay applies the same
+/// boundary filters, so the live loop and event log agree.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputQueues {
     items: Vec<QueuedItem>,
@@ -313,6 +314,18 @@ struct RestoredAgent {
     kind: AgentStateKind,
     context_used: Option<u64>,
     queued_inputs: InputQueues,
+}
+
+impl Default for RestoredAgent {
+    /// A fresh agent: nothing restored, idle.
+    fn default() -> Self {
+        Self {
+            blocks: Vec::new(),
+            kind: AgentStateKind::Idle,
+            context_used: None,
+            queued_inputs: InputQueues::default(),
+        }
+    }
 }
 
 fn restore_events(events: Vec<AgentEvent<'static>>) -> RestoredAgent {
@@ -512,36 +525,17 @@ impl Agent {
             parent,
         );
         write.commit();
-        let inference_session = InferenceSession::new_deep(auth, config, prompt_cache_key);
-        let shell_tools = ShellTools::new(
-            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            Arc::clone(&workspace),
-        );
-        let multi_agent = pool
-            .upgrade()
-            .map(|_| MultiAgentTools::new(pool, agent_id, parent));
-        let state = AgentState {
-            blocks: Vec::new(),
-            tool_specs: agent_tool_specs(&shell_tools, multi_agent.is_some()),
-            system_prompt: system_prompt::prompt(
-                workspace.as_ref(),
-                multi_agent.is_some().then_some(agent_id),
-            ),
-            queued_inputs: InputQueues::default(),
-            kind: AgentStateKind::Idle,
-            context_used: None,
-        };
         let agent = Self::new(
-            inference_session,
-            shell_tools,
-            Some(workspace),
-            state,
-            Some(AgentPersistence {
-                db,
-                agent_id,
-                next_event,
-            }),
-            multi_agent,
+            db,
+            auth,
+            config,
+            prompt_cache_key,
+            agent_id,
+            next_event,
+            workspace,
+            parent,
+            pool,
+            RestoredAgent::default(),
         );
         Ok((agent_id, agent))
     }
@@ -565,17 +559,46 @@ impl Agent {
             .mode
             .deep_config()
             .expect("Rho runtime stored with non-Rho agent mode");
+        // The record, not the caller, is the source of truth for the parent
+        // edge of an existing agent.
+        Self::new(
+            db,
+            auth,
+            config,
+            prompt_cache_key,
+            agent_id,
+            next_event,
+            workspace,
+            record.parent_agent,
+            pool,
+            restored,
+        )
+    }
+
+    /// Shared tail of [`Self::create`] and [`Self::load`]: wire the session,
+    /// tools, and (possibly restored) state into a running loop.
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        db: RhoDb,
+        auth: InferenceAuth,
+        config: DeepConfig,
+        prompt_cache_key: PromptCacheKey,
+        agent_id: AgentId,
+        next_event: AgentEventPos,
+        workspace: Arc<Workspace>,
+        parent: Option<AgentId>,
+        pool: std::sync::Weak<pool::AgentPool>,
+        restored: RestoredAgent,
+    ) -> Self {
         let inference_session = InferenceSession::new_deep(auth, config, prompt_cache_key);
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             Arc::clone(&workspace),
         );
-        // The record, not the caller, is the source of truth for the parent
-        // edge of an existing agent.
         let multi_agent = pool
             .upgrade()
-            .map(|_| MultiAgentTools::new(pool, agent_id, record.parent_agent));
-        let state = AgentState {
+            .map(|_| MultiAgentTools::new(pool, agent_id, parent));
+        let state = Arc::new(RwLock::new(AgentState {
             blocks: restored.blocks,
             tool_specs: agent_tool_specs(&shell_tools, multi_agent.is_some()),
             system_prompt: system_prompt::prompt(
@@ -585,30 +608,7 @@ impl Agent {
             queued_inputs: restored.queued_inputs,
             kind: restored.kind,
             context_used: restored.context_used,
-        };
-        Self::new(
-            inference_session,
-            shell_tools,
-            Some(workspace),
-            state,
-            Some(AgentPersistence {
-                db,
-                agent_id,
-                next_event,
-            }),
-            multi_agent,
-        )
-    }
-
-    fn new(
-        inference_session: InferenceSession,
-        shell_tools: ShellTools,
-        workspace: Option<Arc<Workspace>>,
-        state: AgentState,
-        persistence: Option<AgentPersistence>,
-        multi_agent: Option<MultiAgentTools>,
-    ) -> Self {
-        let state = Arc::new(RwLock::new(state));
+        }));
         let (control, control_rx) = mpsc::unbounded_channel();
         let notify = Arc::new(Notify::new());
         let agent_loop = AgentLoop {
@@ -619,7 +619,11 @@ impl Agent {
             control_rx,
             shell_tools,
             workspace,
-            persistence,
+            persistence: AgentPersistence {
+                db,
+                agent_id,
+                next_event,
+            },
             multi_agent,
         };
         tokio::spawn(agent_loop.run());
@@ -708,6 +712,39 @@ impl Agent {
     }
 }
 
+/// Arm the batch's single wait slot from a `wait` tool call. Errors
+/// (duplicate wait, bad arguments) become ordinary error tool results.
+fn arm_wait(
+    waiting: &mut Option<WaitState>,
+    call: &ToolCall,
+    started_at: UnixMs,
+) -> anyhow::Result<()> {
+    if waiting.is_some() {
+        anyhow::bail!("a wait is already in progress in this tool batch");
+    }
+    let timeout_seconds = multi_agent_tools::parse_wait_timeout(&call.arguments)?;
+    *waiting = Some(WaitState {
+        call_id: call.id.clone(),
+        until: UnixMs(started_at.0 + timeout_seconds * 1000),
+    });
+    Ok(())
+}
+
+/// An error outcome for a call that never ran.
+fn error_tool_result(call: &ToolCall, started_at: UnixMs, error: anyhow::Error) -> ToolResult {
+    ToolResult {
+        call_id: call.id.clone(),
+        tool_type: call.tool_type,
+        body: ToolOutput {
+            output: Arc::new(error.to_string()),
+            status: ToolOutputStatus::Error,
+        },
+        started_at,
+        finished_at: UnixMs::now(),
+        metadata: None,
+    }
+}
+
 fn agent_tool_specs(shell_tools: &ShellTools, multi_agent: bool) -> Arc<[ToolSpec]> {
     let mut specs = shell_tools.specs();
     if multi_agent {
@@ -750,8 +787,8 @@ struct AgentLoop {
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<AgentControl>,
     shell_tools: ShellTools,
-    workspace: Option<Arc<Workspace>>,
-    persistence: Option<AgentPersistence>,
+    workspace: Arc<Workspace>,
+    persistence: AgentPersistence,
     /// Present on pooled agents: identity + `Weak` pool handle for the
     /// built-in spawn/send/wait tools and parent result/error mail.
     multi_agent: Option<MultiAgentTools>,
@@ -919,9 +956,9 @@ impl AgentLoop {
                                 Err(anyhow::anyhow!(
                                     ":rewind is not available while work is running"
                                 ))
-                            } else if let Some(persistence) = self.persistence.as_ref() {
-                                let db = persistence.db.clone();
-                                let agent_id = persistence.agent_id;
+                            } else {
+                                let db = self.persistence.db.clone();
+                                let agent_id = self.persistence.agent_id;
                                 let cursor = {
                                     let (_, records) = db.read().agent_event_records(agent_id);
                                     let user_positions = records
@@ -969,14 +1006,10 @@ impl AgentLoop {
                                         state.context_used = restored.context_used;
                                         state.queued_inputs = restored.queued_inputs;
                                         self.inference_session.abort();
-                                        if let Some(persistence) = &mut self.persistence {
-                                            persistence.next_event = next_event;
-                                        }
+                                        self.persistence.next_event = next_event;
                                         Ok(())
                                     }
                                 }
-                            } else {
-                                Err(anyhow::anyhow!(":rewind requires a persisted agent"))
                             };
                             let _ = reply.send(result);
                         }
@@ -1101,14 +1134,12 @@ impl AgentLoop {
                                     // Turn complete: commit the checkout's
                                     // state so the user's jj view follows the
                                     // agent's work (fire-and-forget).
-                                    if let Some(workspace) = &self.workspace {
-                                        let workspace = Arc::clone(workspace);
-                                        tokio::spawn(async move {
-                                            if let Err(error) = workspace.snapshot().await {
-                                                eprintln!("rho-agent: snapshot failed: {error:#}");
-                                            }
-                                        });
-                                    }
+                                    let workspace = Arc::clone(&self.workspace);
+                                    tokio::spawn(async move {
+                                        if let Err(error) = workspace.snapshot().await {
+                                            eprintln!("rho-agent: snapshot failed: {error:#}");
+                                        }
+                                    });
                                     // Only non-QueueOnly mail earns a fresh
                                     // turn; QueueOnly messages stay parked
                                     // until something else wakes the agent.
@@ -1147,41 +1178,14 @@ impl AgentLoop {
                                             && call.name.as_str()
                                                 == multi_agent_tools::WAIT_TOOL_NAME
                                         {
-                                            let armed = if waiting.is_some() {
-                                                Err(anyhow::anyhow!(
-                                                    "a wait is already in progress in this \
-                                                     tool batch"
-                                                ))
-                                            } else {
-                                                multi_agent_tools::parse_wait_timeout(
-                                                    &call.arguments,
-                                                )
-                                            };
-                                            match armed {
-                                                Ok(timeout_seconds) => {
-                                                    waiting = Some(WaitState {
-                                                        call_id: call.id.clone(),
-                                                        until: UnixMs(
-                                                            started_at.0
-                                                                + timeout_seconds * 1000,
-                                                        ),
-                                                    });
-                                                }
-                                                Err(error) => {
-                                                    self.pending_tools.push(Box::pin(async move {
-                                                        ToolResult {
-                                                            call_id: call.id.clone(),
-                                                            tool_type: call.tool_type,
-                                                            body: ToolOutput {
-                                                                output: Arc::new(error.to_string()),
-                                                                status: ToolOutputStatus::Error,
-                                                            },
-                                                            started_at,
-                                                            finished_at: UnixMs::now(),
-                                                            metadata: None,
-                                                        }
-                                                    }));
-                                                }
+                                            if let Err(error) =
+                                                arm_wait(&mut waiting, &call, started_at)
+                                            {
+                                                self.pending_tools.push(Box::pin(
+                                                    std::future::ready(error_tool_result(
+                                                        &call, started_at, error,
+                                                    )),
+                                                ));
                                             }
                                             continue;
                                         }
@@ -1243,11 +1247,10 @@ impl AgentLoop {
     }
 
     async fn persist_event(&mut self, event: AgentEvent<'_>) {
-        if let Some(persistence) = &mut self.persistence {
-            let mut write = persistence.db.write().await;
-            persistence.next_event = write.append_agent_event(persistence.next_event, &event);
-            write.commit();
-        }
+        let persistence = &mut self.persistence;
+        let mut write = persistence.db.write().await;
+        persistence.next_event = write.append_agent_event(persistence.next_event, &event);
+        write.commit();
     }
 
     /// Persist and queue an incoming message (user input or agent mail),
