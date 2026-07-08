@@ -96,9 +96,9 @@ fn spawn_agent_spec() -> ToolSpec {
         tool_type: ToolType::Function,
         description: "Start a sub-agent working in this repository and return its agent id \
                       immediately. The prompt must be self-contained: the child starts with \
-                      fresh context. The child's turn results arrive later as mail messages \
-                      ([message from agent ...]); use `wait` to block for them. The child is a \
-                      regular agent the user can also see and steer."
+                      fresh context. The child's turn results arrive later as agent mail; use \
+                      `wait` to block for them. The child is a regular agent the user can also \
+                      see and steer."
             .to_owned(),
         input_schema: json!({
             "type": "object",
@@ -265,8 +265,7 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     let child_id = format!("ag-{}", pool.agent_id_prefix(child_id));
     Ok(format!(
         "Spawned agent {} for task \"{}\". It is working now; its results will arrive as mail \
-         ([message from agent ...]). Use send_message to follow up and wait to block for its \
-         results.",
+         from that agent. Use send_message to follow up and wait to block for its results.",
         child_id, task_name,
     ))
 }

@@ -592,6 +592,7 @@ impl Agent {
             system_prompt: system_prompt::prompt(
                 workspace.as_ref(),
                 multi_agent.is_some().then_some(agent_id),
+                parent,
             ),
             queued_inputs: restored.queued_inputs,
             kind: restored.kind,

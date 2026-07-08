@@ -361,7 +361,7 @@ impl RunningAgent {
             // Claude has no agent-mail lane; mail arrives as a labeled user
             // message.
             Self::Claude(agent) => agent.send_user_message(format!(
-                "[message from agent ag-{}]\n{}",
+                "Message Type: MESSAGE\nSender: ag-{}\nPayload:\n{}",
                 sender.encoded(),
                 body
             )),

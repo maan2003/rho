@@ -4,7 +4,11 @@ use crate::db::AgentId;
 
 /// `agent_id` is set for pooled agents, which get the multi-agent tools and
 /// the section explaining them.
-pub fn prompt(workspace: &rho_workspaces::Workspace, agent_id: Option<AgentId>) -> Arc<str> {
+pub fn prompt(
+    workspace: &rho_workspaces::Workspace,
+    agent_id: Option<AgentId>,
+    parent: Option<AgentId>,
+) -> Arc<str> {
     let working_directory = workspace.repo();
     let skills = workspace.discovered_skills();
     for diagnostic in &skills.diagnostics {
@@ -17,32 +21,53 @@ pub fn prompt(workspace: &rho_workspaces::Workspace, agent_id: Option<AgentId>) 
     }
     let skills = render_skills_prompt(&skills.skills).unwrap_or_default();
     let multi_agent = agent_id.map_or_else(String::new, |id| {
+        let agent_id = format!("ag-{}", id.encoded());
+        let role = match parent {
+            Some(parent) => format!(
+                "You are an agent in a team of agents collaborating to complete a task. Your \
+                 agent id is {agent_id}; your parent agent is ag-{}.\n\nMessages from your \
+                 parent define your task. When you provide a final response, that content is \
+                 mailed back to your parent automatically.",
+                parent.encoded()
+            ),
+            None => format!(
+                "You are the primary agent in a team of agents collaborating to fulfill the \
+                 user's goals. Your agent id is {agent_id}.\n\nAt the start of your turn, you \
+                 are the active agent."
+            ),
+        };
         format!(
             "## Sub-Agents
 
-Your agent id is {}. You can delegate self-contained work with the \
-`spawn_agent` tool; each sub-agent is a regular agent the user can also see \
-and steer, so give it a short `task_name` and a complete, self-contained \
-prompt (it starts with fresh context). Choose `workspace` by the task: \
-`join` shares your working copy (read-mostly tasks), `fork` gives the child \
-its own jj workspace forked from your current change (parallel edits), \
-`new` starts it from trunk or a `revset`.
+{role}
 
-Sub-agents report by mail: their finished-turn results arrive in your \
-context as `[message from agent ...]`. Mail does not interrupt an in-flight \
-request, but it can start or continue your next request; call `wait` when \
-you are blocked on sub-agent results and have nothing else useful to do, and \
-use `send_message` to steer or follow up with a running agent. Use \
-`interrupt_agent` when a sub-agent is clearly doing the wrong work and should \
-stop its current turn. If you were spawned by another agent, \
-messages from it define your task; your final responses are mailed back to \
-it automatically.
+You can delegate self-contained work with the `spawn_agent` tool, and child \
+agents can also spawn their own sub-agents. All agents in the team are equally \
+intelligent and capable, and have access to the same set of tools.
 
-Delegate when tasks are parallel and separable; do small or tightly coupled \
-work yourself.
+Choose `workspace` by the task: use `join` for read-mostly work or when agents \
+should intentionally share one live checkout; use `fork` when multiple agents \
+may edit at the same time; use `new` when the task should start from trunk or \
+a specific `revset`.
 
-",
-            format!("ag-{}", id.encoded())
+You can use `spawn_agent` to create a new agent, `send_message` to steer or \
+follow up with an agent, `interrupt_agent` when an agent is clearly doing the \
+wrong work and should stop its current turn, and `wait` when you are blocked \
+on agent results and have nothing else useful to do.
+
+You will receive agent messages in this format:
+```
+Message Type: MESSAGE
+Sender: <agent id>
+Payload:
+<payload text>
+```
+
+Mail does not interrupt an in-flight request, but it can start or continue \
+your next request. Delegate when tasks are parallel and separable; do small or \
+tightly coupled work yourself.
+
+"
         )
     });
     format!(
