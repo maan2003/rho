@@ -105,8 +105,9 @@ impl AgentRegistry {
         let workspace_id = self
             .agent_summary(agent_id)
             .and_then(|agent| agent.workspace.workspace_id())?;
-        let prefix_len = prefix_id::uniform_prefix_len(self.workspace_counter, LABEL_HEADROOM);
-        Some(format!("w{}", &workspace_id.encoded()[..prefix_len]))
+        let prefix_len =
+            prefix_id::uniform_prefix_len(self.workspace_counter, LABEL_HEADROOM).max(2);
+        Some(format!("ws-{}", &workspace_id.encoded()[..prefix_len]))
     }
 
     pub fn agent_mode(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentMode> {
@@ -395,11 +396,11 @@ mod tests {
 
         assert_eq!(
             registry.workspace_id_label(agent_id(1)),
-            Some(format!("w{}", &short_workspace.encoded()[..3]))
+            Some(format!("ws-{}", &short_workspace.encoded()[..3]))
         );
         assert_eq!(
             registry.workspace_id_label(agent_id(2)),
-            Some(format!("w{}", &long_workspace.encoded()[..3]))
+            Some(format!("ws-{}", &long_workspace.encoded()[..3]))
         );
         assert_eq!(registry.workspace_id_label(agent_id(3)), None);
     }
