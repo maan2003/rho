@@ -19,7 +19,7 @@ use super::session::{
     AutoCompaction, ReasoningContext, ResponsesEffort, ServiceTier, TextVerbosity,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum OpenAiResponsesProviderData {
     Message {
         item_id: ProviderResponseItemId,
@@ -38,62 +38,6 @@ pub enum OpenAiResponsesProviderData {
         item_id: ProviderResponseItemId,
         encrypted_content: String,
     },
-}
-
-impl Decoder for OpenAiResponsesProviderData {
-    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
-        #[derive(Decode)]
-        enum Shadow {
-            Message {
-                item_id: ProviderResponseItemId,
-            },
-            FunctionCall {
-                item_id: ProviderResponseItemId,
-            },
-            CustomToolCall {
-                item_id: ProviderResponseItemId,
-            },
-            Reasoning {
-                item_id: ProviderResponseItemId,
-                encrypted_content: Option<String>,
-            },
-            EncryptedReasoning {
-                item_id: ProviderResponseItemId,
-                encrypted_content: String,
-            },
-            Compaction {
-                item_id: ProviderResponseItemId,
-                encrypted_content: Option<String>,
-            },
-        }
-
-        Ok(match Shadow::decode(reader)? {
-            Shadow::Message { item_id } => Self::Message { item_id },
-            Shadow::FunctionCall { item_id } => Self::FunctionCall { item_id },
-            Shadow::CustomToolCall { item_id } => Self::CustomToolCall { item_id },
-            Shadow::Reasoning {
-                item_id,
-                encrypted_content,
-            } => Self::EncryptedReasoning {
-                item_id,
-                encrypted_content: encrypted_content.unwrap_or_default(),
-            },
-            Shadow::EncryptedReasoning {
-                item_id,
-                encrypted_content,
-            } => Self::EncryptedReasoning {
-                item_id,
-                encrypted_content,
-            },
-            Shadow::Compaction {
-                item_id,
-                encrypted_content,
-            } => Self::Compaction {
-                item_id,
-                encrypted_content: encrypted_content.unwrap_or_default(),
-            },
-        })
-    }
 }
 
 impl senax_encoder::TaggedSenax for OpenAiResponsesProviderData {
@@ -444,7 +388,10 @@ fn push_reasoning_provider_specific(
     if encrypted_content.is_empty() {
         return false;
     }
-    let summary = summary.to_vec();
+    let summary = summary
+        .iter()
+        .map(|text| json!({"type": "summary_text", "text": text}))
+        .collect::<Vec<_>>();
     out.push(json!({
         "type": "reasoning",
         "id": item_id.as_str(),

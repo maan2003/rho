@@ -448,7 +448,7 @@ fn compaction_replay_trims_before_latest_compaction_item() {
 }
 
 #[test]
-fn skips_legacy_compaction_without_encrypted_content() {
+fn skips_compaction_without_encrypted_content() {
     let request = inference_request(
         vec![
             inference_response(
@@ -501,7 +501,10 @@ fn replays_reasoning_provider_item() {
     .unwrap();
     assert_eq!(body["input"].as_array().unwrap().len(), 2);
     assert_eq!(body["input"][0]["encrypted_content"], "sealed");
-    assert_eq!(body["input"][0]["summary"], json!(["kept"]));
+    assert_eq!(
+        body["input"][0]["summary"],
+        json!([{"type": "summary_text", "text": "kept"}])
+    );
 }
 
 #[test]
