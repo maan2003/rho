@@ -138,6 +138,42 @@ async fn init_agent_tables_stamps_current_db_format() {
 }
 
 #[tokio::test]
+async fn migration_backfills_agent_last_user_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
+    let agent = AgentRecord {
+        display_name: Some("old".to_owned()),
+        workspace: test_workspace(),
+        status: Status::Normal,
+        created_at: UnixMs(123),
+        updated_at: UnixMs(456),
+        current_lineage: AgentLineageId(1),
+        parent_agent: None,
+        mode: AgentMode::deep_default(),
+        runtime: test_agent_runtime(),
+        last_user_message: UnixMs(0),
+        disposition: AgentDisposition::Done,
+    };
+    let mut write = db.write().await;
+    write.open_table(FORMAT).insert(&(), &"e7f3a9c2".to_owned());
+    write
+        .open_table(AGENTS)
+        .insert(&agent_id, SenValue::borrowed(&agent));
+    write.commit();
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.get_agent(agent_id).last_user_message, UnixMs(123));
+    let format = read.open_table(FORMAT).get(&()).unwrap().value();
+    assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
+}
+
+#[tokio::test]
 #[should_panic(expected = "Update rho one version at a time")]
 async fn init_agent_tables_rejects_unsupported_db_format() {
     let temp = tempfile::tempdir().unwrap();

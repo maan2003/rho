@@ -68,6 +68,7 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
 
     let db = RhoDb::open(&snapshot.path);
+    migrate_snapshot(&db).await;
     let read = db.read();
     let mut agents = read.list_agents();
     agents.sort_by_key(|(id, _)| *id);
@@ -115,6 +116,7 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
     let db = RhoDb::open(&snapshot.path);
+    migrate_snapshot(&db).await;
     let read = db.read();
     let mut agents = read.list_agents();
     agents.sort_by_key(|(id, _)| *id);
@@ -211,9 +213,7 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
     let db = RhoDb::open(&snapshot.path);
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    write.commit();
+    migrate_snapshot(&db).await;
 
     let read = db.read();
     let agents = read.list_agents();
@@ -230,6 +230,12 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "events decoded: {events}")?;
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
+}
+
+async fn migrate_snapshot(db: &RhoDb) {
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
 }
 
 fn disposition_name(disposition: rho_agent::db::AgentDisposition) -> String {
