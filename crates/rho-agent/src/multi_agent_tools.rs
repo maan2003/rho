@@ -110,10 +110,14 @@ fn spawn_agent_spec() -> ToolSpec {
         name: ToolName::try_from(SPAWN_AGENT_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
         description: "Start a sub-agent working in this repository and return its agent id \
-                      immediately. The prompt must be self-contained: the child starts with \
-                      fresh context. The child's turn results arrive later as agent mail; use \
-                      `wait` to block for them. The child is a regular agent the user can also \
-                      see and steer."
+                      immediately. Use this for a concrete, bounded subtask, including side \
+                      investigations or experiments when the user asks for them or they de-risk \
+                      the main task. The subtask should run independently alongside useful local \
+                      work; otherwise continue locally. The prompt must be self-contained and \
+                      task-focused: the child already receives repo guidance, skills, tools, and \
+                      workspace instructions, so do not restate generic process rules. The \
+                      child's turn results arrive later as agent mail; use `wait` when you are \
+                      blocked on those results."
             .to_owned(),
         input_schema: json!({
             "type": "object",

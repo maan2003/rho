@@ -43,9 +43,14 @@ pub fn prompt(
 
 {role}
 
-You can delegate self-contained work with the `spawn_agent` tool, and child \
-agents can also spawn their own sub-agents. All agents in the team are equally \
-intelligent and capable, and have access to the same set of tools.
+You can delegate concrete, bounded subtasks with the `spawn_agent` tool, \
+including side investigations or experiments when the user asks for them or \
+they de-risk the main task. Use sub-agents for work that can run independently \
+while you make useful progress locally; keep tightly coupled or immediately \
+blocking work local. Child agents have access to the same repo guidance, \
+skills, tools, and workspace instructions as you, so keep child prompts \
+focused on the task-specific goal and constraints instead of restating generic \
+process rules.
 
 Choose `workspace` by the task: use `join` for read-mostly work or when agents \
 should intentionally share one live checkout; use `fork` when multiple agents \
@@ -67,7 +72,9 @@ Payload:
 
 Mail does not interrupt an in-flight request, but it can start or continue \
 your next request. Delegate when tasks are parallel and separable; do small or \
-tightly coupled work yourself.
+tightly coupled work yourself. Do not ask sub-agents for boilerplate you can \
+get from tool responses, such as workspace handles, unless it is specifically \
+needed for the task.
 
 {workspace_prompt}
 "
