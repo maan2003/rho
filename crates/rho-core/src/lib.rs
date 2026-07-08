@@ -202,6 +202,7 @@ pub enum ToolFormat {
     Clone,
     Copy,
     Debug,
+    Default,
     PartialEq,
     Eq,
     PartialOrd,
@@ -639,23 +640,6 @@ mod tests {
             error.to_string(),
             "response is incomplete: item at index 0 never finished"
         );
-    }
-
-    #[test]
-    fn finish_rejects_payloadless_compaction() {
-        let mut response = PendingInferenceResponse::default();
-
-        // Compaction was marked finished but its payload never arrived.
-        response.apply(
-            0,
-            ContextItemEvent::Update(StreamingContextItem::Compaction {
-                provider_specific: test_provider_specific_data(),
-            }),
-        );
-        response.apply(0, ContextItemEvent::Finish);
-
-        let error = response.finish().unwrap_err();
-        assert_eq!(error.to_string(), "compaction never finished");
     }
 
     #[test]

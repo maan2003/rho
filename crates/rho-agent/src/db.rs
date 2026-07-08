@@ -341,8 +341,11 @@ pub enum AgentDisposition {
 /// the disposition with `Pending`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentAttentionRecord {
-    /// When the agent last finished a turn.
-    pub last_turn_end: UnixMillis,
+    /// When the user last sent this agent a message; rail recency seed.
+    /// Defaulted so records written before the rename from `last_turn_end`
+    /// still decode (they just lose their seed).
+    #[senax(default)]
+    pub last_user_message: UnixMillis,
     /// That turn ended blocked on the user (error or unfinished calls).
     pub needs_input: bool,
     pub disposition: AgentDisposition,
@@ -572,7 +575,10 @@ pub trait AgentWriteTxnExt {
 
     /// Records a turn end for attention purposes; resets the disposition to
     /// `Pending` — every finished turn demands a fresh disposition.
-    fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId, needs_input: bool);
+    fn record_agent_turn_end(&mut self, agent_id: AgentId, needs_input: bool);
+
+    /// Stamps the user's engagement with an agent, for rail recency.
+    fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId);
 
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
 }
@@ -892,15 +898,37 @@ impl AgentWriteTxnExt for WriteTxn {
         at.next()
     }
 
-    fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId, needs_input: bool) {
-        self.open_table(AGENT_ATTENTION).insert(
+    fn record_agent_turn_end(&mut self, agent_id: AgentId, needs_input: bool) {
+        let mut table = self.open_table(AGENT_ATTENTION);
+        // Turn ends reset the disposition (the ball is back in the user's
+        // court) but say nothing about user engagement, so the message
+        // timestamp survives.
+        let last_user_message = table
+            .get(&agent_id)
+            .map(|record| record.value().into_owned().last_user_message)
+            .unwrap_or(UnixMs(0));
+        table.insert(
             &agent_id,
             SenValue::borrowed(&AgentAttentionRecord {
-                last_turn_end: now,
+                last_user_message,
                 needs_input,
                 disposition: AgentDisposition::Pending,
             }),
         );
+    }
+
+    fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId) {
+        let mut table = self.open_table(AGENT_ATTENTION);
+        let mut record = table
+            .get(&agent_id)
+            .map(|record| record.value().into_owned())
+            .unwrap_or(AgentAttentionRecord {
+                last_user_message: now,
+                needs_input: false,
+                disposition: AgentDisposition::Pending,
+            });
+        record.last_user_message = now;
+        table.insert(&agent_id, SenValue::borrowed(&record));
     }
 
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition) {
@@ -909,7 +937,7 @@ impl AgentWriteTxnExt for WriteTxn {
             .get(&agent_id)
             .map(|record| record.value().into_owned())
             .unwrap_or(AgentAttentionRecord {
-                last_turn_end: UnixMs(0),
+                last_user_message: UnixMs(0),
                 needs_input: false,
                 disposition,
             });

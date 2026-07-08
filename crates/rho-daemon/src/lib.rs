@@ -293,7 +293,7 @@ impl AgentRegistry {
                             },
                             last_active: read
                                 .agent_attention(agent_id)
-                                .map(|record| record.last_turn_end)
+                                .map(|record| record.last_user_message)
                                 .unwrap_or(agent.created_at),
                         })
                         .collect(),
@@ -898,7 +898,7 @@ fn spawn_attention_watcher(
                         AgentStateKind::Error(_) | AgentStateKind::UnfinishedTurn { .. }
                     );
                     let mut write = db.write().await;
-                    write.record_agent_turn_end(rho_core::UnixMs::now(), agent_id, needs_input);
+                    write.record_agent_turn_end(agent_id, needs_input);
                     write.commit();
                 }
                 settled_attention(&db, agent_id)
@@ -1051,6 +1051,11 @@ async fn handle_message(
                 .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
             let text = text_content(&content);
             agent.send_user_message(text.clone(), delivery);
+            {
+                let mut write = agents.db.write().await;
+                write.record_agent_user_message(rho_core::UnixMs::now(), agent_id);
+                write.commit();
+            }
             agents
                 .maybe_generate_title(agent_id, text, outgoing_tx.clone())
                 .await;

@@ -218,12 +218,11 @@ mod tests {
     }
 
     #[test]
-    fn active_agents_sort_by_recency_bucket_after_pins() {
-        const BUCKET_MS: u64 = 15 * 60 * 1000;
+    fn active_agents_sort_by_engagement_after_pins() {
         let idle = agent(1, Status::Normal, 10);
         let pinned = agent(2, Status::Pinned, 10);
         let mut recent = agent(3, Status::Normal, 10);
-        recent.last_active = UnixMs(BUCKET_MS);
+        recent.last_active = UnixMs(100);
         let topic = topic(Status::Normal, vec![idle, pinned, recent]);
 
         let mut registry = AgentRegistry::default();
@@ -233,8 +232,7 @@ mod tests {
             .map(|summary| summary.agent_id)
             .collect::<Vec<_>>();
 
-        // Pins first, then the newer 15-minute bucket; agents in the same
-        // bucket keep the daemon's order (stable sort).
+        // Pins first, then by seeded engagement recency (last user message).
         assert_eq!(
             visible,
             [
@@ -303,7 +301,7 @@ fn visible_agents<'a>(
             (
                 Reverse(registry.attention(summary.agent_id)),
                 summary.status != Status::Pinned,
-                Reverse(registry.recency_bucket(summary.agent_id)),
+                Reverse(registry.rail_seq(summary.agent_id)),
             )
         });
     }
