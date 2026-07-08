@@ -173,7 +173,8 @@ async fn run(
             ServerMessage::Pong
             | ServerMessage::LandLeaseQueued { .. }
             | ServerMessage::LandLeaseGranted { .. }
-            | ServerMessage::LandStatus { .. } => None,
+            | ServerMessage::LandStatus { .. }
+            | ServerMessage::McpAgentToolResult(_) => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()
