@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::MessageDelivery;
-use crate::db::{AgentId, AgentReadTxnExt as _};
+use crate::db::{AgentId, AgentMode, AgentReadTxnExt as _, DeepConfig, DeepEffort, FableEffort};
 use crate::pool::{AgentPool, SpawnWorkspace};
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
@@ -122,7 +122,7 @@ fn spawn_agent_spec() -> ToolSpec {
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["task_name", "prompt", "workspace"],
+            "required": ["task_name", "prompt", "workspace", "mode"],
             "properties": {
                 "task_name": {
                     "type": "string",
@@ -144,6 +144,14 @@ fn spawn_agent_spec() -> ToolSpec {
                     "type": "string",
                     "description": "With workspace=new: jj revset for the parent revision \
                                     (default trunk())."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["fable", "fable-xhigh", "gpt-5.5", "gpt-5.5-xhigh"],
+                    "description": "Required child mode. Use \"fable\" for hard tasks that \
+                                    require human-like judgement; use \"gpt-5.5\" for normal fast \
+                                    coding/research sub-tasks. Use \"fable-xhigh\" or \
+                                    \"gpt-5.5-xhigh\" when the task needs extra reasoning."
                 }
             }
         }),
@@ -254,6 +262,7 @@ struct SpawnArgs {
     prompt: String,
     workspace: WorkspaceChoice,
     revset: Option<String>,
+    mode: String,
 }
 
 #[derive(Deserialize)]
@@ -277,9 +286,10 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
         },
     };
     let task_name = args.task_name.clone();
+    let mode = parse_spawn_mode(&args.mode)?;
     let pool = tools.pool()?;
     let child_id = pool
-        .spawn_child(tools.self_id, args.task_name, args.prompt, workspace)
+        .spawn_child(tools.self_id, args.task_name, args.prompt, workspace, mode)
         .await?;
     let child_workspace = pool.db().read().get_agent(child_id).workspace;
     let workspace_note = match child_workspace.workspace_name() {
@@ -297,6 +307,28 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
          from that agent.{} Use send_message to follow up and wait to block for its results.",
         child_id, task_name, workspace_note,
     ))
+}
+
+pub fn parse_spawn_mode(mode: &str) -> anyhow::Result<AgentMode> {
+    match mode {
+        "fable" => Ok(AgentMode::Fable {
+            effort: FableEffort::Medium,
+        }),
+        "fable-xhigh" => Ok(AgentMode::Fable {
+            effort: FableEffort::Xhigh,
+        }),
+        "gpt-5.5" => Ok(AgentMode::Deep(DeepConfig {
+            effort: DeepEffort::Medium,
+            fast_mode: true,
+        })),
+        "gpt-5.5-xhigh" => Ok(AgentMode::Deep(DeepConfig {
+            effort: DeepEffort::Xhigh,
+            fast_mode: true,
+        })),
+        _ => anyhow::bail!(
+            "unsupported mode {mode:?}; expected fable, fable-xhigh, gpt-5.5, or gpt-5.5-xhigh"
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -397,4 +429,40 @@ pub(crate) fn parse_wait_timeout(arguments: &str) -> anyhow::Result<u64> {
         .timeout_seconds
         .unwrap_or(DEFAULT_WAIT_SECONDS)
         .clamp(1, MAX_WAIT_SECONDS))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_spawn_modes() {
+        assert_eq!(
+            parse_spawn_mode("fable").unwrap(),
+            AgentMode::Fable {
+                effort: FableEffort::Medium
+            }
+        );
+        assert_eq!(
+            parse_spawn_mode("fable-xhigh").unwrap(),
+            AgentMode::Fable {
+                effort: FableEffort::Xhigh
+            }
+        );
+        assert_eq!(
+            parse_spawn_mode("gpt-5.5").unwrap(),
+            AgentMode::Deep(DeepConfig {
+                effort: DeepEffort::Medium,
+                fast_mode: true
+            })
+        );
+        assert_eq!(
+            parse_spawn_mode("gpt-5.5-xhigh").unwrap(),
+            AgentMode::Deep(DeepConfig {
+                effort: DeepEffort::Xhigh,
+                fast_mode: true
+            })
+        );
+        assert!(parse_spawn_mode("opus").is_err());
+    }
 }

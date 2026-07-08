@@ -13,6 +13,7 @@ camino.workspace = true
 clap.workspace = true
 dirs.workspace = true
 futures.workspace = true
+prefix-id.workspace = true
 rho-agent.workspace = true
 rho-claude.workspace = true
 rho-core.workspace = true

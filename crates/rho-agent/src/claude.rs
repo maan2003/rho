@@ -4,10 +4,13 @@
 //! from Claude protocol/transcript messages into Rho agent vocabulary.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 
+use anyhow::Context as _;
 use async_stream::stream;
+use camino::Utf8PathBuf;
 use futures::Stream;
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, Session};
 use rho_core::{ContentPart, ContextBlock, ContextItemEvent, PendingInferenceResponse};
@@ -18,6 +21,7 @@ use uuid::Uuid;
 use crate::db::{
     AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, TopicId, UnixMillis,
 };
+use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
     AgentState, AgentStateKind, FailedInferenceResponse, InputQueues, MessageDelivery, QueuedItem,
     QueuedItemKind, StartWorkspace, system_prompt,
@@ -42,6 +46,8 @@ impl ClaudeAgent {
         display_name: Option<String>,
         start: StartWorkspace,
         mode: AgentMode,
+        parent: Option<AgentId>,
+        pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<(AgentId, Self)> {
         let model = mode
             .claude_model()
@@ -70,14 +76,17 @@ impl ClaudeAgent {
             workspace.info().clone(),
             mode,
             AgentRuntime::Claude { session_id },
-            None,
+            parent,
         );
         write.commit();
 
+        let multi_agent = pool
+            .upgrade()
+            .map(|_| MultiAgentTools::new(pool, agent_id, parent));
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
-            system_prompt: system_prompt::prompt(workspace.as_ref(), None),
+            system_prompt: system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref()),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
@@ -91,6 +100,7 @@ impl ClaudeAgent {
                 session_id,
                 state,
                 ClaudeStartMode::New,
+                multi_agent,
             ),
         ))
     }
@@ -99,6 +109,7 @@ impl ClaudeAgent {
         db: RhoDb,
         agent_id: AgentId,
         workspace: Arc<rho_workspaces::Workspace>,
+        pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
         let AgentRuntime::Claude { session_id } = record.runtime else {
@@ -124,7 +135,12 @@ impl ClaudeAgent {
         let state = AgentState {
             blocks,
             tool_specs: Arc::from([]),
-            system_prompt: system_prompt::prompt(workspace.as_ref(), None),
+            system_prompt: {
+                let multi_agent = pool
+                    .upgrade()
+                    .map(|_| MultiAgentTools::new(pool.clone(), agent_id, record.parent_agent));
+                system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref())
+            },
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used,
@@ -136,6 +152,8 @@ impl ClaudeAgent {
             session_id,
             state,
             ClaudeStartMode::Resume,
+            pool.upgrade()
+                .map(|_| MultiAgentTools::new(pool, agent_id, record.parent_agent)),
         ))
     }
 
@@ -146,6 +164,7 @@ impl ClaudeAgent {
         session_id: Uuid,
         state: AgentState,
         start_mode: ClaudeStartMode,
+        multi_agent: Option<MultiAgentTools>,
     ) -> Self {
         let state = Arc::new(RwLock::new(state));
         let notify = Arc::new(Notify::new());
@@ -157,12 +176,14 @@ impl ClaudeAgent {
             session_id,
             start_mode,
             process: None,
+            claude_prompt_path: None,
             pending_response: PendingInferenceResponse::default(),
             stream_items: BTreeMap::new(),
             turn_usage: None,
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
             control_rx,
+            multi_agent,
         };
         tokio::spawn(loop_state.run());
         Self {
@@ -238,6 +259,7 @@ struct ClaudeLoop {
     session_id: Uuid,
     start_mode: ClaudeStartMode,
     process: Option<ClaudeCode>,
+    claude_prompt_path: Option<tempfile::TempPath>,
     pending_response: PendingInferenceResponse,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
     /// Usage of the in-flight message: `message_start` seeds it,
@@ -248,6 +270,7 @@ struct ClaudeLoop {
     state: Arc<RwLock<AgentState>>,
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
+    multi_agent: Option<MultiAgentTools>,
 }
 
 impl ClaudeLoop {
@@ -265,18 +288,26 @@ impl ClaudeLoop {
                 };
                 match event {
                     ClaudeLoopEvent::Control(Some(control)) => self.handle_control(control).await,
-                    ClaudeLoopEvent::Control(None) => return,
+                    ClaudeLoopEvent::Control(None) => {
+                        self.remove_claude_runtime_files();
+                        return;
+                    }
                     ClaudeLoopEvent::Protocol(event) => match *event {
                         Ok(Some(event)) => self.handle_event(event).await,
-                        Ok(None) => self.process = None,
+                        Ok(None) => {
+                            self.process = None;
+                            self.remove_claude_runtime_files();
+                        }
                         Err(error) => {
                             self.process = None;
+                            self.remove_claude_runtime_files();
                             self.fail(error);
                         }
                     },
                 }
             } else {
                 let Some(control) = self.control_rx.recv().await else {
+                    self.remove_claude_runtime_files();
                     return;
                 };
                 self.handle_control(control).await;
@@ -328,6 +359,7 @@ impl ClaudeLoop {
             }
             ClaudeControl::Cancel => {
                 if let Some(process) = self.process.take() {
+                    self.remove_claude_runtime_files();
                     tokio::spawn(async move {
                         let _ = process.close().await;
                     });
@@ -425,11 +457,96 @@ impl ClaudeLoop {
             self.session_id,
         );
         options.session = session;
+        let file_mounts = self.write_claude_prompt_mount()?.into_iter().collect();
         let mut command = options.command();
-        self.workspace.prepare_command(&mut command).await?;
-        self.process = Some(ClaudeCode::spawn_command(command).await?);
+        if let Some(tools) = &self.multi_agent {
+            command.env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
+        }
+        if let Err(error) = self
+            .workspace
+            .prepare_command_with_file_mounts(&mut command, file_mounts)
+            .await
+        {
+            self.remove_claude_runtime_files();
+            return Err(error);
+        }
+        match ClaudeCode::spawn_command(command).await {
+            Ok(process) => self.process = Some(process),
+            Err(error) => {
+                self.remove_claude_runtime_files();
+                return Err(error);
+            }
+        }
         self.start_mode = ClaudeStartMode::Resume;
         Ok(())
+    }
+
+    fn write_claude_prompt_mount(&mut self) -> anyhow::Result<Option<(Utf8PathBuf, Utf8PathBuf)>> {
+        if self.workspace.is_user_checkout() {
+            eprintln!(
+                "rho-agent: not bind-mounting generated CLAUDE.md for Claude user-checkout \
+                 workspace"
+            );
+            return Ok(None);
+        }
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home directory not found"))?;
+        let target = Utf8PathBuf::try_from(home)
+            .context("home directory path is not valid UTF-8")?
+            .join(".claude")
+            .join("CLAUDE.md");
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create Claude config directory {parent}"))?;
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create Claude prompt bind target {target}"));
+            }
+        }
+        let prompt = system_prompt::prompt(self.workspace.as_ref(), self.multi_agent.as_ref());
+        let mut source_file = tempfile::Builder::new()
+            .prefix("rho-claude-prompt-")
+            .suffix(".md")
+            .tempfile()
+            .context("create generated Claude prompt tempfile")?;
+        source_file
+            .write_all(prompt.as_bytes())
+            .context("write generated Claude prompt tempfile")?;
+        source_file
+            .flush()
+            .context("flush generated Claude prompt tempfile")?;
+        let source = Utf8PathBuf::try_from(source_file.path().to_owned())
+            .context("generated Claude prompt tempfile path is not valid UTF-8")?;
+        self.claude_prompt_path = Some(source_file.into_temp_path());
+        Ok(Some((source, target)))
+    }
+
+    fn remove_claude_md(&mut self) {
+        let Some(path) = self.claude_prompt_path.take() else {
+            return;
+        };
+        let display_path = path.to_path_buf();
+        match path.close() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!(
+                    "rho-agent: remove generated Claude prompt {}: {error}",
+                    display_path.display()
+                )
+            }
+        }
+    }
+
+    fn remove_claude_runtime_files(&mut self) {
+        self.remove_claude_md();
     }
 
     async fn handle_event(&mut self, event: rho_claude::ClaudeEvent) {

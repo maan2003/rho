@@ -29,6 +29,15 @@ than by running a supervisor, extension protocol, or daemon process graph.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
   execution.
 
+Claude Code MCP support follows the same boundary: `rho-claude` knows how to
+set per-agent MCP environment, but the MCP server that exposes Rho multi-agent
+operations lives at the CLI/daemon control boundary. Claude Code can launch a
+globally configured `rho mcp-agent-tools` stdio MCP server; that server reads
+`RHO_MCP_AGENT_ID` from the Claude process environment, relays tool calls to the
+daemon, and the daemon executes parent-scoped spawn, agent mail, interrupt, and
+wait against `AgentPool`. The MCP server must not reach into `rho-core` or
+provider crates.
+
 Dependencies should flow from higher-level assembly/policy crates toward lower
 reusable crates. The shared `rho-core` crate must not depend on provider, agent,
 store, tool, or CLI crates.

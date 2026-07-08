@@ -11,6 +11,7 @@ anyhow.workspace = true
 async-stream.workspace = true
 bytes = "1"
 camino.workspace = true
+dirs.workspace = true
 futures.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
 rand.workspace = true
@@ -26,8 +27,8 @@ rho-workspaces.workspace = true
 senax-encoder = { workspace = true, features = ["uuid"] }
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

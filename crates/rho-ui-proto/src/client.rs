@@ -228,7 +228,8 @@ impl AgentClient {
                     | ServerMessage::VoiceFlushPlayback
                     | ServerMessage::VoiceState { .. }
                     | ServerMessage::VoiceTranscript { .. }
-                    | ServerMessage::VoiceUiAction(_) => {}
+                    | ServerMessage::VoiceUiAction(_)
+                    | ServerMessage::McpAgentToolResult(_) => {}
                 }
             }
         });

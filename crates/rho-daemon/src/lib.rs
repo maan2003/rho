@@ -10,15 +10,16 @@ use rho_agent::MessageDelivery;
 use rho_agent::db::{
     AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, Status, TopicId,
 };
-use rho_agent::pool::{AgentPool, RunningAgent};
+use rho_agent::pool::{AgentPool, RunningAgent, SpawnWorkspace};
 use rho_core::text_content;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, ServerMessage, StartMode,
-    UiAgentSummary, UiTopic, UiWorkdir, read_frame_counted, write_frame_counted,
+    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
+    McpAgentToolResponse, McpSpawnWorkspace, ServerMessage, StartMode, UiAgentSummary, UiTopic,
+    UiWorkdir, read_frame_counted, write_frame_counted,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc};
 
@@ -296,6 +297,133 @@ impl AgentRegistry {
         };
         let (agent_id, agent) = self.pool.create(topic_id, mode, None, start).await?;
         Ok((topic_id, agent_id, agent))
+    }
+
+    async fn mcp_agent_tool(
+        &self,
+        self_agent_id: AgentId,
+        request: McpAgentToolRequest,
+    ) -> anyhow::Result<String> {
+        if !self.pool.agent_exists(self_agent_id) {
+            anyhow::bail!("agent is not known: {self_agent_id:?}");
+        }
+        match request {
+            McpAgentToolRequest::SpawnAgent {
+                task_name,
+                prompt,
+                workspace,
+                mode,
+            } => {
+                if prompt.trim().is_empty() {
+                    anyhow::bail!("prompt must not be empty");
+                }
+                let workspace = match workspace {
+                    McpSpawnWorkspace::Join => SpawnWorkspace::Join,
+                    McpSpawnWorkspace::Fork => SpawnWorkspace::Fork,
+                    McpSpawnWorkspace::New { revset } => SpawnWorkspace::New { revset },
+                };
+                let child_id = self
+                    .pool
+                    .spawn_child(
+                        self_agent_id,
+                        task_name.clone(),
+                        prompt,
+                        workspace,
+                        rho_agent::multi_agent_tools::parse_spawn_mode(&mode)?,
+                    )
+                    .await?;
+                let child_workspace = self.pool.db().read().get_agent(child_id).workspace;
+                let workspace_note = match child_workspace.workspace_name() {
+                    Some(workspace) => format!(
+                        " Its jj workspace is `{workspace}`; inspect its working-copy commit with \
+                         `jj diff -r '{workspace}@' --stat`."
+                    ),
+                    None => " It is running in the shared user checkout workspace; there is no \
+                             separate `<workspace>@` handle."
+                        .to_owned(),
+                };
+                Ok(format!(
+                    "Spawned agent {} for task \"{}\". It is working now; its results will arrive \
+                     as mail from that agent.{} Use send_message to follow up and wait to block for \
+                     its results.",
+                    self.display_agent_id(child_id),
+                    task_name,
+                    workspace_note,
+                ))
+            }
+            McpAgentToolRequest::SendMessage { agent_id, message } => {
+                if message.trim().is_empty() {
+                    anyhow::bail!("message must not be empty");
+                }
+                let recipient = self.resolve_display_agent_id(&agent_id)?;
+                if recipient == self_agent_id {
+                    anyhow::bail!("cannot send a message to yourself");
+                }
+                self.pool
+                    .deliver_mail(
+                        self_agent_id,
+                        recipient,
+                        message,
+                        MessageDelivery::NextRequest,
+                    )
+                    .await?;
+                Ok(format!(
+                    "Message sent to agent {}.",
+                    self.display_agent_id(recipient)
+                ))
+            }
+            McpAgentToolRequest::InterruptAgent { agent_id } => {
+                let target = self.resolve_display_agent_id(&agent_id)?;
+                if target == self_agent_id {
+                    anyhow::bail!("cannot interrupt yourself");
+                }
+                let (_, agent, _) = self.pool.load(target).await?;
+                agent.cancel();
+                Ok(format!(
+                    "Agent {} interrupted. It remains available for follow-up messages.",
+                    self.display_agent_id(target)
+                ))
+            }
+            McpAgentToolRequest::Wait { timeout_seconds } => {
+                let timeout_seconds = timeout_seconds.unwrap_or(300).clamp(1, 3600);
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+                loop {
+                    let (_, agent, _) = self.pool.load(self_agent_id).await?;
+                    if !agent.state().queued_inputs.is_empty() {
+                        return Ok("Message(s) are waiting in your queue.".to_owned());
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok("Timed out waiting for agent messages or user input.".to_owned());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+
+    fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
+        let raw_agent_id = agent_id
+            .trim()
+            .strip_prefix("ag-")
+            .ok_or_else(|| anyhow::anyhow!("agent_id must start with ag-"))?;
+        let resolved = match self.pool.resolve_agent_id(raw_agent_id)? {
+            prefix_id::PrefixResolution::Unique(agent_id)
+            | prefix_id::PrefixResolution::Ambiguous {
+                first: agent_id, ..
+            } => agent_id,
+            prefix_id::PrefixResolution::NotFound => {
+                anyhow::bail!("no agent with id {agent_id}")
+            }
+        };
+        if !self.pool.agent_exists(resolved) {
+            anyhow::bail!("no agent with id {agent_id}");
+        }
+        Ok(resolved)
+    }
+
+    fn display_agent_id(&self, agent_id: AgentId) -> String {
+        format!("ag-{}", self.pool.agent_id_prefix(agent_id))
     }
 
     async fn move_agent(
@@ -753,6 +881,27 @@ async fn handle_message(
             if let Some(agent) = agents.get(agent_id).await {
                 agent.continue_unfinished();
             }
+            Ok(Refresh::None)
+        }
+        ClientMessage::McpAgentTool {
+            request_id,
+            self_agent_id,
+            request,
+        } => {
+            let result = agents.mcp_agent_tool(self_agent_id, request).await;
+            let response = match result {
+                Ok(output) => McpAgentToolResponse {
+                    request_id,
+                    output,
+                    is_error: false,
+                },
+                Err(error) => McpAgentToolResponse {
+                    request_id,
+                    output: error.to_string(),
+                    is_error: true,
+                },
+            };
+            let _ = outgoing_tx.send(ServerMessage::McpAgentToolResult(response));
             Ok(Refresh::None)
         }
         // Intercepted by `voice::handle_client_message` before this dispatch.

@@ -69,6 +69,24 @@ AGENTS.md reads are bounded to 32 KiB per file and truncated with a diagnostic.
 Rho follows symlinks with cycle detection for `AGENTS.md` files and does not
 load legacy `~/.agents`, `.agents.local`, or `AGENTS.*.md` variants.
 
+Claude-runtime agents keep Claude Code's `CLAUDE.md` discovery enabled. In
+managed pool workspaces, Rho provides the rendered Rho prompt through a
+generated temporary file that is file-bind-mounted over `~/.claude/CLAUDE.md`
+inside the Claude process's private workspace mount namespace. If the bind
+target does not exist, Rho creates an empty `~/.claude/CLAUDE.md` file first.
+Rho does not write the generated prompt into the origin checkout or workspace
+slot, and it removes the generated source file when the Claude process exits or
+is cancelled. Loaded `AGENTS.md` content therefore has the same
+external-provider exposure as other agent prompt text.
+
+Claude Code MCP support is bound to the active Rho agent through
+`RHO_MCP_AGENT_ID`, which Rho sets when spawning the Claude process. A globally
+configured `rho mcp-agent-tools` stdio server inherits that environment and
+treats tool calls as provider-controlled input: the daemon validates agent ids
+and workspace choices, preserves the same spawn-depth/live-child limits as
+in-process Rho tools, bounds wait operations, and returns tool errors as data
+instead of panicking.
+
 ## Skills
 
 Rho skills are local Markdown files discovered from project `.agents/skills`

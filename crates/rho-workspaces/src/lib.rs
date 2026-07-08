@@ -401,15 +401,44 @@ impl Workspace {
         &self,
         command: &mut tokio::process::Command,
     ) -> anyhow::Result<()> {
+        self.prepare_command_with_file_mounts(command, Vec::new())
+            .await
+    }
+
+    /// Configure a child process to run in this workspace's path view and
+    /// file-bind additional paths inside that private mount namespace.
+    ///
+    /// `file_mounts` are `(source, target)` absolute file paths. Targets must
+    /// already exist. User-checkout workspaces have no private namespace, so
+    /// file mounts are rejected rather than leaking mounts into the daemon
+    /// namespace.
+    pub async fn prepare_command_with_file_mounts(
+        &self,
+        command: &mut tokio::process::Command,
+        file_mounts: Vec<(Utf8PathBuf, Utf8PathBuf)>,
+    ) -> anyhow::Result<()> {
         if self.is_user_checkout() {
+            anyhow::ensure!(
+                file_mounts.is_empty(),
+                "user checkouts have no private mount namespace for file mounts"
+            );
             command.current_dir(self.repo().as_std_path());
             return Ok(());
         }
         let ns_fd = std::os::fd::AsRawFd::as_raw_fd(self.mnt_ns().await);
         let cwd = CString::new(self.repo().as_str().as_bytes())
             .map_err(|_| anyhow::anyhow!("workspace path contains a NUL byte"))?;
+        let mut mounts = Vec::with_capacity(file_mounts.len());
+        for (source, target) in file_mounts {
+            mounts.push((
+                CString::new(source.as_str().as_bytes())
+                    .map_err(|_| anyhow::anyhow!("file mount source contains a NUL byte"))?,
+                CString::new(target.as_str().as_bytes())
+                    .map_err(|_| anyhow::anyhow!("file mount target contains a NUL byte"))?,
+            ));
+        }
         unsafe {
-            command.pre_exec(move || enter_workspace_ns(ns_fd, &cwd));
+            command.pre_exec(move || enter_workspace_ns(ns_fd, &cwd, &mounts));
         }
         Ok(())
     }
@@ -430,13 +459,20 @@ impl Workspace {
 /// to the working directory (whose path only resolves inside it), and shed
 /// the daemon's in-namespace privileges. Must not allocate — the forked
 /// child could deadlock on the allocator lock.
-fn enter_workspace_ns(ns_fd: RawFd, cwd: &CStr) -> std::io::Result<()> {
+fn enter_workspace_ns(
+    ns_fd: RawFd,
+    cwd: &CStr,
+    file_mounts: &[(CString, CString)],
+) -> std::io::Result<()> {
     use rustix::thread::{CapabilitySet, CapabilitySets, LinkNameSpaceType};
 
     // SAFETY: the fd is kept alive by the `Workspace` held by the spawning
     // agent/tool for the duration of spawn.
     let fd = unsafe { BorrowedFd::borrow_raw(ns_fd) };
     rustix::thread::move_into_link_name_space(fd, Some(LinkNameSpaceType::Mount))?;
+    for (source, target) in file_mounts {
+        rustix::mount::mount_bind(source, target)?;
+    }
     rustix::process::chdir(cwd)?;
     rustix::thread::set_no_new_privs(true)?;
     let empty = CapabilitySet::empty();

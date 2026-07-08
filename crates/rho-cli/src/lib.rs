@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 mod completion;
 mod land;
 mod markdown;
+mod mcp_agent_tools;
 mod tool_render;
 
 #[cfg(test)]
@@ -79,6 +80,7 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Land(args) => land::run(args).await,
+        Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
             rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
@@ -1130,6 +1132,7 @@ enum Command {
     Daemon(DaemonArgs),
     Debug(DebugArgs),
     Land(LandArgs),
+    McpAgentTools(McpAgentToolsArgs),
     ProtocolLog(ProtocolLogArgs),
 }
 
@@ -1156,7 +1159,18 @@ enum CliCommand {
     Daemon(DaemonArgs),
     Debug(DebugArgs),
     Land(LandArgs),
+    McpAgentTools(McpAgentToolsArgs),
     ProtocolLog(ProtocolLogArgs),
+}
+
+#[derive(Clone, clap::Args)]
+pub(crate) struct McpAgentToolsArgs {
+    #[arg(long = "agent-id")]
+    agent_id: Option<String>,
+    #[arg(long = "auth", default_value = "default")]
+    auth: String,
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
 }
 
 #[derive(Clone, clap::Args)]
@@ -1196,6 +1210,7 @@ impl Args {
             Some(CliCommand::Daemon(args)) => Command::Daemon(args),
             Some(CliCommand::Debug(args)) => Command::Debug(args),
             Some(CliCommand::Land(args)) => Command::Land(args),
+            Some(CliCommand::McpAgentTools(args)) => Command::McpAgentTools(args),
             Some(CliCommand::ProtocolLog(args)) => Command::ProtocolLog(args),
             None => Command::Chat(cli.chat),
         };

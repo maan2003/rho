@@ -165,6 +165,45 @@ pub enum ClientMessage {
     VoiceFocus {
         agent_id: Option<AgentId>,
     },
+    McpAgentTool {
+        request_id: u64,
+        self_agent_id: AgentId,
+        request: McpAgentToolRequest,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum McpAgentToolRequest {
+    SpawnAgent {
+        task_name: String,
+        prompt: String,
+        workspace: McpSpawnWorkspace,
+        mode: String,
+    },
+    SendMessage {
+        agent_id: String,
+        message: String,
+    },
+    InterruptAgent {
+        agent_id: String,
+    },
+    Wait {
+        timeout_seconds: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum McpSpawnWorkspace {
+    Join,
+    Fork,
+    New { revset: Option<String> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct McpAgentToolResponse {
+    pub request_id: u64,
+    pub output: String,
+    pub is_error: bool,
 }
 
 /// PCM sample rate used on both legs of the voice path.
@@ -311,6 +350,7 @@ pub enum ServerMessage {
         text: String,
     },
     VoiceUiAction(VoiceUiAction),
+    McpAgentToolResult(McpAgentToolResponse),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

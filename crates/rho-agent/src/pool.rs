@@ -154,9 +154,16 @@ impl AgentPool {
                 (agent_id, RunningAgent::Rho(agent))
             }
             AgentMode::Fable { .. } | AgentMode::Opus { .. } => {
-                let (agent_id, agent) =
-                    ClaudeAgent::create(self.db.clone(), topic_id, display_name, start, mode)
-                        .await?;
+                let (agent_id, agent) = ClaudeAgent::create(
+                    self.db.clone(),
+                    topic_id,
+                    display_name,
+                    start,
+                    mode,
+                    parent,
+                    Arc::downgrade(self),
+                )
+                .await?;
                 (agent_id, RunningAgent::Claude(agent))
             }
         };
@@ -177,15 +184,16 @@ impl AgentPool {
         task_name: String,
         prompt: String,
         workspace: SpawnWorkspace,
+        mode: AgentMode,
     ) -> anyhow::Result<AgentId> {
-        let (topic_id, mode, parent_workspace) = {
+        let (topic_id, parent_workspace) = {
             let read = self.db.read();
             let topic_id = read
                 .agent_topic(parent)
                 .ok_or_else(|| anyhow::anyhow!("spawning agent belongs to no topic"))?;
             let record = read.get_agent(parent);
             self.enforce_spawn_limits(&read, parent)?;
-            (topic_id, record.mode, record.workspace)
+            (topic_id, record.workspace)
         };
         let start = match workspace {
             SpawnWorkspace::Join => {
@@ -324,7 +332,9 @@ impl AgentPool {
                 Arc::downgrade(self),
             )),
             AgentRuntime::Claude { .. } => {
-                let agent = ClaudeAgent::load(self.db.clone(), agent_id, workspace).await?;
+                let agent =
+                    ClaudeAgent::load(self.db.clone(), agent_id, workspace, Arc::downgrade(self))
+                        .await?;
                 RunningAgent::Claude(agent)
             }
         };
