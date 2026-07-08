@@ -54,7 +54,9 @@ pub enum AgentEvent<'a> {
     Queued(QueuedItem),
     /// The loop reached `boundary` and delivered the eligible lanes into
     /// model context. Only written when at least one item was delivered.
-    Dequeued { boundary: MessageDelivery },
+    Dequeued {
+        boundary: MessageDelivery,
+    },
     /// All queued items were dropped (cancel).
     QueueCleared,
 }
@@ -189,14 +191,6 @@ impl InputQueues {
         self.items.clear();
     }
 
-    /// Whether anything here should start a turn on an idle agent (parked
-    /// `QueueOnly` mail alone does not).
-    pub fn wakes(&self) -> bool {
-        self.items
-            .iter()
-            .any(|item| item.delivery != MessageDelivery::QueueOnly)
-    }
-
     fn eligible(item: &QueuedItem, boundary: MessageDelivery) -> bool {
         boundary == MessageDelivery::NextTurn || item.delivery != MessageDelivery::NextTurn
     }
@@ -251,11 +245,6 @@ pub enum MessageDelivery {
     NextRequest,
     /// Wait until the current turn finishes, then start a new turn.
     NextTurn,
-    /// Sit in the queue without waking the agent: delivered like
-    /// `NextRequest` once a turn is running anyway, but never starts a turn
-    /// on an idle agent. Used for child-agent results so a chatty child
-    /// cannot thrash a working parent; the `wait` tool counts as waking.
-    QueueOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -397,8 +386,7 @@ fn restore_events(events: Vec<AgentEvent<'static>>) -> RestoredAgent {
                 // batch committed and a new request went out: flush the batch
                 // block but keep the turn open so an interrupted log still
                 // restores as an unfinished turn.
-                let keep_mid_turn =
-                    boundary == MessageDelivery::NextRequest && turn.is_some();
+                let keep_mid_turn = boundary == MessageDelivery::NextRequest && turn.is_some();
                 commit_finished_turn(&mut turn, &mut blocks);
                 if keep_mid_turn {
                     turn = Some(RestoreToolTurn {
@@ -916,8 +904,7 @@ impl AgentLoop {
                                         previous_attempt: Some(previous_attempt),
                                     };
                                 }
-                                // Idle with restored (or QueueOnly-parked)
-                                // mail: continue delivers it.
+                                // Idle with restored mail: continue delivers it.
                                 AgentStateKind::Idle if !state.queued_inputs.is_empty() => {
                                     self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                         .await;
@@ -1120,8 +1107,8 @@ impl AgentLoop {
                                 }));
                                 if calls.is_empty() {
                                     // A child's finished turn is its report:
-                                    // mail the result to the parent, parked
-                                    // (Result) so it never interrupts.
+                                    // mail the result to the parent so it can
+                                    // react.
                                     let final_text = final_text.unwrap_or_default();
                                     self.mail_parent(
                                         if final_text.is_empty() {
@@ -1129,7 +1116,7 @@ impl AgentLoop {
                                         } else {
                                             final_text
                                         },
-                                        MessageDelivery::QueueOnly,
+                                        MessageDelivery::NextRequest,
                                     );
                                     // Turn complete: commit the checkout's
                                     // state so the user's jj view follows the
@@ -1140,10 +1127,7 @@ impl AgentLoop {
                                             eprintln!("rho-agent: snapshot failed: {error:#}");
                                         }
                                     });
-                                    // Only non-QueueOnly mail earns a fresh
-                                    // turn; QueueOnly messages stay parked
-                                    // until something else wakes the agent.
-                                    if state.queued_inputs.wakes() {
+                                    if !state.queued_inputs.is_empty() {
                                         self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                             .await;
                                         self.send_request(&state);
@@ -1254,7 +1238,7 @@ impl AgentLoop {
     }
 
     /// Persist and queue an incoming message (user input or agent mail),
-    /// waking the agent unless the message is QueueOnly.
+    /// waking the agent if it is idle.
     async fn enqueue_message(
         &mut self,
         state: &mut AgentState,
@@ -1271,13 +1255,8 @@ impl AgentLoop {
         };
         self.persist_event(AgentEvent::Queued(item.clone())).await;
         state.queued_inputs.push(item);
-        // QueueOnly mail never wakes an idle agent; it rides along once
-        // something else starts a turn.
-        if delivery != MessageDelivery::QueueOnly {
-            self.wake_for_queued(state).await;
-        }
-        // An armed wait, however, counts any deliverable arrival (QueueOnly
-        // included: child results are exactly what wait is for).
+        self.wake_for_queued(state).await;
+        // An armed wait counts any deliverable arrival.
         self.maybe_resolve_wait(state).await;
     }
 
@@ -1312,7 +1291,8 @@ impl AgentLoop {
             state
                 .blocks
                 .push(Arc::new(ContextBlock::ToolResults { results }));
-            self.deliver_queued(state, MessageDelivery::NextRequest).await;
+            self.deliver_queued(state, MessageDelivery::NextRequest)
+                .await;
             self.send_request(state);
             state.kind = AgentStateKind::ApiStreaming {
                 pending_response: PendingInferenceResponse::default(),
@@ -1484,7 +1464,11 @@ fn final_answer_text(items: &[InferenceResponseItem]) -> String {
             .join("\n")
     };
     let final_text = text_of(true);
-    if final_text.is_empty() { text_of(false) } else { final_text }
+    if final_text.is_empty() {
+        text_of(false)
+    } else {
+        final_text
+    }
 }
 
 /// Receive mail when this agent has a mailbox; never resolves otherwise, and
@@ -1585,7 +1569,7 @@ mod tests {
             queued_event(
                 MessageSender::Agent { id: agent_id(1) },
                 "done",
-                MessageDelivery::QueueOnly,
+                MessageDelivery::NextRequest,
             ),
             AgentEvent::Dequeued {
                 boundary: MessageDelivery::NextTurn,
@@ -1633,17 +1617,17 @@ mod tests {
     fn undelivered_queue_survives_restore() {
         let restored = restore_events(vec![queued_event(
             MessageSender::Agent { id: agent_id(2) },
-            "parked mail",
-            MessageDelivery::QueueOnly,
+            "pending mail",
+            MessageDelivery::NextRequest,
         )]);
         assert!(restored.blocks.is_empty());
         assert_eq!(restored.queued_inputs.len(), 1);
-        let parked = restored.queued_inputs.iter().next().expect("parked item");
+        let pending = restored.queued_inputs.iter().next().expect("pending item");
         assert_eq!(
-            parked.kind,
+            pending.kind,
             QueuedItemKind::UserMessage {
                 sender: MessageSender::Agent { id: agent_id(2) },
-                content: Arc::new(text_parts("parked mail")),
+                content: Arc::new(text_parts("pending mail")),
             }
         );
     }
@@ -1667,18 +1651,22 @@ mod tests {
         let mut queue = InputQueues::default();
         queue.push(item("steer", MessageDelivery::NextRequest));
         queue.push(item("later", MessageDelivery::NextTurn));
-        queue.push(item("parked", MessageDelivery::QueueOnly));
+        queue.push(item("mail", MessageDelivery::NextRequest));
         queue.push(item("steer2", MessageDelivery::Immediate));
 
         assert_eq!(queue.deliverable(MessageDelivery::NextRequest), 3);
         let drained = queue.drain(MessageDelivery::NextRequest);
         assert_eq!(
             drained.iter().map(text).collect::<Vec<_>>(),
-            ["steer", "parked", "steer2"],
+            ["steer", "mail", "steer2"],
             "arrival order holds, NextTurn is held back"
         );
         assert_eq!(
-            queue.drain(MessageDelivery::NextTurn).iter().map(text).collect::<Vec<_>>(),
+            queue
+                .drain(MessageDelivery::NextTurn)
+                .iter()
+                .map(text)
+                .collect::<Vec<_>>(),
             ["later"]
         );
         assert!(queue.is_empty());
@@ -1726,14 +1714,14 @@ mod tests {
             }
         );
     }
-
 }
 
 #[cfg(test)]
 mod encoding_tests {
+    use senax_encoder::{Decoder as _, Encoder as _};
+
     use super::*;
     use crate::db::AgentIdDomain;
-    use senax_encoder::{Decoder as _, Encoder as _};
 
     #[test]
     fn queue_events_roundtrip_through_senax() {
@@ -1747,7 +1735,7 @@ mod encoding_tests {
                         text: "mail".to_owned(),
                     }]),
                 },
-                delivery: MessageDelivery::QueueOnly,
+                delivery: MessageDelivery::NextRequest,
             }),
             AgentEvent::Queued(QueuedItem {
                 kind: QueuedItemKind::Compaction,

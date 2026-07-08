@@ -167,14 +167,8 @@ async fn create_agent_and_append_events_with_cursor() {
         test_agent_runtime(),
         None,
     );
-    let next = write.append_agent_event(
-        next,
-        &user_event("hello"),
-    );
-    write.append_agent_event(
-        next,
-        &user_event("again"),
-    );
+    let next = write.append_agent_event(next, &user_event("hello"));
+    write.append_agent_event(next, &user_event("again"));
     write.commit();
 
     let read = db.read();
@@ -185,10 +179,7 @@ async fn create_agent_and_append_events_with_cursor() {
     let (next, events) = read.agent_events(agent_id);
     assert_eq!(next.seq, 2);
     assert_eq!(events.len(), 2);
-    assert_eq!(
-        events[0],
-        user_event("hello")
-    );
+    assert_eq!(events[0], user_event("hello"));
 }
 
 #[tokio::test]
@@ -210,14 +201,8 @@ async fn agent_events_read_lineage_parents() {
         test_agent_runtime(),
         None,
     );
-    let fork_at = write.append_agent_event(
-        next,
-        &user_event("parent"),
-    );
-    write.append_agent_event(
-        fork_at,
-        &user_event("sibling"),
-    );
+    let fork_at = write.append_agent_event(next, &user_event("parent"));
+    write.append_agent_event(fork_at, &user_event("sibling"));
 
     let child_lineage = AgentLineageId(99);
     {
@@ -231,10 +216,7 @@ async fn agent_events_read_lineage_parents() {
         agent.current_lineage = child_lineage;
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
-    write.append_agent_event(
-        AgentEventPos::root(child_lineage),
-        &user_event("child"),
-    );
+    write.append_agent_event(AgentEventPos::root(child_lineage), &user_event("child"));
     write.commit();
 
     let read = db.read();
@@ -339,20 +321,11 @@ async fn fork_agent_lineage_repoints_current_branch() {
         test_agent_runtime(),
         None,
     );
-    let fork_at = write.append_agent_event(
-        next,
-        &user_event("parent"),
-    );
-    write.append_agent_event(
-        fork_at,
-        &user_event("old branch"),
-    );
+    let fork_at = write.append_agent_event(next, &user_event("parent"));
+    write.append_agent_event(fork_at, &user_event("old branch"));
 
     let child_next = write.fork_agent_lineage(UnixMs(2), agent_id, fork_at);
-    write.append_agent_event(
-        child_next,
-        &user_event("new branch"),
-    );
+    write.append_agent_event(child_next, &user_event("new branch"));
     write.commit();
 
     let (_, events) = db.read().agent_events(agent_id);

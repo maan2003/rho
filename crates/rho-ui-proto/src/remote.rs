@@ -110,7 +110,7 @@ impl UiAgentState {
                 delivery: *delivery,
                 sender: match sender {
                     rho_agent::MessageSender::User => None,
-                    rho_agent::MessageSender::Agent { id } => Some(id.encoded()),
+                    rho_agent::MessageSender::Agent { id } => Some(format!("ag-{}", id.encoded())),
                 },
             },
             QueuedItem {
@@ -538,7 +538,7 @@ fn ui_blocks(blocks: &[Arc<ContextBlock>]) -> Vec<UiBlock> {
                     text: text_content(content),
                 }),
                 rho_agent::MessageSender::Agent { id } => ui_blocks.push(UiBlock::AgentMessage {
-                    sender: id.encoded(),
+                    sender: format!("ag-{}", id.encoded()),
                     text: text_content(content),
                 }),
             },

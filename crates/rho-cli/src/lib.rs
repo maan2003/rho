@@ -999,9 +999,7 @@ impl StreamingRenderer {
                     self.finish_turn();
                 }
             }
-            UiAgentStatus::Streaming
-            | UiAgentStatus::ToolCalling { .. }
-            | UiAgentStatus::Error => {
+            UiAgentStatus::Streaming | UiAgentStatus::ToolCalling { .. } | UiAgentStatus::Error => {
                 let turn_base = *self
                     .turn_base
                     .get_or_insert_with(|| turn_base_index(&state.blocks));
@@ -1218,7 +1216,6 @@ fn delivery_label(delivery: MessageDelivery) -> Option<&'static str> {
         MessageDelivery::Immediate => None,
         MessageDelivery::NextRequest => Some("(steering)"),
         MessageDelivery::NextTurn => Some("(queued)"),
-        MessageDelivery::QueueOnly => Some("(mail)"),
     }
 }
 

@@ -25,6 +25,7 @@ use crate::{Agent, AgentState, MessageDelivery, StartWorkspace};
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
 const MAX_LIVE_CHILDREN: usize = 8;
+const ID_LABEL_HEADROOM: u64 = 200;
 
 pub struct AgentPool {
     db: RhoDb,
@@ -211,11 +212,7 @@ impl AgentPool {
         Ok(child_id)
     }
 
-    fn enforce_spawn_limits(
-        &self,
-        read: &rho_db::ReadTxn,
-        parent: AgentId,
-    ) -> anyhow::Result<()> {
+    fn enforce_spawn_limits(&self, read: &rho_db::ReadTxn, parent: AgentId) -> anyhow::Result<()> {
         let mut depth = 0;
         let mut cursor = Some(parent);
         while let Some(id) = cursor {
@@ -255,22 +252,31 @@ impl AgentPool {
         Ok(())
     }
 
-    /// Resolve an agent id string (full or unique prefix) against all
-    /// persisted agents.
-    pub fn resolve_agent_id(&self, text: &str) -> anyhow::Result<AgentId> {
-        let matches = self
-            .db
-            .read()
-            .list_agents()
-            .into_iter()
-            .map(|(agent_id, _)| agent_id)
-            .filter(|agent_id| agent_id.encoded().starts_with(text))
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [agent_id] => Ok(*agent_id),
-            [] => anyhow::bail!("no agent with id {text}"),
-            _ => anyhow::bail!("agent id {text} is ambiguous"),
-        }
+    /// Resolve an agent id string or prefix against all generated agent ids.
+    pub fn resolve_agent_id(
+        &self,
+        text: &str,
+    ) -> anyhow::Result<prefix_id::PrefixResolution<crate::db::AgentIdDomain>> {
+        let text = text.trim();
+        let read = self.db.read();
+        let domain = crate::db::AgentIdDomain(read.machine_seed());
+        Ok(AgentId::from_prefix(
+            text,
+            read.last_agent_counter() + 1,
+            &domain,
+        )?)
+    }
+
+    pub fn agent_exists(&self, agent_id: AgentId) -> bool {
+        self.db.read().agent_topic(agent_id).is_some()
+    }
+
+    /// Short raw prefix for an agent id.
+    pub fn agent_id_prefix(&self, agent_id: AgentId) -> String {
+        let read = self.db.read();
+        let prefix_len =
+            prefix_id::uniform_prefix_len(read.last_agent_counter(), ID_LABEL_HEADROOM).max(4);
+        agent_id.encoded()[..prefix_len].to_owned()
     }
 
     /// The shared handle for the repo rooted at (or containing) `path`.
@@ -355,7 +361,7 @@ impl RunningAgent {
             // Claude has no agent-mail lane; mail arrives as a labeled user
             // message.
             Self::Claude(agent) => agent.send_user_message(format!(
-                "[message from agent {}]\n{}",
+                "[message from agent ag-{}]\n{}",
                 sender.encoded(),
                 body
             )),

@@ -385,7 +385,10 @@ impl ClaudeLoop {
             let mut state = self.state.write().expect("poison");
             let matched = state.queued_inputs.remove_first(|queued| match queued {
                 QueuedItem {
-                    kind: QueuedItemKind::UserMessage { content: queued, .. },
+                    kind:
+                        QueuedItemKind::UserMessage {
+                            content: queued, ..
+                        },
                     ..
                 } => **queued == *content,
                 QueuedItem {

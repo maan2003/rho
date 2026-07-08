@@ -1,4 +1,5 @@
-//! Built-in multi-agent tools: `spawn_agent`, `send_message`, `wait`.
+//! Built-in multi-agent tools: `spawn_agent`, `send_message`,
+//! `interrupt_agent`, `wait`.
 //!
 //! These are ordinary fast tools (codex-v2 style): asynchrony lives in the
 //! per-agent message queue, not in tool execution. `spawn_agent` returns the
@@ -16,9 +17,9 @@ use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolT
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::MessageDelivery;
 use crate::db::AgentId;
 use crate::pool::{AgentPool, SpawnWorkspace};
-use crate::MessageDelivery;
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
 /// pool for spawning, mail routing, and id resolution. `Agent::create` and
@@ -66,20 +67,27 @@ impl MultiAgentTools {
 
 pub const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 pub const SEND_MESSAGE_TOOL_NAME: &str = "send_message";
+pub const INTERRUPT_AGENT_TOOL_NAME: &str = "interrupt_agent";
 pub const WAIT_TOOL_NAME: &str = "wait";
 
 const DEFAULT_WAIT_SECONDS: u64 = 300;
 const MAX_WAIT_SECONDS: u64 = 3600;
+const AGENT_ID_EXAMPLE: &str = "ag-h6u7";
 
 pub fn is_agent_tool(name: &str) -> bool {
     matches!(
         name,
-        SPAWN_AGENT_TOOL_NAME | SEND_MESSAGE_TOOL_NAME | WAIT_TOOL_NAME
+        SPAWN_AGENT_TOOL_NAME | SEND_MESSAGE_TOOL_NAME | INTERRUPT_AGENT_TOOL_NAME | WAIT_TOOL_NAME
     )
 }
 
 pub fn agent_tool_specs() -> Vec<ToolSpec> {
-    vec![spawn_agent_spec(), send_message_spec(), wait_spec()]
+    vec![
+        spawn_agent_spec(),
+        send_message_spec(),
+        interrupt_agent_spec(),
+        wait_spec(),
+    ]
 }
 
 fn spawn_agent_spec() -> ToolSpec {
@@ -128,9 +136,9 @@ fn send_message_spec() -> ToolSpec {
     ToolSpec {
         name: ToolName::try_from(SEND_MESSAGE_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
-        description: "Send an async message to another agent by id (from spawn_agent or an \
-                      earlier message). Wakes an idle recipient; a busy recipient sees it at \
-                      its next inference step. Returns immediately after queueing."
+        description: "Send an async message to another agent by id. Wakes an idle recipient; a \
+                      busy recipient sees it at its next inference step. Returns immediately \
+                      after queueing."
             .to_owned(),
         input_schema: json!({
             "type": "object",
@@ -139,11 +147,34 @@ fn send_message_spec() -> ToolSpec {
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Recipient agent id (a unique prefix is accepted)."
+                    "description": format!("example: {AGENT_ID_EXAMPLE}")
                 },
                 "message": {
                     "type": "string",
                     "description": "Message body."
+                }
+            }
+        }),
+        format: None,
+    }
+}
+
+fn interrupt_agent_spec() -> ToolSpec {
+    ToolSpec {
+        name: ToolName::try_from(INTERRUPT_AGENT_TOOL_NAME).expect("valid tool name"),
+        tool_type: ToolType::Function,
+        description: "Interrupt another agent's current turn by id. The agent remains available \
+                      for follow-up messages. Returns plain text after the interrupt request is \
+                      accepted."
+            .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["agent_id"],
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": format!("example: {AGENT_ID_EXAMPLE}")
                 }
             }
         }),
@@ -166,9 +197,7 @@ fn wait_spec() -> ToolSpec {
             "properties": {
                 "timeout_seconds": {
                     "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_WAIT_SECONDS,
-                    "description": "Give up after this many seconds (default 300)."
+                    "description": format!("Give up after this many seconds (default: {DEFAULT_WAIT_SECONDS}, min: 1, max: {MAX_WAIT_SECONDS}).")
                 }
             }
         }),
@@ -180,6 +209,7 @@ pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: ToolCall) -> T
     let result = match call.name.as_str() {
         SPAWN_AGENT_TOOL_NAME => spawn_agent(&tools, &call).await,
         SEND_MESSAGE_TOOL_NAME => send_message(&tools, &call).await,
+        INTERRUPT_AGENT_TOOL_NAME => interrupt_agent(&tools, &call).await,
         // `wait` is intercepted and resolved by the agent loop; it never
         // reaches tool dispatch.
         _ => Err(anyhow::anyhow!(
@@ -228,16 +258,16 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
         },
     };
     let task_name = args.task_name.clone();
-    let child_id = tools
-        .pool()?
+    let pool = tools.pool()?;
+    let child_id = pool
         .spawn_child(tools.self_id, args.task_name, args.prompt, workspace)
         .await?;
+    let child_id = format!("ag-{}", pool.agent_id_prefix(child_id));
     Ok(format!(
         "Spawned agent {} for task \"{}\". It is working now; its results will arrive as mail \
          ([message from agent ...]). Use send_message to follow up and wait to block for its \
          results.",
-        child_id.encoded(),
-        task_name,
+        child_id, task_name,
     ))
 }
 
@@ -253,7 +283,23 @@ async fn send_message(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Resul
         anyhow::bail!("message must not be empty");
     }
     let pool = tools.pool()?;
-    let recipient = pool.resolve_agent_id(&args.agent_id)?;
+    let raw_agent_id = args
+        .agent_id
+        .trim()
+        .strip_prefix("ag-")
+        .ok_or_else(|| anyhow::anyhow!("agent_id must start with ag-"))?;
+    let recipient = match pool.resolve_agent_id(raw_agent_id)? {
+        prefix_id::PrefixResolution::Unique(agent_id)
+        | prefix_id::PrefixResolution::Ambiguous {
+            first: agent_id, ..
+        } => agent_id,
+        prefix_id::PrefixResolution::NotFound => {
+            anyhow::bail!("no agent with id {}", args.agent_id)
+        }
+    };
+    if !pool.agent_exists(recipient) {
+        anyhow::bail!("no agent with id {}", args.agent_id);
+    }
     if recipient == tools.self_id {
         anyhow::bail!("cannot send a message to yourself");
     }
@@ -264,7 +310,46 @@ async fn send_message(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Resul
         MessageDelivery::NextRequest,
     )
     .await?;
-    Ok(format!("Message sent to agent {}.", recipient.encoded()))
+    Ok(format!(
+        "Message sent to agent {}.",
+        format!("ag-{}", pool.agent_id_prefix(recipient))
+    ))
+}
+
+#[derive(Deserialize)]
+struct InterruptArgs {
+    agent_id: String,
+}
+
+async fn interrupt_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
+    let args: InterruptArgs = serde_json::from_str(&call.arguments)?;
+    let pool = tools.pool()?;
+    let raw_agent_id = args
+        .agent_id
+        .trim()
+        .strip_prefix("ag-")
+        .ok_or_else(|| anyhow::anyhow!("agent_id must start with ag-"))?;
+    let target = match pool.resolve_agent_id(raw_agent_id)? {
+        prefix_id::PrefixResolution::Unique(agent_id)
+        | prefix_id::PrefixResolution::Ambiguous {
+            first: agent_id, ..
+        } => agent_id,
+        prefix_id::PrefixResolution::NotFound => {
+            anyhow::bail!("no agent with id {}", args.agent_id)
+        }
+    };
+    if !pool.agent_exists(target) {
+        anyhow::bail!("no agent with id {}", args.agent_id);
+    }
+    if target == tools.self_id {
+        anyhow::bail!("cannot interrupt yourself");
+    }
+    let (_, agent, _) = pool.load(target).await?;
+    agent.cancel();
+    Ok(format!(
+        "Agent {} interrupted. It remains available for follow-up messages.",
+        format!("ag-{}", pool.agent_id_prefix(target))
+    ))
 }
 
 /// Parse a `wait` call's timeout for the loop that arms it.

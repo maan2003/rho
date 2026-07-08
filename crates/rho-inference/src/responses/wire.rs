@@ -207,7 +207,7 @@ fn append_block_items(block: &ContextBlock, out: &mut Vec<WireTimelineItem>) {
             // sender so the model can tell peers from the actual user.
             rho_core::MessageSender::Agent { id } => {
                 let text = format!(
-                    "[message from agent {}]\n{}",
+                    "[message from agent ag-{}]\n{}",
                     id.encoded(),
                     rho_core::text_content(content)
                 );

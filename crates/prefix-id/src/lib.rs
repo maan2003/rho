@@ -173,7 +173,11 @@ impl<D: PrefixIdDomain> PrefixId<D> {
             1 => PrefixResolution::Unique(
                 Self::from_counter(residue, domain).expect("resolved residue is below capacity"),
             ),
-            _ => PrefixResolution::Ambiguous { matches },
+            _ => PrefixResolution::Ambiguous {
+                first: Self::from_counter(residue, domain)
+                    .expect("resolved residue is below capacity"),
+                matches,
+            },
         })
     }
 }
@@ -287,7 +291,7 @@ impl<D: PrefixIdDomain> redb::Key for PrefixId<D> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixResolution<D: PrefixIdDomain> {
     Unique(PrefixId<D>),
-    Ambiguous { matches: u64 },
+    Ambiguous { first: PrefixId<D>, matches: u64 },
     NotFound,
 }
 
@@ -583,7 +587,10 @@ mod tests {
     fn resolves_ambiguous_prefixes() {
         assert_eq!(
             Id::from_prefix(&id(20).encoded()[..1], 36 + 21, &TestDomain).unwrap(),
-            PrefixResolution::Ambiguous { matches: 2 }
+            PrefixResolution::Ambiguous {
+                first: id(20),
+                matches: 2
+            }
         );
     }
 

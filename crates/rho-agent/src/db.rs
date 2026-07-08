@@ -178,7 +178,10 @@ impl redb::Value for LegacyTopicAgentKey {
     where
         Self: 'a,
     {
-        Self(data.try_into().expect("legacy topic-agent key must be 24 bytes"))
+        Self(
+            data.try_into()
+                .expect("legacy topic-agent key must be 24 bytes"),
+        )
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self) -> [u8; 24]

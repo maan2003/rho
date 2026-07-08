@@ -84,9 +84,7 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         }
         UiBlock::QueuedMessage { delivery, .. } => match delivery {
             MessageDelivery::Immediate => BlockKind::User,
-            MessageDelivery::NextRequest
-            | MessageDelivery::NextTurn
-            | MessageDelivery::QueueOnly => BlockKind::QueuedUser,
+            MessageDelivery::NextRequest | MessageDelivery::NextTurn => BlockKind::QueuedUser,
         },
         UiBlock::AgentMessage { .. } => BlockKind::User,
     }
@@ -157,7 +155,10 @@ pub fn render_block(
                 return invisible(kind);
             }
             spans.extend(separator(prev, kind));
-            spans.push(Span::new(format!("from {sender}\n"), StyleClass::SystemInfo));
+            spans.push(Span::new(
+                format!("from {sender}\n"),
+                StyleClass::SystemInfo,
+            ));
             gutter_span = Some(spans.len());
             spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
         }
@@ -171,7 +172,10 @@ pub fn render_block(
             }
             spans.extend(separator(prev, kind));
             if let Some(sender) = sender {
-                spans.push(Span::new(format!("from {sender}\n"), StyleClass::SystemInfo));
+                spans.push(Span::new(
+                    format!("from {sender}\n"),
+                    StyleClass::SystemInfo,
+                ));
             }
             gutter_span = Some(spans.len());
             spans.push(Span::new(text.clone(), StyleClass::UserMessage));
@@ -179,7 +183,6 @@ pub fn render_block(
                 MessageDelivery::Immediate => None,
                 MessageDelivery::NextRequest => Some(" (steering)"),
                 MessageDelivery::NextTurn => Some(" (queued)"),
-                MessageDelivery::QueueOnly => Some(" (mail)"),
             };
             if let Some(label) = label {
                 inlay = Some(InlaySpec {

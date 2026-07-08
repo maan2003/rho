@@ -29,10 +29,12 @@ its own jj workspace forked from your current change (parallel edits), \
 `new` starts it from trunk or a `revset`.
 
 Sub-agents report by mail: their finished-turn results arrive in your \
-context as `[message from agent ...]` the next time you run. Mail never \
-interrupts you mid-thought — call `wait` when you are blocked on sub-agent \
-results and have nothing else useful to do, and use `send_message` to steer \
-or follow up with a running agent. If you were spawned by another agent, \
+context as `[message from agent ...]`. Mail does not interrupt an in-flight \
+request, but it can start or continue your next request; call `wait` when \
+you are blocked on sub-agent results and have nothing else useful to do, and \
+use `send_message` to steer or follow up with a running agent. Use \
+`interrupt_agent` when a sub-agent is clearly doing the wrong work and should \
+stop its current turn. If you were spawned by another agent, \
 messages from it define your task; your final responses are mailed back to \
 it automatically.
 
@@ -40,7 +42,7 @@ Delegate when tasks are parallel and separable; do small or tightly coupled \
 work yourself.
 
 ",
-            id.encoded()
+            format!("ag-{}", id.encoded())
         )
     });
     format!(
