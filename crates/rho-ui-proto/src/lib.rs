@@ -397,6 +397,10 @@ pub struct UiAgentSummary {
     /// Attention level at summary time; kept current afterwards by
     /// [`ServerMessage::AgentAttention`].
     pub attention: UiAttention,
+    /// When the agent last finished a turn (creation time if it never ran).
+    /// Recency tiebreak for rail sorting; clients keep it current from
+    /// Working broadcasts.
+    pub last_active: rho_core::UnixMs,
 }
 
 /// How urgently an agent wants the user, in ascending order — the rail's

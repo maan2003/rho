@@ -34,6 +34,11 @@ pub struct AgentRegistry {
     /// Live attention overlay: broadcasts land here between topic refreshes,
     /// which re-seed it from the summaries' snapshot.
     attention: BTreeMap<AgentId, rho_ui_proto::UiAttention>,
+    /// When each agent last worked, for the rail's recency tiebreak. Seeded
+    /// from summaries, bumped locally whenever a Working broadcast arrives —
+    /// the daemon only persists turn *ends*, so this keeps agents current
+    /// from the moment they start.
+    last_active: BTreeMap<AgentId, rho_core::UnixMs>,
     topics: Vec<UiTopic>,
     active: ActivePane,
     /// The daemon database's machine seed, from `Ready`; kept for consumers
@@ -68,17 +73,40 @@ impl AgentRegistry {
                     .entry(agent.agent_id)
                     .or_insert(AgentLife::Known);
                 self.attention.insert(agent.agent_id, agent.attention);
+                // Keep the freshest signal: a local Working bump can be
+                // newer than the summary's persisted turn end.
+                let last_active = self
+                    .last_active
+                    .entry(agent.agent_id)
+                    .or_insert(rho_core::UnixMs(0));
+                *last_active = (*last_active).max(agent.last_active);
             }
         }
         self.topics = topics;
     }
 
     pub fn set_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
+        if attention == rho_ui_proto::UiAttention::Working {
+            self.last_active
+                .insert(agent_id, rho_core::UnixMs(crate::workspace::now_ms()));
+        }
         self.attention.insert(agent_id, attention);
     }
 
     pub fn attention(&self, agent_id: AgentId) -> rho_ui_proto::UiAttention {
         self.attention.get(&agent_id).copied().unwrap_or_default()
+    }
+
+    /// Recency for rail sorting, deliberately coarse: 15-minute buckets mean
+    /// rows only move when attention changes or a bucket boundary passes,
+    /// not on every turn. Ties within a bucket are broken by stable sort,
+    /// i.e. the daemon's creation order.
+    pub fn recency_bucket(&self, agent_id: AgentId) -> u64 {
+        const BUCKET_MS: u64 = 15 * 60 * 1000;
+        self.last_active
+            .get(&agent_id)
+            .map(|last_active| last_active.0 / BUCKET_MS)
+            .unwrap_or(0)
     }
 
     /// The rail-visible agent most in need of the user, excluding the one
@@ -271,7 +299,7 @@ impl AgentRegistry {
                 (
                     Reverse(self.attention(agent.agent_id)),
                     agent.status != rho_ui_proto::Status::Pinned,
-                    Reverse(agent.created_at),
+                    Reverse(self.recency_bucket(agent.agent_id)),
                 )
             });
             candidates.extend(agents.into_iter().map(|agent| agent.agent_id));
@@ -331,6 +359,7 @@ mod tests {
             },
             status,
             attention: rho_ui_proto::UiAttention::Quiet,
+            last_active: rho_core::UnixMs(0),
         }
     }
 
@@ -354,6 +383,7 @@ mod tests {
             },
             status: Status::Normal,
             attention: rho_ui_proto::UiAttention::Quiet,
+            last_active: rho_core::UnixMs(0),
         }
     }
 
@@ -368,27 +398,51 @@ mod tests {
 
     #[test]
     fn cycling_follows_active_rail_order() {
+        const BUCKET_MS: u64 = 15 * 60 * 1000;
         let mut registry = AgentRegistry::default();
+        let mut recent = agent(3, Status::Normal);
+        recent.last_active = rho_core::UnixMs(BUCKET_MS);
         registry.set_topics(vec![topic(
             1,
             Status::Normal,
-            vec![
-                agent(1, Status::Normal),
-                agent(2, Status::Pinned),
-                agent(3, Status::Normal),
-            ],
+            vec![agent(1, Status::Normal), agent(2, Status::Pinned), recent],
         )]);
         for id in 1..=3 {
             registry.mark_live(agent_id(id));
         }
 
-        // Active rail order is pinned first, then newest-created first:
+        // Active rail order is pinned first, then most recently active
+        // (agent 3 sits in a newer 15-minute bucket than the idle 1):
         // 2, 3, 1. Forward cycling should move down that visible order.
         registry.select_agent(agent_id(2));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
         registry.select_agent(agent_id(3));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
         assert_eq!(registry.next_live_agent(-1), Some(agent_id(2)));
+    }
+
+    #[test]
+    fn same_recency_bucket_keeps_daemon_order() {
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic(
+            1,
+            Status::Normal,
+            vec![
+                agent(3, Status::Normal),
+                agent(1, Status::Normal),
+                agent(2, Status::Normal),
+            ],
+        )]);
+        for id in 1..=3 {
+            registry.mark_live(agent_id(id));
+        }
+
+        // All in bucket zero: the sort is stable, so the daemon's summary
+        // order (3, 1, 2) holds and rows never shuffle on their own.
+        registry.select_agent(agent_id(3));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
+        registry.select_agent(agent_id(1));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
     }
 
     #[test]

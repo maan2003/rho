@@ -291,6 +291,10 @@ impl AgentRegistry {
                             } else {
                                 self.settled_attention(agent_id)
                             },
+                            last_active: read
+                                .agent_attention(agent_id)
+                                .map(|record| record.last_turn_end)
+                                .unwrap_or(agent.created_at),
                         })
                         .collect(),
                 }

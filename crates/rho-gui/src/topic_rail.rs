@@ -164,6 +164,7 @@ mod tests {
             },
             status,
             attention: UiAttention::Quiet,
+            last_active: UnixMs(0),
         }
     }
 
@@ -217,18 +218,23 @@ mod tests {
     }
 
     #[test]
-    fn active_agents_sort_by_created_at_newest_first_after_pins() {
-        let old = agent(1, Status::Normal, 10);
+    fn active_agents_sort_by_recency_bucket_after_pins() {
+        const BUCKET_MS: u64 = 15 * 60 * 1000;
+        let idle = agent(1, Status::Normal, 10);
         let pinned = agent(2, Status::Pinned, 10);
-        let new = agent(3, Status::Normal, 10);
-        let topic = topic(Status::Normal, vec![old, pinned, new]);
+        let mut recent = agent(3, Status::Normal, 10);
+        recent.last_active = UnixMs(BUCKET_MS);
+        let topic = topic(Status::Normal, vec![idle, pinned, recent]);
 
-        let registry = AgentRegistry::default();
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic.clone()]);
         let visible = visible_agents(&topic, &registry, false)
             .into_iter()
             .map(|summary| summary.agent_id)
             .collect::<Vec<_>>();
 
+        // Pins first, then the newer 15-minute bucket; agents in the same
+        // bucket keep the daemon's order (stable sort).
         assert_eq!(
             visible,
             [
@@ -297,7 +303,7 @@ fn visible_agents<'a>(
             (
                 Reverse(registry.attention(summary.agent_id)),
                 summary.status != Status::Pinned,
-                Reverse(summary.created_at),
+                Reverse(registry.recency_bucket(summary.agent_id)),
             )
         });
     }
