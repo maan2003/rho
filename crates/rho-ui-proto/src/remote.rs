@@ -110,7 +110,7 @@ impl UiAgentState {
                 delivery: *delivery,
                 sender: match sender {
                     rho_agent::MessageSender::User => None,
-                    rho_agent::MessageSender::Agent { id } => Some(format!("ag-{}", id.encoded())),
+                    rho_agent::MessageSender::Agent { id } => Some(*id),
                 },
             },
             QueuedItem {
@@ -149,13 +149,13 @@ pub enum UiBlock {
     QueuedMessage {
         text: String,
         delivery: MessageDelivery,
-        /// The sending agent's encoded id; `None` for the user.
-        sender: Option<String>,
+        /// The sending agent; `None` for the user.
+        sender: Option<crate::AgentId>,
     },
     /// A delivered message from another agent.
     AgentMessage {
-        /// The sending agent's encoded id.
-        sender: String,
+        /// The sending agent.
+        sender: crate::AgentId,
         text: String,
     },
 }
@@ -538,7 +538,7 @@ fn ui_blocks(blocks: &[Arc<ContextBlock>]) -> Vec<UiBlock> {
                     text: text_content(content),
                 }),
                 rho_agent::MessageSender::Agent { id } => ui_blocks.push(UiBlock::AgentMessage {
-                    sender: format!("ag-{}", id.encoded()),
+                    sender: *id,
                     text: text_content(content),
                 }),
             },
@@ -968,6 +968,28 @@ mod tests {
         assert_eq!(
             receiver,
             UiAgentState::from_agent_state(&streaming_state("hello"))
+        );
+    }
+
+    #[test]
+    fn agent_message_sender_preserves_agent_id() {
+        let sender = crate::AgentId::from_counter(2, &crate::AgentIdDomain(0)).unwrap();
+        let mut state = finished_state("");
+        state.blocks = vec![Arc::new(ContextBlock::UserMessage {
+            sender: rho_agent::MessageSender::Agent { id: sender },
+            content: vec![ContentPart::Text {
+                text: "hello".to_owned(),
+            }],
+        })];
+
+        let state = UiAgentState::from_agent_state(&state);
+
+        assert_eq!(
+            state.blocks,
+            [UiBlock::AgentMessage {
+                sender,
+                text: "hello".to_owned(),
+            }]
         );
     }
 

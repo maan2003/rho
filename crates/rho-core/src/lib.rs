@@ -275,6 +275,7 @@ pub struct InferenceRequest {
     pub instructions: Arc<str>,
     // arc is used to avoid cloning context blocks too much between requests
     pub input: Vec<Arc<ContextBlock>>,
+    pub agent_id_labels: std::collections::BTreeMap<AgentId, Arc<str>>,
     pub tools: Arc<[ToolSpec]>,
 }
 

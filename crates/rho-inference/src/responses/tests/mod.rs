@@ -118,6 +118,7 @@ fn inference_request(input: Vec<Arc<ContextBlock>>, tools: Vec<ToolSpec>) -> Inf
     InferenceRequest {
         instructions: Arc::from(""),
         input,
+        agent_id_labels: std::collections::BTreeMap::new(),
         tools: tools.into(),
     }
 }

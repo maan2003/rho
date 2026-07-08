@@ -519,6 +519,10 @@ fn topic_of(agent: &AgentClient, agent_id: AgentId) -> Option<rho_ui_proto::Topi
         .map(|topic| topic.topic_id)
 }
 
+fn short_agent_label(agent_id: AgentId) -> String {
+    format!("ag-{}", &agent_id.encoded()[..4])
+}
+
 fn primary_state(states: &HashMap<AgentId, UiAgentState>) -> Option<&UiAgentState> {
     states
         .iter()
@@ -789,6 +793,7 @@ impl ChatTerm {
                     delivery,
                     sender,
                 } => {
+                    let sender = sender.map(short_agent_label);
                     let text = queued_message_text(text, sender.as_deref());
                     match delivery_label(*delivery) {
                         Some(label) => self.print_system(&format!("{text} {label}")),
@@ -799,6 +804,7 @@ impl ChatTerm {
                     }
                 }
                 UiBlock::AgentMessage { sender, text } => {
+                    let sender = short_agent_label(*sender);
                     self.handle.print_output(
                         "history-message",
                         user_message_block(&format!("[from {sender}] {text}")),
@@ -1037,6 +1043,7 @@ impl StreamingRenderer {
                 delivery,
                 sender,
             } => {
+                let sender = sender.map(short_agent_label);
                 let text = queued_message_text(text, sender.as_deref());
                 match delivery_label(*delivery) {
                     Some(label) => {
@@ -1049,6 +1056,7 @@ impl StreamingRenderer {
                 }
             }
             UiBlock::AgentMessage { sender, text } => {
+                let sender = short_agent_label(*sender);
                 self.set_index_block(
                     index,
                     "user",

@@ -30,7 +30,7 @@ use text::{Anchor, ToOffset as _};
 
 use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::render::elision::ElisionPlan;
-use crate::render::{BlockKind, RenderedBlock, render_block};
+use crate::render::{BlockKind, RenderedBlock, render_block_with_agent_labels};
 use crate::store::{FrameSummary, IncrementalUpdate};
 use crate::style::{Region, StyleClass};
 
@@ -85,6 +85,7 @@ impl TranscriptModel {
         state: &UiAgentState,
         summary: FrameSummary,
         now_ms: u64,
+        agent_label: &impl Fn(rho_ui_proto::AgentId) -> String,
         cx: &mut Context<V>,
     ) {
         let Some(first_changed) = summary.first_changed_block else {
@@ -92,7 +93,7 @@ impl TranscriptModel {
         };
 
         if let Some(incremental) = summary.incremental
-            && self.try_incremental_sync(state, first_changed, incremental, now_ms, cx)
+            && self.try_incremental_sync(state, first_changed, incremental, now_ms, agent_label, cx)
         {
             return;
         }
@@ -108,7 +109,8 @@ impl TranscriptModel {
             .unwrap_or(&[])
             .iter()
             .map(|block| {
-                let block = render_block(block, prev_kind, now_ms, cx);
+                let block =
+                    render_block_with_agent_labels(block, prev_kind, now_ms, agent_label, cx);
                 if block.visible() {
                     prev_kind = Some(block.kind);
                 }
@@ -190,6 +192,7 @@ impl TranscriptModel {
         first_changed: usize,
         incremental: IncrementalUpdate,
         now_ms: u64,
+        agent_label: &impl Fn(rho_ui_proto::AgentId) -> String,
         cx: &mut Context<V>,
     ) -> bool {
         let index = match incremental {
@@ -205,7 +208,7 @@ impl TranscriptModel {
         let Some(block) = state.blocks.get(index) else {
             return false;
         };
-        let rendered = render_block(block, prev_kind, now_ms, cx);
+        let rendered = render_block_with_agent_labels(block, prev_kind, now_ms, agent_label, cx);
         let old_record = &self.records[index];
         if index + 1 < self.records.len()
             && (old_record.kind != rendered.kind || old_record.visible != rendered.visible())

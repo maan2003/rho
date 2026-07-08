@@ -149,9 +149,11 @@ impl AgentView {
         state: &UiAgentState,
         summary: FrameSummary,
         now_ms: u64,
+        agent_label: &impl Fn(rho_ui_proto::AgentId) -> String,
         cx: &mut Context<Self>,
     ) {
-        self.transcript.sync(state, summary, now_ms, cx);
+        self.transcript
+            .sync(state, summary, now_ms, agent_label, cx);
     }
 
     pub fn tick_timers(&mut self, now_ms: u64, cx: &mut Context<Self>) {

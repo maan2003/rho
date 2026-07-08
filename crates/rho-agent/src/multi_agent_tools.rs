@@ -54,6 +54,13 @@ impl MultiAgentTools {
         self.parent
     }
 
+    pub(crate) fn display_id(&self, agent_id: AgentId) -> String {
+        let pool = self
+            .pool()
+            .expect("multi-agent tools require a live agent pool");
+        format!("ag-{}", pool.agent_id_prefix(agent_id))
+    }
+
     fn pool(&self) -> anyhow::Result<Arc<AgentPool>> {
         self.pool
             .upgrade()

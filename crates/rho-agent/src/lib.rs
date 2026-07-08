@@ -1435,8 +1435,28 @@ impl AgentLoop {
         self.inference_session.request(InferenceRequest {
             instructions: state.system_prompt.clone(),
             input: state.blocks.clone(),
+            agent_id_labels: self.agent_id_labels(&state.blocks),
             tools: Arc::clone(&state.tool_specs),
         });
+    }
+
+    fn agent_id_labels(
+        &self,
+        blocks: &[Arc<ContextBlock>],
+    ) -> std::collections::BTreeMap<AgentId, Arc<str>> {
+        let Some(tools) = &self.multi_agent else {
+            return std::collections::BTreeMap::new();
+        };
+        blocks
+            .iter()
+            .filter_map(|block| match &**block {
+                ContextBlock::UserMessage {
+                    sender: MessageSender::Agent { id },
+                    ..
+                } => Some((*id, Arc::from(tools.display_id(*id)))),
+                _ => None,
+            })
+            .collect()
     }
 }
 

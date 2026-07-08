@@ -208,7 +208,8 @@ impl AgentPool {
         let (child_id, child) = self
             .create_with_parent(topic_id, mode, Some(task_name), start, Some(parent))
             .await?;
-        child.send_agent_message(parent, prompt, MessageDelivery::NextRequest);
+        let parent_label = format!("ag-{}", self.agent_id_prefix(parent));
+        child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);
         Ok(child_id)
     }
 
@@ -248,7 +249,8 @@ impl AgentPool {
         delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
         let (_, agent, _) = self.load(to).await?;
-        agent.send_agent_message(from, body, delivery);
+        let sender_label = format!("ag-{}", self.agent_id_prefix(from));
+        agent.send_agent_message(from, sender_label, body, delivery);
         Ok(())
     }
 
@@ -355,15 +357,19 @@ impl RunningAgent {
     }
 
     /// Deliver mail from another agent.
-    pub fn send_agent_message(&self, sender: AgentId, body: String, delivery: MessageDelivery) {
+    pub fn send_agent_message(
+        &self,
+        sender: AgentId,
+        sender_label: String,
+        body: String,
+        delivery: MessageDelivery,
+    ) {
         match self {
             Self::Rho(agent) => agent.send_agent_message(sender, body, delivery),
             // Claude has no agent-mail lane; mail arrives as a labeled user
             // message.
             Self::Claude(agent) => agent.send_user_message(format!(
-                "Message Type: MESSAGE\nSender: ag-{}\nPayload:\n{}",
-                sender.encoded(),
-                body
+                "Message Type: MESSAGE\nSender: {sender_label}\nPayload:\n{body}"
             )),
         }
     }

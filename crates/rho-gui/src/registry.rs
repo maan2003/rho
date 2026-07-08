@@ -132,6 +132,14 @@ impl AgentRegistry {
             .and_then(|agent| agent.display_name.as_deref())
     }
 
+    pub fn agent_display_label(&self, agent_id: AgentId) -> String {
+        let id_label = self.agent_id_label(agent_id);
+        match self.agent_display_name(agent_id) {
+            Some(name) if !name.trim().is_empty() => format!("{name} ({id_label})"),
+            _ => id_label,
+        }
+    }
+
     pub fn add_topic(&mut self, topic: UiTopic) {
         // Topics stay in the daemon's creation order; a new topic is the
         // newest, so it belongs at the end.

@@ -116,7 +116,7 @@ impl ResponsesRequest {
         // drop everything before the most recent compaction marker.
         let mut timeline = Vec::new();
         for block in input_blocks {
-            append_block_items(block, &mut timeline);
+            append_block_items(block, &request.agent_id_labels, &mut timeline);
         }
         let timeline = trim_before_latest_compaction(&timeline);
 
@@ -197,7 +197,11 @@ enum WireTimelineItem {
     ResponseItem(InferenceResponseItem),
 }
 
-fn append_block_items(block: &ContextBlock, out: &mut Vec<WireTimelineItem>) {
+fn append_block_items(
+    block: &ContextBlock,
+    agent_id_labels: &std::collections::BTreeMap<rho_core::AgentId, std::sync::Arc<str>>,
+    out: &mut Vec<WireTimelineItem>,
+) {
     match block {
         ContextBlock::UserMessage { sender, content } => match sender {
             rho_core::MessageSender::User => {
@@ -206,9 +210,11 @@ fn append_block_items(block: &ContextBlock, out: &mut Vec<WireTimelineItem>) {
             // Agent mail rides the user role; the header identifies the
             // sender so the model can tell peers from the actual user.
             rho_core::MessageSender::Agent { id } => {
+                let sender = agent_id_labels
+                    .get(id)
+                    .map_or_else(|| format!("ag-{}", id.encoded()), ToString::to_string);
                 let text = format!(
-                    "Message Type: MESSAGE\nSender: ag-{}\nPayload:\n{}",
-                    id.encoded(),
+                    "Message Type: MESSAGE\nSender: {sender}\nPayload:\n{}",
                     rho_core::text_content(content)
                 );
                 out.push(WireTimelineItem::UserMessage(vec![

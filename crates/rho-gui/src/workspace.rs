@@ -219,7 +219,15 @@ impl Workspace {
                     if let Some(view) = self.views.get(&agent_id).cloned()
                         && let Some(state) = self.store.get(&agent_id)
                     {
-                        view.update(cx, |view, cx| view.sync(state, summary, now_ms(), cx));
+                        view.update(cx, |view, cx| {
+                            view.sync(
+                                state,
+                                summary,
+                                now_ms(),
+                                &|id| self.registry.agent_display_label(id),
+                                cx,
+                            )
+                        });
                     }
                 } else if self.views.contains_key(&agent_id) {
                     self.pending_syncs
@@ -1216,7 +1224,15 @@ impl Workspace {
         let deferred = self.pending_syncs.remove(agent_id);
         if let Some(view) = self.views.get(agent_id).cloned() {
             if let (Some(summary), Some(state)) = (deferred, self.store.get(agent_id)) {
-                view.update(cx, |view, cx| view.sync(state, summary, now_ms(), cx));
+                view.update(cx, |view, cx| {
+                    view.sync(
+                        state,
+                        summary,
+                        now_ms(),
+                        &|id| self.registry.agent_display_label(id),
+                        cx,
+                    )
+                });
             }
             return view;
         }
@@ -1226,7 +1242,13 @@ impl Workspace {
         let view = cx.new(|cx| AgentView::new(workspace, window, cx));
         if let Some(state) = self.store.get(agent_id) {
             view.update(cx, |view, cx| {
-                view.sync(state, FrameSummary::everything(), now_ms(), cx);
+                view.sync(
+                    state,
+                    FrameSummary::everything(),
+                    now_ms(),
+                    &|id| self.registry.agent_display_label(id),
+                    cx,
+                );
             });
         }
         self.refresh_view_status(agent_id, &view, cx);

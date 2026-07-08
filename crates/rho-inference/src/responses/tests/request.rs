@@ -92,6 +92,33 @@ fn omits_tool_choice_without_declared_tools() {
 }
 
 #[test]
+fn renders_agent_mail_with_supplied_short_label() {
+    let session = test_inference_service("gpt-test");
+    let agent_id = rho_core::AgentId::from_counter(1, &rho_core::AgentIdDomain(0)).unwrap();
+    let mut agent_id_labels = std::collections::BTreeMap::new();
+    agent_id_labels.insert(agent_id, Arc::from("ag-h6u7"));
+    let request = InferenceRequest {
+        instructions: Arc::from("You are rho."),
+        input: vec![Arc::new(ContextBlock::UserMessage {
+            sender: rho_core::MessageSender::Agent { id: agent_id },
+            content: vec![ContentPart::Text {
+                text: "done".to_owned(),
+            }],
+        })],
+        agent_id_labels,
+        tools: Arc::from([]),
+    };
+
+    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(
+        json["input"][0]["content"][0]["text"],
+        "Message Type: MESSAGE\nSender: ag-h6u7\nPayload:\ndone"
+    );
+}
+
+#[test]
 fn stamps_phase_on_assistant_messages_when_supported() {
     let request = inference_request(
         vec![inference_response(
@@ -158,6 +185,7 @@ fn serializes_required_instructions() {
     let request = InferenceRequest {
         instructions: Arc::from("You are rho."),
         input: vec![user_block("hello")],
+        agent_id_labels: std::collections::BTreeMap::new(),
         tools: Arc::from([]),
     };
 

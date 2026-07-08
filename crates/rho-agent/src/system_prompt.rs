@@ -21,14 +21,14 @@ pub fn prompt(
     let agents_md = render_agents_md_prompt(&context.agents_files).unwrap_or_default();
     let skills = render_skills_prompt(&context.skills).unwrap_or_default();
     let multi_agent = multi_agent.map_or_else(String::new, |tools| {
-        let agent_id = format!("ag-{}", tools.self_id().encoded());
+        let agent_id = tools.display_id(tools.self_id());
         let role = match tools.parent() {
             Some(parent) => format!(
                 "You are an agent in a team of agents collaborating to complete a task. Your \
-                 agent id is {agent_id}; your parent agent is ag-{}.\n\nMessages from your \
+                 agent id is {agent_id}; your parent agent is {}.\n\nMessages from your \
                  parent define your task. When you provide a final response, that content is \
                  mailed back to your parent automatically.",
-                parent.encoded()
+                tools.display_id(parent)
             ),
             None => format!(
                 "You are the primary agent in a team of agents collaborating to fulfill the \

@@ -43,6 +43,7 @@ pub async fn generate_title(auth: InferenceAuth, user_message: &str) -> anyhow::
                 text: truncate_chars(user_message, MAX_PROMPT_CHARS).to_owned(),
             }],
         })],
+        agent_id_labels: std::collections::BTreeMap::new(),
         tools: Arc::from([]),
     });
     let mut pending = PendingInferenceResponse::default();

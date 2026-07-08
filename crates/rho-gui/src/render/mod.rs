@@ -11,8 +11,8 @@ pub mod markdown;
 use std::time::Duration;
 
 use gpui::App;
-use rho_ui_proto::MessageDelivery;
 use rho_ui_proto::remote::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
+use rho_ui_proto::{AgentId, MessageDelivery};
 
 use crate::style::StyleClass;
 
@@ -108,10 +108,11 @@ fn separator(prev: Option<BlockKind>, current: BlockKind) -> Option<Span> {
     }
 }
 
-pub fn render_block(
+pub fn render_block_with_agent_labels(
     block: &UiBlock,
     prev: Option<BlockKind>,
     now_ms: u64,
+    agent_label: &impl Fn(AgentId) -> String,
     cx: &App,
 ) -> RenderedBlock {
     let kind = block_kind(block);
@@ -156,11 +157,11 @@ pub fn render_block(
             }
             spans.extend(separator(prev, kind));
             spans.push(Span::new(
-                format!("from {sender}\n"),
+                format!("from {}\n", agent_label(*sender)),
                 StyleClass::SystemInfo,
             ));
             gutter_span = Some(spans.len());
-            spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
+            spans.push(Span::new(format!("{text}\n\n"), StyleClass::AgentMessage));
         }
         UiBlock::QueuedMessage {
             text,
@@ -173,12 +174,19 @@ pub fn render_block(
             spans.extend(separator(prev, kind));
             if let Some(sender) = sender {
                 spans.push(Span::new(
-                    format!("from {sender}\n"),
+                    format!("from {}\n", agent_label(*sender)),
                     StyleClass::SystemInfo,
                 ));
             }
             gutter_span = Some(spans.len());
-            spans.push(Span::new(text.clone(), StyleClass::UserMessage));
+            spans.push(Span::new(
+                text.clone(),
+                if sender.is_some() {
+                    StyleClass::AgentMessage
+                } else {
+                    StyleClass::UserMessage
+                },
+            ));
             let label = match delivery {
                 MessageDelivery::Immediate => None,
                 MessageDelivery::NextRequest => Some(" (steering)"),
