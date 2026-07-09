@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_sorts_above_pins_in_active_view() {
+    fn pinned_agents_stay_above_attention_bucket() {
         let quiet_pinned = agent(1, Status::Pinned, 10);
         let urgent = agent(2, Status::Normal, 10);
         let topic = topic(Status::Normal, vec![quiet_pinned, urgent.clone()]);
@@ -245,8 +245,8 @@ mod tests {
         assert_eq!(
             visible,
             [
-                AgentId::from_counter(2, &AgentIdDomain(0)).unwrap(),
                 AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
+                AgentId::from_counter(2, &AgentIdDomain(0)).unwrap(),
             ]
         );
     }
@@ -313,8 +313,8 @@ fn new_agent_row(
         .child(div().text_color(text_color).child("new agent"))
 }
 
-/// Splits a topic's agents into the listed ones (rail sort: attention,
-/// pins, engagement) and the folded tail (filed away or stale; most
+/// Splits a topic's agents into the listed ones (rail sort: pins, active
+/// bucket, retained order) and the folded tail (filed away or stale; most
 /// recently touched first).
 fn split_agents<'a>(
     topic: &'a UiTopic,
@@ -324,11 +324,12 @@ fn split_agents<'a>(
         .agents
         .iter()
         .partition(|summary| !registry.agent_folded(summary.agent_id));
+    let top_bucket = registry.top_bucket(agents.iter().copied());
     agents.sort_by_key(|summary| {
         (
-            Reverse(registry.attention(summary.agent_id)),
             summary.status != Status::Pinned,
-            Reverse(registry.rail_seq(summary.agent_id)),
+            !top_bucket.contains(&summary.agent_id),
+            registry.rail_rank(summary.agent_id),
         )
     });
     folded.sort_by_key(|summary| Reverse(summary.updated_at));

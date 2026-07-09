@@ -6,7 +6,7 @@
 //! cycling operate over live agents only.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
 use rho_ui_proto::{AgentId, UiTopic};
@@ -34,13 +34,10 @@ pub struct AgentRegistry {
     /// Live attention overlay: broadcasts land here between topic refreshes,
     /// which re-seed it from the summaries' snapshot.
     attention: BTreeMap<AgentId, rho_ui_proto::UiAttention>,
-    /// Position within an attention group: an agent moves to the top of its
-    /// group when its attention level changes, and otherwise never moves.
-    /// Higher = more recently entered = nearer the top. Seeded on first
-    /// sight from the summaries' last-user-message time, so a fresh GUI
-    /// starts in engagement order.
-    rail_seq: BTreeMap<AgentId, u64>,
-    next_rail_seq: u64,
+    /// Retained top-to-bottom rail order. Bucket changes are applied with a
+    /// stable sort, so agents only move when their coarse rail bucket changes
+    /// or when they are first seen.
+    rail_order: Vec<AgentId>,
     /// When the user last engaged each agent: seeded from summaries, bumped
     /// locally on send. Drives display-time staleness (the "history" view).
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
@@ -86,41 +83,35 @@ impl AgentRegistry {
                     .entry(agent.agent_id)
                     .or_insert(rho_core::UnixMs(0));
                 *last_active = (*last_active).max(agent.last_active);
-                if !self.rail_seq.contains_key(&agent.agent_id) {
+                if !self.rail_order.contains(&agent.agent_id) {
                     unseen.push((agent.last_active, agent.agent_id));
                 }
             }
         }
-        // First-seen agents slot in by engagement recency; agents already
-        // placed keep their position (refreshes must not shuffle the rail).
-        unseen.sort();
-        for (_, agent_id) in unseen {
-            self.bump_rail_seq(agent_id);
-        }
+        // First-seen agents enter above the retained order, seeded by
+        // engagement recency; already-placed agents keep their relative
+        // position across refreshes.
+        unseen.sort_by_key(|(last_active, agent_id)| (Reverse(*last_active), *agent_id));
+        self.rail_order
+            .splice(0..0, unseen.into_iter().map(|(_, agent_id)| agent_id));
         self.topics = topics;
     }
 
     pub fn set_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
-        // Entering a new attention group puts the agent at the top of it;
-        // anything short of a level change never moves a row.
-        if self.attention(agent_id) != attention {
-            self.bump_rail_seq(agent_id);
-        }
         self.attention.insert(agent_id, attention);
-    }
-
-    fn bump_rail_seq(&mut self, agent_id: AgentId) {
-        self.next_rail_seq += 1;
-        self.rail_seq.insert(agent_id, self.next_rail_seq);
     }
 
     pub fn attention(&self, agent_id: AgentId) -> rho_ui_proto::UiAttention {
         self.attention.get(&agent_id).copied().unwrap_or_default()
     }
 
-    /// Sort position within an attention group; see [`Self::rail_seq`].
-    pub fn rail_seq(&self, agent_id: AgentId) -> u64 {
-        self.rail_seq.get(&agent_id).copied().unwrap_or(0)
+    /// Retained top-to-bottom position used as the stable tie-break inside
+    /// rail buckets.
+    pub fn rail_rank(&self, agent_id: AgentId) -> usize {
+        self.rail_order
+            .iter()
+            .position(|id| *id == agent_id)
+            .unwrap_or(usize::MAX)
     }
 
     /// The user engaged this agent right now (sent it a message).
@@ -315,8 +306,8 @@ impl AgentRegistry {
     }
 
     /// All agents in rail display order: pinned topics first, and within a
-    /// topic attention-first, then pins, then newest. Agents known outside
-    /// any topic summary trail at the end.
+    /// topic pinned agents first, then the active bucket, then the retained
+    /// order. Agents known outside any topic summary trail at the end.
     fn rail_order(&self) -> Vec<AgentId> {
         let mut topics = self.topics.iter().collect::<Vec<_>>();
         topics.sort_by_key(|topic| topic.status != rho_ui_proto::Status::Pinned);
@@ -324,11 +315,12 @@ impl AgentRegistry {
         let mut candidates = Vec::new();
         for topic in topics {
             let mut agents = topic.agents.iter().collect::<Vec<_>>();
+            let top_bucket = self.top_bucket(agents.iter().copied());
             agents.sort_by_key(|agent| {
                 (
-                    Reverse(self.attention(agent.agent_id)),
                     agent.status != rho_ui_proto::Status::Pinned,
-                    Reverse(self.rail_seq(agent.agent_id)),
+                    !top_bucket.contains(&agent.agent_id),
+                    self.rail_rank(agent.agent_id),
                 )
             });
             candidates.extend(agents.into_iter().map(|agent| agent.agent_id));
@@ -339,6 +331,46 @@ impl AgentRegistry {
             }
         }
         candidates
+    }
+
+    pub fn top_bucket<'a>(
+        &self,
+        agents: impl IntoIterator<Item = &'a rho_ui_proto::UiAgentSummary>,
+    ) -> BTreeSet<AgentId> {
+        let mut normal = agents
+            .into_iter()
+            .filter(|agent| agent.status != rho_ui_proto::Status::Pinned)
+            .collect::<Vec<_>>();
+        let colored_count = normal
+            .iter()
+            .filter(|agent| self.attention(agent.agent_id) != rho_ui_proto::UiAttention::Quiet)
+            .count();
+        let recent_quiet_slots = 5usize.saturating_sub(colored_count);
+        let mut top = normal
+            .iter()
+            .filter(|agent| self.attention(agent.agent_id) != rho_ui_proto::UiAttention::Quiet)
+            .map(|agent| agent.agent_id)
+            .collect::<BTreeSet<_>>();
+
+        normal.sort_by_key(|agent| {
+            (
+                Reverse(
+                    self.last_active
+                        .get(&agent.agent_id)
+                        .copied()
+                        .unwrap_or(agent.last_active),
+                ),
+                agent.agent_id,
+            )
+        });
+        top.extend(
+            normal
+                .into_iter()
+                .filter(|agent| self.attention(agent.agent_id) == rho_ui_proto::UiAttention::Quiet)
+                .take(recent_quiet_slots)
+                .map(|agent| agent.agent_id),
+        );
+        top
     }
 
     /// Resolves an agent label (as produced by [`Self::agent_id_label`],
@@ -454,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_change_moves_agent_to_group_top_others_hold() {
+    fn attention_change_keeps_retained_order_inside_top_bucket() {
         use rho_ui_proto::UiAttention;
 
         let mut registry = AgentRegistry::default();
@@ -469,8 +501,9 @@ mod tests {
         registry.select_agent(agent_id(3));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
 
-        // Agent 1 works and settles back to Quiet: it re-entered the Quiet
-        // group, so it now leads it; 3 and 2 keep their relative order.
+        // Agent 1 works and settles back to Quiet. Since all three agents
+        // remain inside the top bucket, attention changes do not reshuffle
+        // their retained order.
         registry.set_attention(agent_id(1), UiAttention::Working);
         registry.set_attention(agent_id(1), UiAttention::Quiet);
         registry.select_agent(agent_id(1));
@@ -478,8 +511,38 @@ mod tests {
         registry.select_agent(agent_id(3));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
 
-        // A repeat of the same level is not a group entry: nothing moves.
+        // A repeat of the same level also leaves the retained order alone.
         registry.set_attention(agent_id(2), UiAttention::Quiet);
+        registry.select_agent(agent_id(1));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
+    }
+
+    #[test]
+    fn attention_moves_agent_into_but_not_to_front_of_top_bucket() {
+        use rho_ui_proto::UiAttention;
+
+        let mut registry = AgentRegistry::default();
+        let agents = (1..=7)
+            .map(|id| agent(id, Status::Normal))
+            .collect::<Vec<_>>();
+        registry.set_topics(vec![topic(1, Status::Normal, agents)]);
+        for id in 1..=7 {
+            registry.mark_live(agent_id(id));
+        }
+
+        // Seeded by engagement recency: 7, 6, 5, 4, 3 are the quiet top
+        // bucket; 2 and 1 are below it.
+        registry.select_agent(agent_id(4));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
+        registry.select_agent(agent_id(3));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
+
+        // Coloring agent 1 admits it to the top bucket, but stable retained
+        // order keeps it behind the already-top agents instead of jumping to
+        // row one.
+        registry.set_attention(agent_id(1), UiAttention::Working);
+        registry.select_agent(agent_id(4));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
         registry.select_agent(agent_id(1));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
     }
@@ -549,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_outranks_pins_in_rail_order() {
+    fn pins_stay_above_attention_bucket_in_rail_order() {
         use rho_ui_proto::UiAttention;
 
         let mut registry = AgentRegistry::default();
