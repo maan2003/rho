@@ -7,7 +7,7 @@ use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
-pub use rho_inference::config::{DeepConfig, DeepEffort};
+pub use rho_inference::config::{DeepConfig, DeepEffort, DeepModel};
 use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
@@ -192,6 +192,11 @@ pub enum AgentMode {
     Deep(DeepConfig),
     Fable { effort: FableEffort },
     Opus { effort: OpusEffort },
+    // gpt-5.6 deep modes; appended after Deep so persisted modes keep
+    // decoding.
+    Sol(DeepConfig),
+    Luna(DeepConfig),
+    Terra(DeepConfig),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -213,8 +218,31 @@ impl AgentMode {
 
     pub fn deep_config(self) -> Option<DeepConfig> {
         match self {
-            Self::Deep(config) => Some(config),
+            Self::Deep(config) | Self::Sol(config) | Self::Luna(config) | Self::Terra(config) => {
+                Some(config)
+            }
             Self::Fable { .. } | Self::Opus { .. } => None,
+        }
+    }
+
+    pub fn deep_model(self) -> Option<DeepModel> {
+        match self {
+            Self::Deep(_) => Some(DeepModel::Gpt55),
+            Self::Sol(_) => Some(DeepModel::Gpt56Sol),
+            Self::Luna(_) => Some(DeepModel::Gpt56Luna),
+            Self::Terra(_) => Some(DeepModel::Gpt56Terra),
+            Self::Fable { .. } | Self::Opus { .. } => None,
+        }
+    }
+
+    /// Rebuild this mode around an updated deep config, preserving the model.
+    pub fn with_deep_config(self, config: DeepConfig) -> Self {
+        match self {
+            Self::Deep(_) => Self::Deep(config),
+            Self::Sol(_) => Self::Sol(config),
+            Self::Luna(_) => Self::Luna(config),
+            Self::Terra(_) => Self::Terra(config),
+            Self::Fable { .. } | Self::Opus { .. } => self,
         }
     }
 
@@ -222,7 +250,7 @@ impl AgentMode {
         match self {
             Self::Fable { .. } => Some(rho_claude::Model::Fable),
             Self::Opus { .. } => Some(rho_claude::Model::Opus),
-            Self::Deep(_) => None,
+            Self::Deep(_) | Self::Sol(_) | Self::Luna(_) | Self::Terra(_) => None,
         }
     }
 
@@ -230,7 +258,7 @@ impl AgentMode {
         match self {
             Self::Fable { effort } => Some(effort.to_claude_effort()),
             Self::Opus { effort } => Some(effort.to_claude_effort()),
-            Self::Deep(_) => None,
+            Self::Deep(_) | Self::Sol(_) | Self::Luna(_) | Self::Terra(_) => None,
         }
     }
 

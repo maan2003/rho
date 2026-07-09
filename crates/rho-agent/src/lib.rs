@@ -21,7 +21,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::db::{
     AgentEventPos, AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, DeepConfig,
-    UnixMillis,
+    DeepModel, UnixMillis,
 };
 use crate::multi_agent_tools::MultiAgentTools;
 
@@ -430,6 +430,7 @@ impl Agent {
         let config = mode
             .deep_config()
             .ok_or_else(|| anyhow::anyhow!("cannot create Rho runtime for Claude agent mode"))?;
+        let model = mode.deep_model().expect("deep config implies a deep model");
         // One transaction spans id allocation, the jj workspace creation
         // (the workspace is named after the id), and the record write:
         // failure anywhere drops the transaction, leaving nothing behind —
@@ -462,6 +463,7 @@ impl Agent {
             db,
             auth,
             config,
+            model,
             prompt_cache_key,
             agent_id,
             next_event,
@@ -492,12 +494,17 @@ impl Agent {
             .mode
             .deep_config()
             .expect("Rho runtime stored with non-Rho agent mode");
+        let model = record
+            .mode
+            .deep_model()
+            .expect("Rho runtime stored with non-Rho agent mode");
         // The record, not the caller, is the source of truth for the parent
         // edge of an existing agent.
         Self::new(
             db,
             auth,
             config,
+            model,
             prompt_cache_key,
             agent_id,
             next_event,
@@ -515,6 +522,7 @@ impl Agent {
         db: RhoDb,
         auth: InferenceAuth,
         config: DeepConfig,
+        model: DeepModel,
         prompt_cache_key: PromptCacheKey,
         agent_id: AgentId,
         next_event: AgentEventPos,
@@ -523,7 +531,7 @@ impl Agent {
         pool: std::sync::Weak<pool::AgentPool>,
         restored: RestoredAgent,
     ) -> Self {
-        let inference_session = InferenceSession::new_deep(auth, config, prompt_cache_key);
+        let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             Arc::clone(&workspace),
@@ -610,8 +618,10 @@ impl Agent {
         let _ = self.control.send(AgentControl::ContinueUnfinished);
     }
 
-    pub fn set_deep_config(&self, config: DeepConfig) {
-        let _ = self.control.send(AgentControl::SetDeepConfig(config));
+    pub fn set_deep_config(&self, config: DeepConfig, model: DeepModel) {
+        let _ = self
+            .control
+            .send(AgentControl::SetDeepConfig(config, model));
     }
 
     pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
@@ -698,7 +708,7 @@ enum AgentControl {
     Compact {
         delivery: MessageDelivery,
     },
-    SetDeepConfig(DeepConfig),
+    SetDeepConfig(DeepConfig, DeepModel),
     Rewind {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -862,8 +872,8 @@ impl AgentLoop {
                                 }
                             }
                         }
-                        AgentControl::SetDeepConfig(config) => {
-                            let _ = self.inference_session.set_deep_config(config);
+                        AgentControl::SetDeepConfig(config, model) => {
+                            let _ = self.inference_session.set_deep_config(config, model);
                         }
                         AgentControl::Rewind { turns, reply } => {
                             let result = if turns == 0 {

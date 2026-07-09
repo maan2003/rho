@@ -85,6 +85,8 @@ pub(crate) struct ResponsesRequest {
     pub context_management: Vec<ContextManagementRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_metadata: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -163,7 +165,7 @@ impl ResponsesRequest {
         }
         let timeline = trim_before_latest_compaction(&timeline);
 
-        let tools = request
+        let mut tools = request
             .tools
             .iter()
             .cloned()
@@ -174,12 +176,42 @@ impl ResponsesRequest {
             convert_timeline_item(item.clone(), &mut input);
         }
 
-        let tool_choice = (!tools.is_empty()).then_some("auto");
         let prompt_cache_key = session
             .prompt_cache_key
             .to_wire_uuid(&session.base_url, [0; 32]);
         let previous_response_id = previous_response.map(|(id, _)| id);
         let config = &session.responses_config;
+
+        // Responses Lite (gpt-5.6): tools and instructions are developer
+        // items at the head of the input instead of top-level fields. When
+        // continuing from a previous response the server already holds the
+        // prefix, so only fresh replays carry it.
+        let use_responses_lite = config.model.use_responses_lite();
+        let mut instructions = request.instructions;
+        let mut client_metadata = None;
+        if use_responses_lite {
+            if previous_response_id.is_none() {
+                let mut prefix = vec![serde_json::json!({
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": tools,
+                })];
+                if !instructions.is_empty() {
+                    prefix.push(serde_json::json!({
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{ "type": "input_text", "text": &*instructions }],
+                    }));
+                }
+                input.splice(0..0, prefix);
+            }
+            tools = Vec::new();
+            instructions = Arc::from("");
+            client_metadata = Some(serde_json::json!({
+                "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+            }));
+        }
+        let tool_choice = (!tools.is_empty()).then_some("auto");
         let context_management = config
             .auto_compaction
             .as_ref()
@@ -196,7 +228,7 @@ impl ResponsesRequest {
 
         Self {
             model: config.model.as_str().to_owned(),
-            instructions: request.instructions,
+            instructions,
             input,
             store: Some(false),
             tools,
@@ -228,6 +260,7 @@ impl ResponsesRequest {
             prompt_cache_key,
             context_management,
             previous_response_id,
+            client_metadata,
         }
     }
 }

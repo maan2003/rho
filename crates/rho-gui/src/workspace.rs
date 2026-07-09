@@ -983,7 +983,11 @@ impl Workspace {
             self.notice_on(None, no_target_message, StyleClass::SystemInfo, cx);
             return;
         };
-        let Some(AgentMode::Deep(mut config)) = self.registry.agent_mode(agent_id) else {
+        let Some((mode, mut config)) = self
+            .registry
+            .agent_mode(agent_id)
+            .and_then(|mode| Some((mode, mode.deep_config()?)))
+        else {
             self.notice_on(
                 Some(&agent_id),
                 "mode changes are only available for deep agents",
@@ -995,7 +999,7 @@ impl Workspace {
         update(&mut config);
         self.connection.send(ClientMessage::SetAgentMode {
             agent_id,
-            mode: AgentMode::Deep(config),
+            mode: mode.with_deep_config(config),
         });
     }
 
@@ -1019,9 +1023,12 @@ impl Workspace {
             return;
         };
         let mode = match mode {
-            AgentMode::Deep(mut config) => {
+            AgentMode::Deep(mut config)
+            | AgentMode::Sol(mut config)
+            | AgentMode::Luna(mut config)
+            | AgentMode::Terra(mut config) => {
                 config.effort = effort;
-                AgentMode::Deep(config)
+                mode.with_deep_config(config)
             }
             AgentMode::Fable { .. } | AgentMode::Opus { .. } => {
                 let effort = match effort {
@@ -1038,14 +1045,13 @@ impl Workspace {
                     DeepEffort::Xhigh => FableEffort::Xhigh,
                 };
                 match mode {
-                    AgentMode::Fable { .. } => AgentMode::Fable { effort },
                     AgentMode::Opus { .. } => AgentMode::Opus {
                         effort: match effort {
                             FableEffort::Medium => OpusEffort::Medium,
                             FableEffort::Xhigh => OpusEffort::Xhigh,
                         },
                     },
-                    AgentMode::Deep(_) => unreachable!(),
+                    _ => AgentMode::Fable { effort },
                 }
             }
         };
@@ -1468,24 +1474,32 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
     let effort = words.next().unwrap_or("medium").to_ascii_lowercase();
     if words.next().is_some() {
         return Err(
-            "mode must be `deep [low|medium|xhigh]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
+            "mode must be `deep|sol|luna|terra [low|medium|xhigh]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
                 .to_owned(),
         );
     }
     match kind.as_str() {
-        "deep" => Ok(AgentMode::Deep(DeepConfig {
-            effort: match effort.as_str() {
-                "low" => DeepEffort::Low,
-                "medium" => DeepEffort::Medium,
-                "xhigh" => DeepEffort::Xhigh,
-                _ => {
-                    return Err(format!(
-                        "unknown deep effort `{effort}`; use low, medium, or xhigh"
-                    ));
-                }
-            },
-            fast_mode: true,
-        })),
+        "deep" | "sol" | "luna" | "terra" => {
+            let config = DeepConfig {
+                effort: match effort.as_str() {
+                    "low" => DeepEffort::Low,
+                    "medium" => DeepEffort::Medium,
+                    "xhigh" => DeepEffort::Xhigh,
+                    _ => {
+                        return Err(format!(
+                            "unknown {kind} effort `{effort}`; use low, medium, or xhigh"
+                        ));
+                    }
+                },
+                fast_mode: true,
+            };
+            Ok(match kind.as_str() {
+                "sol" => AgentMode::Sol(config),
+                "luna" => AgentMode::Luna(config),
+                "terra" => AgentMode::Terra(config),
+                _ => AgentMode::Deep(config),
+            })
+        }
         "fable" => Ok(AgentMode::Fable {
             effort: match effort.as_str() {
                 "medium" => FableEffort::Medium,
@@ -1508,7 +1522,9 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
                 }
             },
         }),
-        _ => Err(format!("unknown mode `{kind}`; use deep, fable, or opus")),
+        _ => Err(format!(
+            "unknown mode `{kind}`; use deep, sol, luna, terra, fable, or opus"
+        )),
     }
 }
 
@@ -1525,7 +1541,22 @@ fn cycle_agent_mode_text(current: &str) -> &'static str {
         AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Xhigh,
             ..
+        }) => "sol medium",
+        AgentMode::Sol(DeepConfig {
+            effort: DeepEffort::Xhigh,
+            ..
+        }) => "luna medium",
+        AgentMode::Sol(_) => "sol xhigh",
+        AgentMode::Luna(DeepConfig {
+            effort: DeepEffort::Xhigh,
+            ..
+        }) => "terra medium",
+        AgentMode::Luna(_) => "luna xhigh",
+        AgentMode::Terra(DeepConfig {
+            effort: DeepEffort::Xhigh,
+            ..
         }) => "fable medium",
+        AgentMode::Terra(_) => "terra xhigh",
         AgentMode::Fable {
             effort: FableEffort::Medium,
         } => "fable xhigh",
@@ -1548,17 +1579,24 @@ struct ModeLabel {
 
 fn agent_mode_label(mode: AgentMode) -> ModeLabel {
     match mode {
-        AgentMode::Deep(config) => {
-            let effort = config.effort;
-            let fast_mode = config.fast_mode;
-            let effort = match effort {
+        AgentMode::Deep(config)
+        | AgentMode::Sol(config)
+        | AgentMode::Luna(config)
+        | AgentMode::Terra(config) => {
+            let name = match mode {
+                AgentMode::Sol(_) => "sol",
+                AgentMode::Luna(_) => "luna",
+                AgentMode::Terra(_) => "terra",
+                _ => "deep",
+            };
+            let effort = match config.effort {
                 DeepEffort::Low => "¹",
                 DeepEffort::Medium => "²",
                 DeepEffort::Xhigh => "³",
             };
-            let fast = if fast_mode { "⚡" } else { "" };
+            let fast = if config.fast_mode { "⚡" } else { "" };
             ModeLabel {
-                text: format!("deep{effort}{fast}"),
+                text: format!("{name}{effort}{fast}"),
                 family: ModeFamily::Deep,
             }
         }

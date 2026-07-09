@@ -25,7 +25,7 @@ use super::wire::{
 };
 use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
-use crate::config::{DeepConfig, DeepEffort};
+use crate::config::{DeepConfig, DeepEffort, DeepModel};
 
 fn first_assistant_message(
     items: &[InferenceResponseItem],
@@ -279,6 +279,7 @@ fn test_inference_service_with(
             effort: DeepEffort::Medium,
             fast_mode: false,
         },
+        DeepModel::Gpt55,
         prompt_cache_key,
     );
     session.responses_config = super::session::ResponsesConfig {

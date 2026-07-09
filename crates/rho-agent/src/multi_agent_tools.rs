@@ -147,11 +147,13 @@ fn spawn_agent_spec() -> ToolSpec {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["fable", "fable-xhigh", "gpt-5.5", "gpt-5.5-xhigh"],
+                    "enum": ["fable", "fable-xhigh", "gpt-5.5", "gpt-5.5-xhigh", "sol", "luna", "terra"],
                     "description": "Required child mode. Use \"fable\" for hard tasks that \
                                     require human-like judgement; use \"gpt-5.5\" for normal fast \
                                     coding/research sub-tasks. Use \"fable-xhigh\" or \
-                                    \"gpt-5.5-xhigh\" when the task needs extra reasoning."
+                                    \"gpt-5.5-xhigh\" when the task needs extra reasoning. \
+                                    \"sol\", \"luna\", and \"terra\" are the gpt-5.6 \
+                                    frontier agentic coding models."
                 }
             }
         }),
@@ -325,8 +327,21 @@ pub fn parse_spawn_mode(mode: &str) -> anyhow::Result<AgentMode> {
             effort: DeepEffort::Xhigh,
             fast_mode: true,
         })),
+        "sol" => Ok(AgentMode::Sol(DeepConfig {
+            effort: DeepEffort::Medium,
+            fast_mode: true,
+        })),
+        "luna" => Ok(AgentMode::Luna(DeepConfig {
+            effort: DeepEffort::Medium,
+            fast_mode: true,
+        })),
+        "terra" => Ok(AgentMode::Terra(DeepConfig {
+            effort: DeepEffort::Medium,
+            fast_mode: true,
+        })),
         _ => anyhow::bail!(
-            "unsupported mode {mode:?}; expected fable, fable-xhigh, gpt-5.5, or gpt-5.5-xhigh"
+            "unsupported mode {mode:?}; expected fable, fable-xhigh, gpt-5.5, gpt-5.5-xhigh, sol, \
+             luna, or terra"
         ),
     }
 }
@@ -460,6 +475,27 @@ mod tests {
             parse_spawn_mode("gpt-5.5-xhigh").unwrap(),
             AgentMode::Deep(DeepConfig {
                 effort: DeepEffort::Xhigh,
+                fast_mode: true
+            })
+        );
+        assert_eq!(
+            parse_spawn_mode("sol").unwrap(),
+            AgentMode::Sol(DeepConfig {
+                effort: DeepEffort::Medium,
+                fast_mode: true
+            })
+        );
+        assert_eq!(
+            parse_spawn_mode("luna").unwrap(),
+            AgentMode::Luna(DeepConfig {
+                effort: DeepEffort::Medium,
+                fast_mode: true
+            })
+        );
+        assert_eq!(
+            parse_spawn_mode("terra").unwrap(),
+            AgentMode::Terra(DeepConfig {
+                effort: DeepEffort::Medium,
                 fast_mode: true
             })
         );

@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, broadcast};
 use crate::claude::ClaudeAgent;
 use crate::db::{
     AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
-    AgentWriteTxnExt as _, DeepConfig, TopicId,
+    AgentWriteTxnExt as _, DeepConfig, DeepModel, TopicId,
 };
 use crate::{Agent, AgentState, MessageDelivery, StartWorkspace};
 
@@ -141,7 +141,7 @@ impl AgentPool {
         parent: Option<AgentId>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let (agent_id, agent) = match mode {
-            AgentMode::Deep(_) => {
+            AgentMode::Deep(_) | AgentMode::Sol(_) | AgentMode::Luna(_) | AgentMode::Terra(_) => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
                     self.auth.clone(),
@@ -432,10 +432,10 @@ impl RunningAgent {
         }
     }
 
-    pub fn set_deep_config(&self, config: DeepConfig) -> anyhow::Result<()> {
+    pub fn set_deep_config(&self, config: DeepConfig, model: DeepModel) -> anyhow::Result<()> {
         match self {
             Self::Rho(agent) => {
-                agent.set_deep_config(config);
+                agent.set_deep_config(config, model);
                 Ok(())
             }
             Self::Claude(_) => anyhow::bail!("cannot apply deep config to Claude agent"),

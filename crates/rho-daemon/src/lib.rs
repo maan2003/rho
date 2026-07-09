@@ -556,9 +556,16 @@ impl AgentRegistry {
     async fn set_agent_mode(&self, agent_id: AgentId, mode: AgentMode) -> anyhow::Result<()> {
         let record = self.db.read().get_agent(agent_id);
         match (record.runtime, mode) {
-            (AgentRuntime::Rho { .. }, AgentMode::Deep(config)) => {
+            (
+                AgentRuntime::Rho { .. },
+                AgentMode::Deep(config)
+                | AgentMode::Sol(config)
+                | AgentMode::Luna(config)
+                | AgentMode::Terra(config),
+            ) => {
+                let model = mode.deep_model().expect("deep mode has a model");
                 if let Some(agent) = self.get(agent_id).await {
-                    agent.set_deep_config(config)?;
+                    agent.set_deep_config(config, model)?;
                 }
                 let mut write = self.db.write().await;
                 write.set_agent_mode(rho_core::UnixMs::now(), agent_id, mode);
@@ -568,7 +575,10 @@ impl AgentRegistry {
             (AgentRuntime::Rho { .. }, AgentMode::Fable { .. } | AgentMode::Opus { .. }) => {
                 anyhow::bail!("cannot switch a Rho agent to a Claude runtime")
             }
-            (AgentRuntime::Claude { .. }, AgentMode::Deep(_)) => {
+            (
+                AgentRuntime::Claude { .. },
+                AgentMode::Deep(_) | AgentMode::Sol(_) | AgentMode::Luna(_) | AgentMode::Terra(_),
+            ) => {
                 anyhow::bail!("cannot switch a Claude agent to a Deep runtime")
             }
             (AgentRuntime::Claude { .. }, AgentMode::Fable { .. } | AgentMode::Opus { .. }) => {

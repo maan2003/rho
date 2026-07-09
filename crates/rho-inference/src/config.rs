@@ -10,6 +10,17 @@ pub enum DeepEffort {
     Xhigh,
 }
 
+/// Which Responses-API model a deep session talks to. Not part of
+/// [`DeepConfig`]: agent modes carry it separately, so persisted configs
+/// stay unchanged.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DeepModel {
+    Gpt55,
+    Gpt56Sol,
+    Gpt56Luna,
+    Gpt56Terra,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Encode, Serialize, Pack, Unpack)]
 pub struct DeepConfig {
     pub effort: DeepEffort,

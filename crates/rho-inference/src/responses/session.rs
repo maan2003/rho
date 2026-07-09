@@ -13,7 +13,7 @@ use super::DEFAULT_CHATGPT_BASE_URL;
 use super::oauth::InferenceAuth;
 use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{self, WebSocketConnection};
-use crate::config::{DeepConfig, DeepEffort};
+use crate::config::{DeepConfig, DeepEffort, DeepModel};
 
 #[derive(
     Clone, Copy, Debug, Decode, Encode, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
@@ -141,10 +141,13 @@ pub(crate) struct ResponsesConfig {
 }
 
 impl ResponsesConfig {
-    fn deep(config: DeepConfig) -> Self {
+    fn deep(config: DeepConfig, model: ResponsesModel) -> Self {
+        let context_window = model.context_window();
         Self {
-            model: ResponsesModel::Gpt55,
-            auto_compaction: Some(AutoCompaction::Threshold(272_000 * 95 / 100 * 90 / 100)),
+            model,
+            auto_compaction: Some(AutoCompaction::Threshold(
+                context_window * 95 / 100 * 90 / 100,
+            )),
             reasoning_context: ReasoningContext::AllTurns,
             effort: config.effort.into(),
             text_verbosity: TextVerbosity::Low,
@@ -171,18 +174,57 @@ impl ResponsesConfig {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ResponsesModel {
     Gpt55,
+    Gpt56Sol,
+    Gpt56Luna,
+    Gpt56Terra,
     Gpt54Mini,
     #[cfg(test)]
     Test(String),
+}
+
+impl From<DeepModel> for ResponsesModel {
+    fn from(model: DeepModel) -> Self {
+        match model {
+            DeepModel::Gpt55 => Self::Gpt55,
+            DeepModel::Gpt56Sol => Self::Gpt56Sol,
+            DeepModel::Gpt56Luna => Self::Gpt56Luna,
+            DeepModel::Gpt56Terra => Self::Gpt56Terra,
+        }
+    }
 }
 
 impl ResponsesModel {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Gpt55 => "gpt-5.5",
+            Self::Gpt56Sol => "gpt-5.6-sol",
+            Self::Gpt56Luna => "gpt-5.6-luna",
+            Self::Gpt56Terra => "gpt-5.6-terra",
             Self::Gpt54Mini => "gpt-5.4-mini",
             #[cfg(test)]
             Self::Test(model) => model,
+        }
+    }
+
+    /// gpt-5.6 models use the Responses Lite wire shape: tools and base
+    /// instructions ride the input timeline as developer items instead of
+    /// top-level request fields, and the request is flagged via
+    /// `client_metadata`.
+    pub(crate) fn use_responses_lite(&self) -> bool {
+        match self {
+            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra => true,
+            Self::Gpt55 | Self::Gpt54Mini => false,
+            #[cfg(test)]
+            Self::Test(_) => false,
+        }
+    }
+
+    fn context_window(&self) -> u64 {
+        match self {
+            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra => 372_000,
+            Self::Gpt55 | Self::Gpt54Mini => 272_000,
+            #[cfg(test)]
+            Self::Test(_) => 272_000,
         }
     }
 }
@@ -232,6 +274,7 @@ impl InferenceSession {
     pub fn new_deep(
         auth: InferenceAuth,
         config: DeepConfig,
+        model: DeepModel,
         prompt_cache_key: PromptCacheKey,
     ) -> Self {
         Self {
@@ -241,7 +284,7 @@ impl InferenceSession {
             base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
             auth,
             mode: InferenceSessionMode::Deep(config),
-            responses_config: ResponsesConfig::deep(config),
+            responses_config: ResponsesConfig::deep(config, model.into()),
             prompt_cache_key,
             debug_counter: 0,
         }
@@ -261,11 +304,11 @@ impl InferenceSession {
         }
     }
 
-    pub fn set_deep_config(&mut self, config: DeepConfig) -> bool {
+    pub fn set_deep_config(&mut self, config: DeepConfig, model: DeepModel) -> bool {
         match &mut self.mode {
             InferenceSessionMode::Deep(current) => {
                 *current = config;
-                self.responses_config = ResponsesConfig::deep(config);
+                self.responses_config = ResponsesConfig::deep(config, model.into());
                 true
             }
             InferenceSessionMode::Title => false,

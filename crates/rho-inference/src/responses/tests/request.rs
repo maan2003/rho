@@ -170,6 +170,7 @@ fn serializes_configured_reasoning_context() {
             effort: DeepEffort::Medium,
             fast_mode: false,
         },
+        DeepModel::Gpt55,
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
     session.responses_config.model = ResponsesModel::Test("gpt-test".to_owned());
@@ -573,4 +574,83 @@ fn serializes_custom_tool_calls_and_results() {
     assert_eq!(json["input"][0]["input"], "*** Begin Patch\n*** End Patch");
     assert_eq!(json["input"][1]["type"], "custom_tool_call_output");
     assert_eq!(json["input"][1]["output"], "custom output");
+}
+
+#[test]
+fn responses_lite_moves_tools_and_instructions_into_input() {
+    let (_temp, auth) = test_oauth_file("token", None);
+    let mut session = InferenceSession::new_deep(
+        auth,
+        DeepConfig {
+            effort: DeepEffort::Medium,
+            fast_mode: false,
+        },
+        DeepModel::Gpt56Sol,
+        PromptCacheKey::from_bytes(*b"testkey0"),
+    );
+    session.responses_config.text_verbosity = TextVerbosity::Low;
+    let mut request = inference_request(
+        vec![user_block("hello")],
+        vec![ToolSpec {
+            name: tool_name("shell_run"),
+            tool_type: ToolType::Function,
+            description: "run shell".to_owned(),
+            input_schema: json!({"type": "object"}),
+            format: None,
+        }],
+    );
+    request.instructions = Arc::from("You are rho.");
+
+    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["model"], "gpt-5.6-sol");
+    assert_eq!(json["instructions"], "");
+    assert!(json.get("tools").is_none());
+    assert!(json.get("tool_choice").is_none());
+    assert_eq!(json["input"][0]["type"], "additional_tools");
+    assert_eq!(json["input"][0]["role"], "developer");
+    assert_eq!(json["input"][0]["tools"][0]["name"], "shell_run");
+    assert_eq!(json["input"][1]["type"], "message");
+    assert_eq!(json["input"][1]["role"], "developer");
+    assert_eq!(json["input"][1]["content"][0]["text"], "You are rho.");
+    assert_eq!(json["input"][2]["role"], "user");
+    assert_eq!(
+        json["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"],
+        "true"
+    );
+}
+
+#[test]
+fn responses_lite_previous_response_skips_developer_prefix() {
+    let (_temp, auth) = test_oauth_file("token", None);
+    let session = InferenceSession::new_deep(
+        auth,
+        DeepConfig {
+            effort: DeepEffort::Medium,
+            fast_mode: false,
+        },
+        DeepModel::Gpt56Sol,
+        PromptCacheKey::from_bytes(*b"testkey0"),
+    );
+    let mut request = inference_request(
+        vec![
+            user_block("first"),
+            inference_response(Some("resp_1"), vec![assistant_message("done")]),
+            user_block("second"),
+        ],
+        Vec::new(),
+    );
+    request.instructions = Arc::from("You are rho.");
+
+    let body = ResponsesRequest::from_inference_request(&session, request, Some("resp_1"));
+    let json = serde_json::to_value(body).unwrap();
+
+    assert_eq!(json["previous_response_id"], "resp_1");
+    assert_eq!(json["input"].as_array().unwrap().len(), 1);
+    assert_eq!(json["input"][0]["content"][0]["text"], "second");
+    assert_eq!(
+        json["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"],
+        "true"
+    );
 }

@@ -257,11 +257,18 @@ fn status_name(status: Status) -> &'static str {
 
 fn mode_name(mode: AgentMode) -> String {
     match mode {
-        AgentMode::Deep(config) => {
-            let effort = config.effort;
-            let fast_mode = config.fast_mode;
-            let fast = if fast_mode { " ⚡" } else { "" };
-            format!("deep{fast} {}", deep_effort_name(effort))
+        AgentMode::Deep(config)
+        | AgentMode::Sol(config)
+        | AgentMode::Luna(config)
+        | AgentMode::Terra(config) => {
+            let name = match mode {
+                AgentMode::Sol(_) => "sol",
+                AgentMode::Luna(_) => "luna",
+                AgentMode::Terra(_) => "terra",
+                _ => "deep",
+            };
+            let fast = if config.fast_mode { " ⚡" } else { "" };
+            format!("{name}{fast} {}", deep_effort_name(config.effort))
         }
         AgentMode::Fable { effort } => format!("fable {}", fable_effort_name(effort)),
         AgentMode::Opus { effort } => format!("opus {}", opus_effort_name(effort)),
