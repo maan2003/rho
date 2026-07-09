@@ -104,7 +104,7 @@ impl StyleClass {
             }
         };
         HighlightStyle {
-            color: Some(color.into()),
+            color: Some(color),
             font_weight: bold.then_some(FontWeight::BOLD),
             ..HighlightStyle::default()
         }
