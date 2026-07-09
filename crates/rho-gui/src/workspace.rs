@@ -21,6 +21,7 @@ use rho_ui_proto::{
 use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentView;
+use crate::chime::Chime;
 use crate::connection::{ConnEvent, Connection};
 use crate::draft_view::DraftView;
 use crate::registry::{ActivePane, AgentRegistry};
@@ -78,6 +79,8 @@ pub struct Workspace {
     voice_line: String,
     /// Recent spoken transcript lines for the current/last voice session.
     voice_transcript: Vec<VoiceTranscriptLine>,
+    /// Attention chime output; lazily opened on the first play.
+    chime: Chime,
     _event_task: Task<()>,
 }
 
@@ -127,6 +130,7 @@ impl Workspace {
             voice_state: None,
             voice_line: String::new(),
             voice_transcript: Vec::new(),
+            chime: Chime::default(),
             _event_task: event_task,
         };
         this.seed_draft(false, window, cx);
@@ -243,7 +247,17 @@ impl Workspace {
                 agent_id,
                 attention,
             } => {
+                // Chime on the rising edge into the user's court, like the
+                // lamp turning on — but not for the agent already on screen,
+                // whose turn end the user is watching anyway.
+                let before = self.registry.attention(agent_id);
                 self.registry.set_attention(agent_id, attention);
+                if attention >= rho_ui_proto::UiAttention::Pending
+                    && before < rho_ui_proto::UiAttention::Pending
+                    && self.registry.selected_agent() != Some(&agent_id)
+                {
+                    self.chime.play();
+                }
                 cx.notify();
             }
             ConnEvent::TurnCancelled => {
@@ -380,6 +394,9 @@ impl Workspace {
             content: vec![ContentPart::Text { text }],
             delivery: MessageDelivery::NextRequest,
         });
+        // Engagement bump: keeps display-time staleness correct between
+        // topic refreshes (the daemon persists the same timestamp).
+        self.registry.touch_agent(agent_id);
     }
 
     /// Submitting the compose surface creates the agent: the workdir field

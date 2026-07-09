@@ -42,6 +42,7 @@ rho-ui-proto.workspace = true
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = [
   "playback",
   "recording",
+  "wav",
 ] }
 rustc-hash = "2.1.0"
 search = { git = "https://github.com/maan2003/zed", branch = "rho" }

@@ -105,8 +105,10 @@ pub fn render_topic_rail(
         ))
 }
 
-/// Flips the rail between active and archived views; archived items are
-/// opened (and restored via `:agent archive` / `:topic archive`) from here.
+/// Flips the rail between the active and history views. History holds
+/// manually archived items (restored via `:agent archive` / `:topic
+/// archive`) and agents idle past the staleness window, which come back on
+/// their own when engaged again.
 fn show_archived_row(
     show_archived: bool,
     text_style: &TextStyle,
@@ -141,7 +143,7 @@ fn show_archived_row(
         .child(div().text_color(text_color).child(if show_archived {
             "back to active"
         } else {
-            "view archived"
+            "view history"
         }))
 }
 
@@ -152,6 +154,8 @@ mod tests {
 
     use super::*;
 
+    /// Freshly-engaged fixture (`last_active` at now + `id`), so nothing
+    /// is display-stale unless a test backdates it.
     fn agent(id: u64, status: Status, updated_at: u64) -> UiAgentSummary {
         UiAgentSummary {
             agent_id: AgentId::from_counter(id, &AgentIdDomain(0)).unwrap(),
@@ -164,7 +168,7 @@ mod tests {
             },
             status,
             attention: UiAttention::Quiet,
-            last_active: UnixMs(0),
+            last_active: UnixMs(crate::workspace::now_ms() + id),
         }
     }
 
@@ -175,6 +179,34 @@ mod tests {
             status,
             agents,
         }
+    }
+
+    #[test]
+    fn stale_agents_move_to_the_history_view() {
+        let mut idle = agent(1, Status::Normal, 10);
+        idle.last_active = UnixMs(0);
+        let fresh = agent(2, Status::Normal, 10);
+        let topic = topic(Status::Normal, vec![idle, fresh]);
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic.clone()]);
+
+        let active = visible_agents(&topic, &registry, false)
+            .into_iter()
+            .map(|summary| summary.agent_id)
+            .collect::<Vec<_>>();
+        let history = visible_agents(&topic, &registry, true)
+            .into_iter()
+            .map(|summary| summary.agent_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            active,
+            [AgentId::from_counter(2, &AgentIdDomain(0)).unwrap()]
+        );
+        assert_eq!(
+            history,
+            [AgentId::from_counter(1, &AgentIdDomain(0)).unwrap()]
+        );
     }
 
     #[test]
@@ -222,7 +254,7 @@ mod tests {
         let idle = agent(1, Status::Normal, 10);
         let pinned = agent(2, Status::Pinned, 10);
         let mut recent = agent(3, Status::Normal, 10);
-        recent.last_active = UnixMs(100);
+        recent.last_active = UnixMs(crate::workspace::now_ms() + 100);
         let topic = topic(Status::Normal, vec![idle, pinned, recent]);
 
         let mut registry = AgentRegistry::default();
@@ -278,9 +310,9 @@ fn new_agent_row(
         .child(div().text_color(text_color).child("new agent"))
 }
 
-/// Which of a topic's agents the current view mode shows. The archived view
-/// is the exact complement of the normal one: an agent is archived-visible
-/// when it is archived itself or its whole topic is.
+/// Which of a topic's agents the current view mode shows. The history view
+/// is the exact complement of the normal one: an agent is history-visible
+/// when it is archived (itself or its whole topic) or has gone stale.
 fn visible_agents<'a>(
     topic: &'a UiTopic,
     registry: &AgentRegistry,
@@ -290,7 +322,9 @@ fn visible_agents<'a>(
         .agents
         .iter()
         .filter(|summary| {
-            let hidden = summary.status == Status::Archived || topic.status == Status::Archived;
+            let hidden = summary.status == Status::Archived
+                || topic.status == Status::Archived
+                || registry.agent_stale(summary.agent_id);
             hidden == show_archived
         })
         .collect::<Vec<_>>();

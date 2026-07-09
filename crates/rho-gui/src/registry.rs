@@ -41,6 +41,9 @@ pub struct AgentRegistry {
     /// starts in engagement order.
     rail_seq: BTreeMap<AgentId, u64>,
     next_rail_seq: u64,
+    /// When the user last engaged each agent: seeded from summaries, bumped
+    /// locally on send. Drives display-time staleness (the "history" view).
+    last_active: BTreeMap<AgentId, rho_core::UnixMs>,
     topics: Vec<UiTopic>,
     active: ActivePane,
     /// The daemon database's machine seed, from `Ready`; kept for consumers
@@ -76,6 +79,13 @@ impl AgentRegistry {
                     .entry(agent.agent_id)
                     .or_insert(AgentLife::Known);
                 self.attention.insert(agent.agent_id, agent.attention);
+                // Keep the freshest engagement signal: a local send can be
+                // newer than the summary's persisted timestamp.
+                let last_active = self
+                    .last_active
+                    .entry(agent.agent_id)
+                    .or_insert(rho_core::UnixMs(0));
+                *last_active = (*last_active).max(agent.last_active);
                 if !self.rail_seq.contains_key(&agent.agent_id) {
                     unseen.push((agent.last_active, agent.agent_id));
                 }
@@ -111,6 +121,32 @@ impl AgentRegistry {
     /// Sort position within an attention group; see [`Self::rail_seq`].
     pub fn rail_seq(&self, agent_id: AgentId) -> u64 {
         self.rail_seq.get(&agent_id).copied().unwrap_or(0)
+    }
+
+    /// The user engaged this agent right now (sent it a message).
+    pub fn touch_agent(&mut self, agent_id: AgentId) {
+        self.last_active
+            .insert(agent_id, rho_core::UnixMs(crate::workspace::now_ms()));
+    }
+
+    /// Idle long enough that the rail files it under history instead of the
+    /// active list — display-time only, nothing is persisted. Working,
+    /// pinned, and currently-open agents are exempt: an agent you are using
+    /// must not vanish out from under you.
+    pub fn agent_stale(&self, agent_id: AgentId) -> bool {
+        const STALE_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
+        if self.attention(agent_id) == rho_ui_proto::UiAttention::Working
+            || self.agent_status(agent_id) == rho_ui_proto::Status::Pinned
+            || self.selected_agent() == Some(&agent_id)
+        {
+            return false;
+        }
+        let last_active = self
+            .last_active
+            .get(&agent_id)
+            .copied()
+            .unwrap_or(rho_core::UnixMs(0));
+        crate::workspace::now_ms().saturating_sub(last_active.0) > STALE_AFTER_MS
     }
 
     /// The rail-visible agent most in need of the user, excluding the one
@@ -247,16 +283,18 @@ impl AgentRegistry {
         self.active = ActivePane::Draft;
     }
 
-    /// Hidden from the rail: archived itself, or in an archived topic. Such
-    /// agents stay loadable by id but are skipped by cycling.
+    /// Hidden from the rail: archived itself, in an archived topic, or gone
+    /// stale. Such agents stay loadable by id but are skipped by cycling
+    /// and the attention jump.
     pub fn agent_hidden(&self, agent_id: AgentId) -> bool {
-        self.topics.iter().any(|topic| {
-            topic.agents.iter().any(|agent| {
-                agent.agent_id == agent_id
-                    && (agent.status == rho_ui_proto::Status::Archived
-                        || topic.status == rho_ui_proto::Status::Archived)
+        self.agent_stale(agent_id)
+            || self.topics.iter().any(|topic| {
+                topic.agents.iter().any(|agent| {
+                    agent.agent_id == agent_id
+                        && (agent.status == rho_ui_proto::Status::Archived
+                            || topic.status == rho_ui_proto::Status::Archived)
+                })
             })
-        })
     }
 
     /// Cycles through live, rail-visible agents by `delta`, starting from
@@ -351,6 +389,8 @@ mod tests {
         AgentId::from_counter(id, &AgentIdDomain(0)).unwrap()
     }
 
+    /// Freshly-engaged fixture: `last_active` anchors at now (offset by
+    /// `id` for deterministic seeding order) so nothing is display-stale.
     fn agent(id: u64, status: Status) -> UiAgentSummary {
         UiAgentSummary {
             agent_id: agent_id(id),
@@ -363,7 +403,7 @@ mod tests {
             },
             status,
             attention: rho_ui_proto::UiAttention::Quiet,
-            last_active: rho_core::UnixMs(0),
+            last_active: rho_core::UnixMs(crate::workspace::now_ms() + id),
         }
     }
 
@@ -404,7 +444,7 @@ mod tests {
     fn cycling_follows_active_rail_order() {
         let mut registry = AgentRegistry::default();
         let mut recent = agent(3, Status::Normal);
-        recent.last_active = rho_core::UnixMs(100);
+        recent.last_active = rho_core::UnixMs(crate::workspace::now_ms() + 100);
         registry.set_topics(vec![topic(
             1,
             Status::Normal,
@@ -430,11 +470,7 @@ mod tests {
 
         let mut registry = AgentRegistry::default();
         let agents = (1..=3)
-            .map(|id| {
-                let mut summary = agent(id, Status::Normal);
-                summary.last_active = rho_core::UnixMs(id);
-                summary
-            })
+            .map(|id| agent(id, Status::Normal))
             .collect::<Vec<_>>();
         registry.set_topics(vec![topic(1, Status::Normal, agents)]);
         for id in 1..=3 {
@@ -533,6 +569,29 @@ mod tests {
         registry.select_agent(agent_id(1));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
         assert_eq!(registry.next_live_agent(-1), Some(agent_id(2)));
+    }
+
+    #[test]
+    fn stale_agents_hide_until_engaged_again() {
+        let mut registry = AgentRegistry::default();
+        let mut idle = agent(1, Status::Normal);
+        idle.last_active = rho_core::UnixMs(0);
+        let mut idle_pinned = agent(2, Status::Pinned);
+        idle_pinned.last_active = rho_core::UnixMs(0);
+        registry.set_topics(vec![topic(
+            1,
+            Status::Normal,
+            vec![idle, idle_pinned, agent(3, Status::Normal)],
+        )]);
+
+        // A day without engagement files the agent under history; pins and
+        // fresh agents stay. Touching it (sending a message) revives it.
+        assert!(registry.agent_stale(agent_id(1)));
+        assert!(registry.agent_hidden(agent_id(1)));
+        assert!(!registry.agent_stale(agent_id(2)));
+        assert!(!registry.agent_stale(agent_id(3)));
+        registry.touch_agent(agent_id(1));
+        assert!(!registry.agent_stale(agent_id(1)));
     }
 
     #[test]
