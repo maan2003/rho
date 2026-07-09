@@ -72,6 +72,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     assert_eq!(json["input"][2]["type"], "function_call_output");
     assert_eq!(json["tools"][0]["name"], "shell_run");
     assert_eq!(json["tool_choice"], "auto");
+    assert!(json.get("parallel_tool_calls").is_none());
     assert_eq!(json["store"], false);
     assert_eq!(json["reasoning"]["effort"], "medium");
     assert_eq!(json["text"]["verbosity"], "medium");
@@ -608,6 +609,7 @@ fn responses_lite_moves_tools_and_instructions_into_input() {
     assert_eq!(json["instructions"], "");
     assert!(json.get("tools").is_none());
     assert!(json.get("tool_choice").is_none());
+    assert_eq!(json["parallel_tool_calls"], false);
     assert_eq!(json["input"][0]["type"], "additional_tools");
     assert_eq!(json["input"][0]["role"], "developer");
     assert_eq!(json["input"][0]["tools"][0]["name"], "shell_run");

@@ -73,6 +73,8 @@ pub(crate) struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningRequest>,
@@ -189,6 +191,7 @@ impl ResponsesRequest {
         let use_responses_lite = config.model.use_responses_lite();
         let mut instructions = request.instructions;
         let mut client_metadata = None;
+        let mut parallel_tool_calls = None;
         if use_responses_lite {
             if previous_response_id.is_none() {
                 let mut prefix = vec![serde_json::json!({
@@ -207,6 +210,8 @@ impl ResponsesRequest {
             }
             tools = Vec::new();
             instructions = Arc::from("");
+            // The lite flag rejects requests unless this is explicitly false.
+            parallel_tool_calls = Some(false);
             client_metadata = Some(serde_json::json!({
                 "ws_request_header_x_openai_internal_codex_responses_lite": "true",
             }));
@@ -261,6 +266,7 @@ impl ResponsesRequest {
             context_management,
             previous_response_id,
             client_metadata,
+            parallel_tool_calls,
         }
     }
 }

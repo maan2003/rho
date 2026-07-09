@@ -113,6 +113,7 @@ fn websocket_envelope_has_response_create_type() {
         context_management: Vec::new(),
         previous_response_id: None,
         client_metadata: None,
+        parallel_tool_calls: None,
     };
 
     let json = serde_json::to_value(WsResponseCreate {
