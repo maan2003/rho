@@ -26,6 +26,7 @@ use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use gpui::{App, AppContext as _, KeyBinding, WindowOptions, actions};
 use settings::SettingsStore;
+use tracing_subscriber::EnvFilter;
 
 use crate::workspace::{AttachTarget, Workspace};
 
@@ -58,10 +59,24 @@ struct Args {
 }
 
 fn main() {
+    init_tracing();
     if let Err(error) = run() {
         eprintln!("rho-gui: {error:#}");
         std::process::exit(1);
     }
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_log::LogTracer::init();
+    if let Err(error) = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init()
+    {
+        eprintln!("rho-gui: failed to initialize tracing: {error}");
+    }
+    tracing::info!("rho-gui tracing initialized");
 }
 
 fn run() -> Result<()> {
