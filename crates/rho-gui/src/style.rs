@@ -82,18 +82,18 @@ impl StyleClass {
         let colors = cx.theme().colors();
         let (color, bold) = match self {
             Self::Default => return HighlightStyle::default(),
-            Self::UserMessage => (colors.text_accent, false),
-            Self::SystemInfo => (colors.text_muted, false),
-            Self::SystemImportant => (colors.terminal_ansi_yellow, true),
-            Self::Disconnect => (colors.terminal_ansi_red, false),
-            Self::ToolName => (colors.terminal_ansi_yellow, false),
+            Self::UserMessage => (colors.text_accent.into(), false),
+            Self::SystemInfo => (colors.text_muted.into(), false),
+            Self::SystemImportant => (colors.terminal_ansi_yellow.into(), true),
+            Self::Disconnect => (colors.terminal_ansi_red.into(), false),
+            Self::ToolName => (colors.terminal_ansi_yellow.into(), false),
             Self::ToolShell | Self::ToolDetail => (hint_color(cx), false),
-            Self::StatusRunning => (colors.terminal_ansi_cyan, false),
-            Self::StatusOk => (colors.terminal_ansi_green, false),
-            Self::StatusError => (colors.terminal_ansi_red, false),
-            Self::StatusCancelled => (colors.terminal_ansi_yellow, false),
-            Self::Time => (colors.text_muted, false),
-            Self::AgentMessage => (colors.terminal_ansi_magenta, false),
+            Self::StatusRunning => (colors.terminal_ansi_cyan.into(), false),
+            Self::StatusOk => (colors.terminal_ansi_green.into(), false),
+            Self::StatusError => (colors.terminal_ansi_red.into(), false),
+            Self::StatusCancelled => (colors.terminal_ansi_yellow.into(), false),
+            Self::Time => (colors.text_muted.into(), false),
+            Self::AgentMessage => (colors.terminal_ansi_magenta.into(), false),
             Self::Syntax(id) => {
                 return cx
                     .theme()
@@ -104,7 +104,7 @@ impl StyleClass {
             }
         };
         HighlightStyle {
-            color: Some(color),
+            color: Some(color.into()),
             font_weight: bold.then_some(FontWeight::BOLD),
             ..HighlightStyle::default()
         }
@@ -116,23 +116,23 @@ pub fn hint_color(cx: &App) -> Hsla {
         .syntax()
         .style_for_name("hint")
         .and_then(|style| style.color)
-        .unwrap_or(cx.theme().status().hint)
+        .unwrap_or(cx.theme().status().hint.into())
 }
 
 pub fn user_prompt_gutter_color(cx: &App) -> Hsla {
-    cx.theme().colors().text_accent
+    cx.theme().colors().text_accent.into()
 }
 
 pub fn cwd_chip_style(cx: &App) -> HighlightStyle {
     HighlightStyle {
-        color: Some(cx.theme().colors().terminal_foreground),
+        color: Some(cx.theme().colors().terminal_foreground.into()),
         ..HighlightStyle::default()
     }
 }
 
 pub fn workspace_chip_style(cx: &App) -> HighlightStyle {
     HighlightStyle {
-        color: Some(cx.theme().colors().terminal_ansi_green),
+        color: Some(cx.theme().colors().terminal_ansi_green.into()),
         font_weight: Some(FontWeight::BOLD),
         ..HighlightStyle::default()
     }
@@ -140,7 +140,7 @@ pub fn workspace_chip_style(cx: &App) -> HighlightStyle {
 
 pub fn context_chip_style(cx: &App) -> HighlightStyle {
     HighlightStyle {
-        color: Some(cx.theme().colors().text_muted),
+        color: Some(cx.theme().colors().text_muted.into()),
         ..HighlightStyle::default()
     }
 }
@@ -153,7 +153,7 @@ pub fn mode_chip_style(family: ModeFamily, cx: &App) -> HighlightStyle {
         ModeFamily::Opus => colors.terminal_ansi_yellow,
     };
     HighlightStyle {
-        color: Some(color),
+        color: Some(color.into()),
         font_weight: Some(FontWeight::BOLD),
         ..HighlightStyle::default()
     }

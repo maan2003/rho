@@ -30,12 +30,12 @@ pub fn render_topic_rail(
     let (selected_color, border_color, lamps) = {
         let colors = cx.theme().colors();
         (
-            colors.terminal_ansi_magenta,
+            colors.terminal_ansi_magenta.into(),
             colors.border_variant.opacity(0.6),
             LampColors {
-                needs_input: colors.terminal_ansi_red,
-                pending: colors.terminal_ansi_yellow,
-                working: colors.terminal_ansi_cyan,
+                needs_input: colors.terminal_ansi_red.into(),
+                pending: colors.terminal_ansi_yellow.into(),
+                working: colors.terminal_ansi_cyan.into(),
             },
         )
     };
@@ -121,7 +121,7 @@ fn fold_row(
         .child(
             Icon::new(IconName::Archive)
                 .size(IconSize::XSmall)
-                .color(Color::Custom(text_style.color.opacity(0.5))),
+                .color(Color::Custom(text_style.color.opacity(0.5).into())),
         )
         .child(
             div()
@@ -308,7 +308,7 @@ fn new_agent_row(
         .child(
             Icon::new(IconName::Plus)
                 .size(IconSize::XSmall)
-                .color(Color::Custom(icon_color)),
+                .color(Color::Custom(icon_color.into())),
         )
         .child(div().text_color(text_color).child("new agent"))
 }
@@ -402,14 +402,14 @@ fn render_topic_rows<'a>(
                     this.child(
                         Icon::new(IconName::Pin)
                             .size(IconSize::XSmall)
-                            .color(Color::Custom(text_style.color.opacity(0.65))),
+                            .color(Color::Custom(text_style.color.opacity(0.65).into())),
                     )
                 })
                 .when_some(rollup, |this, lamp| {
                     this.child(
                         Icon::new(IconName::Circle)
                             .size(IconSize::XSmall)
-                            .color(Color::Custom(lamp)),
+                            .color(Color::Custom(lamp.into())),
                     )
                 }),
         )
@@ -463,7 +463,7 @@ fn render_topic_rows<'a>(
                         IconName::Circle
                     })
                     .size(IconSize::XSmall)
-                    .color(Color::Custom(icon_color)),
+                    .color(Color::Custom(icon_color.into())),
                 )
                 .child(
                     div()
