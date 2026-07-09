@@ -38,11 +38,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Pin/unpin the current agent",
     },
     CommandSpec {
-        name: "agent archive",
-        usage: ":agent archive",
-        description: "Archive/restore the current agent (hidden, not deleted)",
-    },
-    CommandSpec {
         name: "agent fast",
         usage: ":agent fast [on|off]",
         description: "Toggle or set fast mode for the current Deep agent",
@@ -71,11 +66,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "topic pin",
         usage: ":topic pin [name]",
         description: "Pin/unpin a topic (default: the current one)",
-    },
-    CommandSpec {
-        name: "topic archive",
-        usage: ":topic archive [name]",
-        description: "Archive/restore a topic (default: the current one)",
     },
     CommandSpec {
         name: "workdirs add",
@@ -114,8 +104,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "done",
-        usage: ":done",
-        description: "Mark the current agent's finished turn as handled",
+        usage: ":done [hide]",
+        description: "Mark the current agent's finished turn as handled; :done hide also folds it away",
     },
     CommandSpec {
         name: "snooze",
@@ -154,7 +144,6 @@ pub enum Command {
     },
     AgentCancel,
     AgentPin,
-    AgentArchive,
     AgentFast {
         enabled: Option<bool>,
     },
@@ -173,9 +162,6 @@ pub enum Command {
     TopicPin {
         name: Option<String>,
     },
-    TopicArchive {
-        name: Option<String>,
-    },
     WorkdirAdd {
         path: Option<Utf8PathBuf>,
         name: Option<String>,
@@ -189,7 +175,10 @@ pub enum Command {
     },
     Continue,
     Compact,
-    AgentDone,
+    AgentDone {
+        /// Also fold the agent away in the rail (`:done hide`).
+        hide: bool,
+    },
     AgentSnooze {
         duration_ms: u64,
     },
@@ -224,10 +213,9 @@ pub fn parse(line: &str) -> Option<Parsed> {
             },
             Some("cancel") => Parsed::Command(Command::AgentCancel),
             Some("pin") => Parsed::Command(Command::AgentPin),
-            Some("archive") => Parsed::Command(Command::AgentArchive),
             Some("fast") => parse_agent_fast(&mut tokens),
             Some("effort") => parse_agent_effort(&mut tokens),
-            _ => Parsed::Invalid(":agent new|rename|cancel|pin|archive|fast|effort".to_owned()),
+            _ => Parsed::Invalid(":agent new|rename|cancel|pin|fast|effort".to_owned()),
         },
         "topic" => match tokens.next() {
             Some("new") => match joined_name(rest) {
@@ -245,10 +233,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
             Some("pin") => Parsed::Command(Command::TopicPin {
                 name: joined_name(rest),
             }),
-            Some("archive") => Parsed::Command(Command::TopicArchive {
-                name: joined_name(rest),
-            }),
-            _ => Parsed::Invalid(":topic new|move|rename|pin|archive".to_owned()),
+            _ => Parsed::Invalid(":topic new|move|rename|pin".to_owned()),
         },
         "workdirs" => match tokens.next() {
             Some("add") => Parsed::Command(Command::WorkdirAdd {
@@ -268,7 +253,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
         "rewind" => parse_rewind(&mut tokens),
         "continue" => Parsed::Command(Command::Continue),
         "compact" => Parsed::Command(Command::Compact),
-        "done" => Parsed::Command(Command::AgentDone),
+        "done" => parse_done(&mut tokens),
         "snooze" => parse_snooze(&mut tokens),
         "quit" | "exit" => Parsed::Command(Command::Quit),
         "clear" => Parsed::Command(Command::Clear),
@@ -307,6 +292,14 @@ fn parse_agent_effort<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed 
     }
 }
 
+fn parse_done<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed {
+    match (tokens.next(), tokens.next()) {
+        (None, None) => Parsed::Command(Command::AgentDone { hide: false }),
+        (Some("hide"), None) => Parsed::Command(Command::AgentDone { hide: true }),
+        _ => Parsed::Invalid(":done [hide]".to_owned()),
+    }
+}
+
 fn parse_snooze<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed {
     match (tokens.next().and_then(parse_duration_ms), tokens.next()) {
         (Some(duration_ms), None) => Parsed::Command(Command::AgentSnooze { duration_ms }),
@@ -340,7 +333,7 @@ fn joined_name(rest: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Toggle semantics for pin/archive commands: applying the state an item is
+/// Toggle semantics for pin commands: applying the state an item is
 /// already in returns it to normal.
 pub fn toggle_status(current: Status, target: Status) -> Status {
     if current == target {
@@ -441,7 +434,7 @@ fn command_word_candidates(prefix_words: &[&str], partial: &str) -> Vec<Candidat
 
 fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> Vec<Candidate> {
     match command {
-        ["topic", "move"] | ["topic", "pin"] | ["topic", "archive"] => ctx
+        ["topic", "move"] | ["topic", "pin"] => ctx
             .topics
             .iter()
             .filter(|topic| fuzzy_contains(topic, partial))

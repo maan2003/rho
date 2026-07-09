@@ -30,12 +30,8 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// Keyed by the workdir's absolute path (UTF-8; paths are strings on disk
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
-/// Attention bookkeeping per agent: when it last finished a turn, whether
-/// that turn ended blocked on the user, and what the user did about it.
-/// Rows appear on an agent's first turn end; absence means "never finished
-/// a turn". Kept out of [`AgentRecord`] so the hot turn-end write never
-/// rewrites agent metadata.
-const CURRENT_AGENT_DB_FORMAT: &str = "4d91a2f7";
+
+const CURRENT_AGENT_DB_FORMAT: &str = "4b8a02c1";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -43,7 +39,11 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "4d91a2f7",
+    to: "4b8a02c1",
+    migrate: migrate_archived_status_to_hidden,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -81,13 +81,15 @@ pub struct WorkdirRecord {
     pub created_at: UnixMillis,
 }
 
-/// Pin/archive state, shared by topics and agents. Pinned items sort first
-/// in client rails; archived items are hidden (never deleted — the event
-/// history stays loadable).
+/// Pin state, shared by topics and agents. Pinned items sort first in
+/// client rails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Status {
     Normal,
     Pinned,
+    /// Legacy: replaced by [`AgentDisposition::Hidden`]. Kept only so
+    /// pre-migration rows decode; remove together with the 4d91a2f7
+    /// migration.
     Archived,
 }
 
@@ -106,6 +108,10 @@ pub enum AgentDisposition {
     /// Deferred: quiet until `until`, then pending again (the Slack-reminder
     /// move for "I'll get back to this").
     Snoozed { until: UnixMillis },
+    /// Done, and file it now: skips the rail's idle wait and folds the agent
+    /// immediately. Like every disposition it's a verdict on the last turn —
+    /// the next user message or turn end overwrites it.
+    Hidden,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -705,6 +711,55 @@ impl AgentWriteTxnExt for WriteTxn {
         agent.updated_at = now;
         agents.insert(&agent_id, SenValue::borrowed(&agent));
         AgentEventPos::root(lineage_id)
+    }
+}
+
+/// Archival became [`AgentDisposition::Hidden`]: rewrite archived agents —
+/// including those archived via their topic — as Normal + Hidden, so they
+/// land in the rail's folded section instead of a separate archived list.
+fn migrate_archived_status_to_hidden(write: &mut WriteTxn) {
+    let topics: Vec<(TopicId, TopicRecord)> = write
+        .open_table(TOPICS)
+        .iter()
+        .map(|(key, value)| (key.value(), value.value().into_owned()))
+        .collect();
+    let archived_topics: std::collections::HashSet<TopicId> = topics
+        .iter()
+        .filter(|(_, topic)| topic.status == Status::Archived)
+        .map(|(topic_id, _)| *topic_id)
+        .collect();
+    for (topic_id, mut topic) in topics {
+        if topic.status == Status::Archived {
+            topic.status = Status::Normal;
+            write
+                .open_table(TOPICS)
+                .insert(&topic_id, SenValue::borrowed(&topic));
+        }
+    }
+
+    let memberships: Vec<TopicAgentKey> = write
+        .open_table(TOPIC_AGENTS)
+        .iter()
+        .map(|(key, _)| key.value())
+        .collect();
+    let agents: Vec<(AgentId, AgentRecord)> = write
+        .open_table(AGENTS)
+        .iter()
+        .map(|(key, value)| (key.value(), value.value().into_owned()))
+        .collect();
+    for (agent_id, mut agent) in agents {
+        let in_archived_topic = memberships
+            .iter()
+            .any(|key| key.agent_id == agent_id && archived_topics.contains(&key.topic_id));
+        if agent.status == Status::Archived || in_archived_topic {
+            if agent.status == Status::Archived {
+                agent.status = Status::Normal;
+            }
+            agent.disposition = AgentDisposition::Hidden;
+            write
+                .open_table(AGENTS)
+                .insert(&agent_id, SenValue::borrowed(&agent));
+        }
     }
 }
 

@@ -222,7 +222,7 @@ impl AgentRegistry {
             voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events: broadcast::channel(1024).0,
         };
-        registry.pool.load_non_archived_agents().await;
+        registry.pool.load_non_hidden_agents().await;
         registry
     }
 
@@ -291,6 +291,7 @@ impl AgentRegistry {
                             status: agent.status,
                             attention: attention_level(kinds.get(&agent_id), agent.disposition),
                             last_active: agent.last_user_message.max(agent.created_at),
+                            hidden: agent.disposition == AgentDisposition::Hidden,
                         })
                         .collect(),
                 }
@@ -857,7 +858,7 @@ fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition)
     }
     let pending = match disposition {
         AgentDisposition::Pending => true,
-        AgentDisposition::Done => false,
+        AgentDisposition::Done | AgentDisposition::Hidden => false,
         // An expired snooze is pending again; the timer only exists to
         // broadcast that moment.
         AgentDisposition::Snoozed { until } => until <= rho_core::UnixMs::now(),
@@ -1097,7 +1098,13 @@ async fn handle_message(
             disposition,
         } => {
             agents.set_disposition(agent_id, disposition).await;
-            Ok(Refresh::None)
+            // Hidden changes what the rail folds, which clients read off
+            // summaries; attention alone travels on its own broadcast.
+            if disposition == AgentDisposition::Hidden {
+                Ok(Refresh::Ready)
+            } else {
+                Ok(Refresh::None)
+            }
         }
         ClientMessage::SetTopicStatus { topic_id, status } => {
             agents.set_topic_status(topic_id, status).await?;

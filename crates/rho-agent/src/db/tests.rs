@@ -319,7 +319,7 @@ async fn topic_and_agent_statuses_are_settable() {
     );
     write.set_topic_status(UnixMs(2), topic_id, Status::Pinned);
     write.set_topic_name(UnixMs(3), topic_id, "platform".to_owned());
-    write.set_agent_status(UnixMs(2), agent_id, Status::Archived);
+    write.set_agent_status(UnixMs(2), agent_id, Status::Pinned);
     write.set_agent_display_name(UnixMs(4), agent_id, "builder".to_owned());
     write.commit();
 
@@ -329,7 +329,7 @@ async fn topic_and_agent_statuses_are_settable() {
     assert_eq!(topic.status, Status::Pinned);
     assert_eq!(topic.updated_at, UnixMs(3));
     let agent = read.get_agent(agent_id);
-    assert_eq!(agent.status, Status::Archived);
+    assert_eq!(agent.status, Status::Pinned);
     assert_eq!(agent.display_name.as_deref(), Some("builder"));
     assert_eq!(agent.updated_at, UnixMs(4));
 }
@@ -390,4 +390,49 @@ async fn agent_ids_allocate_before_records_exist() {
     let read = db.read();
     assert_eq!(read.get_agent(agent_id).workspace, test_workspace());
     assert_eq!(read.list_agents().len(), 1);
+}
+
+/// Remove together with `migrate_archived_status_to_hidden`.
+#[tokio::test]
+async fn migration_rewrites_archived_as_hidden() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let archived_topic = write.create_topic(UnixMs(1), "old".to_owned(), Status::Archived);
+    let live_topic = write.create_topic(UnixMs(1), "live".to_owned(), Status::Normal);
+    let mut agents = Vec::new();
+    for topic_id in [archived_topic, live_topic, live_topic] {
+        let agent_id = write.alloc_agent_id();
+        write.create_agent(
+            UnixMs(2),
+            agent_id,
+            topic_id,
+            None,
+            test_workspace(),
+            AgentMode::deep_default(),
+            test_agent_runtime(),
+            None,
+        );
+        agents.push(agent_id);
+    }
+    let [in_archived_topic, archived_agent, untouched] = agents[..] else {
+        unreachable!()
+    };
+    write.set_agent_status(UnixMs(3), archived_agent, Status::Archived);
+    super::migrate_archived_status_to_hidden(&mut write);
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.get_topic(archived_topic).status, Status::Normal);
+    for agent_id in [in_archived_topic, archived_agent] {
+        let agent = read.get_agent(agent_id);
+        assert_eq!(agent.status, Status::Normal);
+        assert_eq!(agent.disposition, AgentDisposition::Hidden);
+    }
+    assert_eq!(
+        read.get_agent(untouched).disposition,
+        AgentDisposition::Done
+    );
 }

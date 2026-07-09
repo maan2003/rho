@@ -129,17 +129,25 @@ impl AgentRegistry {
             .insert(agent_id, rho_core::UnixMs(crate::workspace::now_ms()));
     }
 
-    /// Idle long enough that the rail files it under history instead of the
-    /// active list — display-time only, nothing is persisted. Working,
-    /// pinned, and currently-open agents are exempt: an agent you are using
-    /// must not vanish out from under you.
-    pub fn agent_stale(&self, agent_id: AgentId) -> bool {
+    /// Folded under the topic's collapsed tail instead of listed — either
+    /// filed away by the user (`:done hide`) or idle for a day. Computed at
+    /// display time; nothing about staleness is persisted. Anything with
+    /// attention (working, pending, blocked), pinned, or currently open is
+    /// exempt: an agent that wants you or that you are using must not
+    /// vanish out from under you.
+    pub fn agent_folded(&self, agent_id: AgentId) -> bool {
         const STALE_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
-        if self.attention(agent_id) == rho_ui_proto::UiAttention::Working
+        if self.attention(agent_id) != rho_ui_proto::UiAttention::Quiet
             || self.agent_status(agent_id) == rho_ui_proto::Status::Pinned
             || self.selected_agent() == Some(&agent_id)
         {
             return false;
+        }
+        if self
+            .agent_summary(agent_id)
+            .is_some_and(|agent| agent.hidden)
+        {
+            return true;
         }
         let last_active = self
             .last_active
@@ -157,7 +165,7 @@ impl AgentRegistry {
         let selected = self.selected_agent().copied();
         self.rail_order()
             .into_iter()
-            .filter(|agent_id| Some(*agent_id) != selected && !self.agent_hidden(*agent_id))
+            .filter(|agent_id| Some(*agent_id) != selected && !self.agent_folded(*agent_id))
             .map(|agent_id| (agent_id, self.attention(agent_id)))
             .filter(|(_, attention)| *attention >= rho_ui_proto::UiAttention::Pending)
             .min_by_key(|(_, attention)| Reverse(*attention))
@@ -283,20 +291,6 @@ impl AgentRegistry {
         self.active = ActivePane::Draft;
     }
 
-    /// Hidden from the rail: archived itself, in an archived topic, or gone
-    /// stale. Such agents stay loadable by id but are skipped by cycling
-    /// and the attention jump.
-    pub fn agent_hidden(&self, agent_id: AgentId) -> bool {
-        self.agent_stale(agent_id)
-            || self.topics.iter().any(|topic| {
-                topic.agents.iter().any(|agent| {
-                    agent.agent_id == agent_id
-                        && (agent.status == rho_ui_proto::Status::Archived
-                            || topic.status == rho_ui_proto::Status::Archived)
-                })
-            })
-    }
-
     /// Cycles through live, rail-visible agents by `delta`, starting from
     /// the current selection. Cycling follows rail order (topics, then
     /// agents within each topic); agent id order is meaningless.
@@ -305,7 +299,7 @@ impl AgentRegistry {
             .rail_order()
             .into_iter()
             .filter(|agent_id| {
-                self.agents.get(agent_id) == Some(&AgentLife::Live) && !self.agent_hidden(*agent_id)
+                self.agents.get(agent_id) == Some(&AgentLife::Live) && !self.agent_folded(*agent_id)
             })
             .collect::<Vec<_>>();
         if live.is_empty() {
@@ -329,14 +323,7 @@ impl AgentRegistry {
 
         let mut candidates = Vec::new();
         for topic in topics {
-            if topic.status == rho_ui_proto::Status::Archived {
-                continue;
-            }
-            let mut agents = topic
-                .agents
-                .iter()
-                .filter(|agent| agent.status != rho_ui_proto::Status::Archived)
-                .collect::<Vec<_>>();
+            let mut agents = topic.agents.iter().collect::<Vec<_>>();
             agents.sort_by_key(|agent| {
                 (
                     Reverse(self.attention(agent.agent_id)),
@@ -404,6 +391,7 @@ mod tests {
             status,
             attention: rho_ui_proto::UiAttention::Quiet,
             last_active: rho_core::UnixMs(crate::workspace::now_ms() + id),
+            hidden: false,
         }
     }
 
@@ -428,6 +416,7 @@ mod tests {
             status: Status::Normal,
             attention: rho_ui_proto::UiAttention::Quiet,
             last_active: rho_core::UnixMs(0),
+            hidden: false,
         }
     }
 
@@ -496,16 +485,19 @@ mod tests {
     }
 
     #[test]
-    fn cycling_skips_archived_agents_and_archived_topics() {
+    fn cycling_and_attention_jump_skip_folded_agents() {
+        use rho_ui_proto::UiAttention;
+
         let mut registry = AgentRegistry::default();
-        registry.set_topics(vec![
-            topic(
-                1,
-                Status::Normal,
-                vec![agent(1, Status::Normal), agent(2, Status::Archived)],
-            ),
-            topic(2, Status::Archived, vec![agent(3, Status::Normal)]),
-        ]);
+        let mut filed = agent(2, Status::Normal);
+        filed.hidden = true;
+        let mut stale = agent(3, Status::Normal);
+        stale.last_active = rho_core::UnixMs(0);
+        registry.set_topics(vec![topic(
+            1,
+            Status::Normal,
+            vec![agent(1, Status::Normal), filed, stale],
+        )]);
         for id in 1..=3 {
             registry.mark_live(agent_id(id));
         }
@@ -513,11 +505,18 @@ mod tests {
         let visible = agent_id(1);
         registry.select_agent(visible);
         // Both forward and backward cycling only ever land on the one
-        // rail-visible agent.
+        // unfolded agent.
         assert_eq!(registry.next_live_agent(1), Some(visible));
         assert_eq!(registry.next_live_agent(-1), Some(visible));
-        assert!(registry.agent_hidden(agent_id(2)));
-        assert!(registry.agent_hidden(agent_id(3)));
+        assert!(registry.agent_folded(agent_id(2)));
+        assert!(registry.agent_folded(agent_id(3)));
+
+        // Attention unfolds a filed agent: it needs the user again, so it
+        // rejoins cycling and can win the jump.
+        registry.set_attention(agent_id(2), UiAttention::Pending);
+        assert!(!registry.agent_folded(agent_id(2)));
+        assert_eq!(registry.next_attention_agent(), Some(agent_id(2)));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
     }
 
     #[test]
@@ -572,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_agents_hide_until_engaged_again() {
+    fn stale_agents_fold_until_engaged_again() {
         let mut registry = AgentRegistry::default();
         let mut idle = agent(1, Status::Normal);
         idle.last_active = rho_core::UnixMs(0);
@@ -584,14 +583,13 @@ mod tests {
             vec![idle, idle_pinned, agent(3, Status::Normal)],
         )]);
 
-        // A day without engagement files the agent under history; pins and
-        // fresh agents stay. Touching it (sending a message) revives it.
-        assert!(registry.agent_stale(agent_id(1)));
-        assert!(registry.agent_hidden(agent_id(1)));
-        assert!(!registry.agent_stale(agent_id(2)));
-        assert!(!registry.agent_stale(agent_id(3)));
+        // A day without engagement folds the agent away; pins and fresh
+        // agents stay. Touching it (sending a message) revives it.
+        assert!(registry.agent_folded(agent_id(1)));
+        assert!(!registry.agent_folded(agent_id(2)));
+        assert!(!registry.agent_folded(agent_id(3)));
         registry.touch_agent(agent_id(1));
-        assert!(!registry.agent_stale(agent_id(1)));
+        assert!(!registry.agent_folded(agent_id(1)));
     }
 
     #[test]

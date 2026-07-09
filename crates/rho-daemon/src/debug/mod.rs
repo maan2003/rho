@@ -244,6 +244,7 @@ fn disposition_name(disposition: rho_agent::db::AgentDisposition) -> String {
         AgentDisposition::Pending => "pending".to_owned(),
         AgentDisposition::Done => "done".to_owned(),
         AgentDisposition::Snoozed { until } => format!("snoozed until {}", until.0),
+        AgentDisposition::Hidden => "hidden".to_owned(),
     }
 }
 

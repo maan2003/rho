@@ -150,19 +150,18 @@ fn parses_status_commands() {
         Some(Parsed::Command(Command::AgentPin))
     );
     assert_eq!(
-        parse(":agent archive"),
-        Some(Parsed::Command(Command::AgentArchive))
-    );
-    assert_eq!(
         parse(":topic pin"),
         Some(Parsed::Command(Command::TopicPin { name: None }))
     );
     assert_eq!(
-        parse(":topic archive old work"),
-        Some(Parsed::Command(Command::TopicArchive {
-            name: Some("old work".to_owned())
-        }))
+        parse(":done"),
+        Some(Parsed::Command(Command::AgentDone { hide: false }))
     );
+    assert_eq!(
+        parse(":done hide"),
+        Some(Parsed::Command(Command::AgentDone { hide: true }))
+    );
+    assert!(matches!(parse(":done later"), Some(Parsed::Invalid(_))));
 }
 
 #[test]
@@ -173,15 +172,6 @@ fn toggle_status_round_trips() {
     );
     assert_eq!(
         toggle_status(Status::Pinned, Status::Pinned),
-        Status::Normal
-    );
-    // Pinning an archived item surfaces it.
-    assert_eq!(
-        toggle_status(Status::Archived, Status::Pinned),
-        Status::Pinned
-    );
-    assert_eq!(
-        toggle_status(Status::Archived, Status::Archived),
         Status::Normal
     );
 }
@@ -227,13 +217,11 @@ fn completes_command_words_stepwise() {
     let second = completion_candidates(":agent ", &ctx);
     assert_eq!(
         values(&second),
-        [
-            "new", "cancel", "rename", "pin", "archive", "fast", "effort"
-        ]
+        ["new", "cancel", "rename", "pin", "fast", "effort"]
     );
 
-    let partial = completion_candidates(":agent ar", &ctx);
-    assert_eq!(values(&partial), ["archive"]);
+    let partial = completion_candidates(":agent re", &ctx);
+    assert_eq!(values(&partial), ["rename"]);
 }
 
 #[test]

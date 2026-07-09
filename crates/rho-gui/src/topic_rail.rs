@@ -3,16 +3,18 @@
 //! Topics are ad-hoc tab groups; every topic — including the daemon-created
 //! "default" one that agents are born into — renders uniformly with its
 //! name as the header, which advertises that grouping exists. Pinned topics
-//! and agents sort first; archived ones are hidden until the "archived"
-//! view mode flips the filter, showing exactly what the normal view hides.
-//! Clicking an agent opens it (loading archived agents on demand); the `+` row
-//! opens the draft compose view and doubles as its selection indicator.
+//! and agents sort first; folded agents (filed via `:done hide` or idle past
+//! the staleness window) collapse into a per-topic tail row that expands in
+//! place. Clicking an agent opens it (loading folded agents on demand); the
+//! `+` row opens the draft compose view and doubles as its selection
+//! indicator.
 
 use std::cmp::Reverse;
+use std::collections::HashSet;
 
 use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, TextStyle, div, px};
-use rho_ui_proto::{AgentId, Status, UiAgentSummary, UiAttention, UiTopic};
+use rho_ui_proto::{AgentId, Status, TopicId, UiAgentSummary, UiAttention, UiTopic};
 use theme::ActiveTheme as _;
 use ui::{Color, Icon, IconName, IconSize};
 
@@ -21,7 +23,7 @@ use crate::workspace::Workspace;
 
 pub fn render_topic_rail(
     registry: &AgentRegistry,
-    show_archived: bool,
+    expanded_folds: &HashSet<TopicId>,
     text_style: &TextStyle,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
@@ -39,22 +41,17 @@ pub fn render_topic_rail(
     };
     let selected_agent = registry.selected_agent().cloned();
 
-    let mut visible_topics = registry
-        .topics()
-        .iter()
-        .filter_map(|topic| {
-            let agents = visible_agents(topic, registry, show_archived);
-            (!agents.is_empty() || (topic.status == Status::Archived) == show_archived)
-                .then_some((topic, agents))
-        })
-        .collect::<Vec<_>>();
-    visible_topics.sort_by_key(|(topic, _)| topic.status != Status::Pinned);
+    let mut visible_topics = registry.topics().iter().collect::<Vec<_>>();
+    visible_topics.sort_by_key(|topic| topic.status != Status::Pinned);
     let rows = visible_topics
         .into_iter()
-        .map(|(topic, agents)| {
+        .map(|topic| {
+            let (agents, folded) = split_agents(topic, registry);
             render_topic_rows(
                 topic,
                 agents,
+                folded,
+                expanded_folds.contains(&topic.topic_id),
                 selected_agent.as_ref(),
                 registry,
                 text_style,
@@ -97,54 +94,44 @@ pub fn render_topic_rail(
             selected_color,
             cx,
         ))
-        .child(show_archived_row(
-            show_archived,
-            text_style,
-            selected_color,
-            cx,
-        ))
 }
 
-/// Flips the rail between the active and history views. History holds
-/// manually archived items (restored via `:agent archive` / `:topic
-/// archive`) and agents idle past the staleness window, which come back on
-/// their own when engaged again.
-fn show_archived_row(
-    show_archived: bool,
+/// The collapsed tail of a topic: click to expand the folded agents in
+/// place (and again to fold them back).
+fn fold_row(
+    topic_id: TopicId,
+    folded_count: usize,
+    expanded: bool,
     text_style: &TextStyle,
-    selected_color: gpui::Hsla,
     cx: &mut Context<Workspace>,
 ) -> Div {
-    let (text_color, icon_color) = if show_archived {
-        (selected_color, selected_color)
-    } else {
-        (text_style.color.opacity(0.8), text_style.color.opacity(0.5))
-    };
     div()
         .w_full()
         .flex()
         .items_center()
         .gap_1()
-        .pl(px(4.))
-        .pt(px(2.))
-        .pb(px(2.))
+        .pl(px(12.))
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|this, _, _window, cx| {
-                this.toggle_show_archived(cx);
+            cx.listener(move |this, _, _window, cx| {
+                this.toggle_topic_fold(topic_id, cx);
             }),
         )
         .child(
             Icon::new(IconName::Archive)
                 .size(IconSize::XSmall)
-                .color(Color::Custom(icon_color)),
+                .color(Color::Custom(text_style.color.opacity(0.5))),
         )
-        .child(div().text_color(text_color).child(if show_archived {
-            "back to active"
-        } else {
-            "view history"
-        }))
+        .child(
+            div()
+                .text_color(text_style.color.opacity(0.65))
+                .child(if expanded {
+                    "fold".to_owned()
+                } else {
+                    format!("{folded_count} older")
+                }),
+        )
 }
 
 #[cfg(test)]
@@ -169,6 +156,7 @@ mod tests {
             status,
             attention: UiAttention::Quiet,
             last_active: UnixMs(crate::workspace::now_ms() + id),
+            hidden: false,
         }
     }
 
@@ -182,19 +170,22 @@ mod tests {
     }
 
     #[test]
-    fn stale_agents_move_to_the_history_view() {
+    fn stale_and_hidden_agents_move_to_the_folded_tail() {
         let mut idle = agent(1, Status::Normal, 10);
         idle.last_active = UnixMs(0);
         let fresh = agent(2, Status::Normal, 10);
-        let topic = topic(Status::Normal, vec![idle, fresh]);
+        let mut filed = agent(3, Status::Normal, 10);
+        filed.hidden = true;
+        let topic = topic(Status::Normal, vec![idle, fresh, filed]);
         let mut registry = AgentRegistry::default();
         registry.set_topics(vec![topic.clone()]);
 
-        let active = visible_agents(&topic, &registry, false)
+        let (active, folded) = split_agents(&topic, &registry);
+        let active = active
             .into_iter()
             .map(|summary| summary.agent_id)
             .collect::<Vec<_>>();
-        let history = visible_agents(&topic, &registry, true)
+        let folded = folded
             .into_iter()
             .map(|summary| summary.agent_id)
             .collect::<Vec<_>>();
@@ -204,25 +195,35 @@ mod tests {
             [AgentId::from_counter(2, &AgentIdDomain(0)).unwrap()]
         );
         assert_eq!(
-            history,
-            [AgentId::from_counter(1, &AgentIdDomain(0)).unwrap()]
+            folded,
+            [
+                AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
+                AgentId::from_counter(3, &AgentIdDomain(0)).unwrap(),
+            ]
         );
     }
 
     #[test]
-    fn archived_agents_sort_by_updated_at_newest_first() {
-        let old = agent(1, Status::Archived, 10);
-        let new = agent(2, Status::Archived, 30);
-        let middle = agent(3, Status::Archived, 20);
-        let topic = topic(Status::Normal, vec![old, new, middle]);
+    fn folded_agents_sort_by_updated_at_newest_first() {
+        let mut summaries = vec![
+            agent(1, Status::Normal, 10),
+            agent(2, Status::Normal, 30),
+            agent(3, Status::Normal, 20),
+        ];
+        for summary in &mut summaries {
+            summary.hidden = true;
+        }
+        let topic = topic(Status::Normal, summaries);
 
-        let registry = AgentRegistry::default();
-        let visible = visible_agents(&topic, &registry, true)
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic.clone()]);
+        let (_, folded) = split_agents(&topic, &registry);
+        let folded = folded
             .into_iter()
             .map(|summary| summary.updated_at)
             .collect::<Vec<_>>();
 
-        assert_eq!(visible, [UnixMs(30), UnixMs(20), UnixMs(10)]);
+        assert_eq!(folded, [UnixMs(30), UnixMs(20), UnixMs(10)]);
     }
 
     #[test]
@@ -235,7 +236,8 @@ mod tests {
         registry.set_topics(vec![topic.clone()]);
         registry.set_attention(urgent.agent_id, UiAttention::NeedsInput);
 
-        let visible = visible_agents(&topic, &registry, false)
+        let visible = split_agents(&topic, &registry)
+            .0
             .into_iter()
             .map(|summary| summary.agent_id)
             .collect::<Vec<_>>();
@@ -259,7 +261,8 @@ mod tests {
 
         let mut registry = AgentRegistry::default();
         registry.set_topics(vec![topic.clone()]);
-        let visible = visible_agents(&topic, &registry, false)
+        let visible = split_agents(&topic, &registry)
+            .0
             .into_iter()
             .map(|summary| summary.agent_id)
             .collect::<Vec<_>>();
@@ -310,36 +313,26 @@ fn new_agent_row(
         .child(div().text_color(text_color).child("new agent"))
 }
 
-/// Which of a topic's agents the current view mode shows. The history view
-/// is the exact complement of the normal one: an agent is history-visible
-/// when it is archived (itself or its whole topic) or has gone stale.
-fn visible_agents<'a>(
+/// Splits a topic's agents into the listed ones (rail sort: attention,
+/// pins, engagement) and the folded tail (filed away or stale; most
+/// recently touched first).
+fn split_agents<'a>(
     topic: &'a UiTopic,
     registry: &AgentRegistry,
-    show_archived: bool,
-) -> Vec<&'a UiAgentSummary> {
-    let mut agents = topic
+) -> (Vec<&'a UiAgentSummary>, Vec<&'a UiAgentSummary>) {
+    let (mut agents, mut folded): (Vec<_>, Vec<_>) = topic
         .agents
         .iter()
-        .filter(|summary| {
-            let hidden = summary.status == Status::Archived
-                || topic.status == Status::Archived
-                || registry.agent_stale(summary.agent_id);
-            hidden == show_archived
-        })
-        .collect::<Vec<_>>();
-    if show_archived {
-        agents.sort_by_key(|summary| Reverse(summary.updated_at));
-    } else {
-        agents.sort_by_key(|summary| {
-            (
-                Reverse(registry.attention(summary.agent_id)),
-                summary.status != Status::Pinned,
-                Reverse(registry.rail_seq(summary.agent_id)),
-            )
-        });
-    }
-    agents
+        .partition(|summary| !registry.agent_folded(summary.agent_id));
+    agents.sort_by_key(|summary| {
+        (
+            Reverse(registry.attention(summary.agent_id)),
+            summary.status != Status::Pinned,
+            Reverse(registry.rail_seq(summary.agent_id)),
+        )
+    });
+    folded.sort_by_key(|summary| Reverse(summary.updated_at));
+    (agents, folded)
 }
 
 /// Lamp palette for attention levels; Quiet has no lamp.
@@ -362,9 +355,11 @@ impl LampColors {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_topic_rows(
+fn render_topic_rows<'a>(
     topic: &UiTopic,
-    agents: Vec<&UiAgentSummary>,
+    mut agents: Vec<&'a UiAgentSummary>,
+    folded: Vec<&'a UiAgentSummary>,
+    expanded: bool,
     selected_agent: Option<&AgentId>,
     registry: &AgentRegistry,
     text_style: &TextStyle,
@@ -373,6 +368,12 @@ fn render_topic_rows(
     cx: &mut Context<Workspace>,
 ) -> Div {
     let name = topic.name.clone();
+    let folded_count = folded.len();
+    if expanded {
+        agents.extend(folded);
+    }
+    let fold = (folded_count > 0)
+        .then(|| fold_row(topic.topic_id, folded_count, expanded, text_style, cx));
     // Roll the topic's most urgent agent up into the header, so a collapsed
     // or scrolled-away topic still shows that something inside wants the
     // user. Working alone doesn't qualify: the header lamp means "act here".
@@ -477,4 +478,5 @@ fn render_topic_rows(
                         .child(label),
                 )
         }))
+        .children(fold)
 }

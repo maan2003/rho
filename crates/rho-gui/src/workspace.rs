@@ -4,7 +4,7 @@
 //! All protocol events flow through [`Workspace::handle_event`]; views receive
 //! already-summarized state changes and never see the protocol.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -67,9 +67,9 @@ pub struct Workspace {
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
     awaiting_draft_agent: bool,
-    /// Rail view mode: browsing archived topics/agents instead of active
-    /// ones.
-    show_archived: bool,
+    /// Topics whose folded tail (filed / stale agents) is expanded in the
+    /// rail.
+    expanded_folds: HashSet<rho_ui_proto::TopicId>,
     connected: bool,
     duration_timer: Option<Task<()>>,
     /// Live audio devices while a voice session runs; `None` otherwise.
@@ -123,7 +123,7 @@ impl Workspace {
             draft_topic_id: None,
             default_topic_id: None,
             awaiting_draft_agent: false,
-            show_archived: false,
+            expanded_folds: HashSet::new(),
             connected: false,
             duration_timer: None,
             voice: None,
@@ -675,13 +675,19 @@ impl Workspace {
                 self.connection
                     .send(ClientMessage::RenameTopic { topic_id, name });
             }
-            Command::AgentDone => {
-                self.set_agent_disposition(
-                    source_agent,
-                    ":done",
-                    rho_ui_proto::AgentDisposition::Done,
-                    cx,
-                );
+            Command::AgentDone { hide } => {
+                let disposition = if hide {
+                    rho_ui_proto::AgentDisposition::Hidden
+                } else {
+                    rho_ui_proto::AgentDisposition::Done
+                };
+                let agent_id = self.set_agent_disposition(source_agent, ":done", disposition, cx);
+                // Hiding the open agent closes its tab, or it would stay
+                // rail-visible through the selection exemption.
+                if hide && agent_id.is_some() && agent_id.as_ref() == self.registry.selected_agent()
+                {
+                    self.select_agent(None, window, cx);
+                }
             }
             Command::AgentSnooze { duration_ms } => {
                 let until = rho_core::UnixMs(now_ms().saturating_add(duration_ms));
@@ -693,10 +699,7 @@ impl Workspace {
                 );
             }
             Command::AgentPin => {
-                self.toggle_agent_status(source_agent, rho_ui_proto::Status::Pinned, window, cx);
-            }
-            Command::AgentArchive => {
-                self.toggle_agent_status(source_agent, rho_ui_proto::Status::Archived, window, cx);
+                self.toggle_agent_status(source_agent, rho_ui_proto::Status::Pinned, cx);
             }
             Command::AgentFast { enabled } => {
                 self.update_deep_config(
@@ -713,9 +716,6 @@ impl Workspace {
             }
             Command::TopicPin { name } => {
                 self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
-            }
-            Command::TopicArchive { name } => {
-                self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Archived, cx);
             }
             Command::TopicMove { name } => {
                 let target = source_agent.or_else(|| self.registry.selected_agent().copied());
@@ -826,8 +826,10 @@ impl Workspace {
         }
     }
 
-    pub fn toggle_show_archived(&mut self, cx: &mut Context<Self>) {
-        self.show_archived = !self.show_archived;
+    pub fn toggle_topic_fold(&mut self, topic_id: rho_ui_proto::TopicId, cx: &mut Context<Self>) {
+        if !self.expanded_folds.remove(&topic_id) {
+            self.expanded_folds.insert(topic_id);
+        }
         cx.notify();
     }
 
@@ -840,13 +842,11 @@ impl Workspace {
         self.select_agent(Some(agent_id), window, cx);
     }
 
-    /// Pin/archive toggle for the addressed (else selected) agent. Archiving
-    /// the selected agent closes its tab: the view returns to the draft.
+    /// Pin toggle for the addressed (else selected) agent.
     fn toggle_agent_status(
         &mut self,
         source_agent: Option<AgentId>,
         target: rho_ui_proto::Status,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
@@ -857,33 +857,30 @@ impl Workspace {
         let status = rho_commands::toggle_status(self.registry.agent_status(agent_id), target);
         self.connection
             .send(ClientMessage::SetAgentStatus { agent_id, status });
-        if status == rho_ui_proto::Status::Archived
-            && self.registry.selected_agent() == Some(&agent_id)
-        {
-            self.select_agent(None, window, cx);
-        }
     }
 
-    /// Clears (or snoozes) an agent's claim on the user's attention. The
-    /// daemon echoes the resulting attention level back as a broadcast, so
-    /// the rail updates through the normal event path.
+    /// Clears (or snoozes, or files away) an agent's claim on the user's
+    /// attention; returns the agent it acted on. The daemon echoes the
+    /// resulting attention level back as a broadcast, so the rail updates
+    /// through the normal event path.
     fn set_agent_disposition(
         &mut self,
         source_agent: Option<AgentId>,
         command: &str,
         disposition: rho_ui_proto::AgentDisposition,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<AgentId> {
         let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
         else {
             let message = format!("{command}: no agent selected");
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-            return;
+            return None;
         };
         self.connection.send(ClientMessage::SetAgentDisposition {
             agent_id,
             disposition,
         });
+        Some(agent_id)
     }
 
     /// Jumps to the rail's most urgent agent (excluding the current one), so
@@ -901,8 +898,8 @@ impl Workspace {
         self.open_agent(agent_id, window, cx);
     }
 
-    /// Pin/archive toggle for a topic named by argument, defaulting to the
-    /// focused agent's topic (else the default topic).
+    /// Pin toggle for a topic named by argument, defaulting to the focused
+    /// agent's topic (else the default topic).
     fn toggle_topic_status(
         &mut self,
         source_agent: Option<AgentId>,
@@ -1067,19 +1064,10 @@ impl Workspace {
             .update(cx, |view, cx| view.seed(&label, force_header, window, cx));
     }
 
-    /// The topic a draft submission lands in: the inherited topic unless it
-    /// has since been archived (new agents must stay visible), else the
+    /// The topic a draft submission lands in: the inherited topic, else the
     /// default topic.
     fn draft_target_topic(&self) -> Option<rho_ui_proto::TopicId> {
-        self.draft_topic_id
-            .filter(|topic_id| !self.topic_archived(*topic_id))
-            .or(self.default_topic_id)
-    }
-
-    fn topic_archived(&self, topic_id: rho_ui_proto::TopicId) -> bool {
-        self.registry.topics().iter().any(|topic| {
-            topic.topic_id == topic_id && topic.status == rho_ui_proto::Status::Archived
-        })
+        self.draft_topic_id.or(self.default_topic_id)
     }
 
     /// Where a new agent works when the draft doesn't say: the target
@@ -1266,7 +1254,7 @@ impl Workspace {
         match action {
             VoiceUiAction::FocusAgent { agent_id } => self.open_agent(agent_id, window, cx),
             VoiceUiAction::ShowAgents => {
-                self.show_archived = false;
+                self.expanded_folds.clear();
                 self.enter_draft(None, window, cx);
             }
             VoiceUiAction::EnterNewAgentScreen => self.enter_draft(None, window, cx),
@@ -1603,7 +1591,7 @@ impl Render for Workspace {
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let rail = crate::topic_rail::render_topic_rail(
             &self.registry,
-            self.show_archived,
+            &self.expanded_folds,
             &text_style,
             cx,
         );
@@ -1670,8 +1658,22 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &AgentJumpAttention, window, cx| {
                 this.jump_to_attention(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &AgentDone, _window, cx| {
-                this.set_agent_disposition(None, ":done", rho_ui_proto::AgentDisposition::Done, cx);
+            .on_action(cx.listener(|this, _: &AgentDone, window, cx| {
+                // Escalating: a first press acknowledges the turn; pressing
+                // again on an already-quiet agent files it away.
+                let selected = this.registry.selected_agent().copied();
+                let quiet = selected.is_some_and(|agent_id| {
+                    this.registry.attention(agent_id) == rho_ui_proto::UiAttention::Quiet
+                });
+                let disposition = if quiet {
+                    rho_ui_proto::AgentDisposition::Hidden
+                } else {
+                    rho_ui_proto::AgentDisposition::Done
+                };
+                this.set_agent_disposition(None, ":done", disposition, cx);
+                if quiet {
+                    this.select_agent(None, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(

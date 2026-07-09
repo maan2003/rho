@@ -313,14 +313,11 @@ impl ChatApp {
             rho_commands::Command::AgentPin => {
                 self.toggle_agent_status(rho_ui_proto::Status::Pinned);
             }
-            rho_commands::Command::AgentArchive => {
-                self.toggle_agent_status(rho_ui_proto::Status::Archived);
-            }
             rho_commands::Command::AgentFast { .. } | rho_commands::Command::AgentEffort { .. } => {
                 self.term
                     .print_system("runtime mode changes are only available in rho-gui");
             }
-            rho_commands::Command::AgentDone | rho_commands::Command::AgentSnooze { .. } => {
+            rho_commands::Command::AgentDone { .. } | rho_commands::Command::AgentSnooze { .. } => {
                 // Attention triage lives in the GUI rail; the CLI fronts a
                 // single agent and has nothing to clear.
                 self.term
@@ -354,9 +351,6 @@ impl ChatApp {
             }
             rho_commands::Command::TopicPin { name } => {
                 self.toggle_topic_status(name, rho_ui_proto::Status::Pinned);
-            }
-            rho_commands::Command::TopicArchive { name } => {
-                self.toggle_topic_status(name, rho_ui_proto::Status::Archived);
             }
             rho_commands::Command::TopicMove { name } => {
                 let Some(agent_id) = primary_agent_id(&self.agent) else {

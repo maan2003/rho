@@ -401,6 +401,9 @@ pub struct UiAgentSummary {
     /// Recency tiebreak for rail sorting; clients keep it current from
     /// Working broadcasts.
     pub last_active: rho_core::UnixMs,
+    /// The user filed this agent away (`AgentDisposition::Hidden`): fold it
+    /// immediately instead of waiting out the rail's idle window.
+    pub hidden: bool,
 }
 
 /// How urgently an agent wants the user, in ascending order — the rail's

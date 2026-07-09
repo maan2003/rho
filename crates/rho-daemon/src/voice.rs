@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rho_agent::MessageDelivery;
-use rho_agent::db::{AgentId, AgentMode, DeepConfig, DeepEffort, Status};
+use rho_agent::db::{AgentDisposition, AgentId, AgentMode, DeepConfig, DeepEffort};
 use rho_core::{InferenceResponseItem, MessagePhase, text_content};
 use rho_ui_proto::{
     ClientMessage, ServerMessage, StartMode, TopicTarget, UiAgentSummary, VOICE_SAMPLE_RATE,
@@ -350,13 +350,11 @@ async fn execute_tool(
         VoiceToolCall::ArchiveAgent { agent } => match resolve(registry, focus, &agent) {
             Err(error) => error,
             Ok((agent_id, label)) => {
-                match registry.set_agent_status(agent_id, Status::Archived).await {
-                    Err(error) => format!("archive failed: {error:#}"),
-                    Ok(()) => {
-                        let _ = outgoing.send(registry.ready_message().await);
-                        format!("archived {label}; it is hidden, not deleted")
-                    }
-                }
+                registry
+                    .set_disposition(agent_id, AgentDisposition::Hidden)
+                    .await;
+                let _ = outgoing.send(registry.ready_message().await);
+                format!("filed {label} away; it is hidden, not deleted")
             }
         },
         VoiceToolCall::FocusAgent { agent } => match resolve(registry, focus, &agent) {
@@ -384,11 +382,8 @@ async fn execute_tool(
 async fn list_agents(registry: &Arc<AgentRegistry>, focus: &Option<AgentId>) -> String {
     let mut lines = Vec::new();
     for topic in registry.topics(&registry.agent_state_kinds().await) {
-        if topic.status == Status::Archived {
-            continue;
-        }
         for agent in &topic.agents {
-            if agent.status == Status::Archived {
+            if agent.hidden {
                 continue;
             }
             let activity = match registry.get(agent.agent_id).await {

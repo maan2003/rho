@@ -17,8 +17,8 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
 use crate::db::{
-    AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, DeepConfig,
-    Status, TopicId,
+    AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
+    AgentWriteTxnExt as _, DeepConfig, TopicId,
 };
 use crate::{Agent, AgentState, MessageDelivery, StartWorkspace};
 
@@ -98,8 +98,8 @@ impl AgentPool {
         agents
     }
 
-    pub async fn load_non_archived_agents(self: &Arc<Self>) {
-        let agent_ids = self.non_archived_agent_ids();
+    pub async fn load_non_hidden_agents(self: &Arc<Self>) {
+        let agent_ids = self.non_hidden_agent_ids();
         for agent_id in agent_ids {
             if let Err(error) = self.load(agent_id).await {
                 eprintln!("rho-agent: failed to load active agent {agent_id:?}: {error:#}");
@@ -107,13 +107,13 @@ impl AgentPool {
         }
     }
 
-    fn non_archived_agent_ids(&self) -> Vec<AgentId> {
-        let read = self.db.read();
-        read.list_topics()
+    fn non_hidden_agent_ids(&self) -> Vec<AgentId> {
+        self.db
+            .read()
+            .list_agents()
             .into_iter()
-            .filter(|(_, topic)| topic.status != Status::Archived)
-            .flat_map(|(topic_id, _)| read.list_topic_agents(topic_id))
-            .filter(|agent_id| read.get_agent(*agent_id).status != Status::Archived)
+            .filter(|(_, agent)| agent.disposition != AgentDisposition::Hidden)
+            .map(|(agent_id, _)| agent_id)
             .collect()
     }
 
@@ -237,7 +237,8 @@ impl AgentPool {
             .list_agents()
             .into_iter()
             .filter(|(_, record)| {
-                record.parent_agent == Some(parent) && record.status != Status::Archived
+                record.parent_agent == Some(parent)
+                    && record.disposition != AgentDisposition::Hidden
             })
             .count();
         if live_children >= MAX_LIVE_CHILDREN {

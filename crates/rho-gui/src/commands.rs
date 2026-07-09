@@ -297,9 +297,9 @@ mod tests {
         let candidates = completions_for(":", &[], &[], &[]);
         assert!(candidates.iter().any(|c| c.value == ":agent"));
         assert!(candidates.iter().any(|c| c.value == ":workdirs"));
-        let candidates = completions_for(":agent ar", &[], &[], &[]);
+        let candidates = completions_for(":agent re", &[], &[], &[]);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "archive");
+        assert_eq!(candidates[0].value, "rename");
     }
 
     #[test]
