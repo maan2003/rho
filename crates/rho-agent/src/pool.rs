@@ -243,7 +243,7 @@ impl AgentPool {
             .count();
         if live_children >= MAX_LIVE_CHILDREN {
             anyhow::bail!(
-                "live sub-agent limit ({MAX_LIVE_CHILDREN}) reached; archive or finish existing \
+                "live sub-agent limit ({MAX_LIVE_CHILDREN}) reached; hide or finish existing \
                  sub-agents first"
             );
         }

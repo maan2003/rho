@@ -252,7 +252,6 @@ fn status_name(status: Status) -> &'static str {
     match status {
         Status::Normal => "normal",
         Status::Pinned => "pinned",
-        Status::Archived => "archived",
     }
 }
 

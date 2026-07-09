@@ -406,7 +406,7 @@ impl ChatApp {
             .is_some_and(|handle| !handle.is_finished())
     }
 
-    /// Pin/archive toggles for the chat's agent.
+    /// Pin toggles for the chat's agent.
     fn toggle_agent_status(&mut self, target: rho_ui_proto::Status) {
         let Some(agent_id) = primary_agent_id(&self.agent) else {
             self.term.print_system("no agent yet");
@@ -426,7 +426,7 @@ impl ChatApp {
         self.agent.set_agent_status(agent_id, status);
     }
 
-    /// Pin/archive toggles for a topic named by argument, defaulting to the
+    /// Pin toggles for a topic named by argument, defaulting to the
     /// chat agent's own topic.
     fn toggle_topic_status(&mut self, name: Option<String>, target: rho_ui_proto::Status) {
         let topics = self.agent.topics();

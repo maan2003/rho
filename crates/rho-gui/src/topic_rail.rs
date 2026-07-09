@@ -3,8 +3,8 @@
 //! Topics are ad-hoc tab groups; every topic — including the daemon-created
 //! "default" one that agents are born into — renders uniformly with its
 //! name as the header, which advertises that grouping exists. Pinned topics
-//! and agents sort first; folded agents (filed via `:done hide` or idle past
-//! the staleness window) collapse into a per-topic tail row that expands in
+//! and agents sort first; folded agents (filed via `:done hide` or outside
+//! the active bucket) collapse into a per-topic tail row that expands in
 //! place. Clicking an agent opens it (loading folded agents on demand); the
 //! `+` row opens the draft compose view and doubles as its selection
 //! indicator.
@@ -129,7 +129,7 @@ fn fold_row(
                 .child(if expanded {
                     "fold".to_owned()
                 } else {
-                    format!("{folded_count} older")
+                    format!("{folded_count} more")
                 }),
         )
 }
@@ -141,8 +141,8 @@ mod tests {
 
     use super::*;
 
-    /// Freshly-engaged fixture (`last_active` at now + `id`), so nothing
-    /// is display-stale unless a test backdates it.
+    /// Freshly-engaged fixture (`last_active` at now + `id`) for deterministic
+    /// active-bucket ordering.
     fn agent(id: u64, status: Status, updated_at: u64) -> UiAgentSummary {
         UiAgentSummary {
             agent_id: AgentId::from_counter(id, &AgentIdDomain(0)).unwrap(),
@@ -170,13 +170,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_hidden_agents_move_to_the_folded_tail() {
-        let mut idle = agent(1, Status::Normal, 10);
-        idle.last_active = UnixMs(0);
+    fn hidden_and_inactive_bucket_agents_move_to_the_folded_tail() {
+        let inactive = agent(1, Status::Normal, 10);
         let fresh = agent(2, Status::Normal, 10);
         let mut filed = agent(3, Status::Normal, 10);
         filed.hidden = true;
-        let topic = topic(Status::Normal, vec![idle, fresh, filed]);
+        let mut summaries = vec![inactive, fresh, filed];
+        summaries.extend((4..=13).map(|id| agent(id, Status::Normal, 10)));
+        let topic = topic(Status::Normal, summaries);
         let mut registry = AgentRegistry::default();
         registry.set_topics(vec![topic.clone()]);
 
@@ -192,12 +193,17 @@ mod tests {
 
         assert_eq!(
             active,
-            [AgentId::from_counter(2, &AgentIdDomain(0)).unwrap()]
+            [13, 12, 11, 10, 9, 8, 7, 6, 5, 4].map(|id| AgentId::from_counter(
+                id,
+                &AgentIdDomain(0)
+            )
+            .unwrap())
         );
         assert_eq!(
             folded,
             [
                 AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
+                AgentId::from_counter(2, &AgentIdDomain(0)).unwrap(),
                 AgentId::from_counter(3, &AgentIdDomain(0)).unwrap(),
             ]
         );
@@ -314,7 +320,7 @@ fn new_agent_row(
 }
 
 /// Splits a topic's agents into the listed ones (rail sort: pins, active
-/// bucket, retained order) and the folded tail (filed away or stale; most
+/// bucket, retained order) and the folded tail (filed away or inactive; most
 /// recently touched first).
 fn split_agents<'a>(
     topic: &'a UiTopic,

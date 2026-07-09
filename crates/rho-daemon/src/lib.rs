@@ -654,11 +654,6 @@ impl AgentRegistry {
     }
 
     async fn set_topic_status(&self, topic_id: TopicId, status: Status) -> anyhow::Result<()> {
-        // New agents land in the default topic; archiving it would hide them
-        // as they are created.
-        if topic_id == self.default_topic_id && status == Status::Archived {
-            anyhow::bail!("cannot archive the default topic");
-        }
         let mut write = self.db.write().await;
         write.set_topic_status(rho_core::UnixMs::now(), topic_id, status);
         write.commit();

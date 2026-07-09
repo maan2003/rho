@@ -39,7 +39,7 @@ pub struct AgentRegistry {
     /// or when they are first seen.
     rail_order: Vec<AgentId>,
     /// When the user last engaged each agent: seeded from summaries, bumped
-    /// locally on send. Drives display-time staleness (the "history" view).
+    /// locally on send. Selects quiet agents for the active rail bucket.
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
     topics: Vec<UiTopic>,
     active: ActivePane,
@@ -120,32 +120,36 @@ impl AgentRegistry {
             .insert(agent_id, rho_core::UnixMs(crate::workspace::now_ms()));
     }
 
-    /// Folded under the topic's collapsed tail instead of listed — either
-    /// filed away by the user (`:done hide`) or idle for a day. Computed at
-    /// display time; nothing about staleness is persisted. Anything with
-    /// attention (working, pending, blocked), pinned, or currently open is
-    /// exempt: an agent that wants you or that you are using must not
-    /// vanish out from under you.
+    /// Folded under the topic's collapsed tail instead of listed. Explicitly
+    /// hidden agents always fold; otherwise the rail shows pinned agents, the
+    /// active bucket, five more agents from the quiet tail, and the current
+    /// selection.
     pub fn agent_folded(&self, agent_id: AgentId) -> bool {
-        const STALE_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
+        let Some(topic) = self
+            .topics
+            .iter()
+            .find(|topic| topic.agent_ids().any(|id| id == agent_id))
+        else {
+            return false;
+        };
+        if topic
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)
+            .is_some_and(|agent| agent.hidden)
+        {
+            return true;
+        }
         if self.attention(agent_id) != rho_ui_proto::UiAttention::Quiet
             || self.agent_status(agent_id) == rho_ui_proto::Status::Pinned
             || self.selected_agent() == Some(&agent_id)
         {
             return false;
         }
-        if self
-            .agent_summary(agent_id)
-            .is_some_and(|agent| agent.hidden)
-        {
-            return true;
-        }
-        let last_active = self
-            .last_active
-            .get(&agent_id)
-            .copied()
-            .unwrap_or(rho_core::UnixMs(0));
-        crate::workspace::now_ms().saturating_sub(last_active.0) > STALE_AFTER_MS
+        !self.top_bucket(topic.agents.iter()).contains(&agent_id)
+            && !self
+                .extra_bucket(topic.agents.iter(), 5)
+                .contains(&agent_id)
     }
 
     /// The rail-visible agent most in need of the user, excluding the one
@@ -211,7 +215,7 @@ impl AgentRegistry {
         self.agent_summary(agent_id).map(|agent| agent.mode)
     }
 
-    /// The pin/archive status of an agent, from topic summaries.
+    /// The pin status of an agent, from topic summaries.
     pub fn agent_status(&self, agent_id: AgentId) -> rho_ui_proto::Status {
         self.agent_summary(agent_id)
             .map(|agent| agent.status)
@@ -339,7 +343,7 @@ impl AgentRegistry {
     ) -> BTreeSet<AgentId> {
         let mut normal = agents
             .into_iter()
-            .filter(|agent| agent.status != rho_ui_proto::Status::Pinned)
+            .filter(|agent| agent.status != rho_ui_proto::Status::Pinned && !agent.hidden)
             .collect::<Vec<_>>();
         let colored_count = normal
             .iter()
@@ -371,6 +375,29 @@ impl AgentRegistry {
                 .map(|agent| agent.agent_id),
         );
         top
+    }
+
+    fn extra_bucket<'a>(
+        &self,
+        agents: impl IntoIterator<Item = &'a rho_ui_proto::UiAgentSummary>,
+        limit: usize,
+    ) -> BTreeSet<AgentId> {
+        let agents = agents.into_iter().collect::<Vec<_>>();
+        let top = self.top_bucket(agents.iter().copied());
+        let mut extra = agents
+            .into_iter()
+            .filter(|agent| {
+                agent.status != rho_ui_proto::Status::Pinned
+                    && !agent.hidden
+                    && !top.contains(&agent.agent_id)
+            })
+            .collect::<Vec<_>>();
+        extra.sort_by_key(|agent| self.rail_rank(agent.agent_id));
+        extra
+            .into_iter()
+            .take(limit)
+            .map(|agent| agent.agent_id)
+            .collect()
     }
 
     /// Resolves an agent label (as produced by [`Self::agent_id_label`],
@@ -409,7 +436,7 @@ mod tests {
     }
 
     /// Freshly-engaged fixture: `last_active` anchors at now (offset by
-    /// `id` for deterministic seeding order) so nothing is display-stale.
+    /// `id` for deterministic seeding order.
     fn agent(id: u64, status: Status) -> UiAgentSummary {
         UiAgentSummary {
             agent_id: agent_id(id),
@@ -531,7 +558,7 @@ mod tests {
         }
 
         // Seeded by engagement recency: 7, 6, 5, 4, 3 are the quiet top
-        // bucket; 2 and 1 are below it.
+        // bucket; 2 and 1 remain visible as the extra tail.
         registry.select_agent(agent_id(4));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
         registry.select_agent(agent_id(3));
@@ -554,32 +581,27 @@ mod tests {
         let mut registry = AgentRegistry::default();
         let mut filed = agent(2, Status::Normal);
         filed.hidden = true;
-        let mut stale = agent(3, Status::Normal);
-        stale.last_active = rho_core::UnixMs(0);
-        registry.set_topics(vec![topic(
-            1,
-            Status::Normal,
-            vec![agent(1, Status::Normal), filed, stale],
-        )]);
-        for id in 1..=3 {
+        let mut agents = (1..=13)
+            .map(|id| agent(id, Status::Normal))
+            .collect::<Vec<_>>();
+        agents[1] = filed;
+        registry.set_topics(vec![topic(1, Status::Normal, agents)]);
+        for id in 1..=13 {
             registry.mark_live(agent_id(id));
         }
 
-        let visible = agent_id(1);
-        registry.select_agent(visible);
-        // Both forward and backward cycling only ever land on the one
-        // unfolded agent.
-        assert_eq!(registry.next_live_agent(1), Some(visible));
-        assert_eq!(registry.next_live_agent(-1), Some(visible));
+        // Explicitly filed agents fold, and quiet agents outside the active
+        // bucket plus the five-agent tail fold automatically.
         assert!(registry.agent_folded(agent_id(2)));
-        assert!(registry.agent_folded(agent_id(3)));
+        assert!(registry.agent_folded(agent_id(1)));
 
-        // Attention unfolds a filed agent: it needs the user again, so it
+        // Attention unfolds an otherwise folded agent: it needs the user, so it
         // rejoins cycling and can win the jump.
-        registry.set_attention(agent_id(2), UiAttention::Pending);
-        assert!(!registry.agent_folded(agent_id(2)));
-        assert_eq!(registry.next_attention_agent(), Some(agent_id(2)));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
+        registry.select_agent(agent_id(10));
+        registry.set_attention(agent_id(1), UiAttention::Pending);
+        assert!(!registry.agent_folded(agent_id(1)));
+        assert_eq!(registry.next_attention_agent(), Some(agent_id(1)));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
     }
 
     #[test]
@@ -634,24 +656,25 @@ mod tests {
     }
 
     #[test]
-    fn stale_agents_fold_until_engaged_again() {
+    fn agents_outside_active_bucket_and_tail_fold_until_engaged_again() {
         let mut registry = AgentRegistry::default();
         let mut idle = agent(1, Status::Normal);
         idle.last_active = rho_core::UnixMs(0);
         let mut idle_pinned = agent(2, Status::Pinned);
         idle_pinned.last_active = rho_core::UnixMs(0);
-        registry.set_topics(vec![topic(
-            1,
-            Status::Normal,
-            vec![idle, idle_pinned, agent(3, Status::Normal)],
-        )]);
+        let mut agents = vec![idle, idle_pinned];
+        agents.extend((3..=13).map(|id| agent(id, Status::Normal)));
+        registry.set_topics(vec![topic(1, Status::Normal, agents)]);
 
-        // A day without engagement folds the agent away; pins and fresh
-        // agents stay. Touching it (sending a message) revives it.
+        // The quiet tail beyond the active bucket plus five more folds away;
+        // pins and active bucket agents stay. Fresh engagement revives it.
         assert!(registry.agent_folded(agent_id(1)));
         assert!(!registry.agent_folded(agent_id(2)));
-        assert!(!registry.agent_folded(agent_id(3)));
-        registry.touch_agent(agent_id(1));
+        assert!(!registry.agent_folded(agent_id(13)));
+        registry.last_active.insert(
+            agent_id(1),
+            rho_core::UnixMs(crate::workspace::now_ms() + 100),
+        );
         assert!(!registry.agent_folded(agent_id(1)));
     }
 

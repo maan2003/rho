@@ -116,8 +116,7 @@ pub enum ClientMessage {
         agent_id: AgentId,
         topic: TopicTarget,
     },
-    /// Pin or archive an agent (or return it to normal). Archiving hides;
-    /// it never deletes, and the agent stays loadable by id.
+    /// Pin an agent, or return it to normal.
     SetAgentStatus {
         agent_id: AgentId,
         status: Status,
@@ -132,7 +131,7 @@ pub enum ClientMessage {
     },
     /// The user's verdict on an agent's last finished turn. Attention is
     /// action-cleared: viewing an agent never clears it; `Done`, snoozing,
-    /// replying, landing, or archiving do.
+    /// replying, landing, or hiding do.
     SetAgentDisposition {
         agent_id: AgentId,
         disposition: AgentDisposition,
