@@ -1,0 +1,438 @@
+{
+  "$schema": "https://zed.dev/schema/themes/v0.2.0.json",
+  "author": "Maan2003, based on Monokai Spectrum",
+  "name": "Rho Monokai P3",
+  "themes": [
+    {
+      "appearance": "dark",
+      "name": "Rho Monokai P3",
+      "style": {
+        "accents": [
+          "oklch(70% 0.24 3 / 1)",
+          "oklch(75% 0.20 50 / 1)",
+          "oklch(91% 0.20 101 / 1)",
+          "oklch(79% 0.20 146 / 1)",
+          "oklch(80% 0.19 210 / 1)",
+          "oklch(69% 0.20 288 / 1)",
+          "oklch(72% 0.17 240 / 1)",
+          "oklch(73% 0.20 330 / 1)"
+        ],
+        "background": "oklch(25.2% 0.0000 0.0)",
+        "background.appearance": "opaque",
+        "surface.background": "oklch(21.3% 0.0000 0.0)",
+        "elevated_surface.background": "oklch(29.4% 0.0018 286.3)",
+        "toolbar.background": "oklch(21.3% 0.0000 0.0)",
+        "drop_target.background": "oklch(80.8% 0.1104 208.6 / 0.267)",
+        "border": "oklch(33.1% 0.0037 308.3)",
+        "border.variant": "oklch(29.4% 0.0018 286.3)",
+        "border.focused": "oklch(91% 0.20 101 / 1)",
+        "border.selected": "oklch(80% 0.19 210 / 1)",
+        "border.transparent": "oklch(0.0% 0.0000 0.0 / 0.000)",
+        "border.disabled": "oklch(29.4% 0.0018 286.3)",
+        "text": "oklch(79.2% 0.0000 0.0)",
+        "text.muted": "oklch(63.2% 0.0109 305.3)",
+        "text.placeholder": "oklch(51.7% 0.0081 304.1)",
+        "text.disabled": "oklch(45.6% 0.0054 314.8)",
+        "text.accent": "oklch(80% 0.19 210 / 1)",
+        "icon": "oklch(79.2% 0.0000 0.0)",
+        "icon.accent": "oklch(80% 0.19 210 / 1)",
+        "icon.muted": "oklch(63.2% 0.0109 305.3)",
+        "icon.disabled": "oklch(45.6% 0.0054 314.8)",
+        "icon.placeholder": "oklch(51.7% 0.0081 304.1)",
+        "element.background": "oklch(21.3% 0.0000 0.0)",
+        "element.hover": "oklch(29.4% 0.0018 286.3)",
+        "element.active": "oklch(33.1% 0.0037 308.3)",
+        "element.selected": "oklch(33.1% 0.0037 308.3)",
+        "element.disabled": "oklch(21.3% 0.0000 0.0)",
+        "ghost_element.background": "oklch(0.0% 0.0000 0.0 / 0.000)",
+        "ghost_element.hover": "oklch(29.4% 0.0018 286.3)",
+        "ghost_element.active": "oklch(33.1% 0.0037 308.3)",
+        "ghost_element.selected": "oklch(33.1% 0.0037 308.3)",
+        "ghost_element.disabled": "oklch(43.4% 0.0055 314.8)",
+        "editor.background": "oklch(21.3% 0.0000 0.0)",
+        "editor.foreground": "oklch(79.2% 0.0000 0.0)",
+        "editor.gutter.background": "oklch(21.3% 0.0000 0.0)",
+        "editor.subheader.background": "oklch(25.2% 0.0000 0.0)",
+        "editor.active_line.background": "oklch(33.1% 0.0037 308.3)",
+        "editor.highlighted_line.background": "oklch(29.4% 0.0018 286.3)",
+        "editor.line_number": "oklch(43.4% 0.0055 314.8)",
+        "editor.active_line_number": "oklch(63.2% 0.0109 305.3)",
+        "editor.invisible": "oklch(43.4% 0.0055 314.8)",
+        "editor.wrap_guide": "oklch(29.4% 0.0018 286.3)",
+        "editor.active_wrap_guide": "oklch(43.4% 0.0055 314.8)",
+        "editor.indent_guide": "oklch(43.4% 0.0055 314.8 / 0.400)",
+        "editor.indent_guide_active": "oklch(51.7% 0.0081 304.1)",
+        "editor.document_highlight.read_background": "oklch(33.1% 0.0037 308.3)",
+        "editor.document_highlight.write_background": "oklch(43.4% 0.0055 314.8 / 0.600)",
+        "editor.document_highlight.bracket_background": "oklch(91.7% 0.1476 99.1 / 0.200)",
+        "search.match_background": "oklch(33.1% 0.0037 308.3)",
+        "panel.background": "oklch(21.3% 0.0000 0.0)",
+        "panel.focused_border": "oklch(91% 0.20 101 / 1)",
+        "panel.indent_guide": "oklch(29.4% 0.0018 286.3)",
+        "panel.indent_guide_active": "oklch(91% 0.20 101 / 1)",
+        "panel.indent_guide_hover": "oklch(77.0% 0.0147 304.1)",
+        "pane.focused_border": "oklch(51.7% 0.0081 304.1)",
+        "pane_group.border": "oklch(29.4% 0.0018 286.3)",
+        "tab.active_background": "oklch(33.1% 0.0037 308.3)",
+        "tab.inactive_background": "oklch(21.3% 0.0000 0.0)",
+        "tab_bar.background": "oklch(21.3% 0.0000 0.0)",
+        "title_bar.background": "oklch(25.2% 0.0000 0.0)",
+        "title_bar.inactive_background": "oklch(21.3% 0.0000 0.0)",
+        "status_bar.background": "oklch(21.3% 0.0000 0.0)",
+        "link_text.hover": "oklch(80% 0.19 210 / 1)",
+        "scrollbar.thumb.background": "oklch(43.4% 0.0055 314.8 / 0.502)",
+        "scrollbar.thumb.hover_background": "oklch(51.7% 0.0081 304.1)",
+        "scrollbar.thumb.border": "oklch(33.1% 0.0037 308.3)",
+        "scrollbar.track.background": "oklch(0.0% 0.0000 0.0 / 0.000)",
+        "scrollbar.track.border": "oklch(21.3% 0.0000 0.0)",
+        "created": "oklch(79% 0.20 146 / 1)",
+        "created.background": "oklch(80.6% 0.1363 149.5 / 0.102)",
+        "created.border": "oklch(79% 0.20 146 / 1)",
+        "modified": "oklch(75% 0.20 50 / 1)",
+        "modified.background": "oklch(76.4% 0.1501 50.0 / 0.102)",
+        "modified.border": "oklch(75% 0.20 50 / 1)",
+        "deleted": "oklch(70% 0.24 3 / 1)",
+        "deleted.background": "oklch(70.3% 0.1915 6.0 / 0.102)",
+        "deleted.border": "oklch(70% 0.24 3 / 1)",
+        "conflict": "oklch(91% 0.20 101 / 1)",
+        "conflict.background": "oklch(91.7% 0.1476 99.1 / 0.102)",
+        "conflict.border": "oklch(91% 0.20 101 / 1)",
+        "ignored": "oklch(51.7% 0.0081 304.1)",
+        "ignored.background": "oklch(29.4% 0.0018 286.3 / 0.400)",
+        "ignored.border": "oklch(51.7% 0.0081 304.1)",
+        "renamed": "oklch(80% 0.19 210 / 1)",
+        "renamed.background": "oklch(80.8% 0.1104 208.6 / 0.102)",
+        "renamed.border": "oklch(80% 0.19 210 / 1)",
+        "hidden": "oklch(45.6% 0.0054 314.8)",
+        "hidden.background": "oklch(29.4% 0.0018 286.3 / 0.400)",
+        "hidden.border": "oklch(33.1% 0.0037 308.3)",
+        "error": "oklch(70% 0.24 3 / 1)",
+        "error.background": "oklch(70.3% 0.1915 6.0 / 0.102)",
+        "error.border": "oklch(70% 0.24 3 / 1)",
+        "warning": "oklch(75% 0.20 50 / 1)",
+        "warning.background": "oklch(76.4% 0.1501 50.0 / 0.102)",
+        "warning.border": "oklch(75% 0.20 50 / 1)",
+        "info": "oklch(80% 0.19 210 / 1)",
+        "info.background": "oklch(80.8% 0.1104 208.6 / 0.102)",
+        "info.border": "oklch(80% 0.19 210 / 1)",
+        "success": "oklch(79% 0.20 146 / 1)",
+        "success.background": "oklch(80.6% 0.1363 149.5 / 0.102)",
+        "success.border": "oklch(79% 0.20 146 / 1)",
+        "hint": "oklch(63.2% 0.0109 305.3)",
+        "hint.background": "oklch(80.8% 0.1104 208.6 / 0.102)",
+        "hint.border": "oklch(80.8% 0.1104 208.6 / 0.400)",
+        "unreachable": "oklch(69% 0.20 288 / 1)",
+        "unreachable.background": "oklch(67.9% 0.1294 287.6 / 0.102)",
+        "unreachable.border": "oklch(69% 0.20 288 / 1)",
+        "predictive": "oklch(51.7% 0.0081 304.1)",
+        "predictive.background": "oklch(29.4% 0.0018 286.3 / 0.400)",
+        "predictive.border": "oklch(51.7% 0.0081 304.1)",
+        "players": [
+          {
+            "cursor": "oklch(79.2% 0.0000 0.0)",
+            "background": "oklch(79.2% 0.0000 0.0)",
+            "selection": "oklch(79.2% 0.0000 0.0 / 0.251)"
+          },
+          {
+            "cursor": "oklch(70% 0.24 3 / 1)",
+            "background": "oklch(70% 0.24 3 / 1)",
+            "selection": "oklch(70.3% 0.1915 6.0 / 0.239)"
+          },
+          {
+            "cursor": "oklch(75% 0.20 50 / 1)",
+            "background": "oklch(75% 0.20 50 / 1)",
+            "selection": "oklch(76.4% 0.1501 50.0 / 0.239)"
+          },
+          {
+            "cursor": "oklch(69% 0.20 288 / 1)",
+            "background": "oklch(69% 0.20 288 / 1)",
+            "selection": "oklch(67.9% 0.1294 287.6 / 0.239)"
+          },
+          {
+            "cursor": "oklch(79% 0.20 146 / 1)",
+            "background": "oklch(79% 0.20 146 / 1)",
+            "selection": "oklch(80.6% 0.1363 149.5 / 0.239)"
+          },
+          {
+            "cursor": "oklch(91% 0.20 101 / 1)",
+            "background": "oklch(91% 0.20 101 / 1)",
+            "selection": "oklch(91.7% 0.1476 99.1 / 0.239)"
+          },
+          {
+            "cursor": "oklch(72% 0.17 240 / 1)",
+            "background": "oklch(72% 0.17 240 / 1)",
+            "selection": "oklch(71.2% 0.1011 238.3 / 0.239)"
+          },
+          {
+            "cursor": "oklch(73% 0.20 330 / 1)",
+            "background": "oklch(73% 0.20 330 / 1)",
+            "selection": "oklch(71.4% 0.1174 333.9 / 0.239)"
+          }
+        ],
+        "syntax": {
+          "comment": {
+            "color": "oklch(51.7% 0.0081 304.1)"
+          },
+          "comment.doc": {
+            "color": "oklch(51.7% 0.0081 304.1)"
+          },
+          "string": {
+            "color": "oklch(91% 0.20 101 / 1)"
+          },
+          "string.escape": {
+            "color": "oklch(75% 0.20 50 / 1)"
+          },
+          "string.regex": {
+            "color": "oklch(91% 0.20 101 / 1)"
+          },
+          "string.special": {
+            "color": "oklch(91% 0.20 101 / 1)"
+          },
+          "string.special.symbol": {
+            "color": "oklch(91% 0.20 101 / 1)"
+          },
+          "number": {
+            "color": "oklch(69% 0.20 288 / 1)"
+          },
+          "boolean": {
+            "color": "oklch(69% 0.20 288 / 1)"
+          },
+          "constant": {
+            "color": "oklch(69% 0.20 288 / 1)"
+          },
+          "constant.builtin": {
+            "color": "oklch(69% 0.20 288 / 1)"
+          },
+          "keyword": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "keyword.control": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "keyword.declaration": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "operator": {
+            "color": "oklch(70% 0.24 3 / 1)"
+          },
+          "preproc": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "type": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "type.unit": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "type.builtin": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "type.definition": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "type.interface": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "constructor": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "function": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "function.builtin": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "function.decorator": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "function.decorator.call": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "function.special": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "function.special.definition": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "tag": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "tag.doctype": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "attribute": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "property": {
+            "color": "oklch(79.2% 0.0000 0.0)"
+          },
+          "property.json_key": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "variable": {
+            "color": "oklch(79.2% 0.0000 0.0)"
+          },
+          "variable.special": {
+            "color": "oklch(69% 0.20 288 / 1)"
+          },
+          "variable.parameter": {
+            "color": "oklch(79.2% 0.0000 0.0)"
+          },
+          "label": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "lifetime": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "namespace": {
+            "color": "oklch(79.2% 0.0000 0.0)"
+          },
+          "enum": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "variant": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "punctuation": {
+            "color": "oklch(77.0% 0.0147 304.1)"
+          },
+          "punctuation.bracket": {
+            "color": "oklch(79.2% 0.0000 0.0)"
+          },
+          "punctuation.delimiter": {
+            "color": "oklch(79.2% 0.0000 0.0)"
+          },
+          "punctuation.special": {
+            "color": "oklch(70% 0.24 3 / 1)"
+          },
+          "embedded": {
+            "color": "oklch(79.2% 0.0000 0.0)"
+          },
+          "primary": {
+            "color": "oklch(79.2% 0.0000 0.0)"
+          },
+          "hint": {
+            "color": "oklch(63.2% 0.0109 305.3)"
+          },
+          "predictive": {
+            "color": "oklch(63.2% 0.0109 305.3)",
+            "font_style": "italic"
+          },
+          "selector.id": {
+            "color": "oklch(91% 0.20 101 / 1)"
+          },
+          "selector.class": {
+            "color": "oklch(91% 0.20 101 / 1)"
+          },
+          "selector.pseudo": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "title.markup": {
+            "color": "oklch(91% 0.20 101 / 1)",
+            "font_weight": 700
+          },
+          "emphasis.markup": {
+            "color": "oklch(80% 0.19 210 / 1)",
+            "font_style": "italic"
+          },
+          "emphasis.strong.markup": {
+            "color": "oklch(75% 0.20 50 / 1)",
+            "font_weight": 700
+          },
+          "text.literal": {
+            "color": "oklch(91% 0.20 101 / 1)"
+          },
+          "text.literal.markup": {
+            "color": "oklch(91% 0.20 101 / 1)"
+          },
+          "strikethrough.markup": {
+            "color": "oklch(51.7% 0.0081 304.1)"
+          },
+          "link_text.markup": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "link_uri.markup": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "punctuation.markup": {
+            "color": "oklch(70% 0.24 3 / 1)"
+          },
+          "punctuation.list_marker.markup": {
+            "color": "oklch(70% 0.24 3 / 1)"
+          },
+          "punctuation.embedded.markup": {
+            "color": "oklch(79.2% 0.0000 0.0)"
+          },
+          "diff.plus": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "diff.minus": {
+            "color": "oklch(70% 0.24 3 / 1)"
+          },
+          "emphasis": {
+            "color": "oklch(80% 0.19 210 / 1)",
+            "font_style": "italic"
+          },
+          "emphasis.strong": {
+            "color": "oklch(75% 0.20 50 / 1)",
+            "font_weight": 700
+          },
+          "link_text": {
+            "color": "oklch(80% 0.19 210 / 1)"
+          },
+          "link_uri": {
+            "color": "oklch(79% 0.20 146 / 1)"
+          },
+          "punctuation.list_marker": {
+            "color": "oklch(70% 0.24 3 / 1)"
+          },
+          "selector": {
+            "color": "oklch(91% 0.20 101 / 1)"
+          },
+          "title": {
+            "color": "oklch(70% 0.24 3 / 1)",
+            "font_weight": 400
+          }
+        },
+        "terminal.background": "oklch(21.3% 0.0000 0.0)",
+        "terminal.foreground": "oklch(79.2% 0.0000 0.0)",
+        "terminal.bright_foreground": "oklch(96.7% 0.0196 305.3)",
+        "terminal.dim_foreground": "oklch(51.7% 0.0081 304.1)",
+        "terminal.ansi.background": "oklch(21.3% 0.0000 0.0)",
+        "terminal.ansi.black": "oklch(21.3% 0.0000 0.0)",
+        "terminal.ansi.red": "oklch(67.3% 0.1400 13.8)",
+        "terminal.ansi.green": "oklch(65.6% 0.0768 130.6)",
+        "terminal.ansi.yellow": "oklch(64.5% 0.0806 45.4)",
+        "terminal.ansi.blue": "oklch(65.9% 0.0836 239.7)",
+        "terminal.ansi.magenta": "oklch(64.9% 0.0941 333.7)",
+        "terminal.ansi.cyan": "oklch(68.2% 0.0658 206.0)",
+        "terminal.ansi.white": "oklch(79.2% 0.0000 0.0)",
+        "terminal.ansi.bright_black": "oklch(34.6% 0.0072 3.7)",
+        "terminal.ansi.bright_red": "oklch(72.3% 0.1243 13.1)",
+        "terminal.ansi.bright_green": "oklch(70.8% 0.1034 130.3)",
+        "terminal.ansi.bright_yellow": "oklch(70.7% 0.1040 47.1)",
+        "terminal.ansi.bright_blue": "oklch(72% 0.17 240 / 1)",
+        "terminal.ansi.bright_magenta": "oklch(73% 0.20 330 / 1)",
+        "terminal.ansi.bright_cyan": "oklch(73.4% 0.0818 204.7)",
+        "terminal.ansi.bright_white": "oklch(96.7% 0.0196 305.3)",
+        "terminal.ansi.dim_black": "oklch(21.3% 0.0000 0.0 / 0.624)",
+        "terminal.ansi.dim_red": "oklch(67.3% 0.1400 13.8 / 0.624)",
+        "terminal.ansi.dim_green": "oklch(65.6% 0.0768 130.6 / 0.624)",
+        "terminal.ansi.dim_yellow": "oklch(64.5% 0.0806 45.4 / 0.624)",
+        "terminal.ansi.dim_blue": "oklch(65.9% 0.0836 239.7 / 0.624)",
+        "terminal.ansi.dim_magenta": "oklch(64.9% 0.0941 333.7 / 0.624)",
+        "terminal.ansi.dim_cyan": "oklch(68.2% 0.0658 206.0 / 0.624)",
+        "terminal.ansi.dim_white": "oklch(79.2% 0.0000 0.0 / 0.624)",
+        "editor.hover_line_number": "oklch(77.0% 0.0147 304.1)",
+        "search.active_match_background": "oklch(91.7% 0.1476 99.1 / 0.400)",
+        "version_control.added": "oklch(79% 0.20 146 / 1)",
+        "version_control.modified": "oklch(75% 0.20 50 / 1)",
+        "version_control.deleted": "oklch(70% 0.24 3 / 1)",
+        "version_control.word_added": "oklch(80.6% 0.1363 149.5 / 0.349)",
+        "version_control.word_deleted": "oklch(70.3% 0.1915 6.0 / 0.800)",
+        "version_control.conflict_marker.ours": "oklch(80.6% 0.1363 149.5 / 0.102)",
+        "version_control.conflict_marker.theirs": "oklch(80.8% 0.1104 208.6 / 0.102)"
+      }
+    }
+  ]
+}

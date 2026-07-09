@@ -10,6 +10,7 @@ mod editor_config;
 mod highlights;
 mod registry;
 mod render;
+mod rho_assets;
 mod store;
 mod style;
 #[cfg(test)]
@@ -28,6 +29,7 @@ use gpui::{App, AppContext as _, KeyBinding, WindowOptions, actions};
 use settings::SettingsStore;
 use tracing_subscriber::EnvFilter;
 
+use crate::rho_assets::RhoAssets;
 use crate::workspace::{AttachTarget, Workspace};
 
 // Keep the `rho_gui` action namespace: the bundled keymaps bind these under
@@ -82,7 +84,7 @@ fn run() -> Result<()> {
     let attach_target = attach_target_from_args(Args::parse())?;
 
     gpui_platform::application()
-        .with_assets(assets::Assets)
+        .with_assets(RhoAssets)
         .run(move |cx: &mut App| {
             if let Err(error) = init_app(cx) {
                 eprintln!("rho-gui: {error:#}");
@@ -113,7 +115,7 @@ fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
 
 fn init_app(cx: &mut App) -> Result<()> {
     gpui_tokio::init(cx);
-    assets::Assets.load_fonts(cx)?;
+    RhoAssets.load_fonts(cx)?;
     let settings_path = settings_path()?;
     let user_settings = load_or_create_settings(&settings_path)?;
     let mut store = SettingsStore::new(cx, settings::default_settings().as_ref());
@@ -122,7 +124,7 @@ fn init_app(cx: &mut App) -> Result<()> {
         .result()
         .with_context(|| format!("failed to load settings from {}", settings_path.display()))?;
     cx.set_global(store);
-    theme_settings::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
+    theme_settings::init(theme::LoadThemes::All(Box::new(RhoAssets)), cx);
     release_channel::init(semver::Version::new(0, 1, 0), cx);
     editor::init(cx);
     command_palette::init(cx);
@@ -167,7 +169,9 @@ fn bind_rho_key_overrides(cx: &mut App) {
 }
 
 const DEFAULT_SETTINGS: &str = r#"// Rho GUI user settings. Values here override bundled defaults.
-{}
+{
+  "theme": "Rho Monokai P3"
+}
 "#;
 
 fn settings_path() -> Result<PathBuf> {
