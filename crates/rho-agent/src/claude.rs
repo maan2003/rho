@@ -347,6 +347,18 @@ impl ClaudeLoop {
                         Ok(None) => {
                             self.process = None;
                             self.remove_claude_runtime_files();
+                            // An exit without a result leaves the turn open;
+                            // settle it as an error so the turn end is
+                            // observable (attention, parent mail).
+                            let mid_turn = matches!(
+                                self.state.read().expect("poison").kind,
+                                AgentStateKind::ApiStreaming { .. }
+                            );
+                            if mid_turn {
+                                self.fail(anyhow::anyhow!(
+                                    "Claude Code exited before finishing the turn"
+                                ));
+                            }
                         }
                         Err(error) => {
                             self.process = None;
@@ -405,6 +417,14 @@ impl ClaudeLoop {
                         delivery,
                     });
                 self.notify.notify_waiters();
+                // A turn-opening send starts the turn now: waiting for the
+                // CLI's first stream event (seconds on a cold spawn) leaves
+                // the agent looking idle while it is working.
+                if !busy {
+                    self.pending_response = PendingInferenceResponse::default();
+                    self.stream_items.clear();
+                    self.set_streaming_kind();
+                }
                 if let Err(error) = self
                     .process
                     .as_mut()
@@ -649,7 +669,26 @@ impl ClaudeLoop {
                 if message.is_error {
                     self.fail(anyhow::anyhow!("{}", message.errors.join("\n")));
                 } else {
-                    self.set_kind(AgentStateKind::Idle);
+                    // A child's finished turn is its report: mail the result
+                    // to the parent so it can react.
+                    let final_text = message.result.unwrap_or_default();
+                    self.mail_parent(
+                        if final_text.is_empty() {
+                            "(turn finished with no text response)".to_owned()
+                        } else {
+                            final_text
+                        },
+                        MessageDelivery::NextRequest,
+                    );
+                    // Queued sends run next inside the CLI: staying in the
+                    // streaming state avoids a false turn end between them.
+                    if self.queued_turns.is_empty() {
+                        self.set_kind(AgentStateKind::Idle);
+                    } else {
+                        self.pending_response = PendingInferenceResponse::default();
+                        self.stream_items.clear();
+                        self.set_streaming_kind();
+                    }
                     let workspace = Arc::clone(&self.workspace);
                     tokio::spawn(async move {
                         if let Err(error) = workspace.snapshot().await {
@@ -734,7 +773,20 @@ impl ClaudeLoop {
         });
     }
 
+    /// Mail the parent agent, if any (fire-and-forget).
+    fn mail_parent(&self, body: String, delivery: MessageDelivery) {
+        if let Some(multi_agent) = &self.multi_agent {
+            multi_agent.mail_parent(body, delivery);
+        }
+    }
+
     fn fail(&self, error: anyhow::Error) {
+        // A silently stuck child is the failure mode worth surfacing: errors
+        // wake the parent.
+        self.mail_parent(
+            format!("Agent hit an error and stopped: {error}"),
+            MessageDelivery::NextRequest,
+        );
         self.set_kind(AgentStateKind::Error(FailedInferenceResponse {
             partial_response: self.pending_response.clone(),
             attempt_count: NonZeroU64::MIN,
