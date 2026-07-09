@@ -3,10 +3,12 @@ use std::sync::Arc;
 use crate::multi_agent_tools::MultiAgentTools;
 
 /// `multi_agent` is set for pooled agents, which get the multi-agent tools and
-/// the section explaining them.
+/// the section explaining them. `code_mode` is set when the agent's tool
+/// surface is the code-mode `exec`/`wait` pair.
 pub fn prompt(
     workspace: &rho_workspaces::Workspace,
     multi_agent: Option<&MultiAgentTools>,
+    code_mode: bool,
 ) -> Arc<str> {
     let working_directory = workspace.repo();
     let workspace_name = workspace.info().workspace_name();
@@ -24,6 +26,19 @@ pub fn prompt(
     let multi_agent = multi_agent.map_or_else(String::new, |tools| {
         let agent_id = tools.display_id(tools.self_id());
         let workspace_prompt = render_multi_agent_workspace_prompt(workspace_name.as_deref());
+        // In code mode the agent tools live under `tools.*` in exec scripts
+        // and `wait` means the exec-cell wait, so mail has no wait tool.
+        let agent_tool_usage = if code_mode {
+            "You can use `spawn_agent` to create a new agent, `send_message` to steer or \
+             follow up with an agent, and `interrupt_agent` when an agent is clearly doing \
+             the wrong work and should stop its current turn. There is no tool for waiting \
+             on agent results: finish your turn and their mail starts your next one."
+        } else {
+            "You can use `spawn_agent` to create a new agent, `send_message` to steer or \
+             follow up with an agent, `interrupt_agent` when an agent is clearly doing the \
+             wrong work and should stop its current turn, and `wait` when you are blocked \
+             on agent results and have nothing else useful to do."
+        };
         let role = match tools.parent() {
             Some(parent) => format!(
                 "You are an agent in a team of agents collaborating to complete a task. Your \
@@ -57,10 +72,7 @@ should intentionally share one live checkout; use `fork` when multiple agents \
 may edit at the same time; use `new` when the task should start from trunk or \
 a specific `revset`.
 
-You can use `spawn_agent` to create a new agent, `send_message` to steer or \
-follow up with an agent, `interrupt_agent` when an agent is clearly doing the \
-wrong work and should stop its current turn, and `wait` when you are blocked \
-on agent results and have nothing else useful to do.
+{agent_tool_usage}
 
 You will receive agent messages in this format:
 ```
@@ -80,9 +92,20 @@ needed for the task.
 "
         )
     });
+    let code_mode = if code_mode { CODE_MODE_PROMPT } else { "" };
     let environment = render_environment_prompt(working_directory.as_str());
-    format!("{BASE_PROMPT}{agents_md}{skills}{multi_agent}{environment}").into()
+    format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{multi_agent}{environment}").into()
 }
+
+const CODE_MODE_PROMPT: &str = "## Code Mode
+
+Your tool surface is code mode: the `exec` tool runs JavaScript, and every \
+other capability is an async function under `tools.*` inside your scripts \
+(see the `exec` tool description for signatures). Top-level variables persist \
+across `exec` calls. The `wait` tool resumes or terminates running exec \
+cells; it does not wait for anything else.
+
+";
 
 fn render_agents_md_prompt(files: &[rho_context_config::AgentsFile]) -> Option<String> {
     if files.is_empty() {

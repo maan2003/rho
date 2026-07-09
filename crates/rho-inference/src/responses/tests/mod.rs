@@ -278,6 +278,7 @@ fn test_inference_service_with(
         DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: false,
+            code_mode: false,
         },
         DeepModel::Gpt55,
         prompt_cache_key,

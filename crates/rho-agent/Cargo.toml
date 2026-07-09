@@ -18,6 +18,7 @@ rand.workspace = true
 redb.workspace = true
 redb-derive = "0.1"
 rho-claude.workspace = true
+rho-code-mode.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true

@@ -451,6 +451,7 @@ async fn new_agent(
             AgentMode::Deep(DeepConfig {
                 effort: DeepEffort::Medium,
                 fast_mode: true,
+                code_mode: false,
             }),
             StartMode::NewOn {
                 repo: path,

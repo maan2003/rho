@@ -8,6 +8,7 @@ members = [
   "crates/rho-claude",
   "crates/rho-cli",
   "crates/rho-cli-term-raw",
+  "crates/rho-code-mode",
   "crates/rho-commands",
   "crates/rho-core",
   "crates/rho-daemon",
@@ -47,6 +48,8 @@ crossterm = { version = "0.28", default-features = false, features = [
   "bracketed-paste",
   "events",
 ] }
+deno_core = "0.407"
+deno_error = "0.7"
 dirs = { version = "6", default-features = false }
 fnv = "1"
 iroh = { version = "1.0.2", default-features = false }
@@ -63,6 +66,7 @@ rho-claude = { path = "crates/rho-claude" }
 rho-ci = { path = "crates/rho-ci" }
 rho-cli = { path = "crates/rho-cli" }
 rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
+rho-code-mode = { path = "crates/rho-code-mode" }
 rho-commands = { path = "crates/rho-commands" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }

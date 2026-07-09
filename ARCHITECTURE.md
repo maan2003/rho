@@ -28,6 +28,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   provider.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
   execution.
+- `rho-code-mode` is a tool crate: it runs model-authored JavaScript in an
+  in-process V8 isolate (deno_core) and exposes the `exec`/`wait` tool pair.
+  Nested tool calls made by scripts leave the crate through a `ToolDispatcher`
+  trait implemented by the assembling harness; the crate depends only on
+  `rho-core` vocabulary.
 
 Claude Code MCP support follows the same boundary: `rho-claude` knows how to
 set per-agent MCP environment, but the MCP server that exposes Rho multi-agent

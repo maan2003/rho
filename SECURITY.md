@@ -99,6 +99,38 @@ is truncated before the closing fence. Discovery follows symlinks with cycle
 detection for roots/directories/files. Skill files are prompt input only; they
 do not restrict filesystem access or grant tools.
 
+## Code mode (`rho-code-mode`)
+
+- `rho-code-mode` runs model-authored JavaScript in an in-process V8 isolate
+  (deno_core), one isolate per session on a dedicated thread. Scripts have full
+  access to the host through the nested tool dispatcher — the same access the
+  model already has through shell tools. Code mode is not a sandbox and adds no
+  new privilege beyond the existing tool surface.
+- Code mode is opt-in per Deep agent (`DeepConfig::code_mode`, chosen at
+  agent creation via the mode text, e.g. `deep xhigh code`; the daemon rejects
+  changing it on a running agent). When on, the model-facing tools are only
+  `exec`/`wait`, and
+  shell plus multi-agent tools are dispatched from scripts on the agent's
+  normal runtime through the same code paths as direct tool calls.
+- Trust boundaries: script source is model-controlled input; nested tool calls
+  leave the isolate through the `ToolDispatcher`, which forwards to the agent's
+  normal tool path with its existing controls. The JS environment strips
+  `console`, `Atomics`, `SharedArrayBuffer`, and `WebAssembly`, and exposes no
+  I/O ops other than nested tool calls, `text`/`notify` output, and timers.
+- Resource bounds: exec/wait yield back to the model after a deadline (default
+  10 s) while the script keeps running as a tracked cell; result text is
+  middle-truncated to a token budget (default 10k tokens); a 100 ms heartbeat
+  on the runtime thread detects synchronous busy loops.
+- Cancellation: terminating a cell escalates from cancelling its pending tool
+  ops (rejecting the promises it awaits), to `TerminateExecution` on the
+  isolate if the heartbeat is stale (the isolate and other cells survive), to
+  marking the cell an inert zombie whose ops are refused and output discarded.
+  Dropping the session cancels all cells and shuts down the runtime thread.
+- Tests: `crates/rho-code-mode/tests/session.rs` covers REPL state
+  persistence, concurrent cells, yield/wait, terminate of both parked and
+  busy-looping cells (with session survival), tool-failure propagation, and
+  output truncation.
+
 ## Future review notes
 
 Future changes that add providers, credential storage, transcript persistence,

@@ -268,7 +268,8 @@ fn mode_name(mode: AgentMode) -> String {
                 _ => "deep",
             };
             let fast = if config.fast_mode { " ⚡" } else { "" };
-            format!("{name}{fast} {}", deep_effort_name(config.effort))
+            let code = if config.code_mode { " {}" } else { "" };
+            format!("{name}{fast}{code} {}", deep_effort_name(config.effort))
         }
         AgentMode::Fable { effort } => format!("fable {}", fable_effort_name(effort)),
         AgentMode::Opus { effort } => format!("opus {}", opus_effort_name(effort)),

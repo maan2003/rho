@@ -90,7 +90,7 @@ impl ClaudeAgent {
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
-            system_prompt: system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref()),
+            system_prompt: system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref(), false),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
@@ -143,7 +143,7 @@ impl ClaudeAgent {
                 let multi_agent = pool
                     .upgrade()
                     .map(|_| MultiAgentTools::new(pool.clone(), agent_id, record.parent_agent));
-                system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref())
+                system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref(), false)
             },
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
@@ -597,7 +597,8 @@ impl ClaudeLoop {
                     .with_context(|| format!("create Claude prompt bind target {target}"));
             }
         }
-        let prompt = system_prompt::prompt(self.workspace.as_ref(), self.multi_agent.as_ref());
+        let prompt =
+            system_prompt::prompt(self.workspace.as_ref(), self.multi_agent.as_ref(), false);
         let mut source_file = tempfile::Builder::new()
             .prefix("rho-claude-prompt-")
             .suffix(".md")

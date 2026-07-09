@@ -170,6 +170,7 @@ fn serializes_configured_reasoning_context() {
         DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: false,
+            code_mode: false,
         },
         DeepModel::Gpt55,
         PromptCacheKey::from_bytes(*b"testkey0"),
@@ -585,6 +586,7 @@ fn responses_lite_moves_tools_and_instructions_into_input() {
         DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: false,
+            code_mode: false,
         },
         DeepModel::Gpt56Sol,
         PromptCacheKey::from_bytes(*b"testkey0"),
@@ -632,6 +634,7 @@ fn responses_lite_previous_response_skips_developer_prefix() {
         DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: false,
+            code_mode: false,
         },
         DeepModel::Gpt56Sol,
         PromptCacheKey::from_bytes(*b"testkey0"),

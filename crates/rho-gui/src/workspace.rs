@@ -1472,9 +1472,23 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
     let mut words = text.split_whitespace();
     let kind = words.next().unwrap_or("deep").to_ascii_lowercase();
     let effort = words.next().unwrap_or("medium").to_ascii_lowercase();
-    if words.next().is_some() {
+    // Code mode is a creation-time choice: it fixes the agent's tool surface,
+    // so it rides the mode text instead of a runtime toggle.
+    let code_mode = match words.next() {
+        None => false,
+        Some(word) if word.eq_ignore_ascii_case("code") => true,
+        Some(_) => {
+            return Err(
+                "mode must be `deep|sol|luna|terra [low|medium|xhigh] [code]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
+                    .to_owned(),
+            );
+        }
+    };
+    if words.next().is_some()
+        || (code_mode && !matches!(kind.as_str(), "deep" | "sol" | "luna" | "terra"))
+    {
         return Err(
-            "mode must be `deep|sol|luna|terra [low|medium|xhigh]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
+            "mode must be `deep|sol|luna|terra [low|medium|xhigh] [code]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
                 .to_owned(),
         );
     }
@@ -1492,6 +1506,7 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
                     }
                 },
                 fast_mode: true,
+                code_mode,
             };
             Ok(match kind.as_str() {
                 "sol" => AgentMode::Sol(config),
@@ -1595,8 +1610,9 @@ fn agent_mode_label(mode: AgentMode) -> ModeLabel {
                 DeepEffort::Xhigh => "³",
             };
             let fast = if config.fast_mode { "⚡" } else { "" };
+            let code = if config.code_mode { "{}" } else { "" };
             ModeLabel {
-                text: format!("{name}{effort}{fast}"),
+                text: format!("{name}{effort}{fast}{code}"),
                 family: ModeFamily::Deep,
             }
         }
@@ -1768,6 +1784,7 @@ mod tests {
             AgentMode::Deep(DeepConfig {
                 effort: DeepEffort::Low,
                 fast_mode: true,
+                code_mode: false,
             })
         );
         assert_eq!(
@@ -1792,6 +1809,7 @@ mod tests {
         let low = agent_mode_label(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Low,
             fast_mode: true,
+            code_mode: false,
         }));
         assert_eq!(low.text, "deep¹⚡");
         assert_eq!(low.family, ModeFamily::Deep);
@@ -1799,6 +1817,7 @@ mod tests {
         let medium = agent_mode_label(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: true,
+            code_mode: false,
         }));
         assert_eq!(medium.text, "deep²⚡");
         assert_eq!(medium.family, ModeFamily::Deep);
@@ -1806,6 +1825,7 @@ mod tests {
         let xhigh = agent_mode_label(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Xhigh,
             fast_mode: true,
+            code_mode: false,
         }));
         assert_eq!(xhigh.text, "deep³⚡");
         assert_eq!(xhigh.family, ModeFamily::Deep);
@@ -1813,6 +1833,7 @@ mod tests {
         let slow = agent_mode_label(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: false,
+            code_mode: false,
         }));
         assert_eq!(slow.text, "deep²");
         assert_eq!(slow.family, ModeFamily::Deep);

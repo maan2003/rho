@@ -322,22 +322,27 @@ pub fn parse_spawn_mode(mode: &str) -> anyhow::Result<AgentMode> {
         "gpt-5.5" => Ok(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: true,
+            code_mode: false,
         })),
         "gpt-5.5-xhigh" => Ok(AgentMode::Deep(DeepConfig {
             effort: DeepEffort::Xhigh,
             fast_mode: true,
+            code_mode: false,
         })),
         "sol" => Ok(AgentMode::Sol(DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: true,
+            code_mode: false,
         })),
         "luna" => Ok(AgentMode::Luna(DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: true,
+            code_mode: false,
         })),
         "terra" => Ok(AgentMode::Terra(DeepConfig {
             effort: DeepEffort::Medium,
             fast_mode: true,
+            code_mode: false,
         })),
         _ => anyhow::bail!(
             "unsupported mode {mode:?}; expected fable, fable-xhigh, gpt-5.5, gpt-5.5-xhigh, sol, \
@@ -468,35 +473,40 @@ mod tests {
             parse_spawn_mode("gpt-5.5").unwrap(),
             AgentMode::Deep(DeepConfig {
                 effort: DeepEffort::Medium,
-                fast_mode: true
+                fast_mode: true,
+                code_mode: false,
             })
         );
         assert_eq!(
             parse_spawn_mode("gpt-5.5-xhigh").unwrap(),
             AgentMode::Deep(DeepConfig {
                 effort: DeepEffort::Xhigh,
-                fast_mode: true
+                fast_mode: true,
+                code_mode: false,
             })
         );
         assert_eq!(
             parse_spawn_mode("sol").unwrap(),
             AgentMode::Sol(DeepConfig {
                 effort: DeepEffort::Medium,
-                fast_mode: true
+                fast_mode: true,
+                code_mode: false,
             })
         );
         assert_eq!(
             parse_spawn_mode("luna").unwrap(),
             AgentMode::Luna(DeepConfig {
                 effort: DeepEffort::Medium,
-                fast_mode: true
+                fast_mode: true,
+                code_mode: false,
             })
         );
         assert_eq!(
             parse_spawn_mode("terra").unwrap(),
             AgentMode::Terra(DeepConfig {
                 effort: DeepEffort::Medium,
-                fast_mode: true
+                fast_mode: true,
+                code_mode: false,
             })
         );
         assert!(parse_spawn_mode("opus").is_err());

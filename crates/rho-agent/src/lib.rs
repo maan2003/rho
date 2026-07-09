@@ -26,6 +26,7 @@ use crate::db::{
 use crate::multi_agent_tools::MultiAgentTools;
 
 pub mod claude;
+mod code_mode;
 pub mod db;
 pub mod multi_agent_tools;
 pub mod pool;
@@ -539,10 +540,15 @@ impl Agent {
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool, agent_id, parent));
+        let code_mode = start_code_mode(config.code_mode, &shell_tools, multi_agent.as_ref());
         let state = Arc::new(RwLock::new(AgentState {
             blocks: restored.blocks,
-            tool_specs: agent_tool_specs(&shell_tools, multi_agent.is_some()),
-            system_prompt: system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref()),
+            tool_specs: agent_tool_specs(&shell_tools, multi_agent.is_some(), code_mode.is_some()),
+            system_prompt: system_prompt::prompt(
+                workspace.as_ref(),
+                multi_agent.as_ref(),
+                code_mode.is_some(),
+            ),
             queued_inputs: restored.queued_inputs,
             kind: restored.kind,
             context_used: restored.context_used,
@@ -563,6 +569,7 @@ impl Agent {
                 next_event,
             },
             multi_agent,
+            code_mode,
         };
         tokio::spawn(agent_loop.run());
         Self {
@@ -670,6 +677,23 @@ fn arm_wait(
     Ok(())
 }
 
+/// Runs one `exec` or `wait` call against the code-mode session.
+async fn code_mode_tool_body(
+    session: &rho_code_mode::CodeModeSession,
+    call: &ToolCall,
+) -> ToolOutput {
+    if call.name.as_str() == rho_code_mode::EXEC_TOOL_NAME {
+        return session.execute(&call.arguments).await;
+    }
+    match serde_json::from_str::<rho_code_mode::WaitArgs>(&call.arguments) {
+        Ok(args) => session.wait(args).await,
+        Err(error) => ToolOutput {
+            output: Arc::new(format!("invalid wait arguments: {error}")),
+            status: ToolOutputStatus::Error,
+        },
+    }
+}
+
 /// An error outcome for a call that never ran.
 fn error_tool_result(call: &ToolCall, started_at: UnixMs, error: anyhow::Error) -> ToolResult {
     ToolResult {
@@ -685,12 +709,38 @@ fn error_tool_result(call: &ToolCall, started_at: UnixMs, error: anyhow::Error) 
     }
 }
 
-fn agent_tool_specs(shell_tools: &ShellTools, multi_agent: bool) -> Arc<[ToolSpec]> {
+fn agent_tool_specs(
+    shell_tools: &ShellTools,
+    multi_agent: bool,
+    code_mode: bool,
+) -> Arc<[ToolSpec]> {
+    if code_mode {
+        return code_mode::tool_specs(shell_tools, multi_agent).into();
+    }
     let mut specs = shell_tools.specs();
     if multi_agent {
         specs.extend(multi_agent_tools::agent_tool_specs());
     }
     specs.into()
+}
+
+/// Starts the code-mode V8 session when enabled; on failure the agent falls
+/// back to the direct tool surface rather than dying.
+fn start_code_mode(
+    enabled: bool,
+    shell_tools: &ShellTools,
+    multi_agent: Option<&MultiAgentTools>,
+) -> Option<Arc<rho_code_mode::CodeModeSession>> {
+    if !enabled {
+        return None;
+    }
+    match code_mode::start_session(shell_tools, multi_agent) {
+        Ok(session) => Some(Arc::new(session)),
+        Err(error) => {
+            eprintln!("rho-agent: code mode unavailable, using direct tools: {error}");
+            None
+        }
+    }
 }
 
 struct AgentPersistence {
@@ -732,6 +782,10 @@ struct AgentLoop {
     /// Present on pooled agents: identity + `Weak` pool handle for the
     /// built-in spawn/send/wait tools and parent result/error mail.
     multi_agent: Option<MultiAgentTools>,
+    /// Present when `DeepConfig::code_mode` is on: the V8 session behind the
+    /// `exec`/`wait` tool surface. Pending exec futures hold their own `Arc`,
+    /// so toggling code mode off mid-turn lets them finish.
+    code_mode: Option<Arc<rho_code_mode::CodeModeSession>>,
 }
 
 impl AgentLoop {
@@ -1108,6 +1162,31 @@ impl AgentLoop {
                                                 metadata: preview_metadata,
                                             },
                                         );
+                                        // In code mode, `exec` and `wait` go
+                                        // to the V8 session; `wait` means the
+                                        // cell wait there, so the multi-agent
+                                        // wait arm below never sees it.
+                                        if let Some(session) = &self.code_mode
+                                            && (call.name.as_str()
+                                                == rho_code_mode::EXEC_TOOL_NAME
+                                                || call.name.as_str()
+                                                    == rho_code_mode::WAIT_TOOL_NAME)
+                                        {
+                                            let session = Arc::clone(session);
+                                            self.pending_tools.push(Box::pin(async move {
+                                                let body = code_mode_tool_body(&session, &call)
+                                                    .await;
+                                                ToolResult {
+                                                    call_id: call.id.clone(),
+                                                    tool_type: call.tool_type,
+                                                    body,
+                                                    started_at,
+                                                    finished_at: UnixMs::now(),
+                                                    metadata: None,
+                                                }
+                                            }));
+                                            continue;
+                                        }
                                         // `wait` is resolved by the loop
                                         // itself, not run as a future: arm it
                                         // (or fail it in place) and move on.

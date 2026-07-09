@@ -564,6 +564,15 @@ impl AgentRegistry {
                 | AgentMode::Luna(config)
                 | AgentMode::Terra(config),
             ) => {
+                // Code mode fixes the agent's tool surface and prompt at
+                // construction; it cannot change on a running agent.
+                let current_code_mode = record
+                    .mode
+                    .deep_config()
+                    .is_some_and(|current| current.code_mode);
+                if config.code_mode != current_code_mode {
+                    anyhow::bail!("code mode can only be chosen when creating an agent");
+                }
                 let model = mode.deep_model().expect("deep mode has a model");
                 if let Some(agent) = self.get(agent_id).await {
                     agent.set_deep_config(config, model)?;
