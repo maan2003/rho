@@ -318,15 +318,7 @@ impl AgentRegistry {
 
         let mut candidates = Vec::new();
         for topic in topics {
-            let mut agents = topic.agents.iter().collect::<Vec<_>>();
-            let top_bucket = self.top_bucket(agents.iter().copied());
-            agents.sort_by_key(|agent| {
-                (
-                    agent.status != rho_ui_proto::Status::Pinned,
-                    !top_bucket.contains(&agent.agent_id),
-                    self.rail_rank(agent.agent_id),
-                )
-            });
+            let agents = self.order_topic_agents(topic, topic.agents.iter().collect());
             candidates.extend(agents.into_iter().map(|agent| agent.agent_id));
         }
         for agent_id in self.agents.keys() {
@@ -335,6 +327,85 @@ impl AgentRegistry {
             }
         }
         candidates
+    }
+
+    /// Orders a subset of a topic as a tree. Roots and siblings retain the
+    /// rail's pin/attention/recency ordering; same-topic children immediately
+    /// follow their parent. Missing or cross-topic parents are roots.
+    pub(crate) fn order_topic_agents<'a>(
+        &self,
+        topic: &UiTopic,
+        mut agents: Vec<&'a rho_ui_proto::UiAgentSummary>,
+    ) -> Vec<&'a rho_ui_proto::UiAgentSummary> {
+        let top_bucket = self.top_bucket(agents.iter().copied());
+        agents.sort_by_key(|agent| {
+            (
+                agent.status != rho_ui_proto::Status::Pinned,
+                !top_bucket.contains(&agent.agent_id),
+                self.rail_rank(agent.agent_id),
+            )
+        });
+
+        let topic_ids = topic.agent_ids().collect::<BTreeSet<_>>();
+        let visible_ids = agents
+            .iter()
+            .map(|agent| agent.agent_id)
+            .collect::<BTreeSet<_>>();
+        let mut children = BTreeMap::<Option<AgentId>, Vec<_>>::new();
+        for agent in agents {
+            let parent = agent
+                .parent_agent
+                .filter(|parent| topic_ids.contains(parent) && visible_ids.contains(parent));
+            children.entry(parent).or_default().push(agent);
+        }
+
+        fn append<'a>(
+            parent: Option<AgentId>,
+            children: &BTreeMap<Option<AgentId>, Vec<&'a rho_ui_proto::UiAgentSummary>>,
+            seen: &mut BTreeSet<AgentId>,
+            ordered: &mut Vec<&'a rho_ui_proto::UiAgentSummary>,
+        ) {
+            for agent in children.get(&parent).into_iter().flatten() {
+                if seen.insert(agent.agent_id) {
+                    ordered.push(agent);
+                    append(Some(agent.agent_id), children, seen, ordered);
+                }
+            }
+        }
+
+        let mut ordered = Vec::new();
+        let mut seen = BTreeSet::new();
+        append(None, &children, &mut seen, &mut ordered);
+        // Persisted data should be acyclic, but don't drop rows if it is not.
+        for agents in children.values() {
+            for agent in agents {
+                if seen.insert(agent.agent_id) {
+                    ordered.push(agent);
+                    append(Some(agent.agent_id), &children, &mut seen, &mut ordered);
+                }
+            }
+        }
+        ordered
+    }
+
+    pub(crate) fn topic_agent_depth(&self, topic: &UiTopic, agent_id: AgentId) -> usize {
+        let mut depth = 0;
+        let mut cursor = agent_id;
+        let mut seen = BTreeSet::new();
+        while seen.insert(cursor) {
+            let Some(parent) = topic
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == cursor)
+                .and_then(|agent| agent.parent_agent)
+                .filter(|parent| topic.agent_ids().any(|id| id == *parent))
+            else {
+                break;
+            };
+            depth += 1;
+            cursor = parent;
+        }
+        depth
     }
 
     pub fn top_bucket<'a>(
@@ -440,6 +511,7 @@ mod tests {
     fn agent(id: u64, status: Status) -> UiAgentSummary {
         UiAgentSummary {
             agent_id: agent_id(id),
+            parent_agent: None,
             display_name: None,
             created_at: rho_core::UnixMs(id),
             updated_at: rho_core::UnixMs(id),
@@ -464,6 +536,7 @@ mod tests {
     fn workspace_agent(id: u64, workspace_id: WorkspaceId) -> UiAgentSummary {
         UiAgentSummary {
             agent_id: agent_id(id),
+            parent_agent: None,
             display_name: None,
             created_at: rho_core::UnixMs(id),
             updated_at: rho_core::UnixMs(id),

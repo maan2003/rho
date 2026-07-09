@@ -283,6 +283,7 @@ impl AgentRegistry {
                         .into_iter()
                         .map(|(agent_id, agent)| UiAgentSummary {
                             agent_id,
+                            parent_agent: agent.parent_agent,
                             display_name: agent.display_name,
                             created_at: agent.created_at,
                             updated_at: agent.updated_at,

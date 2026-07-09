@@ -146,6 +146,7 @@ mod tests {
     fn agent(id: u64, status: Status, updated_at: u64) -> UiAgentSummary {
         UiAgentSummary {
             agent_id: AgentId::from_counter(id, &AgentIdDomain(0)).unwrap(),
+            parent_agent: None,
             display_name: None,
             created_at: UnixMs(id),
             updated_at: UnixMs(updated_at),
@@ -283,6 +284,31 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn same_topic_children_follow_their_parent() {
+        let parent = agent(1, Status::Pinned, 10);
+        let mut child = agent(2, Status::Normal, 10);
+        child.parent_agent = Some(parent.agent_id);
+        let mut grandchild = agent(3, Status::Normal, 10);
+        grandchild.parent_agent = Some(child.agent_id);
+        let root = agent(4, Status::Normal, 10);
+        let topic = topic(Status::Normal, vec![parent, root, grandchild, child]);
+
+        let mut registry = AgentRegistry::default();
+        registry.set_topics(vec![topic.clone()]);
+        let visible = split_agents(&topic, &registry)
+            .0
+            .into_iter()
+            .map(|summary| summary.agent_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible,
+            [1, 2, 3, 4].map(|id| AgentId::from_counter(id, &AgentIdDomain(0)).unwrap())
+        );
+        assert_eq!(registry.topic_agent_depth(&topic, visible[2]), 2);
+    }
 }
 
 fn new_agent_row(
@@ -330,14 +356,7 @@ fn split_agents<'a>(
         .agents
         .iter()
         .partition(|summary| !registry.agent_folded(summary.agent_id));
-    let top_bucket = registry.top_bucket(agents.iter().copied());
-    agents.sort_by_key(|summary| {
-        (
-            summary.status != Status::Pinned,
-            !top_bucket.contains(&summary.agent_id),
-            registry.rail_rank(summary.agent_id),
-        )
-    });
+    agents = registry.order_topic_agents(topic, agents);
     folded.sort_by_key(|summary| Reverse(summary.updated_at));
     (agents, folded)
 }
@@ -379,6 +398,7 @@ fn render_topic_rows<'a>(
     if expanded {
         agents.extend(folded);
     }
+    agents = registry.order_topic_agents(topic, agents);
     let fold = (folded_count > 0)
         .then(|| fold_row(topic.topic_id, folded_count, expanded, text_style, cx));
     // Roll the topic's most urgent agent up into the header, so a collapsed
@@ -427,6 +447,7 @@ fn render_topic_rows<'a>(
                 .clone()
                 .unwrap_or_else(|| registry.agent_id_label(summary.agent_id));
             let selected = selected_agent == Some(agent_id);
+            let depth = registry.topic_agent_depth(topic, summary.agent_id);
             let pinned = summary.status == Status::Pinned;
             let attention = registry.attention(summary.agent_id);
             let lamp = lamps.color(attention);
@@ -450,7 +471,7 @@ fn render_topic_rows<'a>(
                 .flex()
                 .items_center()
                 .gap_1()
-                .pl(px(12.))
+                .pl(px(12. + depth as f32 * 14.))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .cursor_pointer()

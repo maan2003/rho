@@ -383,6 +383,9 @@ impl UiTopic {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiAgentSummary {
     pub agent_id: AgentId,
+    /// The agent that spawned this one. The GUI uses same-topic parent edges
+    /// to present delegated work inline beneath its parent.
+    pub parent_agent: Option<AgentId>,
     pub display_name: Option<String>,
     pub created_at: rho_core::UnixMs,
     pub updated_at: rho_core::UnixMs,
