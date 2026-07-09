@@ -121,13 +121,16 @@ pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
         .is_none_or(char::is_whitespace);
     let words = trimmed.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() || (words.len() == 1 && !typing_new_token) {
-        return ["deep", "fable", "opus"]
+        return ["deep", "sol", "luna", "terra", "fable", "opus"]
             .into_iter()
             .filter(|mode| fuzzy_contains(mode, token))
             .map(|mode| Candidate {
                 value: mode.to_owned(),
                 description: match mode {
-                    "deep" => "rho deep agent".to_owned(),
+                    "deep" => "rho deep agent (gpt-5.5)".to_owned(),
+                    "sol" => "rho deep agent (gpt-5.6-sol)".to_owned(),
+                    "luna" => "rho deep agent (gpt-5.6-luna)".to_owned(),
+                    "terra" => "rho deep agent (gpt-5.6-terra)".to_owned(),
                     "fable" => "Claude Fable agent".to_owned(),
                     "opus" => "Claude Opus agent".to_owned(),
                     _ => unreachable!(),
@@ -137,7 +140,7 @@ pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
     }
 
     let efforts: &[(&str, &str)] = match words.first().copied() {
-        Some("deep") => &[
+        Some("deep" | "sol" | "luna" | "terra") => &[
             ("low", "low effort"),
             ("medium", "medium effort"),
             ("xhigh", "extra-high effort"),
@@ -359,6 +362,19 @@ mod tests {
         let candidates = mode_field_candidates("deep x");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "xhigh");
+
+        let candidates = mode_field_candidates("sol");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].value, "sol");
+
+        let candidates = mode_field_candidates("terra ");
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.value)
+                .collect::<Vec<_>>(),
+            ["low", "medium", "xhigh"]
+        );
 
         let candidates = mode_field_candidates("fable ");
         assert_eq!(
