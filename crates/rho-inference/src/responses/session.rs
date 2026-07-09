@@ -144,10 +144,12 @@ impl ResponsesConfig {
     fn deep(config: DeepConfig, model: ResponsesModel) -> Self {
         let context_window = model.context_window();
         Self {
-            model,
-            auto_compaction: Some(AutoCompaction::Threshold(
+            // Responses Lite rejects server-side compaction requests, so
+            // lite models get no auto-compaction for now.
+            auto_compaction: (!model.use_responses_lite()).then_some(AutoCompaction::Threshold(
                 context_window * 95 / 100 * 90 / 100,
             )),
+            model,
             reasoning_context: ReasoningContext::AllTurns,
             effort: config.effort.into(),
             text_verbosity: TextVerbosity::Low,
