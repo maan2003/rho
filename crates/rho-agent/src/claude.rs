@@ -320,6 +320,7 @@ struct ClaudeLoop {
 struct ClaudeTurn {
     uuid: String,
     input_seq: u64,
+    content: Arc<Vec<ContentPart>>,
 }
 
 impl ClaudeLoop {
@@ -386,10 +387,11 @@ impl ClaudeLoop {
                 } else {
                     MessageDelivery::Immediate
                 };
-                let content = vec![ContentPart::Text { text: text.clone() }];
+                let content = Arc::new(vec![ContentPart::Text { text: text.clone() }]);
                 self.queued_turns.push_back(ClaudeTurn {
                     uuid: uuid.clone(),
                     input_seq: seq,
+                    content: Arc::clone(&content),
                 });
                 self.state
                     .write()
@@ -398,7 +400,7 @@ impl ClaudeLoop {
                     .push(QueuedItem {
                         kind: QueuedItemKind::UserMessage {
                             sender: crate::MessageSender::User,
-                            content: Arc::new(content),
+                            content,
                         },
                         delivery,
                     });
@@ -633,7 +635,10 @@ impl ClaudeLoop {
                 }
             }
             rho_claude::ClaudeEvent::User(message) => {
-                self.activate_turn_from_user_echo(message.uuid.as_deref());
+                let promoted_queued = self.activate_turn_from_user_echo(message.uuid.as_deref());
+                if promoted_queued {
+                    return;
+                }
                 match user_output_to_block(message) {
                     Ok(Some(block)) => self.handle_user_block(block),
                     Ok(None) => {}
@@ -664,10 +669,10 @@ impl ClaudeLoop {
 
     async fn persist_inference_block(&self, _block: &Arc<ContextBlock>) {}
 
-    fn activate_turn_from_user_echo(&mut self, uuid: Option<&str>) {
-        let Some(uuid) = uuid else { return };
+    fn activate_turn_from_user_echo(&mut self, uuid: Option<&str>) -> bool {
+        let Some(uuid) = uuid else { return false };
         let Some(index) = self.queued_turns.iter().position(|turn| turn.uuid == uuid) else {
-            return;
+            return false;
         };
         let turn = self
             .queued_turns
@@ -675,7 +680,14 @@ impl ClaudeLoop {
             .expect("index came from position");
         self.wait_baseline_seq
             .store(turn.input_seq, Ordering::Release);
+
+        let mut state = self.state.write().expect("poison");
+        promote_queued_user_message(&mut state, &turn.content);
+        drop(state);
+
         self.input_notify.notify_waiters();
+        self.notify.notify_waiters();
+        true
     }
 
     async fn handle_system_message(&mut self, message: rho_claude::protocol::SystemMessage) {
@@ -694,33 +706,6 @@ impl ClaudeLoop {
             }
         }
         self.notify.notify_waiters();
-
-        match self.refresh_from_transcript().await {
-            Ok(()) => {}
-            Err(error) => eprintln!("rho-agent Claude compaction refresh failed: {error:#}"),
-        }
-    }
-
-    async fn refresh_from_transcript(&self) -> anyhow::Result<()> {
-        let messages = rho_claude::read_session_messages_by_id(
-            self.session_id,
-            self.workspace.repo(),
-            rho_claude::SessionMessagesOptions::default(),
-        )
-        .await?;
-        let blocks = transcript_messages_to_context(&messages)?;
-        let context_used =
-            rho_claude::read_session_context_used_by_id(self.session_id, self.workspace.repo())
-                .await?;
-        {
-            let mut state = self.state.write().expect("poison");
-            state.blocks = blocks;
-            if context_used.is_some() {
-                state.context_used = context_used;
-            }
-        }
-        self.notify.notify_waiters();
-        Ok(())
     }
 
     fn push_block(&self, block: Arc<ContextBlock>) {
@@ -853,9 +838,73 @@ fn remove_compact_commands(inputs: &mut InputQueues) {
     });
 }
 
+fn promote_queued_user_message(state: &mut AgentState, content: &[ContentPart]) -> bool {
+    let matched = state.queued_inputs.remove_first(|queued| {
+        matches!(
+            queued,
+            QueuedItem {
+                kind: QueuedItemKind::UserMessage { .. },
+                ..
+            }
+        )
+    });
+    if matched.is_none() {
+        return false;
+    }
+    state.blocks.push(Arc::new(ContextBlock::UserMessage {
+        sender: crate::MessageSender::User,
+        content: content.to_vec(),
+    }));
+    true
+}
+
 fn is_compact_command(content: &[ContentPart]) -> bool {
     match content {
         [ContentPart::Text { text }] => text.trim() == "/compact",
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(text: &str) -> Arc<Vec<ContentPart>> {
+        Arc::new(vec![ContentPart::Text {
+            text: text.to_owned(),
+        }])
+    }
+
+    #[test]
+    fn promotes_queued_user_message_from_uuid_matched_turn_content() {
+        let mut state = AgentState {
+            blocks: Vec::new(),
+            tool_specs: Arc::from([]),
+            system_prompt: Arc::from(""),
+            queued_inputs: InputQueues::default(),
+            kind: AgentStateKind::Idle,
+            context_used: None,
+        };
+        state.queued_inputs.push(QueuedItem {
+            kind: QueuedItemKind::UserMessage {
+                sender: crate::MessageSender::User,
+                content: text("claude-normalized text"),
+            },
+            delivery: MessageDelivery::Immediate,
+        });
+        let turn_content = vec![ContentPart::Text {
+            text: "original text".to_owned(),
+        }];
+
+        assert!(promote_queued_user_message(&mut state, &turn_content));
+
+        assert!(state.queued_inputs.is_empty());
+        assert_eq!(
+            state.blocks,
+            vec![Arc::new(ContextBlock::UserMessage {
+                sender: crate::MessageSender::User,
+                content: turn_content,
+            })]
+        );
     }
 }
