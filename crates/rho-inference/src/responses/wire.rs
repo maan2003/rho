@@ -276,6 +276,7 @@ enum WireTimelineItem {
     UserMessage(Vec<ContentPart>),
     CompactionTrigger,
     ToolResult(ToolResult),
+    ToolUpdate(rho_core::ToolUpdate),
     ResponseItem(InferenceResponseItem),
 }
 
@@ -310,6 +311,9 @@ fn append_block_items(
         ContextBlock::ToolResults { results } => {
             out.extend(results.iter().cloned().map(WireTimelineItem::ToolResult));
         }
+        ContextBlock::ToolUpdate(update) => {
+            out.push(WireTimelineItem::ToolUpdate(update.clone()));
+        }
         ContextBlock::InferenceResponse { items, .. } => {
             out.extend(items.iter().cloned().map(WireTimelineItem::ResponseItem))
         }
@@ -323,6 +327,7 @@ fn convert_timeline_item(item: WireTimelineItem, out: &mut Vec<Value>) {
             "type": "compaction_trigger",
         })),
         WireTimelineItem::ToolResult(result) => out.push(convert_tool_result(result)),
+        WireTimelineItem::ToolUpdate(update) => out.push(convert_tool_update(&update)),
         WireTimelineItem::ResponseItem(item) => convert_response_item(item, out),
     }
 }
@@ -583,6 +588,20 @@ fn convert_tool_result(result: ToolResult) -> Value {
         "type": output_type,
         "call_id": result.call_id.as_str(),
         "output": result.body.output.as_ref(),
+    })
+}
+
+/// An update replays as an extra output item for its call; the API accepts
+/// multiple output items per call_id.
+fn convert_tool_update(update: &rho_core::ToolUpdate) -> Value {
+    let output_type = match update.tool_type {
+        ToolType::Function => "function_call_output",
+        ToolType::Custom => "custom_tool_call_output",
+    };
+    json!({
+        "type": output_type,
+        "call_id": update.call_id.as_str(),
+        "output": update.output.as_ref(),
     })
 }
 

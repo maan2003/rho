@@ -117,6 +117,11 @@ do not restrict filesystem access or grant tools.
   normal tool path with its existing controls. The JS environment strips
   `console`, `Atomics`, `SharedArrayBuffer`, and `WebAssembly`, and exposes no
   I/O ops other than nested tool calls, `text`/`notify` output, and timers.
+- `notify(...)` becomes a `ToolUpdate` attributed to the cell's originating
+  `exec` call: it rides the agent's persisted input queue and enters model
+  context at the next request boundary of the active turn. With no active
+  turn the update is dropped, and leftover updates alone never start a turn,
+  so script output cannot wake an idle agent.
 - Resource bounds: exec/wait yield back to the model after a deadline (default
   10 s) while the script keeps running as a tracked cell; result text is
   middle-truncated to a token budget (default 10k tokens); a 100 ms heartbeat

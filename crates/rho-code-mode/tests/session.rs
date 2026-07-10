@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use rho_code_mode::{CodeModeSession, NestedTool, ToolDispatcher, WaitArgs};
-use rho_core::{ToolCall, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
+use rho_core::{ToolCall, ToolCallId, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
 use serde_json::json;
 
 struct FakeDispatcher {
-    notifications: Mutex<Vec<String>>,
+    notifications: Mutex<Vec<(ToolCallId, String)>>,
 }
 
 impl FakeDispatcher {
@@ -53,9 +53,16 @@ impl ToolDispatcher for FakeDispatcher {
         })
     }
 
-    fn notify(&self, text: String) {
-        self.notifications.lock().unwrap().push(text);
+    fn notify(&self, exec_call_id: ToolCallId, text: String) {
+        self.notifications
+            .lock()
+            .unwrap()
+            .push((exec_call_id, text));
     }
+}
+
+fn exec_id() -> ToolCallId {
+    ToolCallId::try_from("exec-call-1".to_string()).unwrap()
 }
 
 fn nested_tools() -> Vec<NestedTool> {
@@ -92,7 +99,9 @@ fn cell_id(output: &str) -> String {
 async fn repl_scope_persists_across_cells() {
     let (session, _) = session();
 
-    let first = session.execute("let counter = 41; text('set')").await;
+    let first = session
+        .execute(exec_id(), "let counter = 41; text('set')")
+        .await;
     assert_eq!(first.status, ToolOutputStatus::Success, "{}", first.output);
     assert!(
         first.output.starts_with("Script completed"),
@@ -100,12 +109,14 @@ async fn repl_scope_persists_across_cells() {
         first.output
     );
 
-    let second = session.execute("counter += 1; text(String(counter))").await;
+    let second = session
+        .execute(exec_id(), "counter += 1; text(String(counter))")
+        .await;
     assert!(second.output.contains("42"), "{}", second.output);
 
     // Redeclaration is legal in REPL mode.
     let third = session
-        .execute("let counter = 5; text(String(counter))")
+        .execute(exec_id(), "let counter = 5; text(String(counter))")
         .await;
     assert!(third.output.contains("5"), "{}", third.output);
 }
@@ -114,7 +125,7 @@ async fn repl_scope_persists_across_cells() {
 async fn nested_tool_calls_round_trip() {
     let (session, _) = session();
     let result = session
-        .execute("const r = await tools.echo({ v: 1 }); text(r)")
+        .execute(exec_id(), "const r = await tools.echo({ v: 1 }); text(r)")
         .await;
     assert_eq!(
         result.status,
@@ -132,7 +143,7 @@ async fn nested_tool_calls_round_trip() {
 #[tokio::test]
 async fn failing_tool_rejects_and_is_catchable() {
     let (session, _) = session();
-    let uncaught = session.execute("await tools.fail({})").await;
+    let uncaught = session.execute(exec_id(), "await tools.fail({})").await;
     assert_eq!(
         uncaught.status,
         ToolOutputStatus::Error,
@@ -151,7 +162,10 @@ async fn failing_tool_rejects_and_is_catchable() {
     );
 
     let caught = session
-        .execute("try { await tools.fail({}) } catch (e) { text('caught ' + e.message) }")
+        .execute(
+            exec_id(),
+            "try { await tools.fail({}) } catch (e) { text('caught ' + e.message) }",
+        )
         .await;
     assert_eq!(
         caught.status,
@@ -166,7 +180,10 @@ async fn failing_tool_rejects_and_is_catchable() {
 async fn slow_cell_yields_then_wait_collects_completion() {
     let (session, _) = session();
     let first = session
-        .execute("// @exec: {\"yield_time_ms\": 50}\nconst r = await tools.slow_echo({}); text(r)")
+        .execute(
+            exec_id(),
+            "// @exec: {\"yield_time_ms\": 50}\nconst r = await tools.slow_echo({}); text(r)",
+        )
         .await;
     assert!(
         first.output.starts_with("Script running with cell ID"),
@@ -206,13 +223,14 @@ async fn concurrent_cells_interleave() {
     let (session, _) = session();
     let slow = session
         .execute(
+            exec_id(),
             "// @exec: {\"yield_time_ms\": 50}\nglobalThis.slowOut = await tools.slow_echo({});",
         )
         .await;
     assert!(slow.output.starts_with("Script running"), "{}", slow.output);
 
     // A second cell runs to completion while the first is parked.
-    let fast = session.execute("text('fast ' + (1 + 1))").await;
+    let fast = session.execute(exec_id(), "text('fast ' + (1 + 1))").await;
     assert!(fast.output.contains("fast 2"), "{}", fast.output);
 
     let done = session
@@ -234,7 +252,10 @@ async fn concurrent_cells_interleave() {
 async fn terminate_parked_cell_rejects_its_tool_call() {
     let (session, _) = session();
     let parked = session
-        .execute("// @exec: {\"yield_time_ms\": 50}\nawait tools.hang({}); text('unreachable')")
+        .execute(
+            exec_id(),
+            "// @exec: {\"yield_time_ms\": 50}\nawait tools.hang({}); text('unreachable')",
+        )
         .await;
     assert!(
         parked.output.starts_with("Script running"),
@@ -257,14 +278,16 @@ async fn terminate_parked_cell_rejects_its_tool_call() {
     );
 
     // The session stays healthy afterwards.
-    let after = session.execute("text('alive')").await;
+    let after = session.execute(exec_id(), "text('alive')").await;
     assert!(after.output.contains("alive"), "{}", after.output);
 }
 
 #[tokio::test]
 async fn terminate_busy_loop_preserves_session_state() {
     let (session, _) = session();
-    let seeded = session.execute("let keep = 'kept'; text('seeded')").await;
+    let seeded = session
+        .execute(exec_id(), "let keep = 'kept'; text('seeded')")
+        .await;
     assert!(
         seeded.output.starts_with("Script completed"),
         "{}",
@@ -272,7 +295,7 @@ async fn terminate_busy_loop_preserves_session_state() {
     );
 
     let spin = session
-        .execute("// @exec: {\"yield_time_ms\": 50}\nglobalThis.spun = 0; while (true) { globalThis.spun++; }")
+        .execute(exec_id(), "// @exec: {\"yield_time_ms\": 50}\nglobalThis.spun = 0; while (true) { globalThis.spun++; }")
         .await;
     assert!(spin.output.starts_with("Script running"), "{}", spin.output);
 
@@ -291,7 +314,7 @@ async fn terminate_busy_loop_preserves_session_state() {
     );
 
     let after = session
-        .execute("text(keep + ' ' + String(globalThis.spun > 0))")
+        .execute(exec_id(), "text(keep + ' ' + String(globalThis.spun > 0))")
         .await;
     assert!(after.output.contains("kept true"), "{}", after.output);
 }
@@ -300,7 +323,7 @@ async fn terminate_busy_loop_preserves_session_state() {
 async fn exit_ends_script_successfully() {
     let (session, _) = session();
     let result = session
-        .execute("text('before'); exit(); text('after')")
+        .execute(exec_id(), "text('before'); exit(); text('after')")
         .await;
     assert_eq!(
         result.status,
@@ -321,12 +344,12 @@ async fn exit_ends_script_successfully() {
 async fn notify_reaches_dispatcher() {
     let (session, dispatcher) = session();
     let result = session
-        .execute("notify('progress note'); text('done')")
+        .execute(exec_id(), "notify('progress note'); text('done')")
         .await;
     assert!(result.output.contains("done"), "{}", result.output);
     assert_eq!(
         dispatcher.notifications.lock().unwrap().as_slice(),
-        ["progress note"]
+        [(exec_id(), "progress note".to_string())]
     );
 }
 
@@ -334,7 +357,10 @@ async fn notify_reaches_dispatcher() {
 async fn yield_control_returns_early_while_script_continues() {
     let (session, _) = session();
     let first = session
-        .execute("text('early'); yield_control(); await tools.slow_echo({}); text('late')")
+        .execute(
+            exec_id(),
+            "text('early'); yield_control(); await tools.slow_echo({}); text('late')",
+        )
         .await;
     assert!(
         first.output.starts_with("Script running"),
@@ -359,7 +385,7 @@ async fn yield_control_returns_early_while_script_continues() {
 #[tokio::test]
 async fn script_errors_are_reported() {
     let (session, _) = session();
-    let result = session.execute("throw new Error('boom')").await;
+    let result = session.execute(exec_id(), "throw new Error('boom')").await;
     assert_eq!(result.status, ToolOutputStatus::Error, "{}", result.output);
     assert!(
         result.output.starts_with("Script failed"),
@@ -392,7 +418,10 @@ async fn wait_on_unknown_cell_reports_not_found() {
 async fn output_is_truncated_to_budget() {
     let (session, _) = session();
     let result = session
-        .execute("// @exec: {\"max_output_tokens\": 10}\ntext('x'.repeat(10000))")
+        .execute(
+            exec_id(),
+            "// @exec: {\"max_output_tokens\": 10}\ntext('x'.repeat(10000))",
+        )
         .await;
     assert!(result.output.contains("truncated"), "{}", result.output);
     assert!(result.output.len() < 2_000, "{}", result.output.len());
@@ -403,6 +432,7 @@ async fn set_timeout_runs_and_clear_timeout_cancels() {
     let (session, _) = session();
     let result = session
         .execute(
+            exec_id(),
             "let fired = [];\n\
              const keep = setTimeout(() => fired.push('keep'), 10);\n\
              const gone = setTimeout(() => fired.push('gone'), 10);\n\

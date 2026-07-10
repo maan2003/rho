@@ -504,8 +504,9 @@ impl ClaudeLoop {
                         },
                     ..
                 } => **queued == *content,
+                // Claude agents never queue tool updates.
                 QueuedItem {
-                    kind: QueuedItemKind::Compaction,
+                    kind: QueuedItemKind::Compaction | QueuedItemKind::ToolUpdate(_),
                     ..
                 } => false,
             });
@@ -885,7 +886,7 @@ fn remove_compact_commands(inputs: &mut InputQueues) {
             ..
         } => !is_compact_command(content),
         QueuedItem {
-            kind: QueuedItemKind::Compaction,
+            kind: QueuedItemKind::Compaction | QueuedItemKind::ToolUpdate(_),
             ..
         } => true,
     });

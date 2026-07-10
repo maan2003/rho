@@ -76,6 +76,10 @@ pub enum ContextBlock {
     ToolResults {
         results: Vec<ToolResult>,
     },
+    /// An out-of-band extra output for an earlier tool call: the call's
+    /// result closes the call, updates annotate it while it (or work it
+    /// started) is still running.
+    ToolUpdate(ToolUpdate),
     InferenceResponse {
         items: Vec<InferenceResponseItem>,
         provider_response_id: Option<ProviderResponseId>,
@@ -173,6 +177,22 @@ pub struct ToolResult {
     pub finished_at: UnixMs,
     /// Tool-specific UI/runtime metadata. Not sent to providers.
     pub metadata: Option<ToolResultMetadata>,
+}
+
+/// An extra output item for a tool call that has (or will have) its own
+/// result — a progress note, not an execution summary. Providers accept
+/// multiple output items per call id; the update replays with the same wire
+/// shape as the call's result.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct ToolUpdate {
+    /// The [`ToolCall`] this update annotates.
+    pub call_id: ToolCallId,
+    /// Wire shape for replaying this update to the provider.
+    pub tool_type: ToolType,
+    pub output: Arc<String>,
+    /// When the tool emitted the update (a single instant; updates have no
+    /// duration).
+    pub at: UnixMs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]

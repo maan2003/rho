@@ -6,10 +6,12 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rho_code_mode::{CodeModeSession, NestedTool, ToolDispatcher};
-use rho_core::{ToolCall, ToolOutput, ToolOutputStatus, ToolSpec};
+use rho_core::{ToolCall, ToolCallId, ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs};
 use rho_tool_shell::ShellTools;
+use tokio::sync::mpsc;
 
 use crate::multi_agent_tools::{self, MultiAgentTools};
+use crate::{AgentControl, ToolUpdate};
 
 /// The model-facing tool surface: `exec` (whose description embeds the nested
 /// tools' TypeScript docs) and `wait`.
@@ -43,6 +45,9 @@ struct Dispatcher {
     /// current-thread runtime: agent tools spawn tasks (sub-agent loops) that
     /// must outlive the session.
     runtime: tokio::runtime::Handle,
+    /// `notify(...)` updates go to the agent loop, which queues them for the
+    /// next request (or drops them when no turn is active).
+    control: mpsc::UnboundedSender<AgentControl>,
 }
 
 impl ToolDispatcher for Dispatcher {
@@ -67,17 +72,30 @@ impl ToolDispatcher for Dispatcher {
             }
         })
     }
+
+    fn notify(&self, exec_call_id: ToolCallId, text: String) {
+        let _ = self.control.send(AgentControl::ToolUpdate(ToolUpdate {
+            call_id: exec_call_id,
+            // `exec` is a custom (freeform) tool, so its extra outputs replay
+            // as `custom_tool_call_output`.
+            tool_type: ToolType::Custom,
+            output: Arc::new(text),
+            at: UnixMs::now(),
+        }));
+    }
 }
 
 /// Must be called on the agent's runtime; blocks briefly for V8 startup.
 pub(crate) fn start_session(
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
+    control: mpsc::UnboundedSender<AgentControl>,
 ) -> Result<CodeModeSession, String> {
     let dispatcher = Arc::new(Dispatcher {
         shell_tools: shell_tools.clone(),
         multi_agent: multi_agent.cloned(),
         runtime: tokio::runtime::Handle::current(),
+        control,
     });
     CodeModeSession::new(nested_tools(shell_tools, multi_agent.is_some()), dispatcher)
 }

@@ -119,6 +119,12 @@ impl UiAgentState {
             } => UiBlock::Notice {
                 text: "compacting context".to_owned(),
             },
+            QueuedItem {
+                kind: QueuedItemKind::ToolUpdate(update),
+                ..
+            } => UiBlock::Notice {
+                text: format!("tool update: {}", update.output),
+            },
         }));
         Self {
             blocks,
@@ -548,6 +554,9 @@ fn ui_blocks(blocks: &[Arc<ContextBlock>]) -> Vec<UiBlock> {
             ContextBlock::InferenceResponse { items, .. } => {
                 ui_blocks.extend(items.iter().filter_map(ui_block_from_response_item));
             }
+            ContextBlock::ToolUpdate(update) => ui_blocks.push(UiBlock::Notice {
+                text: format!("tool update: {}", update.output),
+            }),
             ContextBlock::ToolResults { results } => {
                 for result in results {
                     if let Some(UiBlock::Tool(tool)) = ui_blocks.iter_mut().rev().find(|block| {

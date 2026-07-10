@@ -121,7 +121,7 @@ fn op_notify(state: Rc<RefCell<OpState>>, #[smi] cell_id: u32, #[string] text: S
         && cell.is_running()
         && !text.trim().is_empty()
     {
-        ctx.dispatcher.notify(text);
+        ctx.dispatcher.notify(cell.exec_call_id.clone(), text);
     }
 }
 

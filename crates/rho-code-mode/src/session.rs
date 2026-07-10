@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
-use rho_core::{ToolCall, ToolOutput, ToolOutputStatus};
+use rho_core::{ToolCall, ToolCallId, ToolOutput, ToolOutputStatus};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -26,9 +26,10 @@ use crate::truncate::truncate_middle;
 pub trait ToolDispatcher: Send + Sync + 'static {
     fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput>;
 
-    /// A `notify(...)` progress note from a running script. Fire-and-forget.
-    fn notify(&self, text: String) {
-        let _ = text;
+    /// A `notify(...)` progress note from a running script, attributed to the
+    /// `exec` call that started the cell. Fire-and-forget.
+    fn notify(&self, exec_call_id: ToolCallId, text: String) {
+        let _ = (exec_call_id, text);
     }
 }
 
@@ -79,14 +80,16 @@ impl CodeModeSession {
     }
 
     /// Handles one `exec` tool call: raw JavaScript source, optionally with a
-    /// first-line `// @exec:` pragma.
-    pub async fn execute(&self, input: &str) -> ToolOutput {
+    /// first-line `// @exec:` pragma. `call_id` is the exec call's id; the
+    /// cell's `notify(...)` updates are attributed to it.
+    pub async fn execute(&self, call_id: ToolCallId, input: &str) -> ToolOutput {
         let parsed = match parse_exec_source(input) {
             Ok(parsed) => parsed,
             Err(error) => return error_output(error),
         };
         let cell = Arc::new(CellShared::new(
             self.next_cell.fetch_add(1, Ordering::Relaxed),
+            call_id,
         ));
         self.cells
             .lock()

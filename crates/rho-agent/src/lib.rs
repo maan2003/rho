@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt};
 use rho_core::{
     ApplyPatchMetadata, ContentPart, ContextBlock, InferenceEvent, InferenceRequest,
     InferenceResponseItem, PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId,
-    ToolOutput, ToolOutputStatus, ToolResult, ToolResultMetadata, ToolSpec, UnixMs,
+    ToolOutput, ToolOutputStatus, ToolResult, ToolResultMetadata, ToolSpec, ToolUpdate, UnixMs,
 };
 use rho_db::RhoDb;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
@@ -107,6 +107,11 @@ pub enum QueuedItemKind {
         content: Arc<Vec<ContentPart>>,
     },
     Compaction,
+    /// An out-of-band extra output for an in-flight tool call (code-mode
+    /// `notify(...)`). Rides the queue for persistence/replay, delivers at the
+    /// next request boundary, and never starts a turn: leftovers alone are
+    /// dropped at turn completion.
+    ToolUpdate(ToolUpdate),
 }
 
 /// Pending inputs in arrival order. Delivery filters by eligibility at the
@@ -239,6 +244,7 @@ fn delivered_block(item: QueuedItem) -> ContextBlock {
             content: Arc::try_unwrap(content).unwrap_or_else(|content| (*content).clone()),
         },
         QueuedItemKind::Compaction => ContextBlock::CompactionTrigger,
+        QueuedItemKind::ToolUpdate(update) => ContextBlock::ToolUpdate(update),
     }
 }
 
@@ -540,7 +546,13 @@ impl Agent {
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool, agent_id, parent));
-        let code_mode = start_code_mode(config.code_mode, &shell_tools, multi_agent.as_ref());
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let code_mode = start_code_mode(
+            config.code_mode,
+            &shell_tools,
+            multi_agent.as_ref(),
+            control.clone(),
+        );
         let state = Arc::new(RwLock::new(AgentState {
             blocks: restored.blocks,
             tool_specs: agent_tool_specs(&shell_tools, multi_agent.is_some(), code_mode.is_some()),
@@ -553,7 +565,6 @@ impl Agent {
             kind: restored.kind,
             context_used: restored.context_used,
         }));
-        let (control, control_rx) = mpsc::unbounded_channel();
         let notify = Arc::new(Notify::new());
         let agent_loop = AgentLoop {
             inference_session,
@@ -683,7 +694,7 @@ async fn code_mode_tool_body(
     call: &ToolCall,
 ) -> ToolOutput {
     if call.name.as_str() == rho_code_mode::EXEC_TOOL_NAME {
-        return session.execute(&call.arguments).await;
+        return session.execute(call.id.clone(), &call.arguments).await;
     }
     match serde_json::from_str::<rho_code_mode::WaitArgs>(&call.arguments) {
         Ok(args) => session.wait(args).await,
@@ -730,11 +741,12 @@ fn start_code_mode(
     enabled: bool,
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
+    control: mpsc::UnboundedSender<AgentControl>,
 ) -> Option<Arc<rho_code_mode::CodeModeSession>> {
     if !enabled {
         return None;
     }
-    match code_mode::start_session(shell_tools, multi_agent) {
+    match code_mode::start_session(shell_tools, multi_agent, control) {
         Ok(session) => Some(Arc::new(session)),
         Err(error) => {
             eprintln!("rho-agent: code mode unavailable, using direct tools: {error}");
@@ -758,6 +770,9 @@ enum AgentControl {
     Compact {
         delivery: MessageDelivery,
     },
+    /// An extra output for an in-flight tool call (code-mode `notify(...)`).
+    /// Dropped when no turn is active, matching Codex.
+    ToolUpdate(ToolUpdate),
     SetDeepConfig(DeepConfig, DeepModel),
     Rewind {
         turns: u32,
@@ -859,6 +874,24 @@ impl AgentLoop {
                                 | AgentStateKind::UnfinishedTurn { .. } => {}
                             }
                             self.maybe_resolve_wait(&mut state).await;
+                        }
+                        AgentControl::ToolUpdate(update) => {
+                            // Only meaningful mid-turn: the call it annotates
+                            // must reach the provider in this turn's timeline.
+                            // With no active turn the update is dropped
+                            // (Codex: notify fails with "no active turn").
+                            if matches!(
+                                state.kind,
+                                AgentStateKind::ApiStreaming { .. }
+                                    | AgentStateKind::ToolCalling { .. }
+                            ) {
+                                let item = QueuedItem {
+                                    kind: QueuedItemKind::ToolUpdate(update),
+                                    delivery: MessageDelivery::NextRequest,
+                                };
+                                self.persist_event(AgentEvent::Queued(item.clone())).await;
+                                state.queued_inputs.push(item);
+                            }
                         }
                         AgentControl::Cancel => {
                             self.inference_session.abort();
@@ -1134,7 +1167,22 @@ impl AgentLoop {
                                             eprintln!("rho-agent: snapshot failed: {error:#}");
                                         }
                                     });
-                                    if !state.queued_inputs.is_empty() {
+                                    // Leftover tool updates alone must not
+                                    // start a turn: with nothing else queued,
+                                    // drop them (persisted, so replay ends
+                                    // with the same empty queue). Alongside
+                                    // real inputs they deliver as usual.
+                                    if state
+                                        .queued_inputs
+                                        .iter()
+                                        .all(|item| matches!(item.kind, QueuedItemKind::ToolUpdate(_)))
+                                    {
+                                        if !state.queued_inputs.is_empty() {
+                                            self.persist_event(AgentEvent::QueueCleared).await;
+                                            state.queued_inputs.clear();
+                                        }
+                                        state.kind = AgentStateKind::Idle;
+                                    } else {
                                         self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                             .await;
                                         self.send_request(&state);
@@ -1142,8 +1190,6 @@ impl AgentLoop {
                                             pending_response: PendingInferenceResponse::default(),
                                             previous_attempt: None,
                                         };
-                                    } else {
-                                        state.kind = AgentStateKind::Idle;
                                     }
                                 } else {
                                     let mut previews = BTreeMap::new();
@@ -1682,6 +1728,27 @@ mod tests {
     }
 
     #[test]
+    fn queued_tool_update_replays_into_context() {
+        let update = ToolUpdate {
+            call_id: ToolCallId::try_from("exec-1").unwrap(),
+            tool_type: rho_core::ToolType::Custom,
+            output: Arc::new("progress".to_owned()),
+            at: UnixMs(0),
+        };
+        let restored = restore_events(vec![
+            AgentEvent::Queued(QueuedItem {
+                kind: QueuedItemKind::ToolUpdate(update.clone()),
+                delivery: MessageDelivery::NextRequest,
+            }),
+            AgentEvent::Dequeued {
+                boundary: MessageDelivery::NextRequest,
+            },
+        ]);
+        assert_eq!(*restored.blocks[0], ContextBlock::ToolUpdate(update));
+        assert!(restored.queued_inputs.is_empty());
+    }
+
+    #[test]
     fn undelivered_queue_survives_restore() {
         let restored = restore_events(vec![queued_event(
             MessageSender::Agent { id: agent_id(2) },
@@ -1714,7 +1781,7 @@ mod tests {
                 let ContentPart::Text { text } = &content[0];
                 text.clone()
             }
-            QueuedItemKind::Compaction => unreachable!(),
+            QueuedItemKind::Compaction | QueuedItemKind::ToolUpdate(_) => unreachable!(),
         };
         let mut queue = InputQueues::default();
         queue.push(item("steer", MessageDelivery::NextRequest));
