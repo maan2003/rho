@@ -132,24 +132,56 @@ impl AgentRegistry {
         else {
             return false;
         };
-        if topic
-            .agents
-            .iter()
-            .find(|agent| agent.agent_id == agent_id)
-            .is_some_and(|agent| agent.hidden)
-        {
-            return true;
+        let topic_ids = topic.agent_ids().collect::<BTreeSet<_>>();
+        let mut root_id = agent_id;
+        let mut lineage = BTreeSet::new();
+        while lineage.insert(root_id) {
+            let Some(agent) = topic.agents.iter().find(|agent| agent.agent_id == root_id) else {
+                break;
+            };
+            if agent.hidden {
+                return true;
+            }
+            let Some(parent) = agent
+                .parent_agent
+                .filter(|parent| topic_ids.contains(parent))
+            else {
+                break;
+            };
+            root_id = parent;
         }
-        if self.attention(agent_id) != rho_ui_proto::UiAttention::Quiet
-            || self.agent_status(agent_id) == rho_ui_proto::Status::Pinned
-            || self.selected_agent() == Some(&agent_id)
+        let selected_root = self.selected_agent().map(|selected| {
+            let mut selected_root = *selected;
+            let mut seen = BTreeSet::new();
+            while seen.insert(selected_root) {
+                let Some(parent) = topic
+                    .agents
+                    .iter()
+                    .find(|agent| agent.agent_id == selected_root)
+                    .and_then(|agent| agent.parent_agent)
+                    .filter(|parent| topic_ids.contains(parent))
+                else {
+                    break;
+                };
+                selected_root = parent;
+            }
+            selected_root
+        });
+        if self.attention(root_id) != rho_ui_proto::UiAttention::Quiet
+            || self.agent_status(root_id) == rho_ui_proto::Status::Pinned
+            || selected_root == Some(root_id)
         {
             return false;
         }
-        !self.top_bucket(topic.agents.iter()).contains(&agent_id)
-            && !self
-                .extra_bucket(topic.agents.iter(), 5)
-                .contains(&agent_id)
+        let roots = || {
+            topic.agents.iter().filter(|agent| {
+                !agent
+                    .parent_agent
+                    .is_some_and(|parent| topic_ids.contains(&parent))
+            })
+        };
+        !self.top_bucket(roots()).contains(&root_id)
+            && !self.extra_bucket(roots(), 5).contains(&root_id)
     }
 
     /// The rail-visible agent most in need of the user, excluding the one
@@ -337,7 +369,12 @@ impl AgentRegistry {
         topic: &UiTopic,
         mut agents: Vec<&'a rho_ui_proto::UiAgentSummary>,
     ) -> Vec<&'a rho_ui_proto::UiAgentSummary> {
-        let top_bucket = self.top_bucket(agents.iter().copied());
+        let topic_ids = topic.agent_ids().collect::<BTreeSet<_>>();
+        let top_bucket = self.top_bucket(agents.iter().copied().filter(|agent| {
+            !agent
+                .parent_agent
+                .is_some_and(|parent| topic_ids.contains(&parent))
+        }));
         agents.sort_by_key(|agent| {
             (
                 agent.status != rho_ui_proto::Status::Pinned,
@@ -346,7 +383,6 @@ impl AgentRegistry {
             )
         });
 
-        let topic_ids = topic.agent_ids().collect::<BTreeSet<_>>();
         let visible_ids = agents
             .iter()
             .map(|agent| agent.agent_id)
