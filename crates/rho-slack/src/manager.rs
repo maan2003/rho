@@ -400,7 +400,7 @@ impl SlackManager {
                     .pool
                     .create(
                         self.topic_id,
-                        AgentMode::Terra(DeepConfig {
+                        AgentMode::Coordinator(DeepConfig {
                             effort: DeepEffort::Medium,
                             fast_mode: true,
                             code_mode: true,
@@ -478,11 +478,8 @@ impl SlackManager {
         if is_new {
             text.push_str(
                 "\n\n(This conversation comes from a Slack thread; your final \
-                 response each turn is posted back to it. You are running in \
-                 the configured Slack coordinator repository; do not switch \
-                 repositories in-place. For repo-specific work elsewhere, \
-                 delegate with spawn_agent using workspace=new and an explicit \
-                 repo path. Keep responses concise and self-contained.)",
+                 response each turn is posted back to it. Keep responses \
+                 concise and self-contained.)",
             );
         }
         text

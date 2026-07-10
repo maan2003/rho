@@ -1026,7 +1026,8 @@ impl Workspace {
             AgentMode::Deep(mut config)
             | AgentMode::Sol(mut config)
             | AgentMode::Luna(mut config)
-            | AgentMode::Terra(mut config) => {
+            | AgentMode::Terra(mut config)
+            | AgentMode::Coordinator(mut config) => {
                 config.effort = effort;
                 mode.with_deep_config(config)
             }
@@ -1488,12 +1489,14 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
         || (code_mode && !matches!(kind.as_str(), "deep" | "sol" | "luna" | "terra"))
     {
         return Err(
-            "mode must be `deep|sol|luna|terra [low|medium|xhigh] [code]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
+            "mode must be `deep|sol|luna|terra [low|medium|xhigh] [code]`, `coordinator [low|medium|xhigh]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
                 .to_owned(),
         );
     }
     match kind.as_str() {
-        "deep" | "sol" | "luna" | "terra" => {
+        // Coordinator is terra plus the coordinator prompt; code mode is part
+        // of its definition, not a suffix.
+        "deep" | "sol" | "luna" | "terra" | "coordinator" => {
             let config = DeepConfig {
                 effort: match effort.as_str() {
                     "low" => DeepEffort::Low,
@@ -1506,12 +1509,13 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
                     }
                 },
                 fast_mode: true,
-                code_mode,
+                code_mode: code_mode || kind == "coordinator",
             };
             Ok(match kind.as_str() {
                 "sol" => AgentMode::Sol(config),
                 "luna" => AgentMode::Luna(config),
                 "terra" => AgentMode::Terra(config),
+                "coordinator" => AgentMode::Coordinator(config),
                 _ => AgentMode::Deep(config),
             })
         }
@@ -1538,7 +1542,7 @@ fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
             },
         }),
         _ => Err(format!(
-            "unknown mode `{kind}`; use deep, sol, luna, terra, fable, or opus"
+            "unknown mode `{kind}`; use deep, sol, luna, terra, coordinator, fable, or opus"
         )),
     }
 }
@@ -1572,6 +1576,8 @@ fn cycle_agent_mode_text(current: &str) -> &'static str {
             ..
         }) => "fable medium",
         AgentMode::Terra(_) => "terra xhigh",
+        // Coordinator is not part of the cycle; step back into it.
+        AgentMode::Coordinator(_) => "fable medium",
         AgentMode::Fable {
             effort: FableEffort::Medium,
         } => "fable xhigh",
@@ -1597,11 +1603,13 @@ fn agent_mode_label(mode: AgentMode) -> ModeLabel {
         AgentMode::Deep(config)
         | AgentMode::Sol(config)
         | AgentMode::Luna(config)
-        | AgentMode::Terra(config) => {
+        | AgentMode::Terra(config)
+        | AgentMode::Coordinator(config) => {
             let name = match mode {
                 AgentMode::Sol(_) => "sol",
                 AgentMode::Luna(_) => "luna",
                 AgentMode::Terra(_) => "terra",
+                AgentMode::Coordinator(_) => "coord",
                 _ => "deep",
             };
             let effort = match config.effort {
@@ -1799,6 +1807,15 @@ mod tests {
                 effort: OpusEffort::Xhigh,
             }
         );
+        assert_eq!(
+            parse_agent_mode("coordinator").unwrap(),
+            AgentMode::Coordinator(DeepConfig {
+                effort: DeepEffort::Medium,
+                fast_mode: true,
+                code_mode: true,
+            })
+        );
+        assert!(parse_agent_mode("coordinator medium code").is_err());
         assert!(parse_agent_mode("fable low").is_err());
         assert!(parse_agent_mode("opus low").is_err());
         assert!(parse_agent_mode("sonnet medium").is_err());

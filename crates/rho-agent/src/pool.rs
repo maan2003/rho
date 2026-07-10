@@ -163,7 +163,11 @@ impl AgentPool {
         parent: Option<AgentId>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let (agent_id, agent) = match mode {
-            AgentMode::Deep(_) | AgentMode::Sol(_) | AgentMode::Luna(_) | AgentMode::Terra(_) => {
+            AgentMode::Deep(_)
+            | AgentMode::Sol(_)
+            | AgentMode::Luna(_)
+            | AgentMode::Terra(_)
+            | AgentMode::Coordinator(_) => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
                     self.auth.clone(),

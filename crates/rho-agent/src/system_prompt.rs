@@ -4,11 +4,13 @@ use crate::multi_agent_tools::MultiAgentTools;
 
 /// `multi_agent` is set for pooled agents, which get the multi-agent tools and
 /// the section explaining them. `code_mode` is set when the agent's tool
-/// surface is the code-mode `exec`/`wait` pair.
+/// surface is the code-mode `exec`/`wait` pair. `coordinator` is set for
+/// coordinator-mode agents, which get the cross-repo delegation section.
 pub fn prompt(
     workspace: &rho_workspaces::Workspace,
     multi_agent: Option<&MultiAgentTools>,
     code_mode: bool,
+    coordinator: bool,
 ) -> Arc<str> {
     let working_directory = workspace.repo();
     let workspace_name = workspace.info().workspace_name();
@@ -93,9 +95,32 @@ needed for the task.
         )
     });
     let code_mode = if code_mode { CODE_MODE_PROMPT } else { "" };
+    let coordinator = if coordinator { COORDINATOR_PROMPT } else { "" };
     let environment = render_environment_prompt(working_directory.as_str());
-    format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{multi_agent}{environment}").into()
+    format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{multi_agent}{coordinator}{environment}")
+        .into()
 }
+
+const COORDINATOR_PROMPT: &str = "## Coordinator
+
+You are the user-facing coordinator for work that may span several agents and \
+repositories. For each request, understand what the user wants, then decide: \
+answer or handle small work locally, or delegate bounded repo-specific tasks \
+to worker agents.
+
+You run in your configured repository; it supplies your AGENTS.md guidance and \
+skills. Do not switch repositories in-place. For work in another repository, \
+spawn a worker with `workspace=new` and `repo=<absolute path>`; infer the repo \
+from the request instead of asking the user to pick one up front. Give each \
+worker a complete, self-contained task prompt; the worker owns repo-local \
+implementation details.
+
+While workers run, continue other useful work; their results arrive as agent \
+mail. Do not delegate what you can answer or do directly. Synthesize worker \
+results into concise outcomes for the user, and never claim work is done \
+before the responsible worker reports it.
+
+";
 
 const CODE_MODE_PROMPT: &str = "## Code Mode
 
@@ -337,6 +362,15 @@ mod tests {
         assert!(prompt.contains("user's checkout"));
         assert!(prompt.contains("current working-copy commit is `@`"));
         assert!(prompt.contains("no separate jj workspace id"));
+    }
+
+    #[test]
+    fn coordinator_guidance_is_coordinator_mode_only() {
+        assert!(!BASE_PROMPT.contains("## Coordinator"));
+        assert!(COORDINATOR_PROMPT.contains("## Coordinator"));
+        assert!(COORDINATOR_PROMPT.contains("`workspace=new` and `repo=<absolute path>`"));
+        assert!(COORDINATOR_PROMPT.contains("Do not switch repositories in-place"));
+        assert!(COORDINATOR_PROMPT.contains("never claim work is done"));
     }
 
     #[test]

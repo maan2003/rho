@@ -152,13 +152,14 @@ fn spawn_agent_spec() -> ToolSpec {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["fable", "fable-xhigh", "gpt-5.5", "gpt-5.5-xhigh", "sol", "luna", "terra"],
+                    "enum": ["fable", "fable-xhigh", "gpt-5.5", "gpt-5.5-xhigh", "sol", "luna", "terra", "coordinator"],
                     "description": "Required child mode. Use \"fable\" for hard tasks that \
                                     require human-like judgement; use \"gpt-5.5\" for normal fast \
                                     coding/research sub-tasks. Use \"fable-xhigh\" or \
                                     \"gpt-5.5-xhigh\" when the task needs extra reasoning. \
                                     \"sol\", \"luna\", and \"terra\" are the gpt-5.6 \
-                                    frontier agentic coding models."
+                                    frontier agentic coding models. \"coordinator\" is terra \
+                                    set up to coordinate work across agents and repositories."
                 }
             }
         }),
@@ -352,9 +353,14 @@ pub fn parse_spawn_mode(mode: &str) -> anyhow::Result<AgentMode> {
             fast_mode: true,
             code_mode: false,
         })),
+        "coordinator" => Ok(AgentMode::Coordinator(DeepConfig {
+            effort: DeepEffort::Medium,
+            fast_mode: true,
+            code_mode: true,
+        })),
         _ => anyhow::bail!(
             "unsupported mode {mode:?}; expected fable, fable-xhigh, gpt-5.5, gpt-5.5-xhigh, sol, \
-             luna, or terra"
+             luna, terra, or coordinator"
         ),
     }
 }
@@ -515,6 +521,14 @@ mod tests {
                 effort: DeepEffort::Medium,
                 fast_mode: true,
                 code_mode: false,
+            })
+        );
+        assert_eq!(
+            parse_spawn_mode("coordinator").unwrap(),
+            AgentMode::Coordinator(DeepConfig {
+                effort: DeepEffort::Medium,
+                fast_mode: true,
+                code_mode: true,
             })
         );
         assert!(parse_spawn_mode("opus").is_err());

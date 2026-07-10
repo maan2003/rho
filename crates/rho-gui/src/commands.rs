@@ -121,26 +121,35 @@ pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
         .is_none_or(char::is_whitespace);
     let words = trimmed.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() || (words.len() == 1 && !typing_new_token) {
-        return ["deep", "sol", "luna", "terra", "fable", "opus"]
-            .into_iter()
-            .filter(|mode| fuzzy_contains(mode, token))
-            .map(|mode| Candidate {
-                value: mode.to_owned(),
-                description: match mode {
-                    "deep" => "rho deep agent (gpt-5.5)".to_owned(),
-                    "sol" => "rho deep agent (gpt-5.6-sol)".to_owned(),
-                    "luna" => "rho deep agent (gpt-5.6-luna)".to_owned(),
-                    "terra" => "rho deep agent (gpt-5.6-terra)".to_owned(),
-                    "fable" => "Claude Fable agent".to_owned(),
-                    "opus" => "Claude Opus agent".to_owned(),
-                    _ => unreachable!(),
-                },
-            })
-            .collect();
+        return [
+            "deep",
+            "sol",
+            "luna",
+            "terra",
+            "coordinator",
+            "fable",
+            "opus",
+        ]
+        .into_iter()
+        .filter(|mode| fuzzy_contains(mode, token))
+        .map(|mode| Candidate {
+            value: mode.to_owned(),
+            description: match mode {
+                "deep" => "rho deep agent (gpt-5.5)".to_owned(),
+                "sol" => "rho deep agent (gpt-5.6-sol)".to_owned(),
+                "luna" => "rho deep agent (gpt-5.6-luna)".to_owned(),
+                "terra" => "rho deep agent (gpt-5.6-terra)".to_owned(),
+                "coordinator" => "cross-repo coordinator (terra, code mode)".to_owned(),
+                "fable" => "Claude Fable agent".to_owned(),
+                "opus" => "Claude Opus agent".to_owned(),
+                _ => unreachable!(),
+            },
+        })
+        .collect();
     }
 
     let efforts: &[(&str, &str)] = match words.first().copied() {
-        Some("deep" | "sol" | "luna" | "terra") => &[
+        Some("deep" | "sol" | "luna" | "terra" | "coordinator") => &[
             ("low", "low effort"),
             ("medium", "medium effort"),
             ("xhigh", "extra-high effort"),

@@ -260,11 +260,13 @@ fn mode_name(mode: AgentMode) -> String {
         AgentMode::Deep(config)
         | AgentMode::Sol(config)
         | AgentMode::Luna(config)
-        | AgentMode::Terra(config) => {
+        | AgentMode::Terra(config)
+        | AgentMode::Coordinator(config) => {
             let name = match mode {
                 AgentMode::Sol(_) => "sol",
                 AgentMode::Luna(_) => "luna",
                 AgentMode::Terra(_) => "terra",
+                AgentMode::Coordinator(_) => "coordinator",
                 _ => "deep",
             };
             let fast = if config.fast_mode { " ⚡" } else { "" };

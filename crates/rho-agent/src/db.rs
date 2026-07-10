@@ -190,13 +190,21 @@ pub enum AgentRuntime {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum AgentMode {
     Deep(DeepConfig),
-    Fable { effort: FableEffort },
-    Opus { effort: OpusEffort },
+    Fable {
+        effort: FableEffort,
+    },
+    Opus {
+        effort: OpusEffort,
+    },
     // gpt-5.6 deep modes; appended after Deep so persisted modes keep
     // decoding.
     Sol(DeepConfig),
     Luna(DeepConfig),
     Terra(DeepConfig),
+    /// Terra with a coordinator system-prompt section: a user-facing agent
+    /// that delegates repo-specific work to spawned workers. Appended so
+    /// persisted modes keep decoding.
+    Coordinator(DeepConfig),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -218,9 +226,11 @@ impl AgentMode {
 
     pub fn deep_config(self) -> Option<DeepConfig> {
         match self {
-            Self::Deep(config) | Self::Sol(config) | Self::Luna(config) | Self::Terra(config) => {
-                Some(config)
-            }
+            Self::Deep(config)
+            | Self::Sol(config)
+            | Self::Luna(config)
+            | Self::Terra(config)
+            | Self::Coordinator(config) => Some(config),
             Self::Fable { .. } | Self::Opus { .. } => None,
         }
     }
@@ -230,7 +240,7 @@ impl AgentMode {
             Self::Deep(_) => Some(DeepModel::Gpt55),
             Self::Sol(_) => Some(DeepModel::Gpt56Sol),
             Self::Luna(_) => Some(DeepModel::Gpt56Luna),
-            Self::Terra(_) => Some(DeepModel::Gpt56Terra),
+            Self::Terra(_) | Self::Coordinator(_) => Some(DeepModel::Gpt56Terra),
             Self::Fable { .. } | Self::Opus { .. } => None,
         }
     }
@@ -242,6 +252,7 @@ impl AgentMode {
             Self::Sol(_) => Self::Sol(config),
             Self::Luna(_) => Self::Luna(config),
             Self::Terra(_) => Self::Terra(config),
+            Self::Coordinator(_) => Self::Coordinator(config),
             Self::Fable { .. } | Self::Opus { .. } => self,
         }
     }
@@ -250,7 +261,11 @@ impl AgentMode {
         match self {
             Self::Fable { .. } => Some(rho_claude::Model::Fable),
             Self::Opus { .. } => Some(rho_claude::Model::Opus),
-            Self::Deep(_) | Self::Sol(_) | Self::Luna(_) | Self::Terra(_) => None,
+            Self::Deep(_)
+            | Self::Sol(_)
+            | Self::Luna(_)
+            | Self::Terra(_)
+            | Self::Coordinator(_) => None,
         }
     }
 
@@ -258,12 +273,20 @@ impl AgentMode {
         match self {
             Self::Fable { effort } => Some(effort.to_claude_effort()),
             Self::Opus { effort } => Some(effort.to_claude_effort()),
-            Self::Deep(_) | Self::Sol(_) | Self::Luna(_) | Self::Terra(_) => None,
+            Self::Deep(_)
+            | Self::Sol(_)
+            | Self::Luna(_)
+            | Self::Terra(_)
+            | Self::Coordinator(_) => None,
         }
     }
 
     pub fn is_claude(self) -> bool {
         matches!(self, Self::Fable { .. } | Self::Opus { .. })
+    }
+
+    pub fn is_coordinator(self) -> bool {
+        matches!(self, Self::Coordinator(_))
     }
 }
 
