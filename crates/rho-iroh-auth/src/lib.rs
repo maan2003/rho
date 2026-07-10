@@ -5,9 +5,11 @@
 //! client helper for displaying the enrollment code.
 
 mod client;
+#[cfg(feature = "server")]
 mod server;
 mod shared;
 
 pub use client::EnrollmentCodeExt;
+#[cfg(feature = "server")]
 pub use server::{ApproveError, IrohAuth};
 pub use shared::{EnrollmentCode, ParseEnrollmentCodeError};

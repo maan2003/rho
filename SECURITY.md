@@ -45,6 +45,32 @@ AI APIs.
   import path in Rho. GitHub API responses and errors are remote, semi-trusted
   input and are returned to the calling command rather than panicking.
 
+## Remote UI transports (iroh and web UI)
+
+- With `rho daemon --iroh`, the daemon serves the full UI protocol over iroh
+  (relay-backed QUIC). An enrolled client is fully privileged: everything a
+  local UI client can do, including starting agents that run shell commands.
+  Trust is per client endpoint key, persisted in the local rho database, and
+  granted only by a local user running `rho iroh approve <code>` against the
+  Unix socket; codes are 60-bit, single-use, expire after a minute, and bind
+  the exact client key via a TLS exporter, so approval cannot be replayed or
+  redirected. The daemon's iroh secret key lives owner-readable-only in the
+  rho state directory. Enrollment approval is also accepted from already
+  trusted remote clients (they are fully privileged anyway).
+- The web UI (a static Leptos/wasm page in `webui/`, hostable anywhere) is
+  an iroh client like any other: it connects to the same endpoint on its own
+  ALPN and passes the same per-key enrollment before the daemon serves it.
+  Its session is a reduced JSON command set (list/select agents, send
+  message, new agent in a registered workdir, cancel turn) bridged onto a
+  normal in-process UI protocol session; it grants nothing the full UI
+  protocol does not. The page holds no secrets beyond the browser's own
+  iroh key (kept in local storage, useless without enrollment) and sends
+  only user-authored text.
+- Inbound data on both ALPNs is remote, semi-trusted input: oversized UI
+  protocol frames are rejected (`MAX_FRAME_LEN`), web UI JSON lines are
+  length-bounded (`MAX_LINE_LEN`), malformed frames end the connection, and
+  malformed browser JSON produces an error message, never a panic.
+
 ## Runtime assumptions
 
 - Runtime code is primarily Tokio async Rust plus local CLI/TUI code.

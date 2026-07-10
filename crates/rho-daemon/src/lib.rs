@@ -133,19 +133,11 @@ pub struct DaemonArgs {
     /// Exit once the last UI client disconnects.
     #[arg(long = "die-on-detached")]
     pub die_on_detached: bool,
-    /// Also listen for UI clients over iroh (relay-backed). Remote clients
-    /// must be enrolled once via `rho iroh approve <code>` on this machine.
+    /// Also listen for UI clients (including the web UI) over iroh
+    /// (relay-backed). Remote clients must be enrolled once via
+    /// `rho iroh approve <code>` on this machine.
     #[arg(long = "iroh")]
     pub iroh: bool,
-    /// Serve the web UI WebSocket endpoint on this local address
-    /// (e.g. 127.0.0.1:9190). The endpoint is unauthenticated; do not bind
-    /// it beyond localhost.
-    #[arg(long = "webui")]
-    pub webui: Option<String>,
-    /// Only accept web UI WebSocket connections from this browser origin
-    /// (e.g. https://example.github.io). Unset accepts any origin.
-    #[arg(long = "webui-origin")]
-    pub webui_origin: Option<String>,
     #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
@@ -204,25 +196,16 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     if let Some((secret, iroh_auth)) = iroh {
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret)
-            .alpns(vec![rho_ui_proto::IROH_ALPN.to_vec()])
+            .alpns(vec![
+                rho_ui_proto::IROH_ALPN.to_vec(),
+                rho_webui_messages::ALPN.to_vec(),
+            ])
             .hooks(iroh_auth)
             .bind()
             .await
             .context("bind iroh endpoint")?;
         eprintln!("rho daemon iroh endpoint: {}", endpoint.id());
         tokio::spawn(run_iroh_listener(agents.clone(), endpoint));
-    }
-
-    if let Some(addr) = &args.webui {
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("bind web UI listener on {addr}"))?;
-        eprintln!("rho web UI socket on ws://{addr}/ws");
-        tokio::spawn(webui::serve(
-            listener,
-            agents.clone(),
-            args.webui_origin.clone(),
-        ));
     }
 
     // Attention watchers: one per loaded agent, daemon-owned (not tied to
@@ -336,7 +319,9 @@ fn load_or_create_iroh_secret(path: &std::path::Path) -> anyhow::Result<iroh::Se
 }
 
 /// Accepts enrolled iroh connections ([`rho_iroh_auth::IrohAuth`] gates them
-/// before they reach here) and serves one UI protocol session per bi-stream.
+/// before they reach here) and serves one session per bi-stream: the full UI
+/// protocol on [`rho_ui_proto::IROH_ALPN`], the web UI JSON protocol on
+/// [`rho_webui_messages::ALPN`].
 async fn run_iroh_listener(agents: Arc<AgentRegistry>, endpoint: iroh::Endpoint) {
     while let Some(incoming) = endpoint.accept().await {
         let agents = agents.clone();
@@ -348,13 +333,17 @@ async fn run_iroh_listener(agents: Arc<AgentRegistry>, endpoint: iroh::Endpoint)
                     return;
                 }
             };
+            let webui = connection.alpn() == rho_webui_messages::ALPN;
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let agents = agents.clone();
                 tokio::spawn(async move {
-                    let counters = rho_ui_proto::IoCounters::default();
-                    if let Err(error) =
+                    let result = if webui {
+                        webui::serve_json_session(agents, recv, send).await
+                    } else {
+                        let counters = rho_ui_proto::IoCounters::default();
                         serve_connection_io(agents, recv, send, counters, None).await
-                    {
+                    };
+                    if let Err(error) = result {
                         eprintln!("rho daemon iroh connection error: {error:#}");
                     }
                 });

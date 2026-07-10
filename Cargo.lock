@@ -10448,7 +10448,6 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
- "futures-util",
  "iroh",
  "octo",
  "prefix-id",
@@ -10461,12 +10460,12 @@ dependencies = [
  "rho-slack",
  "rho-ui-proto",
  "rho-voice",
+ "rho-webui-messages",
  "rho-workspaces",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "url",
 ]
@@ -10645,6 +10644,14 @@ dependencies = [
  "tokio-tungstenite",
  "ureq",
  "url",
+]
+
+[[package]]
+name = "rho-webui-messages"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

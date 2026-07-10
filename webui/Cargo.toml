@@ -1,0 +1,33 @@
+# Standalone workspace: this crate targets wasm32-unknown-unknown and is
+# built with trunk into a static bundle (`webui/dist/`), hostable anywhere.
+[workspace]
+
+[package]
+name = "rho-webui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+console_error_panic_hook = "0.1"
+futures = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+iroh = { version = "1.0.2", default-features = false, features = ["tls-ring"] }
+leptos = { version = "0.8", features = ["csr"] }
+rho-iroh-auth = { path = "../crates/rho-iroh-auth", default-features = false }
+rho-webui-messages = { path = "../crates/rho-webui-messages" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+  "CssStyleDeclaration",
+  "HtmlTextAreaElement",
+  "Location",
+  "Storage",
+  "Window",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true

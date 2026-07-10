@@ -1,131 +1,30 @@
-//! JSON vocabulary between the daemon and the browser page.
-//!
-//! Deliberately smaller than the UI protocol: string agent ids, coarse
-//! status/attention labels, and bounded tool output so a long-running agent
-//! cannot flood the browser.
+//! Projection from UI protocol state to the [`rho_webui_messages`]
+//! vocabulary: string agent ids, coarse status/attention labels, and bounded
+//! tool output so a long-running agent cannot flood the browser.
 
 use rho_ui_proto::remote::{UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiToolStatus};
 use rho_ui_proto::{AgentMode, UiAttention, UiTopic, UiWorkdir};
-use serde::{Deserialize, Serialize};
+use rho_webui_messages::{AgentState, AgentSummary, Block, ToBrowser, Topic, Workdir};
 
 /// Longest tool output/error forwarded to the browser, in bytes.
 const TOOL_TEXT_LIMIT: usize = 16 * 1024;
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToBrowser {
-    Hello {
-        topics: Vec<TopicJson>,
-        workdirs: Vec<WorkdirJson>,
-    },
-    Agent {
-        agent_id: String,
-        state: AgentStateJson,
-    },
-    AgentCreated {
-        agent_id: String,
-    },
-    Error {
-        message: String,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum FromBrowser {
-    /// Focus an agent: the daemon loads it and starts forwarding its state.
-    Select {
-        agent_id: String,
-    },
-    Send {
-        agent_id: String,
-        text: String,
-    },
-    NewAgent {
-        repo: String,
-        text: String,
-    },
-    Cancel {
-        agent_id: String,
-    },
-}
-
-#[derive(Debug, Serialize)]
-pub struct TopicJson {
-    pub name: String,
-    pub agents: Vec<AgentSummaryJson>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AgentSummaryJson {
-    pub id: String,
-    pub name: String,
-    pub mode: &'static str,
-    pub attention: &'static str,
-    pub hidden: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct WorkdirJson {
-    pub path: String,
-    pub name: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AgentStateJson {
-    pub status: &'static str,
-    pub context_used: Option<u64>,
-    pub blocks: Vec<BlockJson>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BlockJson {
-    User {
-        text: String,
-    },
-    Assistant {
-        text: String,
-        final_answer: bool,
-    },
-    Reasoning {
-        text: String,
-    },
-    Tool {
-        name: String,
-        preview: Option<String>,
-        status: &'static str,
-        output: Option<String>,
-        error: Option<String>,
-    },
-    Notice {
-        text: String,
-    },
-    Queued {
-        text: String,
-    },
-    AgentMessage {
-        sender: String,
-        text: String,
-    },
-}
 
 pub fn hello(topics: &[UiTopic], workdirs: &[UiWorkdir]) -> ToBrowser {
     ToBrowser::Hello {
         topics: topics
             .iter()
-            .map(|topic| TopicJson {
+            .map(|topic| Topic {
                 name: topic.name.clone(),
                 agents: topic
                     .agents
                     .iter()
                     .map(|agent| {
                         let id = agent.agent_id.encoded();
-                        AgentSummaryJson {
+                        AgentSummary {
                             name: agent.display_name.clone().unwrap_or_else(|| id.clone()),
                             id,
-                            mode: mode_label(agent.mode),
-                            attention: attention_label(agent.attention),
+                            mode: mode_label(agent.mode).to_owned(),
+                            attention: attention_label(agent.attention).to_owned(),
                             hidden: agent.hidden,
                         }
                     })
@@ -134,7 +33,7 @@ pub fn hello(topics: &[UiTopic], workdirs: &[UiWorkdir]) -> ToBrowser {
             .collect(),
         workdirs: workdirs
             .iter()
-            .map(|workdir| WorkdirJson {
+            .map(|workdir| Workdir {
                 path: workdir.path.to_string(),
                 name: workdir.name.clone(),
             })
@@ -142,30 +41,30 @@ pub fn hello(topics: &[UiTopic], workdirs: &[UiWorkdir]) -> ToBrowser {
     }
 }
 
-pub fn agent_state(state: &UiAgentState) -> AgentStateJson {
-    AgentStateJson {
-        status: status_label(&state.status),
+pub fn agent_state(state: &UiAgentState) -> AgentState {
+    AgentState {
+        status: status_label(&state.status).to_owned(),
         context_used: state.context_used,
         blocks: state.blocks.iter().map(block).collect(),
     }
 }
 
-fn block(block: &UiBlock) -> BlockJson {
+fn block(block: &UiBlock) -> Block {
     match block {
-        UiBlock::UserMessage { text } => BlockJson::User { text: text.clone() },
-        UiBlock::AssistantMessage { text, phase } => BlockJson::Assistant {
+        UiBlock::UserMessage { text } => Block::User { text: text.clone() },
+        UiBlock::AssistantMessage { text, phase } => Block::Assistant {
             text: text.clone(),
             final_answer: matches!(phase, Some(UiMessagePhase::FinalAnswer)),
         },
-        UiBlock::Reasoning { text } => BlockJson::Reasoning { text: text.clone() },
-        UiBlock::Tool(tool) => BlockJson::Tool {
+        UiBlock::Reasoning { text } => Block::Reasoning { text: text.clone() },
+        UiBlock::Tool(tool) => Block::Tool {
             name: tool.name.clone(),
             preview: tool
                 .preview
                 .clone()
                 .or_else(|| Some(tool.arguments.clone()).filter(|args| !args.is_empty()))
                 .map(|text| truncate(text, TOOL_TEXT_LIMIT)),
-            status: tool_status_label(tool.status),
+            status: tool_status_label(tool.status).to_owned(),
             output: tool
                 .output
                 .clone()
@@ -175,9 +74,9 @@ fn block(block: &UiBlock) -> BlockJson {
                 .clone()
                 .map(|text| truncate(text, TOOL_TEXT_LIMIT)),
         },
-        UiBlock::Notice { text } => BlockJson::Notice { text: text.clone() },
-        UiBlock::QueuedMessage { text, .. } => BlockJson::Queued { text: text.clone() },
-        UiBlock::AgentMessage { sender, text } => BlockJson::AgentMessage {
+        UiBlock::Notice { text } => Block::Notice { text: text.clone() },
+        UiBlock::QueuedMessage { text, .. } => Block::Queued { text: text.clone() },
+        UiBlock::AgentMessage { sender, text } => Block::AgentMessage {
             sender: sender.encoded(),
             text: text.clone(),
         },
@@ -247,12 +146,5 @@ mod tests {
         let truncated = truncate(text, 3);
         assert!(truncated.starts_with("aé"));
         assert!(truncated.ends_with("…[truncated]"));
-    }
-
-    #[test]
-    fn from_browser_parses_commands() {
-        let message: FromBrowser =
-            serde_json::from_str(r#"{"type":"send","agent_id":"abc","text":"hi"}"#).unwrap();
-        assert!(matches!(message, FromBrowser::Send { .. }));
     }
 }
