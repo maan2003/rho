@@ -10,13 +10,14 @@ members = [
   "crates/rho-cli-term-raw",
   "crates/rho-code-mode",
   "crates/rho-commands",
+  "crates/rho-context-config",
   "crates/rho-core",
   "crates/rho-daemon",
   "crates/rho-db",
-  "crates/rho-context-config",
   "crates/rho-gui",
-  "crates/rho-iroh-auth",
   "crates/rho-inference",
+  "crates/rho-iroh-auth",
+  "crates/rho-slack",
   "crates/rho-term-screen",
   "crates/rho-tool-shell",
   "crates/rho-ui-proto",
@@ -52,28 +53,34 @@ deno_core = "0.407"
 deno_error = "0.7"
 dirs = { version = "6", default-features = false }
 fnv = "1"
-iroh = { version = "1.0.2", default-features = false }
 futures = "0.3"
 futures-util = "0.3"
+iroh = { version = "1.0.2", default-features = false }
 json-stream = { path = "crates/json-stream" }
+libc = "0.2"
 prefix-id = { path = "crates/prefix-id", default-features = false }
 rand = "0.8"
 redb = "4.1.0"
 redb-derive = "0.1.0"
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls-native-roots",
+] }
 rho-agent = { path = "crates/rho-agent" }
 rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
-rho-claude = { path = "crates/rho-claude" }
 rho-ci = { path = "crates/rho-ci" }
+rho-claude = { path = "crates/rho-claude" }
 rho-cli = { path = "crates/rho-cli" }
 rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
 rho-code-mode = { path = "crates/rho-code-mode" }
 rho-commands = { path = "crates/rho-commands" }
+rho-context-config = { path = "crates/rho-context-config" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
-rho-context-config = { path = "crates/rho-context-config" }
 rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
+rho-slack = { path = "crates/rho-slack" }
 rho-term-screen = { path = "crates/rho-term-screen" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }

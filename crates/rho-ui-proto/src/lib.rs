@@ -176,6 +176,11 @@ pub enum ClientMessage {
         self_agent_id: AgentId,
         request: McpAgentToolRequest,
     },
+    /// Install messaging-platform secrets (e.g. Slack tokens) into the
+    /// daemon's RAM-only store and (re)start the platform connection.
+    PlatformSecretsSet {
+        secrets: Vec<(String, String)>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -309,6 +314,10 @@ pub enum ServerMessage {
     },
     Error {
         message: String,
+    },
+    PlatformStatus {
+        running: bool,
+        detail: String,
     },
     Agent {
         agent_id: AgentId,

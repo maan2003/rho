@@ -8,10 +8,10 @@ rust-version = "1.91"
 
 [dependencies]
 iroh.workspace = true
-rho-db.workspace = true
-sha2.workspace = true
 redb.workspace = true
 redb-derive.workspace = true
+rho-db.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

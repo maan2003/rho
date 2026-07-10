@@ -19,10 +19,10 @@ redb.workspace = true
 redb-derive = "0.1"
 rho-claude.workspace = true
 rho-code-mode.workspace = true
+rho-context-config.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
-rho-context-config.workspace = true
 rho-tool-shell.workspace = true
 rho-workspaces.workspace = true
 senax-encoder = { workspace = true, features = ["uuid"] }

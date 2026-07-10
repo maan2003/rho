@@ -245,7 +245,8 @@ impl AgentClient {
                     | ServerMessage::VoiceState { .. }
                     | ServerMessage::VoiceTranscript { .. }
                     | ServerMessage::VoiceUiAction(_)
-                    | ServerMessage::McpAgentToolResult(_) => {}
+                    | ServerMessage::McpAgentToolResult(_)
+                    | ServerMessage::PlatformStatus { .. } => {}
                 }
             }
         });

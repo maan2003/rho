@@ -31,6 +31,7 @@ mod completion;
 mod land;
 mod markdown;
 mod mcp_agent_tools;
+mod slack;
 mod tool_render;
 
 #[cfg(test)]
@@ -81,6 +82,7 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Land(args) => land::run(args).await,
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
+        Command::Slack(args) => slack::run(args).await,
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
             rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
@@ -1134,6 +1136,7 @@ enum Command {
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
     ProtocolLog(ProtocolLogArgs),
+    Slack(SlackArgs),
 }
 
 #[derive(Parser)]
@@ -1161,6 +1164,23 @@ enum CliCommand {
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
     ProtocolLog(ProtocolLogArgs),
+    Slack(SlackArgs),
+}
+
+#[derive(Clone, clap::Args)]
+pub(crate) struct SlackArgs {
+    #[arg(long = "auth", default_value = "default")]
+    auth: String,
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: SlackCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum SlackCommand {
+    /// Install Slack tokens (read from stdin) and connect to Slack.
+    Init,
 }
 
 #[derive(Clone, clap::Args)]
@@ -1212,6 +1232,7 @@ impl Args {
             Some(CliCommand::Land(args)) => Command::Land(args),
             Some(CliCommand::McpAgentTools(args)) => Command::McpAgentTools(args),
             Some(CliCommand::ProtocolLog(args)) => Command::ProtocolLog(args),
+            Some(CliCommand::Slack(args)) => Command::Slack(args),
             None => Command::Chat(cli.chat),
         };
         Ok(Self { command })

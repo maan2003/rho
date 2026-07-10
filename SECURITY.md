@@ -21,6 +21,15 @@ AI APIs.
 - User/repo `AGENTS.md` files and local/project Markdown skills are trusted
   prompt input when discovered. Treat them as useful local guidance, not a
   sandbox or permission boundary.
+- Messaging-platform secrets (e.g. Slack tokens) reach the daemon over the
+  UI socket (`rho slack init` reads them from stdin) — never via argv,
+  exec-time environment, or files. `rho_slack::SecretStore` holds them in a
+  sealed memfd and stashes/reclaims it via the systemd fd store
+  (`FDSTORE=1`/`$LISTEN_FDS`), so tokens never touch disk and survive daemon
+  restarts but not reboots. Token values must not appear in logs or errors.
+  Inbound Slack Socket Mode frames are remote, semi-trusted input: malformed
+  or unexpected frames are skipped, never panicked on, and message text is
+  handed to agents as untrusted user content.
 
 ## Runtime assumptions
 

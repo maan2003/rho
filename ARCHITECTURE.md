@@ -43,6 +43,13 @@ daemon, and the daemon executes parent-scoped spawn, agent mail, interrupt, and
 wait against `AgentPool`. The MCP server must not reach into `rho-core` or
 provider crates.
 
+`rho-slack` is the in-process Slack surface. `SlackManager` is handed the
+daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
+secret storage (`SecretStore`), the Socket Mode reconnect loop, mapping each
+Slack thread to an agent session persisted in rho-db, and posting each
+turn's final answer back to the thread. The daemon only installs secrets
+into it and resumes it from the systemd fd store on startup.
+
 Dependencies should flow from higher-level assembly/policy crates toward lower
 reusable crates. The shared `rho-core` crate must not depend on provider, agent,
 store, tool, or CLI crates.

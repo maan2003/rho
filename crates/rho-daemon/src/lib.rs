@@ -86,6 +86,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .unwrap_or_default(),
     };
     let agents = Arc::new(AgentRegistry::new(db, auth, path_overrides).await);
+    agents.slack.resume_from_fd_store();
 
     // Attention watchers: one per loaded agent, daemon-owned (not tied to
     // any connection). Preloaded agents are covered here; later creations
@@ -179,6 +180,9 @@ struct AgentRegistry {
     land_statuses: Mutex<HashMap<Utf8PathBuf, LandStatus>>,
     /// At most one realtime voice session per daemon (see [`voice`]).
     voice_active: Arc<std::sync::atomic::AtomicBool>,
+    /// In-process Slack connection and its thread sessions
+    /// (see [`rho_slack::SlackManager`]).
+    slack: Arc<rho_slack::SlackManager>,
     /// Daemon-wide fanout for messages every client must hear regardless of
     /// which connection caused them (attention changes); each connection
     /// forwards this onto its own outgoing channel.
@@ -209,6 +213,7 @@ impl AgentRegistry {
                 topic_id
             }
         };
+        let slack = rho_slack::SlackManager::new(pool.clone(), db.clone()).await;
         let registry = Self {
             pool,
             db,
@@ -220,6 +225,7 @@ impl AgentRegistry {
             land_holders: Mutex::new(HashMap::new()),
             land_statuses: Mutex::new(HashMap::new()),
             voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            slack,
             events: broadcast::channel(1024).0,
         };
         registry.pool.load_non_hidden_agents().await;
@@ -965,6 +971,15 @@ async fn handle_message(
     match message {
         ClientMessage::Ping => {
             let _ = outgoing_tx.send(ServerMessage::Pong);
+            Ok(Refresh::None)
+        }
+        ClientMessage::PlatformSecretsSet { secrets } => {
+            let (running, detail) =
+                match agents.slack.install_secrets(secrets.into_iter().collect()) {
+                    Ok(detail) => (true, detail),
+                    Err(error) => (false, format!("{error:#}")),
+                };
+            let _ = outgoing_tx.send(ServerMessage::PlatformStatus { running, detail });
             Ok(Refresh::None)
         }
         ClientMessage::Subscribe => Ok(Refresh::None),
