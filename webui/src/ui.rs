@@ -101,12 +101,18 @@ fn Main(app: App) -> impl IntoView {
     view! {
         <div class="rail">
             <div class="rail-head">
-                <div class="brand"><span class="logo small">"ρ"</span>"Rho"</div>
-                <span class="conn-pill"><span class="dot ok"></span>"connected"</span>
+                <div class="brand"><span class="logo small">"ρ"</span>"rho"</div>
+                <span class="conn-pill" title="connected"><span class="dot ok"></span></span>
+                <button
+                    class="new-agent"
+                    title="New agent"
+                    on:click=move |_| app.show_new_agent.set(true)
+                >
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+                        <path d="M11.5 2.5l2 2L6 12l-2.7.7.7-2.7 7.5-7.5z"/>
+                    </svg>
+                </button>
             </div>
-            <button class="new-agent" on:click=move |_| app.show_new_agent.set(true)>
-                "+ New agent"
-            </button>
             <div class="topics">
                 {move || app.topics.get().into_iter().map(|topic| {
                     let agents: Vec<AgentSummary> = topic
@@ -146,13 +152,6 @@ fn Main(app: App) -> impl IntoView {
 fn AgentRow(app: App, agent: AgentSummary) -> impl IntoView {
     let id = agent.id.clone();
     let selected_id = agent.id.clone();
-    let initial = agent
-        .name
-        .chars()
-        .next()
-        .unwrap_or('ρ')
-        .to_uppercase()
-        .to_string();
     let attention = agent.attention.clone();
     view! {
         <button
@@ -160,7 +159,9 @@ fn AgentRow(app: App, agent: AgentSummary) -> impl IntoView {
             class:active=move || app.selected.get().as_deref() == Some(selected_id.as_str())
             on:click=move |_| app.select(id.clone())
         >
-            <span class="avatar">{initial}</span>
+            <svg class="row-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+                <path d="M2.5 3.5h11v8h-6l-3 2.5v-2.5h-2v-8z"/>
+            </svg>
             <span class="agent-meta">
                 <span class="agent-name">{agent.name}</span>
                 <span class="agent-mode">{agent.mode}</span>
@@ -219,6 +220,9 @@ fn ChatPane(app: App, agent_id: String) -> impl IntoView {
                     })}
                 </span>
             </div>
+            {move || summary.get().map(|agent| view! {
+                <span class="chip">{agent.mode}</span>
+            })}
             {move || busy.get().then(|| {
                 let cancel_id = cancel_id.clone();
                 view! {
