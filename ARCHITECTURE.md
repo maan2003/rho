@@ -59,6 +59,15 @@ The daemon, not Octo, owns platform secret installation and fd-store resume, so
 Octo receives GitHub tokens only through a RAM-only callback into the sealed
 platform secret store.
 
+The daemon's UI protocol (`rho-ui-proto`) is served over three transports, all
+through the same per-connection handler: the local Unix socket, iroh
+bi-streams from clients enrolled through `rho-iroh-auth` (`rho daemon
+--iroh`; approval via `rho iroh approve` stays on the Unix socket), and an
+in-process duplex pipe behind the web UI WebSocket endpoint (`rho daemon
+--webui`). The web UI page itself is a static site (`webui/` at the repo
+root, hostable anywhere); the daemon's webui module only translates a small
+JSON vocabulary onto UI protocol frames and owns no agent policy.
+
 Dependencies should flow from higher-level assembly/policy crates toward lower
 reusable crates. The shared `rho-core` crate must not depend on provider, agent,
 store, tool, or CLI crates.

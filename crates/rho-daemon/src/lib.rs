@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast
 
 pub mod debug;
 mod voice;
+mod webui;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
@@ -132,6 +133,19 @@ pub struct DaemonArgs {
     /// Exit once the last UI client disconnects.
     #[arg(long = "die-on-detached")]
     pub die_on_detached: bool,
+    /// Also listen for UI clients over iroh (relay-backed). Remote clients
+    /// must be enrolled once via `rho iroh approve <code>` on this machine.
+    #[arg(long = "iroh")]
+    pub iroh: bool,
+    /// Serve the web UI WebSocket endpoint on this local address
+    /// (e.g. 127.0.0.1:9190). The endpoint is unauthenticated; do not bind
+    /// it beyond localhost.
+    #[arg(long = "webui")]
+    pub webui: Option<String>,
+    /// Only accept web UI WebSocket connections from this browser origin
+    /// (e.g. https://example.github.io). Unset accepts any origin.
+    #[arg(long = "webui-origin")]
+    pub webui_origin: Option<String>,
     #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
@@ -169,8 +183,48 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default(),
     };
-    let agents = Arc::new(AgentRegistry::new(db, auth, path_overrides, platform_secrets).await);
+    let iroh = if args.iroh {
+        let state_dir = default_db_path()?
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .context("state directory for iroh secret")?;
+        std::fs::create_dir_all(&state_dir).context("create state directory")?;
+        let secret = load_or_create_iroh_secret(&state_dir.join("iroh-secret.key"))?;
+        let iroh_auth = rho_iroh_auth::IrohAuth::new(db.clone(), secret.public());
+        Some((secret, iroh_auth))
+    } else {
+        None
+    };
+
+    let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
+    let agents = Arc::new(
+        AgentRegistry::new(db, auth, path_overrides, platform_secrets, iroh_auth).await,
+    );
     agents.resume_platform_integrations();
+
+    if let Some((secret, iroh_auth)) = iroh {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(secret)
+            .alpns(vec![rho_ui_proto::IROH_ALPN.to_vec()])
+            .hooks(iroh_auth)
+            .bind()
+            .await
+            .context("bind iroh endpoint")?;
+        eprintln!("rho daemon iroh endpoint: {}", endpoint.id());
+        tokio::spawn(run_iroh_listener(agents.clone(), endpoint));
+    }
+
+    if let Some(addr) = &args.webui {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind web UI listener on {addr}"))?;
+        eprintln!("rho web UI socket on ws://{addr}/ws");
+        tokio::spawn(webui::serve(
+            listener,
+            agents.clone(),
+            args.webui_origin.clone(),
+        ));
+    }
 
     // Attention watchers: one per loaded agent, daemon-owned (not tied to
     // any connection). Preloaded agents are covered here; later creations
@@ -254,6 +308,62 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
 }
 
+/// The daemon's iroh identity, raw 32 secret bytes owner-readable only.
+fn load_or_create_iroh_secret(path: &std::path::Path) -> anyhow::Result<iroh::SecretKey> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let bytes: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("iroh secret file {path:?} is not 32 bytes"))?;
+            Ok(iroh::SecretKey::from_bytes(&bytes))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let secret = iroh::SecretKey::generate();
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .context("create iroh secret file")?;
+            file.write_all(&secret.to_bytes())
+                .context("write iroh secret file")?;
+            Ok(secret)
+        }
+        Err(error) => Err(error).context("read iroh secret file"),
+    }
+}
+
+/// Accepts enrolled iroh connections ([`rho_iroh_auth::IrohAuth`] gates them
+/// before they reach here) and serves one UI protocol session per bi-stream.
+async fn run_iroh_listener(agents: Arc<AgentRegistry>, endpoint: iroh::Endpoint) {
+    while let Some(incoming) = endpoint.accept().await {
+        let agents = agents.clone();
+        tokio::spawn(async move {
+            let connection = match incoming.await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    eprintln!("rho daemon iroh accept error: {error:#}");
+                    return;
+                }
+            };
+            while let Ok((send, recv)) = connection.accept_bi().await {
+                let agents = agents.clone();
+                tokio::spawn(async move {
+                    let counters = rho_ui_proto::IoCounters::default();
+                    if let Err(error) =
+                        serve_connection_io(agents, recv, send, counters, None).await
+                    {
+                        eprintln!("rho daemon iroh connection error: {error:#}");
+                    }
+                });
+            }
+        });
+    }
+}
+
 struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
@@ -281,6 +391,8 @@ struct AgentRegistry {
     /// which connection caused them (attention changes); each connection
     /// forwards this onto its own outgoing channel.
     events: broadcast::Sender<ServerMessage>,
+    /// Enrollment/trust for iroh clients; `None` unless `--iroh` is set.
+    iroh_auth: Option<rho_iroh_auth::IrohAuth>,
 }
 
 impl AgentRegistry {
@@ -289,6 +401,7 @@ impl AgentRegistry {
         auth: InferenceAuth,
         path_overrides: PathOverrides,
         platform_secrets: PlatformSecrets,
+        iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     ) -> Self {
         let pool = AgentPool::new(db.clone(), auth.clone(), path_overrides).await;
         let machine_seed = db.read().machine_seed();
@@ -327,6 +440,7 @@ impl AgentRegistry {
             slack,
             platform_secrets,
             events: broadcast::channel(1024).0,
+            iroh_auth,
         };
         registry.pool.load_non_hidden_agents().await;
         registry
@@ -854,6 +968,22 @@ async fn serve_connection(
     });
     let stream = connection.into_stream();
     let (reader, writer) = stream.into_split();
+    serve_connection_io(agents, reader, writer, counters, land_holder).await
+}
+
+/// One UI protocol session over any framed byte stream (Unix socket or an
+/// iroh bi-stream from an enrolled remote client).
+async fn serve_connection_io<R, W>(
+    agents: Arc<AgentRegistry>,
+    reader: R,
+    writer: W,
+    counters: rho_ui_proto::IoCounters,
+    land_holder: Option<LandLeaseHolder>,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let writer_counters = counters.clone();
@@ -1381,6 +1511,23 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         // Intercepted by `voice::handle_client_message` before this dispatch.
+        ClientMessage::IrohApprove { code } => {
+            let auth = agents
+                .iroh_auth
+                .as_ref()
+                .context("daemon is not listening over iroh (start it with --iroh)")?;
+            let code = code
+                .parse::<rho_iroh_auth::EnrollmentCode>()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let endpoint_id = auth
+                .approve_code(&code)
+                .await
+                .map_err(|_| anyhow::anyhow!("no pending enrollment has this code"))?;
+            let _ = outgoing_tx.send(ServerMessage::IrohApproved {
+                endpoint_id: endpoint_id.to_string(),
+            });
+            Ok(Refresh::None)
+        }
         ClientMessage::VoiceStart
         | ClientMessage::VoiceStop
         | ClientMessage::VoiceAudio { .. }

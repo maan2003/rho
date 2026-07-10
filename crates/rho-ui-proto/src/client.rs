@@ -246,7 +246,8 @@ impl AgentClient {
                     | ServerMessage::VoiceTranscript { .. }
                     | ServerMessage::VoiceUiAction(_)
                     | ServerMessage::McpAgentToolResult(_)
-                    | ServerMessage::PlatformStatus { .. } => {}
+                    | ServerMessage::PlatformStatus { .. }
+                    | ServerMessage::IrohApproved { .. } => {}
                 }
             }
         });

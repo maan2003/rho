@@ -25,6 +25,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+/// ALPN identifying this protocol on iroh connections to the daemon.
+pub const IROH_ALPN: &[u8] = b"rho/ui/1";
 const FRAME_LEN_BYTES: u64 = size_of::<u32>() as u64;
 const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP2";
 
@@ -181,6 +183,11 @@ pub enum ClientMessage {
     PlatformSecretsSet {
         secrets: Vec<(String, String)>,
         coordinator_repo: Option<Utf8PathBuf>,
+    },
+    /// Approve a pending iroh client enrollment by its displayed code,
+    /// trusting that client's endpoint key persistently.
+    IrohApprove {
+        code: String,
     },
 }
 
@@ -374,6 +381,11 @@ pub enum ServerMessage {
     },
     VoiceUiAction(VoiceUiAction),
     McpAgentToolResult(McpAgentToolResponse),
+    /// Reply to [`ClientMessage::IrohApprove`]: the enrolled client's
+    /// endpoint id.
+    IrohApproved {
+        endpoint_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

@@ -82,6 +82,7 @@ async fn run(command: Command) -> Result<()> {
             rho_daemon::debug::run(args).await?;
             Ok(())
         }
+        Command::Iroh(args) => run_iroh(args).await,
         Command::Land(args) => land::run(args).await,
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
         Command::Octo(args) => octo_cli::run(args).await,
@@ -90,6 +91,32 @@ async fn run(command: Command) -> Result<()> {
             let mut stdout = io::stdout().lock();
             rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
             Ok(())
+        }
+    }
+}
+
+/// Approves a pending iroh enrollment over the daemon's Unix socket, so
+/// trust decisions always come from a local user on the daemon host.
+async fn run_iroh(args: IrohArgs) -> Result<()> {
+    let IrohCommand::Approve { code } = args.command;
+    let socket_path = match args.socket_path {
+        Some(path) => path,
+        None => default_socket_path()?,
+    };
+    let mut client = UiClient::connect(&socket_path).await?;
+    client
+        .send(&rho_ui_proto::ClientMessage::IrohApprove { code })
+        .await?;
+    loop {
+        match client.recv().await? {
+            rho_ui_proto::ServerMessage::IrohApproved { endpoint_id } => {
+                println!("enrolled iroh client {endpoint_id}");
+                return Ok(());
+            }
+            rho_ui_proto::ServerMessage::Error { message } => anyhow::bail!("{message}"),
+            // The daemon greets every connection with Ready and may stream
+            // other broadcasts; only the approve outcome matters here.
+            _ => {}
         }
     }
 }
@@ -1136,6 +1163,7 @@ enum Command {
     Voice(VoiceArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
+    Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
     Octo(OctoArgs),
@@ -1165,11 +1193,26 @@ enum CliCommand {
     },
     Daemon(DaemonArgs),
     Debug(DebugArgs),
+    Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
     Octo(OctoArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
+}
+
+#[derive(Clone, clap::Args)]
+pub(crate) struct IrohArgs {
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: IrohCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum IrohCommand {
+    /// Approve a pending iroh client enrollment by its displayed code.
+    Approve { code: String },
 }
 
 #[derive(Clone, clap::Args)]
@@ -1254,6 +1297,7 @@ impl Args {
             Some(CliCommand::Voice { command }) => Command::Voice(command),
             Some(CliCommand::Daemon(args)) => Command::Daemon(args),
             Some(CliCommand::Debug(args)) => Command::Debug(args),
+            Some(CliCommand::Iroh(args)) => Command::Iroh(args),
             Some(CliCommand::Land(args)) => Command::Land(args),
             Some(CliCommand::McpAgentTools(args)) => Command::McpAgentTools(args),
             Some(CliCommand::Octo(args)) => Command::Octo(args),

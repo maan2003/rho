@@ -186,7 +186,8 @@ async fn run(
             | ServerMessage::LandLeaseGranted { .. }
             | ServerMessage::LandStatus { .. }
             | ServerMessage::McpAgentToolResult(_)
-            | ServerMessage::PlatformStatus { .. } => None,
+            | ServerMessage::PlatformStatus { .. }
+            | ServerMessage::IrohApproved { .. } => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()
