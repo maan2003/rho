@@ -55,7 +55,11 @@ pub enum SpawnWorkspace {
     /// Own jj workspace forked from the parent's current change.
     Fork,
     /// Own jj workspace on a new change atop `revset` (default `trunk()`).
-    New { revset: Option<String> },
+    /// When set, `repo` selects a different jj repository from the parent.
+    New {
+        revset: Option<String>,
+        repo: Option<Utf8PathBuf>,
+    },
 }
 
 impl AgentPool {
@@ -210,8 +214,11 @@ impl AgentPool {
                     None => "@".to_owned(),
                 },
             },
-            SpawnWorkspace::New { revset } => StartWorkspace::Create {
-                repo: self.repo(parent_workspace.repo()).await?,
+            SpawnWorkspace::New { revset, repo } => StartWorkspace::Create {
+                repo: match repo {
+                    Some(repo) => self.repo(&repo).await?,
+                    None => self.repo(parent_workspace.repo()).await?,
+                },
                 parent_revset: revset.unwrap_or_else(|| "trunk()".to_owned()),
             },
         };

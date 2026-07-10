@@ -189,6 +189,7 @@ pub enum McpAgentToolRequest {
         task_name: String,
         prompt: String,
         workspace: McpSpawnWorkspace,
+        repo: Option<Utf8PathBuf>,
         mode: String,
     },
     SendMessage {

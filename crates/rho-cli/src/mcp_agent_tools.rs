@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
+use camino::Utf8PathBuf;
 use rho_agent::multi_agent_tools;
 use rho_ui_proto::{
     AgentId, AgentIdDomain, ClientMessage, McpAgentToolRequest, McpSpawnWorkspace, ServerMessage,
@@ -152,6 +153,7 @@ fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequ
                     },
                     other => anyhow::bail!("unsupported workspace choice: {other}"),
                 },
+                repo: args.repo.map(Utf8PathBuf::from),
                 mode: args.mode,
             })
         }
@@ -200,6 +202,7 @@ struct SpawnArgs {
     prompt: String,
     workspace: String,
     revset: Option<String>,
+    repo: Option<String>,
     mode: String,
 }
 

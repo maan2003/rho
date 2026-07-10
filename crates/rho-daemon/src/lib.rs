@@ -418,15 +418,19 @@ impl AgentRegistry {
                 task_name,
                 prompt,
                 workspace,
+                repo,
                 mode,
             } => {
                 if prompt.trim().is_empty() {
                     anyhow::bail!("prompt must not be empty");
                 }
-                let workspace = match workspace {
-                    McpSpawnWorkspace::Join => SpawnWorkspace::Join,
-                    McpSpawnWorkspace::Fork => SpawnWorkspace::Fork,
-                    McpSpawnWorkspace::New { revset } => SpawnWorkspace::New { revset },
+                let workspace = match (workspace, repo) {
+                    (McpSpawnWorkspace::Join, None) => SpawnWorkspace::Join,
+                    (McpSpawnWorkspace::Fork, None) => SpawnWorkspace::Fork,
+                    (McpSpawnWorkspace::New { revset }, repo) => {
+                        SpawnWorkspace::New { revset, repo }
+                    }
+                    (_, Some(_)) => anyhow::bail!("repo is only supported with workspace=new"),
                 };
                 let child_id = self
                     .pool

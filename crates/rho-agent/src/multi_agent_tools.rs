@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use camino::Utf8PathBuf;
 use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
 use serde::Deserialize;
 use serde_json::json;
@@ -109,7 +110,7 @@ fn spawn_agent_spec() -> ToolSpec {
     ToolSpec {
         name: ToolName::try_from(SPAWN_AGENT_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
-        description: "Start a sub-agent working in this repository and return its agent id \
+        description: "Start a sub-agent working in this repository (or a specified repository) and return its agent id \
                       immediately. Use this for a concrete, bounded subtask, including side \
                       investigations or experiments when the user asks for them or they de-risk \
                       the main task. The subtask should run independently alongside useful local \
@@ -144,6 +145,10 @@ fn spawn_agent_spec() -> ToolSpec {
                     "type": "string",
                     "description": "With workspace=new: jj revset for the parent revision \
                                     (default trunk())."
+                },
+                "repo": {
+                    "type": "string",
+                    "description": "With workspace=new: absolute path to a jj repository. Defaults to this agent's repository."
                 },
                 "mode": {
                     "type": "string",
@@ -264,6 +269,7 @@ struct SpawnArgs {
     prompt: String,
     workspace: WorkspaceChoice,
     revset: Option<String>,
+    repo: Option<String>,
     mode: String,
 }
 
@@ -280,12 +286,14 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     if args.prompt.trim().is_empty() {
         anyhow::bail!("prompt must not be empty");
     }
-    let workspace = match args.workspace {
-        WorkspaceChoice::Join => SpawnWorkspace::Join,
-        WorkspaceChoice::Fork => SpawnWorkspace::Fork,
-        WorkspaceChoice::New => SpawnWorkspace::New {
+    let workspace = match (args.workspace, args.repo) {
+        (WorkspaceChoice::Join, None) => SpawnWorkspace::Join,
+        (WorkspaceChoice::Fork, None) => SpawnWorkspace::Fork,
+        (WorkspaceChoice::New, repo) => SpawnWorkspace::New {
             revset: args.revset,
+            repo: repo.map(Utf8PathBuf::from),
         },
+        (_, Some(_)) => anyhow::bail!("repo is only supported with workspace=new"),
     };
     let task_name = args.task_name.clone();
     let mode = parse_spawn_mode(&args.mode)?;
