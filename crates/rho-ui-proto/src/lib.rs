@@ -180,6 +180,7 @@ pub enum ClientMessage {
     /// daemon's RAM-only store and (re)start the platform connection.
     PlatformSecretsSet {
         secrets: Vec<(String, String)>,
+        coordinator_repo: Utf8PathBuf,
     },
 }
 

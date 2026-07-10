@@ -30,11 +30,6 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// Keyed by the workdir's absolute path (UTF-8; paths are strings on disk
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
-/// Messaging-platform session key (e.g. `slack:<channel>:<thread_ts>`) ->
-/// the agent carrying that conversation, so platform threads survive daemon
-/// restarts.
-const PLATFORM_SESSIONS: TableDefinition<String, AgentId> =
-    TableDefinition::new("platform_sessions");
 
 const CURRENT_AGENT_DB_FORMAT: &str = "4b8a02c1";
 
@@ -304,7 +299,6 @@ pub trait AgentReadTxnExt {
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
     fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
     fn list_workdirs(&self) -> Vec<(Utf8PathBuf, WorkdirRecord)>;
-    fn get_platform_session(&self, session_key: &str) -> Option<AgentId>;
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
     fn agent_event_records(
         &self,
@@ -349,9 +343,6 @@ pub trait AgentWriteTxnExt {
     /// Re-points the agent's topic membership. Topics are ad-hoc groupings
     /// agents move into after the fact; nothing else about the agent changes.
     fn move_agent_to_topic(&mut self, agent_id: AgentId, topic_id: TopicId);
-
-    /// Registers `path` or renames it if already registered.
-    fn set_platform_session(&mut self, session_key: &str, agent_id: AgentId);
 
     fn upsert_workdir(&mut self, now: UnixMillis, path: &str, name: String);
 
@@ -454,12 +445,6 @@ impl AgentReadTxnExt for ReadTxn {
             .collect()
     }
 
-    fn get_platform_session(&self, session_key: &str) -> Option<AgentId> {
-        self.open_table(PLATFORM_SESSIONS)
-            .get(&session_key.to_owned())
-            .map(|value| value.value())
-    }
-
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>) {
         let (next, records) = self.agent_event_records(agent_id);
         (next, records.into_iter().map(|(_, event)| event).collect())
@@ -524,7 +509,6 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(TOPICS);
         self.open_table(TOPIC_AGENTS);
         self.open_table(WORKDIRS);
-        self.open_table(PLATFORM_SESSIONS);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
@@ -664,11 +648,6 @@ impl AgentWriteTxnExt for WriteTxn {
             topic_agents.remove(&key);
         }
         topic_agents.insert(&TopicAgentKey::new(topic_id, agent_id), &());
-    }
-
-    fn set_platform_session(&mut self, session_key: &str, agent_id: AgentId) {
-        self.open_table(PLATFORM_SESSIONS)
-            .insert(&session_key.to_owned(), &agent_id);
     }
 
     fn upsert_workdir(&mut self, now: UnixMillis, path: &str, name: String) {

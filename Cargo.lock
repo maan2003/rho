@@ -10418,13 +10418,16 @@ name = "rho-slack"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "camino",
  "futures-util",
  "libc",
+ "redb",
  "reqwest 0.12.28",
  "rho-agent",
  "rho-core",
  "rho-db",
+ "senax-encoder",
  "serde",
  "serde_json",
  "tempfile",

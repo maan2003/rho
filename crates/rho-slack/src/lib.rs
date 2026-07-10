@@ -10,12 +10,14 @@
 //! WebSocket connection yielding normalized [`MessageEvent`]s).
 
 mod api;
+mod db;
 mod manager;
 mod mrkdwn;
 mod secrets;
 mod socket_mode;
 
 pub use api::{BotIdentity, SlackApi, ThreadMessage};
+pub use db::{SlackConfigRecord, SlackReadTxnExt, SlackWriteTxnExt};
 pub use manager::SlackManager;
 pub use mrkdwn::to_mrkdwn;
 pub use secrets::SecretStore;

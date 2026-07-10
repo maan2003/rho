@@ -14,12 +14,14 @@ use rho_ui_proto::{ClientMessage, ServerMessage};
 use crate::{SlackArgs, SlackCommand, connect_or_start_daemon, default_socket_path};
 
 pub(crate) async fn run(args: SlackArgs) -> Result<()> {
-    match args.command {
-        SlackCommand::Init => init(args).await,
+    match args.command.clone() {
+        SlackCommand::Init { dir } => init(args, dir).await,
     }
 }
 
-async fn init(args: SlackArgs) -> Result<()> {
+async fn init(args: SlackArgs, dir: camino::Utf8PathBuf) -> Result<()> {
+    let coordinator_repo = rho_workspaces::resolve_repo_root(dir.as_std_path())
+        .with_context(|| format!("resolving Slack coordinator repo {dir}"))?;
     let bot_token = prompt_token("Bot User OAuth Token (xoxb-...): ", "xoxb-")?;
     let app_token = prompt_token("App-Level Token for Socket Mode (xapp-...): ", "xapp-")?;
 
@@ -34,6 +36,7 @@ async fn init(args: SlackArgs) -> Result<()> {
                 ("SLACK_BOT_TOKEN".to_owned(), bot_token),
                 ("SLACK_APP_TOKEN".to_owned(), app_token),
             ],
+            coordinator_repo,
         })
         .await?;
     loop {

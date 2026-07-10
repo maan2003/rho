@@ -11,9 +11,9 @@ use rho_agent::db::{
     AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
     AgentWriteTxnExt as _, Status, TopicId,
 };
-use rho_agent::pool::{AgentPool, RunningAgent, SpawnWorkspace};
-use rho_agent::{AgentStateKind, MessageDelivery};
-use rho_core::text_content;
+use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent, SpawnWorkspace};
+use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
+use rho_core::{ContextBlock, text_content};
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
 use rho_ui_proto::remote::AgentRemoteEncoder;
@@ -93,16 +93,24 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // ride the pool's `created` broadcast, and late loads the LoadAgent
     // handler.
     for (agent_id, agent) in agents.loaded().await {
-        spawn_attention_watcher(agents.db.clone(), agents.events.clone(), agent_id, agent);
+        spawn_attention_watcher(
+            agents.pool.clone(),
+            agents.db.clone(),
+            agents.events.clone(),
+            agent_id,
+            agent,
+        );
     }
     {
         let mut created_rx = agents.pool.subscribe_created();
+        let pool = agents.pool.clone();
         let db = agents.db.clone();
         let events = agents.events.clone();
         tokio::spawn(async move {
             loop {
                 match created_rx.recv().await {
                     Ok(created) => spawn_attention_watcher(
+                        pool.clone(),
                         db.clone(),
                         events.clone(),
                         created.agent_id,
@@ -902,6 +910,7 @@ fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition)
 /// Sub-agents (a parent spawned them) get Working broadcasts but no turn-end
 /// records: their finished turns are the parent's court, not the user's.
 fn spawn_attention_watcher(
+    pool: Arc<AgentPool>,
     db: RhoDb,
     events: broadcast::Sender<ServerMessage>,
     agent_id: AgentId,
@@ -911,7 +920,9 @@ fn spawn_attention_watcher(
         let is_child = db.read().get_agent(agent_id).parent_agent.is_some();
         let changes = agent.subscribe();
         futures::pin_mut!(changes);
-        let mut was_working = is_working(&agent.state().kind);
+        let initial_state = agent.state();
+        let mut was_working = is_working(&initial_state.kind);
+        let mut last_reported_response_count = inference_response_count(&initial_state);
         let mut last_sent = None;
         while let Some(state) = changes.next().await {
             let working = is_working(&state.kind);
@@ -919,6 +930,17 @@ fn spawn_attention_watcher(
                 let mut write = db.write().await;
                 write.record_agent_turn_end(agent_id);
                 write.commit();
+            }
+            if !working
+                && was_working
+                && let Some((response_count, final_answer)) = latest_final_response(&state)
+                && response_count > last_reported_response_count
+            {
+                last_reported_response_count = response_count;
+                pool.publish_completed_turn(AgentTurnCompleted {
+                    agent_id,
+                    final_answer,
+                });
             }
             was_working = working;
             let disposition = db.read().get_agent(agent_id).disposition;
@@ -932,6 +954,28 @@ fn spawn_attention_watcher(
             }
         }
     });
+}
+
+fn inference_response_count(state: &AgentState) -> usize {
+    state
+        .blocks
+        .iter()
+        .filter(|block| matches!(block.as_ref(), ContextBlock::InferenceResponse { .. }))
+        .count()
+}
+
+fn latest_final_response(state: &AgentState) -> Option<(usize, String)> {
+    let response_count = inference_response_count(state);
+    if response_count == 0 {
+        return None;
+    }
+    state.blocks.iter().rev().find_map(|block| {
+        if let ContextBlock::InferenceResponse { items, .. } = block.as_ref() {
+            Some((response_count, rho_agent::final_answer_text(items)))
+        } else {
+            None
+        }
+    })
 }
 
 /// Wakes a snoozed agent: at `until`, rebroadcasts its (by then pending)
@@ -977,12 +1021,21 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::Pong);
             Ok(Refresh::None)
         }
-        ClientMessage::PlatformSecretsSet { secrets } => {
-            let (running, detail) =
-                match agents.slack.install_secrets(secrets.into_iter().collect()) {
+        ClientMessage::PlatformSecretsSet {
+            secrets,
+            coordinator_repo,
+        } => {
+            let (running, detail) = match validate_repo_root(coordinator_repo) {
+                Ok(coordinator_repo) => match agents
+                    .slack
+                    .install_secrets(secrets.into_iter().collect(), coordinator_repo)
+                    .await
+                {
                     Ok(detail) => (true, detail),
                     Err(error) => (false, format!("{error:#}")),
-                };
+                },
+                Err(error) => (false, format!("{error:#}")),
+            };
             let _ = outgoing_tx.send(ServerMessage::PlatformStatus { running, detail });
             Ok(Refresh::None)
         }
@@ -1061,6 +1114,7 @@ async fn handle_message(
             let (agent_id, agent, loaded_now) = agents.load(agent_id).await?;
             if loaded_now {
                 spawn_attention_watcher(
+                    agents.pool.clone(),
                     agents.db.clone(),
                     agents.events.clone(),
                     agent_id,
@@ -1235,4 +1289,54 @@ fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
     let rest = path.strip_prefix("~").ok()?;
     let home = Utf8PathBuf::try_from(dirs::home_dir()?).ok()?;
     Some(home.join(rest))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rho_agent::{AgentState, AgentStateKind, InputQueues};
+    use rho_core::{
+        ContentPart, ContextBlock, InferenceResponseItem, MessagePhase, ToolSpec,
+        UnknownProviderSpecificData,
+    };
+
+    use super::{inference_response_count, latest_final_response};
+
+    fn state_with_responses(texts: &[&str]) -> AgentState {
+        AgentState {
+            blocks: texts
+                .iter()
+                .map(|text| {
+                    Arc::new(ContextBlock::InferenceResponse {
+                        items: vec![InferenceResponseItem::AssistantMessage {
+                            provider_specific: Box::new(UnknownProviderSpecificData {
+                                tag: "test".to_owned(),
+                            }),
+                            content: vec![ContentPart::Text {
+                                text: (*text).to_owned(),
+                            }],
+                            phase: Some(MessagePhase::FinalAnswer),
+                        }],
+                        provider_response_id: None,
+                    })
+                })
+                .collect(),
+            tool_specs: Vec::<ToolSpec>::new().into(),
+            system_prompt: "".into(),
+            queued_inputs: InputQueues::default(),
+            kind: AgentStateKind::Idle,
+            context_used: None,
+        }
+    }
+
+    #[test]
+    fn latest_final_response_reports_newest_response_and_count() {
+        let state = state_with_responses(&["first", "second"]);
+        assert_eq!(inference_response_count(&state), 2);
+        assert_eq!(
+            latest_final_response(&state),
+            Some((2, "second".to_owned()))
+        );
+    }
 }

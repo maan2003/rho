@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use rho_cli_term_raw::{
@@ -1180,7 +1181,11 @@ pub(crate) struct SlackArgs {
 #[derive(Clone, Subcommand)]
 pub(crate) enum SlackCommand {
     /// Install Slack tokens (read from stdin) and connect to Slack.
-    Init,
+    Init {
+        /// Repository where Slack coordinator agents should run.
+        #[arg(long = "dir")]
+        dir: Utf8PathBuf,
+    },
 }
 
 #[derive(Clone, clap::Args)]

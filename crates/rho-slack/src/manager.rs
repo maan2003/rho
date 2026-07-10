@@ -13,23 +13,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use futures_util::StreamExt as _;
+use camino::Utf8PathBuf;
+use rho_agent::MessageDelivery;
 use rho_agent::db::{
-    AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, DeepConfig, DeepEffort, Status,
-    TopicId, WorkdirRecord,
+    AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, DeepConfig, DeepEffort, Status, TopicId,
 };
-use rho_agent::pool::{AgentPool, RunningAgent};
-use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
-use rho_core::ContextBlock;
+use rho_agent::pool::AgentPool;
 use rho_db::RhoDb;
 use tokio::sync::mpsc;
 
-use crate::{MessageEvent, SecretStore, SlackApi, SlackConfig, run_connection};
+use crate::{
+    MessageEvent, SecretStore, SlackApi, SlackConfig, SlackConfigRecord, SlackReadTxnExt as _,
+    SlackWriteTxnExt as _, run_connection,
+};
 
 /// FDNAME under which the secrets memfd lives in the systemd fd store.
 const FD_STORE_NAME: &str = "platform-secrets";
-/// Give up on a turn (and apologize on Slack) after this long.
-const TURN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
@@ -49,6 +48,9 @@ pub struct SlackManager {
 impl SlackManager {
     /// Finds (or creates) the "slack" topic up front.
     pub async fn new(pool: Arc<AgentPool>, db: RhoDb) -> Arc<Self> {
+        let mut write = db.write().await;
+        write.init_slack_tables();
+        write.commit();
         let existing = db
             .read()
             .list_topics()
@@ -65,14 +67,16 @@ impl SlackManager {
                 topic_id
             }
         };
-        Arc::new(Self {
+        let manager = Arc::new(Self {
             pool,
             db,
             topic_id,
             user_names: tokio::sync::Mutex::new(HashMap::new()),
             secrets: std::sync::Mutex::new(None),
             run_task: std::sync::Mutex::new(None),
-        })
+        });
+        manager.start_turn_delivery_loop();
+        manager
     }
 
     /// Reclaim secrets stashed before the last daemon restart and connect
@@ -90,12 +94,20 @@ impl SlackManager {
 
     /// Install fresh secrets: seal them into a memfd, stash it in the systemd
     /// fd store for restart survival, and (re)connect.
-    pub fn install_secrets(
+    pub async fn install_secrets(
         self: &Arc<Self>,
         secrets: BTreeMap<String, String>,
+        coordinator_repo: Utf8PathBuf,
     ) -> anyhow::Result<String> {
         if !secrets.contains_key("SLACK_BOT_TOKEN") || !secrets.contains_key("SLACK_APP_TOKEN") {
             anyhow::bail!("both SLACK_BOT_TOKEN and SLACK_APP_TOKEN are required");
+        }
+        {
+            let mut write = self.db.write().await;
+            write.set_slack_config(SlackConfigRecord {
+                coordinator_repo: coordinator_repo.clone(),
+            });
+            write.commit();
         }
         let store = SecretStore::create(&secrets).context("sealing platform secrets")?;
         let stashed = store
@@ -124,6 +136,20 @@ impl SlackManager {
         }));
     }
 
+    fn start_turn_delivery_loop(self: &Arc<Self>) {
+        let manager = self.clone();
+        let mut completed = self.pool.subscribe_completed_turns();
+        tokio::spawn(async move {
+            loop {
+                match completed.recv().await {
+                    Ok(report) => manager.deliver_completed_turn(report).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     fn slack_config(&self) -> anyhow::Result<SlackConfig> {
         let store = self
             .secrets
@@ -140,6 +166,46 @@ impl SlackManager {
                 .remove("SLACK_APP_TOKEN")
                 .context("SLACK_APP_TOKEN not among installed secrets")?,
         ))
+    }
+
+    async fn deliver_completed_turn(&self, report: rho_agent::pool::AgentTurnCompleted) {
+        let Some(thread) = self.slack_thread_for_agent(report.agent_id) else {
+            return;
+        };
+        let config = match self.slack_config() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::debug!(%error, "skipping slack turn delivery without secrets");
+                return;
+            }
+        };
+        let api = SlackApi::new(&config.api_base);
+        let text = if report.final_answer.trim().is_empty() {
+            "(the agent finished without a text response)".to_owned()
+        } else {
+            report.final_answer
+        };
+        if let Err(error) = api
+            .post_message(
+                &config.bot_token,
+                &thread.channel,
+                Some(&thread.thread_ts),
+                &crate::mrkdwn::to_mrkdwn(&text),
+            )
+            .await
+        {
+            tracing::error!(%error, "posting slack turn completion");
+        }
+    }
+
+    fn slack_thread_for_agent(&self, agent_id: rho_agent::db::AgentId) -> Option<SlackThread> {
+        self.db
+            .read()
+            .list_slack_sessions()
+            .into_iter()
+            .find_map(|(session_key, session_agent)| {
+                (session_agent == agent_id).then(|| SlackThread::parse(&session_key))?
+            })
     }
 
     /// Reconnect loop: one Socket Mode connection at a time. Routine
@@ -187,7 +253,7 @@ impl SlackManager {
 
     async fn handle_event(&self, api: &SlackApi, config: &SlackConfig, event: MessageEvent) {
         let session_key = event.session_key();
-        let known_session = self.db.read().get_platform_session(&session_key).is_some();
+        let known_session = self.db.read().get_slack_session(&session_key).is_some();
         // Respond to DMs, mentions, and follow-ups in threads we already
         // carry; stay silent on ambient channel chatter.
         if !(event.is_mention || event.channel_type == "im" || known_session) {
@@ -214,8 +280,10 @@ impl SlackManager {
         }
     }
 
-    /// One inbound message: find or create the thread's agent, run a turn,
-    /// and return the text to post back (None suppresses the reply).
+    /// One inbound message: find or create the thread's coordinator agent and
+    /// enqueue the Slack text. Final answers are posted by the generic
+    /// completed-turn subscriber, so returning None suppresses an immediate
+    /// reply.
     async fn run_turn(
         &self,
         api: &SlackApi,
@@ -223,25 +291,26 @@ impl SlackManager {
         session_key: &str,
         event: &MessageEvent,
     ) -> anyhow::Result<Option<String>> {
-        let existing = self.db.read().get_platform_session(session_key);
-        let (agent, new_session_note) = match existing {
+        let existing = self.db.read().get_slack_session(session_key);
+        let (agent, is_new) = match existing {
             Some(agent_id) if self.pool.agent_exists(agent_id) => {
                 let (_, agent, _) = self
                     .pool
                     .load(agent_id)
                     .await
                     .context("loading slack session agent")?;
-                (agent, None)
+                (agent, false)
             }
             _ => {
-                let workdirs = self.db.read().list_workdirs();
-                let repo = match pick_workdir(&workdirs, &event.text) {
-                    Ok(repo) => repo,
-                    Err(guidance) => return Ok(Some(guidance)),
+                let Some(config) = self.db.read().get_slack_config() else {
+                    return Ok(Some(
+                        "rho slack is not configured with a coordinator repo; run `rho slack init \
+                         --dir <coordinator-repo>`"
+                            .to_owned(),
+                    ));
                 };
-                let note = workdir_note(&workdirs, &repo);
                 let start = rho_agent::StartWorkspace::Create {
-                    repo: self.pool.repo(&repo).await?,
+                    repo: self.pool.repo(&config.coordinator_repo).await?,
                     parent_revset: "@-".to_owned(),
                 };
                 let (agent_id, agent) = self
@@ -259,90 +328,40 @@ impl SlackManager {
                     .await
                     .context("creating slack session agent")?;
                 let mut write = self.db.write().await;
-                write.set_platform_session(session_key, agent_id);
+                write.set_slack_session(session_key, agent_id);
                 write.commit();
-                (agent, Some(note))
+                (agent, true)
             }
         };
 
         // Joining mid-thread: the agent needs to see what was already said.
-        let thread_context = if new_session_note.is_some() && event.thread_ts.is_some() {
+        let thread_context = if is_new && event.thread_ts.is_some() {
             self.thread_context(api, config, event).await
         } else {
             None
         };
         let text = self
-            .inbound_text(api, config, event, new_session_note, thread_context)
+            .inbound_text(api, config, event, is_new, thread_context)
             .await;
         agent.send_user_message(text, MessageDelivery::NextRequest);
-        let state = tokio::time::timeout(TURN_TIMEOUT, wait_for_turn_end(&agent))
-            .await
-            .map_err(|_| anyhow::anyhow!("agent turn did not finish within {TURN_TIMEOUT:?}"))?;
-        let text = last_final_response(&state);
-        Ok(Some(if text.trim().is_empty() {
-            "(the agent finished without a text response)".to_owned()
-        } else {
-            text
-        }))
+        Ok(None)
     }
 }
 
-/// The repo a new session's agent works in: a leading "@<workdir>" in the
-/// first message wins, otherwise the most recently registered workdir.
-/// `Err` carries user guidance.
-fn pick_workdir(
-    workdirs: &[(camino::Utf8PathBuf, WorkdirRecord)],
-    text: &str,
-) -> Result<camino::Utf8PathBuf, String> {
-    let prefixed = text
-        .split_whitespace()
-        .next()
-        .and_then(|first| first.strip_prefix('@'))
-        .and_then(|name| {
-            workdirs
-                .iter()
-                .find(|(_, record)| record.name.eq_ignore_ascii_case(name))
-        });
-    if let Some((path, _)) = prefixed {
-        return Ok(path.clone());
-    }
-    workdirs
-        .iter()
-        .max_by_key(|(path, record)| (record.created_at, path))
-        .map(|(path, _)| path.clone())
-        .ok_or_else(|| {
-            "rho has no registered workdirs; register one in the rho GUI first".to_owned()
+struct SlackThread {
+    channel: String,
+    thread_ts: String,
+}
+
+impl SlackThread {
+    fn parse(session_key: &str) -> Option<Self> {
+        let rest = session_key.strip_prefix("slack:")?;
+        let (channel, thread_ts) = rest.split_once(':')?;
+        Some(Self {
+            channel: channel.to_owned(),
+            thread_ts: thread_ts.to_owned(),
         })
-}
-
-/// The first-turn note telling a new session's agent which repo it works in
-/// and, when others are registered, how to reach them.
-fn workdir_note(
-    workdirs: &[(camino::Utf8PathBuf, WorkdirRecord)],
-    repo: &camino::Utf8Path,
-) -> String {
-    let name = workdirs
-        .iter()
-        .find(|(path, _)| path == repo)
-        .map(|(_, record)| record.name.as_str());
-    let mut note = match name {
-        Some(name) => format!("You are working in the \"{name}\" repo at {repo}."),
-        None => format!("You are working in the repo at {repo}."),
-    };
-    let others: Vec<String> = workdirs
-        .iter()
-        .filter(|(path, _)| path != repo)
-        .map(|(path, record)| format!("{} — {}", record.name, path))
-        .collect();
-    if !others.is_empty() {
-        note.push_str(&format!(
-            " Other registered repos: {}. For a task that belongs in one of those, spawn a \
-             sub-agent there with spawn_agent(workspace=new, repo=\"<absolute path>\"), wait for \
-             its result within your turn, and relay it.",
-            others.join("; ")
-        ));
     }
-    note
 }
 
 impl SlackManager {
@@ -351,7 +370,7 @@ impl SlackManager {
         api: &SlackApi,
         config: &SlackConfig,
         event: &MessageEvent,
-        new_session_note: Option<String>,
+        is_new: bool,
         thread_context: Option<String>,
     ) -> String {
         let user = match &event.user {
@@ -367,12 +386,15 @@ impl SlackManager {
             "[slack message from {user} in {}]\n{body}",
             event.channel
         ));
-        if let Some(note) = new_session_note {
-            text.push_str(&format!(
+        if is_new {
+            text.push_str(
                 "\n\n(This conversation comes from a Slack thread; your final \
-                 response each turn is posted back to it. Keep responses \
-                 concise and self-contained. {note})"
-            ));
+                 response each turn is posted back to it. You are running in \
+                 the configured Slack coordinator repository; do not switch \
+                 repositories in-place. For repo-specific work elsewhere, \
+                 delegate with spawn_agent using workspace=new and an explicit \
+                 repo path. Keep responses concise and self-contained.)",
+            );
         }
         text
     }
@@ -460,105 +482,16 @@ impl SlackManager {
     }
 }
 
-/// Mid-turn: a reply is not ready while the agent is in these states.
-fn is_working(kind: &AgentStateKind) -> bool {
-    matches!(
-        kind,
-        AgentStateKind::ApiStreaming { .. } | AgentStateKind::ToolCalling { .. }
-    )
-}
-
-/// Wait until the turn our queued message starts has ended: first let the
-/// agent go working, then return the state that left working.
-async fn wait_for_turn_end(agent: &RunningAgent) -> AgentState {
-    let changes = agent.subscribe();
-    futures_util::pin_mut!(changes);
-    let mut seen_working = is_working(&agent.state().kind);
-    let mut last = agent.state();
-    while let Some(state) = changes.next().await {
-        let working = is_working(&state.kind);
-        if seen_working && !working && state.queued_inputs.is_empty() {
-            return state;
-        }
-        seen_working |= working;
-        last = state;
-    }
-    last
-}
-
-/// The turn's report: the last inference response's answer, extracted with
-/// the same [`rho_agent::final_answer_text`] used for parent notifications.
-fn last_final_response(state: &AgentState) -> String {
-    for block in state.blocks.iter().rev() {
-        if let ContextBlock::InferenceResponse { items, .. } = block.as_ref() {
-            return rho_agent::final_answer_text(items);
-        }
-    }
-    String::new()
-}
-
 #[cfg(test)]
 mod tests {
-    use camino::{Utf8Path, Utf8PathBuf};
-
-    use super::*;
-
-    fn workdirs(entries: &[(&str, &str, u64)]) -> Vec<(Utf8PathBuf, WorkdirRecord)> {
-        entries
-            .iter()
-            .map(|(path, name, created_at)| {
-                (
-                    Utf8PathBuf::from(*path),
-                    WorkdirRecord {
-                        name: (*name).to_owned(),
-                        created_at: rho_core::UnixMs(*created_at),
-                    },
-                )
-            })
-            .collect()
-    }
+    use super::SlackThread;
 
     #[test]
-    fn pick_workdir_errors_without_registered_workdirs() {
-        assert!(pick_workdir(&[], "hello").is_err());
-    }
-
-    #[test]
-    fn pick_workdir_uses_the_sole_workdir() {
-        let workdirs = workdirs(&[("/src/rho", "rho", 1)]);
-        assert_eq!(pick_workdir(&workdirs, "hello").unwrap(), "/src/rho");
-    }
-
-    #[test]
-    fn pick_workdir_defaults_to_most_recently_registered() {
-        let workdirs = workdirs(&[("/src/old", "old", 1), ("/src/new", "new", 2)]);
-        assert_eq!(pick_workdir(&workdirs, "fix the bug").unwrap(), "/src/new");
-        // An unknown @-prefix is not a workdir override.
-        assert_eq!(pick_workdir(&workdirs, "@alice hi").unwrap(), "/src/new");
-    }
-
-    #[test]
-    fn pick_workdir_prefix_overrides_default() {
-        let workdirs = workdirs(&[("/src/old", "old", 1), ("/src/new", "new", 2)]);
-        assert_eq!(
-            pick_workdir(&workdirs, "@OLD fix the bug").unwrap(),
-            "/src/old"
-        );
-    }
-
-    #[test]
-    fn workdir_note_names_the_repo_without_a_roster_for_a_sole_workdir() {
-        let workdirs = workdirs(&[("/src/rho", "rho", 1)]);
-        let note = workdir_note(&workdirs, Utf8Path::new("/src/rho"));
-        assert_eq!(note, "You are working in the \"rho\" repo at /src/rho.");
-    }
-
-    #[test]
-    fn workdir_note_lists_other_repos_with_delegation_guidance() {
-        let workdirs = workdirs(&[("/src/rho", "rho", 1), ("/src/web", "web", 2)]);
-        let note = workdir_note(&workdirs, Utf8Path::new("/src/web"));
-        assert!(note.starts_with("You are working in the \"web\" repo at /src/web."));
-        assert!(note.contains("rho — /src/rho"));
-        assert!(note.contains("spawn_agent(workspace=new, repo=\"<absolute path>\")"));
+    fn parses_slack_session_key() {
+        let thread = SlackThread::parse("slack:C123:1700000000.000001").unwrap();
+        assert_eq!(thread.channel, "C123");
+        assert_eq!(thread.thread_ts, "1700000000.000001");
+        assert!(SlackThread::parse("discord:C123:1").is_none());
+        assert!(SlackThread::parse("slack:C123").is_none());
     }
 }

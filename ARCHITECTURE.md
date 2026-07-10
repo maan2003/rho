@@ -45,10 +45,12 @@ provider crates.
 
 `rho-slack` is the in-process Slack surface. `SlackManager` is handed the
 daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
-secret storage (`SecretStore`), the Socket Mode reconnect loop, mapping each
-Slack thread to an agent session persisted in rho-db, and posting each
-turn's final answer back to the thread. The daemon only installs secrets
-into it and resumes it from the systemd fd store on startup.
+secret storage (`SecretStore`), the Socket Mode reconnect loop, the persisted
+Slack coordinator repository and Slack-thread → agent-session mapping, and
+posting each mapped coordinator agent's completed-turn final answer back to the
+thread. The daemon validates and installs Slack setup, resumes secrets from the
+systemd fd store on startup, and publishes generic agent turn-completion
+reports through `AgentPool`; it does not own Slack routing policy.
 
 Dependencies should flow from higher-level assembly/policy crates toward lower
 reusable crates. The shared `rho-core` crate must not depend on provider, agent,

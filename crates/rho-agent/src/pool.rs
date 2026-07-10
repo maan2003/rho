@@ -38,6 +38,8 @@ pub struct AgentPool {
     /// Fires for every agent created in this pool — including agents spawned
     /// by other agents — so every UI connection can pick them up.
     created: broadcast::Sender<AgentCreated>,
+    /// Fires when a loaded agent completes a turn with a final answer.
+    completed_turns: broadcast::Sender<AgentTurnCompleted>,
 }
 
 /// Broadcast when any agent is created in the pool.
@@ -46,6 +48,13 @@ pub struct AgentCreated {
     pub topic_id: TopicId,
     pub agent_id: AgentId,
     pub agent: RunningAgent,
+}
+
+/// Broadcast when an agent completes a turn.
+#[derive(Clone, Debug)]
+pub struct AgentTurnCompleted {
+    pub agent_id: AgentId,
+    pub final_answer: String,
 }
 
 /// Where a spawned child works, relative to its parent.
@@ -75,11 +84,20 @@ impl AgentPool {
             agents: Mutex::new(HashMap::new()),
             repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
+            completed_turns: broadcast::channel(64).0,
         })
     }
 
     pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {
         self.created.subscribe()
+    }
+
+    pub fn subscribe_completed_turns(&self) -> broadcast::Receiver<AgentTurnCompleted> {
+        self.completed_turns.subscribe()
+    }
+
+    pub fn publish_completed_turn(&self, completed: AgentTurnCompleted) {
+        let _ = self.completed_turns.send(completed);
     }
 
     pub fn db(&self) -> &RhoDb {
