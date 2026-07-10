@@ -153,7 +153,6 @@ fn AgentRow(app: App, agent: AgentSummary) -> impl IntoView {
         .unwrap_or('ρ')
         .to_uppercase()
         .to_string();
-    let hue = hue(&agent.id);
     let attention = agent.attention.clone();
     view! {
         <button
@@ -161,13 +160,7 @@ fn AgentRow(app: App, agent: AgentSummary) -> impl IntoView {
             class:active=move || app.selected.get().as_deref() == Some(selected_id.as_str())
             on:click=move |_| app.select(id.clone())
         >
-            <span
-                class="avatar"
-                style=format!(
-                    "background:linear-gradient(135deg,hsl({hue},60%,45%),hsl({},60%,35%))",
-                    (hue + 40) % 360
-                )
-            >{initial}</span>
+            <span class="avatar">{initial}</span>
             <span class="agent-meta">
                 <span class="agent-name">{agent.name}</span>
                 <span class="agent-mode">{agent.mode}</span>
@@ -175,12 +168,6 @@ fn AgentRow(app: App, agent: AgentSummary) -> impl IntoView {
             <span class=format!("attn {attention}")></span>
         </button>
     }
-}
-
-fn hue(id: &str) -> u32 {
-    id.bytes().fold(0u32, |hash, byte| {
-        hash.wrapping_mul(31).wrapping_add(byte as u32)
-    }) % 360
 }
 
 fn ChatPane(app: App, agent_id: String) -> impl IntoView {
@@ -350,7 +337,13 @@ fn ToolCard(
                 <span class="chev">{move || if open.get() { "▾" } else { "▸" }}</span>
                 <span class="tool-name">{name}</span>
                 <span class="tool-hint">{hint}</span>
-                <span class=format!("badge {status}")>{status.clone()}</span>
+                <span class=format!("badge {status}")>
+                    {match status.as_str() {
+                        "success" => "✓".to_owned(),
+                        "running" => "running…".to_owned(),
+                        other => other.to_owned(),
+                    }}
+                </span>
             </button>
             {move || open.get().then(|| view! {
                 <div class="tool-body">
@@ -397,26 +390,30 @@ fn Composer(app: App) -> impl IntoView {
     };
     view! {
         <div class="composer">
-            <textarea
-                rows="1"
-                placeholder="Message the agent…"
-                node_ref=area
-                on:input=move |event| {
-                    if let Some(element) = event
-                        .target()
-                        .and_then(|target| target.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
-                    {
-                        autosize(&element);
+            <div class="composer-card">
+                <textarea
+                    rows="1"
+                    placeholder="Message the agent…"
+                    node_ref=area
+                    on:input=move |event| {
+                        if let Some(element) = event
+                            .target()
+                            .and_then(|target| target.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
+                        {
+                            autosize(&element);
+                        }
                     }
-                }
-                on:keydown=move |event| {
-                    if event.key() == "Enter" && !event.shift_key() {
-                        event.prevent_default();
-                        send();
+                    on:keydown=move |event| {
+                        if event.key() == "Enter" && !event.shift_key() {
+                            event.prevent_default();
+                            send();
+                        }
                     }
-                }
-            ></textarea>
-            <button class="send" on:click=move |_| send() title="Send">"↑"</button>
+                ></textarea>
+                <div class="composer-bar">
+                    <button class="send" on:click=move |_| send() title="Send">"↑"</button>
+                </div>
+            </div>
         </div>
     }
 }
