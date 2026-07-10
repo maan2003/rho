@@ -48,9 +48,12 @@ daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
 secret storage (`SecretStore`), the Socket Mode reconnect loop, the persisted
 Slack coordinator repository and Slack-thread → agent-session mapping, and
 posting each mapped coordinator agent's completed-turn final answer back to the
-thread. The daemon validates and installs Slack setup, resumes secrets from the
-systemd fd store on startup, and publishes generic agent turn-completion
-reports through `AgentPool`; it does not own Slack routing policy.
+thread. It also subscribes to generic accepted-input reports and mirrors
+non-Slack local user inputs into mapped Slack threads, using a private opaque
+source id to avoid echoing Slack-originated inputs. The daemon validates and
+installs Slack setup, resumes secrets from the systemd fd store on startup, and
+publishes generic agent turn-completion and accepted-input reports through
+`AgentPool`; it does not own Slack routing policy.
 
 `octo`/`oct` are vendored GitHub helper crates from `~maan2003/claude`. Rho
 runs Octo as an in-process daemon Unix-socket server and exposes its socket path

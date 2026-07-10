@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
-use rho_agent::MessageDelivery;
 use rho_agent::db::{
     AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, DeepConfig, DeepEffort, Status, TopicId,
 };
 use rho_agent::pool::AgentPool;
+use rho_agent::{InputSourceId, MessageDelivery, MessageSender};
 use rho_db::RhoDb;
 use tokio::sync::mpsc;
 
@@ -44,6 +44,7 @@ pub struct SlackManager {
     /// turn removes its matching in-progress reaction without adding a
     /// success reaction.
     in_progress: tokio::sync::Mutex<HashMap<rho_agent::db::AgentId, Vec<SlackReaction>>>,
+    source_id: InputSourceId,
     secrets: std::sync::Mutex<Option<Arc<SecretStore>>>,
     /// Aborting the previous run loop on secret rotation.
     run_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -77,10 +78,12 @@ impl SlackManager {
             topic_id,
             user_names: tokio::sync::Mutex::new(HashMap::new()),
             in_progress: tokio::sync::Mutex::new(HashMap::new()),
+            source_id: next_source_id(),
             secrets: std::sync::Mutex::new(None),
             run_task: std::sync::Mutex::new(None),
         });
         manager.start_turn_delivery_loop();
+        manager.start_input_delivery_loop();
         manager
     }
 
@@ -183,6 +186,20 @@ impl SlackManager {
         });
     }
 
+    fn start_input_delivery_loop(self: &Arc<Self>) {
+        let manager = self.clone();
+        let mut accepted = self.pool.subscribe_accepted_inputs();
+        tokio::spawn(async move {
+            loop {
+                match accepted.recv().await {
+                    Ok(report) => manager.deliver_accepted_input(report).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     fn slack_config(&self) -> anyhow::Result<SlackConfig> {
         let store = self
             .secrets
@@ -235,6 +252,35 @@ impl SlackManager {
             .await
         {
             tracing::error!(%error, "posting slack turn completion");
+        }
+    }
+
+    async fn deliver_accepted_input(&self, report: rho_agent::pool::AgentInputAccepted) {
+        if !should_relay_input(&report, self.source_id) {
+            return;
+        }
+        let Some(thread) = self.slack_thread_for_agent(report.input_id.agent_id) else {
+            return;
+        };
+        let config = match self.slack_config() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::debug!(%error, "skipping slack input relay without secrets");
+                return;
+            }
+        };
+        let text = local_input_relay_text(&rho_core::text_content(&report.content));
+        let api = SlackApi::new(&config.api_base);
+        if let Err(error) = api
+            .post_message(
+                &config.bot_token,
+                &thread.channel,
+                Some(&thread.thread_ts),
+                &crate::mrkdwn::to_mrkdwn(&text),
+            )
+            .await
+        {
+            tracing::error!(%error, "posting slack input relay");
         }
     }
 
@@ -427,9 +473,37 @@ impl SlackManager {
             .inbound_text(api, config, event, is_new, thread_context)
             .await;
         self.add_in_progress(agent_id, event).await;
-        agent.send_user_message(text, MessageDelivery::NextRequest);
+        agent.send_user_message_with_source(
+            text,
+            MessageDelivery::NextRequest,
+            Some(self.source_id),
+        );
         Ok(None)
     }
+}
+
+fn next_source_id() -> InputSourceId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    InputSourceId::from_raw(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+fn should_relay_input(
+    report: &rho_agent::pool::AgentInputAccepted,
+    own_source_id: InputSourceId,
+) -> bool {
+    should_relay_input_source(report.sender, report.source_id, own_source_id)
+}
+
+fn should_relay_input_source(
+    sender: MessageSender,
+    source_id: Option<InputSourceId>,
+    own_source_id: InputSourceId,
+) -> bool {
+    sender == MessageSender::User && source_id != Some(own_source_id)
+}
+
+fn local_input_relay_text(text: &str) -> String {
+    format!("Local Rho user:\n{text}")
 }
 
 struct SlackReaction {
@@ -570,7 +644,9 @@ impl SlackManager {
 
 #[cfg(test)]
 mod tests {
-    use super::SlackThread;
+    use rho_agent::{InputSourceId, MessageSender};
+
+    use super::{SlackThread, local_input_relay_text, should_relay_input_source};
 
     #[test]
     fn parses_slack_session_key() {
@@ -579,5 +655,32 @@ mod tests {
         assert_eq!(thread.thread_ts, "1700000000.000001");
         assert!(SlackThread::parse("discord:C123:1").is_none());
         assert!(SlackThread::parse("slack:C123").is_none());
+    }
+
+    #[test]
+    fn input_relay_filter_skips_own_source_and_agent_mail() {
+        let own = InputSourceId::from_raw(7);
+        assert!(!should_relay_input_source(
+            MessageSender::User,
+            Some(own),
+            own
+        ));
+        assert!(should_relay_input_source(MessageSender::User, None, own));
+        assert!(!should_relay_input_source(
+            MessageSender::Agent {
+                id: rho_agent::db::AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(0))
+                    .unwrap()
+            },
+            None,
+            own
+        ));
+    }
+
+    #[test]
+    fn local_input_relay_uses_conservative_attribution() {
+        assert_eq!(
+            local_input_relay_text("please continue"),
+            "Local Rho user:\nplease continue"
+        );
     }
 }

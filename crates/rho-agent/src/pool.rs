@@ -20,7 +20,7 @@ use crate::db::{
     AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
     AgentWriteTxnExt as _, DeepConfig, DeepModel, TopicId,
 };
-use crate::{Agent, AgentState, MessageDelivery, StartWorkspace};
+use crate::{Agent, AgentInputId, AgentState, InputSourceId, MessageDelivery, StartWorkspace};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -40,6 +40,8 @@ pub struct AgentPool {
     created: broadcast::Sender<AgentCreated>,
     /// Fires when a loaded agent completes a turn with a final answer.
     completed_turns: broadcast::Sender<AgentTurnCompleted>,
+    /// Fires after a user input has been durably accepted into an agent log.
+    accepted_inputs: broadcast::Sender<AgentInputAccepted>,
 }
 
 /// Broadcast when any agent is created in the pool.
@@ -55,6 +57,16 @@ pub struct AgentCreated {
 pub struct AgentTurnCompleted {
     pub agent_id: AgentId,
     pub final_answer: String,
+}
+
+/// Broadcast when a user input is accepted into an agent.
+#[derive(Clone, Debug)]
+pub struct AgentInputAccepted {
+    pub input_id: AgentInputId,
+    pub sender: rho_core::MessageSender,
+    pub content: Vec<rho_core::ContentPart>,
+    pub delivery: MessageDelivery,
+    pub source_id: Option<InputSourceId>,
 }
 
 /// Where a spawned child works, relative to its parent.
@@ -85,6 +97,7 @@ impl AgentPool {
             repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
             completed_turns: broadcast::channel(64).0,
+            accepted_inputs: broadcast::channel(64).0,
         })
     }
 
@@ -96,8 +109,16 @@ impl AgentPool {
         self.completed_turns.subscribe()
     }
 
+    pub fn subscribe_accepted_inputs(&self) -> broadcast::Receiver<AgentInputAccepted> {
+        self.accepted_inputs.subscribe()
+    }
+
     pub fn publish_completed_turn(&self, completed: AgentTurnCompleted) {
         let _ = self.completed_turns.send(completed);
+    }
+
+    pub fn publish_accepted_input(&self, accepted: AgentInputAccepted) {
+        let _ = self.accepted_inputs.send(accepted);
     }
 
     pub fn db(&self) -> &RhoDb {
@@ -390,8 +411,17 @@ impl RunningAgent {
     }
 
     pub fn send_user_message(&self, text: String, delivery: MessageDelivery) {
+        self.send_user_message_with_source(text, delivery, None);
+    }
+
+    pub fn send_user_message_with_source(
+        &self,
+        text: String,
+        delivery: MessageDelivery,
+        source_id: Option<InputSourceId>,
+    ) {
         match self {
-            Self::Rho(agent) => agent.send_user_message(text, delivery),
+            Self::Rho(agent) => agent.send_user_message_with_source(text, delivery, source_id),
             // The Claude CLI does its own mid-turn steering; there is no
             // lane choice to forward.
             Self::Claude(agent) => agent.send_user_message(text),

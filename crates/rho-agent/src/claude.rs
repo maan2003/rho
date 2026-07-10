@@ -418,6 +418,7 @@ impl ClaudeLoop {
                         kind: QueuedItemKind::UserMessage {
                             sender: crate::MessageSender::User,
                             content,
+                            source_id: None,
                         },
                         delivery,
                     });
@@ -952,6 +953,7 @@ mod tests {
             kind: QueuedItemKind::UserMessage {
                 sender: crate::MessageSender::User,
                 content: text("claude-normalized text"),
+                source_id: None,
             },
             delivery: MessageDelivery::Immediate,
         });

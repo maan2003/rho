@@ -16,6 +16,7 @@ fn user_event(text: &str) -> AgentEvent<'static> {
             content: Arc::new(vec![ContentPart::Text {
                 text: text.to_owned(),
             }]),
+            source_id: None,
         },
         delivery: MessageDelivery::Immediate,
     })

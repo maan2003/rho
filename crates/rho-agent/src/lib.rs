@@ -24,6 +24,7 @@ use crate::db::{
     DeepModel, UnixMillis,
 };
 use crate::multi_agent_tools::MultiAgentTools;
+use crate::pool::AgentInputAccepted;
 
 pub mod claude;
 mod code_mode;
@@ -63,6 +64,28 @@ pub enum AgentEvent<'a> {
 }
 
 pub use rho_core::MessageSender;
+
+/// Stable identity for an accepted user input in an agent's persisted event
+/// log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AgentInputId {
+    pub agent_id: AgentId,
+    pub event_pos: AgentEventPos,
+}
+
+/// Opaque tag for the surface that submitted an input.
+///
+/// The value is deliberately policy-free: consumers can compare it for equality
+/// with a private value they own, but should not infer a user-visible origin
+/// from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
+pub struct InputSourceId(u64);
+
+impl InputSourceId {
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
 
 /// Live runtime state of an agent turn.
 #[derive(Clone, Debug, PartialEq)]
@@ -105,6 +128,8 @@ pub enum QueuedItemKind {
     UserMessage {
         sender: MessageSender,
         content: Arc<Vec<ContentPart>>,
+        #[senax(default)]
+        source_id: Option<InputSourceId>,
     },
     Compaction,
     /// An out-of-band extra output for an in-flight tool call (code-mode
@@ -239,7 +264,9 @@ struct RestoreToolTurn {
 /// The context block a queued input becomes at delivery.
 fn delivered_block(item: QueuedItem) -> ContextBlock {
     match item.kind {
-        QueuedItemKind::UserMessage { sender, content } => ContextBlock::UserMessage {
+        QueuedItemKind::UserMessage {
+            sender, content, ..
+        } => ContextBlock::UserMessage {
             sender,
             content: Arc::try_unwrap(content).unwrap_or_else(|content| (*content).clone()),
         },
@@ -548,7 +575,8 @@ impl Agent {
         );
         let multi_agent = pool
             .upgrade()
-            .map(|_| MultiAgentTools::new(pool, agent_id, parent));
+            .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
+        let pool_events = pool;
         let (control, control_rx) = mpsc::unbounded_channel();
         let code_mode = start_code_mode(
             config.code_mode,
@@ -585,6 +613,7 @@ impl Agent {
             },
             multi_agent,
             code_mode,
+            pool_events,
         };
         tokio::spawn(agent_loop.run());
         Self {
@@ -605,10 +634,20 @@ impl Agent {
     /// Send a message. If the agent is busy it queues and enters model context
     /// at the point `delivery` names; otherwise it starts a turn immediately.
     pub fn send_user_message(&self, text: impl Into<String>, delivery: MessageDelivery) {
+        self.send_user_message_with_source(text, delivery, None);
+    }
+
+    pub fn send_user_message_with_source(
+        &self,
+        text: impl Into<String>,
+        delivery: MessageDelivery,
+        source_id: Option<InputSourceId>,
+    ) {
         let _ = self.control.send(AgentControl::UserMessage {
             sender: MessageSender::User,
             content: vec![ContentPart::Text { text: text.into() }],
             delivery,
+            source_id,
         });
     }
 
@@ -624,6 +663,7 @@ impl Agent {
             sender: MessageSender::Agent { id: sender },
             content: vec![ContentPart::Text { text: text.into() }],
             delivery,
+            source_id: None,
         });
     }
 
@@ -770,6 +810,7 @@ enum AgentControl {
         sender: MessageSender,
         content: Vec<ContentPart>,
         delivery: MessageDelivery,
+        source_id: Option<InputSourceId>,
     },
     Compact {
         delivery: MessageDelivery,
@@ -805,6 +846,7 @@ struct AgentLoop {
     /// `exec`/`wait` tool surface. Pending exec futures hold their own `Arc`,
     /// so toggling code mode off mid-turn lets them finish.
     code_mode: Option<Arc<rho_code_mode::CodeModeSession>>,
+    pool_events: std::sync::Weak<pool::AgentPool>,
 }
 
 impl AgentLoop {
@@ -851,8 +893,10 @@ impl AgentLoop {
                             sender,
                             content,
                             delivery,
+                            source_id,
                         } => {
-                            self.enqueue_message(&mut state, sender, content, delivery).await;
+                            self.enqueue_message(&mut state, sender, content, delivery, source_id)
+                                .await;
                         }
                         AgentControl::Compact { delivery } => {
                             let item = QueuedItem {
@@ -1312,11 +1356,13 @@ impl AgentLoop {
         }
     }
 
-    async fn persist_event(&mut self, event: AgentEvent<'_>) {
+    async fn persist_event(&mut self, event: AgentEvent<'_>) -> AgentEventPos {
         let persistence = &mut self.persistence;
+        let event_pos = persistence.next_event;
         let mut write = persistence.db.write().await;
         persistence.next_event = write.append_agent_event(persistence.next_event, &event);
         write.commit();
+        event_pos
     }
 
     /// Persist and queue an incoming message (user input or agent mail),
@@ -1327,15 +1373,30 @@ impl AgentLoop {
         sender: MessageSender,
         content: Vec<ContentPart>,
         delivery: MessageDelivery,
+        source_id: Option<InputSourceId>,
     ) {
+        let content = Arc::new(content);
         let item = QueuedItem {
             kind: QueuedItemKind::UserMessage {
                 sender,
-                content: Arc::new(content),
+                content: Arc::clone(&content),
+                source_id,
             },
             delivery,
         };
-        self.persist_event(AgentEvent::Queued(item.clone())).await;
+        let event_pos = self.persist_event(AgentEvent::Queued(item.clone())).await;
+        if let Some(pool) = self.pool_events.upgrade() {
+            pool.publish_accepted_input(AgentInputAccepted {
+                input_id: AgentInputId {
+                    agent_id: self.persistence.agent_id,
+                    event_pos,
+                },
+                sender,
+                content: (*content).clone(),
+                delivery,
+                source_id,
+            });
+        }
         state.queued_inputs.push(item);
         self.wake_for_queued(state).await;
         self.yield_code_mode_wait_for_queued(state);
@@ -1667,6 +1728,7 @@ mod tests {
             kind: QueuedItemKind::UserMessage {
                 sender,
                 content: Arc::new(text_parts(text)),
+                source_id: None,
             },
             delivery,
         })
@@ -1795,6 +1857,7 @@ mod tests {
             QueuedItemKind::UserMessage {
                 sender: MessageSender::Agent { id: agent_id(2) },
                 content: Arc::new(text_parts("pending mail")),
+                source_id: None,
             }
         );
     }
@@ -1805,6 +1868,7 @@ mod tests {
             kind: QueuedItemKind::UserMessage {
                 sender: MessageSender::User,
                 content: Arc::new(text_parts(text)),
+                source_id: None,
             },
             delivery,
         };
@@ -1876,6 +1940,7 @@ mod tests {
             kind: QueuedItemKind::UserMessage {
                 sender: MessageSender::User,
                 content: Arc::new(text_parts("steer")),
+                source_id: None,
             },
             delivery: MessageDelivery::NextRequest,
         });
@@ -1892,6 +1957,7 @@ mod tests {
             kind: QueuedItemKind::UserMessage {
                 sender: MessageSender::Agent { id: agent_id(3) },
                 content: Arc::new(text_parts("done")),
+                source_id: None,
             },
             delivery: MessageDelivery::NextRequest,
         });
@@ -1908,6 +1974,7 @@ mod tests {
             kind: QueuedItemKind::UserMessage {
                 sender: MessageSender::User,
                 content: Arc::new(text_parts("later")),
+                source_id: None,
             },
             delivery: MessageDelivery::NextTurn,
         });
@@ -1979,6 +2046,7 @@ mod encoding_tests {
                     content: Arc::new(vec![ContentPart::Text {
                         text: "mail".to_owned(),
                     }]),
+                    source_id: Some(InputSourceId::from_raw(42)),
                 },
                 delivery: MessageDelivery::NextRequest,
             }),

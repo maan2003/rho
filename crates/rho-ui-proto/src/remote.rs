@@ -103,7 +103,10 @@ impl UiAgentState {
         blocks.extend(in_flight_blocks(&state.kind));
         blocks.extend(state.queued_inputs.iter().map(|input| match input {
             QueuedItem {
-                kind: QueuedItemKind::UserMessage { sender, content },
+                kind:
+                    QueuedItemKind::UserMessage {
+                        sender, content, ..
+                    },
                 delivery,
             } => UiBlock::QueuedMessage {
                 text: text_content(content),

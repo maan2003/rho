@@ -34,38 +34,16 @@ AI APIs.
   Inbound Slack Socket Mode frames are remote, semi-trusted input: malformed or
   unexpected frames are skipped, never panicked on, and message text is handed to
   agents as untrusted user content. Slack replies are posted only for agents
-  reverse-mapped from Slack thread sessions when the generic agent
-  turn-completion stream reports a final answer.
+  reverse-mapped from Slack thread sessions. Slack-originated inputs are tagged
+  with a private in-memory source id so the Slack relay can ignore its own
+  accepted-input reports; other local-client user inputs to Slack-mapped agents
+  are mirrored into the mapped thread with conservative attribution, and final
+  answers are posted when the generic agent turn-completion stream reports them.
 - The embedded Octo server listens only on a daemon-owned Unix socket whose path
   is passed to agent commands as `OCTO_SOCKET`. Octo uses the sealed platform
   secret store as its GitHub token source and has no token argv/env/file/admin
   import path in Rho. GitHub API responses and errors are remote, semi-trusted
   input and are returned to the calling command rather than panicking.
-
-## Remote UI transports (iroh and web UI)
-
-- With `rho daemon --iroh`, the daemon serves the full UI protocol over iroh
-  (relay-backed QUIC). An enrolled client is fully privileged: everything a
-  local UI client can do, including starting agents that run shell commands.
-  Trust is per client endpoint key, persisted in the local rho database, and
-  granted only by a local user running `rho iroh approve <code>` against the
-  Unix socket; codes are 60-bit, single-use, expire after a minute, and bind
-  the exact client key via a TLS exporter, so approval cannot be replayed or
-  redirected. The daemon's iroh secret key lives owner-readable-only in the
-  rho state directory. Enrollment approval is also accepted from already
-  trusted remote clients (they are fully privileged anyway).
-- With `rho daemon --webui <addr>`, the daemon exposes an unauthenticated
-  WebSocket (`/ws`) that bridges a reduced JSON command set (list/select
-  agents, send message, new agent in a registered workdir, cancel turn) onto
-  a normal in-process UI protocol session. It must only be bound to
-  localhost or an otherwise access-controlled interface. Because any website
-  in a local browser can open WebSockets to localhost, `--webui-origin`
-  should be set to the origin hosting the static page; requests from other
-  origins are rejected before the upgrade. The static page (`webui/`) holds
-  no secrets and sends only user-authored text.
-- Inbound frames on both transports are remote, semi-trusted input: oversized
-  frames are rejected (`MAX_FRAME_LEN`), malformed frames end the connection,
-  and malformed browser JSON produces an error message, never a panic.
 
 ## Runtime assumptions
 

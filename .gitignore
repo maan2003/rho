@@ -3,6 +3,8 @@
 /result
 /result-*
 /target
+/.jj
+/.jj/**
 /tmp
 /tmp/
 /.isolate
