@@ -1,6 +1,6 @@
-//! Code-mode tool surface. When `DeepConfig::code_mode` is on, the model gets
-//! only the `exec` and `wait` tools; shell and multi-agent tools are reached
-//! from JavaScript through the session's nested `tools.*` dispatch.
+//! Code-mode tool surface. When `InferenceProfile::code_mode` is on, the model
+//! gets only the `exec` and `wait` tools; shell and multi-agent tools are
+//! reached from JavaScript through the session's nested `tools.*` dispatch.
 
 use std::sync::Arc;
 

@@ -12,7 +12,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use redb::{AccessGuard, Database, ReadableDatabase, ReadableTable, TableDefinition, TypeName};
+use redb::{
+    AccessGuard, Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle, TypeName,
+};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const CACHE_SIZE: usize = 10 * 1024 * 1024;
@@ -200,9 +202,31 @@ impl RhoDb {
             _guard: guard,
         }
     }
+
+    pub async fn persistent_savepoint(&self, record: impl FnOnce(&mut WriteTxn, u64)) -> u64 {
+        let guard = Arc::clone(&self.write_lock).lock_owned().await;
+        let inner = self.database.begin_write().expect("begin rho-db write txn");
+        let id = inner
+            .persistent_savepoint()
+            .expect("create rho-db persistent savepoint");
+        let mut write = WriteTxn {
+            inner,
+            _guard: guard,
+        };
+        record(&mut write, id);
+        write.commit();
+        id
+    }
 }
 
 impl ReadTxn {
+    pub fn has_table(&self, name: &str) -> bool {
+        self.inner
+            .list_tables()
+            .expect("list rho-db tables")
+            .any(|table| table.name() == name)
+    }
+
     pub fn open_table<K, V>(&self, definition: TableDefinition<K, V>) -> ReadTable<K, V>
     where
         K: redb::Key + 'static,

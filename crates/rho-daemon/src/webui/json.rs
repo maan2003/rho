@@ -5,7 +5,7 @@
 use rho_ui_proto::remote::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
-use rho_ui_proto::{AgentMode, UiAttention, UiTopic, UiWorkdir};
+use rho_ui_proto::{AgentConfig, AgentMode, Intelligence, UiAttention, UiTopic, UiWorkdir};
 use rho_webui_messages::{AgentState, AgentSummary, Block, ToBrowser, Topic, Workdir};
 
 /// Longest tool output/error forwarded to the browser, in bytes.
@@ -148,15 +148,13 @@ fn truncate(mut text: String, limit: usize) -> String {
     text
 }
 
-fn mode_label(mode: AgentMode) -> &'static str {
-    match mode {
-        AgentMode::Deep(_) => "deep",
-        AgentMode::Fable { .. } => "fable",
-        AgentMode::Opus { .. } => "opus",
-        AgentMode::Sol(_) => "sol",
-        AgentMode::Luna(_) => "luna",
-        AgentMode::Terra(_) => "terra",
-        AgentMode::Coordinator(_) => "coordinator",
+fn mode_label(config: AgentConfig) -> &'static str {
+    match (config.mode, config.intelligence) {
+        (AgentMode::Coordinator, _) => "coordinator",
+        (_, Intelligence::Low) => "low",
+        (_, Intelligence::Medium) => "medium",
+        (_, Intelligence::High) => "high",
+        (_, Intelligence::Ultra) => "ultra",
     }
 }
 

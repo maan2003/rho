@@ -121,42 +121,32 @@ pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
         .is_none_or(char::is_whitespace);
     let words = trimmed.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() || (words.len() == 1 && !typing_new_token) {
-        return [
-            "deep",
-            "sol",
-            "luna",
-            "terra",
-            "coordinator",
-            "fable",
-            "opus",
-        ]
-        .into_iter()
-        .filter(|mode| fuzzy_contains(mode, token))
-        .map(|mode| Candidate {
-            value: mode.to_owned(),
-            description: match mode {
-                "deep" => "rho deep agent (gpt-5.5)".to_owned(),
-                "sol" => "rho deep agent (gpt-5.6-sol)".to_owned(),
-                "luna" => "rho deep agent (gpt-5.6-luna)".to_owned(),
-                "terra" => "rho deep agent (gpt-5.6-terra)".to_owned(),
-                "coordinator" => "cross-repo coordinator (terra, code mode)".to_owned(),
-                "fable" => "Claude Fable agent".to_owned(),
-                "opus" => "Claude Opus agent".to_owned(),
-                _ => unreachable!(),
-            },
-        })
-        .collect();
+        return ["normal", "coordinator"]
+            .into_iter()
+            .filter(|mode| fuzzy_contains(mode, token))
+            .map(|mode| Candidate {
+                value: mode.to_owned(),
+                description: if mode == "coordinator" {
+                    "delegating coordinator".to_owned()
+                } else {
+                    "normal agent".to_owned()
+                },
+            })
+            .collect();
     }
 
     let efforts: &[(&str, &str)] = match words.first().copied() {
-        Some("deep" | "sol" | "luna" | "terra" | "coordinator") => &[
-            ("low", "low effort"),
-            ("medium", "medium effort"),
-            ("xhigh", "extra-high effort"),
+        Some("normal") => &[
+            ("low", "low intelligence"),
+            ("medium", "medium intelligence"),
+            ("high", "high intelligence"),
+            ("ultra", "ultra intelligence"),
         ],
-        Some("fable") | Some("opus") => {
-            &[("medium", "medium effort"), ("xhigh", "extra-high effort")]
-        }
+        Some("coordinator") => &[
+            ("low", "low intelligence"),
+            ("medium", "medium intelligence"),
+            ("high", "high intelligence"),
+        ],
         _ => return Vec::new(),
     };
     efforts
@@ -363,35 +353,27 @@ mod tests {
     }
 
     #[test]
-    fn mode_field_completes_modes_and_efforts() {
-        let candidates = mode_field_candidates("f");
+    fn mode_field_completes_modes_and_intelligence() {
+        let candidates = mode_field_candidates("norm");
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "fable");
+        assert_eq!(candidates[0].value, "normal");
 
-        let candidates = mode_field_candidates("deep x");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "xhigh");
-
-        let candidates = mode_field_candidates("sol");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "sol");
-
-        let candidates = mode_field_candidates("terra ");
+        let candidates = mode_field_candidates("normal ");
         assert_eq!(
             candidates
                 .into_iter()
                 .map(|candidate| candidate.value)
                 .collect::<Vec<_>>(),
-            ["low", "medium", "xhigh"]
+            ["low", "medium", "high", "ultra"]
         );
 
-        let candidates = mode_field_candidates("fable ");
+        let candidates = mode_field_candidates("coordinator ");
         assert_eq!(
             candidates
                 .into_iter()
                 .map(|candidate| candidate.value)
                 .collect::<Vec<_>>(),
-            ["medium", "xhigh"]
+            ["low", "medium", "high"]
         );
     }
 }

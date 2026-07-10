@@ -8,8 +8,8 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use rho_agent::db::{
-    AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
-    AgentWriteTxnExt as _, Status, TopicId,
+    AgentConfig, AgentDisposition, AgentId, AgentReadTxnExt as _, AgentWriteTxnExt as _, Status,
+    TopicId,
 };
 use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent, SpawnWorkspace};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
@@ -508,10 +508,10 @@ impl AgentRegistry {
                         .map(|(agent_id, agent)| UiAgentSummary {
                             agent_id,
                             parent_agent: agent.parent_agent,
+                            mode: agent.config(),
                             display_name: agent.display_name,
                             created_at: agent.created_at,
                             updated_at: agent.updated_at,
-                            mode: agent.mode,
                             workspace: agent.workspace,
                             status: agent.status,
                             attention: attention_level(kinds.get(&agent_id), agent.disposition),
@@ -606,7 +606,7 @@ impl AgentRegistry {
     async fn create(
         &self,
         topic_id: TopicId,
-        mode: AgentMode,
+        mode: AgentConfig,
         start: StartMode,
     ) -> anyhow::Result<(TopicId, AgentId, RunningAgent)> {
         let start = match start {
@@ -645,7 +645,7 @@ impl AgentRegistry {
                 prompt,
                 workspace,
                 repo,
-                mode,
+                intelligence,
             } => {
                 if prompt.trim().is_empty() {
                     anyhow::bail!("prompt must not be empty");
@@ -665,7 +665,7 @@ impl AgentRegistry {
                         task_name.clone(),
                         prompt,
                         workspace,
-                        rho_agent::multi_agent_tools::parse_spawn_mode(&mode)?,
+                        rho_agent::multi_agent_tools::parse_spawn_intelligence(&intelligence)?,
                     )
                     .await?;
                 let child_workspace = self.pool.db().read().get_agent(child_id).workspace;
@@ -790,68 +790,13 @@ impl AgentRegistry {
         Ok(())
     }
 
-    async fn set_agent_mode(&self, agent_id: AgentId, mode: AgentMode) -> anyhow::Result<()> {
+    async fn set_agent_mode(&self, agent_id: AgentId, config: AgentConfig) -> anyhow::Result<()> {
         let record = self.db.read().get_agent(agent_id);
-        match (record.runtime, mode) {
-            (
-                AgentRuntime::Rho { .. },
-                AgentMode::Deep(config)
-                | AgentMode::Sol(config)
-                | AgentMode::Luna(config)
-                | AgentMode::Terra(config)
-                | AgentMode::Coordinator(config),
-            ) => {
-                // Code mode fixes the agent's tool surface and prompt at
-                // construction; it cannot change on a running agent. The
-                // coordinator prompt section is fixed the same way.
-                let current_code_mode = record
-                    .mode
-                    .deep_config()
-                    .is_some_and(|current| current.code_mode);
-                if config.code_mode != current_code_mode {
-                    anyhow::bail!("code mode can only be chosen when creating an agent");
-                }
-                if mode.is_coordinator() != record.mode.is_coordinator() {
-                    anyhow::bail!("coordinator mode can only be chosen when creating an agent");
-                }
-                let model = mode.deep_model().expect("deep mode has a model");
-                if let Some(agent) = self.get(agent_id).await {
-                    agent.set_deep_config(config, model)?;
-                }
-                let mut write = self.db.write().await;
-                write.set_agent_mode(rho_core::UnixMs::now(), agent_id, mode);
-                write.commit();
-                Ok(())
-            }
-            (AgentRuntime::Rho { .. }, AgentMode::Fable { .. } | AgentMode::Opus { .. }) => {
-                anyhow::bail!("cannot switch a Rho agent to a Claude runtime")
-            }
-            (
-                AgentRuntime::Claude { .. },
-                AgentMode::Deep(_)
-                | AgentMode::Sol(_)
-                | AgentMode::Luna(_)
-                | AgentMode::Terra(_)
-                | AgentMode::Coordinator(_),
-            ) => {
-                anyhow::bail!("cannot switch a Claude agent to a Deep runtime")
-            }
-            (AgentRuntime::Claude { .. }, AgentMode::Fable { .. } | AgentMode::Opus { .. }) => {
-                if record.mode.claude_model() != mode.claude_model() {
-                    anyhow::bail!("cannot switch a Claude agent model")
-                }
-                let effort = mode
-                    .claude_effort()
-                    .ok_or_else(|| anyhow::anyhow!("Claude mode missing effort"))?;
-                if let Some(agent) = self.get(agent_id).await {
-                    agent.set_claude_effort(effort).await?;
-                }
-                let mut write = self.db.write().await;
-                write.set_agent_mode(rho_core::UnixMs::now(), agent_id, mode);
-                write.commit();
-                Ok(())
-            }
+        let current = record.config();
+        if config.mode != current.mode || config.intelligence != current.intelligence {
+            anyhow::bail!("mode and intelligence can only be chosen when creating an agent");
         }
+        self.pool.set_latency(agent_id, config.latency).await
     }
 
     /// Titles an untitled agent from its first user message, in the

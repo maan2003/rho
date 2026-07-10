@@ -7,6 +7,64 @@ use rho_inference::PromptCacheKey;
 use rho_workspaces::WorkspaceInfo;
 
 use super::*;
+
+#[test]
+fn agent_config_resolves_opinionated_profiles() {
+    let profile = |intelligence| {
+        AgentConfig {
+            mode: AgentMode::Normal,
+            intelligence,
+            latency: Latency::Standard,
+        }
+        .session_profile()
+        .unwrap()
+    };
+    assert!(matches!(
+        profile(Intelligence::Low),
+        SessionBinding::ResponsesTerra(InferenceProfile {
+            effort: ReasoningEffort::Low,
+            ..
+        })
+    ));
+    assert!(matches!(
+        profile(Intelligence::Medium),
+        SessionBinding::ResponsesSol(InferenceProfile {
+            effort: ReasoningEffort::Medium,
+            ..
+        })
+    ));
+    assert!(matches!(
+        profile(Intelligence::High),
+        SessionBinding::ResponsesSol(InferenceProfile {
+            effort: ReasoningEffort::Xhigh,
+            ..
+        })
+    ));
+    assert_eq!(
+        profile(Intelligence::Ultra),
+        SessionBinding::ClaudeFable {
+            effort: ClaudeEffort::High
+        }
+    );
+}
+
+#[test]
+fn unsupported_agent_config_combinations_are_rejected() {
+    for config in [
+        AgentConfig {
+            mode: AgentMode::Coordinator,
+            intelligence: Intelligence::Ultra,
+            latency: Latency::Standard,
+        },
+        AgentConfig {
+            mode: AgentMode::Normal,
+            intelligence: Intelligence::Ultra,
+            latency: Latency::Fast,
+        },
+    ] {
+        assert!(config.session_profile().is_err());
+    }
+}
 use crate::{MessageDelivery, MessageSender, QueuedItem, QueuedItemKind};
 
 fn user_event(text: &str) -> AgentEvent<'static> {
@@ -82,8 +140,8 @@ fn agent_db_migrations_eventually_reach_current_format() {
 #[test]
 fn deep_default_uses_default_deep_config() {
     assert_eq!(
-        AgentMode::deep_default(),
-        AgentMode::Deep(DeepConfig::default())
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        SessionBinding::ResponsesGpt55(InferenceProfile::default())
     );
 }
 
@@ -164,7 +222,7 @@ async fn create_agent_and_append_events_with_cursor() {
         topic_id,
         Some("main".to_owned()),
         test_workspace(),
-        AgentMode::deep_default(),
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
@@ -198,7 +256,7 @@ async fn agent_events_read_lineage_parents() {
         topic_id,
         Some("main".to_owned()),
         test_workspace(),
-        AgentMode::deep_default(),
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
@@ -246,7 +304,7 @@ async fn fork_agent_lineage_repoints_current_branch() {
         topic_id,
         Some("main".to_owned()),
         test_workspace(),
-        AgentMode::deep_default(),
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
@@ -281,7 +339,7 @@ async fn move_agent_to_topic_repoints_membership() {
         default_topic,
         None,
         test_workspace(),
-        AgentMode::deep_default(),
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
@@ -314,7 +372,7 @@ async fn topic_and_agent_statuses_are_settable() {
         topic_id,
         None,
         test_workspace(),
-        AgentMode::deep_default(),
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
@@ -382,7 +440,7 @@ async fn agent_ids_allocate_before_records_exist() {
         topic_id,
         None,
         test_workspace(),
-        AgentMode::deep_default(),
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );

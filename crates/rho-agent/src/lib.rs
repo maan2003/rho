@@ -20,13 +20,13 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, DeepConfig,
-    DeepModel, UnixMillis,
+    AgentEventPos, AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRuntime,
+    AgentWriteTxnExt, InferenceModel, InferenceProfile, SessionBinding, UnixMillis,
 };
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::pool::AgentInputAccepted;
 
-pub mod claude;
+mod claude;
 mod code_mode;
 pub mod db;
 pub mod multi_agent_tools;
@@ -461,10 +461,10 @@ pub enum StartWorkspace {
 
 impl Agent {
     #[allow(clippy::too_many_arguments)]
-    pub async fn create(
+    pub(crate) async fn create(
         db: RhoDb,
         auth: InferenceAuth,
-        mode: AgentMode,
+        mode: SessionBinding,
         topic_id: db::TopicId,
         display_name: Option<String>,
         start: StartWorkspace,
@@ -543,11 +543,11 @@ impl Agent {
             panic!("cannot load Claude agent with the Rho agent runtime");
         };
         let config = record
-            .mode
+            .binding
             .deep_config()
             .expect("Rho runtime stored with non-Rho agent mode");
         let model = record
-            .mode
+            .binding
             .deep_model()
             .expect("Rho runtime stored with non-Rho agent mode");
         // The record, not the caller, is the source of truth for the parent
@@ -557,7 +557,7 @@ impl Agent {
             auth,
             config,
             model,
-            record.mode.is_coordinator(),
+            record.binding.is_coordinator(),
             prompt_cache_key,
             agent_id,
             next_event,
@@ -575,8 +575,8 @@ impl Agent {
     fn new(
         db: RhoDb,
         auth: InferenceAuth,
-        config: DeepConfig,
-        model: DeepModel,
+        config: InferenceProfile,
+        model: InferenceModel,
         coordinator: bool,
         prompt_cache_key: PromptCacheKey,
         agent_id: AgentId,
@@ -707,7 +707,7 @@ impl Agent {
         let _ = self.control.send(AgentControl::ContinueUnfinished);
     }
 
-    pub fn set_deep_config(&self, config: DeepConfig, model: DeepModel) {
+    pub fn set_deep_config(&self, config: InferenceProfile, model: InferenceModel) {
         let _ = self
             .control
             .send(AgentControl::SetDeepConfig(config, model));
@@ -850,7 +850,7 @@ enum AgentControl {
     /// An extra output for an in-flight tool call (code-mode `notify(...)`).
     /// Dropped when no turn is active, matching Codex.
     ToolUpdate(ToolUpdate),
-    SetDeepConfig(DeepConfig, DeepModel),
+    SetDeepConfig(InferenceProfile, InferenceModel),
     Rewind {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -876,9 +876,9 @@ struct AgentLoop {
     multi_agent: Option<MultiAgentTools>,
     /// Integration-provided tools bound to this agent.
     tool_extension: Option<Arc<dyn AgentToolExtension>>,
-    /// Present when `DeepConfig::code_mode` is on: the V8 session behind the
-    /// `exec`/`wait` tool surface. Pending exec futures hold their own `Arc`,
-    /// so toggling code mode off mid-turn lets them finish.
+    /// Present when `InferenceProfile::code_mode` is on: the V8 session behind
+    /// the `exec`/`wait` tool surface. Pending exec futures hold their own
+    /// `Arc`, so toggling code mode off mid-turn lets them finish.
     code_mode: Option<Arc<rho_code_mode::CodeModeSession>>,
     pool_events: std::sync::Weak<pool::AgentPool>,
 }

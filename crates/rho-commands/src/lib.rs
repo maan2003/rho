@@ -7,7 +7,7 @@
 //! *are*.
 
 use camino::Utf8PathBuf;
-use rho_ui_proto::{DeepEffort, Status, TopicId};
+use rho_ui_proto::{Status, TopicId};
 
 pub struct CommandSpec {
     /// Full command name after the `:`, e.g. `agent new`.
@@ -41,11 +41,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "agent fast",
         usage: ":agent fast [on|off]",
         description: "Toggle or set fast mode for the current Deep agent",
-    },
-    CommandSpec {
-        name: "agent effort",
-        usage: ":agent effort <low|medium|xhigh>",
-        description: "Set reasoning effort for the current agent",
     },
     CommandSpec {
         name: "topic new",
@@ -147,9 +142,6 @@ pub enum Command {
     AgentFast {
         enabled: Option<bool>,
     },
-    AgentEffort {
-        effort: DeepEffort,
-    },
     TopicNew {
         name: String,
     },
@@ -214,8 +206,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
             Some("cancel") => Parsed::Command(Command::AgentCancel),
             Some("pin") => Parsed::Command(Command::AgentPin),
             Some("fast") => parse_agent_fast(&mut tokens),
-            Some("effort") => parse_agent_effort(&mut tokens),
-            _ => Parsed::Invalid(":agent new|rename|cancel|pin|fast|effort".to_owned()),
+            _ => Parsed::Invalid(":agent new|rename|cancel|pin|fast".to_owned()),
         },
         "topic" => match tokens.next() {
             Some("new") => match joined_name(rest) {
@@ -274,21 +265,6 @@ fn parse_agent_fast<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed {
             enabled: Some(false),
         }),
         _ => Parsed::Invalid(":agent fast [on|off]".to_owned()),
-    }
-}
-
-fn parse_agent_effort<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed {
-    match (tokens.next(), tokens.next()) {
-        (Some("low"), None) => Parsed::Command(Command::AgentEffort {
-            effort: DeepEffort::Low,
-        }),
-        (Some("medium"), None) => Parsed::Command(Command::AgentEffort {
-            effort: DeepEffort::Medium,
-        }),
-        (Some("xhigh"), None) => Parsed::Command(Command::AgentEffort {
-            effort: DeepEffort::Xhigh,
-        }),
-        _ => Parsed::Invalid(":agent effort <low|medium|xhigh>".to_owned()),
     }
 }
 
@@ -449,14 +425,6 @@ fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> 
             .map(|value| Candidate {
                 value: value.to_owned(),
                 description: "fast mode".to_owned(),
-            })
-            .collect(),
-        ["agent", "effort"] => ["low", "medium", "xhigh"]
-            .into_iter()
-            .filter(|value| value.starts_with(partial))
-            .map(|value| Candidate {
-                value: value.to_owned(),
-                description: "Deep effort".to_owned(),
             })
             .collect(),
         ["agent", "new"] | ["workdirs", "rm"] => ctx

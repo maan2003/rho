@@ -20,7 +20,8 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{
-    AgentId, AgentMode, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt, TopicId, UnixMillis,
+    AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt,
+    SessionBinding, TopicId, UnixMillis,
 };
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
@@ -30,8 +31,10 @@ use crate::{
 
 mod projection;
 
-pub use projection::transcript_messages_to_context;
-use projection::{ClaudeStreamItem, assistant_message_to_block, user_output_to_block};
+use projection::{
+    ClaudeStreamItem, assistant_message_to_block, transcript_messages_to_context,
+    user_output_to_block,
+};
 
 #[derive(Clone)]
 pub struct ClaudeAgent {
@@ -44,12 +47,12 @@ pub struct ClaudeAgent {
 }
 
 impl ClaudeAgent {
-    pub async fn create(
+    pub(crate) async fn create(
         db: RhoDb,
         topic_id: TopicId,
         display_name: Option<String>,
         start: StartWorkspace,
-        mode: AgentMode,
+        mode: SessionBinding,
         parent: Option<AgentId>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<(AgentId, Self)> {
@@ -125,11 +128,11 @@ impl ClaudeAgent {
             anyhow::bail!("cannot load Rho agent with the Claude agent runtime");
         };
         let model = record
-            .mode
+            .binding
             .claude_model()
             .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
         let effort = record
-            .mode
+            .binding
             .claude_effort()
             .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
         let messages = rho_claude::read_session_messages_by_id(

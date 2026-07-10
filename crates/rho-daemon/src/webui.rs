@@ -16,7 +16,7 @@ use camino::Utf8PathBuf;
 use rho_core::ContentPart;
 use rho_ui_proto::remote::UiAgentState;
 use rho_ui_proto::{
-    AgentId, AgentMode, ClientMessage, MessageDelivery, ServerMessage, StartMode, UiTopic,
+    AgentConfig, AgentId, ClientMessage, MessageDelivery, ServerMessage, StartMode, UiTopic,
     UiWorkdir, read_frame, write_frame,
 };
 use rho_webui_messages::{FromBrowser, MAX_LINE_LEN, ToBrowser};
@@ -174,7 +174,7 @@ where
                         let Some(topic_id) = default_topic else { continue };
                         write_frame(&mut session_write, &ClientMessage::NewAgent {
                             topic_id,
-                            mode: AgentMode::deep_default(),
+                            mode: AgentConfig::default(),
                             start: StartMode::NewOn {
                                 repo: Utf8PathBuf::from(repo),
                                 revset: "@-".to_owned(),

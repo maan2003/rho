@@ -11,8 +11,8 @@ use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
 pub use rho_agent::MessageDelivery;
 pub use rho_agent::db::{
-    AgentDisposition, AgentId, AgentIdDomain, AgentMode, DeepConfig, DeepEffort, FableEffort,
-    OpusEffort, Status, TopicId, TopicIdDomain,
+    AgentConfig, AgentDisposition, AgentId, AgentIdDomain, AgentMode, Intelligence, Latency,
+    Status, TopicId, TopicIdDomain,
 };
 use rho_core::ContentPart;
 pub use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
@@ -75,7 +75,7 @@ pub enum ClientMessage {
     },
     NewAgent {
         topic_id: TopicId,
-        mode: AgentMode,
+        mode: AgentConfig,
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).
         start: StartMode,
@@ -125,7 +125,7 @@ pub enum ClientMessage {
     },
     SetAgentMode {
         agent_id: AgentId,
-        mode: AgentMode,
+        mode: AgentConfig,
     },
     SetTopicStatus {
         topic_id: TopicId,
@@ -201,7 +201,7 @@ pub enum McpAgentToolRequest {
         prompt: String,
         workspace: McpSpawnWorkspace,
         repo: Option<Utf8PathBuf>,
-        mode: String,
+        intelligence: String,
     },
     SendMessage {
         agent_id: String,
@@ -416,8 +416,9 @@ pub struct UiAgentSummary {
     pub display_name: Option<String>,
     pub created_at: rho_core::UnixMs,
     pub updated_at: rho_core::UnixMs,
-    /// The model/runtime mode this agent was created with.
-    pub mode: AgentMode,
+    /// The opinionated configuration represented by this agent's pinned session
+    /// profile.
+    pub mode: AgentConfig,
     /// Where the agent works. Clients resolve start targets against this
     /// themselves: "on top of agent" is the revset `<workspace name>@`, and
     /// joining sends the info back verbatim.

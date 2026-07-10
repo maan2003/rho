@@ -15,8 +15,8 @@ use gpui::prelude::*;
 use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
 use rho_ui_proto::{
-    AgentId, AgentMode, ClientMessage, DeepConfig, DeepEffort, FableEffort, MessageDelivery,
-    OpusEffort, VoiceRole, VoiceState, VoiceUiAction,
+    AgentConfig, AgentId, AgentMode, ClientMessage, Intelligence, Latency, MessageDelivery,
+    VoiceRole, VoiceState, VoiceUiAction,
 };
 use theme::ActiveTheme as _;
 
@@ -706,13 +706,15 @@ impl Workspace {
                     source_agent,
                     ":agent fast: no agent selected",
                     |config| {
-                        config.fast_mode = enabled.unwrap_or(!config.fast_mode);
+                        let fast = enabled.unwrap_or(config.latency != Latency::Fast);
+                        config.latency = if fast {
+                            Latency::Fast
+                        } else {
+                            Latency::Standard
+                        };
                     },
                     cx,
                 );
-            }
-            Command::AgentEffort { effort } => {
-                self.update_agent_effort(source_agent, effort, cx);
             }
             Command::TopicPin { name } => {
                 self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
@@ -975,7 +977,7 @@ impl Workspace {
         &mut self,
         source_agent: Option<AgentId>,
         no_target_message: &str,
-        update: impl FnOnce(&mut DeepConfig),
+        update: impl FnOnce(&mut AgentConfig),
         cx: &mut Context<Self>,
     ) {
         let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
@@ -983,11 +985,7 @@ impl Workspace {
             self.notice_on(None, no_target_message, StyleClass::SystemInfo, cx);
             return;
         };
-        let Some((mode, mut config)) = self
-            .registry
-            .agent_mode(agent_id)
-            .and_then(|mode| Some((mode, mode.deep_config()?)))
-        else {
+        let Some(mut config) = self.registry.agent_mode(agent_id) else {
             self.notice_on(
                 Some(&agent_id),
                 "mode changes are only available for deep agents",
@@ -999,65 +997,8 @@ impl Workspace {
         update(&mut config);
         self.connection.send(ClientMessage::SetAgentMode {
             agent_id,
-            mode: mode.with_deep_config(config),
+            mode: config,
         });
-    }
-
-    fn update_agent_effort(
-        &mut self,
-        source_agent: Option<AgentId>,
-        effort: DeepEffort,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
-        else {
-            self.notice_on(
-                None,
-                ":agent effort: no agent selected",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        };
-        let Some(mode) = self.registry.agent_mode(agent_id) else {
-            return;
-        };
-        let mode = match mode {
-            AgentMode::Deep(mut config)
-            | AgentMode::Sol(mut config)
-            | AgentMode::Luna(mut config)
-            | AgentMode::Terra(mut config)
-            | AgentMode::Coordinator(mut config) => {
-                config.effort = effort;
-                mode.with_deep_config(config)
-            }
-            AgentMode::Fable { .. } | AgentMode::Opus { .. } => {
-                let effort = match effort {
-                    DeepEffort::Low => {
-                        self.notice_on(
-                            Some(&agent_id),
-                            "low effort is only available for deep agents",
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                        return;
-                    }
-                    DeepEffort::Medium => FableEffort::Medium,
-                    DeepEffort::Xhigh => FableEffort::Xhigh,
-                };
-                match mode {
-                    AgentMode::Opus { .. } => AgentMode::Opus {
-                        effort: match effort {
-                            FableEffort::Medium => OpusEffort::Medium,
-                            FableEffort::Xhigh => OpusEffort::Xhigh,
-                        },
-                    },
-                    _ => AgentMode::Fable { effort },
-                }
-            }
-        };
-        self.connection
-            .send(ClientMessage::SetAgentMode { agent_id, mode });
     }
 
     /// (Re)writes the draft scaffold with the derived default workdir; the
@@ -1469,127 +1410,97 @@ impl Workspace {
     }
 }
 
-fn parse_agent_mode(text: &str) -> Result<AgentMode, String> {
+fn parse_agent_mode(text: &str) -> Result<AgentConfig, String> {
     let mut words = text.split_whitespace();
-    let kind = words.next().unwrap_or("deep").to_ascii_lowercase();
-    let effort = words.next().unwrap_or("medium").to_ascii_lowercase();
-    // Code mode is a creation-time choice: it fixes the agent's tool surface,
-    // so it rides the mode text instead of a runtime toggle.
-    let code_mode = match words.next() {
-        None => false,
-        Some(word) if word.eq_ignore_ascii_case("code") => true,
+    let mode = match words
+        .next()
+        .unwrap_or("normal")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "normal" => AgentMode::Normal,
+        "coordinator" => AgentMode::Coordinator,
+        other => return Err(format!("unknown mode `{other}`; use normal or coordinator")),
+    };
+    let intelligence = match words
+        .next()
+        .unwrap_or("medium")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "low" => Intelligence::Low,
+        "medium" => Intelligence::Medium,
+        "high" => Intelligence::High,
+        "ultra" => Intelligence::Ultra,
+        other => {
+            return Err(format!(
+                "unknown intelligence `{other}`; use low, medium, high, or ultra"
+            ));
+        }
+    };
+    let latency = match words.next() {
+        None => Latency::Standard,
+        Some(word) if word.eq_ignore_ascii_case("fast") => Latency::Fast,
         Some(_) => {
             return Err(
-                "mode must be `deep|sol|luna|terra [low|medium|xhigh] [code]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
-                    .to_owned(),
+                "config must be `normal|coordinator low|medium|high|ultra [fast]`".to_owned(),
             );
         }
     };
-    if words.next().is_some()
-        || (code_mode && !matches!(kind.as_str(), "deep" | "sol" | "luna" | "terra"))
-    {
-        return Err(
-            "mode must be `deep|sol|luna|terra [low|medium|xhigh] [code]`, `coordinator [low|medium|xhigh]`, `fable [medium|xhigh]`, or `opus [medium|xhigh]`"
-                .to_owned(),
-        );
+    if words.next().is_some() {
+        return Err("config must be `normal|coordinator low|medium|high|ultra [fast]`".to_owned());
     }
-    match kind.as_str() {
-        // Coordinator is terra plus the coordinator prompt; code mode is part
-        // of its definition, not a suffix.
-        "deep" | "sol" | "luna" | "terra" | "coordinator" => {
-            let config = DeepConfig {
-                effort: match effort.as_str() {
-                    "low" => DeepEffort::Low,
-                    "medium" => DeepEffort::Medium,
-                    "xhigh" => DeepEffort::Xhigh,
-                    _ => {
-                        return Err(format!(
-                            "unknown {kind} effort `{effort}`; use low, medium, or xhigh"
-                        ));
-                    }
-                },
-                fast_mode: true,
-                code_mode: code_mode || kind == "coordinator",
-            };
-            Ok(match kind.as_str() {
-                "sol" => AgentMode::Sol(config),
-                "luna" => AgentMode::Luna(config),
-                "terra" => AgentMode::Terra(config),
-                "coordinator" => AgentMode::Coordinator(config),
-                _ => AgentMode::Deep(config),
-            })
-        }
-        "fable" => Ok(AgentMode::Fable {
-            effort: match effort.as_str() {
-                "medium" => FableEffort::Medium,
-                "xhigh" => FableEffort::Xhigh,
-                _ => {
-                    return Err(format!(
-                        "unknown fable effort `{effort}`; use medium or xhigh"
-                    ));
-                }
-            },
-        }),
-        "opus" => Ok(AgentMode::Opus {
-            effort: match effort.as_str() {
-                "medium" => OpusEffort::Medium,
-                "xhigh" => OpusEffort::Xhigh,
-                _ => {
-                    return Err(format!(
-                        "unknown opus effort `{effort}`; use medium or xhigh"
-                    ));
-                }
-            },
-        }),
-        _ => Err(format!(
-            "unknown mode `{kind}`; use deep, sol, luna, terra, coordinator, fable, or opus"
-        )),
-    }
+    let config = AgentConfig {
+        mode,
+        intelligence,
+        latency,
+    };
+    config.validate().map_err(|error| error.to_string())?;
+    Ok(config)
 }
 
 fn cycle_agent_mode_text(current: &str) -> &'static str {
-    match parse_agent_mode(current).unwrap_or_else(|_| AgentMode::deep_default()) {
-        AgentMode::Deep(DeepConfig {
-            effort: DeepEffort::Low,
+    match parse_agent_mode(current).unwrap_or_default() {
+        AgentConfig {
+            mode: AgentMode::Normal,
+            intelligence: Intelligence::Low,
             ..
-        }) => "deep medium",
-        AgentMode::Deep(DeepConfig {
-            effort: DeepEffort::Medium,
+        } => "normal medium",
+        AgentConfig {
+            mode: AgentMode::Normal,
+            intelligence: Intelligence::Medium,
             ..
-        }) => "deep xhigh",
-        AgentMode::Deep(DeepConfig {
-            effort: DeepEffort::Xhigh,
+        } => "normal high",
+        AgentConfig {
+            mode: AgentMode::Normal,
+            intelligence: Intelligence::High,
             ..
-        }) => "sol medium",
-        AgentMode::Sol(DeepConfig {
-            effort: DeepEffort::Xhigh,
+        } => "normal ultra",
+        AgentConfig {
+            mode: AgentMode::Normal,
+            intelligence: Intelligence::Ultra,
             ..
-        }) => "luna medium",
-        AgentMode::Sol(_) => "sol xhigh",
-        AgentMode::Luna(DeepConfig {
-            effort: DeepEffort::Xhigh,
+        } => "coordinator low",
+        AgentConfig {
+            mode: AgentMode::Coordinator,
+            intelligence: Intelligence::Low,
             ..
-        }) => "terra medium",
-        AgentMode::Luna(_) => "luna xhigh",
-        AgentMode::Terra(DeepConfig {
-            effort: DeepEffort::Xhigh,
+        } => "coordinator medium",
+        AgentConfig {
+            mode: AgentMode::Coordinator,
+            intelligence: Intelligence::Medium,
             ..
-        }) => "fable medium",
-        AgentMode::Terra(_) => "terra xhigh",
-        // Coordinator is not part of the cycle; step back into it.
-        AgentMode::Coordinator(_) => "fable medium",
-        AgentMode::Fable {
-            effort: FableEffort::Medium,
-        } => "fable xhigh",
-        AgentMode::Fable {
-            effort: FableEffort::Xhigh,
-        } => "opus medium",
-        AgentMode::Opus {
-            effort: OpusEffort::Medium,
-        } => "opus xhigh",
-        AgentMode::Opus {
-            effort: OpusEffort::Xhigh,
-        } => "deep low",
+        } => "coordinator high",
+        AgentConfig {
+            mode: AgentMode::Coordinator,
+            intelligence: Intelligence::High,
+            ..
+        } => "normal low",
+        AgentConfig {
+            mode: AgentMode::Coordinator,
+            intelligence: Intelligence::Ultra,
+            ..
+        } => "normal low",
     }
 }
 
@@ -1598,52 +1509,29 @@ struct ModeLabel {
     family: ModeFamily,
 }
 
-fn agent_mode_label(mode: AgentMode) -> ModeLabel {
-    match mode {
-        AgentMode::Deep(config)
-        | AgentMode::Sol(config)
-        | AgentMode::Luna(config)
-        | AgentMode::Terra(config)
-        | AgentMode::Coordinator(config) => {
-            let name = match mode {
-                AgentMode::Sol(_) => "sol",
-                AgentMode::Luna(_) => "luna",
-                AgentMode::Terra(_) => "terra",
-                AgentMode::Coordinator(_) => "coord",
-                _ => "deep",
-            };
-            let effort = match config.effort {
-                DeepEffort::Low => "¹",
-                DeepEffort::Medium => "²",
-                DeepEffort::Xhigh => "³",
-            };
-            let fast = if config.fast_mode { "⚡" } else { "" };
-            let code = if config.code_mode { "{}" } else { "" };
-            ModeLabel {
-                text: format!("{name}{effort}{fast}{code}"),
-                family: ModeFamily::Deep,
-            }
-        }
-        AgentMode::Fable { effort } => {
-            let suffix = match effort {
-                FableEffort::Medium => "",
-                FableEffort::Xhigh => "²",
-            };
-            ModeLabel {
-                text: format!("fable{suffix}"),
-                family: ModeFamily::Fable,
-            }
-        }
-        AgentMode::Opus { effort } => {
-            let suffix = match effort {
-                OpusEffort::Medium => "",
-                OpusEffort::Xhigh => "²",
-            };
-            ModeLabel {
-                text: format!("opus{suffix}"),
-                family: ModeFamily::Opus,
-            }
-        }
+fn agent_mode_label(config: AgentConfig) -> ModeLabel {
+    let mode = match config.mode {
+        AgentMode::Normal => "",
+        AgentMode::Coordinator => "coord ",
+    };
+    let intelligence = match config.intelligence {
+        Intelligence::Low => "low",
+        Intelligence::Medium => "medium",
+        Intelligence::High => "high",
+        Intelligence::Ultra => "ultra",
+    };
+    let fast = if config.latency == Latency::Fast {
+        " ⚡"
+    } else {
+        ""
+    };
+    ModeLabel {
+        text: format!("{mode}{intelligence}{fast}"),
+        family: if config.intelligence == Intelligence::Ultra {
+            ModeFamily::Fable
+        } else {
+            ModeFamily::Deep
+        },
     }
 }
 
@@ -1786,97 +1674,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_agent_mode_field() {
+    fn parses_agent_config() {
         assert_eq!(
-            parse_agent_mode("deep low").unwrap(),
-            AgentMode::Deep(DeepConfig {
-                effort: DeepEffort::Low,
-                fast_mode: true,
-                code_mode: false,
-            })
-        );
-        assert_eq!(
-            parse_agent_mode("fable xhigh").unwrap(),
-            AgentMode::Fable {
-                effort: FableEffort::Xhigh,
+            parse_agent_mode("normal low").unwrap(),
+            AgentConfig {
+                mode: AgentMode::Normal,
+                intelligence: Intelligence::Low,
+                latency: Latency::Standard
             }
         );
         assert_eq!(
-            parse_agent_mode("opus xhigh").unwrap(),
-            AgentMode::Opus {
-                effort: OpusEffort::Xhigh,
+            parse_agent_mode("coordinator high fast").unwrap(),
+            AgentConfig {
+                mode: AgentMode::Coordinator,
+                intelligence: Intelligence::High,
+                latency: Latency::Fast
             }
         );
-        assert_eq!(
-            parse_agent_mode("coordinator").unwrap(),
-            AgentMode::Coordinator(DeepConfig {
-                effort: DeepEffort::Medium,
-                fast_mode: true,
-                code_mode: true,
-            })
-        );
-        assert!(parse_agent_mode("coordinator medium code").is_err());
-        assert!(parse_agent_mode("fable low").is_err());
-        assert!(parse_agent_mode("opus low").is_err());
-        assert!(parse_agent_mode("sonnet medium").is_err());
+        assert!(parse_agent_mode("coordinator ultra").is_err());
+        assert!(parse_agent_mode("normal ultra fast").is_err());
     }
 
     #[test]
-    fn renders_compact_agent_mode_labels() {
-        let low = agent_mode_label(AgentMode::Deep(DeepConfig {
-            effort: DeepEffort::Low,
-            fast_mode: true,
-            code_mode: false,
-        }));
-        assert_eq!(low.text, "deep¹⚡");
-        assert_eq!(low.family, ModeFamily::Deep);
-
-        let medium = agent_mode_label(AgentMode::Deep(DeepConfig {
-            effort: DeepEffort::Medium,
-            fast_mode: true,
-            code_mode: false,
-        }));
-        assert_eq!(medium.text, "deep²⚡");
-        assert_eq!(medium.family, ModeFamily::Deep);
-
-        let xhigh = agent_mode_label(AgentMode::Deep(DeepConfig {
-            effort: DeepEffort::Xhigh,
-            fast_mode: true,
-            code_mode: false,
-        }));
-        assert_eq!(xhigh.text, "deep³⚡");
-        assert_eq!(xhigh.family, ModeFamily::Deep);
-
-        let slow = agent_mode_label(AgentMode::Deep(DeepConfig {
-            effort: DeepEffort::Medium,
-            fast_mode: false,
-            code_mode: false,
-        }));
-        assert_eq!(slow.text, "deep²");
-        assert_eq!(slow.family, ModeFamily::Deep);
-
-        let fable = agent_mode_label(AgentMode::Fable {
-            effort: FableEffort::Medium,
+    fn labels_agent_config() {
+        let label = agent_mode_label(AgentConfig {
+            mode: AgentMode::Coordinator,
+            intelligence: Intelligence::High,
+            latency: Latency::Fast,
         });
-        assert_eq!(fable.text, "fable");
-        assert_eq!(fable.family, ModeFamily::Fable);
-
-        let fable_xhigh = agent_mode_label(AgentMode::Fable {
-            effort: FableEffort::Xhigh,
-        });
-        assert_eq!(fable_xhigh.text, "fable²");
-        assert_eq!(fable_xhigh.family, ModeFamily::Fable);
-
-        let opus = agent_mode_label(AgentMode::Opus {
-            effort: OpusEffort::Medium,
-        });
-        assert_eq!(opus.text, "opus");
-        assert_eq!(opus.family, ModeFamily::Opus);
-
-        let opus_xhigh = agent_mode_label(AgentMode::Opus {
-            effort: OpusEffort::Xhigh,
-        });
-        assert_eq!(opus_xhigh.text, "opus²");
-        assert_eq!(opus_xhigh.family, ModeFamily::Opus);
+        assert_eq!(label.text, "coord high ⚡");
     }
 }

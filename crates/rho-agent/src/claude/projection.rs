@@ -130,7 +130,7 @@ impl ClaudeStreamItem {
     }
 }
 
-pub fn transcript_messages_to_context(
+pub(super) fn transcript_messages_to_context(
     messages: &[rho_claude::SessionMessage],
 ) -> anyhow::Result<Vec<Arc<ContextBlock>>> {
     messages

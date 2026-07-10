@@ -71,18 +71,6 @@ fn parses_agent_mode_commands() {
             enabled: Some(false)
         }))
     );
-    assert_eq!(
-        parse(":agent effort xhigh"),
-        Some(Parsed::Command(Command::AgentEffort {
-            effort: DeepEffort::Xhigh
-        }))
-    );
-    assert_eq!(
-        parse(":agent effort"),
-        Some(Parsed::Invalid(
-            ":agent effort <low|medium|xhigh>".to_owned()
-        ))
-    );
 }
 
 #[test]
@@ -215,10 +203,7 @@ fn completes_command_words_stepwise() {
     assert_eq!(values(&first).iter().filter(|v| **v == "agent").count(), 1);
 
     let second = completion_candidates(":agent ", &ctx);
-    assert_eq!(
-        values(&second),
-        ["new", "cancel", "rename", "pin", "fast", "effort"]
-    );
+    assert_eq!(values(&second), ["new", "cancel", "rename", "pin", "fast"]);
 
     let partial = completion_candidates(":agent re", &ctx);
     assert_eq!(values(&partial), ["rename"]);
@@ -237,10 +222,6 @@ fn completes_arguments_from_context() {
     assert_eq!(
         values(&completion_candidates(":agent fast ", &ctx)),
         ["on", "off"]
-    );
-    assert_eq!(
-        values(&completion_candidates(":agent effort x", &ctx)),
-        ["xhigh"]
     );
     assert_eq!(
         values(&completion_candidates(":topic move in", &ctx)),

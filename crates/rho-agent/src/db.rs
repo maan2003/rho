@@ -7,7 +7,7 @@ use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
-pub use rho_inference::config::{DeepConfig, DeepEffort, DeepModel};
+pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
@@ -30,8 +30,10 @@ const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("t
 /// Keyed by the workdir's absolute path (UTF-8; paths are strings on disk
 /// and on the wire), making paths unique by construction.
 const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
+const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
+    TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "4b8a02c1";
+const CURRENT_AGENT_DB_FORMAT: &str = "d91e4a72";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -39,7 +41,26 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct MigrationRecoveryPoint {
+    pub savepoint_id: u64,
+    pub from_format: String,
+    pub to_format: String,
+    pub created_at: UnixMillis,
+}
+
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: "4b8a02c1",
+        to: "a73c91e4",
+        migrate: |_| {},
+    },
+    AgentDbMigration {
+        from: "a73c91e4",
+        to: "d91e4a72",
+        migrate: migrate_agent_config,
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -157,7 +178,50 @@ impl AgentEventPos {
 
 pub type UnixMillis = UnixMs;
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub fn migration_recovery_point(db: &rho_db::RhoDb) -> Option<MigrationRecoveryPoint> {
+    let read = db.read();
+    if !read.has_table("migration_recovery") {
+        return None;
+    }
+    let table = read.open_table(MIGRATION_RECOVERY);
+    table.get(&()).map(|point| point.value().into_owned())
+}
+
+pub async fn prepare_agent_db_migration(db: &rho_db::RhoDb) {
+    let from_format = {
+        let read = db.read();
+        read.has_table("format")
+            .then(|| {
+                read.open_table(FORMAT)
+                    .get(&())
+                    .map(|format| format.value())
+            })
+            .flatten()
+            .filter(|format| format != CURRENT_AGENT_DB_FORMAT)
+    };
+    let Some(from_format) = from_format else {
+        return;
+    };
+    if migration_recovery_point(db).is_some_and(|point| {
+        point.from_format == from_format && point.to_format == CURRENT_AGENT_DB_FORMAT
+    }) {
+        return;
+    }
+    db.persistent_savepoint(|write, savepoint_id| {
+        let point = MigrationRecoveryPoint {
+            savepoint_id,
+            from_format,
+            to_format: CURRENT_AGENT_DB_FORMAT.to_owned(),
+            created_at: UnixMillis::now(),
+        };
+        write
+            .open_table(MIGRATION_RECOVERY)
+            .insert(&(), SenValue::borrowed(&point));
+    })
+    .await;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
     /// Where this agent works. Fixed at creation: the accumulated model
@@ -170,7 +234,8 @@ pub struct AgentRecord {
     pub updated_at: UnixMillis,
     pub current_lineage: AgentLineageId,
     pub parent_agent: Option<AgentId>,
-    pub mode: AgentMode,
+    pub config: AgentConfig,
+    pub(crate) binding: SessionBinding,
     pub runtime: AgentRuntime,
     /// When the user last sent this agent a message; rail recency seed.
     /// Turn ends reset the disposition but leave this alone — replying is
@@ -181,6 +246,130 @@ pub struct AgentRecord {
     pub disposition: AgentDisposition,
 }
 
+impl AgentRecord {
+    pub fn config(&self) -> AgentConfig {
+        self.config
+    }
+}
+
+impl senax_encoder::Decoder for AgentRecord {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        #[derive(Clone, Copy, Debug, Decode)]
+        enum LegacyAgentMode {
+            Deep(LegacyDeepConfig),
+            Fable { effort: LegacyClaudeEffort },
+            Opus { effort: LegacyClaudeEffort },
+            Sol(LegacyDeepConfig),
+            Luna(LegacyDeepConfig),
+            Terra(LegacyDeepConfig),
+            Coordinator(LegacyDeepConfig),
+        }
+
+        #[derive(Clone, Copy, Debug, Decode)]
+        struct LegacyDeepConfig {
+            effort: LegacyDeepEffort,
+            fast_mode: bool,
+            #[senax(default)]
+            code_mode: bool,
+        }
+
+        #[derive(Clone, Copy, Debug, Decode)]
+        enum LegacyDeepEffort {
+            Low,
+            Medium,
+            Xhigh,
+        }
+
+        #[derive(Clone, Copy, Debug, Decode)]
+        enum LegacyClaudeEffort {
+            Medium,
+            Xhigh,
+        }
+
+        #[derive(Decode)]
+        struct EncodedAgentRecord {
+            display_name: Option<String>,
+            workspace: WorkspaceInfo,
+            status: Status,
+            created_at: UnixMillis,
+            updated_at: UnixMillis,
+            current_lineage: AgentLineageId,
+            parent_agent: Option<AgentId>,
+            mode: Option<LegacyAgentMode>,
+            config: Option<AgentConfig>,
+            binding: Option<SessionBinding>,
+            runtime: AgentRuntime,
+            #[senax(default)]
+            last_user_message: UnixMillis,
+            #[senax(default)]
+            disposition: AgentDisposition,
+        }
+
+        fn legacy_binding(mode: LegacyAgentMode) -> SessionBinding {
+            let profile = |config: LegacyDeepConfig| InferenceProfile {
+                effort: match config.effort {
+                    LegacyDeepEffort::Low => ReasoningEffort::Low,
+                    LegacyDeepEffort::Medium => ReasoningEffort::Medium,
+                    LegacyDeepEffort::Xhigh => ReasoningEffort::Xhigh,
+                },
+                fast_mode: config.fast_mode,
+                code_mode: config.code_mode,
+            };
+            match mode {
+                LegacyAgentMode::Deep(config) => SessionBinding::ResponsesGpt55(profile(config)),
+                LegacyAgentMode::Fable { effort } => SessionBinding::ClaudeFable {
+                    effort: match effort {
+                        LegacyClaudeEffort::Medium => ClaudeEffort::Medium,
+                        LegacyClaudeEffort::Xhigh => ClaudeEffort::Xhigh,
+                    },
+                },
+                LegacyAgentMode::Opus { effort } => SessionBinding::ClaudeOpus {
+                    effort: match effort {
+                        LegacyClaudeEffort::Medium => ClaudeEffort::Medium,
+                        LegacyClaudeEffort::Xhigh => ClaudeEffort::Xhigh,
+                    },
+                },
+                LegacyAgentMode::Sol(config) => SessionBinding::ResponsesSol(profile(config)),
+                LegacyAgentMode::Luna(config) => SessionBinding::ResponsesLuna(profile(config)),
+                LegacyAgentMode::Terra(config) => SessionBinding::ResponsesTerra(profile(config)),
+                LegacyAgentMode::Coordinator(config) => {
+                    SessionBinding::CoordinatorTerra(profile(config))
+                }
+            }
+        }
+
+        let encoded = EncodedAgentRecord::decode(reader)?;
+        let binding = match (encoded.binding, encoded.mode) {
+            (Some(binding), _) => binding,
+            (None, Some(mode)) => legacy_binding(mode),
+            (None, None) => return Err(missing_agent_field("binding")),
+        };
+        Ok(Self {
+            display_name: encoded.display_name,
+            workspace: encoded.workspace,
+            status: encoded.status,
+            created_at: encoded.created_at,
+            updated_at: encoded.updated_at,
+            current_lineage: encoded.current_lineage,
+            parent_agent: encoded.parent_agent,
+            config: encoded.config.unwrap_or_else(|| binding.agent_config()),
+            binding,
+            runtime: encoded.runtime,
+            last_user_message: encoded.last_user_message,
+            disposition: encoded.disposition,
+        })
+    }
+}
+
+fn missing_agent_field(field: &'static str) -> senax_encoder::EncoderError {
+    senax_encoder::EncoderError::StructDecode(
+        senax_encoder::StructDecodeError::MissingRequiredField {
+            field,
+            struct_name: "AgentRecord",
+        },
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum AgentRuntime {
     Rho { prompt_cache_key: PromptCacheKey },
@@ -188,122 +377,245 @@ pub enum AgentRuntime {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentMode {
-    Deep(DeepConfig),
-    Fable {
-        effort: FableEffort,
+pub(crate) enum SessionBinding {
+    ResponsesGpt55(InferenceProfile),
+    ClaudeFable {
+        effort: ClaudeEffort,
     },
-    Opus {
-        effort: OpusEffort,
+    ClaudeOpus {
+        effort: ClaudeEffort,
     },
     // gpt-5.6 deep modes; appended after Deep so persisted modes keep
     // decoding.
-    Sol(DeepConfig),
-    Luna(DeepConfig),
-    Terra(DeepConfig),
+    ResponsesSol(InferenceProfile),
+    ResponsesLuna(InferenceProfile),
+    ResponsesTerra(InferenceProfile),
     /// Terra with a coordinator system-prompt section: a user-facing agent
     /// that delegates repo-specific work to spawned workers. Appended so
     /// persisted modes keep decoding.
-    Coordinator(DeepConfig),
+    CoordinatorTerra(InferenceProfile),
+    /// Sol-backed coordinator used by the opinionated medium/high levels.
+    CoordinatorSol(InferenceProfile),
+}
+
+/// Opinionated configuration for creating a new agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct AgentConfig {
+    pub mode: AgentMode,
+    pub intelligence: Intelligence,
+    pub latency: Latency,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum FableEffort {
-    Medium,
-    Xhigh,
+pub enum AgentMode {
+    Normal,
+    Coordinator,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum OpusEffort {
+pub enum Intelligence {
+    Low,
     Medium,
-    Xhigh,
+    High,
+    Ultra,
 }
 
-impl AgentMode {
-    pub fn deep_default() -> Self {
-        Self::Deep(DeepConfig::default())
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum Latency {
+    Standard,
+    Fast,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            mode: AgentMode::Normal,
+            intelligence: Intelligence::Medium,
+            latency: Latency::Standard,
+        }
+    }
+}
+
+impl AgentConfig {
+    pub fn validate(self) -> anyhow::Result<()> {
+        self.session_profile().map(|_| ())
     }
 
-    pub fn deep_config(self) -> Option<DeepConfig> {
-        match self {
-            Self::Deep(config)
-            | Self::Sol(config)
-            | Self::Luna(config)
-            | Self::Terra(config)
-            | Self::Coordinator(config) => Some(config),
-            Self::Fable { .. } | Self::Opus { .. } => None,
+    pub(crate) fn session_profile(self) -> anyhow::Result<SessionBinding> {
+        if self.mode == AgentMode::Coordinator && self.intelligence == Intelligence::Ultra {
+            anyhow::bail!("coordinator mode does not support ultra intelligence");
+        }
+        if self.intelligence == Intelligence::Ultra && self.latency == Latency::Fast {
+            anyhow::bail!("ultra intelligence does not support fast latency");
+        }
+        let fast_mode = self.latency == Latency::Fast;
+        let deep = |effort| InferenceProfile {
+            effort,
+            fast_mode,
+            code_mode: self.mode == AgentMode::Coordinator,
+        };
+        Ok(match (self.mode, self.intelligence) {
+            (AgentMode::Coordinator, Intelligence::Low) => {
+                SessionBinding::CoordinatorTerra(deep(ReasoningEffort::Low))
+            }
+            (AgentMode::Coordinator, Intelligence::Medium) => {
+                SessionBinding::CoordinatorSol(deep(ReasoningEffort::Medium))
+            }
+            (AgentMode::Coordinator, Intelligence::High) => {
+                SessionBinding::CoordinatorSol(deep(ReasoningEffort::Xhigh))
+            }
+            (AgentMode::Normal, Intelligence::Low) => {
+                SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low))
+            }
+            (AgentMode::Normal, Intelligence::Medium) => {
+                SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium))
+            }
+            (AgentMode::Normal, Intelligence::High) => {
+                SessionBinding::ResponsesSol(deep(ReasoningEffort::Xhigh))
+            }
+            (AgentMode::Normal, Intelligence::Ultra) => SessionBinding::ClaudeFable {
+                effort: ClaudeEffort::High,
+            },
+            (AgentMode::Coordinator, Intelligence::Ultra) => unreachable!(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub(crate) enum ClaudeEffort {
+    Medium,
+    Xhigh,
+    High,
+}
+
+impl SessionBinding {
+    pub fn agent_config(self) -> AgentConfig {
+        let mode = if self.is_coordinator() {
+            AgentMode::Coordinator
+        } else {
+            AgentMode::Normal
+        };
+        let (intelligence, latency) = match self {
+            Self::ClaudeFable {
+                effort: ClaudeEffort::High,
+            } => (Intelligence::Ultra, Latency::Standard),
+            Self::ResponsesSol(config) if config.effort == ReasoningEffort::Xhigh => (
+                Intelligence::High,
+                if config.fast_mode {
+                    Latency::Fast
+                } else {
+                    Latency::Standard
+                },
+            ),
+            Self::ResponsesTerra(config) if config.effort == ReasoningEffort::Low => (
+                Intelligence::Low,
+                if config.fast_mode {
+                    Latency::Fast
+                } else {
+                    Latency::Standard
+                },
+            ),
+            Self::ResponsesGpt55(config)
+            | Self::ResponsesSol(config)
+            | Self::ResponsesLuna(config)
+            | Self::ResponsesTerra(config)
+            | Self::CoordinatorTerra(config)
+            | Self::CoordinatorSol(config) => (
+                match config.effort {
+                    ReasoningEffort::Low => Intelligence::Low,
+                    ReasoningEffort::Medium => Intelligence::Medium,
+                    ReasoningEffort::Xhigh => Intelligence::High,
+                },
+                if config.fast_mode {
+                    Latency::Fast
+                } else {
+                    Latency::Standard
+                },
+            ),
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } => {
+                (Intelligence::Ultra, Latency::Standard)
+            }
+        };
+        AgentConfig {
+            mode,
+            intelligence,
+            latency,
         }
     }
 
-    pub fn deep_model(self) -> Option<DeepModel> {
+    pub fn deep_config(self) -> Option<InferenceProfile> {
         match self {
-            Self::Deep(_) => Some(DeepModel::Gpt55),
-            Self::Sol(_) => Some(DeepModel::Gpt56Sol),
-            Self::Luna(_) => Some(DeepModel::Gpt56Luna),
-            Self::Terra(_) | Self::Coordinator(_) => Some(DeepModel::Gpt56Terra),
-            Self::Fable { .. } | Self::Opus { .. } => None,
+            Self::ResponsesGpt55(config)
+            | Self::ResponsesSol(config)
+            | Self::ResponsesLuna(config)
+            | Self::ResponsesTerra(config)
+            | Self::CoordinatorTerra(config)
+            | Self::CoordinatorSol(config) => Some(config),
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } => None,
+        }
+    }
+
+    pub fn deep_model(self) -> Option<InferenceModel> {
+        match self {
+            Self::ResponsesGpt55(_) => Some(InferenceModel::Gpt55),
+            Self::ResponsesSol(_) => Some(InferenceModel::Gpt56Sol),
+            Self::ResponsesLuna(_) => Some(InferenceModel::Gpt56Luna),
+            Self::ResponsesTerra(_) | Self::CoordinatorTerra(_) => Some(InferenceModel::Gpt56Terra),
+            Self::CoordinatorSol(_) => Some(InferenceModel::Gpt56Sol),
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } => None,
         }
     }
 
     /// Rebuild this mode around an updated deep config, preserving the model.
-    pub fn with_deep_config(self, config: DeepConfig) -> Self {
+    pub fn with_deep_config(self, config: InferenceProfile) -> Self {
         match self {
-            Self::Deep(_) => Self::Deep(config),
-            Self::Sol(_) => Self::Sol(config),
-            Self::Luna(_) => Self::Luna(config),
-            Self::Terra(_) => Self::Terra(config),
-            Self::Coordinator(_) => Self::Coordinator(config),
-            Self::Fable { .. } | Self::Opus { .. } => self,
+            Self::ResponsesGpt55(_) => Self::ResponsesGpt55(config),
+            Self::ResponsesSol(_) => Self::ResponsesSol(config),
+            Self::ResponsesLuna(_) => Self::ResponsesLuna(config),
+            Self::ResponsesTerra(_) => Self::ResponsesTerra(config),
+            Self::CoordinatorTerra(_) => Self::CoordinatorTerra(config),
+            Self::CoordinatorSol(_) => Self::CoordinatorSol(config),
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } => self,
         }
     }
 
     pub fn claude_model(self) -> Option<rho_claude::Model> {
         match self {
-            Self::Fable { .. } => Some(rho_claude::Model::Fable),
-            Self::Opus { .. } => Some(rho_claude::Model::Opus),
-            Self::Deep(_)
-            | Self::Sol(_)
-            | Self::Luna(_)
-            | Self::Terra(_)
-            | Self::Coordinator(_) => None,
+            Self::ClaudeFable { .. } => Some(rho_claude::Model::Fable),
+            Self::ClaudeOpus { .. } => Some(rho_claude::Model::Opus),
+            Self::ResponsesGpt55(_)
+            | Self::ResponsesSol(_)
+            | Self::ResponsesLuna(_)
+            | Self::ResponsesTerra(_)
+            | Self::CoordinatorTerra(_)
+            | Self::CoordinatorSol(_) => None,
         }
     }
 
     pub fn claude_effort(self) -> Option<rho_claude::Effort> {
         match self {
-            Self::Fable { effort } => Some(effort.to_claude_effort()),
-            Self::Opus { effort } => Some(effort.to_claude_effort()),
-            Self::Deep(_)
-            | Self::Sol(_)
-            | Self::Luna(_)
-            | Self::Terra(_)
-            | Self::Coordinator(_) => None,
+            Self::ClaudeFable { effort } => Some(effort.to_claude_effort()),
+            Self::ClaudeOpus { effort } => Some(effort.to_claude_effort()),
+            Self::ResponsesGpt55(_)
+            | Self::ResponsesSol(_)
+            | Self::ResponsesLuna(_)
+            | Self::ResponsesTerra(_)
+            | Self::CoordinatorTerra(_)
+            | Self::CoordinatorSol(_) => None,
         }
-    }
-
-    pub fn is_claude(self) -> bool {
-        matches!(self, Self::Fable { .. } | Self::Opus { .. })
     }
 
     pub fn is_coordinator(self) -> bool {
-        matches!(self, Self::Coordinator(_))
+        matches!(self, Self::CoordinatorTerra(_) | Self::CoordinatorSol(_))
     }
 }
 
-impl FableEffort {
+impl ClaudeEffort {
     fn to_claude_effort(self) -> rho_claude::Effort {
         match self {
             Self::Medium => rho_claude::Effort::Medium,
             Self::Xhigh => rho_claude::Effort::Xhigh,
-        }
-    }
-}
-
-impl OpusEffort {
-    fn to_claude_effort(self) -> rho_claude::Effort {
-        match self {
-            Self::Medium => rho_claude::Effort::Medium,
-            Self::Xhigh => rho_claude::Effort::Xhigh,
+            Self::High => rho_claude::Effort::High,
         }
     }
 }
@@ -341,8 +653,6 @@ pub trait AgentWriteTxnExt {
 
     fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status);
 
-    fn set_agent_mode(&mut self, now: UnixMillis, agent_id: AgentId, mode: AgentMode);
-
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
 
     fn alloc_agent_id(&mut self) -> AgentId;
@@ -350,18 +660,6 @@ pub trait AgentWriteTxnExt {
     /// Reserves a fresh jj workspace name. Ids never repeat, so recreated
     /// workspaces can't collide with forgotten names in the repo view.
     fn alloc_workspace_id(&mut self) -> WorkspaceId;
-
-    fn create_agent(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        topic_id: TopicId,
-        display_name: Option<String>,
-        workspace: WorkspaceInfo,
-        mode: AgentMode,
-        runtime: AgentRuntime,
-        parent_agent: Option<AgentId>,
-    ) -> AgentEventPos;
 
     /// Re-points the agent's topic membership. Topics are ad-hoc groupings
     /// agents move into after the fact; nothing else about the agent changes.
@@ -389,6 +687,71 @@ pub trait AgentWriteTxnExt {
     fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId);
 
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) trait AgentProfileWriteTxnExt {
+    fn set_agent_mode(&mut self, now: UnixMillis, agent_id: AgentId, mode: SessionBinding);
+
+    fn create_agent(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        topic_id: TopicId,
+        display_name: Option<String>,
+        workspace: WorkspaceInfo,
+        mode: SessionBinding,
+        runtime: AgentRuntime,
+        parent_agent: Option<AgentId>,
+    ) -> AgentEventPos;
+}
+
+impl AgentProfileWriteTxnExt for WriteTxn {
+    fn set_agent_mode(&mut self, now: UnixMillis, agent_id: AgentId, mode: SessionBinding) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.binding = mode;
+        agent.updated_at = now;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
+    fn create_agent(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        topic_id: TopicId,
+        display_name: Option<String>,
+        workspace: WorkspaceInfo,
+        mode: SessionBinding,
+        runtime: AgentRuntime,
+        parent_agent: Option<AgentId>,
+    ) -> AgentEventPos {
+        let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
+        self.open_table(LINEAGE_PARENTS);
+        let agent = AgentRecord {
+            display_name,
+            workspace,
+            status: Status::Normal,
+            created_at: now,
+            updated_at: now,
+            current_lineage: lineage_id,
+            parent_agent,
+            config: mode.agent_config(),
+            binding: mode,
+            runtime,
+            last_user_message: now,
+            disposition: AgentDisposition::Done,
+        };
+        self.open_table(AGENTS)
+            .insert(&agent_id, SenValue::borrowed(&agent));
+        self.open_table(TOPIC_AGENTS)
+            .insert(&TopicAgentKey::new(topic_id, agent_id), &());
+        AgentEventPos::root(lineage_id)
+    }
 }
 
 impl AgentReadTxnExt for ReadTxn {
@@ -590,18 +953,6 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
-    fn set_agent_mode(&mut self, now: UnixMillis, agent_id: AgentId, mode: AgentMode) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.mode = mode;
-        agent.updated_at = now;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-    }
-
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String) {
         let mut agents = self.open_table(AGENTS);
         let mut agent = agents
@@ -624,40 +975,6 @@ impl AgentWriteTxnExt for WriteTxn {
         let domain = WorkspaceIdDomain(machine_seed(self));
         WorkspaceId::from_counter(next_counter(self, CounterKey::LAST_WORKSPACE_ID), &domain)
             .expect("workspace id counter exceeds prefix-id capacity")
-    }
-
-    fn create_agent(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        topic_id: TopicId,
-        display_name: Option<String>,
-        workspace: WorkspaceInfo,
-        mode: AgentMode,
-        runtime: AgentRuntime,
-        parent_agent: Option<AgentId>,
-    ) -> AgentEventPos {
-        let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
-        self.open_table(LINEAGE_PARENTS);
-        let agent = AgentRecord {
-            display_name,
-            workspace,
-            status: Status::Normal,
-            created_at: now,
-            updated_at: now,
-            current_lineage: lineage_id,
-            parent_agent,
-            mode,
-            runtime,
-            // Creating an agent is engagement; there is no turn to act on.
-            last_user_message: now,
-            disposition: AgentDisposition::Done,
-        };
-        self.open_table(AGENTS)
-            .insert(&agent_id, SenValue::borrowed(&agent));
-        self.open_table(TOPIC_AGENTS)
-            .insert(&TopicAgentKey::new(topic_id, agent_id), &());
-        AgentEventPos::root(lineage_id)
     }
 
     fn move_agent_to_topic(&mut self, agent_id: AgentId, topic_id: TopicId) {
@@ -783,6 +1100,20 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
+}
+
+fn migrate_agent_config(write: &mut WriteTxn) {
+    let records = {
+        let agents = write.open_table(AGENTS);
+        agents
+            .iter()
+            .map(|(id, record)| (id.value(), record.value().into_owned()))
+            .collect::<Vec<_>>()
+    };
+    let mut agents = write.open_table(AGENTS);
+    for (agent_id, record) in records {
+        agents.insert(&agent_id, SenValue::borrowed(&record));
+    }
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

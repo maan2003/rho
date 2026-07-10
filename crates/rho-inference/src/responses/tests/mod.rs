@@ -25,7 +25,7 @@ use super::wire::{
 };
 use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
-use crate::config::{DeepConfig, DeepEffort, DeepModel};
+use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 
 fn first_assistant_message(
     items: &[InferenceResponseItem],
@@ -275,12 +275,12 @@ fn test_inference_service_with(
 ) -> InferenceSession {
     let mut session = InferenceSession::new_deep(
         auth,
-        DeepConfig {
-            effort: DeepEffort::Medium,
+        InferenceProfile {
+            effort: ReasoningEffort::Medium,
             fast_mode: false,
             code_mode: false,
         },
-        DeepModel::Gpt55,
+        InferenceModel::Gpt55,
         prompt_cache_key,
     );
     session.responses_config = super::session::ResponsesConfig {

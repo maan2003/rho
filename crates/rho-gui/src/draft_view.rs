@@ -31,7 +31,7 @@ const START_TARGET_HINT_INLAY_ID: usize = 4;
 /// The start field's default base: the parents of the user's working copy —
 /// visible and editable rather than an empty field with implicit meaning.
 pub const DEFAULT_START: &str = "@-";
-pub const DEFAULT_MODE: &str = "deep medium";
+pub const DEFAULT_MODE: &str = "normal medium";
 
 /// How the start field's target is interpreted; toggled with Shift-Tab while
 /// the cursor is in the field. The field label shows the current mode.

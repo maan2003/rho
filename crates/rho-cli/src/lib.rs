@@ -345,7 +345,7 @@ impl ChatApp {
             rho_commands::Command::AgentPin => {
                 self.toggle_agent_status(rho_ui_proto::Status::Pinned);
             }
-            rho_commands::Command::AgentFast { .. } | rho_commands::Command::AgentEffort { .. } => {
+            rho_commands::Command::AgentFast { .. } => {
                 self.term
                     .print_system("runtime mode changes are only available in rho-gui");
             }

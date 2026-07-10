@@ -17,8 +17,8 @@ use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use futures_util::future::{BoxFuture, FutureExt as _};
 use rho_agent::db::{
-    AgentId, AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, DeepConfig, DeepEffort,
-    Status, TopicId,
+    AgentConfig, AgentId, AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, Intelligence,
+    Latency, Status, TopicId,
 };
 use rho_agent::pool::{AgentPool, AgentToolExtensionProvider};
 use rho_agent::{AgentToolExtension, InputSourceId, MessageDelivery, MessageSender};
@@ -448,11 +448,11 @@ impl SlackManager {
                     .pool
                     .create_with_tool_extension(
                         self.topic_id,
-                        AgentMode::Coordinator(DeepConfig {
-                            effort: DeepEffort::Medium,
-                            fast_mode: true,
-                            code_mode: true,
-                        }),
+                        AgentConfig {
+                            mode: AgentMode::Coordinator,
+                            intelligence: Intelligence::Medium,
+                            latency: Latency::Fast,
+                        },
                         None,
                         start,
                         {

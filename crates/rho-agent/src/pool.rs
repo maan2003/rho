@@ -17,8 +17,9 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
 use crate::db::{
-    AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
-    AgentWriteTxnExt as _, DeepConfig, DeepModel, TopicId,
+    AgentConfig, AgentDisposition, AgentId, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _,
+    AgentRuntime, AgentWriteTxnExt as _, InferenceModel, InferenceProfile, Latency, SessionBinding,
+    TopicId,
 };
 use crate::{
     Agent, AgentInputId, AgentState, AgentToolExtension, AgentToolExtensionFactory, InputSourceId,
@@ -94,6 +95,7 @@ pub enum SpawnWorkspace {
 impl AgentPool {
     /// Opens the pool over `db`, initializing the agent tables.
     pub async fn new(db: RhoDb, auth: InferenceAuth, path_overrides: PathOverrides) -> Arc<Self> {
+        crate::db::prepare_agent_db_migration(&db).await;
         let mut write = db.write().await;
         write.init_agent_tables();
         write.commit();
@@ -185,28 +187,52 @@ impl AgentPool {
         self.agents.lock().await.get(&agent_id).cloned()
     }
 
+    pub async fn set_latency(&self, agent_id: AgentId, latency: Latency) -> anyhow::Result<()> {
+        let record = self.db.read().get_agent(agent_id);
+        let Some(mut config) = record.binding.deep_config() else {
+            anyhow::bail!("latency cannot be changed for this agent");
+        };
+        config.fast_mode = latency == Latency::Fast;
+        let profile = record.binding.with_deep_config(config);
+        let model = profile.deep_model().expect("deep profile has a model");
+        if let Some(RunningAgent::Rho(agent)) = self.get(agent_id).await {
+            agent.set_deep_config(config, model);
+        }
+        let mut write = self.db.write().await;
+        write.set_agent_mode(rho_core::UnixMs::now(), agent_id, profile);
+        write.commit();
+        Ok(())
+    }
+
     pub async fn create(
         self: &Arc<Self>,
         topic_id: TopicId,
-        mode: AgentMode,
+        config: AgentConfig,
         display_name: Option<String>,
         start: StartWorkspace,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        self.create_with_parent(topic_id, mode, display_name, start, None, None)
-            .await
+        self.create_with_parent(
+            topic_id,
+            config.session_profile()?,
+            display_name,
+            start,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn create_with_tool_extension(
         self: &Arc<Self>,
         topic_id: TopicId,
-        mode: AgentMode,
+        config: AgentConfig,
         display_name: Option<String>,
         start: StartWorkspace,
         tool_extension: AgentToolExtensionFactory,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         self.create_with_parent(
             topic_id,
-            mode,
+            config.session_profile()?,
             display_name,
             start,
             None,
@@ -218,18 +244,19 @@ impl AgentPool {
     async fn create_with_parent(
         self: &Arc<Self>,
         topic_id: TopicId,
-        mode: AgentMode,
+        mode: SessionBinding,
         display_name: Option<String>,
         start: StartWorkspace,
         parent: Option<AgentId>,
         tool_extension: Option<AgentToolExtensionFactory>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let (agent_id, agent) = match mode {
-            AgentMode::Deep(_)
-            | AgentMode::Sol(_)
-            | AgentMode::Luna(_)
-            | AgentMode::Terra(_)
-            | AgentMode::Coordinator(_) => {
+            SessionBinding::ResponsesGpt55(_)
+            | SessionBinding::ResponsesSol(_)
+            | SessionBinding::ResponsesLuna(_)
+            | SessionBinding::ResponsesTerra(_)
+            | SessionBinding::CoordinatorTerra(_)
+            | SessionBinding::CoordinatorSol(_) => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
                     self.auth.clone(),
@@ -244,7 +271,7 @@ impl AgentPool {
                 .await?;
                 (agent_id, RunningAgent::Rho(agent))
             }
-            AgentMode::Fable { .. } | AgentMode::Opus { .. } => {
+            SessionBinding::ClaudeFable { .. } | SessionBinding::ClaudeOpus { .. } => {
                 let (agent_id, agent) = ClaudeAgent::create(
                     self.db.clone(),
                     topic_id,
@@ -275,7 +302,7 @@ impl AgentPool {
         task_name: String,
         prompt: String,
         workspace: SpawnWorkspace,
-        mode: AgentMode,
+        config: AgentConfig,
     ) -> anyhow::Result<AgentId> {
         let (topic_id, parent_workspace) = {
             let read = self.db.read();
@@ -308,7 +335,14 @@ impl AgentPool {
             },
         };
         let (child_id, child) = self
-            .create_with_parent(topic_id, mode, Some(task_name), start, Some(parent), None)
+            .create_with_parent(
+                topic_id,
+                config.session_profile()?,
+                Some(task_name),
+                start,
+                Some(parent),
+                None,
+            )
             .await?;
         let parent_label = format!("ag-{}", self.agent_id_prefix(parent));
         child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);
@@ -534,7 +568,11 @@ impl RunningAgent {
         }
     }
 
-    pub fn set_deep_config(&self, config: DeepConfig, model: DeepModel) -> anyhow::Result<()> {
+    pub fn set_deep_config(
+        &self,
+        config: InferenceProfile,
+        model: InferenceModel,
+    ) -> anyhow::Result<()> {
         match self {
             Self::Rho(agent) => {
                 agent.set_deep_config(config, model);

@@ -13,7 +13,7 @@ use super::DEFAULT_CHATGPT_BASE_URL;
 use super::oauth::InferenceAuth;
 use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{self, WebSocketConnection};
-use crate::config::{DeepConfig, DeepEffort, DeepModel};
+use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 
 #[derive(
     Clone, Copy, Debug, Decode, Encode, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
@@ -126,7 +126,7 @@ pub struct InferenceSession {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum InferenceSessionMode {
-    Deep(DeepConfig),
+    Deep(InferenceProfile),
     Title,
 }
 
@@ -141,7 +141,7 @@ pub(crate) struct ResponsesConfig {
 }
 
 impl ResponsesConfig {
-    fn deep(config: DeepConfig, model: ResponsesModel) -> Self {
+    fn deep(config: InferenceProfile, model: ResponsesModel) -> Self {
         let context_window = model.context_window();
         Self {
             // Responses Lite rejects server-side compaction requests, so
@@ -184,13 +184,13 @@ pub(crate) enum ResponsesModel {
     Test(String),
 }
 
-impl From<DeepModel> for ResponsesModel {
-    fn from(model: DeepModel) -> Self {
+impl From<InferenceModel> for ResponsesModel {
+    fn from(model: InferenceModel) -> Self {
         match model {
-            DeepModel::Gpt55 => Self::Gpt55,
-            DeepModel::Gpt56Sol => Self::Gpt56Sol,
-            DeepModel::Gpt56Luna => Self::Gpt56Luna,
-            DeepModel::Gpt56Terra => Self::Gpt56Terra,
+            InferenceModel::Gpt55 => Self::Gpt55,
+            InferenceModel::Gpt56Sol => Self::Gpt56Sol,
+            InferenceModel::Gpt56Luna => Self::Gpt56Luna,
+            InferenceModel::Gpt56Terra => Self::Gpt56Terra,
         }
     }
 }
@@ -238,12 +238,12 @@ pub(crate) enum ResponsesEffort {
     Xhigh,
 }
 
-impl From<DeepEffort> for ResponsesEffort {
-    fn from(effort: DeepEffort) -> Self {
+impl From<ReasoningEffort> for ResponsesEffort {
+    fn from(effort: ReasoningEffort) -> Self {
         match effort {
-            DeepEffort::Low => Self::Low,
-            DeepEffort::Medium => Self::Medium,
-            DeepEffort::Xhigh => Self::Xhigh,
+            ReasoningEffort::Low => Self::Low,
+            ReasoningEffort::Medium => Self::Medium,
+            ReasoningEffort::Xhigh => Self::Xhigh,
         }
     }
 }
@@ -275,8 +275,8 @@ pub(crate) enum AutoCompaction {
 impl InferenceSession {
     pub fn new_deep(
         auth: InferenceAuth,
-        config: DeepConfig,
-        model: DeepModel,
+        config: InferenceProfile,
+        model: InferenceModel,
         prompt_cache_key: PromptCacheKey,
     ) -> Self {
         Self {
@@ -306,7 +306,7 @@ impl InferenceSession {
         }
     }
 
-    pub fn set_deep_config(&mut self, config: DeepConfig, model: DeepModel) -> bool {
+    pub fn set_deep_config(&mut self, config: InferenceProfile, model: InferenceModel) -> bool {
         match &mut self.mode {
             InferenceSessionMode::Deep(current) => {
                 *current = config;

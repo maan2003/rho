@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rho_agent::MessageDelivery;
-use rho_agent::db::{AgentDisposition, AgentId, AgentMode, DeepConfig, DeepEffort};
+use rho_agent::db::{AgentConfig, AgentDisposition, AgentId, Intelligence, Latency};
 use rho_core::{InferenceResponseItem, MessagePhase, text_content};
 use rho_ui_proto::{
     ClientMessage, ServerMessage, StartMode, TopicTarget, UiAgentSummary, VOICE_SAMPLE_RATE,
@@ -448,11 +448,11 @@ async fn new_agent(
     let created = registry
         .create(
             registry.default_topic_id,
-            AgentMode::Deep(DeepConfig {
-                effort: DeepEffort::Medium,
-                fast_mode: true,
-                code_mode: false,
-            }),
+            AgentConfig {
+                intelligence: Intelligence::Medium,
+                latency: Latency::Fast,
+                ..AgentConfig::default()
+            },
             StartMode::NewOn {
                 repo: path,
                 // Same base the GUI's draft seeds: the parents of the user's

@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::MessageDelivery;
-use crate::db::{AgentId, AgentMode, AgentReadTxnExt as _, DeepConfig, DeepEffort, FableEffort};
+use crate::db::{AgentConfig, AgentId, AgentMode, AgentReadTxnExt as _, Intelligence, Latency};
 use crate::pool::{AgentPool, SpawnWorkspace};
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
@@ -123,7 +123,7 @@ fn spawn_agent_spec() -> ToolSpec {
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["task_name", "prompt", "workspace", "mode"],
+            "required": ["task_name", "prompt", "workspace", "intelligence"],
             "properties": {
                 "task_name": {
                     "type": "string",
@@ -150,16 +150,10 @@ fn spawn_agent_spec() -> ToolSpec {
                     "type": "string",
                     "description": "With workspace=new: absolute path to a jj repository. Defaults to this agent's repository."
                 },
-                "mode": {
+                "intelligence": {
                     "type": "string",
-                    "enum": ["fable", "fable-xhigh", "gpt-5.5", "gpt-5.5-xhigh", "sol", "luna", "terra", "coordinator"],
-                    "description": "Required child mode. Use \"fable\" for hard tasks that \
-                                    require human-like judgement; use \"gpt-5.5\" for normal fast \
-                                    coding/research sub-tasks. Use \"fable-xhigh\" or \
-                                    \"gpt-5.5-xhigh\" when the task needs extra reasoning. \
-                                    \"sol\", \"luna\", and \"terra\" are the gpt-5.6 \
-                                    frontier agentic coding models. \"coordinator\" is terra \
-                                    set up to coordinate work across agents and repositories."
+                    "enum": ["low", "medium", "high", "ultra"],
+                    "description": "Required child intelligence level."
                 }
             }
         }),
@@ -271,7 +265,7 @@ struct SpawnArgs {
     workspace: WorkspaceChoice,
     revset: Option<String>,
     repo: Option<String>,
-    mode: String,
+    intelligence: String,
 }
 
 #[derive(Deserialize)]
@@ -297,10 +291,16 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
         (_, Some(_)) => anyhow::bail!("repo is only supported with workspace=new"),
     };
     let task_name = args.task_name.clone();
-    let mode = parse_spawn_mode(&args.mode)?;
+    let config = parse_spawn_intelligence(&args.intelligence)?;
     let pool = tools.pool()?;
     let child_id = pool
-        .spawn_child(tools.self_id, args.task_name, args.prompt, workspace, mode)
+        .spawn_child(
+            tools.self_id,
+            args.task_name,
+            args.prompt,
+            workspace,
+            config,
+        )
         .await?;
     let child_workspace = pool.db().read().get_agent(child_id).workspace;
     let workspace_note = match child_workspace.workspace_name() {
@@ -320,49 +320,21 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     ))
 }
 
-pub fn parse_spawn_mode(mode: &str) -> anyhow::Result<AgentMode> {
-    match mode {
-        "fable" => Ok(AgentMode::Fable {
-            effort: FableEffort::Medium,
-        }),
-        "fable-xhigh" => Ok(AgentMode::Fable {
-            effort: FableEffort::Xhigh,
-        }),
-        "gpt-5.5" => Ok(AgentMode::Deep(DeepConfig {
-            effort: DeepEffort::Medium,
-            fast_mode: true,
-            code_mode: false,
-        })),
-        "gpt-5.5-xhigh" => Ok(AgentMode::Deep(DeepConfig {
-            effort: DeepEffort::Xhigh,
-            fast_mode: true,
-            code_mode: false,
-        })),
-        "sol" => Ok(AgentMode::Sol(DeepConfig {
-            effort: DeepEffort::Medium,
-            fast_mode: true,
-            code_mode: false,
-        })),
-        "luna" => Ok(AgentMode::Luna(DeepConfig {
-            effort: DeepEffort::Medium,
-            fast_mode: true,
-            code_mode: false,
-        })),
-        "terra" => Ok(AgentMode::Terra(DeepConfig {
-            effort: DeepEffort::Medium,
-            fast_mode: true,
-            code_mode: false,
-        })),
-        "coordinator" => Ok(AgentMode::Coordinator(DeepConfig {
-            effort: DeepEffort::Medium,
-            fast_mode: true,
-            code_mode: true,
-        })),
+pub fn parse_spawn_intelligence(intelligence: &str) -> anyhow::Result<AgentConfig> {
+    let intelligence = match intelligence {
+        "low" => Intelligence::Low,
+        "medium" => Intelligence::Medium,
+        "high" => Intelligence::High,
+        "ultra" => Intelligence::Ultra,
         _ => anyhow::bail!(
-            "unsupported mode {mode:?}; expected fable, fable-xhigh, gpt-5.5, gpt-5.5-xhigh, sol, \
-             luna, terra, or coordinator"
+            "unsupported intelligence {intelligence:?}; expected low, medium, high, or ultra"
         ),
-    }
+    };
+    Ok(AgentConfig {
+        mode: AgentMode::Normal,
+        intelligence,
+        latency: Latency::Standard,
+    })
 }
 
 #[derive(Deserialize)]
@@ -470,67 +442,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_spawn_modes() {
-        assert_eq!(
-            parse_spawn_mode("fable").unwrap(),
-            AgentMode::Fable {
-                effort: FableEffort::Medium
-            }
-        );
-        assert_eq!(
-            parse_spawn_mode("fable-xhigh").unwrap(),
-            AgentMode::Fable {
-                effort: FableEffort::Xhigh
-            }
-        );
-        assert_eq!(
-            parse_spawn_mode("gpt-5.5").unwrap(),
-            AgentMode::Deep(DeepConfig {
-                effort: DeepEffort::Medium,
-                fast_mode: true,
-                code_mode: false,
-            })
-        );
-        assert_eq!(
-            parse_spawn_mode("gpt-5.5-xhigh").unwrap(),
-            AgentMode::Deep(DeepConfig {
-                effort: DeepEffort::Xhigh,
-                fast_mode: true,
-                code_mode: false,
-            })
-        );
-        assert_eq!(
-            parse_spawn_mode("sol").unwrap(),
-            AgentMode::Sol(DeepConfig {
-                effort: DeepEffort::Medium,
-                fast_mode: true,
-                code_mode: false,
-            })
-        );
-        assert_eq!(
-            parse_spawn_mode("luna").unwrap(),
-            AgentMode::Luna(DeepConfig {
-                effort: DeepEffort::Medium,
-                fast_mode: true,
-                code_mode: false,
-            })
-        );
-        assert_eq!(
-            parse_spawn_mode("terra").unwrap(),
-            AgentMode::Terra(DeepConfig {
-                effort: DeepEffort::Medium,
-                fast_mode: true,
-                code_mode: false,
-            })
-        );
-        assert_eq!(
-            parse_spawn_mode("coordinator").unwrap(),
-            AgentMode::Coordinator(DeepConfig {
-                effort: DeepEffort::Medium,
-                fast_mode: true,
-                code_mode: true,
-            })
-        );
-        assert!(parse_spawn_mode("opus").is_err());
+    fn parses_spawn_intelligence() {
+        for (name, intelligence) in [
+            ("low", Intelligence::Low),
+            ("medium", Intelligence::Medium),
+            ("high", Intelligence::High),
+            ("ultra", Intelligence::Ultra),
+        ] {
+            assert_eq!(
+                parse_spawn_intelligence(name).unwrap(),
+                AgentConfig {
+                    mode: AgentMode::Normal,
+                    intelligence,
+                    latency: Latency::Standard,
+                }
+            );
+        }
+        assert!(parse_spawn_intelligence("terra").is_err());
     }
 }

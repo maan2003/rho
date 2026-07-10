@@ -3,10 +3,7 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use rho_agent::db::{
-    AgentMode, AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, DeepEffort, FableEffort,
-    OpusEffort, Status,
-};
+use rho_agent::db::{AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, Status};
 use rho_db::RhoDb;
 use rho_workspaces::WorkspaceInfo;
 
@@ -90,7 +87,7 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
             disposition_name(agent.disposition)
         )?;
         writeln!(output, "  last_user_message: {}", agent.last_user_message.0)?;
-        writeln!(output, "  mode: {}", mode_name(agent.mode))?;
+        writeln!(output, "  mode: {}", config_name(agent.config()))?;
         writeln!(output, "  workspace: {}", workspace_name(&agent.workspace))?;
         match agent.runtime {
             AgentRuntime::Rho { prompt_cache_key } => {
@@ -173,10 +170,6 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 )
                 .await?;
                 writeln!(output, "  messages: {}", messages.len())?;
-                match rho_agent::claude::transcript_messages_to_context(&messages) {
-                    Ok(blocks) => writeln!(output, "  restored blocks: {}", blocks.len())?,
-                    Err(error) => writeln!(output, "  restored blocks: ERROR: {error:#}")?,
-                }
                 match rho_claude::last_assistant_usage(&messages) {
                     Some(usage) => {
                         writeln!(output, "  last assistant usage:")?;
@@ -226,6 +219,13 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "source: {}", snapshot.source.display())?;
     writeln!(output, "snapshot: {}", snapshot.path.display())?;
     writeln!(output, "migration on copied database: ok")?;
+    if let Some(point) = rho_agent::db::migration_recovery_point(&db) {
+        writeln!(
+            output,
+            "recovery savepoint: {} ({} -> {}, created {})",
+            point.savepoint_id, point.from_format, point.to_format, point.created_at.0
+        )?;
+    }
     writeln!(output, "agents decoded: {}", agents.len())?;
     writeln!(output, "events decoded: {events}")?;
     io::stdout().lock().write_all(output.as_bytes())?;
@@ -233,6 +233,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 async fn migrate_snapshot(db: &RhoDb) {
+    rho_agent::db::prepare_agent_db_migration(db).await;
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
@@ -255,49 +256,23 @@ fn status_name(status: Status) -> &'static str {
     }
 }
 
-fn mode_name(mode: AgentMode) -> String {
-    match mode {
-        AgentMode::Deep(config)
-        | AgentMode::Sol(config)
-        | AgentMode::Luna(config)
-        | AgentMode::Terra(config)
-        | AgentMode::Coordinator(config) => {
-            let name = match mode {
-                AgentMode::Sol(_) => "sol",
-                AgentMode::Luna(_) => "luna",
-                AgentMode::Terra(_) => "terra",
-                AgentMode::Coordinator(_) => "coordinator",
-                _ => "deep",
-            };
-            let fast = if config.fast_mode { " ⚡" } else { "" };
-            let code = if config.code_mode { " {}" } else { "" };
-            format!("{name}{fast}{code} {}", deep_effort_name(config.effort))
-        }
-        AgentMode::Fable { effort } => format!("fable {}", fable_effort_name(effort)),
-        AgentMode::Opus { effort } => format!("opus {}", opus_effort_name(effort)),
-    }
-}
-
-fn deep_effort_name(effort: DeepEffort) -> &'static str {
-    match effort {
-        DeepEffort::Low => "low",
-        DeepEffort::Medium => "medium",
-        DeepEffort::Xhigh => "xhigh",
-    }
-}
-
-fn fable_effort_name(effort: FableEffort) -> &'static str {
-    match effort {
-        FableEffort::Medium => "medium",
-        FableEffort::Xhigh => "xhigh",
-    }
-}
-
-fn opus_effort_name(effort: OpusEffort) -> &'static str {
-    match effort {
-        OpusEffort::Medium => "medium",
-        OpusEffort::Xhigh => "xhigh",
-    }
+fn config_name(config: rho_agent::db::AgentConfig) -> String {
+    let mode = match config.mode {
+        rho_agent::db::AgentMode::Normal => "normal",
+        rho_agent::db::AgentMode::Coordinator => "coordinator",
+    };
+    let intelligence = match config.intelligence {
+        rho_agent::db::Intelligence::Low => "low",
+        rho_agent::db::Intelligence::Medium => "medium",
+        rho_agent::db::Intelligence::High => "high",
+        rho_agent::db::Intelligence::Ultra => "ultra",
+    };
+    let fast = if config.latency == rho_agent::db::Latency::Fast {
+        " fast"
+    } else {
+        ""
+    };
+    format!("{mode} {intelligence}{fast}")
 }
 
 fn workspace_name(workspace: &WorkspaceInfo) -> String {

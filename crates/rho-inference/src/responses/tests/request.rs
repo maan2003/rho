@@ -167,12 +167,12 @@ fn serializes_configured_reasoning_context() {
     let (_temp, auth) = test_oauth_file("token", None);
     let mut session = InferenceSession::new_deep(
         auth,
-        DeepConfig {
-            effort: DeepEffort::Medium,
+        InferenceProfile {
+            effort: ReasoningEffort::Medium,
             fast_mode: false,
             code_mode: false,
         },
-        DeepModel::Gpt55,
+        InferenceModel::Gpt55,
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
     session.responses_config.model = ResponsesModel::Test("gpt-test".to_owned());
@@ -583,12 +583,12 @@ fn responses_lite_moves_tools_and_instructions_into_input() {
     let (_temp, auth) = test_oauth_file("token", None);
     let mut session = InferenceSession::new_deep(
         auth,
-        DeepConfig {
-            effort: DeepEffort::Medium,
+        InferenceProfile {
+            effort: ReasoningEffort::Medium,
             fast_mode: false,
             code_mode: false,
         },
-        DeepModel::Gpt56Sol,
+        InferenceModel::Gpt56Sol,
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
     session.responses_config.text_verbosity = TextVerbosity::Low;
@@ -631,12 +631,12 @@ fn responses_lite_previous_response_skips_developer_prefix() {
     let (_temp, auth) = test_oauth_file("token", None);
     let session = InferenceSession::new_deep(
         auth,
-        DeepConfig {
-            effort: DeepEffort::Medium,
+        InferenceProfile {
+            effort: ReasoningEffort::Medium,
             fast_mode: false,
             code_mode: false,
         },
-        DeepModel::Gpt56Sol,
+        InferenceModel::Gpt56Sol,
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
     let mut request = inference_request(
