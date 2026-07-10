@@ -40,6 +40,10 @@ pub struct SlackManager {
     /// user id → display name, so mention tags and author lines read as
     /// names instead of `U03AB12CD` (filled via `users.info`).
     user_names: tokio::sync::Mutex<HashMap<String, String>>,
+    /// In-flight Slack messages keyed by their session agent. A completed
+    /// turn removes its matching in-progress reaction without adding a
+    /// success reaction.
+    in_progress: tokio::sync::Mutex<HashMap<rho_agent::db::AgentId, Vec<SlackReaction>>>,
     secrets: std::sync::Mutex<Option<Arc<SecretStore>>>,
     /// Aborting the previous run loop on secret rotation.
     run_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -72,6 +76,7 @@ impl SlackManager {
             db,
             topic_id,
             user_names: tokio::sync::Mutex::new(HashMap::new()),
+            in_progress: tokio::sync::Mutex::new(HashMap::new()),
             secrets: std::sync::Mutex::new(None),
             run_task: std::sync::Mutex::new(None),
         });
@@ -180,6 +185,13 @@ impl SlackManager {
             }
         };
         let api = SlackApi::new(&config.api_base);
+        if let Some(reaction) = self.take_in_progress(report.agent_id).await
+            && let Err(error) = api
+                .reactions_remove(&config.bot_token, &reaction.channel, &reaction.ts, "eyes")
+                .await
+        {
+            tracing::debug!(%error, "removing in-progress reaction");
+        }
         let text = if report.final_answer.trim().is_empty() {
             "(the agent finished without a text response)".to_owned()
         } else {
@@ -196,6 +208,28 @@ impl SlackManager {
         {
             tracing::error!(%error, "posting slack turn completion");
         }
+    }
+
+    async fn add_in_progress(&self, agent_id: rho_agent::db::AgentId, event: &MessageEvent) {
+        self.in_progress
+            .lock()
+            .await
+            .entry(agent_id)
+            .or_default()
+            .push(SlackReaction {
+                channel: event.channel.clone(),
+                ts: event.ts.clone(),
+            });
+    }
+
+    async fn take_in_progress(&self, agent_id: rho_agent::db::AgentId) -> Option<SlackReaction> {
+        let mut in_progress = self.in_progress.lock().await;
+        let reactions = in_progress.get_mut(&agent_id)?;
+        let reaction = reactions.remove(0);
+        if reactions.is_empty() {
+            in_progress.remove(&agent_id);
+        }
+        Some(reaction)
     }
 
     fn slack_thread_for_agent(&self, agent_id: rho_agent::db::AgentId) -> Option<SlackThread> {
@@ -259,13 +293,34 @@ impl SlackManager {
         if !(event.is_mention || event.channel_type == "im" || known_session) {
             return;
         }
-        let reply = self
-            .run_turn(api, config, &session_key, &event)
+        if let Err(error) = api
+            .reactions_add(&config.bot_token, &event.channel, &event.ts, "eyes")
             .await
-            .unwrap_or_else(|error| {
+        {
+            tracing::debug!(%error, "adding in-progress reaction");
+        }
+        let (reply, failed) = match self.run_turn(api, config, &session_key, &event).await {
+            Ok(reply) => (reply, false),
+            Err(error) => {
                 tracing::error!(%error, session_key, "slack turn failed");
-                Some(format!("rho hit an error handling this message: {error:#}"))
-            });
+                (
+                    Some(format!("rho hit an error handling this message: {error:#}")),
+                    true,
+                )
+            }
+        };
+        if failed || reply.is_some() {
+            let _ = api
+                .reactions_remove(&config.bot_token, &event.channel, &event.ts, "eyes")
+                .await;
+        }
+        if failed
+            && let Err(error) = api
+                .reactions_add(&config.bot_token, &event.channel, &event.ts, "x")
+                .await
+        {
+            tracing::debug!(%error, "adding error reaction");
+        }
         if let Some(reply) = reply
             && let Err(error) = api
                 .post_message(
@@ -292,14 +347,14 @@ impl SlackManager {
         event: &MessageEvent,
     ) -> anyhow::Result<Option<String>> {
         let existing = self.db.read().get_slack_session(session_key);
-        let (agent, is_new) = match existing {
+        let (agent_id, agent, is_new) = match existing {
             Some(agent_id) if self.pool.agent_exists(agent_id) => {
                 let (_, agent, _) = self
                     .pool
                     .load(agent_id)
                     .await
                     .context("loading slack session agent")?;
-                (agent, false)
+                (agent_id, agent, false)
             }
             _ => {
                 let Some(config) = self.db.read().get_slack_config() else {
@@ -330,7 +385,7 @@ impl SlackManager {
                 let mut write = self.db.write().await;
                 write.set_slack_session(session_key, agent_id);
                 write.commit();
-                (agent, true)
+                (agent_id, agent, true)
             }
         };
 
@@ -343,9 +398,15 @@ impl SlackManager {
         let text = self
             .inbound_text(api, config, event, is_new, thread_context)
             .await;
+        self.add_in_progress(agent_id, event).await;
         agent.send_user_message(text, MessageDelivery::NextRequest);
         Ok(None)
     }
+}
+
+struct SlackReaction {
+    channel: String,
+    ts: String,
 }
 
 struct SlackThread {
