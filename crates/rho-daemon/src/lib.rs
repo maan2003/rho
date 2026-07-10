@@ -197,9 +197,8 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
 
     let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
-    let agents = Arc::new(
-        AgentRegistry::new(db, auth, path_overrides, platform_secrets, iroh_auth).await,
-    );
+    let agents =
+        Arc::new(AgentRegistry::new(db, auth, path_overrides, platform_secrets, iroh_auth).await);
     agents.resume_platform_integrations();
 
     if let Some((secret, iroh_auth)) = iroh {
@@ -984,7 +983,6 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let writer_counters = counters.clone();
     tokio::spawn(async move {

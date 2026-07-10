@@ -34,10 +34,20 @@ pub enum ToBrowser {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FromBrowser {
     /// Focus an agent: the daemon loads it and starts forwarding its state.
-    Select { agent_id: String },
-    Send { agent_id: String, text: String },
-    NewAgent { repo: String, text: String },
-    Cancel { agent_id: String },
+    Select {
+        agent_id: String,
+    },
+    Send {
+        agent_id: String,
+        text: String,
+    },
+    NewAgent {
+        repo: String,
+        text: String,
+    },
+    Cancel {
+        agent_id: String,
+    },
 }
 
 #[derive(Debug, Serialize)]

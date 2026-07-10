@@ -503,7 +503,7 @@ fn should_relay_input_source(
 }
 
 fn local_input_relay_text(text: &str) -> String {
-    format!("Local Rho user:\n{text}")
+    format!("user: {text}")
 }
 
 struct SlackReaction {
@@ -680,7 +680,7 @@ mod tests {
     fn local_input_relay_uses_conservative_attribution() {
         assert_eq!(
             local_input_relay_text("please continue"),
-            "Local Rho user:\nplease continue"
+            "user: please continue"
         );
     }
 }

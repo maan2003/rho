@@ -13,6 +13,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use futures_util::{SinkExt as _, StreamExt as _};
+use json::{FromBrowser, ToBrowser};
 use rho_core::ContentPart;
 use rho_ui_proto::remote::UiAgentState;
 use rho_ui_proto::{
@@ -27,7 +28,6 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 
 use crate::AgentRegistry;
-use json::{FromBrowser, ToBrowser};
 
 mod json;
 
