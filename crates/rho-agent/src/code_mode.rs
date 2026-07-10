@@ -11,13 +11,17 @@ use rho_tool_shell::ShellTools;
 use tokio::sync::mpsc;
 
 use crate::multi_agent_tools::{self, MultiAgentTools};
-use crate::{AgentControl, ToolUpdate};
+use crate::{AgentControl, AgentToolExtension, ToolUpdate};
 
 /// The model-facing tool surface: `exec` (whose description embeds the nested
 /// tools' TypeScript docs) and `wait`.
-pub(crate) fn tool_specs(shell_tools: &ShellTools, multi_agent: bool) -> Vec<ToolSpec> {
+pub(crate) fn tool_specs(
+    shell_tools: &ShellTools,
+    multi_agent: bool,
+    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
+) -> Vec<ToolSpec> {
     vec![
-        rho_code_mode::exec_tool_spec(&nested_tools(shell_tools, multi_agent)),
+        rho_code_mode::exec_tool_spec(&nested_tools(shell_tools, multi_agent, tool_extension)),
         rho_code_mode::wait_tool_spec(),
     ]
 }
@@ -26,7 +30,11 @@ pub(crate) fn tool_specs(shell_tools: &ShellTools, multi_agent: bool) -> Vec<Too
 /// multi-agent tools except `wait` — that name belongs to the code-mode
 /// `wait`, and mail waiting is resolved by the agent loop, not dispatchable
 /// as a future. Mail from sub-agents arrives between turns as usual.
-fn nested_tools(shell_tools: &ShellTools, multi_agent: bool) -> Vec<NestedTool> {
+fn nested_tools(
+    shell_tools: &ShellTools,
+    multi_agent: bool,
+    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
+) -> Vec<NestedTool> {
     let mut specs = shell_tools.specs();
     if multi_agent {
         specs.extend(
@@ -35,12 +43,16 @@ fn nested_tools(shell_tools: &ShellTools, multi_agent: bool) -> Vec<NestedTool> 
                 .filter(|spec| spec.name.as_str() != multi_agent_tools::WAIT_TOOL_NAME),
         );
     }
+    if let Some(extension) = tool_extension {
+        specs.extend(extension.specs());
+    }
     specs.iter().map(NestedTool::from_spec).collect()
 }
 
 struct Dispatcher {
     shell_tools: ShellTools,
     multi_agent: Option<MultiAgentTools>,
+    tool_extension: Option<Arc<dyn AgentToolExtension>>,
     /// Nested calls run on the agent's runtime, not the code-mode thread's
     /// current-thread runtime: agent tools spawn tasks (sub-agent loops) that
     /// must outlive the session.
@@ -56,10 +68,20 @@ impl ToolDispatcher for Dispatcher {
         let agent_tools = multi_agent_tools::is_agent_tool(call.name.as_str())
             .then(|| self.multi_agent.clone())
             .flatten();
+        let extension = self.tool_extension.as_ref().and_then(|extension| {
+            extension
+                .specs()
+                .iter()
+                .any(|spec| spec.name == call.name)
+                .then(|| Arc::clone(extension))
+        });
         let task = self.runtime.spawn(async move {
-            match agent_tools {
-                Some(tools) => multi_agent_tools::call_agent_tool(tools, call).await,
-                None => shell_tools.call(call).await,
+            if let Some(extension) = extension {
+                extension.call(call).await
+            } else if let Some(tools) = agent_tools {
+                multi_agent_tools::call_agent_tool(tools, call).await
+            } else {
+                shell_tools.call(call).await
             }
         });
         Box::pin(async move {
@@ -89,23 +111,33 @@ impl ToolDispatcher for Dispatcher {
 pub(crate) fn start_session(
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
+    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
     control: mpsc::UnboundedSender<AgentControl>,
 ) -> Result<CodeModeSession, String> {
     let dispatcher = Arc::new(Dispatcher {
         shell_tools: shell_tools.clone(),
         multi_agent: multi_agent.cloned(),
+        tool_extension: tool_extension.cloned(),
         runtime: tokio::runtime::Handle::current(),
         control,
     });
-    CodeModeSession::new(nested_tools(shell_tools, multi_agent.is_some()), dispatcher)
+    CodeModeSession::new(
+        nested_tools(shell_tools, multi_agent.is_some(), tool_extension),
+        dispatcher,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use futures::future::BoxFuture;
+    use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
     use rho_tool_shell::ShellTools;
     use rho_workspaces::PathOverrides;
+
+    use crate::AgentToolExtension;
 
     fn shell_tools() -> ShellTools {
         ShellTools::in_directory(
@@ -117,7 +149,7 @@ mod tests {
 
     #[test]
     fn code_mode_surface_is_exec_and_wait_with_nested_docs() {
-        let specs = super::tool_specs(&shell_tools(), true);
+        let specs = super::tool_specs(&shell_tools(), true, None);
         let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
         assert_eq!(names, ["exec", "wait"]);
         // The exec description embeds the nested tools, including multi-agent
@@ -130,7 +162,44 @@ mod tests {
 
     #[test]
     fn without_pool_no_agent_tools_are_nested() {
-        let specs = super::tool_specs(&shell_tools(), false);
+        let specs = super::tool_specs(&shell_tools(), false, None);
         assert!(!specs[0].description.contains("spawn_agent"));
+    }
+
+    struct TestExtension;
+
+    impl AgentToolExtension for TestExtension {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: ToolName::try_from("platform_reply").unwrap(),
+                tool_type: ToolType::Function,
+                description: "Reply on the mapped platform thread.".to_owned(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+                format: None,
+            }]
+        }
+
+        fn call(&self, _call: ToolCall) -> BoxFuture<'static, ToolOutput> {
+            Box::pin(std::future::ready(ToolOutput {
+                output: Arc::new("ok".to_owned()),
+                status: ToolOutputStatus::Success,
+            }))
+        }
+    }
+
+    #[test]
+    fn code_mode_nests_tool_extension_docs() {
+        let extension: Arc<dyn AgentToolExtension> = Arc::new(TestExtension);
+        let specs = super::tool_specs(&shell_tools(), false, Some(&extension));
+        let exec = &specs[0].description;
+        assert!(exec.contains("platform_reply"), "{exec}");
+        assert!(
+            exec.contains("Reply on the mapped platform thread."),
+            "{exec}"
+        );
     }
 }

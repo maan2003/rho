@@ -34,6 +34,19 @@ pub mod pool;
 pub mod system_prompt;
 pub mod title;
 
+/// A small, host-provided tool surface for a specific agent.
+///
+/// Higher-level integrations can attach model-facing tools without making
+/// `rho-agent` depend on the integration crate. Tool names must not collide
+/// with built-in tools.
+pub trait AgentToolExtension: Send + Sync + 'static {
+    fn specs(&self) -> Vec<ToolSpec>;
+    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput>;
+}
+
+pub type AgentToolExtensionFactory =
+    Arc<dyn Fn(AgentId) -> Arc<dyn AgentToolExtension> + Send + Sync + 'static>;
+
 /// An agent timeline event. Some events fold into model context; future
 /// runtime-only events, like tool output chunks, can live here without becoming
 /// inference input.
@@ -459,6 +472,7 @@ impl Agent {
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
         // multi-agent tools are not offered.
         pool: std::sync::Weak<pool::AgentPool>,
+        tool_extension: Option<AgentToolExtensionFactory>,
     ) -> anyhow::Result<(AgentId, Self)> {
         let prompt_cache_key = PromptCacheKey::generate();
         let config = mode
@@ -471,6 +485,7 @@ impl Agent {
         // not even the id counter bump.
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
+        let tool_extension = tool_extension.map(|factory| factory(agent_id));
         let workspace = match start {
             StartWorkspace::Create {
                 repo,
@@ -505,6 +520,7 @@ impl Agent {
             workspace,
             parent,
             pool,
+            tool_extension,
             RestoredAgent::default(),
         );
         Ok((agent_id, agent))
@@ -518,6 +534,7 @@ impl Agent {
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
         // multi-agent tools are not offered.
         pool: std::sync::Weak<pool::AgentPool>,
+        tool_extension: Option<Arc<dyn AgentToolExtension>>,
     ) -> Self {
         let record = db.read().get_agent(agent_id);
         let (next_event, events) = db.read().agent_events(agent_id);
@@ -547,6 +564,7 @@ impl Agent {
             workspace,
             record.parent_agent,
             pool,
+            tool_extension,
             restored,
         )
     }
@@ -566,6 +584,7 @@ impl Agent {
         workspace: Arc<Workspace>,
         parent: Option<AgentId>,
         pool: std::sync::Weak<pool::AgentPool>,
+        tool_extension: Option<Arc<dyn AgentToolExtension>>,
         restored: RestoredAgent,
     ) -> Self {
         let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
@@ -583,11 +602,17 @@ impl Agent {
             config.code_mode,
             &shell_tools,
             multi_agent.as_ref(),
+            tool_extension.as_ref(),
             control.clone(),
         );
         let state = Arc::new(RwLock::new(AgentState {
             blocks: restored.blocks,
-            tool_specs: agent_tool_specs(&shell_tools, multi_agent.is_some(), code_mode.is_some()),
+            tool_specs: agent_tool_specs(
+                &shell_tools,
+                multi_agent.is_some(),
+                code_mode.is_some(),
+                tool_extension.as_ref(),
+            ),
             system_prompt: system_prompt::prompt(
                 workspace.as_ref(),
                 multi_agent.as_ref(),
@@ -613,6 +638,7 @@ impl Agent {
                 next_event,
             },
             multi_agent,
+            tool_extension,
             code_mode,
             pool_events,
         };
@@ -769,13 +795,17 @@ fn agent_tool_specs(
     shell_tools: &ShellTools,
     multi_agent: bool,
     code_mode: bool,
+    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
 ) -> Arc<[ToolSpec]> {
     if code_mode {
-        return code_mode::tool_specs(shell_tools, multi_agent).into();
+        return code_mode::tool_specs(shell_tools, multi_agent, tool_extension).into();
     }
     let mut specs = shell_tools.specs();
     if multi_agent {
         specs.extend(multi_agent_tools::agent_tool_specs());
+    }
+    if let Some(extension) = tool_extension {
+        specs.extend(extension.specs());
     }
     specs.into()
 }
@@ -786,12 +816,13 @@ fn start_code_mode(
     enabled: bool,
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
+    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
     control: mpsc::UnboundedSender<AgentControl>,
 ) -> Option<Arc<rho_code_mode::CodeModeSession>> {
     if !enabled {
         return None;
     }
-    match code_mode::start_session(shell_tools, multi_agent, control) {
+    match code_mode::start_session(shell_tools, multi_agent, tool_extension, control) {
         Ok(session) => Some(Arc::new(session)),
         Err(error) => {
             eprintln!("rho-agent: code mode unavailable, using direct tools: {error}");
@@ -843,6 +874,8 @@ struct AgentLoop {
     /// Present on pooled agents: identity + `Weak` pool handle for the
     /// built-in spawn/send/wait tools and parent result/error mail.
     multi_agent: Option<MultiAgentTools>,
+    /// Integration-provided tools bound to this agent.
+    tool_extension: Option<Arc<dyn AgentToolExtension>>,
     /// Present when `DeepConfig::code_mode` is on: the V8 session behind the
     /// `exec`/`wait` tool surface. Pending exec futures hold their own `Arc`,
     /// so toggling code mode off mid-turn lets them finish.
@@ -1304,18 +1337,24 @@ impl AgentLoop {
                                         let agent_tools = multi_agent_tools::is_agent_tool(call.name.as_str())
                                             .then(|| self.multi_agent.clone())
                                             .flatten();
+                                        let extension = self.tool_extension.as_ref().and_then(|extension| {
+                                            extension
+                                                .specs()
+                                                .iter()
+                                                .any(|spec| spec.name == call.name)
+                                                .then(|| Arc::clone(extension))
+                                        });
                                         self.pending_tools.push(Box::pin(async move {
                                             let call_id = call.id.clone();
                                             let tool_type = call.tool_type;
-                                            let (body, metadata) = match agent_tools {
-                                                Some(tools) => {
-                                                    (multi_agent_tools::call_agent_tool(tools, call).await, None)
-                                                }
-                                                None => {
-                                                    let output =
-                                                        shell_tools.call_with_metadata(call).await;
-                                                    (output.body, output.metadata)
-                                                }
+                                            let (body, metadata) = if let Some(extension) = extension {
+                                                (extension.call(call).await, None)
+                                            } else if let Some(tools) = agent_tools {
+                                                (multi_agent_tools::call_agent_tool(tools, call).await, None)
+                                            } else {
+                                                let output =
+                                                    shell_tools.call_with_metadata(call).await;
+                                                (output.body, output.metadata)
                                             };
                                             let finished_at = UnixMs::now();
                                             ToolResult {

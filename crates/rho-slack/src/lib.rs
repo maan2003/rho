@@ -3,7 +3,8 @@
 //! [`SlackManager`] is the whole surface the daemon needs: it owns the
 //! secrets ([`SecretStore`]: a sealed memfd stashed in the systemd fd store,
 //! never on disk), the Socket Mode reconnect loop, the Slack-thread → agent
-//! session mapping, and posting each turn's final answer back to the thread.
+//! session mapping, and the `slack_reply` model-facing tool agents use to
+//! post back to their mapped thread.
 //!
 //! Underneath sit the protocol pieces, exposed for tests: [`SlackApi`]
 //! (the Web API subset rho calls) and [`run_connection`] (one Socket Mode

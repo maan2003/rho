@@ -20,7 +20,10 @@ use crate::db::{
     AgentDisposition, AgentId, AgentMode, AgentReadTxnExt as _, AgentRuntime,
     AgentWriteTxnExt as _, DeepConfig, DeepModel, TopicId,
 };
-use crate::{Agent, AgentInputId, AgentState, InputSourceId, MessageDelivery, StartWorkspace};
+use crate::{
+    Agent, AgentInputId, AgentState, AgentToolExtension, AgentToolExtensionFactory, InputSourceId,
+    MessageDelivery, StartWorkspace,
+};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -42,6 +45,11 @@ pub struct AgentPool {
     completed_turns: broadcast::Sender<AgentTurnCompleted>,
     /// Fires after a user input has been durably accepted into an agent log.
     accepted_inputs: broadcast::Sender<AgentInputAccepted>,
+    tool_extension_provider: std::sync::RwLock<Option<Arc<dyn AgentToolExtensionProvider>>>,
+}
+
+pub trait AgentToolExtensionProvider: Send + Sync + 'static {
+    fn tool_extension(&self, agent_id: AgentId) -> Option<Arc<dyn AgentToolExtension>>;
 }
 
 /// Broadcast when any agent is created in the pool.
@@ -98,7 +106,20 @@ impl AgentPool {
             created: broadcast::channel(64).0,
             completed_turns: broadcast::channel(64).0,
             accepted_inputs: broadcast::channel(64).0,
+            tool_extension_provider: std::sync::RwLock::new(None),
         })
+    }
+
+    pub fn set_tool_extension_provider(&self, provider: Arc<dyn AgentToolExtensionProvider>) {
+        *self.tool_extension_provider.write().expect("poison") = Some(provider);
+    }
+
+    fn tool_extension_for(&self, agent_id: AgentId) -> Option<Arc<dyn AgentToolExtension>> {
+        self.tool_extension_provider
+            .read()
+            .expect("poison")
+            .as_ref()
+            .and_then(|provider| provider.tool_extension(agent_id))
     }
 
     pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {
@@ -171,8 +192,27 @@ impl AgentPool {
         display_name: Option<String>,
         start: StartWorkspace,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        self.create_with_parent(topic_id, mode, display_name, start, None)
+        self.create_with_parent(topic_id, mode, display_name, start, None, None)
             .await
+    }
+
+    pub async fn create_with_tool_extension(
+        self: &Arc<Self>,
+        topic_id: TopicId,
+        mode: AgentMode,
+        display_name: Option<String>,
+        start: StartWorkspace,
+        tool_extension: AgentToolExtensionFactory,
+    ) -> anyhow::Result<(AgentId, RunningAgent)> {
+        self.create_with_parent(
+            topic_id,
+            mode,
+            display_name,
+            start,
+            None,
+            Some(tool_extension),
+        )
+        .await
     }
 
     async fn create_with_parent(
@@ -182,6 +222,7 @@ impl AgentPool {
         display_name: Option<String>,
         start: StartWorkspace,
         parent: Option<AgentId>,
+        tool_extension: Option<AgentToolExtensionFactory>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let (agent_id, agent) = match mode {
             AgentMode::Deep(_)
@@ -198,6 +239,7 @@ impl AgentPool {
                     start,
                     parent,
                     Arc::downgrade(self),
+                    tool_extension,
                 )
                 .await?;
                 (agent_id, RunningAgent::Rho(agent))
@@ -266,7 +308,7 @@ impl AgentPool {
             },
         };
         let (child_id, child) = self
-            .create_with_parent(topic_id, mode, Some(task_name), start, Some(parent))
+            .create_with_parent(topic_id, mode, Some(task_name), start, Some(parent), None)
             .await?;
         let parent_label = format!("ag-{}", self.agent_id_prefix(parent));
         child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);
@@ -383,6 +425,7 @@ impl AgentPool {
                 agent_id,
                 workspace,
                 Arc::downgrade(self),
+                self.tool_extension_for(agent_id),
             )),
             AgentRuntime::Claude { .. } => {
                 let agent =

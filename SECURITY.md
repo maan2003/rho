@@ -33,12 +33,14 @@ AI APIs.
   first-message repo selection. Token values must not appear in logs or errors.
   Inbound Slack Socket Mode frames are remote, semi-trusted input: malformed or
   unexpected frames are skipped, never panicked on, and message text is handed to
-  agents as untrusted user content. Slack replies are posted only for agents
-  reverse-mapped from Slack thread sessions. Slack-originated inputs are tagged
-  with a private in-memory source id so the Slack relay can ignore its own
-  accepted-input reports; other local-client user inputs to Slack-mapped agents
-  are mirrored into the mapped thread with conservative attribution, and final
-  answers are posted when the generic agent turn-completion stream reports them.
+  agents as untrusted user content. Slack replies are posted only when a
+  Slack-mapped Rho agent explicitly calls its injected `slack_reply({text})`
+  tool, which re-checks the persisted agent→thread mapping at dispatch time;
+  completed-turn reports only clean up in-progress reactions. Slack-originated
+  inputs are tagged with a private in-memory source id so the Slack relay can
+  ignore its own accepted-input reports; other local-client user inputs to
+  Slack-mapped agents are mirrored into the mapped thread with conservative
+  attribution.
 - The embedded Octo server listens only on a daemon-owned Unix socket whose path
   is passed to agent commands as `OCTO_SOCKET`. Octo uses the sealed platform
   secret store as its GitHub token source and has no token argv/env/file/admin
@@ -70,6 +72,7 @@ AI APIs.
   protocol frames are rejected (`MAX_FRAME_LEN`), web UI JSON lines are
   length-bounded (`MAX_LINE_LEN`), malformed frames end the connection, and
   malformed browser JSON produces an error message, never a panic.
+
 
 ## Runtime assumptions
 

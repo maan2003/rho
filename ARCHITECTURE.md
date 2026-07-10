@@ -46,14 +46,15 @@ provider crates.
 `rho-slack` is the in-process Slack surface. `SlackManager` is handed the
 daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
 secret storage (`SecretStore`), the Socket Mode reconnect loop, the persisted
-Slack coordinator repository and Slack-thread → agent-session mapping, and
-posting each mapped coordinator agent's completed-turn final answer back to the
-thread. It also subscribes to generic accepted-input reports and mirrors
-non-Slack local user inputs into mapped Slack threads, using a private opaque
-source id to avoid echoing Slack-originated inputs. The daemon validates and
-installs Slack setup, resumes secrets from the systemd fd store on startup, and
-publishes generic agent turn-completion and accepted-input reports through
-`AgentPool`; it does not own Slack routing policy.
+Slack coordinator repository and Slack-thread → agent-session mapping, and a
+Slack-bound `slack_reply` tool extension for mapped coordinator agents. It also
+subscribes to generic accepted-input reports and mirrors non-Slack local user
+inputs into mapped Slack threads, using a private opaque source id to avoid
+echoing Slack-originated inputs. The daemon validates and installs Slack setup,
+resumes secrets from the systemd fd store on startup, and publishes generic
+agent turn-completion and accepted-input reports through `AgentPool`; Slack uses
+completed-turn reports for reaction cleanup, not automatic final-answer posting,
+and the daemon does not own Slack routing policy.
 
 `octo`/`oct` are vendored GitHub helper crates from `~maan2003/claude`. Rho
 runs Octo as an in-process daemon Unix-socket server and exposes its socket path
@@ -73,6 +74,7 @@ daemon's webui module only translates the JSON vocabulary and owns no agent
 policy. The web UI page itself is a static Leptos/wasm app (`webui/` at the
 repo root, its own cargo workspace, hostable anywhere) that connects as an
 iroh client from the browser.
+
 
 Dependencies should flow from higher-level assembly/policy crates toward lower
 reusable crates. The shared `rho-core` crate must not depend on provider, agent,

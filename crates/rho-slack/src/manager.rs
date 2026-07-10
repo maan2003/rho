@@ -1,12 +1,13 @@
 //! The Slack surface for rho agents: Socket Mode events drive the agent
-//! pool, replies post back into the thread.
+//! pool, and mapped agents can explicitly post back into the thread with the
+//! `slack_reply` tool.
 //!
 //! Tokens live in a sealed memfd ([`SecretStore`]) stashed in the systemd fd
 //! store, so they survive daemon restarts without touching disk. Each Slack
 //! thread maps to one agent, persisted in rho-db (`platform_sessions`), so
 //! conversations survive restarts too: first message creates the agent,
-//! later messages continue it, and the agent's final answer for each turn is
-//! posted back as the threaded reply.
+//! later messages continue it, and the agent gets a thread-bound `slack_reply`
+//! tool for replies.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -14,12 +15,16 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
+use futures_util::future::{BoxFuture, FutureExt as _};
 use rho_agent::db::{
-    AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, DeepConfig, DeepEffort, Status, TopicId,
+    AgentId, AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, DeepConfig, DeepEffort,
+    Status, TopicId,
 };
-use rho_agent::pool::AgentPool;
-use rho_agent::{InputSourceId, MessageDelivery, MessageSender};
+use rho_agent::pool::{AgentPool, AgentToolExtensionProvider};
+use rho_agent::{AgentToolExtension, InputSourceId, MessageDelivery, MessageSender};
+use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
 use rho_db::RhoDb;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -82,6 +87,11 @@ impl SlackManager {
             secrets: std::sync::Mutex::new(None),
             run_task: std::sync::Mutex::new(None),
         });
+        manager
+            .pool
+            .set_tool_extension_provider(Arc::new(SlackToolProvider {
+                manager: Arc::downgrade(&manager),
+            }));
         manager.start_turn_delivery_loop();
         manager.start_input_delivery_loop();
         manager
@@ -219,9 +229,6 @@ impl SlackManager {
     }
 
     async fn deliver_completed_turn(&self, report: rho_agent::pool::AgentTurnCompleted) {
-        let Some(thread) = self.slack_thread_for_agent(report.agent_id) else {
-            return;
-        };
         let config = match self.slack_config() {
             Ok(config) => config,
             Err(error) => {
@@ -236,22 +243,6 @@ impl SlackManager {
                 .await
         {
             tracing::debug!(%error, "removing in-progress reaction");
-        }
-        let text = if report.final_answer.trim().is_empty() {
-            "(the agent finished without a text response)".to_owned()
-        } else {
-            report.final_answer
-        };
-        if let Err(error) = api
-            .post_message(
-                &config.bot_token,
-                &thread.channel,
-                Some(&thread.thread_ts),
-                &crate::mrkdwn::to_mrkdwn(&text),
-            )
-            .await
-        {
-            tracing::error!(%error, "posting slack turn completion");
         }
     }
 
@@ -316,6 +307,13 @@ impl SlackManager {
             })
     }
 
+    fn slack_tool_extension(self: &Arc<Self>, agent_id: AgentId) -> Arc<dyn AgentToolExtension> {
+        Arc::new(SlackTool {
+            manager: Arc::downgrade(self),
+            agent_id,
+        })
+    }
+
     /// Reconnect loop: one Socket Mode connection at a time. Routine
     /// refreshes reconnect immediately; failures back off with doubling up
     /// to a minute.
@@ -359,7 +357,12 @@ impl SlackManager {
         }
     }
 
-    async fn handle_event(&self, api: &SlackApi, config: &SlackConfig, event: MessageEvent) {
+    async fn handle_event(
+        self: Arc<Self>,
+        api: &SlackApi,
+        config: &SlackConfig,
+        event: MessageEvent,
+    ) {
         let session_key = event.session_key();
         let known_session = self.db.read().get_slack_session(&session_key).is_some();
         // Respond to DMs, mentions, and follow-ups in threads we already
@@ -410,11 +413,10 @@ impl SlackManager {
     }
 
     /// One inbound message: find or create the thread's coordinator agent and
-    /// enqueue the Slack text. Final answers are posted by the generic
-    /// completed-turn subscriber, so returning None suppresses an immediate
-    /// reply.
+    /// enqueue the Slack text. The coordinator replies explicitly with its
+    /// `slack_reply` tool, so returning None suppresses an immediate reply.
     async fn run_turn(
-        &self,
+        self: &Arc<Self>,
         api: &SlackApi,
         config: &SlackConfig,
         session_key: &str,
@@ -444,7 +446,7 @@ impl SlackManager {
                 };
                 let (agent_id, agent) = self
                     .pool
-                    .create(
+                    .create_with_tool_extension(
                         self.topic_id,
                         AgentMode::Coordinator(DeepConfig {
                             effort: DeepEffort::Medium,
@@ -453,6 +455,15 @@ impl SlackManager {
                         }),
                         None,
                         start,
+                        {
+                            let manager = Arc::downgrade(self);
+                            Arc::new(move |agent_id| {
+                                Arc::new(SlackTool {
+                                    manager: manager.clone(),
+                                    agent_id,
+                                }) as Arc<dyn AgentToolExtension>
+                            })
+                        },
                     )
                     .await
                     .context("creating slack session agent")?;
@@ -506,6 +517,105 @@ fn local_input_relay_text(text: &str) -> String {
     format!("user: {text}")
 }
 
+struct SlackToolProvider {
+    manager: std::sync::Weak<SlackManager>,
+}
+
+impl AgentToolExtensionProvider for SlackToolProvider {
+    fn tool_extension(&self, agent_id: AgentId) -> Option<Arc<dyn AgentToolExtension>> {
+        let manager = self.manager.upgrade()?;
+        manager
+            .slack_thread_for_agent(agent_id)
+            .is_some()
+            .then(|| manager.slack_tool_extension(agent_id))
+    }
+}
+
+struct SlackTool {
+    manager: std::sync::Weak<SlackManager>,
+    agent_id: AgentId,
+}
+
+#[derive(Deserialize)]
+struct SlackReplyArgs {
+    text: String,
+}
+
+const SLACK_REPLY_TOOL: &str = "slack_reply";
+
+impl AgentToolExtension for SlackTool {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: ToolName::try_from(SLACK_REPLY_TOOL).expect("valid tool name"),
+            tool_type: ToolType::Function,
+            description: "Post a message to this agent's mapped Slack thread. Use this when you want Slack users to see a reply; final answers are not posted automatically.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The Slack reply text to post."
+                    }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+            format: None,
+        }]
+    }
+
+    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
+        let manager = self.manager.clone();
+        let agent_id = self.agent_id;
+        async move {
+            let parsed = serde_json::from_str::<SlackReplyArgs>(&call.arguments);
+            let args = match parsed {
+                Ok(args) if !args.text.trim().is_empty() => args,
+                Ok(_) => {
+                    return tool_error("text must not be empty");
+                }
+                Err(error) => {
+                    return tool_error(format!("invalid slack_reply arguments: {error}"));
+                }
+            };
+            let Some(manager) = manager.upgrade() else {
+                return tool_error("slack integration is no longer available");
+            };
+            let Some(thread) = manager.slack_thread_for_agent(agent_id) else {
+                return tool_error("this agent is not mapped to a Slack thread");
+            };
+            let config = match manager.slack_config() {
+                Ok(config) => config,
+                Err(error) => return tool_error(format!("slack is not connected: {error}")),
+            };
+            let api = SlackApi::new(&config.api_base);
+            match api
+                .post_message(
+                    &config.bot_token,
+                    &thread.channel,
+                    Some(&thread.thread_ts),
+                    &crate::mrkdwn::to_mrkdwn(&args.text),
+                )
+                .await
+            {
+                Ok(_) => ToolOutput {
+                    output: Arc::new("posted to Slack thread".to_owned()),
+                    status: ToolOutputStatus::Success,
+                },
+                Err(error) => tool_error(format!("posting slack reply failed: {error}")),
+            }
+        }
+        .boxed()
+    }
+}
+
+fn tool_error(message: impl Into<String>) -> ToolOutput {
+    ToolOutput {
+        output: Arc::new(message.into()),
+        status: ToolOutputStatus::Error,
+    }
+}
+
 struct SlackReaction {
     channel: String,
     ts: String,
@@ -552,8 +662,9 @@ impl SlackManager {
         if is_new {
             text.push_str(
                 "\n\n(This conversation comes from a Slack thread; your final \
-                 response each turn is posted back to it. Keep responses \
-                 concise and self-contained.)",
+                 response is not posted automatically. Use slack_reply({text}) \
+                 whenever you want to send a message to the thread. Keep \
+                 responses concise and self-contained.)",
             );
         }
         text
@@ -644,9 +755,13 @@ impl SlackManager {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent::{InputSourceId, MessageSender};
+    use rho_agent::db::{AgentId, AgentIdDomain};
+    use rho_agent::{AgentToolExtension as _, InputSourceId, MessageSender};
 
-    use super::{SlackThread, local_input_relay_text, should_relay_input_source};
+    use super::{
+        SLACK_REPLY_TOOL, SlackReplyArgs, SlackThread, SlackTool, local_input_relay_text,
+        should_relay_input_source,
+    };
 
     #[test]
     fn parses_slack_session_key() {
@@ -682,5 +797,22 @@ mod tests {
             local_input_relay_text("please continue"),
             "user: please continue"
         );
+    }
+
+    #[test]
+    fn slack_reply_tool_is_model_facing() {
+        let tool = SlackTool {
+            manager: std::sync::Weak::new(),
+            agent_id: AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
+        };
+        let specs = tool.specs();
+        assert_eq!(specs[0].name.as_str(), SLACK_REPLY_TOOL);
+        assert!(
+            specs[0]
+                .description
+                .contains("final answers are not posted automatically")
+        );
+        let args: SlackReplyArgs = serde_json::from_str(r#"{"text":"hello"}"#).unwrap();
+        assert_eq!(args.text, "hello");
     }
 }
