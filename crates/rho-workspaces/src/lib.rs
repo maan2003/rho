@@ -357,11 +357,21 @@ impl Repo {
         if git_pointer.is_file() {
             let content =
                 std::fs::read_to_string(&git_pointer).context("read git worktree pointer")?;
-            std::fs::write(
-                &git_pointer,
-                content.replace(self.root.as_str(), parent.as_str()),
-            )
-            .context("rewrite git worktree pointer")?;
+            let rewritten_content = content.replace(self.root.as_str(), parent.as_str());
+            std::fs::write(&git_pointer, &rewritten_content)
+                .context("rewrite git worktree pointer")?;
+            if let Some(gitdir) = gitdir_path(&rewritten_content) {
+                let back_pointer = gitdir.join("gitdir");
+                if back_pointer.is_file() {
+                    let content = std::fs::read_to_string(&back_pointer)
+                        .context("read git worktree back-pointer")?;
+                    std::fs::write(
+                        &back_pointer,
+                        content.replace(self.root.as_str(), parent.as_str()),
+                    )
+                    .context("rewrite git worktree back-pointer")?;
+                }
+            }
         }
         Ok(())
     }
@@ -617,6 +627,13 @@ fn ensure_ws_parent_symlink(repo: &Utf8Path) -> anyhow::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error).with_context(|| format!("create {link}")),
     }
+}
+
+fn gitdir_path(pointer: &str) -> Option<Utf8PathBuf> {
+    pointer
+        .strip_prefix("gitdir: ")
+        .map(str::trim)
+        .map(Utf8PathBuf::from)
 }
 
 fn copy_mtime(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Result<()> {
