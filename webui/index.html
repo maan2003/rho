@@ -12,7 +12,7 @@
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; height: 100vh; display: flex; background: var(--bg);
+    margin: 0; height: 100vh; height: 100dvh; display: flex; background: var(--bg);
     color: var(--text); font: 14px/1.5 system-ui, sans-serif;
   }
   #rail {
@@ -93,6 +93,18 @@
     position: fixed; bottom: 16px; right: 16px; background: var(--red); color: #10131a;
     padding: 8px 14px; border-radius: 8px; display: none; max-width: 420px;
   }
+  #back-btn { display: none; }
+  /* Phones: one pane at a time — the rail is a full-screen list, selecting
+     an agent slides to the chat, "‹" returns. */
+  @media (max-width: 700px) {
+    #rail { width: 100%; min-width: 0; border-right: none; }
+    #main { display: none; }
+    body.chat #rail { display: none; }
+    body.chat #main { display: flex; }
+    body.chat #back-btn { display: inline-block; }
+    .agent { padding: 12px 10px; }
+    dialog { width: calc(100vw - 32px); max-width: 480px; }
+  }
 </style>
 </head>
 <body>
@@ -106,6 +118,7 @@
   </div>
   <div id="main">
     <div id="status-bar">
+      <button id="back-btn" title="Back to agents">‹ agents</button>
       <span id="status-label">no agent selected</span>
       <span style="flex:1"></span>
       <button id="cancel-btn" style="display:none">cancel turn</button>
@@ -232,6 +245,7 @@ function renderRepos() {
 
 function select(agentId) {
   selected = agentId;
+  document.body.classList.add("chat");
   renderRail();
   $("empty").style.display = "none";
   $("transcript").style.display = "";
@@ -304,6 +318,7 @@ function sendMessage() {
 }
 
 $("cancel-btn").onclick = () => { if (selected) send({ type: "cancel", agent_id: selected }); };
+$("back-btn").onclick = () => document.body.classList.remove("chat");
 
 $("new-agent-btn").onclick = () => {
   if (!workdirs.length) { toast("no workdirs registered; add one from the GUI/CLI first"); return; }
