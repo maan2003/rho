@@ -56,6 +56,19 @@ async fn shell_command_stdin_is_null() {
 }
 
 #[tokio::test]
+async fn shell_command_inherits_tool_environment() {
+    let tools = test_tools(2).with_env("RHO_AGENT_ID", "agent-id");
+    let result = tools
+        .call(shell_call(
+            json!({"command": "printf '%s' \"$RHO_AGENT_ID\""}),
+        ))
+        .await;
+
+    assert_eq!(result.status, ToolOutputStatus::Success);
+    assert!(result.output.as_ref().contains("Output:\nagent-id"));
+}
+
+#[tokio::test]
 async fn nonzero_exit_is_structured_result_not_tool_error() {
     let tools = test_tools(2);
     let result = tools

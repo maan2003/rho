@@ -378,7 +378,7 @@ struct AgentRegistry {
     title_tasks: Mutex<HashSet<AgentId>>,
     land_locks: Mutex<HashMap<Utf8PathBuf, Arc<TokioMutex<()>>>>,
     land_holders: Mutex<HashMap<Utf8PathBuf, LandLeaseHolder>>,
-    land_statuses: Mutex<HashMap<Utf8PathBuf, LandStatus>>,
+    land_statuses: Mutex<HashMap<Utf8PathBuf, (Option<AgentId>, LandStatus)>>,
     /// At most one realtime voice session per daemon (see [`voice`]).
     voice_active: Arc<std::sync::atomic::AtomicBool>,
     /// In-process Slack connection and its thread sessions
@@ -590,8 +590,16 @@ impl AgentRegistry {
         self.land_holders.lock().await.remove(repo);
     }
 
-    async fn set_land_status(&self, repo: Utf8PathBuf, status: LandStatus) {
-        self.land_statuses.lock().await.insert(repo, status);
+    async fn set_land_status(
+        &self,
+        repo: Utf8PathBuf,
+        agent_id: Option<AgentId>,
+        status: LandStatus,
+    ) {
+        self.land_statuses
+            .lock()
+            .await
+            .insert(repo, (agent_id, status));
     }
 
     async fn create_topic(&self, name: String) -> UiTopic {
@@ -1041,8 +1049,9 @@ where
     }
 
     let mut reader = reader;
-    // Attention changes fan out to every client, not just the one whose
-    // agent turned; aborted on disconnect so the writer channel can close.
+    // Daemon-wide events fan out to every client, not just the connection
+    // whose action produced them; aborted on disconnect so the writer channel
+    // can close.
     let mut events_rx = agents.events.subscribe();
     let events_tx = outgoing_tx.clone();
     let events_task = tokio::spawn(async move {
@@ -1340,13 +1349,13 @@ async fn handle_message(
             agents.remove_workdir(path).await?;
             Ok(Refresh::Ready)
         }
-        ClientMessage::AcquireLandLease { repo } => {
+        ClientMessage::AcquireLandLease { repo, agent_id } => {
             let lock = agents.land_lock(repo.clone()).await;
             let lease = match lock.clone().try_lock_owned() {
                 Ok(lease) => lease,
                 Err(_) => {
                     agents
-                        .set_land_status(repo.clone(), LandStatus::Queued)
+                        .set_land_status(repo.clone(), agent_id, LandStatus::Queued)
                         .await;
                     let holder = agents.land_holder(&repo).await;
                     let _ = outgoing_tx.send(ServerMessage::LandLeaseQueued {
@@ -1363,12 +1372,22 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::LandLeaseGranted { repo });
             Ok(Refresh::None)
         }
-        ClientMessage::LandStatus { repo, status } => {
-            agents.set_land_status(repo.clone(), status.clone()).await;
-            let _ = outgoing_tx.send(ServerMessage::LandStatus { repo, status });
+        ClientMessage::LandStatus {
+            repo,
+            agent_id,
+            status,
+        } => {
+            agents
+                .set_land_status(repo.clone(), agent_id, status.clone())
+                .await;
+            let _ = agents.events.send(ServerMessage::LandStatus {
+                repo,
+                agent_id,
+                status,
+            });
             Ok(Refresh::None)
         }
-        ClientMessage::ReleaseLandLease { repo } => {
+        ClientMessage::ReleaseLandLease { repo, agent_id: _ } => {
             if let Some(index) = land_leases
                 .iter()
                 .position(|(leased_repo, _)| *leased_repo == repo)

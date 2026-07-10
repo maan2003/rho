@@ -149,13 +149,16 @@ pub enum ClientMessage {
     },
     AcquireLandLease {
         repo: Utf8PathBuf,
+        agent_id: Option<AgentId>,
     },
     LandStatus {
         repo: Utf8PathBuf,
+        agent_id: Option<AgentId>,
         status: LandStatus,
     },
     ReleaseLandLease {
         repo: Utf8PathBuf,
+        agent_id: Option<AgentId>,
     },
     /// Start the daemon's realtime voice session (one per daemon; the
     /// connection that starts it owns it). Explicit user action: audio
@@ -360,6 +363,7 @@ pub enum ServerMessage {
     },
     LandStatus {
         repo: Utf8PathBuf,
+        agent_id: Option<AgentId>,
         status: LandStatus,
     },
     /// Assistant audio: raw PCM16 little-endian mono at

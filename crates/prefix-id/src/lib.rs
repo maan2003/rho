@@ -124,6 +124,27 @@ impl<D: PrefixIdDomain> PrefixId<D> {
         String::from_utf8(self.bytes.to_vec()).expect("PrefixId contains only ASCII bytes")
     }
 
+    /// Parses a complete encoded ID string.
+    pub fn from_encoded(encoded: &str) -> Result<Self, ParsePrefixIdError> {
+        if encoded.len() != LEN {
+            return Err(ParsePrefixIdError::InvalidLength {
+                actual: encoded.len(),
+                expected: LEN,
+            });
+        }
+        let mut bytes = [0; LEN];
+        for (index, byte) in encoded.bytes().enumerate() {
+            if !ALPHABET.contains(&byte) {
+                return Err(ParsePrefixIdError::InvalidCharacter(byte as char));
+            }
+            bytes[index] = byte;
+        }
+        Ok(Self {
+            bytes,
+            _domain: PhantomData,
+        })
+    }
+
     /// Resolves a prefix against the first `total_generated` IDs.
     ///
     /// `total_generated` is the count of IDs generated so far, so the
@@ -299,6 +320,7 @@ pub enum PrefixResolution<D: PrefixIdDomain> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsePrefixIdError {
     PrefixTooLong { max: usize, actual: usize },
+    InvalidLength { expected: usize, actual: usize },
     InvalidCharacter(char),
 }
 
@@ -307,6 +329,12 @@ impl fmt::Display for ParsePrefixIdError {
         match self {
             Self::PrefixTooLong { max, actual } => {
                 write!(f, "prefix is too long: max {max}, got {actual}")
+            }
+            Self::InvalidLength { expected, actual } => {
+                write!(
+                    f,
+                    "invalid prefix id length: expected {expected}, got {actual}"
+                )
             }
             Self::InvalidCharacter(char) => write!(f, "invalid prefix id character: {char:?}"),
         }
@@ -446,10 +474,25 @@ mod tests {
         for counter in counters {
             assert_eq!(id(counter).to_counter(&TestDomain), counter);
             assert_eq!(
+                Id::from_encoded(&id(counter).encoded()).unwrap(),
+                id(counter)
+            );
+            assert_eq!(
                 Id::from_prefix(&id(counter).encoded(), CAPACITY, &TestDomain).unwrap(),
                 PrefixResolution::Unique(id(counter))
             );
         }
+        assert_eq!(
+            Id::from_encoded("short").unwrap_err(),
+            ParsePrefixIdError::InvalidLength {
+                expected: LEN,
+                actual: 5,
+            }
+        );
+        assert_eq!(
+            Id::from_encoded("!!!!!!!!!!!!").unwrap_err(),
+            ParsePrefixIdError::InvalidCharacter('!'),
+        );
     }
 
     #[test]

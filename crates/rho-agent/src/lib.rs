@@ -572,7 +572,8 @@ impl Agent {
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             Arc::clone(&workspace),
-        );
+        )
+        .with_env("RHO_AGENT_ID", agent_id.encoded());
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));

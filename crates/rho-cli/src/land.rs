@@ -8,7 +8,7 @@ use camino::Utf8PathBuf;
 use rho_ci::config::{self, MergeMode};
 use rho_ci::{Candidate, CheckEvent, CheckOptions, run_check};
 use rho_ui_proto::client::Client as UiClient;
-use rho_ui_proto::{ClientMessage, LandStatus, ServerMessage};
+use rho_ui_proto::{AgentId, ClientMessage, LandStatus, ServerMessage};
 
 use crate::{LandArgs, connect_or_start_daemon};
 
@@ -25,8 +25,14 @@ pub(crate) async fn run(args: LandArgs) -> Result<()> {
     let workspace_root = PathBuf::from(workspace_root);
     let repo_root =
         rho_workspaces::resolve_repo_root(&workspace_root).context("resolve origin repo")?;
-    let mut lease =
-        LandLease::acquire(repo_root.clone(), &args.auth, args.socket_path.as_deref()).await?;
+    let agent_id = current_agent_id()?;
+    let mut lease = LandLease::acquire(
+        repo_root.clone(),
+        agent_id,
+        &args.auth,
+        args.socket_path.as_deref(),
+    )
+    .await?;
 
     let Some(config) = config::read_config(repo_root.as_std_path())? else {
         lease.status(LandStatus::Bounced).await.ok();
@@ -112,10 +118,16 @@ pub(crate) async fn run(args: LandArgs) -> Result<()> {
 struct LandLease {
     client: UiClient,
     repo: Utf8PathBuf,
+    agent_id: Option<AgentId>,
 }
 
 impl LandLease {
-    async fn acquire(repo: Utf8PathBuf, auth: &str, socket_path: Option<&Path>) -> Result<Self> {
+    async fn acquire(
+        repo: Utf8PathBuf,
+        agent_id: Option<AgentId>,
+        auth: &str,
+        socket_path: Option<&Path>,
+    ) -> Result<Self> {
         let socket_path = match socket_path {
             Some(path) => path.to_owned(),
             None => rho_daemon::default_socket_path()?,
@@ -123,14 +135,21 @@ impl LandLease {
         let mut client = connect_or_start_daemon(&socket_path, auth).await?;
         eprintln!("queued for land lease");
         client
-            .send(&ClientMessage::AcquireLandLease { repo: repo.clone() })
+            .send(&ClientMessage::AcquireLandLease {
+                repo: repo.clone(),
+                agent_id,
+            })
             .await
             .context("request land lease")?;
         loop {
             match client.recv().await.context("wait for land lease")? {
                 ServerMessage::LandLeaseGranted { repo: granted } if granted == repo => {
                     eprintln!("land lease granted");
-                    return Ok(Self { client, repo });
+                    return Ok(Self {
+                        client,
+                        repo,
+                        agent_id,
+                    });
                 }
                 ServerMessage::LandLeaseQueued {
                     repo: queued,
@@ -163,6 +182,7 @@ impl LandLease {
         self.client
             .send(&ClientMessage::LandStatus {
                 repo: self.repo.clone(),
+                agent_id: self.agent_id,
                 status,
             })
             .await
@@ -172,6 +192,7 @@ impl LandLease {
         self.client
             .send(&ClientMessage::ReleaseLandLease {
                 repo: self.repo.clone(),
+                agent_id: self.agent_id,
             })
             .await
     }
@@ -472,6 +493,18 @@ fn current_jj_workspace(checkout: &Path) -> Result<String> {
     name.strip_suffix('@')
         .map(str::to_owned)
         .with_context(|| format!("malformed working copy name: {name}"))
+}
+
+fn current_agent_id() -> Result<Option<AgentId>> {
+    let Some(id) = std::env::var_os("RHO_AGENT_ID") else {
+        return Ok(None);
+    };
+    let id = id
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("RHO_AGENT_ID is not valid UTF-8"))?;
+    AgentId::from_encoded(&id)
+        .map(Some)
+        .context("parse RHO_AGENT_ID")
 }
 
 fn current_jj_workspace_from_root(checkout: &Path) -> Result<String> {

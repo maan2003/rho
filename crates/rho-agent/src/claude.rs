@@ -554,6 +554,7 @@ impl ClaudeLoop {
             }
         };
         if let Some(tools) = &self.multi_agent {
+            command.env("RHO_AGENT_ID", tools.self_id().encoded());
             command.env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
         }
         if let Err(error) = self

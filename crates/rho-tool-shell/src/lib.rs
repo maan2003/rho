@@ -39,6 +39,7 @@ const APPROX_BYTES_PER_TOKEN: u64 = 4;
 pub struct ShellTools {
     default_timeout: Duration,
     exec: ExecContext,
+    env: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +73,7 @@ impl ShellTools {
         Self {
             default_timeout: timeout,
             exec: ExecContext::Workspace(workspace),
+            env: Vec::new(),
         }
     }
 
@@ -87,7 +89,13 @@ impl ShellTools {
                 working_directory,
                 path_overrides,
             },
+            env: Vec::new(),
         }
+    }
+
+    pub fn with_env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
     }
 
     /// Where in-process file operations (patches) apply: the real checkout
@@ -209,6 +217,9 @@ impl ShellTools {
 
         let mut command = Command::new("sh");
         command.arg("-c").arg(&args.command);
+        for (name, value) in &self.env {
+            command.env(name, value);
+        }
         command.kill_on_drop(true);
         let cwd = args.cwd.as_deref().map(Utf8Path::new);
         match &self.exec {
