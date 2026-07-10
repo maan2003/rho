@@ -95,13 +95,13 @@ pub enum Block {
         text: String,
         final_answer: bool,
     },
-    Reasoning {
-        text: String,
-    },
     Tool {
-        name: String,
-        preview: Option<String>,
+        /// One-line label already rendered by the daemon (`$ command`,
+        /// `read path`, …), mirroring the GUI transcript.
+        label: String,
         status: String,
+        /// Wall time of a finished tool; the client formats and sums these.
+        duration_ms: Option<u64>,
         output: Option<String>,
         error: Option<String>,
     },

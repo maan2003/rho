@@ -1,5 +1,13 @@
 /* Rho web UI — dark, monospace, terminal-editorial (Amp-style). */
 
+/* Bundled so the UI is monospace even without local mono fonts. */
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("fonts/JetBrainsMono.woff2") format("woff2");
+  font-weight: 100 800;
+  font-display: swap;
+}
+
 :root {
   color-scheme: dark;
   --background: #0b0d0b;
@@ -18,7 +26,7 @@
   --warning: #d6a038;
   --link: #6ca0e0;
   --radius: 6px;
-  --mono: "Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo,
+  --mono: "Berkeley Mono", "JetBrains Mono", ui-monospace, "SF Mono", Menlo,
     Consolas, monospace;
 }
 
@@ -230,9 +238,21 @@ pre.code,
   flex: 1;
 }
 
-.conn-pill {
+.rail-foot {
   display: flex;
   align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--faint-foreground);
+}
+
+.foot-label {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .dot {
@@ -420,6 +440,13 @@ pre.code,
   white-space: nowrap;
 }
 
+.chip.mode {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 7px;
+  color: var(--muted-foreground);
+}
+
 .chip.status-streaming,
 .chip.status-tool_calling {
   color: var(--link);
@@ -472,8 +499,8 @@ pre.code,
 .bubble.user {
   max-width: min(85%, 42rem);
   background: var(--bubble);
-  border-radius: 8px;
-  padding: 7px 11px;
+  border-radius: 10px;
+  padding: 8px 14px;
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
@@ -540,16 +567,6 @@ pre.code,
   text-decoration: underline;
 }
 
-.block.assistant.final {
-  border-left: 2px solid var(--success);
-  padding-left: 12px;
-}
-
-.block.reasoning {
-  color: var(--faint-foreground);
-  font-size: 12px;
-}
-
 .block.notice {
   color: var(--faint-foreground);
   font-size: 11px;
@@ -574,85 +591,78 @@ pre.code,
   font-size: 12px;
 }
 
-.tool-head {
+.tool-line {
   display: flex;
-  align-items: center;
-  gap: 7px;
+  align-items: baseline;
+  gap: 8px;
   width: 100%;
-  padding: 2px 6px;
+  padding: 1px 6px;
   margin: 0 -6px;
   text-align: left;
   color: var(--muted-foreground);
+  cursor: default;
 }
 
-.tool-head:hover {
+.tool-line.expandable {
+  cursor: pointer;
+}
+
+.tool-line.expandable:hover {
   background: var(--accent);
 }
 
-.chev {
-  color: var(--faint-foreground);
-  font-size: 8px;
-  width: 9px;
-  flex: none;
-}
-
-.tool-name {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--muted-foreground);
-  flex: none;
-}
-
-.tool-head:hover .tool-name {
-  color: var(--foreground);
-}
-
-.tool-hint {
-  flex: 1;
+.tool-label {
   min-width: 0;
-  color: var(--faint-foreground);
-  font-size: 11.5px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.badge {
+.tool-status,
+.tool-dur {
   flex: none;
   font-size: 11px;
   color: var(--faint-foreground);
 }
 
-.badge.running {
-  color: var(--link);
-}
-
-.badge.error {
+.tool-status.error {
   color: var(--destructive);
 }
 
-.badge.cancelled {
+.tool-status.cancelled {
   color: var(--warning);
 }
 
-.badge.success {
-  color: var(--success);
+/* Centered "Worked for … ›" rule, Amp-style. */
+.fold-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--faint-foreground);
+}
+
+.fold-head::before,
+.fold-head::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
+.fold-head:hover {
+  color: var(--muted-foreground);
+}
+
+.chev {
+  flex: none;
+  font-size: 12px;
+  margin-left: -4px;
 }
 
 .tool-body {
-  padding: 5px 0 3px 16px;
-}
-
-.tool-section {
-  font-size: 10px;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-  color: var(--faint-foreground);
-  margin: 8px 0 3px;
-}
-
-.tool-section:first-child {
-  margin-top: 0;
+  padding: 5px 0 5px 0;
 }
 
 .tool-body pre {
@@ -670,8 +680,7 @@ pre.code,
   padding: 7px 11px;
 }
 
-.tool-body pre.err,
-.tool-section.err {
+.tool-body pre.err {
   color: var(--destructive);
 }
 
@@ -702,7 +711,7 @@ pre.code,
   background: none;
   resize: none;
   max-height: 200px;
-  min-height: 44px;
+  min-height: 56px;
   padding: 10px 12px 2px;
   border-radius: 0;
 }
@@ -719,8 +728,8 @@ pre.code,
   width: 24px;
   height: 24px;
   border-radius: 50%;
-  border: 1px solid var(--input-border);
-  color: var(--muted-foreground);
+  background: var(--muted-foreground);
+  color: var(--background);
   font-size: 13px;
   display: grid;
   place-items: center;
@@ -730,8 +739,6 @@ pre.code,
 
 .send:hover {
   background: var(--foreground);
-  border-color: var(--foreground);
-  color: var(--background);
 }
 
 /* ---- overlay dialog & toast ---- */

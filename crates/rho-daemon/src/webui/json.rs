@@ -2,12 +2,17 @@
 //! vocabulary: string agent ids, coarse status/attention labels, and bounded
 //! tool output so a long-running agent cannot flood the browser.
 
-use rho_ui_proto::remote::{UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiToolStatus};
+use rho_ui_proto::remote::{
+    UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
+};
 use rho_ui_proto::{AgentMode, UiAttention, UiTopic, UiWorkdir};
 use rho_webui_messages::{AgentState, AgentSummary, Block, ToBrowser, Topic, Workdir};
 
 /// Longest tool output/error forwarded to the browser, in bytes.
 const TOOL_TEXT_LIMIT: usize = 16 * 1024;
+
+/// Longest one-line tool label, in bytes.
+const TOOL_LABEL_LIMIT: usize = 256;
 
 pub fn hello(topics: &[UiTopic], workdirs: &[UiWorkdir]) -> ToBrowser {
     ToBrowser::Hello {
@@ -45,26 +50,23 @@ pub fn agent_state(state: &UiAgentState) -> AgentState {
     AgentState {
         status: status_label(&state.status).to_owned(),
         context_used: state.context_used,
-        blocks: state.blocks.iter().map(block).collect(),
+        blocks: state.blocks.iter().filter_map(block).collect(),
     }
 }
 
-fn block(block: &UiBlock) -> Block {
-    match block {
+/// `None` for blocks the web UI never renders (reasoning, like the GUI).
+fn block(block: &UiBlock) -> Option<Block> {
+    Some(match block {
         UiBlock::UserMessage { text } => Block::User { text: text.clone() },
         UiBlock::AssistantMessage { text, phase } => Block::Assistant {
             text: text.clone(),
             final_answer: matches!(phase, Some(UiMessagePhase::FinalAnswer)),
         },
-        UiBlock::Reasoning { text } => Block::Reasoning { text: text.clone() },
+        UiBlock::Reasoning { .. } => return None,
         UiBlock::Tool(tool) => Block::Tool {
-            name: tool.name.clone(),
-            preview: tool
-                .preview
-                .clone()
-                .or_else(|| Some(tool.arguments.clone()).filter(|args| !args.is_empty()))
-                .map(|text| truncate(text, TOOL_TEXT_LIMIT)),
+            label: truncate(tool_label(&tool.name, &tool.arguments), TOOL_LABEL_LIMIT),
             status: tool_status_label(tool.status).to_owned(),
+            duration_ms: tool_duration_ms(tool),
             output: tool
                 .output
                 .clone()
@@ -80,7 +82,57 @@ fn block(block: &UiBlock) -> Block {
             sender: sender.encoded(),
             text: text.clone(),
         },
+    })
+}
+
+/// One-line tool label matching the GUI transcript: shell-like tools render
+/// as `$ command`, Claude's file tools as `read/write/edit path`, everything
+/// else as `name arguments`. Argument extraction tolerates the partial JSON
+/// seen while arguments stream.
+fn tool_label(name: &str, arguments: &str) -> String {
+    match name {
+        "shell" | "shell_command" | "Bash" => {
+            let command = streaming_json_text_field(arguments, "command")
+                .or_else(|| {
+                    (!arguments.trim_start().starts_with('{')).then(|| arguments.to_owned())
+                })
+                .unwrap_or_default();
+            if command.is_empty() {
+                "$".to_owned()
+            } else {
+                format!("$ {command}")
+            }
+        }
+        "Read" | "Write" | "Edit" => {
+            let verb = name.to_ascii_lowercase();
+            match streaming_json_text_field(arguments, "file_path") {
+                Some(path) if !path.is_empty() => format!("{verb} {path}"),
+                _ => verb,
+            }
+        }
+        _ if arguments.is_empty() => name.to_owned(),
+        _ => format!("{name} {arguments}"),
     }
+}
+
+fn streaming_json_text_field(arguments: &str, key: &str) -> Option<String> {
+    let mut parser = json_stream::JsonStreamParser::new();
+    for character in arguments.chars() {
+        if parser.add_char(character).is_err() {
+            return None;
+        }
+    }
+    parser
+        .get_result()
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+fn tool_duration_ms(tool: &UiTool) -> Option<u64> {
+    let started = tool.started_at?.0;
+    let finished = tool.finished_at?.0;
+    Some(finished.saturating_sub(started))
 }
 
 fn truncate(mut text: String, limit: usize) -> String {

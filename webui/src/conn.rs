@@ -50,6 +50,11 @@ fn daemon_id_from_page() -> Option<String> {
     storage.get_item(DAEMON_KEY).ok()?
 }
 
+/// Remembered daemon endpoint id, for display.
+pub fn daemon_id() -> Option<String> {
+    local_storage()?.get_item(DAEMON_KEY).ok()?
+}
+
 /// Called from the connect screen; remembers the id and starts connecting.
 pub fn set_daemon(app: App, daemon: String) {
     if let Some(storage) = local_storage() {

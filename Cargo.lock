@@ -10449,6 +10449,7 @@ dependencies = [
  "dirs",
  "futures",
  "iroh",
+ "json-stream",
  "octo",
  "prefix-id",
  "rho-agent",

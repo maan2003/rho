@@ -102,7 +102,6 @@ fn Main(app: App) -> impl IntoView {
         <div class="rail">
             <div class="rail-head">
                 <div class="brand"><span class="logo small">"ρ"</span>"rho"</div>
-                <span class="conn-pill" title="connected"><span class="dot ok"></span></span>
                 <button
                     class="new-agent"
                     title="New agent"
@@ -132,6 +131,10 @@ fn Main(app: App) -> impl IntoView {
                     .into_any()
                 }).collect_view()}
             </div>
+            <div class="rail-foot" title="connected">
+                <span class="dot ok"></span>
+                <span class="foot-label">{daemon_short()}</span>
+            </div>
         </div>
         <div class="chat">
             {move || match app.selected.get() {
@@ -146,6 +149,15 @@ fn Main(app: App) -> impl IntoView {
             }}
         </div>
         {move || app.show_new_agent.get().then(|| NewAgentDialog(app))}
+    }
+}
+
+/// Shortened daemon endpoint id for the rail footer.
+fn daemon_short() -> String {
+    match conn::daemon_id() {
+        Some(id) if id.len() > 12 => format!("{}…", &id[..12]),
+        Some(id) => id,
+        None => "connected".to_owned(),
     }
 }
 
@@ -221,7 +233,7 @@ fn ChatPane(app: App, agent_id: String) -> impl IntoView {
                 </span>
             </div>
             {move || summary.get().map(|agent| view! {
-                <span class="chip">{agent.mode}</span>
+                <span class="chip mode">{agent.mode}</span>
             })}
             {move || busy.get().then(|| {
                 let cancel_id = cancel_id.clone();
@@ -254,15 +266,78 @@ fn Transcript(app: App) -> impl IntoView {
             <div class="column">
                 {move || match app.state.get() {
                     None => view! { <p class="muted loading">"Loading transcript…"</p> }.into_any(),
-                    Some(state) => state
-                        .blocks
-                        .iter()
-                        .map(BlockView)
-                        .collect_view()
-                        .into_any(),
+                    Some(state) => {
+                        let busy = matches!(state.status.as_str(), "streaming" | "tool_calling");
+                        Blocks(&state.blocks, busy).into_any()
+                    }
                 }}
             </div>
         </div>
+    }
+}
+
+fn Blocks(blocks: &[Block], busy: bool) -> impl IntoView {
+    let mut views = Vec::new();
+    let mut index = 0;
+    while index < blocks.len() {
+        let run_end = blocks[index..]
+            .iter()
+            .position(|block| !matches!(block, Block::Tool { .. }))
+            .map(|offset| index + offset)
+            .unwrap_or(blocks.len());
+        if run_end == index {
+            views.push(BlockView(&blocks[index]));
+            index += 1;
+            continue;
+        }
+        // Finished runs of tool lines collapse behind a "Worked for …" fold;
+        // the trailing run stays open while the agent is busy so live
+        // activity is visible.
+        let run = &blocks[index..run_end];
+        let tail_open = busy && run_end == blocks.len();
+        if run.len() > 1 && !tail_open {
+            views.push(ToolFold(run.to_vec()));
+        } else {
+            views.extend(run.iter().map(BlockView));
+        }
+        index = run_end;
+    }
+    views.collect_view()
+}
+
+fn ToolFold(run: Vec<Block>) -> AnyView {
+    let open = RwSignal::new(false);
+    let total_ms: u64 = run
+        .iter()
+        .filter_map(|block| match block {
+            Block::Tool { duration_ms, .. } => *duration_ms,
+            _ => None,
+        })
+        .sum();
+    let label = if total_ms >= 1000 {
+        format!("Worked for {}", format_duration(total_ms))
+    } else {
+        format!("{} tools", run.len())
+    };
+    view! {
+        <div class="tool-fold">
+            <button class="fold-head" on:click=move |_| open.update(|open| *open = !*open)>
+                <span class="fold-label">{label}</span>
+                <span class="chev">{move || if open.get() { "⌄" } else { "›" }}</span>
+            </button>
+            {move || open.get().then(|| run.iter().map(BlockView).collect_view())}
+        </div>
+    }
+    .into_any()
+}
+
+/// `3s` / `1m20s`, matching the GUI transcript.
+fn format_duration(ms: u64) -> String {
+    let seconds = ms / 1000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
     }
 }
 
@@ -280,20 +355,16 @@ fn BlockView(block: &Block) -> AnyView {
             };
             view! { <div class=class inner_html=md::render(text)></div> }.into_any()
         }
-        Block::Reasoning { text } => view! {
-            <div class="block reasoning" inner_html=md::render(text)></div>
-        }
-        .into_any(),
         Block::Tool {
-            name,
-            preview,
+            label,
             status,
+            duration_ms,
             output,
             error,
-        } => ToolCard(
-            name,
-            preview.as_deref(),
+        } => ToolLine(
+            label,
             status,
+            *duration_ms,
             output.as_deref(),
             error.as_deref(),
         ),
@@ -314,55 +385,47 @@ fn BlockView(block: &Block) -> AnyView {
     }
 }
 
-fn ToolCard(
-    name: &str,
-    preview: Option<&str>,
+/// One quiet line per tool, GUI-style: `label status [duration]`. Clicking
+/// the line reveals output/error when the tool produced any.
+fn ToolLine(
+    label: &str,
     status: &str,
+    duration_ms: Option<u64>,
     output: Option<&str>,
     error: Option<&str>,
 ) -> AnyView {
     let open = RwSignal::new(false);
-    let hint = preview
-        .unwrap_or("")
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(80)
-        .collect::<String>();
-    let name = name.to_owned();
+    let expandable = output.is_some() || error.is_some();
+    let status_text = match status {
+        "running" => "…",
+        "success" => "ok",
+        other => other,
+    }
+    .to_owned();
+    let label = label.to_owned();
     let status = status.to_owned();
-    let preview = preview.map(str::to_owned);
+    let duration = duration_ms.filter(|&ms| ms >= 1000).map(format_duration);
     let output = output.map(str::to_owned);
     let error = error.map(str::to_owned);
     view! {
         <div class="tool" class:open=move || open.get()>
-            <button class="tool-head" on:click=move |_| open.update(|open| *open = !*open)>
-                <span class="chev">{move || if open.get() { "▾" } else { "▸" }}</span>
-                <span class="tool-name">{name}</span>
-                <span class="tool-hint">{hint}</span>
-                <span class=format!("badge {status}")>
-                    {match status.as_str() {
-                        "success" => "✓".to_owned(),
-                        "running" => "running…".to_owned(),
-                        other => other.to_owned(),
-                    }}
-                </span>
+            <button
+                class="tool-line"
+                class:expandable=expandable
+                on:click=move |_| {
+                    if expandable {
+                        open.update(|open| *open = !*open);
+                    }
+                }
+            >
+                <span class="tool-label">{label}</span>
+                <span class=format!("tool-status {status}")>{status_text}</span>
+                {duration.map(|duration| view! { <span class="tool-dur">{duration}</span> })}
             </button>
-            {move || open.get().then(|| view! {
+            {move || (open.get() && expandable).then(|| view! {
                 <div class="tool-body">
-                    {preview.clone().map(|text| view! {
-                        <div class="tool-section">"input"</div>
-                        <pre>{text}</pre>
-                    })}
-                    {output.clone().map(|text| view! {
-                        <div class="tool-section">"output"</div>
-                        <pre>{text}</pre>
-                    })}
-                    {error.clone().map(|text| view! {
-                        <div class="tool-section err">"error"</div>
-                        <pre class="err">{text}</pre>
-                    })}
+                    {output.clone().map(|text| view! { <pre>{text}</pre> })}
+                    {error.clone().map(|text| view! { <pre class="err">{text}</pre> })}
                 </div>
             })}
         </div>
