@@ -15,7 +15,8 @@ use std::time::Duration;
 use anyhow::Context as _;
 use futures_util::StreamExt as _;
 use rho_agent::db::{
-    AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, DeepConfig, DeepEffort, Status, TopicId,
+    AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, DeepConfig, DeepEffort, Status,
+    TopicId, WorkdirRecord,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
@@ -223,20 +224,22 @@ impl SlackManager {
         event: &MessageEvent,
     ) -> anyhow::Result<Option<String>> {
         let existing = self.db.read().get_platform_session(session_key);
-        let (agent, is_new) = match existing {
+        let (agent, new_session_note) = match existing {
             Some(agent_id) if self.pool.agent_exists(agent_id) => {
                 let (_, agent, _) = self
                     .pool
                     .load(agent_id)
                     .await
                     .context("loading slack session agent")?;
-                (agent, false)
+                (agent, None)
             }
             _ => {
-                let repo = match self.pick_workdir(&event.text) {
+                let workdirs = self.db.read().list_workdirs();
+                let repo = match pick_workdir(&workdirs, &event.text) {
                     Ok(repo) => repo,
                     Err(guidance) => return Ok(Some(guidance)),
                 };
+                let note = workdir_note(&workdirs, &repo);
                 let start = rho_agent::StartWorkspace::Create {
                     repo: self.pool.repo(&repo).await?,
                     parent_revset: "@-".to_owned(),
@@ -258,18 +261,18 @@ impl SlackManager {
                 let mut write = self.db.write().await;
                 write.set_platform_session(session_key, agent_id);
                 write.commit();
-                (agent, true)
+                (agent, Some(note))
             }
         };
 
         // Joining mid-thread: the agent needs to see what was already said.
-        let thread_context = if is_new && event.thread_ts.is_some() {
+        let thread_context = if new_session_note.is_some() && event.thread_ts.is_some() {
             self.thread_context(api, config, event).await
         } else {
             None
         };
         let text = self
-            .inbound_text(api, config, event, is_new, thread_context)
+            .inbound_text(api, config, event, new_session_note, thread_context)
             .await;
         agent.send_user_message(text, MessageDelivery::NextRequest);
         let state = tokio::time::timeout(TURN_TIMEOUT, wait_for_turn_end(&agent))
@@ -282,42 +285,64 @@ impl SlackManager {
             text
         }))
     }
+}
 
-    /// The repo a new session's agent works in: the sole registered workdir,
-    /// or a leading "@<workdir>" in the first message. `Err` carries user
-    /// guidance.
-    fn pick_workdir(&self, text: &str) -> Result<camino::Utf8PathBuf, String> {
-        let workdirs = self.db.read().list_workdirs();
-        match &workdirs[..] {
-            [(path, _)] => Ok(path.clone()),
-            [] => {
-                Err("rho has no registered workdirs; register one in the rho GUI first".to_owned())
-            }
-            many => {
-                let prefixed = text
-                    .split_whitespace()
-                    .next()
-                    .and_then(|first| first.strip_prefix('@'))
-                    .and_then(|name| {
-                        many.iter()
-                            .find(|(_, record)| record.name.eq_ignore_ascii_case(name))
-                    });
-                match prefixed {
-                    Some((path, _)) => Ok(path.clone()),
-                    None => {
-                        let names: Vec<_> = many
-                            .iter()
-                            .map(|(_, record)| record.name.as_str())
-                            .collect();
-                        Err(format!(
-                            "start your first message with @<workdir> to pick a repo: {}",
-                            names.join(", ")
-                        ))
-                    }
-                }
-            }
-        }
+/// The repo a new session's agent works in: a leading "@<workdir>" in the
+/// first message wins, otherwise the most recently registered workdir.
+/// `Err` carries user guidance.
+fn pick_workdir(
+    workdirs: &[(camino::Utf8PathBuf, WorkdirRecord)],
+    text: &str,
+) -> Result<camino::Utf8PathBuf, String> {
+    let prefixed = text
+        .split_whitespace()
+        .next()
+        .and_then(|first| first.strip_prefix('@'))
+        .and_then(|name| {
+            workdirs
+                .iter()
+                .find(|(_, record)| record.name.eq_ignore_ascii_case(name))
+        });
+    if let Some((path, _)) = prefixed {
+        return Ok(path.clone());
     }
+    workdirs
+        .iter()
+        .max_by_key(|(path, record)| (record.created_at, path))
+        .map(|(path, _)| path.clone())
+        .ok_or_else(|| {
+            "rho has no registered workdirs; register one in the rho GUI first".to_owned()
+        })
+}
+
+/// The first-turn note telling a new session's agent which repo it works in
+/// and, when others are registered, how to reach them.
+fn workdir_note(
+    workdirs: &[(camino::Utf8PathBuf, WorkdirRecord)],
+    repo: &camino::Utf8Path,
+) -> String {
+    let name = workdirs
+        .iter()
+        .find(|(path, _)| path == repo)
+        .map(|(_, record)| record.name.as_str());
+    let mut note = match name {
+        Some(name) => format!("You are working in the \"{name}\" repo at {repo}."),
+        None => format!("You are working in the repo at {repo}."),
+    };
+    let others: Vec<String> = workdirs
+        .iter()
+        .filter(|(path, _)| path != repo)
+        .map(|(path, record)| format!("{} — {}", record.name, path))
+        .collect();
+    if !others.is_empty() {
+        note.push_str(&format!(
+            " Other registered repos: {}. For a task that belongs in one of those, spawn a \
+             sub-agent there with spawn_agent(workspace=new, repo=\"<absolute path>\"), wait for \
+             its result within your turn, and relay it.",
+            others.join("; ")
+        ));
+    }
+    note
 }
 
 impl SlackManager {
@@ -326,7 +351,7 @@ impl SlackManager {
         api: &SlackApi,
         config: &SlackConfig,
         event: &MessageEvent,
-        is_new: bool,
+        new_session_note: Option<String>,
         thread_context: Option<String>,
     ) -> String {
         let user = match &event.user {
@@ -342,12 +367,12 @@ impl SlackManager {
             "[slack message from {user} in {}]\n{body}",
             event.channel
         ));
-        if is_new {
-            text.push_str(
+        if let Some(note) = new_session_note {
+            text.push_str(&format!(
                 "\n\n(This conversation comes from a Slack thread; your final \
                  response each turn is posted back to it. Keep responses \
-                 concise and self-contained.)",
-            );
+                 concise and self-contained. {note})"
+            ));
         }
         text
     }
@@ -470,4 +495,70 @@ fn last_final_response(state: &AgentState) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::{Utf8Path, Utf8PathBuf};
+
+    use super::*;
+
+    fn workdirs(entries: &[(&str, &str, u64)]) -> Vec<(Utf8PathBuf, WorkdirRecord)> {
+        entries
+            .iter()
+            .map(|(path, name, created_at)| {
+                (
+                    Utf8PathBuf::from(*path),
+                    WorkdirRecord {
+                        name: (*name).to_owned(),
+                        created_at: rho_core::UnixMs(*created_at),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pick_workdir_errors_without_registered_workdirs() {
+        assert!(pick_workdir(&[], "hello").is_err());
+    }
+
+    #[test]
+    fn pick_workdir_uses_the_sole_workdir() {
+        let workdirs = workdirs(&[("/src/rho", "rho", 1)]);
+        assert_eq!(pick_workdir(&workdirs, "hello").unwrap(), "/src/rho");
+    }
+
+    #[test]
+    fn pick_workdir_defaults_to_most_recently_registered() {
+        let workdirs = workdirs(&[("/src/old", "old", 1), ("/src/new", "new", 2)]);
+        assert_eq!(pick_workdir(&workdirs, "fix the bug").unwrap(), "/src/new");
+        // An unknown @-prefix is not a workdir override.
+        assert_eq!(pick_workdir(&workdirs, "@alice hi").unwrap(), "/src/new");
+    }
+
+    #[test]
+    fn pick_workdir_prefix_overrides_default() {
+        let workdirs = workdirs(&[("/src/old", "old", 1), ("/src/new", "new", 2)]);
+        assert_eq!(
+            pick_workdir(&workdirs, "@OLD fix the bug").unwrap(),
+            "/src/old"
+        );
+    }
+
+    #[test]
+    fn workdir_note_names_the_repo_without_a_roster_for_a_sole_workdir() {
+        let workdirs = workdirs(&[("/src/rho", "rho", 1)]);
+        let note = workdir_note(&workdirs, Utf8Path::new("/src/rho"));
+        assert_eq!(note, "You are working in the \"rho\" repo at /src/rho.");
+    }
+
+    #[test]
+    fn workdir_note_lists_other_repos_with_delegation_guidance() {
+        let workdirs = workdirs(&[("/src/rho", "rho", 1), ("/src/web", "web", 2)]);
+        let note = workdir_note(&workdirs, Utf8Path::new("/src/web"));
+        assert!(note.starts_with("You are working in the \"web\" repo at /src/web."));
+        assert!(note.contains("rho — /src/rho"));
+        assert!(note.contains("spawn_agent(workspace=new, repo=\"<absolute path>\")"));
+    }
 }
