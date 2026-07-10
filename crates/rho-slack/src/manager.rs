@@ -19,7 +19,7 @@ use rho_agent::db::{
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
-use rho_core::{ContextBlock, InferenceResponseItem, MessagePhase, text_content};
+use rho_core::ContextBlock;
 use rho_db::RhoDb;
 use tokio::sync::mpsc;
 
@@ -192,24 +192,13 @@ impl SlackManager {
         if !(event.is_mention || event.channel_type == "im" || known_session) {
             return;
         }
-        // Turns take minutes; the reactions are the only in-flight feedback.
-        // Failures (missing reactions:write scope) must not block the turn.
-        if let Err(error) = api
-            .reactions_add(&config.bot_token, &event.channel, &event.ts, "eyes")
+        let reply = self
+            .run_turn(api, config, &session_key, &event)
             .await
-        {
-            tracing::debug!(%error, "adding in-progress reaction");
-        }
-        let result = self.run_turn(api, config, &session_key, &event).await;
-        let verdict = if result.is_ok() {
-            "white_check_mark"
-        } else {
-            "x"
-        };
-        let reply = result.unwrap_or_else(|error| {
-            tracing::error!(%error, session_key, "slack turn failed");
-            Some(format!("rho hit an error handling this message: {error:#}"))
-        });
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, session_key, "slack turn failed");
+                Some(format!("rho hit an error handling this message: {error:#}"))
+            });
         if let Some(reply) = reply
             && let Err(error) = api
                 .post_message(
@@ -221,15 +210,6 @@ impl SlackManager {
                 .await
         {
             tracing::error!(%error, "posting slack reply");
-        }
-        let _ = api
-            .reactions_remove(&config.bot_token, &event.channel, &event.ts, "eyes")
-            .await;
-        if let Err(error) = api
-            .reactions_add(&config.bot_token, &event.channel, &event.ts, verdict)
-            .await
-        {
-            tracing::debug!(%error, "adding verdict reaction");
         }
     }
 
@@ -481,36 +461,12 @@ async fn wait_for_turn_end(agent: &RunningAgent) -> AgentState {
     last
 }
 
-/// The last completed assistant answer, preferring final-answer text over
-/// commentary (same selection as the voice surface).
+/// The turn's report: the last inference response's answer, extracted with
+/// the same [`rho_agent::final_answer_text`] used for parent notifications.
 fn last_final_response(state: &AgentState) -> String {
     for block in state.blocks.iter().rev() {
-        let ContextBlock::InferenceResponse { items, .. } = block.as_ref() else {
-            continue;
-        };
-        let text_of = |wanted_final: bool| {
-            items
-                .iter()
-                .filter_map(|item| match item {
-                    InferenceResponseItem::AssistantMessage { content, phase, .. } => {
-                        let is_final = *phase == Some(MessagePhase::FinalAnswer);
-                        (is_final == wanted_final || !wanted_final).then(|| text_content(content))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let text = {
-            let final_text = text_of(true);
-            if final_text.trim().is_empty() {
-                text_of(false)
-            } else {
-                final_text
-            }
-        };
-        if !text.trim().is_empty() {
-            return text;
+        if let ContextBlock::InferenceResponse { items, .. } = block.as_ref() {
+            return rho_agent::final_answer_text(items);
         }
     }
     String::new()

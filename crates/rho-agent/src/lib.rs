@@ -1543,7 +1543,7 @@ impl AgentLoop {
 
 /// The turn's answer for reporting to a parent agent: final-channel text,
 /// falling back to all assistant text when the model skipped phases.
-fn final_answer_text(items: &[InferenceResponseItem]) -> String {
+pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
     let text_of = |want_final: bool| {
         items
             .iter()

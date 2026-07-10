@@ -162,30 +162,6 @@ impl SlackApi {
         Ok(first_ts)
     }
 
-    pub async fn reactions_add(
-        &self,
-        bot_token: &str,
-        channel: &str,
-        ts: &str,
-        name: &str,
-    ) -> anyhow::Result<()> {
-        let body = serde_json::json!({ "channel": channel, "timestamp": ts, "name": name });
-        self.call("reactions.add", bot_token, Some(body)).await?;
-        Ok(())
-    }
-
-    pub async fn reactions_remove(
-        &self,
-        bot_token: &str,
-        channel: &str,
-        ts: &str,
-        name: &str,
-    ) -> anyhow::Result<()> {
-        let body = serde_json::json!({ "channel": channel, "timestamp": ts, "name": name });
-        self.call("reactions.remove", bot_token, Some(body)).await?;
-        Ok(())
-    }
-
     /// A user's display name (falling back to real name, then handle).
     pub async fn users_info(&self, bot_token: &str, user_id: &str) -> anyhow::Result<String> {
         let value = self
