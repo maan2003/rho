@@ -219,6 +219,47 @@ async fn slow_cell_yields_then_wait_collects_completion() {
 }
 
 #[tokio::test]
+async fn session_requested_yield_wakes_wait_before_deadline() {
+    let (session, _) = session();
+    let first = session
+        .execute(
+            exec_id(),
+            "// @exec: {\"yield_time_ms\": 50}\nconst r = await tools.slow_echo({}); text(r)",
+        )
+        .await;
+    assert!(
+        first.output.starts_with("Script running"),
+        "{}",
+        first.output
+    );
+
+    let cell_id = cell_id(&first.output);
+    let started = std::time::Instant::now();
+    let (result, ()) = tokio::join!(
+        session.wait(WaitArgs {
+            cell_id,
+            yield_time_ms: 5_000,
+            max_tokens: None,
+            terminate: false,
+        }),
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            session.request_yield();
+        }
+    );
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "wait ignored requested yield"
+    );
+    assert!(
+        result.output.starts_with("Script running"),
+        "{}",
+        result.output
+    );
+}
+
+#[tokio::test]
 async fn concurrent_cells_interleave() {
     let (session, _) = session();
     let slow = session

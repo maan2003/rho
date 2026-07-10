@@ -1334,6 +1334,7 @@ impl AgentLoop {
         self.persist_event(AgentEvent::Queued(item.clone())).await;
         state.queued_inputs.push(item);
         self.wake_for_queued(state).await;
+        self.yield_code_mode_wait_for_queued(state);
         // An armed wait counts any deliverable arrival.
         self.maybe_resolve_wait(state).await;
     }
@@ -1441,6 +1442,20 @@ impl AgentLoop {
         .await;
     }
 
+    /// Code-mode `wait` is a normal pending tool future, not the loop-armed
+    /// multi-agent wait. When deliverable input arrives mid-turn, ask the
+    /// observed cell to yield so the tool batch can finish and the queued input
+    /// can enter the next request promptly.
+    fn yield_code_mode_wait_for_queued(&self, state: &AgentState) {
+        let Some(session) = &self.code_mode else {
+            return;
+        };
+        if !should_yield_code_mode_wait_for_queued(state) {
+            return;
+        }
+        session.request_yield();
+    }
+
     /// Move queued inputs into model context at a delivery boundary.
     /// `boundary` is the point the loop has reached: `NextRequest` (about to
     /// issue a mid-turn inference request) delivers everything but the
@@ -1539,6 +1554,19 @@ impl AgentLoop {
             })
             .collect()
     }
+}
+
+fn should_yield_code_mode_wait_for_queued(state: &AgentState) -> bool {
+    let AgentStateKind::ToolCalling { previews, .. } = &state.kind else {
+        return false;
+    };
+    previews
+        .values()
+        .any(|preview| preview.call.name.as_str() == rho_code_mode::WAIT_TOOL_NAME)
+        && state
+            .queued_inputs
+            .deliverable(MessageDelivery::NextRequest)
+            > 0
 }
 
 /// The turn's answer for reporting to a parent agent: final-channel text,
@@ -1805,6 +1833,84 @@ mod tests {
             ["later"]
         );
         assert!(queue.is_empty());
+    }
+
+    fn tool_calling_state_with_queue(queue: InputQueues) -> AgentState {
+        let call = ToolCall {
+            id: ToolCallId::try_from("wait-1").unwrap(),
+            name: ToolName::try_from(rho_code_mode::WAIT_TOOL_NAME).unwrap(),
+            tool_type: rho_core::ToolType::Function,
+            arguments: "{}".to_owned(),
+        };
+        let mut previews = BTreeMap::new();
+        previews.insert(
+            call.id.clone(),
+            ToolPreview {
+                call,
+                started_at: UnixMs(0),
+                metadata: None,
+            },
+        );
+        AgentState {
+            blocks: Vec::new(),
+            tool_specs: Arc::from([]),
+            system_prompt: Arc::from(""),
+            queued_inputs: queue,
+            kind: AgentStateKind::ToolCalling {
+                previews,
+                results: Vec::new(),
+                waiting: None,
+            },
+            context_used: None,
+        }
+    }
+
+    #[test]
+    fn code_mode_wait_yields_for_queued_user_message() {
+        let mut queue = InputQueues::default();
+        queue.push(QueuedItem {
+            kind: QueuedItemKind::UserMessage {
+                sender: MessageSender::User,
+                content: Arc::new(text_parts("steer")),
+            },
+            delivery: MessageDelivery::NextRequest,
+        });
+
+        assert!(should_yield_code_mode_wait_for_queued(
+            &tool_calling_state_with_queue(queue)
+        ));
+    }
+
+    #[test]
+    fn code_mode_wait_yields_for_queued_agent_mail() {
+        let mut queue = InputQueues::default();
+        queue.push(QueuedItem {
+            kind: QueuedItemKind::UserMessage {
+                sender: MessageSender::Agent { id: agent_id(3) },
+                content: Arc::new(text_parts("done")),
+            },
+            delivery: MessageDelivery::NextRequest,
+        });
+
+        assert!(should_yield_code_mode_wait_for_queued(
+            &tool_calling_state_with_queue(queue)
+        ));
+    }
+
+    #[test]
+    fn code_mode_wait_does_not_yield_for_next_turn_message() {
+        let mut queue = InputQueues::default();
+        queue.push(QueuedItem {
+            kind: QueuedItemKind::UserMessage {
+                sender: MessageSender::User,
+                content: Arc::new(text_parts("later")),
+            },
+            delivery: MessageDelivery::NextTurn,
+        });
+
+        assert!(!should_yield_code_mode_wait_for_queued(
+            &tool_calling_state_with_queue(queue)
+        ));
     }
 
     #[test]

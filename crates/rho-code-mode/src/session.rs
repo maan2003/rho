@@ -133,6 +133,21 @@ impl CodeModeSession {
         .await
     }
 
+    /// Ask any currently running cells to yield to their observers.
+    ///
+    /// This is used by the host agent loop when external input arrives while a
+    /// model-facing `wait` call is parked on a cell: the cell keeps running,
+    /// but the `wait` tool returns promptly so the queued input can enter the
+    /// next model request.
+    pub fn request_yield(&self) {
+        for cell in self.cells.lock().unwrap().values() {
+            if cell.is_running() {
+                cell.yield_requested.store(true, Ordering::Release);
+                cell.notify.notify_waiters();
+            }
+        }
+    }
+
     /// Waits for terminal status, new output, an explicit `yield_control()`,
     /// or the yield deadline, then formats the model-facing response.
     async fn observe(
