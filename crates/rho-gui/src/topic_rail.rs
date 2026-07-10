@@ -297,6 +297,17 @@ mod tests {
 
         let mut registry = AgentRegistry::default();
         registry.set_topics(vec![topic.clone()]);
+        let collapsed = split_agents(&topic, &registry)
+            .0
+            .into_iter()
+            .map(|summary| summary.agent_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            collapsed,
+            [1, 4].map(|id| AgentId::from_counter(id, &AgentIdDomain(0)).unwrap())
+        );
+
+        registry.select_agent(AgentId::from_counter(1, &AgentIdDomain(0)).unwrap());
         let visible = split_agents(&topic, &registry)
             .0
             .into_iter()
@@ -355,6 +366,7 @@ fn split_agents<'a>(
     let (mut agents, mut folded): (Vec<_>, Vec<_>) = topic
         .agents
         .iter()
+        .filter(|summary| !registry.agent_auto_collapsed(summary.agent_id))
         .partition(|summary| !registry.agent_folded(summary.agent_id));
     agents = registry.order_topic_agents(topic, agents);
     folded.sort_by_key(|summary| Reverse(summary.updated_at));

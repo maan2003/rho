@@ -133,10 +133,14 @@ impl AgentRegistry {
             return false;
         };
         let topic_ids = topic.agent_ids().collect::<BTreeSet<_>>();
-        let mut root_id = agent_id;
+        let root_id = Self::topic_root(topic, agent_id);
+        if self.agent_auto_collapsed(agent_id) {
+            return true;
+        }
+        let mut cursor = agent_id;
         let mut lineage = BTreeSet::new();
-        while lineage.insert(root_id) {
-            let Some(agent) = topic.agents.iter().find(|agent| agent.agent_id == root_id) else {
+        while lineage.insert(cursor) {
+            let Some(agent) = topic.agents.iter().find(|agent| agent.agent_id == cursor) else {
                 break;
             };
             if agent.hidden {
@@ -148,25 +152,11 @@ impl AgentRegistry {
             else {
                 break;
             };
-            root_id = parent;
+            cursor = parent;
         }
-        let selected_root = self.selected_agent().map(|selected| {
-            let mut selected_root = *selected;
-            let mut seen = BTreeSet::new();
-            while seen.insert(selected_root) {
-                let Some(parent) = topic
-                    .agents
-                    .iter()
-                    .find(|agent| agent.agent_id == selected_root)
-                    .and_then(|agent| agent.parent_agent)
-                    .filter(|parent| topic_ids.contains(parent))
-                else {
-                    break;
-                };
-                selected_root = parent;
-            }
-            selected_root
-        });
+        let selected_root = self
+            .selected_agent()
+            .map(|selected| Self::topic_root(topic, *selected));
         if self.attention(root_id) != rho_ui_proto::UiAttention::Quiet
             || self.agent_status(root_id) == rho_ui_proto::Status::Pinned
             || selected_root == Some(root_id)
@@ -182,6 +172,42 @@ impl AgentRegistry {
         };
         !self.top_bucket(roots()).contains(&root_id)
             && !self.extra_bucket(roots(), 5).contains(&root_id)
+    }
+
+    /// Descendants are shown only for the selected root subtree. They are
+    /// separate from the topic's manual folded tail and its "more" count.
+    pub(crate) fn agent_auto_collapsed(&self, agent_id: AgentId) -> bool {
+        let Some(topic) = self
+            .topics
+            .iter()
+            .find(|topic| topic.agent_ids().any(|id| id == agent_id))
+        else {
+            return false;
+        };
+        let root = Self::topic_root(topic, agent_id);
+        root != agent_id
+            && self
+                .selected_agent()
+                .is_none_or(|selected| Self::topic_root(topic, *selected) != root)
+    }
+
+    fn topic_root(topic: &UiTopic, agent_id: AgentId) -> AgentId {
+        let topic_ids = topic.agent_ids().collect::<BTreeSet<_>>();
+        let mut root = agent_id;
+        let mut seen = BTreeSet::new();
+        while seen.insert(root) {
+            let Some(parent) = topic
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == root)
+                .and_then(|agent| agent.parent_agent)
+                .filter(|parent| topic_ids.contains(parent))
+            else {
+                break;
+            };
+            root = parent;
+        }
+        root
     }
 
     /// The rail-visible agent most in need of the user, excluding the one
