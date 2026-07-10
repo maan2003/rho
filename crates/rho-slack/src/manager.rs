@@ -265,10 +265,10 @@ impl SlackManager {
                     .pool
                     .create(
                         self.topic_id,
-                        AgentMode::Deep(DeepConfig {
+                        AgentMode::Terra(DeepConfig {
                             effort: DeepEffort::Medium,
                             fast_mode: true,
-                            code_mode: false,
+                            code_mode: true,
                         }),
                         None,
                         start,
