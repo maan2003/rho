@@ -36,7 +36,7 @@ async fn init(args: SlackArgs, dir: camino::Utf8PathBuf) -> Result<()> {
                 ("SLACK_BOT_TOKEN".to_owned(), bot_token),
                 ("SLACK_APP_TOKEN".to_owned(), app_token),
             ],
-            coordinator_repo,
+            coordinator_repo: Some(coordinator_repo),
         })
         .await?;
     loop {

@@ -52,6 +52,13 @@ thread. The daemon validates and installs Slack setup, resumes secrets from the
 systemd fd store on startup, and publishes generic agent turn-completion
 reports through `AgentPool`; it does not own Slack routing policy.
 
+`octo`/`oct` are vendored GitHub helper crates from `~maan2003/claude`. Rho
+runs Octo as an in-process daemon Unix-socket server and exposes its socket path
+to agent commands via `OCTO_SOCKET`; the `oct` CLI is the agent-facing client.
+The daemon, not Octo, owns platform secret installation and fd-store resume, so
+Octo receives GitHub tokens only through a RAM-only callback into the sealed
+platform secret store.
+
 Dependencies should flow from higher-level assembly/policy crates toward lower
 reusable crates. The shared `rho-core` crate must not depend on provider, agent,
 store, tool, or CLI crates.

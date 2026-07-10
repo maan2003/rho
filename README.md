@@ -91,6 +91,12 @@ Rho discovers Markdown skills from project `.agents/skills` plus user
 names, descriptions, and file paths; the model reads the referenced files with
 normal shell tools when a task calls for them.
 
+The daemon also runs an embedded Octo GitHub helper server for agent commands.
+Install its GitHub token with `rho octo init`; the token is read from stdin and
+kept in the daemon's sealed RAM-only platform secret store. Agent shell and
+Claude commands receive the server path in `OCTO_SOCKET`, and can use the
+vendored `oct` CLI.
+
 For one-shot use:
 
 ```sh

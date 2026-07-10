@@ -21,21 +21,26 @@ AI APIs.
 - User/repo `AGENTS.md` files and local/project Markdown skills are trusted
   prompt input when discovered. Treat them as useful local guidance, not a
   sandbox or permission boundary.
-- Messaging-platform secrets (e.g. Slack tokens) reach the daemon over the
-  UI socket (`rho slack init --dir <coordinator-repo>` reads them from stdin)
-  — never via argv, exec-time environment, or files. `rho_slack::SecretStore`
-  holds them in a sealed memfd and stashes/reclaims it via the systemd fd
-  store (`FDSTORE=1`/`$LISTEN_FDS`), so tokens never touch disk and survive
-  daemon restarts but not reboots. The explicit Slack coordinator repo is
-  persisted in the local rho database, and Slack thread sessions always start
-  coordinator agents there; cross-repo work is model-directed delegation to
-  spawned agents with explicit repo paths, not first-message repo selection.
-  Token values must not appear in logs or errors. Inbound Slack Socket Mode
-  frames are remote, semi-trusted input: malformed or unexpected frames are
-  skipped, never panicked on, and message text is handed to agents as untrusted
-  user content. Slack replies are posted only for agents reverse-mapped from
-  Slack thread sessions when the generic agent turn-completion stream reports a
-  final answer.
+- Messaging-platform/API secrets (e.g. Slack tokens and Octo's GitHub token)
+  reach the daemon over the UI socket (`rho slack init --dir <coordinator-repo>`
+  and `rho octo init` read them from stdin) — never via argv, exec-time
+  environment, or files. `rho_slack::SecretStore` holds them in a sealed memfd
+  and stashes/reclaims it via the systemd fd store (`FDSTORE=1`/`$LISTEN_FDS`),
+  so tokens never touch disk and survive daemon restarts but not reboots. The
+  explicit Slack coordinator repo is persisted in the local rho database, and
+  Slack thread sessions always start coordinator agents there; cross-repo work
+  is model-directed delegation to spawned agents with explicit repo paths, not
+  first-message repo selection. Token values must not appear in logs or errors.
+  Inbound Slack Socket Mode frames are remote, semi-trusted input: malformed or
+  unexpected frames are skipped, never panicked on, and message text is handed to
+  agents as untrusted user content. Slack replies are posted only for agents
+  reverse-mapped from Slack thread sessions when the generic agent
+  turn-completion stream reports a final answer.
+- The embedded Octo server listens only on a daemon-owned Unix socket whose path
+  is passed to agent commands as `OCTO_SOCKET`. Octo uses the sealed platform
+  secret store as its GitHub token source and has no token argv/env/file/admin
+  import path in Rho. GitHub API responses and errors are remote, semi-trusted
+  input and are returned to the calling command rather than panicking.
 
 ## Runtime assumptions
 

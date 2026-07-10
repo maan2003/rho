@@ -127,6 +127,34 @@ impl SlackManager {
         })
     }
 
+    /// Start or restart Slack from the daemon-owned platform secret store.
+    ///
+    /// The store may also contain non-Slack platform secrets; Slack only
+    /// connects when both expected Slack tokens are present.
+    pub fn start_from_store(self: &Arc<Self>, store: Arc<SecretStore>) -> anyhow::Result<()> {
+        let secrets = store.read().context("reading platform secrets")?;
+        if !secrets.contains_key("SLACK_BOT_TOKEN") || !secrets.contains_key("SLACK_APP_TOKEN") {
+            anyhow::bail!("both SLACK_BOT_TOKEN and SLACK_APP_TOKEN are required");
+        }
+        self.start(store);
+        Ok(())
+    }
+
+    /// Persist Slack's coordinator repo and start from the daemon-owned
+    /// platform secret store.
+    pub async fn configure_and_start_from_store(
+        self: &Arc<Self>,
+        store: Arc<SecretStore>,
+        coordinator_repo: Utf8PathBuf,
+    ) -> anyhow::Result<()> {
+        {
+            let mut write = self.db.write().await;
+            write.set_slack_config(SlackConfigRecord { coordinator_repo });
+            write.commit();
+        }
+        self.start_from_store(store)
+    }
+
     fn start(self: &Arc<Self>, store: Arc<SecretStore>) {
         *self.secrets.lock().expect("secrets lock") = Some(store);
         let mut task = self.run_task.lock().expect("run task lock");

@@ -1,6 +1,9 @@
 [workspace]
 members = [
   "crates/json-stream",
+  "crates/oct",
+  "crates/octo",
+  "crates/octo-types",
   "crates/prefix-id",
   "crates/rho-agent",
   "crates/rho-blocking-notify-channel",
@@ -39,6 +42,7 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1"
 async-stream = "0.3"
+axum = "0.8"
 base64 = "0.22"
 bon = { version = "3", default-features = false }
 bytes = "1"
@@ -58,10 +62,13 @@ futures-util = "0.3"
 iroh = { version = "1.0.2", default-features = false }
 json-stream = { path = "crates/json-stream" }
 libc = "0.2"
+octo = { path = "crates/octo" }
+octo-types = { path = "crates/octo-types" }
 prefix-id = { path = "crates/prefix-id", default-features = false }
 rand = "0.8"
 redb = "4.1.0"
 redb-derive = "0.1.0"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "rustls-tls-native-roots",
@@ -122,6 +129,7 @@ ureq = { version = "3", default-features = false, features = [
 url = { version = "2", default-features = false }
 uuid = { version = "1", features = ["serde", "v4"] }
 vt100 = { version = "0.16", default-features = false }
+zip = { version = "2", default-features = false, features = ["deflate", "time"] }
 
 [profile.ci]
 debug = "line-tables-only"

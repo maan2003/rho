@@ -32,6 +32,7 @@ mod completion;
 mod land;
 mod markdown;
 mod mcp_agent_tools;
+mod octo_cli;
 mod slack;
 mod tool_render;
 
@@ -83,6 +84,7 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Land(args) => land::run(args).await,
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
+        Command::Octo(args) => octo_cli::run(args).await,
         Command::Slack(args) => slack::run(args).await,
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
@@ -1136,6 +1138,7 @@ enum Command {
     Debug(DebugArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
+    Octo(OctoArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
 }
@@ -1164,6 +1167,7 @@ enum CliCommand {
     Debug(DebugArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
+    Octo(OctoArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
 }
@@ -1186,6 +1190,22 @@ pub(crate) enum SlackCommand {
         #[arg(long = "dir")]
         dir: Utf8PathBuf,
     },
+}
+
+#[derive(Clone, clap::Args)]
+pub(crate) struct OctoArgs {
+    #[arg(long = "auth", default_value = "default")]
+    auth: String,
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: OctoCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum OctoCommand {
+    /// Install a GitHub token (read from stdin) for the daemon's Octo server.
+    Init,
 }
 
 #[derive(Clone, clap::Args)]
@@ -1236,6 +1256,7 @@ impl Args {
             Some(CliCommand::Debug(args)) => Command::Debug(args),
             Some(CliCommand::Land(args)) => Command::Land(args),
             Some(CliCommand::McpAgentTools(args)) => Command::McpAgentTools(args),
+            Some(CliCommand::Octo(args)) => Command::Octo(args),
             Some(CliCommand::ProtocolLog(args)) => Command::ProtocolLog(args),
             Some(CliCommand::Slack(args)) => Command::Slack(args),
             None => Command::Chat(cli.chat),

@@ -115,6 +115,18 @@ fn command_parse_known_and_unknown() {
 }
 
 #[test]
+fn top_level_octo_init_parses() {
+    let args = Args::try_parse(["octo".to_owned(), "init".to_owned()].into_iter()).unwrap();
+    assert!(matches!(
+        args.command,
+        super::Command::Octo(super::OctoArgs {
+            command: super::OctoCommand::Init,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn markdown_renderer_styles_common_markdown() {
     let rendered = markdown::markdown_text("# Title\nhello `code` and **bold**");
     let spans = rendered.spans();
