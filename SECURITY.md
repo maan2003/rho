@@ -90,6 +90,11 @@ AI APIs.
 - Production paths should not panic on malformed inference data, bad local input,
   missing files, or network failures.
 
+`rho debug render-prompt <role>` performs local context discovery in the
+current workdir and prints the resulting prompt and model-facing Rho tool
+specifications. Its output may contain repository instructions and user skill
+metadata; it performs no inference and creates no agent or workspace.
+
 ## Realtime voice provider (`rho-voice`)
 
 - `rho-voice` is a client for the xAI realtime voice WebSocket (Grok Voice

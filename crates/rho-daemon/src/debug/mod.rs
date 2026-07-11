@@ -3,7 +3,10 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use rho_agent::db::{AgentReadTxnExt as _, AgentRuntime, AgentWriteTxnExt as _, Status};
+use rho_agent::db::{
+    AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWriteTxnExt as _, EngineerIntelligence,
+    OracleIntelligence, Status,
+};
 use rho_db::RhoDb;
 use rho_workspaces::WorkspaceInfo;
 
@@ -29,6 +32,12 @@ enum DebugCommand {
     /// restore on load (event log for Rho agents, session transcript for
     /// Claude agents).
     Context,
+    /// Render the system prompt and top-level model-facing tools for a role.
+    RenderPrompt {
+        /// Role text: eng, eng-low, eng-high, eng-ultra, pm, oracle, or
+        /// oracle-high.
+        role: String,
+    },
 }
 
 pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
@@ -36,7 +45,78 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Agents => print_agents(args.db_path).await,
         DebugCommand::Migrate => test_migration(args.db_path).await,
         DebugCommand::Context => print_context(args.db_path).await,
+        DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
     }
+}
+
+async fn render_prompt(role: &str) -> anyhow::Result<()> {
+    let role = parse_role(role)?;
+    let cwd = std::env::current_dir().context("read current directory")?;
+    let (root, is_jj) = rho_workspaces::resolve_workdir_root(&cwd)?;
+    let repo = if is_jj {
+        rho_workspaces::Repo::open(root.as_std_path())?
+    } else {
+        rho_workspaces::Repo::open_plain_with_path_overrides(
+            root.as_std_path(),
+            rho_workspaces::PathOverrides::default(),
+        )?
+    };
+    let workspace = std::sync::Arc::new(repo).user_checkout().await?;
+    let view = rho_workspaces::View::new(vec![workspace])?;
+    let surface = rho_agent::render_agent_surface(view, role)?;
+
+    println!("# System prompt\n");
+    if surface.system_prompt.is_empty() {
+        println!("(empty; Claude Code supplies its own system prompt)");
+    } else {
+        print!("{}", surface.system_prompt);
+        if !surface.system_prompt.ends_with('\n') {
+            println!();
+        }
+    }
+    println!("\n# Tools");
+    if surface.tools.is_empty() {
+        println!("\n(none supplied by Rho at the provider API level)");
+    }
+    for tool in surface.tools.iter() {
+        println!("\n## {} ({:?})\n", tool.name.as_str(), tool.tool_type);
+        println!("{}", tool.description);
+        if !tool.input_schema.is_null() {
+            println!(
+                "\nInput schema:\n```json\n{}\n```",
+                serde_json::to_string_pretty(&tool.input_schema)?
+            );
+        }
+        if let Some(format) = &tool.format {
+            println!("\nFormat:\n```text\n{format:?}\n```");
+        }
+    }
+    Ok(())
+}
+
+fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
+    Ok(match text {
+        "eng" => AgentRole::default(),
+        "eng-low" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Low,
+        },
+        "eng-high" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+        },
+        "eng-ultra" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Ultra,
+        },
+        "pm" => AgentRole::PM,
+        "oracle" | "oracle-medium" => AgentRole::Oracle {
+            intelligence: OracleIntelligence::Medium,
+        },
+        "oracle-high" => AgentRole::Oracle {
+            intelligence: OracleIntelligence::High,
+        },
+        _ => anyhow::bail!(
+            "unknown role `{text}`; use eng, eng-low, eng-high, eng-ultra, pm, oracle, or oracle-high"
+        ),
+    })
 }
 
 struct Snapshot {
@@ -296,5 +376,22 @@ fn workspace_name(workspace: &WorkspaceInfo) -> String {
     match workspace {
         WorkspaceInfo::UserCheckout { repo } => format!("user-checkout {repo}"),
         WorkspaceInfo::Workspace { repo, id } => format!("workspace {} in {repo}", id.encoded()),
+    }
+}
+
+#[cfg(test)]
+mod render_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn parses_render_prompt_roles() {
+        assert_eq!(parse_role("eng").unwrap(), AgentRole::default());
+        assert_eq!(
+            parse_role("oracle-high").unwrap(),
+            AgentRole::Oracle {
+                intelligence: OracleIntelligence::High
+            }
+        );
+        assert!(parse_role("ultra").is_err());
     }
 }

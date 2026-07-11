@@ -47,6 +47,38 @@ pub trait AgentToolExtension: Send + Sync + 'static {
 pub type AgentToolExtensionFactory =
     Arc<dyn Fn(AgentId) -> Arc<dyn AgentToolExtension> + Send + Sync + 'static>;
 
+/// Model-facing prompt and top-level tools for a newly created role. Dynamic
+/// agent identity/team text and host-provided tool extensions are omitted.
+pub struct RenderedAgentSurface {
+    pub system_prompt: Arc<str>,
+    pub tools: Arc<[ToolSpec]>,
+}
+
+pub fn render_agent_surface(
+    view: Arc<View>,
+    role: db::AgentRole,
+) -> anyhow::Result<RenderedAgentSurface> {
+    let binding = role.session_profile()?;
+    if binding.claude_model().is_some() {
+        return Ok(RenderedAgentSurface {
+            system_prompt: system_prompt::claude_prompt(None, role),
+            tools: Arc::from([]),
+        });
+    }
+    let profile = binding
+        .deep_config()
+        .ok_or_else(|| anyhow::anyhow!("role has no inference profile"))?;
+    let shell_tools = ShellTools::new(
+        std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        Arc::clone(&view),
+    );
+    let agent_tools_enabled = !matches!(role, db::AgentRole::Oracle { .. });
+    Ok(RenderedAgentSurface {
+        system_prompt: system_prompt::prompt(view.as_ref(), None, profile.code_mode, role),
+        tools: agent_tool_specs(&shell_tools, agent_tools_enabled, profile.code_mode, None),
+    })
+}
+
 /// An agent timeline event. Some events fold into model context; future
 /// runtime-only events, like tool output chunks, can live here without becoming
 /// inference input.
