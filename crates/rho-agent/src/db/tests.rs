@@ -36,6 +36,13 @@ fn agent_role_resolves_opinionated_bindings() {
             ..
         })
     ));
+    for intelligence in [
+        EngineerIntelligence::Low,
+        EngineerIntelligence::Medium,
+        EngineerIntelligence::High,
+    ] {
+        assert!(profile(intelligence).deep_config().unwrap().code_mode);
+    }
     assert_eq!(
         profile(EngineerIntelligence::Ultra),
         SessionBinding::ClaudeFable {
@@ -64,6 +71,14 @@ fn agent_role_resolves_opinionated_bindings() {
             ..
         })
     ));
+    assert!(
+        AgentRole::PM
+            .session_profile()
+            .unwrap()
+            .deep_config()
+            .unwrap()
+            .code_mode
+    );
 }
 
 use crate::{MessageDelivery, MessageSender, QueuedItem, QueuedItemKind};

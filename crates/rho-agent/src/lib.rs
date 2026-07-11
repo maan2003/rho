@@ -602,7 +602,7 @@ impl Agent {
         let code_mode = start_code_mode(
             config.code_mode,
             &shell_tools,
-            multi_agent.as_ref(),
+            agent_tools_enabled.then_some(()).and(multi_agent.as_ref()),
             tool_extension.as_ref(),
             control.clone(),
         );

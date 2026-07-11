@@ -33,7 +33,7 @@ const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::n
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "e4c71b9a";
+const CURRENT_AGENT_DB_FORMAT: &str = "a1f83c6d";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -64,6 +64,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         from: "d91e4a72",
         to: "e4c71b9a",
         migrate: migrate_agent_config,
+    },
+    AgentDbMigration {
+        from: "e4c71b9a",
+        to: "a1f83c6d",
+        migrate: migrate_gpt56_code_mode,
     },
 ];
 
@@ -492,22 +497,22 @@ impl Default for AgentRole {
 
 impl AgentRole {
     pub(crate) fn session_profile(self) -> anyhow::Result<SessionBinding> {
-        let deep = |effort, code_mode| InferenceProfile {
+        let deep = |effort| InferenceProfile {
             effort,
             fast_mode: false,
-            code_mode,
+            code_mode: true,
         };
         Ok(match self {
-            AgentRole::PM => SessionBinding::CoordinatorSol(deep(ReasoningEffort::Medium, true)),
+            AgentRole::PM => SessionBinding::CoordinatorSol(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Low,
-            } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low, false)),
+            } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Medium,
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium, false)),
+            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::High,
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Xhigh, false)),
+            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Xhigh)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Ultra,
             } => SessionBinding::ClaudeFable {
@@ -515,7 +520,7 @@ impl AgentRole {
             },
             AgentRole::Oracle {
                 intelligence: OracleIntelligence::Medium,
-            } => SessionBinding::OracleSol(deep(ReasoningEffort::Xhigh, false)),
+            } => SessionBinding::OracleSol(deep(ReasoningEffort::Xhigh)),
             AgentRole::Oracle {
                 intelligence: OracleIntelligence::High,
             } => SessionBinding::ClaudeOracle {
@@ -1140,6 +1145,33 @@ fn migrate_agent_config(write: &mut WriteTxn) {
     };
     let mut agents = write.open_table(AGENTS);
     for (agent_id, record) in records {
+        agents.insert(&agent_id, SenValue::borrowed(&record));
+    }
+}
+
+fn migrate_gpt56_code_mode(write: &mut WriteTxn) {
+    let records = {
+        let agents = write.open_table(AGENTS);
+        agents
+            .iter()
+            .map(|(id, record)| (id.value(), record.value().into_owned()))
+            .collect::<Vec<_>>()
+    };
+    let mut agents = write.open_table(AGENTS);
+    for (agent_id, mut record) in records {
+        let profile = match &mut record.binding {
+            SessionBinding::ResponsesSol(profile)
+            | SessionBinding::ResponsesLuna(profile)
+            | SessionBinding::ResponsesTerra(profile)
+            | SessionBinding::CoordinatorTerra(profile)
+            | SessionBinding::CoordinatorSol(profile)
+            | SessionBinding::OracleSol(profile) => profile,
+            SessionBinding::ResponsesGpt55(_)
+            | SessionBinding::ClaudeFable { .. }
+            | SessionBinding::ClaudeOpus { .. }
+            | SessionBinding::ClaudeOracle { .. } => continue,
+        };
+        profile.code_mode = true;
         agents.insert(&agent_id, SenValue::borrowed(&record));
     }
 }
