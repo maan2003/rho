@@ -427,7 +427,7 @@ impl DraftView {
         self.editor.update(cx, |editor, cx| {
             editor.splice_inlays(
                 &[],
-                vec![Inlay::custom(MODE_LABEL_INLAY_ID, field_start, "Mode: ")],
+                vec![Inlay::custom(MODE_LABEL_INLAY_ID, field_start, "Role: ")],
                 cx,
             );
         });

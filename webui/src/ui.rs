@@ -105,31 +105,23 @@ fn Main(app: App) -> impl IntoView {
                 <button
                     class="new-agent"
                     title="New agent"
-                    on:click=move |_| app.show_new_agent.set(true)
+                    on:click=move |_| {
+                        app.show_new_agent.set(true);
+                        app.chat_open.set(true);
+                    }
                 >
                     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
                         <path d="M11.5 2.5l2 2L6 12l-2.7.7.7-2.7 7.5-7.5z"/>
                     </svg>
+                    <span>"New"</span>
                 </button>
             </div>
             <div class="topics">
-                {move || app.topics.get().into_iter().map(|topic| {
-                    let agents: Vec<AgentSummary> = topic
-                        .agents
-                        .into_iter()
-                        .filter(|agent| !agent.hidden)
-                        .collect();
-                    if agents.is_empty() {
-                        return ().into_any();
-                    }
-                    view! {
-                        <div class="topic">
-                            <div class="topic-name">{topic.name}</div>
-                            {agents.into_iter().map(|agent| AgentRow(app, agent)).collect_view()}
-                        </div>
-                    }
-                    .into_any()
-                }).collect_view()}
+                {move || {
+                    let mut topics = app.topics.get();
+                    topics.sort_by_key(|topic| !topic.pinned);
+                    topics.into_iter().map(|topic| TopicSection(app, topic)).collect_view()
+                }}
             </div>
             <div class="rail-foot" title="connected">
                 <span class="dot ok"></span>
@@ -137,18 +129,54 @@ fn Main(app: App) -> impl IntoView {
             </div>
         </div>
         <div class="chat">
-            {move || match app.selected.get() {
-                Some(agent_id) => ChatPane(app, agent_id).into_any(),
-                None => view! {
+            {move || if app.show_new_agent.get() {
+                NewAgentPage(app).into_any()
+            } else {
+                match app.selected.get() {
+                    Some(agent_id) => ChatPane(app, agent_id).into_any(),
+                    None => view! {
                     <div class="placeholder">
                         <div class="logo big">"ρ"</div>
                         <p class="muted">"Pick an agent, or start a new one."</p>
                     </div>
+                    }.into_any(),
                 }
-                .into_any(),
             }}
         </div>
-        {move || app.show_new_agent.get().then(|| NewAgentDialog(app))}
+    }
+}
+
+fn TopicSection(app: App, topic: rho_webui_messages::Topic) -> impl IntoView {
+    let expanded = RwSignal::new(false);
+    let mut agents = topic.agents;
+    agents.sort_by_key(|agent| (!agent.pinned, std::cmp::Reverse(agent.updated_at)));
+    let mut active = Vec::new();
+    let mut folded = Vec::new();
+    for agent in agents {
+        if agent.hidden || active.len() >= 10 {
+            folded.push(agent);
+        } else {
+            active.push(agent);
+        }
+    }
+    let folded_count = folded.len();
+    view! {
+        <div class="topic">
+            <div class="topic-name">
+                <span>{topic.name}</span>
+                {topic.pinned.then(|| view! { <span class="pin" title="Pinned">"◆"</span> })}
+            </div>
+            {active.into_iter().map(|agent| AgentRow(app, agent)).collect_view()}
+            {move || expanded.get().then(|| {
+                folded.clone().into_iter().map(|agent| AgentRow(app, agent)).collect_view()
+            })}
+            {(folded_count > 0).then(|| view! {
+                <button class="fold-row" on:click=move |_| expanded.update(|value| *value = !*value)>
+                    <span>{move || if expanded.get() { "⌃" } else { "⌄" }}</span>
+                    <span>{move || if expanded.get() { "Show less".to_owned() } else { format!("{folded_count} more") }}</span>
+                </button>
+            })}
+        </div>
     }
 }
 
@@ -176,7 +204,7 @@ fn AgentRow(app: App, agent: AgentSummary) -> impl IntoView {
             </svg>
             <span class="agent-meta">
                 <span class="agent-name">{agent.name}</span>
-                <span class="agent-mode">{agent.mode}</span>
+                <span class="agent-mode">{agent.role}</span>
             </span>
             <span class=format!("attn {attention}")></span>
         </button>
@@ -233,7 +261,7 @@ fn ChatPane(app: App, agent_id: String) -> impl IntoView {
                 </span>
             </div>
             {move || summary.get().map(|agent| view! {
-                <span class="chip mode">{agent.mode}</span>
+                <span class="chip mode">{agent.role}</span>
             })}
             {move || busy.get().then(|| {
                 let cancel_id = cancel_id.clone();
@@ -493,7 +521,7 @@ fn autosize(element: &web_sys::HtmlTextAreaElement) {
     let _ = style.set_property("height", &format!("{height}px"));
 }
 
-fn NewAgentDialog(app: App) -> impl IntoView {
+fn NewAgentPage(app: App) -> impl IntoView {
     let repo = RwSignal::new(
         app.workdirs
             .get_untracked()
@@ -501,6 +529,23 @@ fn NewAgentDialog(app: App) -> impl IntoView {
             .map(|workdir| workdir.path.clone())
             .unwrap_or_default(),
     );
+    let topics = app.topics.get_untracked();
+    let selected = app.selected.get_untracked();
+    let topic_id = RwSignal::new(
+        selected
+            .as_ref()
+            .and_then(|selected| {
+                topics
+                    .iter()
+                    .find(|topic| topic.agents.iter().any(|agent| &agent.id == selected))
+            })
+            .or_else(|| topics.first())
+            .map(|topic| topic.id.clone())
+            .unwrap_or_default(),
+    );
+    let role = RwSignal::new("eng".to_owned());
+    let join = RwSignal::new(false);
+    let revset = RwSignal::new("@-".to_owned());
     let area: NodeRef<html::Textarea> = NodeRef::new();
     let create = move || {
         let Some(element) = area.get_untracked() else {
@@ -514,26 +559,79 @@ fn NewAgentDialog(app: App) -> impl IntoView {
             return;
         }
         app.send(FromBrowser::NewAgent {
+            topic_id: topic_id.get_untracked(),
             repo,
+            role: role.get_untracked(),
+            join: join.get_untracked(),
+            revset: revset.get_untracked(),
             text: text.to_owned(),
         });
-        app.show_new_agent.set(false);
     };
     view! {
-        <div class="overlay" on:click=move |_| app.show_new_agent.set(false)>
-            <div class="dialog" on:click=|event| event.stop_propagation()>
-                <h2>"New agent"</h2>
-                <label>"Repository"</label>
+        <div class="draft-page">
+            <div class="draft-head">
+                <button class="back" on:click=move |_| app.show_new_agent.set(false)>"‹"</button>
+                <div>
+                    <h1>"New agent"</h1>
+                    <p class="muted">"Choose how this agent should work, then give it a first task."</p>
+                </div>
+            </div>
+            <div class="draft-form">
+                <section>
+                    <h2>"Task"</h2>
+                    <label>"First message"</label>
+                    <textarea class="draft-task" rows="8" placeholder="What should it work on?" node_ref=area></textarea>
+                </section>
+                <div class="draft-grid">
+                    <section>
+                        <h2>"Location"</h2>
+                        <label>"Repository"</label>
                 <select on:change=move |event| repo.set(event_target_value(&event))>
                     {move || app.workdirs.get().into_iter().map(|workdir| {
                         view! { <option value=workdir.path.clone()>{workdir.name}</option> }
                     }).collect_view()}
                 </select>
-                <label>"First message"</label>
-                <textarea rows="4" placeholder="What should it work on?" node_ref=area></textarea>
-                <div class="dialog-actions">
+                        <label>"Topic"</label>
+                        <select prop:value=move || topic_id.get()
+                            on:change=move |event| topic_id.set(event_target_value(&event))>
+                            {move || app.topics.get().into_iter().map(|topic| {
+                                view! { <option value=topic.id>{topic.name}</option> }
+                            }).collect_view()}
+                        </select>
+                    </section>
+                    <section>
+                        <h2>"Role"</h2>
+                        <label>"Responsibility and intelligence"</label>
+                        <select on:change=move |event| role.set(event_target_value(&event))>
+                            <option value="eng-low">"Engineer · Low"</option>
+                            <option value="eng" selected>"Engineer · Standard"</option>
+                            <option value="eng-high">"Engineer · High"</option>
+                            <option value="eng-ultra">"Engineer · Ultra"</option>
+                            <option value="pm">"Project manager"</option>
+                        </select>
+                        <p class="field-help">"Engineers implement changes. Project managers coordinate work across agents."</p>
+                    </section>
+                    <section>
+                        <h2>"Workspace"</h2>
+                        <label class="choice">
+                            <input type="radio" name="workspace" value="new" checked
+                                on:change=move |_| join.set(false) />
+                            <span><strong>"New isolated workspace"</strong><small>"Recommended · keeps changes separate"</small></span>
+                        </label>
+                        <label class="choice">
+                            <input type="radio" name="workspace" value="join"
+                                on:change=move |_| join.set(true) />
+                            <span><strong>"Work in my checkout"</strong><small>"Shares files and uncommitted changes"</small></span>
+                        </label>
+                        <div class="revset" class:hidden=move || join.get()>
+                            <label>"Base revision"</label>
+                            <input value="@-" on:input=move |event| revset.set(event_target_value(&event)) />
+                        </div>
+                    </section>
+                </div>
+                <div class="draft-actions">
                     <button on:click=move |_| app.show_new_agent.set(false)>"Cancel"</button>
-                    <button class="primary" on:click=move |_| create()>"Start"</button>
+                    <button class="primary" on:click=move |_| create()>"Start agent"</button>
                 </div>
             </div>
         </div>

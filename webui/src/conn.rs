@@ -172,6 +172,7 @@ fn handle(app: App, message: ToBrowser) {
             }
         }
         ToBrowser::AgentCreated { agent_id } => {
+            app.show_new_agent.set(false);
             app.select(agent_id);
         }
         ToBrowser::Error { message } => {

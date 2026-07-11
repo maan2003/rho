@@ -84,7 +84,9 @@ AI APIs.
   code running after the user approves the WebAuthn prompt can read the
   derived enrolled key and thereby gain persistent daemon access. Deploy the
   page on a dedicated origin without third-party scripts and treat its build
-  and publishing pipeline as security-critical.
+  and publishing pipeline as security-critical. Besides user-authored text,
+  the page sends bounded agent creation choices (topic, registered workdir,
+  role, base revset, and workspace mode).
 - Inbound data on both ALPNs is remote, semi-trusted input: oversized UI
   protocol frames are rejected (`MAX_FRAME_LEN`), web UI JSON lines are
   length-bounded (`MAX_LINE_LEN`), malformed frames end the connection, and

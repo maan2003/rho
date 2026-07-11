@@ -56,12 +56,12 @@ actions!(
 )]
 struct Args {
     /// Connect directly to this rho daemon Unix socket.
-    #[arg(long, conflicts_with = "iroh")]
+    #[arg(long, conflicts_with = "endpoint")]
     socket: Option<PathBuf>,
 
     /// Connect to this rho daemon iroh endpoint id.
-    #[arg(long, value_name = "ENDPOINT_ID")]
-    iroh: Option<iroh::EndpointId>,
+    #[arg(long, visible_alias = "iroh", value_name = "ENDPOINT_ID")]
+    endpoint: Option<iroh::EndpointId>,
 }
 
 fn main() {
@@ -110,11 +110,10 @@ fn run() -> Result<()> {
 }
 
 fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
-    if let Some(endpoint_id) = args.iroh {
-        let state_dir = settings_path()?
-            .parent()
-            .context("rho-gui config directory")?
-            .to_path_buf();
+    if let Some(endpoint_id) = args.endpoint {
+        let state_dir = dirs::state_dir()
+            .context("state directory not available")?
+            .join("rho-gui");
         return Ok(AttachTarget::Iroh {
             endpoint_id,
             secret_path: state_dir.join("iroh-secret.key"),

@@ -255,9 +255,9 @@ async fn connect_iroh(
 ) -> anyhow::Result<Box<dyn AsyncStream>> {
     use rho_iroh_auth::EnrollmentCodeExt as _;
 
-    let secret = load_or_create_iroh_secret(secret_path)?;
+    let (secret, needs_persist) = load_iroh_secret(secret_path)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret)
+        .secret_key(secret.clone())
         .bind()
         .await
         .context("bind iroh client endpoint")?;
@@ -265,40 +265,54 @@ async fn connect_iroh(
         .connect(daemon_id, rho_ui_proto::IROH_ALPN)
         .await
         .context("connect to daemon over iroh")?;
-    let code = connection.enrollment_code(endpoint.id());
-    let _ = events.unbounded_send(ConnEvent::Enrollment(code.to_string()));
-    let (send, recv) = connection.open_bi().await.context("open iroh UI stream")?;
+    let open_stream = connection.open_bi();
+    tokio::pin!(open_stream);
+    let (send, recv) = tokio::select! {
+        stream = &mut open_stream => stream,
+        () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+            let code = connection.enrollment_code(endpoint.id());
+            let _ = events.unbounded_send(ConnEvent::Enrollment(code.to_string()));
+            open_stream.await
+        }
+    }
+    .context("open iroh UI stream")?;
+    if needs_persist {
+        persist_iroh_secret(secret_path, &secret)?;
+    }
     Ok(Box::new(IrohStream {
         inner: tokio::io::join(recv, send),
         _endpoint: endpoint,
     }))
 }
 
-fn load_or_create_iroh_secret(path: &Path) -> anyhow::Result<iroh::SecretKey> {
+fn load_iroh_secret(path: &Path) -> anyhow::Result<(iroh::SecretKey, bool)> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
                 anyhow::anyhow!("iroh secret file {} is not 32 bytes", path.display())
             })?;
-            Ok(iroh::SecretKey::from_bytes(&bytes))
+            Ok((iroh::SecretKey::from_bytes(&bytes), false))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).context("create rho-gui config directory")?;
-            }
-            let secret = iroh::SecretKey::generate();
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-                .context("create rho-gui iroh secret")?;
-            file.write_all(&secret.to_bytes())
-                .context("write rho-gui iroh secret")?;
-            Ok(secret)
+            Ok((iroh::SecretKey::generate(), true))
         }
         Err(error) => Err(error).context("read rho-gui iroh secret"),
     }
+}
+
+fn persist_iroh_secret(path: &Path, secret: &iroh::SecretKey) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("create rho-gui state directory")?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .context("create rho-gui iroh secret")?;
+    file.write_all(&secret.to_bytes())
+        .context("write rho-gui iroh secret")
 }

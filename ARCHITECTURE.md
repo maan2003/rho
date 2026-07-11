@@ -101,7 +101,9 @@ iroh endpoint carries a second ALPN for the web UI: newline-delimited JSON
 (`rho-webui-messages`, shared with the browser as a wasm-safe crate) bridged
 through an in-process duplex pipe onto a normal UI protocol session, so the
 daemon's webui module only translates the JSON vocabulary and owns no agent
-policy. The web UI page itself is a static Leptos/wasm app (`webui/` at the
+policy. Its new-agent command carries the selected topic, registered workdir,
+role, and isolated-versus-user-checkout start choice. The web UI page itself
+is a static Leptos/wasm app (`webui/` at the
 repo root, its own cargo workspace, hostable anywhere) that connects as an
 iroh client from the browser.
 

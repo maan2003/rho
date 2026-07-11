@@ -19,7 +19,9 @@ pub fn hello(topics: &[UiTopic], workdirs: &[UiWorkdir]) -> ToBrowser {
         topics: topics
             .iter()
             .map(|topic| Topic {
+                id: topic.topic_id.encoded(),
                 name: topic.name.clone(),
+                pinned: topic.status == rho_ui_proto::Status::Pinned,
                 agents: topic
                     .agents
                     .iter()
@@ -28,7 +30,9 @@ pub fn hello(topics: &[UiTopic], workdirs: &[UiWorkdir]) -> ToBrowser {
                         AgentSummary {
                             name: agent.display_name.clone().unwrap_or_else(|| id.clone()),
                             id,
-                            mode: role_label(agent.role).to_owned(),
+                            role: role_label(agent.role).to_owned(),
+                            pinned: agent.status == rho_ui_proto::Status::Pinned,
+                            updated_at: agent.updated_at.0,
                             attention: attention_label(agent.attention).to_owned(),
                             hidden: agent.hidden,
                         }

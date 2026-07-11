@@ -170,15 +170,29 @@ where
                             delivery: MessageDelivery::Immediate,
                         }).await?;
                     }
-                    FromBrowser::NewAgent { repo, text } => {
-                        let Some(topic_id) = default_topic else { continue };
+                    FromBrowser::NewAgent { topic_id, repo, role, join, revset, text } => {
+                        let topic_id = topics.iter()
+                            .find(|topic| topic.topic_id.encoded() == topic_id)
+                            .map(|topic| topic.topic_id)
+                            .or(default_topic);
+                        let Some(topic_id) = topic_id else { continue };
+                        let role = match parse_role(&role) {
+                            Some(role) => role,
+                            None => {
+                                send_json(&mut writer, &ToBrowser::Error { message: format!("unknown role: {role}") }).await?;
+                                continue;
+                            }
+                        };
+                        let repo = Utf8PathBuf::from(repo);
+                        let start = if join {
+                            StartMode::Join(rho_ui_proto::JoinTarget::User { repo })
+                        } else {
+                            StartMode::NewOn { repo, revset }
+                        };
                         write_frame(&mut session_write, &ClientMessage::NewAgent {
                             topic_id,
-                            role: AgentRole::default(),
-                            start: StartMode::NewOn {
-                                repo: Utf8PathBuf::from(repo),
-                                revset: "@-".to_owned(),
-                            },
+                            role,
+                            start,
                             content: Some(vec![ContentPart::Text { text }]),
                         }).await?;
                     }
@@ -201,6 +215,26 @@ where
             }
         }
     }
+}
+
+fn parse_role(role: &str) -> Option<AgentRole> {
+    use rho_ui_proto::EngineerIntelligence;
+    Some(match role {
+        "eng-low" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Low,
+        },
+        "eng" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
+        },
+        "eng-high" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+        },
+        "eng-ultra" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Ultra,
+        },
+        "pm" => AgentRole::PM,
+        _ => return None,
+    })
 }
 
 /// One text line, or `None` on clean end of stream. Bounded so a client

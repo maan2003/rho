@@ -49,7 +49,13 @@ pub enum FromBrowser {
         text: String,
     },
     NewAgent {
+        topic_id: String,
         repo: String,
+        role: String,
+        /// Work directly in the registered checkout instead of creating an
+        /// isolated workspace.
+        join: bool,
+        revset: String,
         text: String,
     },
     Cancel {
@@ -59,7 +65,9 @@ pub enum FromBrowser {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Topic {
+    pub id: String,
     pub name: String,
+    pub pinned: bool,
     pub agents: Vec<AgentSummary>,
 }
 
@@ -67,7 +75,9 @@ pub struct Topic {
 pub struct AgentSummary {
     pub id: String,
     pub name: String,
-    pub mode: String,
+    pub role: String,
+    pub pinned: bool,
+    pub updated_at: u64,
     pub attention: String,
     pub hidden: bool,
 }
