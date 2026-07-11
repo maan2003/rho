@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
+use crate::db::AgentRole;
 use crate::multi_agent_tools::MultiAgentTools;
 
 /// `multi_agent` is set for pooled agents, which get the multi-agent tools and
 /// the section explaining them. `code_mode` is set when the agent's tool
-/// surface is the code-mode `exec`/`wait` pair. `coordinator` is set for
-/// coordinator-mode agents, which get the cross-repo delegation section.
+/// surface is the code-mode `exec`/`wait` pair.
 pub fn prompt(
     workspace: &rho_workspaces::Workspace,
     multi_agent: Option<&MultiAgentTools>,
     code_mode: bool,
-    coordinator: bool,
+    role: AgentRole,
 ) -> Arc<str> {
     let working_directory = workspace.repo();
     let workspace_name = workspace.info().workspace_name();
@@ -41,7 +41,7 @@ pub fn prompt(
              wrong work and should stop its current turn, and `wait` when you are blocked \
              on agent results and have nothing else useful to do."
         };
-        let role = match tools.parent() {
+        let identity = match tools.parent() {
             Some(parent) => format!(
                 "You are an agent in a team of agents collaborating to complete a task. Your \
                  agent id is {agent_id}; your parent agent is {}.\n\nMessages from your \
@@ -55,16 +55,41 @@ pub fn prompt(
                  are the active agent."
             ),
         };
+        if matches!(role, AgentRole::Oracle { .. }) {
+            return format!(
+                "## Team Context
+
+{identity}
+
+You are advisory only. Do not use `spawn_agent`, `send_message`, or \
+`interrupt_agent`; do not manage other agents. Complete your independent \
+analysis and return it to your parent through your final response.
+"
+            );
+        }
+        let delegation_policy = match role {
+            AgentRole::Engineer { .. } => {
+                "You may spawn another agent only when the user explicitly requests a team or \
+                 delegation, or when an active workflow skill explicitly authorizes fan-out. \
+                 Otherwise do the work yourself. When authorized, delegate only concrete, \
+                 bounded work that can run independently while you continue useful local work; \
+                 keep tightly coupled or immediately blocking work local."
+            }
+            AgentRole::PM => {
+                "Use `spawn_agent` with `role=eng` to route substantive technical outcomes to an \
+                 Engineer. Do not spawn an Oracle or delegate conversational work, status \
+                 updates, or clarification that belongs to you."
+            }
+            AgentRole::Oracle { .. } => unreachable!(),
+        };
         format!(
             "## Sub-Agents
 
-{role}
+{identity}
 
-You can delegate concrete, bounded subtasks with the `spawn_agent` tool, \
-including side investigations or experiments when the user asks for them or \
-they de-risk the main task. Use sub-agents for work that can run independently \
-while you make useful progress locally; keep tightly coupled or immediately \
-blocking work local. Child agents have access to the same repo guidance, \
+{delegation_policy}
+
+Child agents have access to the same repo guidance, \
 skills, tools, and workspace instructions as you, so keep child prompts \
 focused on the task-specific goal and constraints instead of restating generic \
 process rules.
@@ -85,8 +110,7 @@ Payload:
 ```
 
 Mail does not interrupt an in-flight request, but it can start or continue \
-your next request. Delegate when tasks are parallel and separable; do small or \
-tightly coupled work yourself. Do not ask sub-agents for boilerplate you can \
+your next request. Do not ask sub-agents for boilerplate you can \
 get from tool responses, such as workspace handles, unless it is specifically \
 needed for the task.
 
@@ -95,30 +119,32 @@ needed for the task.
         )
     });
     let code_mode = if code_mode { CODE_MODE_PROMPT } else { "" };
-    let coordinator = if coordinator { COORDINATOR_PROMPT } else { "" };
+    let role = match role {
+        AgentRole::Engineer { .. } => "",
+        AgentRole::PM => PM_PROMPT,
+        AgentRole::Oracle { .. } => ORACLE_PROMPT,
+    };
     let environment = render_environment_prompt(working_directory.as_str());
-    format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{multi_agent}{coordinator}{environment}")
-        .into()
+    format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{multi_agent}{role}{environment}").into()
 }
 
-const COORDINATOR_PROMPT: &str = "## Coordinator
+const PM_PROMPT: &str = "## PM
 
-You are the user-facing coordinator for work that may span several agents and \
-repositories. For each request, understand what the user wants, then decide: \
-answer or handle small work locally, or delegate bounded repo-specific tasks \
-to worker agents.
+You are the user-facing project manager. Clarify outcomes, communicate status, \
+and route substantive technical work to an Engineer. Do not inspect or modify \
+repositories yourself.
 
-You run in your configured repository; it supplies your AGENTS.md guidance and \
-skills. Do not switch repositories in-place. For work in another repository, \
-spawn a worker with `workspace=new` and `repo=<absolute path>`; infer the repo \
-from the request instead of asking the user to pick one up front. Give each \
-worker a complete, self-contained task prompt; the worker owns repo-local \
-implementation details.
+Give the owning Engineer a complete outcome-focused prompt, track its progress, \
+and synthesize its results for the user. Never claim work is done before the \
+responsible Engineer reports it.
 
-While workers run, continue other useful work; their results arrive as agent \
-mail. Do not delegate what you can answer or do directly. Synthesize worker \
-results into concise outcomes for the user, and never claim work is done \
-before the responsible worker reports it.
+";
+
+const ORACLE_PROMPT: &str = "## Oracle
+
+You are an independent technical second opinion. Analyze the question deeply, \
+surface risks and tradeoffs, and recommend a path. You are advisory only: do \
+not implement changes and do not delegate work to other agents.
 
 ";
 
@@ -365,12 +391,12 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_guidance_is_coordinator_mode_only() {
-        assert!(!BASE_PROMPT.contains("## Coordinator"));
-        assert!(COORDINATOR_PROMPT.contains("## Coordinator"));
-        assert!(COORDINATOR_PROMPT.contains("`workspace=new` and `repo=<absolute path>`"));
-        assert!(COORDINATOR_PROMPT.contains("Do not switch repositories in-place"));
-        assert!(COORDINATOR_PROMPT.contains("never claim work is done"));
+    fn role_guidance_is_separate_from_the_base_prompt() {
+        assert!(!BASE_PROMPT.contains("## PM"));
+        assert!(!BASE_PROMPT.contains("## Oracle"));
+        assert!(PM_PROMPT.contains("Do not inspect or modify"));
+        assert!(PM_PROMPT.contains("Never claim work is done"));
+        assert!(ORACLE_PROMPT.contains("advisory only"));
     }
 
     #[test]

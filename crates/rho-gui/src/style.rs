@@ -11,7 +11,7 @@ use gpui::{App, FontWeight, HighlightStyle, Hsla};
 use theme::ActiveTheme as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModeFamily {
+pub enum RoleFamily {
     Deep,
     Fable,
 }
@@ -144,11 +144,11 @@ pub fn context_chip_style(cx: &App) -> HighlightStyle {
     }
 }
 
-pub fn mode_chip_style(family: ModeFamily, cx: &App) -> HighlightStyle {
+pub fn role_chip_style(family: RoleFamily, cx: &App) -> HighlightStyle {
     let colors = cx.theme().colors();
     let color = match family {
-        ModeFamily::Deep => colors.terminal_ansi_cyan,
-        ModeFamily::Fable => colors.terminal_ansi_magenta,
+        RoleFamily::Deep => colors.terminal_ansi_cyan,
+        RoleFamily::Fable => colors.terminal_ansi_magenta,
     };
     HighlightStyle {
         color: Some(color.into()),

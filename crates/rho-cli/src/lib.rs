@@ -345,10 +345,6 @@ impl ChatApp {
             rho_commands::Command::AgentPin => {
                 self.toggle_agent_status(rho_ui_proto::Status::Pinned);
             }
-            rho_commands::Command::AgentFast { .. } => {
-                self.term
-                    .print_system("runtime mode changes are only available in rho-gui");
-            }
             rho_commands::Command::AgentDone { .. } | rho_commands::Command::AgentSnooze { .. } => {
                 // Attention triage lives in the GUI rail; the CLI fronts a
                 // single agent and has nothing to clear.

@@ -154,7 +154,7 @@ fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequ
                     other => anyhow::bail!("unsupported workspace choice: {other}"),
                 },
                 repo: args.repo.map(Utf8PathBuf::from),
-                intelligence: args.intelligence,
+                role: args.role,
             })
         }
         multi_agent_tools::SEND_MESSAGE_TOOL_NAME => {
@@ -203,7 +203,7 @@ struct SpawnArgs {
     workspace: String,
     revset: Option<String>,
     repo: Option<String>,
-    intelligence: String,
+    role: String,
 }
 
 #[derive(Deserialize)]

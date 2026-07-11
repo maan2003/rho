@@ -17,9 +17,8 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
 use crate::db::{
-    AgentConfig, AgentDisposition, AgentId, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _,
-    AgentRuntime, AgentWriteTxnExt as _, InferenceModel, InferenceProfile, Latency, SessionBinding,
-    TopicId,
+    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime,
+    AgentWriteTxnExt as _, InferenceModel, InferenceProfile, SessionBinding, TopicId,
 };
 use crate::{
     Agent, AgentInputId, AgentState, AgentToolExtension, AgentToolExtensionFactory, InputSourceId,
@@ -187,27 +186,10 @@ impl AgentPool {
         self.agents.lock().await.get(&agent_id).cloned()
     }
 
-    pub async fn set_latency(&self, agent_id: AgentId, latency: Latency) -> anyhow::Result<()> {
-        let record = self.db.read().get_agent(agent_id);
-        let Some(mut config) = record.binding.deep_config() else {
-            anyhow::bail!("latency cannot be changed for this agent");
-        };
-        config.fast_mode = latency == Latency::Fast;
-        let profile = record.binding.with_deep_config(config);
-        let model = profile.deep_model().expect("deep profile has a model");
-        if let Some(RunningAgent::Rho(agent)) = self.get(agent_id).await {
-            agent.set_deep_config(config, model);
-        }
-        let mut write = self.db.write().await;
-        write.set_agent_mode(rho_core::UnixMs::now(), agent_id, profile);
-        write.commit();
-        Ok(())
-    }
-
     pub async fn create(
         self: &Arc<Self>,
         topic_id: TopicId,
-        config: AgentConfig,
+        config: AgentRole,
         display_name: Option<String>,
         start: StartWorkspace,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
@@ -225,7 +207,7 @@ impl AgentPool {
     pub async fn create_with_tool_extension(
         self: &Arc<Self>,
         topic_id: TopicId,
-        config: AgentConfig,
+        config: AgentRole,
         display_name: Option<String>,
         start: StartWorkspace,
         tool_extension: AgentToolExtensionFactory,
@@ -256,7 +238,8 @@ impl AgentPool {
             | SessionBinding::ResponsesLuna(_)
             | SessionBinding::ResponsesTerra(_)
             | SessionBinding::CoordinatorTerra(_)
-            | SessionBinding::CoordinatorSol(_) => {
+            | SessionBinding::CoordinatorSol(_)
+            | SessionBinding::OracleSol(_) => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
                     self.auth.clone(),
@@ -271,7 +254,9 @@ impl AgentPool {
                 .await?;
                 (agent_id, RunningAgent::Rho(agent))
             }
-            SessionBinding::ClaudeFable { .. } | SessionBinding::ClaudeOpus { .. } => {
+            SessionBinding::ClaudeFable { .. }
+            | SessionBinding::ClaudeOpus { .. }
+            | SessionBinding::ClaudeOracle { .. } => {
                 let (agent_id, agent) = ClaudeAgent::create(
                     self.db.clone(),
                     topic_id,
@@ -302,7 +287,7 @@ impl AgentPool {
         task_name: String,
         prompt: String,
         workspace: SpawnWorkspace,
-        config: AgentConfig,
+        config: AgentRole,
     ) -> anyhow::Result<AgentId> {
         let (topic_id, parent_workspace) = {
             let read = self.db.read();

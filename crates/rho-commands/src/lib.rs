@@ -38,11 +38,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Pin/unpin the current agent",
     },
     CommandSpec {
-        name: "agent fast",
-        usage: ":agent fast [on|off]",
-        description: "Toggle or set fast mode for the current Deep agent",
-    },
-    CommandSpec {
         name: "topic new",
         usage: ":topic new <name>",
         description: "Create a new topic",
@@ -139,9 +134,6 @@ pub enum Command {
     },
     AgentCancel,
     AgentPin,
-    AgentFast {
-        enabled: Option<bool>,
-    },
     TopicNew {
         name: String,
     },
@@ -205,8 +197,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
             },
             Some("cancel") => Parsed::Command(Command::AgentCancel),
             Some("pin") => Parsed::Command(Command::AgentPin),
-            Some("fast") => parse_agent_fast(&mut tokens),
-            _ => Parsed::Invalid(":agent new|rename|cancel|pin|fast".to_owned()),
+            _ => Parsed::Invalid(":agent new|rename|cancel|pin".to_owned()),
         },
         "topic" => match tokens.next() {
             Some("new") => match joined_name(rest) {
@@ -253,19 +244,6 @@ pub fn parse(line: &str) -> Option<Parsed> {
         other => Parsed::Unknown(format!(":{other}")),
     };
     Some(parsed)
-}
-
-fn parse_agent_fast<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed {
-    match (tokens.next(), tokens.next()) {
-        (None, None) => Parsed::Command(Command::AgentFast { enabled: None }),
-        (Some("on" | "true" | "yes"), None) => Parsed::Command(Command::AgentFast {
-            enabled: Some(true),
-        }),
-        (Some("off" | "false" | "no"), None) => Parsed::Command(Command::AgentFast {
-            enabled: Some(false),
-        }),
-        _ => Parsed::Invalid(":agent fast [on|off]".to_owned()),
-    }
 }
 
 fn parse_done<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Parsed {
@@ -417,14 +395,6 @@ fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> 
             .map(|topic| Candidate {
                 value: topic.clone(),
                 description: "topic".to_owned(),
-            })
-            .collect(),
-        ["agent", "fast"] => ["on", "off"]
-            .into_iter()
-            .filter(|value| value.starts_with(partial))
-            .map(|value| Candidate {
-                value: value.to_owned(),
-                description: "fast mode".to_owned(),
             })
             .collect(),
         ["agent", "new"] | ["workdirs", "rm"] => ctx

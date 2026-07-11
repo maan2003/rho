@@ -28,7 +28,7 @@ AI APIs.
   and stashes/reclaims it via the systemd fd store (`FDSTORE=1`/`$LISTEN_FDS`),
   so tokens never touch disk and survive daemon restarts but not reboots. The
   explicit Slack coordinator repo is persisted in the local rho database, and
-  Slack thread sessions always start coordinator agents there; cross-repo work
+  Slack thread sessions always start PM agents there; cross-repo work
   is model-directed delegation to spawned agents with explicit repo paths, not
   first-message repo selection. Token values must not appear in logs or errors.
   Inbound Slack Socket Mode frames are remote, semi-trusted input: malformed or
@@ -158,8 +158,8 @@ do not restrict filesystem access or grant tools.
   access to the host through the nested tool dispatcher — the same access the
   model already has through shell tools. Code mode is not a sandbox and adds no
   new privilege beyond the existing tool surface.
-- Code mode is part of the opinionated coordinator agent mode and is fixed at
-  agent creation; the daemon rejects changing the mode on a running agent. When
+- Code mode is part of the opinionated PM agent role and is fixed at
+  agent creation; the daemon rejects changing the role on a running agent. When
   on, the model-facing tools are only
   `exec`/`wait`, and
   shell plus multi-agent tools are dispatched from scripts on the agent's

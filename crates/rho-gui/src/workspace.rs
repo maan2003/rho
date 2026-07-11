@@ -15,7 +15,7 @@ use gpui::prelude::*;
 use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
 use rho_ui_proto::{
-    AgentConfig, AgentId, AgentMode, ClientMessage, Intelligence, Latency, MessageDelivery,
+    AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery, OracleIntelligence,
     VoiceRole, VoiceState, VoiceUiAction,
 };
 use theme::ActiveTheme as _;
@@ -26,7 +26,7 @@ use crate::connection::{ConnEvent, Connection};
 use crate::draft_view::DraftView;
 use crate::registry::{ActivePane, AgentRegistry};
 use crate::store::{AgentStore, FrameSummary};
-use crate::style::{ModeFamily, StyleClass};
+use crate::style::{RoleFamily, StyleClass};
 use crate::voice_audio::VoiceAudio;
 use crate::{
     AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, RoleCycle, RoleCycleGroup,
@@ -188,7 +188,7 @@ impl Workspace {
                     self.draft_view.update(cx, |view, cx| {
                         view.set_body_text("", cx);
                         view.set_workdir_text(&label, cx);
-                        view.set_mode_text(crate::draft_view::DEFAULT_MODE, cx);
+                        view.set_role_text(crate::draft_view::DEFAULT_ROLE, cx);
                         view.set_start_text(crate::draft_view::DEFAULT_START, cx);
                     });
                     self.select_agent(Some(agent_id), window, cx);
@@ -454,8 +454,8 @@ impl Workspace {
                 }
             }
         };
-        let mode = match parse_agent_mode(self.draft_view.read(cx).mode_text(cx).trim()) {
-            Ok(mode) => mode,
+        let role = match parse_agent_role(self.draft_view.read(cx).role_text(cx).trim()) {
+            Ok(role) => role,
             Err(message) => {
                 self.notice_on(None, &message, StyleClass::SystemInfo, cx);
                 return;
@@ -464,7 +464,7 @@ impl Workspace {
         self.awaiting_draft_agent = true;
         self.connection.send(ClientMessage::NewAgent {
             topic_id,
-            mode,
+            role,
             start,
             content: Some(vec![ContentPart::Text { text: body }]),
         });
@@ -700,21 +700,6 @@ impl Workspace {
             }
             Command::AgentPin => {
                 self.toggle_agent_status(source_agent, rho_ui_proto::Status::Pinned, cx);
-            }
-            Command::AgentFast { enabled } => {
-                self.update_deep_config(
-                    source_agent,
-                    ":agent fast: no agent selected",
-                    |config| {
-                        let fast = enabled.unwrap_or(config.latency != Latency::Fast);
-                        config.latency = if fast {
-                            Latency::Fast
-                        } else {
-                            Latency::Standard
-                        };
-                    },
-                    cx,
-                );
             }
             Command::TopicPin { name } => {
                 self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
@@ -961,9 +946,9 @@ impl Workspace {
     fn cycle_draft_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.registry.selected_agent().is_none() {
             self.draft_view.update(cx, |view, cx| {
-                if view.cursor_in_mode_field(cx) {
-                    let next = cycle_agent_mode_text(&view.mode_text(cx));
-                    view.set_mode_text(next, cx);
+                if view.cursor_in_role_field(cx) {
+                    let next = cycle_agent_role_text(&view.role_text(cx));
+                    view.set_role_text(next, cx);
                 } else if view.cursor_in_start_field(cx) {
                     view.cycle_start_mode(cx);
                 } else {
@@ -971,34 +956,6 @@ impl Workspace {
                 }
             });
         }
-    }
-
-    fn update_deep_config(
-        &mut self,
-        source_agent: Option<AgentId>,
-        no_target_message: &str,
-        update: impl FnOnce(&mut AgentConfig),
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
-        else {
-            self.notice_on(None, no_target_message, StyleClass::SystemInfo, cx);
-            return;
-        };
-        let Some(mut config) = self.registry.agent_mode(agent_id) else {
-            self.notice_on(
-                Some(&agent_id),
-                "mode changes are only available for deep agents",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        };
-        update(&mut config);
-        self.connection.send(ClientMessage::SetAgentMode {
-            agent_id,
-            mode: config,
-        });
     }
 
     /// (Re)writes the draft scaffold with the derived default workdir; the
@@ -1280,7 +1237,7 @@ impl Workspace {
     ) {
         let directory_label = self.working_directory_label(agent_id);
         let workspace_label = self.registry.workspace_id_label(*agent_id);
-        let mode_label = self.mode_label(agent_id);
+        let role_label = self.role_label(agent_id);
         let context_used = self
             .store
             .get(agent_id)
@@ -1289,7 +1246,7 @@ impl Workspace {
             view.set_status(
                 &directory_label,
                 workspace_label.as_deref(),
-                mode_label
+                role_label
                     .as_ref()
                     .map(|label| (label.text.as_str(), label.family)),
                 context_used,
@@ -1342,8 +1299,8 @@ impl Workspace {
             .unwrap_or_else(|| directory.to_string())
     }
 
-    fn mode_label(&self, agent_id: &AgentId) -> Option<ModeLabel> {
-        self.registry.agent_mode(*agent_id).map(agent_mode_label)
+    fn role_label(&self, agent_id: &AgentId) -> Option<RoleLabel> {
+        self.registry.agent_role(*agent_id).map(agent_role_label)
     }
 
     pub fn live_agent_targets(&self) -> Vec<crate::commands::Candidate> {
@@ -1410,127 +1367,84 @@ impl Workspace {
     }
 }
 
-fn parse_agent_mode(text: &str) -> Result<AgentConfig, String> {
-    let mut words = text.split_whitespace();
-    let mode = match words
-        .next()
-        .unwrap_or("normal")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "normal" => AgentMode::Normal,
-        "coordinator" => AgentMode::Coordinator,
-        other => return Err(format!("unknown mode `{other}`; use normal or coordinator")),
-    };
-    let intelligence = match words
-        .next()
-        .unwrap_or("medium")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "low" => Intelligence::Low,
-        "medium" => Intelligence::Medium,
-        "high" => Intelligence::High,
-        "ultra" => Intelligence::Ultra,
-        other => {
-            return Err(format!(
-                "unknown intelligence `{other}`; use low, medium, high, or ultra"
-            ));
-        }
-    };
-    let latency = match words.next() {
-        None => Latency::Standard,
-        Some(word) if word.eq_ignore_ascii_case("fast") => Latency::Fast,
-        Some(_) => {
-            return Err(
-                "config must be `normal|coordinator low|medium|high|ultra [fast]`".to_owned(),
-            );
-        }
-    };
-    if words.next().is_some() {
-        return Err("config must be `normal|coordinator low|medium|high|ultra [fast]`".to_owned());
-    }
-    let config = AgentConfig {
-        mode,
-        intelligence,
-        latency,
-    };
-    config.validate().map_err(|error| error.to_string())?;
-    Ok(config)
-}
-
-fn cycle_agent_mode_text(current: &str) -> &'static str {
-    match parse_agent_mode(current).unwrap_or_default() {
-        AgentConfig {
-            mode: AgentMode::Normal,
-            intelligence: Intelligence::Low,
-            ..
-        } => "normal medium",
-        AgentConfig {
-            mode: AgentMode::Normal,
-            intelligence: Intelligence::Medium,
-            ..
-        } => "normal high",
-        AgentConfig {
-            mode: AgentMode::Normal,
-            intelligence: Intelligence::High,
-            ..
-        } => "normal ultra",
-        AgentConfig {
-            mode: AgentMode::Normal,
-            intelligence: Intelligence::Ultra,
-            ..
-        } => "coordinator low",
-        AgentConfig {
-            mode: AgentMode::Coordinator,
-            intelligence: Intelligence::Low,
-            ..
-        } => "coordinator medium",
-        AgentConfig {
-            mode: AgentMode::Coordinator,
-            intelligence: Intelligence::Medium,
-            ..
-        } => "coordinator high",
-        AgentConfig {
-            mode: AgentMode::Coordinator,
-            intelligence: Intelligence::High,
-            ..
-        } => "normal low",
-        AgentConfig {
-            mode: AgentMode::Coordinator,
-            intelligence: Intelligence::Ultra,
-            ..
-        } => "normal low",
+fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" | "eng" => Ok(AgentRole::default()),
+        "eng-low" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Low,
+        }),
+        "eng-high" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+        }),
+        "eng-ultra" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Ultra,
+        }),
+        "pm" => Ok(AgentRole::PM),
+        other => Err(format!(
+            "unknown role `{other}`; use eng, eng-low, eng-high, eng-ultra, or pm"
+        )),
     }
 }
 
-struct ModeLabel {
+fn cycle_agent_role_text(current: &str) -> &'static str {
+    match parse_agent_role(current).unwrap_or_default() {
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Low,
+            ..
+        } => "eng",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
+            ..
+        } => "eng-high",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+            ..
+        } => "eng-ultra",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Ultra,
+            ..
+        } => "pm",
+        AgentRole::Oracle { .. } => "eng",
+        AgentRole::PM => "eng-low",
+    }
+}
+
+struct RoleLabel {
     text: String,
-    family: ModeFamily,
+    family: RoleFamily,
 }
 
-fn agent_mode_label(config: AgentConfig) -> ModeLabel {
-    let mode = match config.mode {
-        AgentMode::Normal => "",
-        AgentMode::Coordinator => "coord ",
-    };
-    let intelligence = match config.intelligence {
-        Intelligence::Low => "low",
-        Intelligence::Medium => "medium",
-        Intelligence::High => "high",
-        Intelligence::Ultra => "ultra",
-    };
-    let fast = if config.latency == Latency::Fast {
-        " ⚡"
-    } else {
-        ""
-    };
-    ModeLabel {
-        text: format!("{mode}{intelligence}{fast}"),
-        family: if config.intelligence == Intelligence::Ultra {
-            ModeFamily::Fable
-        } else {
-            ModeFamily::Deep
+fn agent_role_label(config: AgentRole) -> RoleLabel {
+    match config {
+        AgentRole::PM => RoleLabel {
+            text: "pm".to_owned(),
+            family: RoleFamily::Deep,
+        },
+        AgentRole::Oracle { intelligence } => RoleLabel {
+            text: match intelligence {
+                OracleIntelligence::Medium => "oracle-medium",
+                OracleIntelligence::High => "oracle-high",
+            }
+            .to_owned(),
+            family: if intelligence == OracleIntelligence::High {
+                RoleFamily::Fable
+            } else {
+                RoleFamily::Deep
+            },
+        },
+        AgentRole::Engineer { intelligence } => RoleLabel {
+            text: match intelligence {
+                EngineerIntelligence::Low => "eng-low",
+                EngineerIntelligence::Medium => "eng",
+                EngineerIntelligence::High => "eng-high",
+                EngineerIntelligence::Ultra => "eng-ultra",
+            }
+            .to_owned(),
+            family: if intelligence == EngineerIntelligence::Ultra {
+                RoleFamily::Fable
+            } else {
+                RoleFamily::Deep
+            },
         },
     }
 }
@@ -1674,34 +1588,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_agent_config() {
+    fn parses_agent_role() {
         assert_eq!(
-            parse_agent_mode("normal low").unwrap(),
-            AgentConfig {
-                mode: AgentMode::Normal,
-                intelligence: Intelligence::Low,
-                latency: Latency::Standard
+            parse_agent_role("eng-low").unwrap(),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Low,
             }
         );
-        assert_eq!(
-            parse_agent_mode("coordinator high fast").unwrap(),
-            AgentConfig {
-                mode: AgentMode::Coordinator,
-                intelligence: Intelligence::High,
-                latency: Latency::Fast
-            }
-        );
-        assert!(parse_agent_mode("coordinator ultra").is_err());
-        assert!(parse_agent_mode("normal ultra fast").is_err());
+        assert_eq!(parse_agent_role("pm").unwrap(), AgentRole::PM);
+        assert!(parse_agent_role("pm ultra").is_err());
+        assert!(parse_agent_role("eng-ultra-fast").is_err());
+        assert!(parse_agent_role("oracle high").is_err());
     }
 
     #[test]
-    fn labels_agent_config() {
-        let label = agent_mode_label(AgentConfig {
-            mode: AgentMode::Coordinator,
-            intelligence: Intelligence::High,
-            latency: Latency::Fast,
-        });
-        assert_eq!(label.text, "coord high ⚡");
+    fn labels_agent_role() {
+        let label = agent_role_label(AgentRole::PM);
+        assert_eq!(label.text, "pm");
     }
 }

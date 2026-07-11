@@ -9,62 +9,63 @@ use rho_workspaces::WorkspaceInfo;
 use super::*;
 
 #[test]
-fn agent_config_resolves_opinionated_profiles() {
+fn agent_role_resolves_opinionated_bindings() {
     let profile = |intelligence| {
-        AgentConfig {
-            mode: AgentMode::Normal,
-            intelligence,
-            latency: Latency::Standard,
-        }
-        .session_profile()
-        .unwrap()
+        AgentRole::Engineer { intelligence }
+            .session_profile()
+            .unwrap()
     };
     assert!(matches!(
-        profile(Intelligence::Low),
+        profile(EngineerIntelligence::Low),
         SessionBinding::ResponsesTerra(InferenceProfile {
             effort: ReasoningEffort::Low,
             ..
         })
     ));
     assert!(matches!(
-        profile(Intelligence::Medium),
+        profile(EngineerIntelligence::Medium),
         SessionBinding::ResponsesSol(InferenceProfile {
             effort: ReasoningEffort::Medium,
             ..
         })
     ));
     assert!(matches!(
-        profile(Intelligence::High),
+        profile(EngineerIntelligence::High),
         SessionBinding::ResponsesSol(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             ..
         })
     ));
     assert_eq!(
-        profile(Intelligence::Ultra),
+        profile(EngineerIntelligence::Ultra),
         SessionBinding::ClaudeFable {
             effort: ClaudeEffort::High
         }
     );
+    assert_eq!(
+        AgentRole::Oracle {
+            intelligence: OracleIntelligence::High,
+        }
+        .session_profile()
+        .unwrap(),
+        SessionBinding::ClaudeOracle {
+            effort: ClaudeEffort::High
+        }
+    );
+    assert!(matches!(
+        AgentRole::Oracle {
+            intelligence: OracleIntelligence::Medium,
+        }
+        .session_profile()
+        .unwrap(),
+        SessionBinding::OracleSol(InferenceProfile {
+            effort: ReasoningEffort::Xhigh,
+            fast_mode: false,
+            ..
+        })
+    ));
 }
 
-#[test]
-fn unsupported_agent_config_combinations_are_rejected() {
-    for config in [
-        AgentConfig {
-            mode: AgentMode::Coordinator,
-            intelligence: Intelligence::Ultra,
-            latency: Latency::Standard,
-        },
-        AgentConfig {
-            mode: AgentMode::Normal,
-            intelligence: Intelligence::Ultra,
-            latency: Latency::Fast,
-        },
-    ] {
-        assert!(config.session_profile().is_err());
-    }
-}
 use crate::{MessageDelivery, MessageSender, QueuedItem, QueuedItemKind};
 
 fn user_event(text: &str) -> AgentEvent<'static> {

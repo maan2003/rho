@@ -62,6 +62,7 @@ impl ClaudeAgent {
         let effort = mode
             .claude_effort()
             .ok_or_else(|| anyhow::anyhow!("cannot create Claude runtime for Rho agent mode"))?;
+        let role = mode.agent_role();
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
         let workspace = match start {
@@ -97,7 +98,7 @@ impl ClaudeAgent {
                 workspace.as_ref(),
                 multi_agent.as_ref(),
                 false,
-                false,
+                role,
             ),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
@@ -113,6 +114,7 @@ impl ClaudeAgent {
                 state,
                 ClaudeStartMode::New,
                 multi_agent,
+                role,
             ),
         ))
     }
@@ -151,7 +153,7 @@ impl ClaudeAgent {
                 let multi_agent = pool
                     .upgrade()
                     .map(|_| MultiAgentTools::new(pool.clone(), agent_id, record.parent_agent));
-                system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref(), false, false)
+                system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref(), false, record.role)
             },
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
@@ -166,6 +168,7 @@ impl ClaudeAgent {
             ClaudeStartMode::Resume,
             pool.upgrade()
                 .map(|_| MultiAgentTools::new(pool, agent_id, record.parent_agent)),
+            record.role,
         ))
     }
 
@@ -177,6 +180,7 @@ impl ClaudeAgent {
         state: AgentState,
         start_mode: ClaudeStartMode,
         multi_agent: Option<MultiAgentTools>,
+        role: crate::db::AgentRole,
     ) -> Self {
         let state = Arc::new(RwLock::new(state));
         let notify = Arc::new(Notify::new());
@@ -202,6 +206,7 @@ impl ClaudeAgent {
             input_notify: Arc::clone(&input_notify),
             control_rx,
             multi_agent,
+            role,
         };
         tokio::spawn(loop_state.run());
         Self {
@@ -323,6 +328,7 @@ struct ClaudeLoop {
     input_notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
     multi_agent: Option<MultiAgentTools>,
+    role: crate::db::AgentRole,
 }
 
 struct ClaudeTurn {
@@ -612,7 +618,7 @@ impl ClaudeLoop {
             self.workspace.as_ref(),
             self.multi_agent.as_ref(),
             false,
-            false,
+            self.role,
         );
         let mut source_file = tempfile::Builder::new()
             .prefix("rho-claude-prompt-")

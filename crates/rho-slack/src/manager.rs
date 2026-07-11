@@ -17,8 +17,7 @@ use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use futures_util::future::{BoxFuture, FutureExt as _};
 use rho_agent::db::{
-    AgentConfig, AgentId, AgentMode, AgentReadTxnExt as _, AgentWriteTxnExt as _, Intelligence,
-    Latency, Status, TopicId,
+    AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _, Status, TopicId,
 };
 use rho_agent::pool::{AgentPool, AgentToolExtensionProvider};
 use rho_agent::{AgentToolExtension, InputSourceId, MessageDelivery, MessageSender};
@@ -446,25 +445,15 @@ impl SlackManager {
                 };
                 let (agent_id, agent) = self
                     .pool
-                    .create_with_tool_extension(
-                        self.topic_id,
-                        AgentConfig {
-                            mode: AgentMode::Coordinator,
-                            intelligence: Intelligence::Medium,
-                            latency: Latency::Fast,
-                        },
-                        None,
-                        start,
-                        {
-                            let manager = Arc::downgrade(self);
-                            Arc::new(move |agent_id| {
-                                Arc::new(SlackTool {
-                                    manager: manager.clone(),
-                                    agent_id,
-                                }) as Arc<dyn AgentToolExtension>
-                            })
-                        },
-                    )
+                    .create_with_tool_extension(self.topic_id, AgentRole::PM, None, start, {
+                        let manager = Arc::downgrade(self);
+                        Arc::new(move |agent_id| {
+                            Arc::new(SlackTool {
+                                manager: manager.clone(),
+                                agent_id,
+                            }) as Arc<dyn AgentToolExtension>
+                        })
+                    })
                     .await
                     .context("creating slack session agent")?;
                 let mut write = self.db.write().await;

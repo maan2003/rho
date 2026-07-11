@@ -256,23 +256,27 @@ fn status_name(status: Status) -> &'static str {
     }
 }
 
-fn config_name(config: rho_agent::db::AgentConfig) -> String {
-    let mode = match config.mode {
-        rho_agent::db::AgentMode::Normal => "normal",
-        rho_agent::db::AgentMode::Coordinator => "coordinator",
-    };
-    let intelligence = match config.intelligence {
-        rho_agent::db::Intelligence::Low => "low",
-        rho_agent::db::Intelligence::Medium => "medium",
-        rho_agent::db::Intelligence::High => "high",
-        rho_agent::db::Intelligence::Ultra => "ultra",
-    };
-    let fast = if config.latency == rho_agent::db::Latency::Fast {
-        " fast"
-    } else {
-        ""
-    };
-    format!("{mode} {intelligence}{fast}")
+fn config_name(config: rho_agent::db::AgentRole) -> String {
+    use rho_agent::db::{AgentRole, EngineerIntelligence};
+    match config {
+        AgentRole::PM => "pm".to_owned(),
+        AgentRole::Oracle { intelligence } => format!(
+            "oracle {}",
+            match intelligence {
+                rho_agent::db::OracleIntelligence::Medium => "medium",
+                rho_agent::db::OracleIntelligence::High => "high",
+            }
+        ),
+        AgentRole::Engineer { intelligence } => {
+            let intelligence = match intelligence {
+                EngineerIntelligence::Low => "low",
+                EngineerIntelligence::Medium => "medium",
+                EngineerIntelligence::High => "high",
+                EngineerIntelligence::Ultra => "ultra",
+            };
+            format!("engineer {intelligence}")
+        }
+    }
 }
 
 fn workspace_name(workspace: &WorkspaceInfo) -> String {

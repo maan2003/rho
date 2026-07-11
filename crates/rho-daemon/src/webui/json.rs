@@ -5,7 +5,7 @@
 use rho_ui_proto::remote::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
-use rho_ui_proto::{AgentConfig, AgentMode, Intelligence, UiAttention, UiTopic, UiWorkdir};
+use rho_ui_proto::{AgentRole, EngineerIntelligence, UiAttention, UiTopic, UiWorkdir};
 use rho_webui_messages::{AgentState, AgentSummary, Block, ToBrowser, Topic, Workdir};
 
 /// Longest tool output/error forwarded to the browser, in bytes.
@@ -28,7 +28,7 @@ pub fn hello(topics: &[UiTopic], workdirs: &[UiWorkdir]) -> ToBrowser {
                         AgentSummary {
                             name: agent.display_name.clone().unwrap_or_else(|| id.clone()),
                             id,
-                            mode: mode_label(agent.mode).to_owned(),
+                            mode: role_label(agent.role).to_owned(),
                             attention: attention_label(agent.attention).to_owned(),
                             hidden: agent.hidden,
                         }
@@ -148,13 +148,31 @@ fn truncate(mut text: String, limit: usize) -> String {
     text
 }
 
-fn mode_label(config: AgentConfig) -> &'static str {
-    match (config.mode, config.intelligence) {
-        (AgentMode::Coordinator, _) => "coordinator",
-        (_, Intelligence::Low) => "low",
-        (_, Intelligence::Medium) => "medium",
-        (_, Intelligence::High) => "high",
-        (_, Intelligence::Ultra) => "ultra",
+fn role_label(config: AgentRole) -> &'static str {
+    match config {
+        AgentRole::PM => "pm",
+        AgentRole::Oracle {
+            intelligence: rho_ui_proto::OracleIntelligence::Medium,
+        } => "oracle-medium",
+        AgentRole::Oracle {
+            intelligence: rho_ui_proto::OracleIntelligence::High,
+        } => "oracle-high",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Low,
+            ..
+        } => "eng-low",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
+            ..
+        } => "eng",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+            ..
+        } => "eng-high",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Ultra,
+            ..
+        } => "eng-ultra",
     }
 }
 

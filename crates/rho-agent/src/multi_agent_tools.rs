@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::MessageDelivery;
-use crate::db::{AgentConfig, AgentId, AgentMode, AgentReadTxnExt as _, Intelligence, Latency};
+use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
 use crate::pool::{AgentPool, SpawnWorkspace};
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
@@ -123,7 +123,7 @@ fn spawn_agent_spec() -> ToolSpec {
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["task_name", "prompt", "workspace", "intelligence"],
+            "required": ["task_name", "prompt", "workspace", "role"],
             "properties": {
                 "task_name": {
                     "type": "string",
@@ -150,10 +150,10 @@ fn spawn_agent_spec() -> ToolSpec {
                     "type": "string",
                     "description": "With workspace=new: absolute path to a jj repository. Defaults to this agent's repository."
                 },
-                "intelligence": {
+                "role": {
                     "type": "string",
-                    "enum": ["low", "medium", "high", "ultra"],
-                    "description": "Required child intelligence level."
+                    "enum": ["eng", "oracle"],
+                    "description": "Required child role. Oracle is advisory only and does not implement or delegate."
                 }
             }
         }),
@@ -265,7 +265,7 @@ struct SpawnArgs {
     workspace: WorkspaceChoice,
     revset: Option<String>,
     repo: Option<String>,
-    intelligence: String,
+    role: String,
 }
 
 #[derive(Deserialize)]
@@ -291,7 +291,7 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
         (_, Some(_)) => anyhow::bail!("repo is only supported with workspace=new"),
     };
     let task_name = args.task_name.clone();
-    let config = parse_spawn_intelligence(&args.intelligence)?;
+    let config = parse_spawn_role(&args.role)?;
     let pool = tools.pool()?;
     let child_id = pool
         .spawn_child(
@@ -320,20 +320,13 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     ))
 }
 
-pub fn parse_spawn_intelligence(intelligence: &str) -> anyhow::Result<AgentConfig> {
-    let intelligence = match intelligence {
-        "low" => Intelligence::Low,
-        "medium" => Intelligence::Medium,
-        "high" => Intelligence::High,
-        "ultra" => Intelligence::Ultra,
-        _ => anyhow::bail!(
-            "unsupported intelligence {intelligence:?}; expected low, medium, high, or ultra"
-        ),
-    };
-    Ok(AgentConfig {
-        mode: AgentMode::Normal,
-        intelligence,
-        latency: Latency::Standard,
+pub fn parse_spawn_role(role: &str) -> anyhow::Result<AgentRole> {
+    Ok(match role {
+        "eng" => AgentRole::default(),
+        "oracle" => AgentRole::Oracle {
+            intelligence: crate::db::OracleIntelligence::Medium,
+        },
+        _ => anyhow::bail!("unsupported child role {role:?}"),
     })
 }
 
@@ -442,22 +435,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_spawn_intelligence() {
-        for (name, intelligence) in [
-            ("low", Intelligence::Low),
-            ("medium", Intelligence::Medium),
-            ("high", Intelligence::High),
-            ("ultra", Intelligence::Ultra),
-        ] {
-            assert_eq!(
-                parse_spawn_intelligence(name).unwrap(),
-                AgentConfig {
-                    mode: AgentMode::Normal,
-                    intelligence,
-                    latency: Latency::Standard,
-                }
-            );
-        }
-        assert!(parse_spawn_intelligence("terra").is_err());
+    fn parses_spawn_role() {
+        assert_eq!(parse_spawn_role("eng").unwrap(), AgentRole::default());
+        assert!(parse_spawn_role("terra").is_err());
+        assert_eq!(
+            parse_spawn_role("oracle").unwrap(),
+            AgentRole::Oracle {
+                intelligence: crate::db::OracleIntelligence::Medium
+            }
+        );
     }
 }

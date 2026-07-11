@@ -234,7 +234,7 @@ impl AgentView {
         &mut self,
         project_label: &str,
         workspace_label: Option<&str>,
-        mode_label: Option<(&str, style::ModeFamily)>,
+        role_label: Option<(&str, style::RoleFamily)>,
         context_used: Option<u64>,
         cx: &mut Context<Self>,
     ) {
@@ -250,15 +250,15 @@ impl AgentView {
             }
             spans.push((workspace_label.to_owned(), style::workspace_chip_style(cx)));
         }
-        if let Some((mode_label, mode_family)) = mode_label
-            && !mode_label.is_empty()
+        if let Some((role_label, mode_family)) = role_label
+            && !role_label.is_empty()
         {
             if !spans.is_empty() {
                 spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
             }
             spans.push((
-                mode_label.to_owned(),
-                style::mode_chip_style(mode_family, cx),
+                role_label.to_owned(),
+                style::role_chip_style(mode_family, cx),
             ));
         }
         if let Some(context_used) = context_used {

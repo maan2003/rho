@@ -137,7 +137,7 @@ fn fold_row(
 #[cfg(test)]
 mod tests {
     use rho_core::UnixMs;
-    use rho_ui_proto::{AgentConfig, AgentIdDomain, TopicId, TopicIdDomain, WorkspaceInfo};
+    use rho_ui_proto::{AgentIdDomain, AgentRole, TopicId, TopicIdDomain, WorkspaceInfo};
 
     use super::*;
 
@@ -150,7 +150,7 @@ mod tests {
             display_name: None,
             created_at: UnixMs(id),
             updated_at: UnixMs(updated_at),
-            mode: AgentConfig::default(),
+            role: AgentRole::default(),
             workspace: WorkspaceInfo::UserCheckout {
                 repo: "/tmp".into(),
             },

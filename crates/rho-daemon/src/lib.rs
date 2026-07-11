@@ -8,7 +8,7 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use rho_agent::db::{
-    AgentConfig, AgentDisposition, AgentId, AgentReadTxnExt as _, AgentWriteTxnExt as _, Status,
+    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _, Status,
     TopicId,
 };
 use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent, SpawnWorkspace};
@@ -508,7 +508,7 @@ impl AgentRegistry {
                         .map(|(agent_id, agent)| UiAgentSummary {
                             agent_id,
                             parent_agent: agent.parent_agent,
-                            mode: agent.config(),
+                            role: agent.config(),
                             display_name: agent.display_name,
                             created_at: agent.created_at,
                             updated_at: agent.updated_at,
@@ -606,7 +606,7 @@ impl AgentRegistry {
     async fn create(
         &self,
         topic_id: TopicId,
-        mode: AgentConfig,
+        role: AgentRole,
         start: StartMode,
     ) -> anyhow::Result<(TopicId, AgentId, RunningAgent)> {
         let start = match start {
@@ -627,7 +627,7 @@ impl AgentRegistry {
                 )
             }
         };
-        let (agent_id, agent) = self.pool.create(topic_id, mode, None, start).await?;
+        let (agent_id, agent) = self.pool.create(topic_id, role, None, start).await?;
         Ok((topic_id, agent_id, agent))
     }
 
@@ -639,13 +639,19 @@ impl AgentRegistry {
         if !self.pool.agent_exists(self_agent_id) {
             anyhow::bail!("agent is not known: {self_agent_id:?}");
         }
+        if matches!(
+            self.db.read().get_agent(self_agent_id).role,
+            AgentRole::Oracle { .. }
+        ) {
+            anyhow::bail!("Oracle agents do not have multi-agent tools");
+        }
         match request {
             McpAgentToolRequest::SpawnAgent {
                 task_name,
                 prompt,
                 workspace,
                 repo,
-                intelligence,
+                role,
             } => {
                 if prompt.trim().is_empty() {
                     anyhow::bail!("prompt must not be empty");
@@ -665,7 +671,7 @@ impl AgentRegistry {
                         task_name.clone(),
                         prompt,
                         workspace,
-                        rho_agent::multi_agent_tools::parse_spawn_intelligence(&intelligence)?,
+                        rho_agent::multi_agent_tools::parse_spawn_role(&role)?,
                     )
                     .await?;
                 let child_workspace = self.pool.db().read().get_agent(child_id).workspace;
@@ -788,15 +794,6 @@ impl AgentRegistry {
         write.set_agent_status(rho_core::UnixMs::now(), agent_id, status);
         write.commit();
         Ok(())
-    }
-
-    async fn set_agent_mode(&self, agent_id: AgentId, config: AgentConfig) -> anyhow::Result<()> {
-        let record = self.db.read().get_agent(agent_id);
-        let current = record.config();
-        if config.mode != current.mode || config.intelligence != current.intelligence {
-            anyhow::bail!("mode and intelligence can only be chosen when creating an agent");
-        }
-        self.pool.set_latency(agent_id, config.latency).await
     }
 
     /// Titles an untitled agent from its first user message, in the
@@ -1258,13 +1255,13 @@ async fn handle_message(
         }
         ClientMessage::NewAgent {
             topic_id,
-            mode,
+            role,
             start,
             content,
         } => {
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
-            let (_topic_id, agent_id, agent) = agents.create(topic_id, mode, start).await?;
+            let (_topic_id, agent_id, agent) = agents.create(topic_id, role, start).await?;
             if let Some(content) = content {
                 let text = text_content(&content);
                 // The agent is fresh, so the lanes are equivalent here.
@@ -1388,10 +1385,6 @@ async fn handle_message(
         }
         ClientMessage::SetAgentStatus { agent_id, status } => {
             agents.set_agent_status(agent_id, status).await?;
-            Ok(Refresh::Ready)
-        }
-        ClientMessage::SetAgentMode { agent_id, mode } => {
-            agents.set_agent_mode(agent_id, mode).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::RenameAgent { agent_id, name } => {

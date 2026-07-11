@@ -111,8 +111,8 @@ pub fn workdir_field_candidates(
         .collect()
 }
 
-/// Completion inside the draft's mode field buffer.
-pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
+/// Completion inside the draft's role field buffer.
+pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
     let trimmed = text_before_cursor.trim_start();
     let token = last_token(text_before_cursor);
     let typing_new_token = text_before_cursor
@@ -121,42 +121,20 @@ pub fn mode_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
         .is_none_or(char::is_whitespace);
     let words = trimmed.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() || (words.len() == 1 && !typing_new_token) {
-        return ["normal", "coordinator"]
+        return ["eng", "eng-low", "eng-high", "eng-ultra", "pm"]
             .into_iter()
             .filter(|mode| fuzzy_contains(mode, token))
             .map(|mode| Candidate {
                 value: mode.to_owned(),
-                description: if mode == "coordinator" {
-                    "delegating coordinator".to_owned()
-                } else {
-                    "normal agent".to_owned()
+                description: match mode {
+                    "pm" => "project manager".to_owned(),
+                    _ => "engineer intelligence".to_owned(),
                 },
             })
             .collect();
     }
 
-    let efforts: &[(&str, &str)] = match words.first().copied() {
-        Some("normal") => &[
-            ("low", "low intelligence"),
-            ("medium", "medium intelligence"),
-            ("high", "high intelligence"),
-            ("ultra", "ultra intelligence"),
-        ],
-        Some("coordinator") => &[
-            ("low", "low intelligence"),
-            ("medium", "medium intelligence"),
-            ("high", "high intelligence"),
-        ],
-        _ => return Vec::new(),
-    };
-    efforts
-        .iter()
-        .filter(|(effort, _)| fuzzy_contains(effort, token))
-        .map(|(value, description)| Candidate {
-            value: (*value).to_owned(),
-            description: (*description).to_owned(),
-        })
-        .collect()
+    Vec::new()
 }
 
 pub struct WorkspaceCompletionProvider {
@@ -164,8 +142,9 @@ pub struct WorkspaceCompletionProvider {
     /// The draft view's workdir field buffer: completions in it come from
     /// the registered workdirs, not the prompt grammar.
     workdir_buffer: Option<gpui::EntityId>,
-    /// The draft view's mode field buffer: completions are mode/effort names.
-    mode_buffer: Option<gpui::EntityId>,
+    /// The draft view's role field buffer: completions are role/intelligence
+    /// names.
+    role_buffer: Option<gpui::EntityId>,
     /// The draft view's start field buffer: completions are `user` and the
     /// live agent labels.
     start_buffer: Option<gpui::EntityId>,
@@ -175,13 +154,13 @@ impl WorkspaceCompletionProvider {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         workdir_buffer: Option<gpui::EntityId>,
-        mode_buffer: Option<gpui::EntityId>,
+        role_buffer: Option<gpui::EntityId>,
         start_buffer: Option<gpui::EntityId>,
     ) -> Rc<Self> {
         Rc::new(Self {
             workspace,
             workdir_buffer,
-            mode_buffer,
+            role_buffer,
             start_buffer,
         })
     }
@@ -210,7 +189,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             .unwrap_or_default();
 
         let in_workdir_field = self.workdir_buffer == Some(buffer.entity_id());
-        let in_mode_field = self.mode_buffer == Some(buffer.entity_id());
+        let in_role_field = self.role_buffer == Some(buffer.entity_id());
         let in_start_field = self.start_buffer == Some(buffer.entity_id());
         let buffer = buffer.read(cx);
         let cursor_offset = buffer_position.to_offset(buffer);
@@ -220,8 +199,8 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             buffer.anchor_before(replace_start)..buffer.anchor_before(cursor_offset);
         let candidates = if in_workdir_field {
             workdir_field_candidates(&text_before_cursor, &workdirs)
-        } else if in_mode_field {
-            mode_field_candidates(&text_before_cursor)
+        } else if in_role_field {
+            role_field_candidates(&text_before_cursor)
         } else if in_start_field {
             start_field_candidates(&text_before_cursor, &live_agents)
         } else {
@@ -353,27 +332,9 @@ mod tests {
     }
 
     #[test]
-    fn mode_field_completes_modes_and_intelligence() {
-        let candidates = mode_field_candidates("norm");
+    fn role_field_completes_roles_and_intelligence() {
+        let candidates = role_field_candidates("eng-h");
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "normal");
-
-        let candidates = mode_field_candidates("normal ");
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|candidate| candidate.value)
-                .collect::<Vec<_>>(),
-            ["low", "medium", "high", "ultra"]
-        );
-
-        let candidates = mode_field_candidates("coordinator ");
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|candidate| candidate.value)
-                .collect::<Vec<_>>(),
-            ["low", "medium", "high"]
-        );
+        assert_eq!(candidates[0].value, "eng-high");
     }
 }

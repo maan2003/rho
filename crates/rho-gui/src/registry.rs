@@ -269,8 +269,8 @@ impl AgentRegistry {
         Some(format!("ws-{}", &workspace_id.encoded()[..prefix_len]))
     }
 
-    pub fn agent_mode(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentConfig> {
-        self.agent_summary(agent_id).map(|agent| agent.mode)
+    pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentRole> {
+        self.agent_summary(agent_id).map(|agent| agent.role)
     }
 
     /// The pin status of an agent, from topic summaries.
@@ -577,7 +577,7 @@ mod tests {
             display_name: None,
             created_at: rho_core::UnixMs(id),
             updated_at: rho_core::UnixMs(id),
-            mode: rho_ui_proto::AgentConfig::default(),
+            role: rho_ui_proto::AgentRole::default(),
             workspace: rho_ui_proto::WorkspaceInfo::UserCheckout {
                 repo: "/tmp".into(),
             },
@@ -602,7 +602,7 @@ mod tests {
             display_name: None,
             created_at: rho_core::UnixMs(id),
             updated_at: rho_core::UnixMs(id),
-            mode: rho_ui_proto::AgentConfig::default(),
+            role: rho_ui_proto::AgentRole::default(),
             workspace: rho_ui_proto::WorkspaceInfo::Workspace {
                 repo: "/tmp".into(),
                 id: workspace_id,

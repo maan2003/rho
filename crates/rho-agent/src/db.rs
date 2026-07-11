@@ -33,7 +33,7 @@ const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::n
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "d91e4a72";
+const CURRENT_AGENT_DB_FORMAT: &str = "e4c71b9a";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -58,6 +58,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
     AgentDbMigration {
         from: "a73c91e4",
         to: "d91e4a72",
+        migrate: migrate_agent_config,
+    },
+    AgentDbMigration {
+        from: "d91e4a72",
+        to: "e4c71b9a",
         migrate: migrate_agent_config,
     },
 ];
@@ -234,7 +239,7 @@ pub struct AgentRecord {
     pub updated_at: UnixMillis,
     pub current_lineage: AgentLineageId,
     pub parent_agent: Option<AgentId>,
-    pub config: AgentConfig,
+    pub role: AgentRole,
     pub(crate) binding: SessionBinding,
     pub runtime: AgentRuntime,
     /// When the user last sent this agent a message; rail recency seed.
@@ -247,8 +252,8 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
-    pub fn config(&self) -> AgentConfig {
-        self.config
+    pub fn config(&self) -> AgentRole {
+        self.role
     }
 }
 
@@ -286,6 +291,46 @@ impl senax_encoder::Decoder for AgentRecord {
             Xhigh,
         }
 
+        #[derive(Clone, Copy, Debug, Decode)]
+        enum CompatibleAgentRoleKind {
+            Normal,
+            Coordinator,
+            Engineer,
+            PM,
+            Oracle,
+        }
+
+        #[derive(Clone, Copy, Debug, Decode)]
+        #[expect(dead_code)]
+        struct CompatibleAgentConfig {
+            mode: Option<CompatibleAgentRoleKind>,
+            role: Option<CompatibleAgentRoleKind>,
+            intelligence: EngineerIntelligence,
+            latency: Latency,
+        }
+
+        impl CompatibleAgentConfig {
+            fn current(self) -> AgentRole {
+                match self
+                    .role
+                    .or(self.mode)
+                    .unwrap_or(CompatibleAgentRoleKind::Engineer)
+                {
+                    CompatibleAgentRoleKind::Normal | CompatibleAgentRoleKind::Engineer => {
+                        AgentRole::Engineer {
+                            intelligence: self.intelligence,
+                        }
+                    }
+                    CompatibleAgentRoleKind::Coordinator | CompatibleAgentRoleKind::PM => {
+                        AgentRole::PM
+                    }
+                    CompatibleAgentRoleKind::Oracle => AgentRole::Oracle {
+                        intelligence: OracleIntelligence::High,
+                    },
+                }
+            }
+        }
+
         #[derive(Decode)]
         struct EncodedAgentRecord {
             display_name: Option<String>,
@@ -296,7 +341,8 @@ impl senax_encoder::Decoder for AgentRecord {
             current_lineage: AgentLineageId,
             parent_agent: Option<AgentId>,
             mode: Option<LegacyAgentMode>,
-            config: Option<AgentConfig>,
+            config: Option<CompatibleAgentConfig>,
+            role: Option<AgentRole>,
             binding: Option<SessionBinding>,
             runtime: AgentRuntime,
             #[senax(default)]
@@ -352,7 +398,10 @@ impl senax_encoder::Decoder for AgentRecord {
             updated_at: encoded.updated_at,
             current_lineage: encoded.current_lineage,
             parent_agent: encoded.parent_agent,
-            config: encoded.config.unwrap_or_else(|| binding.agent_config()),
+            role: encoded
+                .role
+                .or_else(|| encoded.config.map(CompatibleAgentConfig::current))
+                .unwrap_or_else(|| binding.agent_role()),
             binding,
             runtime: encoded.runtime,
             last_user_message: encoded.last_user_message,
@@ -396,24 +445,24 @@ pub(crate) enum SessionBinding {
     CoordinatorTerra(InferenceProfile),
     /// Sol-backed coordinator used by the opinionated medium/high levels.
     CoordinatorSol(InferenceProfile),
-}
-
-/// Opinionated configuration for creating a new agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct AgentConfig {
-    pub mode: AgentMode,
-    pub intelligence: Intelligence,
-    pub latency: Latency,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentMode {
-    Normal,
-    Coordinator,
+    /// Ultra advisory agent. Kept distinct from an ultra engineer so its role
+    /// survives session pinning.
+    ClaudeOracle {
+        effort: ClaudeEffort,
+    },
+    /// Sol-backed advisory agent.
+    OracleSol(InferenceProfile),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum Intelligence {
+pub enum AgentRole {
+    Engineer { intelligence: EngineerIntelligence },
+    PM,
+    Oracle { intelligence: OracleIntelligence },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum EngineerIntelligence {
     Low,
     Medium,
     High,
@@ -421,62 +470,57 @@ pub enum Intelligence {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum Latency {
+pub enum OracleIntelligence {
+    Medium,
+    High,
+}
+
+// Temporary migration-only representation of the previous latency field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+enum Latency {
     Standard,
     Fast,
 }
 
-impl Default for AgentConfig {
+impl Default for AgentRole {
     fn default() -> Self {
-        Self {
-            mode: AgentMode::Normal,
-            intelligence: Intelligence::Medium,
-            latency: Latency::Standard,
+        Self::Engineer {
+            intelligence: EngineerIntelligence::Medium,
         }
     }
 }
 
-impl AgentConfig {
-    pub fn validate(self) -> anyhow::Result<()> {
-        self.session_profile().map(|_| ())
-    }
-
+impl AgentRole {
     pub(crate) fn session_profile(self) -> anyhow::Result<SessionBinding> {
-        if self.mode == AgentMode::Coordinator && self.intelligence == Intelligence::Ultra {
-            anyhow::bail!("coordinator mode does not support ultra intelligence");
-        }
-        if self.intelligence == Intelligence::Ultra && self.latency == Latency::Fast {
-            anyhow::bail!("ultra intelligence does not support fast latency");
-        }
-        let fast_mode = self.latency == Latency::Fast;
-        let deep = |effort| InferenceProfile {
+        let deep = |effort, code_mode| InferenceProfile {
             effort,
-            fast_mode,
-            code_mode: self.mode == AgentMode::Coordinator,
+            fast_mode: false,
+            code_mode,
         };
-        Ok(match (self.mode, self.intelligence) {
-            (AgentMode::Coordinator, Intelligence::Low) => {
-                SessionBinding::CoordinatorTerra(deep(ReasoningEffort::Low))
-            }
-            (AgentMode::Coordinator, Intelligence::Medium) => {
-                SessionBinding::CoordinatorSol(deep(ReasoningEffort::Medium))
-            }
-            (AgentMode::Coordinator, Intelligence::High) => {
-                SessionBinding::CoordinatorSol(deep(ReasoningEffort::Xhigh))
-            }
-            (AgentMode::Normal, Intelligence::Low) => {
-                SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low))
-            }
-            (AgentMode::Normal, Intelligence::Medium) => {
-                SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium))
-            }
-            (AgentMode::Normal, Intelligence::High) => {
-                SessionBinding::ResponsesSol(deep(ReasoningEffort::Xhigh))
-            }
-            (AgentMode::Normal, Intelligence::Ultra) => SessionBinding::ClaudeFable {
+        Ok(match self {
+            AgentRole::PM => SessionBinding::CoordinatorSol(deep(ReasoningEffort::Medium, true)),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Low,
+            } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low, false)),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Medium,
+            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium, false)),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High,
+            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Xhigh, false)),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Ultra,
+            } => SessionBinding::ClaudeFable {
                 effort: ClaudeEffort::High,
             },
-            (AgentMode::Coordinator, Intelligence::Ultra) => unreachable!(),
+            AgentRole::Oracle {
+                intelligence: OracleIntelligence::Medium,
+            } => SessionBinding::OracleSol(deep(ReasoningEffort::Xhigh, false)),
+            AgentRole::Oracle {
+                intelligence: OracleIntelligence::High,
+            } => SessionBinding::ClaudeOracle {
+                effort: ClaudeEffort::High,
+            },
         })
     }
 }
@@ -489,18 +533,27 @@ pub(crate) enum ClaudeEffort {
 }
 
 impl SessionBinding {
-    pub fn agent_config(self) -> AgentConfig {
-        let mode = if self.is_coordinator() {
-            AgentMode::Coordinator
-        } else {
-            AgentMode::Normal
-        };
-        let (intelligence, latency) = match self {
+    pub fn agent_role(self) -> AgentRole {
+        if self.is_coordinator() {
+            return AgentRole::PM;
+        } else if matches!(self, Self::ClaudeOracle { .. }) {
+            return AgentRole::Oracle {
+                intelligence: OracleIntelligence::High,
+            };
+        } else if matches!(self, Self::OracleSol(_)) {
+            return AgentRole::Oracle {
+                intelligence: OracleIntelligence::Medium,
+            };
+        }
+        let (intelligence, _latency) = match self {
             Self::ClaudeFable {
                 effort: ClaudeEffort::High,
-            } => (Intelligence::Ultra, Latency::Standard),
+            }
+            | Self::ClaudeOracle {
+                effort: ClaudeEffort::High,
+            } => (EngineerIntelligence::Ultra, Latency::Standard),
             Self::ResponsesSol(config) if config.effort == ReasoningEffort::Xhigh => (
-                Intelligence::High,
+                EngineerIntelligence::High,
                 if config.fast_mode {
                     Latency::Fast
                 } else {
@@ -508,7 +561,7 @@ impl SessionBinding {
                 },
             ),
             Self::ResponsesTerra(config) if config.effort == ReasoningEffort::Low => (
-                Intelligence::Low,
+                EngineerIntelligence::Low,
                 if config.fast_mode {
                     Latency::Fast
                 } else {
@@ -520,11 +573,12 @@ impl SessionBinding {
             | Self::ResponsesLuna(config)
             | Self::ResponsesTerra(config)
             | Self::CoordinatorTerra(config)
-            | Self::CoordinatorSol(config) => (
+            | Self::CoordinatorSol(config)
+            | Self::OracleSol(config) => (
                 match config.effort {
-                    ReasoningEffort::Low => Intelligence::Low,
-                    ReasoningEffort::Medium => Intelligence::Medium,
-                    ReasoningEffort::Xhigh => Intelligence::High,
+                    ReasoningEffort::Low => EngineerIntelligence::Low,
+                    ReasoningEffort::Medium => EngineerIntelligence::Medium,
+                    ReasoningEffort::Xhigh => EngineerIntelligence::High,
                 },
                 if config.fast_mode {
                     Latency::Fast
@@ -532,15 +586,11 @@ impl SessionBinding {
                     Latency::Standard
                 },
             ),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } => {
-                (Intelligence::Ultra, Latency::Standard)
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeOracle { .. } => {
+                (EngineerIntelligence::Ultra, Latency::Standard)
             }
         };
-        AgentConfig {
-            mode,
-            intelligence,
-            latency,
-        }
+        AgentRole::Engineer { intelligence }
     }
 
     pub fn deep_config(self) -> Option<InferenceProfile> {
@@ -550,58 +600,50 @@ impl SessionBinding {
             | Self::ResponsesLuna(config)
             | Self::ResponsesTerra(config)
             | Self::CoordinatorTerra(config)
-            | Self::CoordinatorSol(config) => Some(config),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } => None,
+            | Self::CoordinatorSol(config)
+            | Self::OracleSol(config) => Some(config),
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeOracle { .. } => None,
         }
     }
 
     pub fn deep_model(self) -> Option<InferenceModel> {
         match self {
             Self::ResponsesGpt55(_) => Some(InferenceModel::Gpt55),
-            Self::ResponsesSol(_) => Some(InferenceModel::Gpt56Sol),
+            Self::ResponsesSol(_) | Self::OracleSol(_) => Some(InferenceModel::Gpt56Sol),
             Self::ResponsesLuna(_) => Some(InferenceModel::Gpt56Luna),
             Self::ResponsesTerra(_) | Self::CoordinatorTerra(_) => Some(InferenceModel::Gpt56Terra),
             Self::CoordinatorSol(_) => Some(InferenceModel::Gpt56Sol),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } => None,
-        }
-    }
-
-    /// Rebuild this mode around an updated deep config, preserving the model.
-    pub fn with_deep_config(self, config: InferenceProfile) -> Self {
-        match self {
-            Self::ResponsesGpt55(_) => Self::ResponsesGpt55(config),
-            Self::ResponsesSol(_) => Self::ResponsesSol(config),
-            Self::ResponsesLuna(_) => Self::ResponsesLuna(config),
-            Self::ResponsesTerra(_) => Self::ResponsesTerra(config),
-            Self::CoordinatorTerra(_) => Self::CoordinatorTerra(config),
-            Self::CoordinatorSol(_) => Self::CoordinatorSol(config),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } => self,
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeOracle { .. } => None,
         }
     }
 
     pub fn claude_model(self) -> Option<rho_claude::Model> {
         match self {
-            Self::ClaudeFable { .. } => Some(rho_claude::Model::Fable),
+            Self::ClaudeFable { .. } | Self::ClaudeOracle { .. } => Some(rho_claude::Model::Fable),
             Self::ClaudeOpus { .. } => Some(rho_claude::Model::Opus),
             Self::ResponsesGpt55(_)
             | Self::ResponsesSol(_)
             | Self::ResponsesLuna(_)
             | Self::ResponsesTerra(_)
             | Self::CoordinatorTerra(_)
-            | Self::CoordinatorSol(_) => None,
+            | Self::CoordinatorSol(_)
+            | Self::OracleSol(_) => None,
         }
     }
 
     pub fn claude_effort(self) -> Option<rho_claude::Effort> {
         match self {
-            Self::ClaudeFable { effort } => Some(effort.to_claude_effort()),
+            Self::ClaudeFable { effort } | Self::ClaudeOracle { effort } => {
+                Some(effort.to_claude_effort())
+            }
             Self::ClaudeOpus { effort } => Some(effort.to_claude_effort()),
             Self::ResponsesGpt55(_)
             | Self::ResponsesSol(_)
             | Self::ResponsesLuna(_)
             | Self::ResponsesTerra(_)
             | Self::CoordinatorTerra(_)
-            | Self::CoordinatorSol(_) => None,
+            | Self::CoordinatorSol(_)
+            | Self::OracleSol(_) => None,
         }
     }
 
@@ -691,8 +733,6 @@ pub trait AgentWriteTxnExt {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) trait AgentProfileWriteTxnExt {
-    fn set_agent_mode(&mut self, now: UnixMillis, agent_id: AgentId, mode: SessionBinding);
-
     fn create_agent(
         &mut self,
         now: UnixMillis,
@@ -707,18 +747,6 @@ pub(crate) trait AgentProfileWriteTxnExt {
 }
 
 impl AgentProfileWriteTxnExt for WriteTxn {
-    fn set_agent_mode(&mut self, now: UnixMillis, agent_id: AgentId, mode: SessionBinding) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.binding = mode;
-        agent.updated_at = now;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-    }
-
     fn create_agent(
         &mut self,
         now: UnixMillis,
@@ -740,7 +768,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             updated_at: now,
             current_lineage: lineage_id,
             parent_agent,
-            config: mode.agent_config(),
+            role: mode.agent_role(),
             binding: mode,
             runtime,
             last_user_message: now,

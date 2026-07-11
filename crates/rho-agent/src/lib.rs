@@ -513,7 +513,7 @@ impl Agent {
             auth,
             config,
             model,
-            mode.is_coordinator(),
+            mode.agent_role(),
             prompt_cache_key,
             agent_id,
             next_event,
@@ -557,7 +557,7 @@ impl Agent {
             auth,
             config,
             model,
-            record.binding.is_coordinator(),
+            record.role,
             prompt_cache_key,
             agent_id,
             next_event,
@@ -577,7 +577,7 @@ impl Agent {
         auth: InferenceAuth,
         config: InferenceProfile,
         model: InferenceModel,
-        coordinator: bool,
+        role: db::AgentRole,
         prompt_cache_key: PromptCacheKey,
         agent_id: AgentId,
         next_event: AgentEventPos,
@@ -596,6 +596,7 @@ impl Agent {
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
+        let agent_tools_enabled = !matches!(role, db::AgentRole::Oracle { .. });
         let pool_events = pool;
         let (control, control_rx) = mpsc::unbounded_channel();
         let code_mode = start_code_mode(
@@ -609,7 +610,7 @@ impl Agent {
             blocks: restored.blocks,
             tool_specs: agent_tool_specs(
                 &shell_tools,
-                multi_agent.is_some(),
+                multi_agent.is_some() && agent_tools_enabled,
                 code_mode.is_some(),
                 tool_extension.as_ref(),
             ),
@@ -617,7 +618,7 @@ impl Agent {
                 workspace.as_ref(),
                 multi_agent.as_ref(),
                 code_mode.is_some(),
-                coordinator,
+                role,
             ),
             queued_inputs: restored.queued_inputs,
             kind: restored.kind,
@@ -638,6 +639,7 @@ impl Agent {
                 next_event,
             },
             multi_agent,
+            agent_tools_enabled,
             tool_extension,
             code_mode,
             pool_events,
@@ -874,6 +876,9 @@ struct AgentLoop {
     /// Present on pooled agents: identity + `Weak` pool handle for the
     /// built-in spawn/send/wait tools and parent result/error mail.
     multi_agent: Option<MultiAgentTools>,
+    /// False for Oracle: retain parent-mail/team identity without exposing or
+    /// dispatching agent-management tools.
+    agent_tools_enabled: bool,
     /// Integration-provided tools bound to this agent.
     tool_extension: Option<Arc<dyn AgentToolExtension>>,
     /// Present when `InferenceProfile::code_mode` is on: the V8 session behind
@@ -1318,7 +1323,8 @@ impl AgentLoop {
                                         // `wait` is resolved by the loop
                                         // itself, not run as a future: arm it
                                         // (or fail it in place) and move on.
-                                        if self.multi_agent.is_some()
+                                        if self.agent_tools_enabled
+                                            && self.multi_agent.is_some()
                                             && call.name.as_str()
                                                 == multi_agent_tools::WAIT_TOOL_NAME
                                         {
@@ -1334,7 +1340,8 @@ impl AgentLoop {
                                             continue;
                                         }
                                         let shell_tools = self.shell_tools.clone();
-                                        let agent_tools = multi_agent_tools::is_agent_tool(call.name.as_str())
+                                        let agent_tools = (self.agent_tools_enabled
+                                            && multi_agent_tools::is_agent_tool(call.name.as_str()))
                                             .then(|| self.multi_agent.clone())
                                             .flatten();
                                         let extension = self.tool_extension.as_ref().and_then(|extension| {
