@@ -188,6 +188,10 @@ pub enum ClientMessage {
     IrohApprove {
         code: String,
     },
+    /// Revoke persistent trust for an iroh client endpoint.
+    IrohRevoke {
+        endpoint_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -392,6 +396,9 @@ pub enum ServerMessage {
     /// Reply to [`ClientMessage::IrohApprove`]: the enrolled client's
     /// endpoint id.
     IrohApproved {
+        endpoint_id: String,
+    },
+    IrohRevoked {
         endpoint_id: String,
     },
 }

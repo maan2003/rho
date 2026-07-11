@@ -26,6 +26,7 @@ const LEGACY_SECRET_KEY: &str = "rho-webui-secret";
 const DAEMON_KEY: &str = "rho-webui-daemon";
 const PRF_LABEL: &[u8] = b"rho webui iroh prf v1";
 const HKDF_INFO: &[u8] = b"rho webui iroh ed25519 seed v1";
+const MAX_CREDENTIAL_ID_LEN: usize = 1024;
 
 thread_local! {
     /// Held until a daemon id is known (typed in or from the URL).
@@ -37,8 +38,10 @@ thread_local! {
 /// for [`set_daemon`].
 pub fn init(app: App, receiver: UnboundedReceiver<FromBrowser>) {
     PENDING_RECEIVER.with(|cell| *cell.borrow_mut() = Some(receiver));
-    if let Some(daemon) = daemon_id_from_page() {
-        start(app, daemon);
+    if !matches!(app.phase.get_untracked(), Phase::Failed(_))
+        && let Some(daemon) = daemon_id_from_page()
+    {
+        app.phase.set(Phase::Unlock(daemon));
     }
 }
 
@@ -70,6 +73,20 @@ pub fn set_daemon(app: App, daemon: String) {
         let _ = storage.set_item(DAEMON_KEY, &daemon);
     }
     start(app, daemon);
+}
+
+/// Connect to a remembered daemon after an explicit click unlocks WebAuthn.
+pub fn unlock(app: App, daemon: String) {
+    start(app, daemon);
+}
+
+/// Forget this origin's passkey metadata. The daemon's old endpoint trust must
+/// still be revoked separately if compromise, rather than loss, prompted this.
+pub fn reset_passkey() {
+    if let Some(storage) = local_storage() {
+        let _ = storage.remove_item(CREDENTIAL_KEY);
+        let _ = storage.remove_item(LEGACY_SECRET_KEY);
+    }
 }
 
 fn start(app: App, daemon: String) {
@@ -186,10 +203,16 @@ fn handle(app: App, message: ToBrowser) {
 /// memory for the lifetime of the iroh endpoint.
 async fn passkey_secret(daemon: EndpointId) -> anyhow::Result<iroh::SecretKey> {
     let storage = local_storage().ok_or_else(|| anyhow::anyhow!("local storage unavailable"))?;
-    let credential_id = match storage.get_item(CREDENTIAL_KEY) {
-        Ok(Some(hex)) => decode_hex_vec(&hex)
-            .ok_or_else(|| anyhow::anyhow!("stored passkey credential id is invalid"))?,
-        _ => {
+    let credential_id = match storage
+        .get_item(CREDENTIAL_KEY)
+        .ok()
+        .flatten()
+        .and_then(|hex| decode_hex_vec(&hex))
+        .filter(|id| id.len() <= MAX_CREDENTIAL_ID_LEN)
+    {
+        Some(id) => id,
+        None => {
+            let _ = storage.remove_item(CREDENTIAL_KEY);
             let id = create_passkey().await?;
             storage
                 .set_item(CREDENTIAL_KEY, &encode_hex(&id))

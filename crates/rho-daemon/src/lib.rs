@@ -1596,6 +1596,23 @@ async fn handle_message(
             });
             Ok(Refresh::None)
         }
+        ClientMessage::IrohRevoke { endpoint_id } => {
+            let auth = agents
+                .iroh_auth
+                .as_ref()
+                .context("daemon is not listening over iroh (start it with --iroh)")?;
+            let endpoint_id = endpoint_id
+                .parse::<iroh::EndpointId>()
+                .context("invalid iroh client endpoint id")?;
+            anyhow::ensure!(
+                auth.revoke(endpoint_id).await,
+                "iroh client is not enrolled"
+            );
+            let _ = outgoing_tx.send(ServerMessage::IrohRevoked {
+                endpoint_id: endpoint_id.to_string(),
+            });
+            Ok(Refresh::None)
+        }
         ClientMessage::VoiceStart
         | ClientMessage::VoiceStop
         | ClientMessage::VoiceAudio { .. }

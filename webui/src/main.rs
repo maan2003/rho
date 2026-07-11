@@ -15,6 +15,8 @@ use rho_webui_messages::{AgentState, FromBrowser, Topic, Workdir};
 pub enum Phase {
     /// No daemon endpoint id known yet; ask for one.
     NeedDaemon,
+    /// A daemon id is known, but WebAuthn waits for an explicit user gesture.
+    Unlock(String),
     Connecting,
     /// Connected but not yet enrolled; show `rho iroh approve <code>`.
     Enroll(String),
@@ -80,7 +82,22 @@ fn main() {
     console_error_panic_hook::set_once();
     let (sender, receiver) = futures::channel::mpsc::unbounded();
     let app = App::new(sender);
+    if is_framed() {
+        app.phase.set(Phase::Failed(
+            "Rho cannot run inside another page. Open it in a top-level tab.".to_owned(),
+        ));
+    }
     // Mount first: it initializes the wasm executor `conn` spawns onto.
     leptos::mount::mount_to_body(move || ui::Root(app));
     conn::init(app, receiver);
+}
+
+fn is_framed() -> bool {
+    let Some(window) = web_sys::window() else {
+        return true;
+    };
+    match window.top() {
+        Ok(Some(top)) => !js_sys::Object::is(top.as_ref(), window.as_ref()),
+        _ => true,
+    }
 }

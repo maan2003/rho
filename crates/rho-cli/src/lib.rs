@@ -98,19 +98,26 @@ async fn run(command: Command) -> Result<()> {
 /// Approves a pending iroh enrollment over the daemon's Unix socket, so
 /// trust decisions always come from a local user on the daemon host.
 async fn run_iroh(args: IrohArgs) -> Result<()> {
-    let IrohCommand::Approve { code } = args.command;
+    let request = match args.command {
+        IrohCommand::Approve { code } => rho_ui_proto::ClientMessage::IrohApprove { code },
+        IrohCommand::Revoke { endpoint_id } => {
+            rho_ui_proto::ClientMessage::IrohRevoke { endpoint_id }
+        }
+    };
     let socket_path = match args.socket_path {
         Some(path) => path,
         None => default_socket_path()?,
     };
     let mut client = UiClient::connect(&socket_path).await?;
-    client
-        .send(&rho_ui_proto::ClientMessage::IrohApprove { code })
-        .await?;
+    client.send(&request).await?;
     loop {
         match client.recv().await? {
             rho_ui_proto::ServerMessage::IrohApproved { endpoint_id } => {
                 println!("enrolled iroh client {endpoint_id}");
+                return Ok(());
+            }
+            rho_ui_proto::ServerMessage::IrohRevoked { endpoint_id } => {
+                println!("revoked iroh client {endpoint_id}");
                 return Ok(());
             }
             rho_ui_proto::ServerMessage::Error { message } => anyhow::bail!("{message}"),
@@ -1209,6 +1216,8 @@ pub(crate) struct IrohArgs {
 pub(crate) enum IrohCommand {
     /// Approve a pending iroh client enrollment by its displayed code.
     Approve { code: String },
+    /// Revoke a previously enrolled iroh client endpoint.
+    Revoke { endpoint_id: String },
 }
 
 #[derive(Clone, clap::Args)]

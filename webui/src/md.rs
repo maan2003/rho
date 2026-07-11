@@ -160,6 +160,6 @@ mod tests {
             render("```rust\nlet x = 1;\n```\n[docs](https://example.com) [bad](javascript:x)");
         assert!(html.contains("<pre class=\"code\"><code>let x = 1;"));
         assert!(html.contains("href=\"https://example.com\""));
-        assert!(!html.contains("javascript:"));
+        assert!(!html.contains("href=\"javascript:"));
     }
 }

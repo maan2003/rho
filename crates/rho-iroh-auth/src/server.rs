@@ -149,6 +149,17 @@ impl TrustedClients {
         write.commit();
     }
 
+    async fn revoke(&self, client_endpoint_id: EndpointId) -> bool {
+        self.ensure_tables().await;
+        let mut write = self.db.write().await;
+        let removed = write
+            .open_table(TRUSTED_CLIENTS)
+            .remove(TrustedClientId(client_endpoint_id))
+            .is_some();
+        write.commit();
+        removed
+    }
+
     async fn ensure_tables(&self) {
         self.initialized
             .get_or_init(|| async {
@@ -304,6 +315,12 @@ impl IrohAuth {
         self.inner.trusted.trust(client_endpoint_id).await;
         Ok(client_endpoint_id)
     }
+
+    /// Remove persistent trust for a client endpoint. Existing connections
+    /// close normally; subsequent connections require enrollment again.
+    pub async fn revoke(&self, client_endpoint_id: EndpointId) -> bool {
+        self.inner.trusted.revoke(client_endpoint_id).await
+    }
 }
 
 impl EndpointHooks for IrohAuth {
@@ -386,6 +403,15 @@ mod tests {
                 .await
                 .unwrap(),
             AuthDecision::Trusted
+        ));
+
+        assert!(auth.revoke(client).await);
+        assert!(!auth.revoke(client).await);
+        assert!(matches!(
+            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JK25").unwrap())
+                .await
+                .unwrap(),
+            AuthDecision::Pending(_)
         ));
     }
 

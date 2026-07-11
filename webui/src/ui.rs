@@ -15,12 +15,39 @@ pub fn Root(app: App) -> impl IntoView {
         <div class="shell" class=("chat-open", move || app.chat_open.get())>
             {move || match app.phase.get() {
                 Phase::NeedDaemon => ConnectScreen(app).into_any(),
+                Phase::Unlock(daemon) => UnlockScreen(app, daemon).into_any(),
                 Phase::Connecting => StatusScreen("Connecting to your daemon…", None).into_any(),
                 Phase::Enroll(code) => EnrollScreen(code).into_any(),
                 Phase::Failed(message) => StatusScreen("Connection failed", Some(message)).into_any(),
                 Phase::Online => Main(app).into_any(),
             }}
             {move || app.toast.get().map(|message| view! { <div class="toast">{message}</div> })}
+        </div>
+    }
+}
+
+fn UnlockScreen(app: App, daemon: String) -> impl IntoView {
+    let connect_daemon = daemon.clone();
+    let reset_daemon = daemon.clone();
+    let short = if daemon.len() > 20 {
+        format!("{}…", &daemon[..20])
+    } else {
+        daemon
+    };
+    view! {
+        <div class="screen">
+            <div class="card">
+                <div class="logo">"ρ"</div>
+                <h1>"Unlock Rho"</h1>
+                <p class="muted">"Use your passkey to connect to daemon " <code>{short}</code> "."</p>
+                <button class="primary" on:click=move |_| conn::unlock(app, connect_daemon.clone())>
+                    "Unlock and connect"
+                </button>
+                <button on:click=move |_| {
+                    conn::reset_passkey();
+                    conn::unlock(app, reset_daemon.clone());
+                }>"Use a new passkey"</button>
+            </div>
         </div>
     }
 }

@@ -29,3 +29,32 @@ shell's `gcc`) leaks in.
    local storage afterwards).
 3. First visit shows an enrollment code; run `rho iroh approve <code>` on
    the daemon machine within a minute.
+
+The browser and authenticator must support the WebAuthn PRF extension. Rho
+requires user verification on every connection and derives a stable,
+daemon-specific iroh identity without storing its secret key.
+
+## Hosting security
+
+Host the page on a dedicated origin with no unrelated applications or
+third-party scripts. The generated page includes a restrictive CSP, but static
+hosts should also send it as an HTTP header and must send
+`Content-Security-Policy: frame-ancestors 'none'`; browsers do not enforce that
+directive from a meta tag. A reverse proxy in front of GitHub Pages can add the
+required header.
+
+All code served by the origin is trusted with the enrolled daemon identity once
+the user approves the passkey prompt. After an origin or publishing-pipeline
+compromise, revoke the enrolled iroh endpoint, clear the origin's browser site
+data (including service workers), verify the deployment, and enroll again.
+"Use a new passkey" clears local credential metadata and creates a new browser
+identity, but does not revoke the previous endpoint on the daemon.
+
+Revoke an old identity locally with:
+
+```sh
+rho iroh revoke <endpoint-id>
+```
+
+Revocation prevents reconnection. Restart the daemon as part of compromise
+recovery to terminate any connection that was already established.

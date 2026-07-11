@@ -88,9 +88,18 @@ AI APIs.
   code running after the user approves the WebAuthn prompt can read the
   derived enrolled key and thereby gain persistent daemon access. Deploy the
   page on a dedicated origin without third-party scripts and treat its build
-  and publishing pipeline as security-critical. Besides user-authored text,
-  the page sends bounded agent creation choices (topic, registered workdir,
-  role, base revset, and workspace mode).
+  and publishing pipeline as security-critical. The page refuses to run when
+  framed and ships a restrictive meta CSP; production hosting must additionally
+  send `Content-Security-Policy: frame-ancestors 'none'` as an HTTP header.
+  Besides user-authored text, the page sends bounded agent creation choices
+  (topic, registered workdir, role, base revset, and workspace mode).
+  A compromised origin can register a persistent service worker as well as
+  steal an unlocked key, so recovery requires revoking the endpoint, clearing
+  the origin's browser site data, verifying the deployment, and enrolling a
+  new identity.
+  `rho iroh revoke <endpoint-id>` removes persistent trust through the local
+  daemon socket; already-established connections are not forcibly closed and
+  must be disconnected (or the daemon restarted) during compromise recovery.
 - Inbound data on both ALPNs is remote, semi-trusted input: oversized UI
   protocol frames are rejected (`MAX_FRAME_LEN`), web UI JSON lines are
   length-bounded (`MAX_LINE_LEN`), malformed frames end the connection, and
