@@ -49,28 +49,7 @@ pub struct MigrationRecoveryPoint {
     pub created_at: UnixMillis,
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: "4b8a02c1",
-        to: "a73c91e4",
-        migrate: |_| {},
-    },
-    AgentDbMigration {
-        from: "a73c91e4",
-        to: "d91e4a72",
-        migrate: migrate_agent_config,
-    },
-    AgentDbMigration {
-        from: "d91e4a72",
-        to: "e4c71b9a",
-        migrate: migrate_agent_config,
-    },
-    AgentDbMigration {
-        from: "e4c71b9a",
-        to: "a1f83c6d",
-        migrate: migrate_gpt56_code_mode,
-    },
-];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -231,7 +210,7 @@ pub async fn prepare_agent_db_migration(db: &rho_db::RhoDb) {
     .await;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
     /// Where this agent works. Fixed at creation: the accumulated model
@@ -260,168 +239,6 @@ impl AgentRecord {
     pub fn config(&self) -> AgentRole {
         self.role
     }
-}
-
-impl senax_encoder::Decoder for AgentRecord {
-    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
-        #[derive(Clone, Copy, Debug, Decode)]
-        enum LegacyAgentMode {
-            Deep(LegacyDeepConfig),
-            Fable { effort: LegacyClaudeEffort },
-            Opus { effort: LegacyClaudeEffort },
-            Sol(LegacyDeepConfig),
-            Luna(LegacyDeepConfig),
-            Terra(LegacyDeepConfig),
-            Coordinator(LegacyDeepConfig),
-        }
-
-        #[derive(Clone, Copy, Debug, Decode)]
-        struct LegacyDeepConfig {
-            effort: LegacyDeepEffort,
-            fast_mode: bool,
-            #[senax(default)]
-            code_mode: bool,
-        }
-
-        #[derive(Clone, Copy, Debug, Decode)]
-        enum LegacyDeepEffort {
-            Low,
-            Medium,
-            Xhigh,
-        }
-
-        #[derive(Clone, Copy, Debug, Decode)]
-        enum LegacyClaudeEffort {
-            Medium,
-            Xhigh,
-        }
-
-        #[derive(Clone, Copy, Debug, Decode)]
-        enum CompatibleAgentRoleKind {
-            Normal,
-            Coordinator,
-            Engineer,
-            PM,
-            Oracle,
-        }
-
-        #[derive(Clone, Copy, Debug, Decode)]
-        #[expect(dead_code)]
-        struct CompatibleAgentConfig {
-            mode: Option<CompatibleAgentRoleKind>,
-            role: Option<CompatibleAgentRoleKind>,
-            intelligence: EngineerIntelligence,
-            latency: Latency,
-        }
-
-        impl CompatibleAgentConfig {
-            fn current(self) -> AgentRole {
-                match self
-                    .role
-                    .or(self.mode)
-                    .unwrap_or(CompatibleAgentRoleKind::Engineer)
-                {
-                    CompatibleAgentRoleKind::Normal | CompatibleAgentRoleKind::Engineer => {
-                        AgentRole::Engineer {
-                            intelligence: self.intelligence,
-                        }
-                    }
-                    CompatibleAgentRoleKind::Coordinator | CompatibleAgentRoleKind::PM => {
-                        AgentRole::PM
-                    }
-                    CompatibleAgentRoleKind::Oracle => AgentRole::Oracle {
-                        intelligence: OracleIntelligence::High,
-                    },
-                }
-            }
-        }
-
-        #[derive(Decode)]
-        struct EncodedAgentRecord {
-            display_name: Option<String>,
-            workspace: WorkspaceInfo,
-            status: Status,
-            created_at: UnixMillis,
-            updated_at: UnixMillis,
-            current_lineage: AgentLineageId,
-            parent_agent: Option<AgentId>,
-            mode: Option<LegacyAgentMode>,
-            config: Option<CompatibleAgentConfig>,
-            role: Option<AgentRole>,
-            binding: Option<SessionBinding>,
-            runtime: AgentRuntime,
-            #[senax(default)]
-            last_user_message: UnixMillis,
-            #[senax(default)]
-            disposition: AgentDisposition,
-        }
-
-        fn legacy_binding(mode: LegacyAgentMode) -> SessionBinding {
-            let profile = |config: LegacyDeepConfig| InferenceProfile {
-                effort: match config.effort {
-                    LegacyDeepEffort::Low => ReasoningEffort::Low,
-                    LegacyDeepEffort::Medium => ReasoningEffort::Medium,
-                    LegacyDeepEffort::Xhigh => ReasoningEffort::Xhigh,
-                },
-                fast_mode: config.fast_mode,
-                code_mode: config.code_mode,
-            };
-            match mode {
-                LegacyAgentMode::Deep(config) => SessionBinding::ResponsesGpt55(profile(config)),
-                LegacyAgentMode::Fable { effort } => SessionBinding::ClaudeFable {
-                    effort: match effort {
-                        LegacyClaudeEffort::Medium => ClaudeEffort::Medium,
-                        LegacyClaudeEffort::Xhigh => ClaudeEffort::Xhigh,
-                    },
-                },
-                LegacyAgentMode::Opus { effort } => SessionBinding::ClaudeOpus {
-                    effort: match effort {
-                        LegacyClaudeEffort::Medium => ClaudeEffort::Medium,
-                        LegacyClaudeEffort::Xhigh => ClaudeEffort::Xhigh,
-                    },
-                },
-                LegacyAgentMode::Sol(config) => SessionBinding::ResponsesSol(profile(config)),
-                LegacyAgentMode::Luna(config) => SessionBinding::ResponsesLuna(profile(config)),
-                LegacyAgentMode::Terra(config) => SessionBinding::ResponsesTerra(profile(config)),
-                LegacyAgentMode::Coordinator(config) => {
-                    SessionBinding::CoordinatorTerra(profile(config))
-                }
-            }
-        }
-
-        let encoded = EncodedAgentRecord::decode(reader)?;
-        let binding = match (encoded.binding, encoded.mode) {
-            (Some(binding), _) => binding,
-            (None, Some(mode)) => legacy_binding(mode),
-            (None, None) => return Err(missing_agent_field("binding")),
-        };
-        Ok(Self {
-            display_name: encoded.display_name,
-            workspace: encoded.workspace,
-            status: encoded.status,
-            created_at: encoded.created_at,
-            updated_at: encoded.updated_at,
-            current_lineage: encoded.current_lineage,
-            parent_agent: encoded.parent_agent,
-            role: encoded
-                .role
-                .or_else(|| encoded.config.map(CompatibleAgentConfig::current))
-                .unwrap_or_else(|| binding.agent_role()),
-            binding,
-            runtime: encoded.runtime,
-            last_user_message: encoded.last_user_message,
-            disposition: encoded.disposition,
-        })
-    }
-}
-
-fn missing_agent_field(field: &'static str) -> senax_encoder::EncoderError {
-    senax_encoder::EncoderError::StructDecode(
-        senax_encoder::StructDecodeError::MissingRequiredField {
-            field,
-            struct_name: "AgentRecord",
-        },
-    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -1133,47 +950,6 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
-}
-
-fn migrate_agent_config(write: &mut WriteTxn) {
-    let records = {
-        let agents = write.open_table(AGENTS);
-        agents
-            .iter()
-            .map(|(id, record)| (id.value(), record.value().into_owned()))
-            .collect::<Vec<_>>()
-    };
-    let mut agents = write.open_table(AGENTS);
-    for (agent_id, record) in records {
-        agents.insert(&agent_id, SenValue::borrowed(&record));
-    }
-}
-
-fn migrate_gpt56_code_mode(write: &mut WriteTxn) {
-    let records = {
-        let agents = write.open_table(AGENTS);
-        agents
-            .iter()
-            .map(|(id, record)| (id.value(), record.value().into_owned()))
-            .collect::<Vec<_>>()
-    };
-    let mut agents = write.open_table(AGENTS);
-    for (agent_id, mut record) in records {
-        let profile = match &mut record.binding {
-            SessionBinding::ResponsesSol(profile)
-            | SessionBinding::ResponsesLuna(profile)
-            | SessionBinding::ResponsesTerra(profile)
-            | SessionBinding::CoordinatorTerra(profile)
-            | SessionBinding::CoordinatorSol(profile)
-            | SessionBinding::OracleSol(profile) => profile,
-            SessionBinding::ResponsesGpt55(_)
-            | SessionBinding::ClaudeFable { .. }
-            | SessionBinding::ClaudeOpus { .. }
-            | SessionBinding::ClaudeOracle { .. } => continue,
-        };
-        profile.code_mode = true;
-        agents.insert(&agent_id, SenValue::borrowed(&record));
-    }
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
