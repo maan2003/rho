@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use rho_core::{ToolCall, ToolCallId, ToolOutput, ToolOutputStatus};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 
 use crate::cell::{CellShared, CellStatus};
@@ -24,13 +25,20 @@ use crate::truncate::truncate_middle;
 /// must honor cancellation by simply completing; the cell-side future is
 /// dropped when a cell is terminated.
 pub trait ToolDispatcher: Send + Sync + 'static {
-    fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput>;
+    fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, NestedToolOutput>;
 
     /// A `notify(...)` progress note from a running script, attributed to the
     /// `exec` call that started the cell. Fire-and-forget.
     fn notify(&self, exec_call_id: ToolCallId, text: String) {
         let _ = (exec_call_id, text);
     }
+}
+
+/// A nested tool's JavaScript value. Model-facing tool calls may render the
+/// same result as text, but scripts receive this structured value directly.
+pub struct NestedToolOutput {
+    pub value: JsonValue,
+    pub status: ToolOutputStatus,
 }
 
 /// Arguments of the `wait` tool.

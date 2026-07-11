@@ -67,7 +67,7 @@ globalThis.__rhoInit = (toolList) => {
         }
         args = input;
       }
-      return ops.op_call_tool(current, tool.name, args);
+      return ops.op_call_tool(current, tool.name, args).then((value) => JSON.parse(value));
     };
   }
 

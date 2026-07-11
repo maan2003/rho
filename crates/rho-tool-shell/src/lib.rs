@@ -12,6 +12,7 @@ mod truncate;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -23,23 +24,119 @@ use rho_core::{
 use rho_workspaces::{PathOverrides, View};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time;
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
-pub const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
+pub const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
+pub const WRITE_STDIN_TOOL_NAME: &str = "write_stdin";
 pub const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 const MAX_OUTPUT_TOKENS: usize = 10_000;
 const MAX_OUTPUT_BYTES: usize = MAX_OUTPUT_TOKENS * APPROX_BYTES_PER_TOKEN as usize;
 const APPROX_BYTES_PER_TOKEN: u64 = 4;
+static NEXT_CHUNK_ID: AtomicI32 = AtomicI32::new(1);
 
 #[derive(Clone, Debug)]
 pub struct ShellTools {
-    default_timeout: Duration,
     exec: ExecContext,
     env: Vec<(String, String)>,
+    processes: Arc<ProcessManager>,
+}
+
+async fn collect_process_output(
+    session: &mut ProcessSession,
+    yield_time: Duration,
+) -> Result<(Option<std::process::ExitStatus>, Vec<u8>)> {
+    let deadline = time::Instant::now() + yield_time.min(Duration::from_secs(300));
+    let mut output = BoundedOutput::new(MAX_OUTPUT_BYTES);
+    let status = loop {
+        if let Some(status) = session.child.try_wait()? {
+            break Some(status);
+        }
+        tokio::select! {
+            chunk = session.output_rx.recv() => {
+                if let Some(chunk) = chunk { output.push(&chunk); }
+            }
+            _ = time::sleep_until(deadline) => break None,
+            _ = time::sleep(Duration::from_millis(10)) => {}
+        }
+    };
+    if status.is_some() {
+        while let Some(chunk) = session.output_rx.recv().await {
+            output.push(&chunk);
+        }
+    }
+    Ok((status, output.finish().bytes))
+}
+
+struct ExecOutput {
+    chunk_id: String,
+    wall_time_seconds: f64,
+    exit_code: Option<i32>,
+    session_id: Option<i32>,
+    output: String,
+}
+
+impl ExecOutput {
+    fn render(&self) -> String {
+        let mut sections = vec![
+            format!("Chunk ID: {}", self.chunk_id),
+            format!("Wall time: {:.4} seconds", self.wall_time_seconds),
+        ];
+        if let Some(exit_code) = self.exit_code {
+            sections.push(format!("Process exited with code {exit_code}"));
+        }
+        if let Some(session_id) = self.session_id {
+            sections.push(format!("Process running with session ID {session_id}"));
+        }
+        sections.push("Output:".to_owned());
+        sections.push(self.output.clone());
+        sections.join("\n")
+    }
+
+    fn json(self) -> Value {
+        let mut value = serde_json::Map::from_iter([
+            ("chunk_id".to_owned(), Value::String(self.chunk_id)),
+            (
+                "wall_time_seconds".to_owned(),
+                json!(self.wall_time_seconds),
+            ),
+            ("output".to_owned(), Value::String(self.output)),
+        ]);
+        if let Some(exit_code) = self.exit_code {
+            value.insert("exit_code".to_owned(), json!(exit_code));
+        }
+        if let Some(session_id) = self.session_id {
+            value.insert("session_id".to_owned(), json!(session_id));
+        }
+        Value::Object(value)
+    }
+}
+
+fn exec_output(
+    wall_time: Duration,
+    exit_code: Option<i32>,
+    process_id: Option<i32>,
+    bytes: Vec<u8>,
+    max_output_tokens: Option<usize>,
+) -> ExecOutput {
+    let max_bytes = max_output_tokens
+        .unwrap_or(MAX_OUTPUT_TOKENS)
+        .min(MAX_OUTPUT_TOKENS)
+        .saturating_mul(APPROX_BYTES_PER_TOKEN as usize);
+    let mut output = BoundedOutput::new(max_bytes);
+    output.push(&bytes);
+    let output = output.finish();
+    let (content, _) = decode_output(output.bytes);
+    ExecOutput {
+        chunk_id: format!("{:x}", NEXT_CHUNK_ID.fetch_add(1, Ordering::Relaxed)),
+        wall_time_seconds: wall_time.as_secs_f64(),
+        exit_code,
+        session_id: process_id,
+        output: content,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -59,37 +156,78 @@ pub struct ShellToolOutput {
 
 #[derive(Debug, Deserialize)]
 struct ShellArgs {
-    #[serde(alias = "cmd")]
-    command: String,
-    cwd: Option<String>,
-    timeout: Option<u64>,
+    #[serde(alias = "command")]
+    cmd: String,
+    #[serde(alias = "cwd")]
+    workdir: Option<String>,
+    #[serde(default = "default_yield_time_ms")]
+    yield_time_ms: u64,
+    max_output_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WriteStdinArgs {
+    session_id: i32,
+    #[serde(default)]
+    chars: String,
+    #[serde(default = "default_poll_time_ms")]
+    yield_time_ms: u64,
+    max_output_tokens: Option<usize>,
+}
+
+fn default_yield_time_ms() -> u64 {
+    10_000
+}
+fn default_poll_time_ms() -> u64 {
+    10_000
+}
+
+#[derive(Debug)]
+struct ProcessManager {
+    next_id: AtomicI32,
+    sessions: Mutex<std::collections::HashMap<i32, ProcessSession>>,
+}
+
+#[derive(Debug)]
+struct ProcessSession {
+    child: tokio::process::Child,
+    output_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+impl Default for ProcessManager {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicI32::new(1),
+            sessions: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
 }
 
 impl ShellTools {
     /// Tools for an agent's workspace view. Namespace setup and cache warming
     /// run lazily on the first shell command, hiding their latency behind the
     /// model's first response.
-    pub fn new(timeout: Duration, view: Arc<View>) -> Self {
+    pub fn new(_timeout: Duration, view: Arc<View>) -> Self {
         Self {
-            default_timeout: timeout,
             exec: ExecContext::View(view),
             env: Vec::new(),
+            processes: Arc::new(ProcessManager::default()),
         }
     }
 
     /// Tools running directly in a directory, without a workspace.
     pub fn in_directory(
-        timeout: Duration,
+        _timeout: Duration,
         working_directory: Utf8PathBuf,
         path_overrides: PathOverrides,
     ) -> Self {
         Self {
-            default_timeout: timeout,
             exec: ExecContext::Directory {
                 working_directory,
                 path_overrides,
             },
             env: Vec::new(),
+            processes: Arc::new(ProcessManager::default()),
         }
     }
 
@@ -124,32 +262,61 @@ impl ShellTools {
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        vec![self.shell_command_spec(), self.apply_patch_spec()]
+        vec![
+            self.exec_command_spec(),
+            self.write_stdin_spec(),
+            self.apply_patch_spec(),
+        ]
     }
 
-    pub fn shell_command_spec(&self) -> ToolSpec {
+    pub fn exec_command_spec(&self) -> ToolSpec {
         ToolSpec {
-            name: ToolName::try_from(SHELL_COMMAND_TOOL_NAME).expect("valid tool name"),
+            name: ToolName::try_from(EXEC_COMMAND_TOOL_NAME).expect("valid tool name"),
             tool_type: ToolType::Function,
-            description: "Run a shell command and return structured process output.".to_owned(),
+            description:
+                "Runs a command, returning output or a session ID for ongoing interaction."
+                    .to_owned(),
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["command"],
+                "required": ["cmd"],
                 "properties": {
-                    "command": {
+                    "cmd": {
                         "type": "string",
                         "description": "Command to run with bash -c"
                     },
-                    "cwd": {
+                    "workdir": {
                         "type": "string",
                         "description": "Optional working directory; defaults to the agent's working directory"
                     },
-                    "timeout": {
+                    "yield_time_ms": {
                         "type": "integer",
-                        "minimum": 1,
-                        "description": "Optional command timeout in seconds"
+                        "description": "Wait before yielding output. Defaults to 10000 ms."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Output token budget. Defaults to 10000 tokens."
                     }
+                }
+            }),
+            format: None,
+        }
+    }
+
+    pub fn write_stdin_spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: ToolName::try_from(WRITE_STDIN_TOOL_NAME).expect("valid tool name"),
+            tool_type: ToolType::Function,
+            description:
+                "Writes characters to an existing unified exec session and returns recent output."
+                    .to_owned(),
+            input_schema: json!({
+                "type": "object", "additionalProperties": false, "required": ["session_id"],
+                "properties": {
+                    "session_id": {"type": "integer", "description": "Identifier of the running unified exec session."},
+                    "chars": {"type": "string", "description": "Bytes to write to stdin. Defaults to empty, which polls without writing."},
+                    "yield_time_ms": {"type": "integer", "description": "Wait before yielding output."},
+                    "max_output_tokens": {"type": "integer", "description": "Output token budget. Defaults to 10000 tokens."}
                 }
             }),
             format: None,
@@ -170,7 +337,10 @@ impl ShellTools {
     }
 
     pub fn supports(&self, name: &str) -> bool {
-        matches!(name, SHELL_COMMAND_TOOL_NAME | APPLY_PATCH_TOOL_NAME)
+        matches!(
+            name,
+            EXEC_COMMAND_TOOL_NAME | WRITE_STDIN_TOOL_NAME | APPLY_PATCH_TOOL_NAME
+        )
     }
 
     pub fn preview_metadata(&self, call: &ToolCall) -> Option<ToolResultMetadata> {
@@ -186,6 +356,33 @@ impl ShellTools {
 
     pub async fn call(&self, call: ToolCall) -> ToolOutput {
         self.call_with_metadata(call).await.body
+    }
+
+    /// Structured result used by JavaScript code mode. Direct tool calls use
+    /// the Codex-style rendered text from `call_with_metadata` instead.
+    pub async fn call_code_mode(&self, call: ToolCall) -> Result<Value> {
+        match call.name.as_str() {
+            EXEC_COMMAND_TOOL_NAME => Ok(self.exec_command(&call).await?.json()),
+            WRITE_STDIN_TOOL_NAME => Ok(self.write_stdin(&call).await?.json()),
+            APPLY_PATCH_TOOL_NAME => Ok(Value::String(self.call_apply_patch(&call)?.0)),
+            _ => Err(anyhow!("unsupported tool call: {}", call.name.as_str())),
+        }
+    }
+
+    pub fn code_mode_output_schema(name: &str) -> Option<Value> {
+        matches!(name, EXEC_COMMAND_TOOL_NAME | WRITE_STDIN_TOOL_NAME).then(|| {
+            json!({
+                "type": "object",
+                "required": ["chunk_id", "wall_time_seconds", "output"],
+                "properties": {
+                "chunk_id": {"type": "string", "description": "Identifier for this output chunk."},
+                "wall_time_seconds": {"type": "number", "description": "Time spent waiting during this call."},
+                "exit_code": {"type": "integer", "description": "Exit code when the process completed; otherwise absent."},
+                "session_id": {"type": "integer", "description": "Session to pass to write_stdin while the process remains live; otherwise absent."},
+                "output": {"type": "string", "description": "Output produced during this call."}
+                }
+            })
+        })
     }
 
     pub async fn call_with_metadata(&self, call: ToolCall) -> ShellToolOutput {
@@ -209,26 +406,19 @@ impl ShellTools {
 
     async fn call_inner(&self, call: &ToolCall) -> Result<(String, Option<ToolResultMetadata>)> {
         match call.name.as_str() {
-            SHELL_COMMAND_TOOL_NAME => self.call_shell(call).await,
+            EXEC_COMMAND_TOOL_NAME => Ok((self.exec_command(call).await?.render(), None)),
+            WRITE_STDIN_TOOL_NAME => Ok((self.write_stdin(call).await?.render(), None)),
             APPLY_PATCH_TOOL_NAME => self.call_apply_patch(call),
             _ => Err(anyhow!("unsupported tool call: {}", call.name.as_str())),
         }
     }
 
-    async fn call_shell(&self, call: &ToolCall) -> Result<(String, Option<ToolResultMetadata>)> {
+    async fn exec_command(&self, call: &ToolCall) -> Result<ExecOutput> {
         if call.tool_type != ToolType::Function {
-            return Err(anyhow!("shell_command expects a function tool call"));
+            return Err(anyhow!("exec_command expects a function tool call"));
         }
 
         let args: ShellArgs = serde_json::from_str(&call.arguments)?;
-        let timeout = args
-            .timeout
-            .map(Duration::from_secs)
-            .unwrap_or(self.default_timeout);
-        if timeout.is_zero() {
-            return Err(anyhow!("timeout must be greater than zero"));
-        }
-
         let mut command = Command::new("direnv");
         command.args(["exec", "."]);
         command.env_remove("DIRENV_DIFF");
@@ -238,9 +428,9 @@ impl ShellTools {
         for (name, value) in &self.env {
             command.env(name, value);
         }
-        command.args(["bash", "-c"]).arg(&args.command);
+        command.args(["bash", "-c"]).arg(&args.cmd);
         command.kill_on_drop(true);
-        let cwd = args.cwd.as_deref().map(Utf8Path::new);
+        let cwd = args.workdir.as_deref().map(Utf8Path::new);
         match &self.exec {
             ExecContext::Directory {
                 working_directory,
@@ -264,7 +454,7 @@ impl ShellTools {
         }
 
         let started = Instant::now();
-        command.stdin(std::process::Stdio::null());
+        command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
@@ -276,58 +466,65 @@ impl ShellTools {
             .stderr
             .take()
             .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
         let stdout_task = tokio::spawn(read_output_chunks(stdout, output_tx.clone()));
         let stderr_task = tokio::spawn(read_output_chunks(stderr, output_tx));
 
-        let status = match time::timeout(timeout, child.wait()).await {
-            Ok(status) => status?,
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                return Ok((timeout_output_text(timeout), None));
-            }
-        };
-        stdout_task
-            .await
-            .map_err(|error| anyhow!("stdout task failed: {error}"))??;
-        stderr_task
-            .await
-            .map_err(|error| anyhow!("stderr task failed: {error}"))??;
-        let mut output = BoundedOutput::new(MAX_OUTPUT_BYTES);
-        while let Some(chunk) = output_rx.recv().await {
-            output.push(&chunk);
+        drop(stdout_task);
+        drop(stderr_task);
+        let mut session = ProcessSession { child, output_rx };
+        let (status, output) =
+            collect_process_output(&mut session, Duration::from_millis(args.yield_time_ms)).await?;
+        let process_id = status
+            .is_none()
+            .then(|| self.processes.next_id.fetch_add(1, Ordering::Relaxed));
+        if let Some(id) = process_id {
+            self.processes.sessions.lock().await.insert(id, session);
         }
+        Ok(exec_output(
+            started.elapsed(),
+            status.and_then(|s| s.code()),
+            process_id,
+            output,
+            args.max_output_tokens,
+        ))
+    }
 
-        let elapsed = started.elapsed();
-        let status_code = status.code();
-        #[cfg(unix)]
-        let signal = std::os::unix::process::ExitStatusExt::signal(&status);
-        #[cfg(not(unix))]
-        let signal = None;
-
-        let output = output.finish();
-        let (mut content, valid_utf8) = decode_output(output.bytes);
-        if let Some(stats) = output.truncated {
-            content = format!(
-                "Warning: truncated output (original token count: {})\nTotal output lines: {}\n\n{}",
-                approx_tokens_from_byte_count(stats.total_bytes),
-                stats.total_lines,
-                content,
-            );
+    async fn write_stdin(&self, call: &ToolCall) -> Result<ExecOutput> {
+        let args: WriteStdinArgs = serde_json::from_str(&call.arguments)?;
+        let started = Instant::now();
+        let mut session = self
+            .processes
+            .sessions
+            .lock()
+            .await
+            .remove(&args.session_id)
+            .ok_or_else(|| anyhow!("unknown session ID {}", args.session_id))?;
+        if !args.chars.is_empty() {
+            let stdin = session
+                .child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| anyhow!("session stdin is closed"))?;
+            stdin.write_all(args.chars.as_bytes()).await?;
+            stdin.flush().await?;
         }
-
-        Ok((
-            command_output_text(CommandOutputText {
-                status: status_code,
-                signal,
-                elapsed,
-                output: content,
-                valid_utf8,
-            }),
-            None,
+        let (status, output) =
+            collect_process_output(&mut session, Duration::from_millis(args.yield_time_ms)).await?;
+        let process_id = status.is_none().then_some(args.session_id);
+        if process_id.is_some() {
+            self.processes
+                .sessions
+                .lock()
+                .await
+                .insert(args.session_id, session);
+        }
+        Ok(exec_output(
+            started.elapsed(),
+            status.and_then(|s| s.code()),
+            process_id,
+            output,
+            args.max_output_tokens,
         ))
     }
 
@@ -368,11 +565,13 @@ struct BoundedOutput {
     last_byte: Option<u8>,
 }
 
+#[allow(dead_code)]
 struct FinishedOutput {
     bytes: Vec<u8>,
     truncated: Option<OutputStats>,
 }
 
+#[allow(dead_code)]
 struct OutputStats {
     total_bytes: u64,
     total_lines: u64,
@@ -461,39 +660,6 @@ where
             return Ok(());
         }
     }
-}
-
-struct CommandOutputText {
-    status: Option<i32>,
-    signal: Option<i32>,
-    elapsed: Duration,
-    output: String,
-    valid_utf8: bool,
-}
-
-fn timeout_output_text(timeout: Duration) -> String {
-    format!(
-        "Command timed out after {} seconds\nOutput:\n",
-        timeout.as_secs()
-    )
-}
-
-fn command_output_text(details: CommandOutputText) -> String {
-    let mut sections = Vec::new();
-    match (details.status, details.signal) {
-        (Some(status), _) => sections.push(format!("Exit code: {status}")),
-        (None, Some(signal)) => sections.push(format!("Signal: {signal}")),
-        (None, None) => sections.push("Exit status: unknown".to_owned()),
-    }
-    sections.push(format!(
-        "Wall time: {:.3} seconds",
-        details.elapsed.as_secs_f64()
-    ));
-    if !details.valid_utf8 {
-        sections.push("Output contained invalid UTF-8 and was decoded lossily".to_owned());
-    }
-    sections.push(format!("Output:\n{}", details.output));
-    sections.join("\n")
 }
 
 #[cfg(test)]

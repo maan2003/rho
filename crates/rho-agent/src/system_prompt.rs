@@ -25,16 +25,15 @@ pub fn prompt(
     let skills = render_skills_prompt(&skills).unwrap_or_default();
     let multi_agent = multi_agent.map_or_else(String::new, |tools| {
         let agent_id = tools.display_id(tools.self_id());
-        // In code mode the agent tools live under `tools.*` in exec scripts
-        // and `wait` means the exec-cell wait, so mail has no wait tool.
         let agent_tool_usage = if code_mode {
-            "You can use `spawn_engineer` to create an Engineer, `message_engineer` to steer or \
-             follow up, `interrupt_engineer` to stop a turn, and `ask_advisor` or \
-             `followup_advisor` for independent advice. There is no tool for waiting \
-             on agent results: finish your turn and their mail starts your next one."
+            "Collaboration tools live inside the `exec` `tools.*` namespace. Use \
+             `spawn_engineer`, `message_engineer`, `interrupt_engineer`, `ask_advisor`, and \
+             `followup_advisor` there. Call `await tools.wait_agent(...)` sparingly when blocked \
+             on agent mail; if the exec cell yields, use the model-facing `wait` with its cell \
+             id until it resumes."
         } else {
             "You can use `spawn_engineer`, `message_engineer`, `interrupt_engineer`, \
-             `ask_advisor`, and `followup_advisor`, plus `wait` when you are blocked \
+             `ask_advisor`, and `followup_advisor`, plus `wait_agent` when you are blocked \
              on agent results and have nothing else useful to do."
         };
         let identity = match tools.parent() {

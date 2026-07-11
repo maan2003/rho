@@ -1459,7 +1459,7 @@ impl AgentLoop {
                 _ = tokio::time::sleep_until(wait_deadline), if armed_wait.is_some() => {
                     self.resolve_wait(
                         &mut state,
-                        "Wait timed out with no new messages.".to_owned(),
+                        "Wait timed out.".to_owned(),
                     )
                     .await;
                 }
@@ -1610,14 +1610,7 @@ impl AgentLoop {
         if pending == 0 {
             return;
         }
-        self.resolve_wait(
-            state,
-            format!(
-                "Wait completed: {pending} queued message(s) will enter context after this \
-                 tool batch."
-            ),
-        )
-        .await;
+        self.resolve_wait(state, "Wait completed.".to_owned()).await;
     }
 
     /// Code-mode `wait` is a normal pending tool future, not the loop-armed

@@ -14,7 +14,7 @@ fn test_tools(timeout_secs: u64) -> ShellTools {
 fn shell_call(arguments: serde_json::Value) -> ToolCall {
     ToolCall {
         id: ToolCallId::try_from("call-1").unwrap(),
-        name: ToolName::try_from(SHELL_COMMAND_TOOL_NAME).unwrap(),
+        name: ToolName::try_from(EXEC_COMMAND_TOOL_NAME).unwrap(),
         tool_type: ToolType::Function,
         arguments: arguments.to_string(),
     }
@@ -38,21 +38,63 @@ async fn runs_shell_call() {
 
     assert_eq!(result.status, ToolOutputStatus::Success);
     assert!(serde_json::from_str::<Value>(result.output.as_ref()).is_err());
-    assert!(result.output.as_ref().contains("Exit code: 0"));
+    assert!(
+        result
+            .output
+            .as_ref()
+            .contains("Process exited with code 0"),
+        "{}",
+        result.output
+    );
     assert!(result.output.as_ref().contains("Output:\nhello"));
 }
 
 #[tokio::test]
-async fn shell_command_stdin_is_null() {
+async fn code_mode_receives_structured_exec_output() {
+    let result = test_tools(2)
+        .call_code_mode(shell_call(json!({"cmd": "printf hello"})))
+        .await
+        .unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["output"], "hello");
+    assert!(result["chunk_id"].is_string());
+    assert!(result.get("session_id").is_none());
+}
+
+#[tokio::test]
+async fn write_stdin_continues_a_running_process() {
     let tools = test_tools(2);
     let result = tools
         .call(shell_call(
-            json!({"command": "if read line; then printf got; else printf eof; fi"}),
+            json!({"cmd": "read line; printf 'got:%s' \"$line\"", "yield_time_ms": 1}),
         ))
         .await;
-
     assert_eq!(result.status, ToolOutputStatus::Success);
-    assert!(result.output.as_ref().contains("Output:\neof"));
+    assert!(
+        result
+            .output
+            .as_ref()
+            .contains("Process running with session ID 1"),
+        "{}",
+        result.output
+    );
+    let result = tools
+        .call(ToolCall {
+            id: ToolCallId::try_from("call-2").unwrap(),
+            name: ToolName::try_from(WRITE_STDIN_TOOL_NAME).unwrap(),
+            tool_type: ToolType::Function,
+            arguments: json!({"session_id": 1, "chars": "hello\n"}).to_string(),
+        })
+        .await;
+    assert!(
+        result
+            .output
+            .as_ref()
+            .contains("Process exited with code 0"),
+        "{}",
+        result.output
+    );
+    assert!(result.output.as_ref().contains("Output:\ngot:hello"));
 }
 
 #[tokio::test]
@@ -76,7 +118,12 @@ async fn nonzero_exit_is_structured_result_not_tool_error() {
         .await;
 
     assert_eq!(result.status, ToolOutputStatus::Success);
-    assert!(result.output.as_ref().contains("Exit code: 3"));
+    assert!(
+        result
+            .output
+            .as_ref()
+            .contains("Process exited with code 3")
+    );
     assert!(result.output.as_ref().contains("Output:\nnope"));
 }
 
@@ -102,66 +149,21 @@ async fn truncates_concatenated_output() {
 
     assert_eq!(result.status, ToolOutputStatus::Success);
     assert!(serde_json::from_str::<Value>(result.output.as_ref()).is_err());
-    assert!(
-        result
-            .output
-            .as_ref()
-            .contains("Warning: truncated output (original token count:")
-    );
-    assert!(result.output.as_ref().contains("Total output lines: 20000"));
     assert!(result.output.as_ref().contains("tokens truncated"));
     assert!(result.output.len() < MAX_OUTPUT_BYTES + 2048);
 }
 
-#[tokio::test]
-async fn accepts_timeout_argument_name() {
-    let tools = test_tools(30);
-    let result = tools
-        .call(shell_call(json!({"command": "sleep 2", "timeout": 1})))
-        .await;
-
-    assert_eq!(result.status, ToolOutputStatus::Success);
-    assert!(
-        result
-            .output
-            .as_ref()
-            .contains("Command timed out after 1 seconds")
-    );
-}
-
-#[tokio::test]
-async fn timeout_kills_shell_process() {
-    let temp = tempfile::tempdir().unwrap();
-    let marker = temp.path().join("marker");
-    let tools = test_tools(30);
-    let result = tools
-        .call(shell_call(json!({
-            "command": format!("sleep 2; touch {}", marker.display()),
-            "timeout": 1,
-        })))
-        .await;
-
-    assert_eq!(result.status, ToolOutputStatus::Success);
-    assert!(
-        result
-            .output
-            .as_ref()
-            .contains("Command timed out after 1 seconds")
-    );
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(!marker.exists());
-}
-
 #[test]
-fn specs_expose_only_shell_command_and_apply_patch() {
+fn specs_expose_unified_exec_and_apply_patch() {
     let tools = test_tools(2);
     let specs = tools.specs();
 
-    assert_eq!(specs.len(), 2);
-    assert_eq!(specs[0].name.as_str(), SHELL_COMMAND_TOOL_NAME);
-    assert_eq!(specs[1].name.as_str(), APPLY_PATCH_TOOL_NAME);
-    assert_eq!(specs[1].tool_type, ToolType::Custom);
-    assert!(matches!(specs[1].format, Some(ToolFormat::Grammar { .. })));
+    assert_eq!(specs.len(), 3);
+    assert_eq!(specs[0].name.as_str(), EXEC_COMMAND_TOOL_NAME);
+    assert_eq!(specs[1].name.as_str(), WRITE_STDIN_TOOL_NAME);
+    assert_eq!(specs[2].name.as_str(), APPLY_PATCH_TOOL_NAME);
+    assert_eq!(specs[2].tool_type, ToolType::Custom);
+    assert!(matches!(specs[2].format, Some(ToolFormat::Grammar { .. })));
 }
 
 #[tokio::test]

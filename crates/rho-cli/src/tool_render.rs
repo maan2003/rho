@@ -16,7 +16,7 @@ pub(crate) fn tool_call_block(
         return apply_patch_block();
     }
 
-    if name == "shell_command" {
+    if matches!(name, "exec_command" | "write_stdin" | "shell_command") {
         return shell_command_block(arguments, status);
     }
 
@@ -89,7 +89,8 @@ pub(crate) fn tool_status_color(status: &ToolOutputStatus) -> Color {
 
 fn tool_argument_summary(name: &str, arguments: &str) -> Option<String> {
     match name {
-        "shell_command" => shell_command_summary(arguments),
+        "exec_command" | "shell_command" => shell_command_summary(arguments),
+        "write_stdin" => Some("wait for command output".to_owned()),
         _ => {
             serde_json::from_str::<serde_json::Value>(arguments).ok()?;
             Some(truncate_inline(arguments, 96))
@@ -100,7 +101,8 @@ fn tool_argument_summary(name: &str, arguments: &str) -> Option<String> {
 fn shell_command_summary(arguments: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
     value
-        .get("command")
+        .get("cmd")
+        .or_else(|| value.get("command"))
         .and_then(|command| command.as_str())
         .map(|command| truncate_inline(command, 96))
 }

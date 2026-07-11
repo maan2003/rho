@@ -91,7 +91,7 @@ fn block(block: &UiBlock) -> Option<Block> {
 /// seen while arguments stream.
 fn tool_label(name: &str, arguments: &str) -> String {
     match name {
-        "shell" | "shell_command" | "Bash" => {
+        "shell" | "shell_command" | "exec_command" | "write_stdin" | "Bash" => {
             let command = streaming_json_text_field(arguments, "command")
                 .or_else(|| {
                     (!arguments.trim_start().starts_with('{')).then(|| arguments.to_owned())

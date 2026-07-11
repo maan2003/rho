@@ -96,9 +96,12 @@ async fn op_call_tool(
             Err(deno_error::JsErrorBox::generic("exec cell terminated"))
         }
         output = dispatch => match output.status {
-            ToolOutputStatus::Success => Ok(output.output.as_ref().clone()),
+            ToolOutputStatus::Success => serde_json::to_string(&output.value)
+                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string())),
             ToolOutputStatus::Error | ToolOutputStatus::Cancelled => {
-                Err(deno_error::JsErrorBox::generic(output.output.as_ref().clone()))
+                Err(deno_error::JsErrorBox::generic(
+                    output.value.as_str().map(str::to_owned).unwrap_or_else(|| output.value.to_string())
+                ))
             }
         },
     }

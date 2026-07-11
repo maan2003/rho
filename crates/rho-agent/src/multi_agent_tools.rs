@@ -1,5 +1,5 @@
 //! Built-in multi-agent tools: `spawn_engineer`, `message_engineer`,
-//! `interrupt_engineer`, `wait`.
+//! `interrupt_engineer`, `wait_agent`.
 //!
 //! These are ordinary fast tools (codex-v2 style): asynchrony lives in the
 //! per-agent message queue, not in tool execution. `spawn_engineer` returns the
@@ -87,7 +87,7 @@ pub const MESSAGE_ENGINEER_TOOL_NAME: &str = "message_engineer";
 pub const INTERRUPT_ENGINEER_TOOL_NAME: &str = "interrupt_engineer";
 pub const ASK_ADVISOR_TOOL_NAME: &str = "ask_advisor";
 pub const FOLLOWUP_ADVISOR_TOOL_NAME: &str = "followup_advisor";
-pub const WAIT_TOOL_NAME: &str = "wait";
+pub const WAIT_TOOL_NAME: &str = "wait_agent";
 
 const DEFAULT_WAIT_SECONDS: u64 = 300;
 const MAX_WAIT_SECONDS: u64 = 3600;
@@ -261,10 +261,10 @@ fn wait_spec() -> ToolSpec {
     ToolSpec {
         name: ToolName::try_from(WAIT_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
-        description: "Block until a message is waiting in your queue (sub-agent mail or new \
-                      user input) or the timeout passes. Queued messages enter your context \
-                      right after this tool returns. Call this when you are blocked on \
-                      sub-agent results and have nothing else useful to do."
+        description: "Wait for a mailbox update from any live agent, including queued messages \
+                      and final responses. The wait also ends early when new user input is \
+                      steered into the active turn. Does not return the content; queued input \
+                      enters context after this tool returns."
             .to_owned(),
         input_schema: json!({
             "type": "object",
@@ -287,8 +287,7 @@ pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: ToolCall) -> T
         INTERRUPT_ENGINEER_TOOL_NAME => interrupt_engineer(&tools, &call).await,
         ASK_ADVISOR_TOOL_NAME => ask_advisor(&tools, &call).await,
         FOLLOWUP_ADVISOR_TOOL_NAME => followup_advisor(&tools, &call).await,
-        // `wait` is intercepted and resolved by the agent loop; it never
-        // reaches tool dispatch.
+        WAIT_TOOL_NAME => wait_agent(&tools, &call).await,
         _ => Err(anyhow::anyhow!(
             "unsupported tool call: {}",
             call.name.as_str()
@@ -304,6 +303,18 @@ pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: ToolCall) -> T
             status: ToolOutputStatus::Error,
         },
     }
+}
+
+async fn wait_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
+    let timeout = std::time::Duration::from_secs(parse_wait_timeout(&call.arguments)?);
+    let pool = tools.pool()?;
+    let (_, agent, _) = pool.load(tools.self_id).await?;
+    Ok(if agent.wait_for_input(timeout).await {
+        "Wait completed."
+    } else {
+        "Wait timed out."
+    }
+    .to_owned())
 }
 
 #[derive(Deserialize)]

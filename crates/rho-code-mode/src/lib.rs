@@ -27,4 +27,4 @@ pub use description::{
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_YIELD_TIME_MS, EXEC_TOOL_NAME, NestedTool, WAIT_TOOL_NAME,
     exec_tool_spec, parse_exec_source, wait_tool_spec,
 };
-pub use session::{CodeModeSession, ToolDispatcher, WaitArgs};
+pub use session::{CodeModeSession, NestedToolOutput, ToolDispatcher, WaitArgs};

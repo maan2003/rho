@@ -22,7 +22,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - Evaluates the provided JavaScript in this session's persistent JavaScript environment (V8 REPL mode).
 - Top-level variables, functions, and classes persist across `exec` calls in this session. Redeclaring `let`/`const` in a later `exec` call is allowed.
 - All nested tools are available on the global `tools` object, for example `await tools.shell_command(...)`. Tool names are exposed as normalized JavaScript identifiers.
-- Nested tool methods take either a string or an object as their input argument, and return a string.
+- Nested tool methods take either a string or an object as their input argument and return the documented JavaScript value. Command tools return structured objects; text-only tools return strings.
 - Runs raw JavaScript -- no Node, no file system, no network access, no console. All host access goes through the nested tools.
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
@@ -66,6 +66,7 @@ pub struct NestedTool {
     pub tool_type: ToolType,
     pub description: String,
     pub input_schema: Option<JsonValue>,
+    pub output_schema: Option<JsonValue>,
 }
 
 impl NestedTool {
@@ -79,7 +80,13 @@ impl NestedTool {
             tool_type: spec.tool_type,
             description: spec.description.clone(),
             input_schema,
+            output_schema: None,
         }
+    }
+
+    pub fn with_output_schema(mut self, schema: JsonValue) -> Self {
+        self.output_schema = Some(schema);
+        self
     }
 
     /// The identifier scripts use: `tools.<global_name>(...)`.
@@ -166,8 +173,13 @@ fn render_nested_tool_section(tool: &NestedTool) -> String {
         ),
         ToolType::Custom => ("input", "string".to_string()),
     };
+    let output_type = tool
+        .output_schema
+        .as_ref()
+        .map(render_json_schema_to_typescript)
+        .unwrap_or_else(|| "string".to_owned());
     let declaration = format!(
-        "declare const tools: {{ {global_name}({input_name}: {input_type}): Promise<string>; }};"
+        "declare const tools: {{ {global_name}({input_name}: {input_type}): Promise<{output_type}>; }};"
     );
     let description = tool.description.trim();
     if description.is_empty() {
@@ -557,6 +569,7 @@ mod tests {
                 "required": ["command"],
                 "properties": { "command": { "type": "string" } }
             })),
+            output_schema: None,
         };
         let description = build_exec_tool_description(&[tool]);
         assert!(description.contains("### `shell_command`"), "{description}");

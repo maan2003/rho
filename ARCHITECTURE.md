@@ -45,6 +45,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   provider.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
   execution.
+- `rho-tool-shell` owns Codex-compatible unified command sessions:
+  `exec_command` yields a process session id when a command remains live and
+  `write_stdin` writes to or polls that session. Command continuation state is
+  per agent because each agent owns its `ShellTools` instance.
 - `rho-code-mode` is a tool crate: it runs model-authored JavaScript in an
   in-process V8 isolate (deno_core) and exposes the `exec`/`wait` tool pair.
   Nested tool calls made by scripts leave the crate through a `ToolDispatcher`

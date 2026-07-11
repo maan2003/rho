@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use rho_code_mode::{CodeModeSession, NestedTool, ToolDispatcher, WaitArgs};
-use rho_core::{ToolCall, ToolCallId, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
+use rho_code_mode::{CodeModeSession, NestedTool, NestedToolOutput, ToolDispatcher, WaitArgs};
+use rho_core::{ToolCall, ToolCallId, ToolOutputStatus, ToolSpec, ToolType};
 use serde_json::json;
 
 struct FakeDispatcher {
@@ -22,17 +22,21 @@ impl FakeDispatcher {
 }
 
 impl ToolDispatcher for FakeDispatcher {
-    fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
+    fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, NestedToolOutput> {
         Box::pin(async move {
             match call.name.as_str() {
-                "echo" => ToolOutput {
-                    output: Arc::new(format!("echo:{}", call.arguments)),
+                "echo" => NestedToolOutput {
+                    value: json!(format!("echo:{}", call.arguments)),
+                    status: ToolOutputStatus::Success,
+                },
+                "structured" => NestedToolOutput {
+                    value: json!({"session_id": 42, "output": "ready"}),
                     status: ToolOutputStatus::Success,
                 },
                 "slow_echo" => {
                     tokio::time::sleep(Duration::from_millis(300)).await;
-                    ToolOutput {
-                        output: Arc::new("slow done".to_string()),
+                    NestedToolOutput {
+                        value: json!("slow done"),
                         status: ToolOutputStatus::Success,
                     }
                 }
@@ -41,12 +45,12 @@ impl ToolDispatcher for FakeDispatcher {
                     futures::future::pending::<()>().await;
                     unreachable!()
                 }
-                "fail" => ToolOutput {
-                    output: Arc::new("tool exploded".to_string()),
+                "fail" => NestedToolOutput {
+                    value: json!("tool exploded"),
                     status: ToolOutputStatus::Error,
                 },
-                other => ToolOutput {
-                    output: Arc::new(format!("unknown tool {other}")),
+                other => NestedToolOutput {
+                    value: json!(format!("unknown tool {other}")),
                     status: ToolOutputStatus::Error,
                 },
             }
@@ -66,7 +70,7 @@ fn exec_id() -> ToolCallId {
 }
 
 fn nested_tools() -> Vec<NestedTool> {
-    ["echo", "slow_echo", "hang", "fail"]
+    ["echo", "structured", "slow_echo", "hang", "fail"]
         .into_iter()
         .map(|name| {
             NestedTool::from_spec(&ToolSpec {
@@ -78,6 +82,24 @@ fn nested_tools() -> Vec<NestedTool> {
             })
         })
         .collect()
+}
+
+#[tokio::test]
+async fn nested_tool_returns_a_structured_javascript_value() {
+    let session = CodeModeSession::new(nested_tools(), FakeDispatcher::new()).unwrap();
+    let result = session
+        .execute(
+            exec_id(),
+            "const result = await tools.structured({}); text(`${result.session_id}:${result.output}`)",
+        )
+        .await;
+    assert_eq!(
+        result.status,
+        ToolOutputStatus::Success,
+        "{}",
+        result.output
+    );
+    assert!(result.output.contains("42:ready"), "{}", result.output);
 }
 
 fn session() -> (CodeModeSession, Arc<FakeDispatcher>) {

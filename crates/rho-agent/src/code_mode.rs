@@ -1,12 +1,12 @@
 //! Code-mode tool surface. When `InferenceProfile::code_mode` is on, the model
-//! gets only the `exec` and `wait` tools; shell and multi-agent tools are
-//! reached from JavaScript through the session's nested `tools.*` dispatch.
+//! gets only `exec` and its cell-scoped `wait`; shell and collaboration tools
+//! are reached from JavaScript through the session's nested `tools.*` API.
 
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use rho_code_mode::{CodeModeSession, NestedTool, ToolDispatcher};
-use rho_core::{ToolCall, ToolCallId, ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs};
+use rho_code_mode::{CodeModeSession, NestedTool, NestedToolOutput, ToolDispatcher};
+use rho_core::{ToolCall, ToolCallId, ToolOutputStatus, ToolSpec, ToolType, UnixMs};
 use rho_tool_shell::ShellTools;
 use tokio::sync::mpsc;
 
@@ -26,10 +26,8 @@ pub(crate) fn tool_specs(
     ]
 }
 
-/// Tools reachable from scripts: shell tools plus, on pooled agents, the
-/// multi-agent tools except `wait` — that name belongs to the code-mode
-/// `wait`, and mail waiting is resolved by the agent loop, not dispatchable
-/// as a future. Mail from sub-agents arrives between turns as usual.
+/// Tools reachable from scripts. `wait_agent` is distinct from code mode's
+/// model-facing `wait`, which observes a yielded JavaScript cell.
 fn nested_tools(
     shell_tools: &ShellTools,
     multi_agent: bool,
@@ -37,16 +35,21 @@ fn nested_tools(
 ) -> Vec<NestedTool> {
     let mut specs = shell_tools.specs();
     if multi_agent {
-        specs.extend(
-            multi_agent_tools::agent_tool_specs()
-                .into_iter()
-                .filter(|spec| spec.name.as_str() != multi_agent_tools::WAIT_TOOL_NAME),
-        );
+        specs.extend(multi_agent_tools::agent_tool_specs());
     }
     if let Some(extension) = tool_extension {
         specs.extend(extension.specs());
     }
-    specs.iter().map(NestedTool::from_spec).collect()
+    specs
+        .iter()
+        .map(|spec| {
+            let tool = NestedTool::from_spec(spec);
+            match ShellTools::code_mode_output_schema(spec.name.as_str()) {
+                Some(schema) => tool.with_output_schema(schema),
+                None => tool,
+            }
+        })
+        .collect()
 }
 
 struct Dispatcher {
@@ -63,7 +66,7 @@ struct Dispatcher {
 }
 
 impl ToolDispatcher for Dispatcher {
-    fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
+    fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, NestedToolOutput> {
         let shell_tools = self.shell_tools.clone();
         let agent_tools = multi_agent_tools::is_agent_tool(call.name.as_str())
             .then(|| self.multi_agent.clone())
@@ -77,18 +80,35 @@ impl ToolDispatcher for Dispatcher {
         });
         let task = self.runtime.spawn(async move {
             if let Some(extension) = extension {
-                extension.call(call).await
+                let output = extension.call(call).await;
+                NestedToolOutput {
+                    value: serde_json::Value::String(output.output.as_ref().clone()),
+                    status: output.status,
+                }
             } else if let Some(tools) = agent_tools {
-                multi_agent_tools::call_agent_tool(tools, call).await
+                let output = multi_agent_tools::call_agent_tool(tools, call).await;
+                NestedToolOutput {
+                    value: serde_json::Value::String(output.output.as_ref().clone()),
+                    status: output.status,
+                }
             } else {
-                shell_tools.call(call).await
+                match shell_tools.call_code_mode(call).await {
+                    Ok(value) => NestedToolOutput {
+                        value,
+                        status: ToolOutputStatus::Success,
+                    },
+                    Err(error) => NestedToolOutput {
+                        value: serde_json::Value::String(error.to_string()),
+                        status: ToolOutputStatus::Error,
+                    },
+                }
             }
         });
         Box::pin(async move {
             match task.await {
                 Ok(output) => output,
-                Err(_) => ToolOutput {
-                    output: Arc::new("nested tool task failed".to_string()),
+                Err(_) => NestedToolOutput {
+                    value: serde_json::Value::String("nested tool task failed".to_owned()),
                     status: ToolOutputStatus::Error,
                 },
             }
@@ -152,11 +172,12 @@ mod tests {
         let specs = super::tool_specs(&shell_tools(), true, None);
         let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
         assert_eq!(names, ["exec", "wait"]);
-        // The exec description embeds the nested tools, including multi-agent
-        // tools but not the loop-resolved mail `wait`.
+        // Collaboration tools are nested alongside command tools.
         let exec = &specs[0].description;
-        assert!(exec.contains("shell_command"), "{exec}");
+        assert!(exec.contains("exec_command"), "{exec}");
+        assert!(exec.contains("write_stdin"), "{exec}");
         assert!(exec.contains("spawn_engineer"), "{exec}");
+        assert!(exec.contains("wait_agent"), "{exec}");
         assert!(!exec.contains("async function wait"), "{exec}");
     }
 

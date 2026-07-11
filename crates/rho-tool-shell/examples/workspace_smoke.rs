@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolType};
-use rho_tool_shell::{SHELL_COMMAND_TOOL_NAME, ShellTools};
+use rho_tool_shell::{EXEC_COMMAND_TOOL_NAME, ShellTools};
 use rho_workspaces::{Repo, View, WorkspaceId, WorkspaceIdDomain};
 
 fn shell_call(command: &str) -> ToolCall {
     ToolCall {
         id: ToolCallId::try_from("call-1").unwrap(),
-        name: ToolName::try_from(SHELL_COMMAND_TOOL_NAME).unwrap(),
+        name: ToolName::try_from(EXEC_COMMAND_TOOL_NAME).unwrap(),
         tool_type: ToolType::Function,
         arguments: serde_json::json!({ "command": command }).to_string(),
     }

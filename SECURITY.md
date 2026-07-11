@@ -18,6 +18,10 @@ AI APIs.
   transcripts.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
   explicit user-facing capabilities.
+- Long-running `exec_command` processes are retained only in their owning
+  agent's in-memory command-session table. `write_stdin` requires that local
+  numeric session id; waits are capped at five minutes and dropping the agent
+  drops and kills its retained child processes.
 - An agent's working set (its workdirs/mount-namespace view) is version
   isolation, not access isolation: the namespace redirects entry paths to the
   agent's checkouts but does not restrict access to the rest of the
@@ -199,6 +203,10 @@ do not restrict filesystem access or grant tools.
   `exec`/`wait`, and
   shell plus multi-agent tools are dispatched from scripts on the agent's
   normal runtime through the same code paths as direct tool calls.
+- Nested command calls return structured JSON values to JavaScript (including
+  process session ids), while direct command calls render the equivalent
+  Codex-style status headers as text. Other nested tools return JSON strings;
+  tool errors reject the JavaScript promise rather than becoming values.
 - Trust boundaries: script source is model-controlled input; nested tool calls
   leave the isolate through the `ToolDispatcher`, which forwards to the agent's
   normal tool path with its existing controls. The JS environment strips
