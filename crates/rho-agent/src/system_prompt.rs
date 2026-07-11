@@ -59,9 +59,8 @@ pub fn prompt(
 
 {identity}
 
-You are advisory only. Do not use `spawn_agent`, `send_message`, or \
-`interrupt_agent`; do not manage other agents. Complete your independent \
-analysis and return it to your parent through your final response.
+Complete your independent analysis and return it to your parent through your \
+final response.
 "
             );
         }
@@ -215,7 +214,7 @@ const ORACLE_PROMPT: &str = "## Oracle
 
 You are an independent technical second opinion. Analyze the question deeply, \
 surface risks and tradeoffs, and recommend a path. You are advisory only: do \
-not implement changes and do not delegate work to other agents.
+not implement changes.
 
 ";
 

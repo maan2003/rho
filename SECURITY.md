@@ -138,14 +138,10 @@ slot, and it removes the generated source file when the Claude process exits or
 is cancelled. Loaded `AGENTS.md` content therefore has the same
 external-provider exposure as other agent prompt text.
 
-Claude Code MCP code mode is bound to the active Rho agent through
-`RHO_MCP_AGENT_ID`, which Rho sets when spawning the Claude process. When the
-user configures `rho mcp-agent-tools` as a Claude MCP server, it inherits that
-environment and owns a
-persistent V8 session for that Claude process, and treats tool calls as
-provider-controlled input. Nested shell calls inherit the agent workspace mount
-namespace and have the same authority as Claude Code's former native tools;
-the daemon validates agent ids
+Claude Code MCP support is bound to the active Rho agent through
+`RHO_MCP_AGENT_ID`, which Rho sets when spawning the Claude process. A globally
+configured `rho mcp-agent-tools` stdio server inherits that environment and
+treats tool calls as provider-controlled input: the daemon validates agent ids
 and workspace choices, preserves the same spawn-depth/live-child limits as
 in-process Rho tools, bounds wait operations, and returns tool errors as data
 instead of panicking.

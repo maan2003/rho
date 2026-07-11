@@ -564,14 +564,6 @@ impl ClaudeLoop {
         if let Some(tools) = &self.multi_agent {
             command.env("RHO_AGENT_ID", tools.self_id().encoded());
             command.env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
-            command.env(
-                "RHO_MCP_AGENT_TOOLS",
-                if matches!(self.role, crate::db::AgentRole::Oracle { .. }) {
-                    "0"
-                } else {
-                    "1"
-                },
-            );
         }
         if let Err(error) = self
             .view
