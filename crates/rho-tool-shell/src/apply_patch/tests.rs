@@ -36,7 +36,7 @@ fn add_file_rejects_existing_target() {
             path: path.clone(),
             contents: "replacement\n".to_owned(),
         }],
-        temp.path(),
+        &|path| resolve_path(temp.path(), path),
     )
     .expect_err("add file should reject existing target");
 

@@ -237,7 +237,7 @@ async fn create_agent_and_append_events_with_cursor() {
         agent_id,
         topic_id,
         Some("main".to_owned()),
-        test_workspace(),
+        vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -271,7 +271,7 @@ async fn agent_events_read_lineage_parents() {
         agent_id,
         topic_id,
         Some("main".to_owned()),
-        test_workspace(),
+        vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -319,7 +319,7 @@ async fn fork_agent_lineage_repoints_current_branch() {
         agent_id,
         topic_id,
         Some("main".to_owned()),
-        test_workspace(),
+        vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -354,7 +354,7 @@ async fn move_agent_to_topic_repoints_membership() {
         agent_id,
         default_topic,
         None,
-        test_workspace(),
+        vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -387,7 +387,7 @@ async fn topic_and_agent_statuses_are_settable() {
         agent_id,
         topic_id,
         None,
-        test_workspace(),
+        vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -455,7 +455,7 @@ async fn agent_ids_allocate_before_records_exist() {
         agent_id,
         topic_id,
         None,
-        test_workspace(),
+        vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -463,6 +463,6 @@ async fn agent_ids_allocate_before_records_exist() {
     write.commit();
 
     let read = db.read();
-    assert_eq!(read.get_agent(agent_id).workspace, test_workspace());
+    assert_eq!(read.get_agent(agent_id).workdirs, vec![test_workspace()]);
     assert_eq!(read.list_agents().len(), 1);
 }

@@ -18,6 +18,13 @@ AI APIs.
   transcripts.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
   explicit user-facing capabilities.
+- An agent's working set (its workdirs/mount-namespace view) is version
+  isolation, not access isolation: the namespace redirects entry paths to the
+  agent's checkouts but does not restrict access to the rest of the
+  filesystem. The set is fixed at spawn and persisted on the agent record.
+  Apply-patch translates absolute paths inside any workdir to that workdir's
+  checkout, so in-process file writes follow the same redirection as
+  namespaced commands.
 - User/repo `AGENTS.md` files and local/project Markdown skills are trusted
   prompt input when discovered. Treat them as useful local guidance, not a
   sandbox or permission boundary.

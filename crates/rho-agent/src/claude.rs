@@ -26,7 +26,7 @@ use crate::db::{
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
     AgentState, AgentStateKind, FailedInferenceResponse, InputQueues, MessageDelivery, QueuedItem,
-    QueuedItemKind, StartWorkspace, system_prompt,
+    QueuedItemKind, StartWorkdir, system_prompt,
 };
 
 mod projection;
@@ -39,6 +39,7 @@ use projection::{
 #[derive(Clone)]
 pub struct ClaudeAgent {
     state: Arc<RwLock<AgentState>>,
+    view: Arc<rho_workspaces::View>,
     control: mpsc::UnboundedSender<ClaudeControl>,
     notify: Arc<Notify>,
     input_seq: Arc<AtomicU64>,
@@ -51,7 +52,7 @@ impl ClaudeAgent {
         db: RhoDb,
         topic_id: TopicId,
         display_name: Option<String>,
-        start: StartWorkspace,
+        start: Vec<StartWorkdir>,
         mode: SessionBinding,
         parent: Option<AgentId>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
@@ -65,23 +66,18 @@ impl ClaudeAgent {
         let role = mode.agent_role();
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let workspace = match start {
-            StartWorkspace::Create {
-                repo,
-                parent_revset,
-            } => {
-                let workspace_id = write.alloc_workspace_id();
-                repo.create_workspace(workspace_id, &parent_revset).await?
-            }
-            StartWorkspace::Existing(workspace) => workspace,
-        };
+        let entries = crate::materialize_workdirs(&mut write, start).await?;
+        let view = rho_workspaces::View::new(entries.clone())?;
         let session_id = Uuid::new_v4();
         write.create_agent(
             UnixMillis::now(),
             agent_id,
             topic_id,
             display_name,
-            workspace.info().clone(),
+            entries
+                .iter()
+                .map(|workspace| workspace.info().clone())
+                .collect(),
             mode,
             AgentRuntime::Claude { session_id },
             parent,
@@ -94,12 +90,7 @@ impl ClaudeAgent {
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
-            system_prompt: system_prompt::prompt(
-                workspace.as_ref(),
-                multi_agent.as_ref(),
-                false,
-                role,
-            ),
+            system_prompt: system_prompt::prompt(view.as_ref(), multi_agent.as_ref(), false, role),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
@@ -107,7 +98,7 @@ impl ClaudeAgent {
         Ok((
             agent_id,
             Self::new(
-                workspace,
+                view,
                 model,
                 effort,
                 session_id,
@@ -122,7 +113,7 @@ impl ClaudeAgent {
     pub async fn load(
         db: RhoDb,
         agent_id: AgentId,
-        workspace: Arc<rho_workspaces::Workspace>,
+        view: Arc<rho_workspaces::View>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
@@ -137,15 +128,16 @@ impl ClaudeAgent {
             .binding
             .claude_effort()
             .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
+        let primary = view.primary();
         let messages = rho_claude::read_session_messages_by_id(
             session_id,
-            workspace.repo(),
+            primary.repo(),
             rho_claude::SessionMessagesOptions::default(),
         )
         .await?;
         let blocks = transcript_messages_to_context(&messages)?;
         let context_used =
-            rho_claude::read_session_context_used_by_id(session_id, workspace.repo()).await?;
+            rho_claude::read_session_context_used_by_id(session_id, primary.repo()).await?;
         let state = AgentState {
             blocks,
             tool_specs: Arc::from([]),
@@ -153,14 +145,14 @@ impl ClaudeAgent {
                 let multi_agent = pool
                     .upgrade()
                     .map(|_| MultiAgentTools::new(pool.clone(), agent_id, record.parent_agent));
-                system_prompt::prompt(workspace.as_ref(), multi_agent.as_ref(), false, record.role)
+                system_prompt::prompt(view.as_ref(), multi_agent.as_ref(), false, record.role)
             },
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used,
         };
         Ok(Self::new(
-            workspace,
+            view,
             model,
             effort,
             session_id,
@@ -174,7 +166,7 @@ impl ClaudeAgent {
 
     #[expect(clippy::too_many_arguments)]
     fn new(
-        workspace: Arc<rho_workspaces::Workspace>,
+        view: Arc<rho_workspaces::View>,
         model: Model,
         effort: Effort,
         session_id: Uuid,
@@ -190,7 +182,7 @@ impl ClaudeAgent {
         let input_notify = Arc::new(Notify::new());
         let (control, control_rx) = mpsc::unbounded_channel();
         let loop_state = ClaudeLoop {
-            workspace,
+            view: Arc::clone(&view),
             model,
             effort,
             session_id,
@@ -217,11 +209,17 @@ impl ClaudeAgent {
             input_seq,
             wait_baseline_seq,
             input_notify,
+            view,
         }
     }
 
     pub fn state(&self) -> AgentState {
         self.state.read().expect("poison").clone()
+    }
+
+    /// The agent's filesystem view (its working set of workdirs).
+    pub fn view(&self) -> &Arc<rho_workspaces::View> {
+        &self.view
     }
 
     pub fn send_user_message(&self, text: impl Into<String>) {
@@ -308,7 +306,7 @@ enum ClaudeControl {
 }
 
 struct ClaudeLoop {
-    workspace: Arc<rho_workspaces::Workspace>,
+    view: Arc<rho_workspaces::View>,
     model: Model,
     effort: Effort,
     session_id: Uuid,
@@ -549,7 +547,7 @@ impl ClaudeLoop {
             },
         };
         let mut options = ClaudeCodeOptions::new(
-            self.workspace.repo().to_owned(),
+            self.view.primary().repo().to_owned(),
             self.model,
             self.effort,
             self.session_id,
@@ -568,8 +566,8 @@ impl ClaudeLoop {
             command.env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
         }
         if let Err(error) = self
-            .workspace
-            .prepare_command_with_file_mounts(&mut command, file_mounts)
+            .view
+            .prepare_command(&mut command, None, file_mounts)
             .await
         {
             self.remove_claude_runtime_files();
@@ -587,10 +585,16 @@ impl ClaudeLoop {
     }
 
     fn write_claude_prompt_mount(&mut self) -> anyhow::Result<Option<(Utf8PathBuf, Utf8PathBuf)>> {
-        if self.workspace.is_user_checkout() {
+        // A view whose entries are all live checkouts has no private mount
+        // namespace to bind the generated prompt into.
+        if self
+            .view
+            .entries()
+            .iter()
+            .all(|workspace| workspace.is_user_checkout())
+        {
             eprintln!(
-                "rho-agent: not bind-mounting generated CLAUDE.md for Claude user-checkout \
-                 workspace"
+                "rho-agent: not bind-mounting generated CLAUDE.md for Claude live-checkout view"
             );
             return Ok(None);
         }
@@ -615,12 +619,8 @@ impl ClaudeLoop {
                     .with_context(|| format!("create Claude prompt bind target {target}"));
             }
         }
-        let prompt = system_prompt::prompt(
-            self.workspace.as_ref(),
-            self.multi_agent.as_ref(),
-            false,
-            self.role,
-        );
+        let prompt =
+            system_prompt::prompt(self.view.as_ref(), self.multi_agent.as_ref(), false, self.role);
         let mut source_file = tempfile::Builder::new()
             .prefix("rho-claude-prompt-")
             .suffix(".md")
@@ -712,9 +712,9 @@ impl ClaudeLoop {
                         self.stream_items.clear();
                         self.set_streaming_kind();
                     }
-                    let workspace = Arc::clone(&self.workspace);
+                    let view = Arc::clone(&self.view);
                     tokio::spawn(async move {
-                        if let Err(error) = workspace.snapshot().await {
+                        if let Err(error) = view.snapshot().await {
                             eprintln!("rho-agent Claude snapshot failed: {error:#}");
                         }
                     });

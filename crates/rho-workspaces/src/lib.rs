@@ -1,12 +1,17 @@
-//! Per-agent jj workspaces backed by the fork's workspace pool.
+//! Per-agent working sets of jj workspaces backed by the fork's workspace
+//! pool.
 //!
-//! Each agent works in a jj pool slot (`<repo>/.jj/ws-pool/N`) claimed with
-//! `jj workspace add --pool`. The jj workspace *name* (the workspace id's
-//! encoding) is the durable handle — the repo view's `wc_commit_ids[name]`
-//! follows the agent's change across every operation — while the slot directory
-//! is droppable cache that jj rebinds on attach. With namespaces available,
-//! each agent's commands run in a private mount namespace where the slot is
-//! mounted *over the origin repo path*, so the agent sees the real path:
+//! An agent's filesystem is a [`View`]: a working set of workdir entries,
+//! fixed at spawn, each binding an origin path to a materialized
+//! [`Workspace`] (a jj pool-slot checkout, the user's live checkout, or a
+//! plain directory). Checkouts live in jj pool slots
+//! (`<repo>/.jj/ws-pool/N`) claimed with `jj workspace add --pool`. The jj
+//! workspace *name* (the workspace id's encoding) is the durable handle —
+//! the repo view's `wc_commit_ids[name]` follows the agent's change across
+//! every operation — while the slot directory is droppable cache that jj
+//! rebinds on attach. With namespaces available, each agent's commands run
+//! in a private per-view mount namespace where every entry's slot is
+//! mounted *over its origin repo path*, so the agent sees the real paths:
 //! informative context, working `../` relative references, and
 //! absolute-path-keyed caches (cargo) stay valid.
 //!
@@ -118,12 +123,15 @@ impl WorkspaceInfo {
 /// the ws-parent pointer plumbing.
 ///
 /// Hold exactly one instance per repo root (the daemon keeps a dedup map):
-/// agents joining a workspace share one live [`Workspace`] — one checkout,
-/// one mount namespace — only within one `Repo` instance.
+/// agents joining a workspace share one live [`Workspace`] — one checkout —
+/// only within one `Repo` instance.
 #[derive(Debug)]
 pub struct Repo {
     /// Canonicalized origin root; UTF-8 validated at open.
     root: Utf8PathBuf,
+    /// False for a plain directory workdir with no jj repo: only the live
+    /// [`Workspace`] exists for it, and snapshotting is a no-op.
+    is_jj: bool,
     /// PATH entries applied to commands prepared for this repo's workspaces.
     path_overrides: PathOverrides,
     /// Serializes jj invocations. jj's op log makes concurrent commands safe
@@ -156,11 +164,44 @@ impl Repo {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             root: resolve_repo_root(path)?,
+            is_jj: true,
             path_overrides,
             jj_lock: Mutex::new(()),
             workspaces: Mutex::new(HashMap::new()),
             reaped: OnceCell::new(),
         })
+    }
+
+    /// Opens a plain directory (no jj repo) as a live-only workdir: agents
+    /// work directly at the path, and no separate workspaces can be created.
+    pub fn open_plain_with_path_overrides(
+        path: &Path,
+        path_overrides: PathOverrides,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            path.is_absolute(),
+            "workdir path must be absolute: {}",
+            path.display()
+        );
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("workdir does not exist: {}", path.display()))?;
+        let root = Utf8PathBuf::try_from(path).context("workdir path is not valid UTF-8")?;
+        anyhow::ensure!(root.is_dir(), "workdir is not a directory: {root}");
+        Ok(Self {
+            root,
+            is_jj: false,
+            path_overrides,
+            jj_lock: Mutex::new(()),
+            workspaces: Mutex::new(HashMap::new()),
+            reaped: OnceCell::new(),
+        })
+    }
+
+    /// Whether this workdir is a jj repo (as opposed to a plain live
+    /// directory).
+    pub fn is_jj(&self) -> bool {
+        self.is_jj
     }
 
     /// Creates the jj workspace named after `id`'s encoding for a new agent
@@ -173,6 +214,7 @@ impl Repo {
         id: WorkspaceId,
         parent_revset: &str,
     ) -> anyhow::Result<Arc<Workspace>> {
+        anyhow::ensure!(self.is_jj, "not a jj repository: {}", self.root);
         let name = id.encoded();
         let slot = self.attach(&name, Some(parent_revset)).await?;
         self.warm_pool();
@@ -187,6 +229,7 @@ impl Repo {
         self: &Arc<Self>,
         id: WorkspaceId,
     ) -> anyhow::Result<Arc<Workspace>> {
+        anyhow::ensure!(self.is_jj, "not a jj repository: {}", self.root);
         let info = self.workspace_info(id);
         if let Some(workspace) = self.workspaces.lock().await.get(&info) {
             return Ok(Arc::clone(workspace));
@@ -260,7 +303,6 @@ impl Repo {
             info: info.clone(),
             repo: Arc::clone(self),
             slot,
-            mnt_ns: OnceCell::new(),
             context_config: OnceLock::new(),
         });
         self.workspaces
@@ -377,15 +419,13 @@ impl Repo {
     }
 }
 
-/// One materialized workspace checkout. Callers share it via `Arc`; the
-/// mount-namespace fd is created lazily on first use (a daemon restart needs
-/// no recovery pass — the first spawned command pays the ~100µs setup once).
+/// One materialized workspace checkout: the unit agents share and [`View`]s
+/// compose. Callers share it via `Arc`.
 #[derive(Debug)]
 pub struct Workspace {
     info: WorkspaceInfo,
     repo: Arc<Repo>,
     slot: Utf8PathBuf,
-    mnt_ns: OnceCell<OwnedFd>,
     context_config: OnceLock<Arc<rho_context_config::DiscoveredContext>>,
 }
 
@@ -419,92 +459,156 @@ impl Workspace {
         &self.slot
     }
 
-    /// The workspace's mount namespace, created on first call. The fd keeps
-    /// the namespace alive; commands enter it with `setns` from `pre_exec`.
-    ///
-    /// Panics when namespace setup fails (including when
-    /// [`init_daemon_namespace`] never ran): an agent whose real cwd
-    /// contradicts the paths baked into its context would silently corrupt
-    /// every later turn, so there is deliberately no degraded mode.
-    /// User-checkout workspaces never call this — they have no namespace.
-    pub async fn mnt_ns(&self) -> &OwnedFd {
-        assert!(!self.is_user_checkout(), "user checkouts have no namespace");
-        self.mnt_ns
-            .get_or_init(|| async {
-                let repo = self.repo.root().to_owned();
-                let slot = self.slot.clone();
-                tokio::task::spawn_blocking(move || {
-                    ns::create_workspace_ns(repo.as_std_path(), slot.as_std_path())
-                })
-                .await
-                .expect("namespace task panicked")
-                .expect("workspace mount namespace setup failed")
-            })
-            .await
+    /// Whether commands for this workspace need a cover mount (the slot is
+    /// not already the origin path).
+    fn needs_mount(&self) -> bool {
+        !self.is_user_checkout()
     }
 
-    /// Configure a child process to run in this workspace's path view.
+    /// Commits the checkout's current file state into the repo (any jj
+    /// command snapshots all workspaces under the fork). Called at turn
+    /// boundaries so the user's own jj view follows the agent's work.
+    /// A no-op for plain (non-jj) directory workdirs.
+    pub async fn snapshot(&self) -> anyhow::Result<()> {
+        if !self.repo.is_jj {
+            return Ok(());
+        }
+        let _guard = self.repo.jj_lock.lock().await;
+        let mut command = self.repo.jj();
+        command.args(["workspace", "list"]);
+        run_jj(command).await.context("jj snapshot")?;
+        Ok(())
+    }
+}
+
+/// One agent's view of the filesystem: a working set of workdir entries
+/// fixed at construction, each binding an origin path to a materialized
+/// [`Workspace`], realized as a private mount namespace with each entry's
+/// slot mounted over its origin path. Entry 0 is the primary workdir: the
+/// default cwd and the path the system prompt reports.
+///
+/// The namespace fd is created lazily on the first prepared command that
+/// needs a cover mount (a daemon restart needs no recovery pass — the first
+/// spawned command pays the ~100µs setup once).
+#[derive(Debug)]
+pub struct View {
+    entries: WorkingSet,
+    /// Present once a command needed a cover mount. Holding the fd keeps the
+    /// namespace alive; commands enter it with `setns` from `pre_exec`.
+    /// The lock serializes namespace creation, so the namespace is built
+    /// exactly once.
+    mnt_ns: Mutex<Option<OwnedFd>>,
+}
+
+/// A nonempty working set of workdirs with pairwise-disjoint origin roots,
+/// primary first. The constructor enforces the invariants, so a held
+/// `WorkingSet` is always valid: overlapping roots would shadow each other's
+/// cover mounts (a parent mounted after a child hides the child's slot).
+#[derive(Debug, Clone)]
+pub struct WorkingSet(Vec<Arc<Workspace>>);
+
+impl WorkingSet {
+    pub fn new(entries: Vec<Arc<Workspace>>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !entries.is_empty(),
+            "a working set needs at least one workdir"
+        );
+        for (i, entry) in entries.iter().enumerate() {
+            Self::ensure_disjoint(&entries[..i], entry.repo())?;
+        }
+        Ok(Self(entries))
+    }
+
+    /// The primary workdir (entry 0): default cwd, prompt header.
+    pub fn primary(&self) -> &Arc<Workspace> {
+        &self.0[0]
+    }
+
+    fn ensure_disjoint(existing: &[Arc<Workspace>], candidate: &Utf8Path) -> anyhow::Result<()> {
+        for entry in existing {
+            anyhow::ensure!(
+                !candidate.starts_with(entry.repo()) && !entry.repo().starts_with(candidate),
+                "workdir root {candidate} overlaps {} already in the working set",
+                entry.repo()
+            );
+        }
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for WorkingSet {
+    type Target = [Arc<Workspace>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a WorkingSet {
+    type Item = &'a Arc<Workspace>;
+    type IntoIter = std::slice::Iter<'a, Arc<Workspace>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl View {
+    /// A view over `entries` (nonempty; entry 0 is the primary workdir).
+    /// Entries must have disjoint origin roots.
+    pub fn new(entries: Vec<Arc<Workspace>>) -> anyhow::Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            entries: WorkingSet::new(entries)?,
+            mnt_ns: Mutex::new(None),
+        }))
+    }
+
+    /// The primary workdir (entry 0): default cwd, prompt header.
+    pub fn primary(&self) -> Arc<Workspace> {
+        Arc::clone(self.entries.primary())
+    }
+
+    /// The working set, primary first.
+    pub fn entries(&self) -> &WorkingSet {
+        &self.entries
+    }
+
+    /// Configure a child process to run in this view: enter the view's
+    /// namespace, set PATH from the primary workdir's repo, and set the cwd
+    /// (relative to the primary workdir; absolute used as-is; `None` for the
+    /// primary itself).
     ///
-    /// User checkouts run directly at the repo root. Pool workspaces enter the
-    /// workspace mount namespace in `pre_exec` and then chdir to the origin
-    /// repo path, which resolves to the pool slot inside that namespace.
+    /// `file_mounts` are `(source, target)` absolute file paths to bind
+    /// inside the namespace; targets must already exist. A view whose
+    /// entries are all live checkouts has no private namespace, so file
+    /// mounts are rejected rather than leaking mounts into the daemon
+    /// namespace.
     pub async fn prepare_command(
         &self,
         command: &mut tokio::process::Command,
-    ) -> anyhow::Result<()> {
-        self.prepare_command_with_file_mounts(command, Vec::new())
-            .await
-    }
-
-    /// Configure a child process to run in this workspace's path view with a
-    /// cwd relative to the origin repo root.
-    pub async fn prepare_command_with_cwd(
-        &self,
-        command: &mut tokio::process::Command,
-        cwd: Option<&Utf8Path>,
-    ) -> anyhow::Result<()> {
-        self.prepare_command_with_cwd_and_file_mounts(command, cwd, Vec::new())
-            .await
-    }
-
-    /// Configure a child process to run in this workspace's path view and
-    /// file-bind additional paths inside that private mount namespace.
-    ///
-    /// `file_mounts` are `(source, target)` absolute file paths. Targets must
-    /// already exist. User-checkout workspaces have no private namespace, so
-    /// file mounts are rejected rather than leaking mounts into the daemon
-    /// namespace.
-    pub async fn prepare_command_with_file_mounts(
-        &self,
-        command: &mut tokio::process::Command,
-        file_mounts: Vec<(Utf8PathBuf, Utf8PathBuf)>,
-    ) -> anyhow::Result<()> {
-        self.prepare_command_with_cwd_and_file_mounts(command, None, file_mounts)
-            .await
-    }
-
-    async fn prepare_command_with_cwd_and_file_mounts(
-        &self,
-        command: &mut tokio::process::Command,
         cwd: Option<&Utf8Path>,
         file_mounts: Vec<(Utf8PathBuf, Utf8PathBuf)>,
     ) -> anyhow::Result<()> {
+        let mut ns_guard = self.mnt_ns.lock().await;
+        let entries = self.entries();
+        let primary = &entries[0];
         command.env(
             "PATH",
-            self.repo
+            primary
+                .repo
                 .path_overrides()
                 .add_to(&std::env::var_os("PATH").expect("PATH must be set")),
         );
-        let cwd = cwd.map_or_else(|| self.repo().to_owned(), |cwd| self.repo().join(cwd));
-        if self.is_user_checkout() {
+        let cwd = cwd.map_or_else(|| primary.repo().to_owned(), |cwd| primary.repo().join(cwd));
+        if !entries.iter().any(|entry| entry.needs_mount()) {
             anyhow::ensure!(
                 file_mounts.is_empty(),
-                "user checkouts have no private mount namespace for file mounts"
+                "live-checkout views have no private mount namespace for file mounts"
             );
             command.current_dir(cwd.as_std_path());
             return Ok(());
         }
-        let ns_fd = std::os::fd::AsRawFd::as_raw_fd(self.mnt_ns().await);
+        let ns_fd = std::os::fd::AsRawFd::as_raw_fd(ensure_ns(&mut ns_guard, entries).await);
         let cwd = CString::new(cwd.as_str().as_bytes())
             .map_err(|_| anyhow::anyhow!("workspace path contains a NUL byte"))?;
         let mut mounts = Vec::with_capacity(file_mounts.len());
@@ -522,16 +626,67 @@ impl Workspace {
         Ok(())
     }
 
-    /// Commits the checkout's current file state into the repo (any jj
-    /// command snapshots all workspaces under the fork). Called at turn
-    /// boundaries so the user's own jj view follows the agent's work.
+    /// Maps a path in the agent-visible view (origin paths) to the host path
+    /// where the bytes actually live (slot checkouts), for in-process file
+    /// operations that do not enter the namespace. Paths outside every entry
+    /// are returned unchanged.
+    pub fn resolve_host_path(&self, path: &Path) -> PathBuf {
+        for entry in self.entries() {
+            if let Ok(rel) = path.strip_prefix(entry.repo().as_std_path()) {
+                return entry.slot().as_std_path().join(rel);
+            }
+        }
+        path.to_owned()
+    }
+
+    /// Commits every jj entry's checkout state into its repo. Called at turn
+    /// boundaries so the user's jj view follows the agent's work in each
+    /// workdir.
     pub async fn snapshot(&self) -> anyhow::Result<()> {
-        let _guard = self.repo.jj_lock.lock().await;
-        let mut command = self.repo.jj();
-        command.args(["workspace", "list"]);
-        run_jj(command).await.context("jj snapshot")?;
+        let mut failures = Vec::new();
+        for entry in self.entries() {
+            if let Err(error) = entry.snapshot().await {
+                failures.push(format!("{}: {error:#}", entry.repo()));
+            }
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "snapshot failed: {}",
+            failures.join("; ")
+        );
         Ok(())
     }
+}
+
+/// The view's mount namespace, created on first need under the view's
+/// namespace lock.
+///
+/// Panics when namespace setup fails (including when
+/// [`init_daemon_namespace`] never ran): an agent whose real cwd contradicts
+/// the paths baked into its context would silently corrupt every later turn,
+/// so there is deliberately no degraded mode.
+async fn ensure_ns<'ns>(
+    ns_guard: &'ns mut Option<OwnedFd>,
+    entries: &[Arc<Workspace>],
+) -> &'ns OwnedFd {
+    if ns_guard.is_none() {
+        let mounts = entries
+            .iter()
+            .filter(|entry| entry.needs_mount())
+            .map(|entry| {
+                (
+                    entry.repo().as_std_path().to_owned(),
+                    entry.slot().as_std_path().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let ns = tokio::task::spawn_blocking(move || ns::create_view_ns(mounts))
+            .await
+            .expect("namespace task panicked")
+            .expect("view mount namespace setup failed");
+        *ns_guard = Some(ns);
+    }
+    ns_guard.as_ref().expect("namespace just ensured")
 }
 
 /// Runs between fork and exec: enter the workspace's mount namespace, move
@@ -545,8 +700,9 @@ fn enter_workspace_ns(
 ) -> std::io::Result<()> {
     use rustix::thread::{CapabilitySet, CapabilitySets, LinkNameSpaceType};
 
-    // SAFETY: the fd is kept alive by the `Workspace` held by the spawning
-    // agent/tool for the duration of spawn.
+    // SAFETY: the fd is kept alive by the `View` held by the spawning
+    // agent/tool for the duration of spawn (a view's namespace fd is never
+    // dropped once created).
     let fd = unsafe { BorrowedFd::borrow_raw(ns_fd) };
     rustix::thread::move_into_link_name_space(fd, Some(LinkNameSpaceType::Mount))?;
     for (source, target) in file_mounts {
@@ -614,6 +770,36 @@ pub fn resolve_repo_root(path: &Path) -> anyhow::Result<Utf8PathBuf> {
         return Ok(origin);
     }
     Ok(path)
+}
+
+/// Resolves a workdir path for an agent working set: walks up to the
+/// containing jj repo root (through workspace pointers) when there is one,
+/// otherwise canonicalizes the plain directory. Returns the root and whether
+/// it is a jj repo.
+pub fn resolve_workdir_root(path: &Path) -> anyhow::Result<(Utf8PathBuf, bool)> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "workdir path must be absolute: {}",
+        path.display()
+    );
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("workdir does not exist: {}", path.display()))?;
+    let canonical = Utf8PathBuf::try_from(canonical).context("workdir path is not valid UTF-8")?;
+    anyhow::ensure!(
+        canonical.is_dir(),
+        "workdir is not a directory: {canonical}"
+    );
+    let mut cursor: &Utf8Path = &canonical;
+    loop {
+        if cursor.join(".jj").is_dir() {
+            return Ok((resolve_repo_root(cursor.as_std_path())?, true));
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => return Ok((canonical, false)),
+        }
+    }
 }
 
 /// The origin's `.jj/ws-parent -> ..` symlink (back to the repo root — the

@@ -4,7 +4,7 @@
 
 use std::fs::File;
 use std::os::fd::{AsFd as _, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use rustix::fs::CWD;
@@ -56,51 +56,60 @@ pub unsafe fn init_daemon_namespace() -> anyhow::Result<()> {
 /// [`create_workspace_ns`] binds the real origin.
 pub const WS_PARENT: &str = "ws-parent";
 
-/// Creates the mount namespace for one workspace: a copy of the daemon's
-/// namespace with the slot checkout mounted over the origin repo path, and
-/// the origin bound back in at `.jj/ws-parent` for the slot's repo pointers.
-/// Runs on a dedicated thread because the thread ends up permanently inside
-/// the new namespace — the returned `/proc/thread-self/ns/mnt` fd is what
-/// keeps it alive after the thread exits.
-pub fn create_workspace_ns(repo: &Path, slot: &Path) -> anyhow::Result<OwnedFd> {
-    let repo = repo.to_owned();
-    let slot = slot.to_owned();
+/// Creates the mount namespace for one agent view: a copy of the daemon's
+/// namespace with each entry's slot checkout mounted over its origin repo
+/// path, and each origin bound back in at `.jj/ws-parent` for the slot's
+/// repo pointers. Runs on a dedicated thread because the thread ends up
+/// permanently inside the new namespace — the returned
+/// `/proc/thread-self/ns/mnt` fd is what keeps it alive after the thread
+/// exits.
+pub fn create_view_ns(mounts: Vec<(PathBuf, PathBuf)>) -> anyhow::Result<OwnedFd> {
     std::thread::spawn(move || -> anyhow::Result<OwnedFd> {
         // SAFETY: NEWNS implies unsharing fs state for this thread only; the
         // thread exits immediately after and shares nothing else.
         unsafe { unshare_unsafe(UnshareFlags::NEWNS) }.context("unshare mount namespace")?;
-        // Clone both trees before the cover mount hides the origin.
-        let clone = |path: &Path| {
-            open_tree(
-                CWD,
-                path,
-                OpenTreeFlags::OPEN_TREE_CLONE
-                    | OpenTreeFlags::AT_RECURSIVE
-                    | OpenTreeFlags::OPEN_TREE_CLOEXEC,
-            )
-        };
-        let origin_tree = clone(&repo).context("open repo tree")?;
-        let slot_tree = clone(&slot).context("open slot tree")?;
-        move_mount(
-            slot_tree.as_fd(),
-            "",
-            CWD,
-            &repo,
-            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-        )
-        .context("mount slot over repo path")?;
-        // The path now resolves inside the slot: its empty ws-parent dir.
-        move_mount(
-            origin_tree.as_fd(),
-            "",
-            CWD,
-            repo.join(".jj").join(WS_PARENT),
-            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-        )
-        .context("bind origin at ws-parent")?;
+        for (repo, slot) in &mounts {
+            cover_origin_with_slot(repo, slot)?;
+        }
         let fd = File::open("/proc/thread-self/ns/mnt").context("open mount namespace fd")?;
         Ok(fd.into())
     })
     .join()
-    .expect("workspace namespace thread panicked")
+    .expect("view namespace thread panicked")
+}
+
+/// The per-entry mount dance, in whatever namespace this thread is in:
+/// mount the slot checkout over the origin repo path and bind the origin
+/// back in at the slot's `.jj/ws-parent`.
+fn cover_origin_with_slot(repo: &Path, slot: &Path) -> anyhow::Result<()> {
+    // Clone both trees before the cover mount hides the origin.
+    let clone = |path: &Path| {
+        open_tree(
+            CWD,
+            path,
+            OpenTreeFlags::OPEN_TREE_CLONE
+                | OpenTreeFlags::AT_RECURSIVE
+                | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+        )
+    };
+    let origin_tree = clone(repo).context("open repo tree")?;
+    let slot_tree = clone(slot).context("open slot tree")?;
+    move_mount(
+        slot_tree.as_fd(),
+        "",
+        CWD,
+        repo,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .context("mount slot over repo path")?;
+    // The path now resolves inside the slot: its empty ws-parent dir.
+    move_mount(
+        origin_tree.as_fd(),
+        "",
+        CWD,
+        repo.join(".jj").join(WS_PARENT),
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .context("bind origin at ws-parent")?;
+    Ok(())
 }

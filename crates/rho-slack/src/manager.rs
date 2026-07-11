@@ -439,10 +439,10 @@ impl SlackManager {
                             .to_owned(),
                     ));
                 };
-                let start = rho_agent::StartWorkspace::Create {
+                let start = vec![rho_agent::StartWorkdir::Create {
                     repo: self.pool.repo(&config.coordinator_repo).await?,
                     parent_revset: "@-".to_owned(),
-                };
+                }];
                 let (agent_id, agent) = self
                     .pool
                     .create_with_tool_extension(self.topic_id, AgentRole::PM, None, start, {

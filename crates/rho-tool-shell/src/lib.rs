@@ -20,7 +20,7 @@ use rho_core::{
     ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
     ToolOutputStatus, ToolResultMetadata, ToolSpec, ToolType,
 };
-use rho_workspaces::{PathOverrides, Workspace};
+use rho_workspaces::{PathOverrides, View};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -48,7 +48,7 @@ enum ExecContext {
         working_directory: Utf8PathBuf,
         path_overrides: PathOverrides,
     },
-    Workspace(Arc<Workspace>),
+    View(Arc<View>),
 }
 
 #[derive(Clone, Debug)]
@@ -66,13 +66,13 @@ struct ShellArgs {
 }
 
 impl ShellTools {
-    /// Tools for an agent's workspace. Namespace setup and cache warming run
-    /// lazily on the first shell command, hiding their latency behind the
+    /// Tools for an agent's workspace view. Namespace setup and cache warming
+    /// run lazily on the first shell command, hiding their latency behind the
     /// model's first response.
-    pub fn new(timeout: Duration, workspace: Arc<Workspace>) -> Self {
+    pub fn new(timeout: Duration, view: Arc<View>) -> Self {
         Self {
             default_timeout: timeout,
-            exec: ExecContext::Workspace(workspace),
+            exec: ExecContext::View(view),
             env: Vec::new(),
         }
     }
@@ -98,14 +98,28 @@ impl ShellTools {
         self
     }
 
-    /// Where in-process file operations (patches) apply: the real checkout
-    /// files, never a namespace-relative path.
-    fn patch_directory(&self) -> &Path {
+    /// Resolve a patch path to where in-process file operations apply: the
+    /// real checkout files, never a namespace-relative path. Relative paths
+    /// land in the primary workdir's checkout; absolute paths inside any
+    /// workdir are translated to that workdir's checkout.
+    fn resolve_patch_path(&self, path: &Path) -> std::path::PathBuf {
         match &self.exec {
             ExecContext::Directory {
                 working_directory, ..
-            } => working_directory.as_std_path(),
-            ExecContext::Workspace(workspace) => workspace.slot().as_std_path(),
+            } => {
+                if path.is_absolute() {
+                    path.to_owned()
+                } else {
+                    working_directory.as_std_path().join(path)
+                }
+            }
+            ExecContext::View(view) => {
+                if path.is_absolute() {
+                    view.resolve_host_path(path)
+                } else {
+                    view.primary().slot().as_std_path().join(path)
+                }
+            }
         }
     }
 
@@ -239,10 +253,8 @@ impl ShellTools {
                 );
                 command.current_dir(cwd.as_std_path());
             }
-            ExecContext::Workspace(workspace) => {
-                workspace
-                    .prepare_command_with_cwd(&mut command, cwd)
-                    .await?;
+            ExecContext::View(view) => {
+                view.prepare_command(&mut command, cwd, Vec::new()).await?;
             }
         }
 
@@ -319,7 +331,9 @@ impl ShellTools {
             return Err(anyhow!("apply_patch expects a custom tool call"));
         }
         let (output, metadata) =
-            apply_patch::apply_patch_with_metadata(&call.arguments, self.patch_directory())?;
+            apply_patch::apply_patch_with_metadata(&call.arguments, &|path| {
+                self.resolve_patch_path(path)
+            })?;
         Ok((
             output,
             Some(ToolResultMetadata::ApplyPatch(ApplyPatchMetadata {

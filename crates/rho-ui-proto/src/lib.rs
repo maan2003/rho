@@ -195,8 +195,9 @@ pub enum McpAgentToolRequest {
     SpawnAgent {
         task_name: String,
         prompt: String,
-        workspace: McpSpawnWorkspace,
-        repo: Option<Utf8PathBuf>,
+        /// The child's working set, primary first; empty forks the spawning
+        /// agent's whole working set.
+        workdirs: Vec<McpSpawnWorkdir>,
         role: String,
     },
     SendMessage {
@@ -211,11 +212,13 @@ pub enum McpAgentToolRequest {
     },
 }
 
+/// One spawn `workdirs` entry, passed through as the tool surface received
+/// it; the daemon validates and parses it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum McpSpawnWorkspace {
-    Join,
-    Fork,
-    New { revset: Option<String> },
+pub struct McpSpawnWorkdir {
+    pub repo: String,
+    pub checkout: Option<String>,
+    pub revset: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

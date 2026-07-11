@@ -20,7 +20,7 @@ use serde_json::json;
 
 use crate::MessageDelivery;
 use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
-use crate::pool::{AgentPool, SpawnWorkspace};
+use crate::pool::{AgentPool, SpawnCheckout, SpawnWorkdir};
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
 /// pool for spawning, mail routing, and id resolution. `Agent::create` and
@@ -93,7 +93,10 @@ const AGENT_ID_EXAMPLE: &str = "ag-h6u7";
 pub fn is_agent_tool(name: &str) -> bool {
     matches!(
         name,
-        SPAWN_AGENT_TOOL_NAME | SEND_MESSAGE_TOOL_NAME | INTERRUPT_AGENT_TOOL_NAME | WAIT_TOOL_NAME
+        SPAWN_AGENT_TOOL_NAME
+            | SEND_MESSAGE_TOOL_NAME
+            | INTERRUPT_AGENT_TOOL_NAME
+            | WAIT_TOOL_NAME
     )
 }
 
@@ -110,8 +113,8 @@ fn spawn_agent_spec() -> ToolSpec {
     ToolSpec {
         name: ToolName::try_from(SPAWN_AGENT_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
-        description: "Start a sub-agent working in this repository (or a specified repository) and return its agent id \
-                      immediately. Use this for a concrete, bounded subtask, including side \
+        description: "Start a sub-agent with its own working set of workdirs (defaulting to a \
+                      fork of yours) and return its agent id immediately. Use this for a concrete, bounded subtask, including side \
                       investigations or experiments when the user asks for them or they de-risk \
                       the main task. The subtask should run independently alongside useful local \
                       work; otherwise continue locally. The prompt must be self-contained and \
@@ -123,7 +126,7 @@ fn spawn_agent_spec() -> ToolSpec {
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["task_name", "prompt", "workspace", "role"],
+            "required": ["task_name", "prompt", "role"],
             "properties": {
                 "task_name": {
                     "type": "string",
@@ -133,22 +136,43 @@ fn spawn_agent_spec() -> ToolSpec {
                     "type": "string",
                     "description": "Complete, self-contained task for the sub-agent."
                 },
-                "workspace": {
-                    "type": "string",
-                    "enum": ["join", "fork", "new"],
-                    "description": "join: share this agent's working copy (read-mostly tasks). \
-                                    fork: own jj workspace forked from this agent's current \
-                                    change (editing tasks). new: own jj workspace on a fresh \
-                                    change from trunk (or `revset`)."
-                },
-                "revset": {
-                    "type": "string",
-                    "description": "With workspace=new: jj revset for the parent revision \
-                                    (default trunk())."
-                },
-                "repo": {
-                    "type": "string",
-                    "description": "With workspace=new: absolute path to a jj repository. Defaults to this agent's repository."
+                "workdirs": {
+                    "type": "array",
+                    "description": "The child's working set, primary workdir first. Omit for \
+                                    the default: your whole working set, with the child's own \
+                                    jj workspace forked from your current change in each \
+                                    workdir (safe for concurrent edits). List entries \
+                                    explicitly to share your checkouts, start from another \
+                                    revision, or work in other repositories.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["repo"],
+                        "properties": {
+                            "repo": {
+                                "type": "string",
+                                "description": "Absolute path of the repository or directory \
+                                                (or anywhere inside it)."
+                            },
+                            "checkout": {
+                                "type": "string",
+                                "enum": ["own", "shared"],
+                                "description": "own (default): the child edits its own \
+                                                isolated checkout on a new change; your files \
+                                                are untouched. shared: the child works in the \
+                                                same checkout you use — its edits appear in \
+                                                your files immediately (read-mostly tasks). \
+                                                Plain non-jj directories are always shared."
+                            },
+                            "revset": {
+                                "type": "string",
+                                "description": "With checkout=own: jj revset the child's \
+                                                change starts from. Defaults to your current \
+                                                change in that repo, or trunk() for \
+                                                repositories outside your working set."
+                            }
+                        }
+                    }
                 },
                 "role": {
                     "type": "string",
@@ -262,18 +286,46 @@ pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: ToolCall) -> T
 struct SpawnArgs {
     task_name: String,
     prompt: String,
-    workspace: WorkspaceChoice,
-    revset: Option<String>,
-    repo: Option<String>,
+    #[serde(default)]
+    workdirs: Vec<SpawnWorkdirArgs>,
     role: String,
 }
 
+/// One `workdirs` entry as the spawn tools accept it; shared with the MCP
+/// agent-tool surface so both parse identically.
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum WorkspaceChoice {
-    Join,
-    Fork,
-    New,
+pub struct SpawnWorkdirArgs {
+    pub repo: String,
+    pub checkout: Option<String>,
+    pub revset: Option<String>,
+}
+
+/// Parses tool-surface workdir entries into pool spawn entries.
+pub fn parse_spawn_workdirs(entries: Vec<SpawnWorkdirArgs>) -> anyhow::Result<Vec<SpawnWorkdir>> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let checkout = match entry.checkout.as_deref() {
+                None | Some("own") => SpawnCheckout::Own {
+                    revset: entry.revset,
+                },
+                Some("shared") => {
+                    anyhow::ensure!(
+                        entry.revset.is_none(),
+                        "revset is only supported with checkout=own"
+                    );
+                    SpawnCheckout::Shared
+                }
+                Some(other) => {
+                    anyhow::bail!("unsupported checkout {other:?}; expected own or shared")
+                }
+            };
+            Ok(SpawnWorkdir {
+                repo: Utf8PathBuf::from(entry.repo),
+                checkout,
+            })
+        })
+        .collect()
 }
 
 async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
@@ -281,15 +333,7 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     if args.prompt.trim().is_empty() {
         anyhow::bail!("prompt must not be empty");
     }
-    let workspace = match (args.workspace, args.repo) {
-        (WorkspaceChoice::Join, None) => SpawnWorkspace::Join,
-        (WorkspaceChoice::Fork, None) => SpawnWorkspace::Fork,
-        (WorkspaceChoice::New, repo) => SpawnWorkspace::New {
-            revset: args.revset,
-            repo: repo.map(Utf8PathBuf::from),
-        },
-        (_, Some(_)) => anyhow::bail!("repo is only supported with workspace=new"),
-    };
+    let workdirs = parse_spawn_workdirs(args.workdirs)?;
     let task_name = args.task_name.clone();
     let config = parse_spawn_role(&args.role)?;
     let pool = tools.pool()?;
@@ -298,12 +342,12 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
             tools.self_id,
             args.task_name,
             args.prompt,
-            workspace,
+            workdirs,
             config,
         )
         .await?;
-    let child_workspace = pool.db().read().get_agent(child_id).workspace;
-    let workspace_note = match child_workspace.workspace_name() {
+    let child_record = pool.db().read().get_agent(child_id);
+    let workspace_note = match child_record.primary_workdir().workspace_name() {
         Some(workspace) => format!(
             " Its jj workspace is `{workspace}`; inspect its working-copy commit with `jj diff -r \
              '{workspace}@' --stat`."

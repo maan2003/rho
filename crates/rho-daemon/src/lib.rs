@@ -11,7 +11,7 @@ use rho_agent::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _, Status,
     TopicId,
 };
-use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent, SpawnWorkspace};
+use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
 use rho_core::{ContextBlock, text_content};
 use rho_db::RhoDb;
@@ -20,7 +20,7 @@ use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
-    McpAgentToolResponse, McpSpawnWorkspace, ServerMessage, StartMode, UiAgentSummary, UiAttention,
+    McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention,
     UiTopic, UiWorkdir, read_frame_counted, write_frame_counted,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc};
@@ -509,10 +509,10 @@ impl AgentRegistry {
                             agent_id,
                             parent_agent: agent.parent_agent,
                             role: agent.config(),
-                            display_name: agent.display_name,
                             created_at: agent.created_at,
                             updated_at: agent.updated_at,
-                            workspace: agent.workspace,
+                            workspace: agent.primary_workdir().clone(),
+                            display_name: agent.display_name,
                             status: agent.status,
                             attention: attention_level(kinds.get(&agent_id), agent.disposition),
                             last_active: agent.last_user_message.max(agent.created_at),
@@ -612,19 +612,21 @@ impl AgentRegistry {
         let start = match start {
             StartMode::NewOn { repo, revset } => {
                 let repo = validate_repo_root(repo)?;
-                rho_agent::StartWorkspace::Create {
+                vec![rho_agent::StartWorkdir::Create {
                     repo: self.pool.repo(&repo).await?,
                     parent_revset: revset,
-                }
+                }]
             }
             StartMode::Join(JoinTarget::Workspace(info)) => {
-                rho_agent::StartWorkspace::Existing(self.pool.open_workspace(&info).await?)
+                vec![rho_agent::StartWorkdir::Existing(
+                    self.pool.open_workspace(&info).await?,
+                )]
             }
             StartMode::Join(JoinTarget::User { repo }) => {
                 let repo = validate_repo_root(repo)?;
-                rho_agent::StartWorkspace::Existing(
+                vec![rho_agent::StartWorkdir::Existing(
                     self.pool.repo(&repo).await?.user_checkout().await?,
-                )
+                )]
             }
         };
         let (agent_id, agent) = self.pool.create(topic_id, role, None, start).await?;
@@ -649,33 +651,34 @@ impl AgentRegistry {
             McpAgentToolRequest::SpawnAgent {
                 task_name,
                 prompt,
-                workspace,
-                repo,
+                workdirs,
                 role,
             } => {
                 if prompt.trim().is_empty() {
                     anyhow::bail!("prompt must not be empty");
                 }
-                let workspace = match (workspace, repo) {
-                    (McpSpawnWorkspace::Join, None) => SpawnWorkspace::Join,
-                    (McpSpawnWorkspace::Fork, None) => SpawnWorkspace::Fork,
-                    (McpSpawnWorkspace::New { revset }, repo) => {
-                        SpawnWorkspace::New { revset, repo }
-                    }
-                    (_, Some(_)) => anyhow::bail!("repo is only supported with workspace=new"),
-                };
+                let workdirs = rho_agent::multi_agent_tools::parse_spawn_workdirs(
+                    workdirs
+                        .into_iter()
+                        .map(|entry| rho_agent::multi_agent_tools::SpawnWorkdirArgs {
+                            repo: entry.repo,
+                            checkout: entry.checkout,
+                            revset: entry.revset,
+                        })
+                        .collect(),
+                )?;
                 let child_id = self
                     .pool
                     .spawn_child(
                         self_agent_id,
                         task_name.clone(),
                         prompt,
-                        workspace,
+                        workdirs,
                         rho_agent::multi_agent_tools::parse_spawn_role(&role)?,
                     )
                     .await?;
-                let child_workspace = self.pool.db().read().get_agent(child_id).workspace;
-                let workspace_note = match child_workspace.workspace_name() {
+                let child_record = self.pool.db().read().get_agent(child_id);
+                let workspace_note = match child_record.primary_workdir().workspace_name() {
                     Some(workspace) => format!(
                         " Its jj workspace is `{workspace}`; inspect its working-copy commit with \
                          `jj diff -r '{workspace}@' --stat`."

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolType};
 use rho_tool_shell::{SHELL_COMMAND_TOOL_NAME, ShellTools};
-use rho_workspaces::{Repo, WorkspaceId, WorkspaceIdDomain};
+use rho_workspaces::{Repo, View, WorkspaceId, WorkspaceIdDomain};
 
 fn shell_call(command: &str) -> ToolCall {
     ToolCall {
@@ -79,7 +79,10 @@ async fn run() -> anyhow::Result<()> {
         "slots live inside the repo's pool"
     );
 
-    let tools = ShellTools::new(Duration::from_secs(30), Arc::clone(&workspace));
+    let tools = ShellTools::new(
+        Duration::from_secs(30),
+        View::new(vec![Arc::clone(&workspace)])?,
+    );
 
     let started = std::time::Instant::now();
     let result = tools.call(shell_call("pwd; cat file.txt")).await;
@@ -184,7 +187,7 @@ async fn run() -> anyhow::Result<()> {
         Arc::ptr_eq(&workspace, &joined),
         "join shares the live workspace instance"
     );
-    let tools_joined = ShellTools::new(Duration::from_secs(30), joined);
+    let tools_joined = ShellTools::new(Duration::from_secs(30), View::new(vec![joined])?);
     let result = tools_joined
         .call(shell_call("echo joint > joint.txt"))
         .await;
@@ -200,7 +203,7 @@ async fn run() -> anyhow::Result<()> {
     // A user-checkout workspace works directly in the user's own checkout:
     // real repo path, no namespace, edits land in the origin immediately.
     let uc = repo_handle.user_checkout().await?;
-    let tools_uc = ShellTools::new(Duration::from_secs(30), uc);
+    let tools_uc = ShellTools::new(Duration::from_secs(30), View::new(vec![uc])?);
     let result = tools_uc.call(shell_call("pwd && echo here > uc.txt")).await;
     assert!(result.output.contains(repo.to_str().unwrap()));
     assert_eq!(std::fs::read_to_string(repo.join("uc.txt"))?, "here\n");
@@ -210,7 +213,7 @@ async fn run() -> anyhow::Result<()> {
     // Two independent sibling workspaces, both children of the user's @.
     let wa = repo_handle.create_workspace(agent_a_id, "@").await?;
     let wb = repo_handle.create_workspace(agent_b_id, "@").await?;
-    let tools_a = ShellTools::new(Duration::from_secs(30), Arc::clone(&wa));
+    let tools_a = ShellTools::new(Duration::from_secs(30), View::new(vec![Arc::clone(&wa)])?);
 
     // (1) Snapshot from OUTSIDE (origin jj): the user's edit follows down
     // into both slots via rebase_descendants, sibling edits stay isolated
@@ -301,7 +304,7 @@ async fn run() -> anyhow::Result<()> {
         !listing.contains(&agent_a_name) && !listing.contains(&main_name),
         "other stale attachments should have been reaped: {listing}"
     );
-    let tools_b2 = ShellTools::new(Duration::from_secs(30), Arc::clone(&wb2));
+    let tools_b2 = ShellTools::new(Duration::from_secs(30), View::new(vec![Arc::clone(&wb2)])?);
     let result = tools_b2.call(shell_call("cat b.txt")).await;
     assert!(
         result.output.contains("two"),
@@ -309,6 +312,44 @@ async fn run() -> anyhow::Result<()> {
         result.output
     );
     println!("lazy reap + reattach: ok");
+
+    // ---- multi-workdir view: two repos in one namespace ----
+    // A view over two workdirs mounts both entries' slots over their origin
+    // paths: commands see the agent's workspace checkout in each repo, at
+    // the repo's real path.
+    let repo2 = repo.parent().unwrap().join("repo2");
+    std::fs::create_dir(&repo2)?;
+    let status = std::process::Command::new("jj")
+        .current_dir(&repo2)
+        .args(["git", "init", "--colocate"])
+        .status()?;
+    assert!(status.success());
+    std::fs::write(repo2.join("file.txt"), "user\n")?;
+    jj(&repo2, &["commit", "-m", "init"]);
+    std::fs::write(repo2.join("file.txt"), "user\n")?;
+    jj(&repo2, &["st"]);
+    let repo2_handle = Arc::new(Repo::open(&repo2)?);
+    let repo2_ws_id = WorkspaceId::from_counter(4, &workspace_domain).unwrap();
+    let repo2_ws = repo2_handle.create_workspace(repo2_ws_id, "@").await?;
+    // Distinguish the workspace checkout from the user's live files.
+    std::fs::write(repo2_ws.slot().join("file.txt"), "workspace\n")?;
+
+    let view = View::new(vec![Arc::clone(&wb2), Arc::clone(&repo2_ws)])?;
+    let tools_multi = ShellTools::new(Duration::from_secs(30), Arc::clone(&view));
+    let repo2_path = repo2.display();
+    let result = tools_multi
+        .call(shell_call(&format!("cat {repo2_path}/file.txt")))
+        .await;
+    assert!(
+        result.output.contains("workspace"),
+        "the second workdir shows the workspace checkout at its real path: {}",
+        result.output
+    );
+    assert!(
+        View::new(vec![Arc::clone(&wb2), Arc::clone(&wb2)]).is_err(),
+        "a view with the same repo twice must be rejected"
+    );
+    println!("multi-workdir view: ok");
 
     println!("smoke test passed");
     Ok(())

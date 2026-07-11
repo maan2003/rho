@@ -88,7 +88,16 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
         )?;
         writeln!(output, "  last_user_message: {}", agent.last_user_message.0)?;
         writeln!(output, "  mode: {}", config_name(agent.config()))?;
-        writeln!(output, "  workspace: {}", workspace_name(&agent.workspace))?;
+        writeln!(
+            output,
+            "  workdirs: {}",
+            agent
+                .workdirs
+                .iter()
+                .map(workspace_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
         match agent.runtime {
             AgentRuntime::Rho { prompt_cache_key } => {
                 writeln!(output, "  runtime: rho")?;
@@ -97,8 +106,11 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
             AgentRuntime::Claude { session_id } => {
                 writeln!(output, "  runtime: claude")?;
                 writeln!(output, "  session_id: {session_id}")?;
-                match rho_claude::find_session_transcript(session_id, agent.workspace.repo())
-                    .await?
+                match rho_claude::find_session_transcript(
+                    session_id,
+                    agent.primary_workdir().repo(),
+                )
+                .await?
                 {
                     Some(path) => writeln!(output, "  transcript: {path}")?,
                     None => writeln!(output, "  transcript: <missing>")?,
@@ -157,7 +169,8 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 writeln!(output, "  runtime: claude")?;
                 writeln!(output, "  session_id: {session_id}")?;
                 let transcript =
-                    rho_claude::find_session_transcript(session_id, agent.workspace.repo()).await?;
+                    rho_claude::find_session_transcript(session_id, agent.primary_workdir().repo())
+                        .await?;
                 let Some(transcript) = transcript else {
                     writeln!(output, "  transcript: <missing>")?;
                     continue;
@@ -165,7 +178,7 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 writeln!(output, "  transcript: {transcript}")?;
                 let messages = rho_claude::read_session_messages_by_id(
                     session_id,
-                    agent.workspace.repo(),
+                    agent.primary_workdir().repo(),
                     rho_claude::SessionMessagesOptions::default(),
                 )
                 .await?;

@@ -15,10 +15,20 @@ than by running a supervisor, extension protocol, or daemon process graph.
   scheduling, streamed transcript handling, inference response block recording,
   and persistence hooks. It depends directly on the concrete `rho-inference`
   session.
+- `rho-workspaces` owns checkout materialization and filesystem views. A
+  `Workspace` is one materialized checkout (a jj pool slot, the user's live
+  checkout, or a plain directory); a `View` is one agent's world: a working
+  set of workdir entries, fixed at spawn, realized as a private mount
+  namespace with each entry's slot mounted over its origin path. Entry 0 is
+  the primary workdir (default cwd, prompt header).
+  Agents joining a workspace share the `Workspace`; each agent has its own
+  `View`. All jj workspaces created for one agent share one workspace id, so
+  the agent's jj workspace name is the same in every repo it forks.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Results are cached per
-  `rho-workspaces::Workspace`; `rho-agent` owns system prompt rendering.
-  Clients have no special skill or AGENTS.md command path.
+  `rho-workspaces::Workspace` and merged across a view's workdirs;
+  `rho-agent` owns system prompt rendering. Clients have no special skill or
+  AGENTS.md command path.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
   rendering. They should not own inference protocol details.
 - `rho-voice` is a provider-protocol crate outside the inference contract: it

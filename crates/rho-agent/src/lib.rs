@@ -15,7 +15,7 @@ use rho_core::{
 use rho_db::RhoDb;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
-use rho_workspaces::{Repo, Workspace};
+use rho_workspaces::{Repo, View, Workspace};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -445,18 +445,48 @@ pub struct Agent {
     state: Arc<RwLock<AgentState>>,
     control: mpsc::UnboundedSender<AgentControl>,
     notify: Arc<Notify>,
+    view: Arc<View>,
 }
 
-/// Where a new agent's workspace comes from.
-pub enum StartWorkspace {
+/// Where one of a new agent's workdirs comes from. Agents start from a
+/// nonempty list of these; the first entry is the primary workdir.
+pub enum StartWorkdir {
     /// Create a jj workspace on a new change on top of the revset.
     Create {
         repo: Arc<Repo>,
         parent_revset: String,
     },
-    /// Work in an existing workspace (joining another agent, or the user's
-    /// checkout).
+    /// Work in an existing workspace (joining another agent, the user's
+    /// checkout, or a plain live directory).
     Existing(Arc<Workspace>),
+}
+
+/// Materializes a new agent's workdirs into checkouts. All `Create` entries
+/// share one freshly allocated workspace id, so the agent's jj workspace
+/// name is the same in every repo it forks.
+pub(crate) async fn materialize_workdirs(
+    write: &mut rho_db::WriteTxn,
+    start: Vec<StartWorkdir>,
+) -> anyhow::Result<Vec<Arc<Workspace>>> {
+    anyhow::ensure!(!start.is_empty(), "an agent needs at least one workdir");
+    let workspace_id = start
+        .iter()
+        .any(|entry| matches!(entry, StartWorkdir::Create { .. }))
+        .then(|| write.alloc_workspace_id());
+    let mut entries = Vec::with_capacity(start.len());
+    for entry in start {
+        entries.push(match entry {
+            StartWorkdir::Create {
+                repo,
+                parent_revset,
+            } => {
+                let id = workspace_id.expect("allocated for Create entries");
+                repo.create_workspace(id, &parent_revset).await?
+            }
+            StartWorkdir::Existing(workspace) => workspace,
+        });
+    }
+    Ok(entries)
 }
 
 impl Agent {
@@ -467,7 +497,7 @@ impl Agent {
         mode: SessionBinding,
         topic_id: db::TopicId,
         display_name: Option<String>,
-        start: StartWorkspace,
+        start: Vec<StartWorkdir>,
         parent: Option<AgentId>,
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
         // multi-agent tools are not offered.
@@ -486,23 +516,18 @@ impl Agent {
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
         let tool_extension = tool_extension.map(|factory| factory(agent_id));
-        let workspace = match start {
-            StartWorkspace::Create {
-                repo,
-                parent_revset,
-            } => {
-                let workspace_id = write.alloc_workspace_id();
-                repo.create_workspace(workspace_id, &parent_revset).await?
-            }
-            StartWorkspace::Existing(workspace) => workspace,
-        };
+        let entries = materialize_workdirs(&mut write, start).await?;
+        let view = View::new(entries.clone())?;
         let now = UnixMillis::now();
         let next_event = write.create_agent(
             now,
             agent_id,
             topic_id,
             display_name,
-            workspace.info().clone(),
+            entries
+                .iter()
+                .map(|workspace| workspace.info().clone())
+                .collect(),
             mode,
             AgentRuntime::Rho { prompt_cache_key },
             parent,
@@ -517,7 +542,7 @@ impl Agent {
             prompt_cache_key,
             agent_id,
             next_event,
-            workspace,
+            view,
             parent,
             pool,
             tool_extension,
@@ -530,7 +555,7 @@ impl Agent {
         db: RhoDb,
         auth: InferenceAuth,
         agent_id: AgentId,
-        workspace: Arc<Workspace>,
+        view: Arc<View>,
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
         // multi-agent tools are not offered.
         pool: std::sync::Weak<pool::AgentPool>,
@@ -561,7 +586,7 @@ impl Agent {
             prompt_cache_key,
             agent_id,
             next_event,
-            workspace,
+            view,
             record.parent_agent,
             pool,
             tool_extension,
@@ -581,7 +606,7 @@ impl Agent {
         prompt_cache_key: PromptCacheKey,
         agent_id: AgentId,
         next_event: AgentEventPos,
-        workspace: Arc<Workspace>,
+        view: Arc<View>,
         parent: Option<AgentId>,
         pool: std::sync::Weak<pool::AgentPool>,
         tool_extension: Option<Arc<dyn AgentToolExtension>>,
@@ -590,7 +615,7 @@ impl Agent {
         let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            Arc::clone(&workspace),
+            Arc::clone(&view),
         )
         .with_env("RHO_AGENT_ID", agent_id.encoded());
         let multi_agent = pool
@@ -615,7 +640,7 @@ impl Agent {
                 tool_extension.as_ref(),
             ),
             system_prompt: system_prompt::prompt(
-                workspace.as_ref(),
+                view.as_ref(),
                 multi_agent.as_ref(),
                 code_mode.is_some(),
                 role,
@@ -632,7 +657,7 @@ impl Agent {
             notify: Arc::clone(&notify),
             control_rx,
             shell_tools,
-            workspace,
+            view: Arc::clone(&view),
             persistence: AgentPersistence {
                 db,
                 agent_id,
@@ -649,7 +674,13 @@ impl Agent {
             state,
             control,
             notify,
+            view,
         }
+    }
+
+    /// The agent's filesystem view (its working set of workdirs).
+    pub fn view(&self) -> &Arc<View> {
+        &self.view
     }
 
     pub fn state(&self) -> AgentState {
@@ -871,7 +902,7 @@ struct AgentLoop {
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<AgentControl>,
     shell_tools: ShellTools,
-    workspace: Arc<Workspace>,
+    view: Arc<View>,
     persistence: AgentPersistence,
     /// Present on pooled agents: identity + `Weak` pool handle for the
     /// built-in spawn/send/wait tools and parent result/error mail.
@@ -1248,9 +1279,9 @@ impl AgentLoop {
                                     // Turn complete: commit the checkout's
                                     // state so the user's jj view follows the
                                     // agent's work (fire-and-forget).
-                                    let workspace = Arc::clone(&self.workspace);
+                                    let view = Arc::clone(&self.view);
                                     tokio::spawn(async move {
-                                        if let Err(error) = workspace.snapshot().await {
+                                        if let Err(error) = view.snapshot().await {
                                             eprintln!("rho-agent: snapshot failed: {error:#}");
                                         }
                                     });

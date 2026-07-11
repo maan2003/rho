@@ -1,10 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
-use camino::Utf8PathBuf;
 use rho_agent::multi_agent_tools;
 use rho_ui_proto::{
-    AgentId, AgentIdDomain, ClientMessage, McpAgentToolRequest, McpSpawnWorkspace, ServerMessage,
+    AgentId, AgentIdDomain, ClientMessage, McpAgentToolRequest, McpSpawnWorkdir, ServerMessage,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -145,15 +144,15 @@ fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequ
             Ok(McpAgentToolRequest::SpawnAgent {
                 task_name: args.task_name,
                 prompt: args.prompt,
-                workspace: match args.workspace.as_str() {
-                    "join" => McpSpawnWorkspace::Join,
-                    "fork" => McpSpawnWorkspace::Fork,
-                    "new" => McpSpawnWorkspace::New {
-                        revset: args.revset,
-                    },
-                    other => anyhow::bail!("unsupported workspace choice: {other}"),
-                },
-                repo: args.repo.map(Utf8PathBuf::from),
+                workdirs: args
+                    .workdirs
+                    .into_iter()
+                    .map(|entry| McpSpawnWorkdir {
+                        repo: entry.repo,
+                        checkout: entry.checkout,
+                        revset: entry.revset,
+                    })
+                    .collect(),
                 role: args.role,
             })
         }
@@ -200,9 +199,8 @@ struct ToolCallParams {
 struct SpawnArgs {
     task_name: String,
     prompt: String,
-    workspace: String,
-    revset: Option<String>,
-    repo: Option<String>,
+    #[serde(default)]
+    workdirs: Vec<multi_agent_tools::SpawnWorkdirArgs>,
     role: String,
 }
 

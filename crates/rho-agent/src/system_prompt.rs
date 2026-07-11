@@ -7,27 +7,25 @@ use crate::multi_agent_tools::MultiAgentTools;
 /// the section explaining them. `code_mode` is set when the agent's tool
 /// surface is the code-mode `exec`/`wait` pair.
 pub fn prompt(
-    workspace: &rho_workspaces::Workspace,
+    view: &rho_workspaces::View,
     multi_agent: Option<&MultiAgentTools>,
     code_mode: bool,
     role: AgentRole,
 ) -> Arc<str> {
-    let working_directory = workspace.repo();
-    let workspace_name = workspace.info().workspace_name();
-    let context = workspace.discovered_context();
-    for diagnostic in &context.diagnostics {
-        eprintln!(
-            "rho-agent: context config {:?}: {}: {}",
-            diagnostic.kind,
-            diagnostic.path.display(),
-            diagnostic.message
-        );
-    }
-    let agents_md = render_agents_md_prompt(&context.agents_files).unwrap_or_default();
-    let skills = render_skills_prompt(&context.skills).unwrap_or_default();
+    let entries = view.entries();
+    let workdirs = entries
+        .iter()
+        .map(|workspace| WorkdirPrompt {
+            path: workspace.repo().to_string(),
+            workspace_name: workspace.info().workspace_name(),
+        })
+        .collect::<Vec<_>>();
+    let (agents_files, skills) = merged_context(entries);
+    let agents_md = render_agents_md_prompt(&agents_files).unwrap_or_default();
+    let skills = render_skills_prompt(&skills).unwrap_or_default();
     let multi_agent = multi_agent.map_or_else(String::new, |tools| {
         let agent_id = tools.display_id(tools.self_id());
-        let workspace_prompt = render_multi_agent_workspace_prompt(workspace_name.as_deref());
+        let workspace_prompt = render_multi_agent_workspace_prompt(&workdirs);
         // In code mode the agent tools live under `tools.*` in exec scripts
         // and `wait` means the exec-cell wait, so mail has no wait tool.
         let agent_tool_usage = if code_mode {
@@ -94,10 +92,13 @@ skills, tools, and workspace instructions as you, so keep child prompts \
 focused on the task-specific goal and constraints instead of restating generic \
 process rules.
 
-Choose `workspace` by the task: use `join` for read-mostly work or when agents \
-should intentionally share one live checkout; use `fork` when multiple agents \
-may edit at the same time; use `new` when the task should start from trunk or \
-a specific `revset`.
+A child's `workdirs` define its working set, primary first. The default (no \
+`workdirs`) forks your whole working set: the child gets its own checkout of \
+your current change in each workdir, safe for concurrent edits. List entries \
+explicitly when the task needs something else: `checkout=shared` to work in \
+the same checkouts you see (read-mostly tasks), or a `repo`/`revset` entry \
+when the task should start from trunk, another revision, or another \
+repository.
 
 {agent_tool_usage}
 
@@ -124,8 +125,52 @@ needed for the task.
         AgentRole::PM => PM_PROMPT,
         AgentRole::Oracle { .. } => ORACLE_PROMPT,
     };
-    let environment = render_environment_prompt(working_directory.as_str());
+    let environment = render_environment_prompt(&workdirs);
     format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{multi_agent}{role}{environment}").into()
+}
+
+/// One workdir as the prompt renders it: the agent-visible path plus its jj
+/// workspace name (`None` for the user's checkout or a plain directory).
+struct WorkdirPrompt {
+    path: String,
+    workspace_name: Option<String>,
+}
+
+/// Union of every workdir's discovered context: AGENTS.md files deduped by
+/// path (the user-level file appears in each entry's discovery), skills
+/// deduped by name with earlier (primary-first) workdirs winning.
+fn merged_context(
+    entries: &[Arc<rho_workspaces::Workspace>],
+) -> (
+    Vec<rho_context_config::AgentsFile>,
+    Vec<rho_context_config::Skill>,
+) {
+    let mut seen_files = std::collections::HashSet::new();
+    let mut seen_skills = std::collections::HashSet::new();
+    let mut agents_files = Vec::new();
+    let mut skills = Vec::new();
+    for entry in entries {
+        let context = entry.discovered_context();
+        for diagnostic in &context.diagnostics {
+            eprintln!(
+                "rho-agent: context config {:?}: {}: {}",
+                diagnostic.kind,
+                diagnostic.path.display(),
+                diagnostic.message
+            );
+        }
+        for file in &context.agents_files {
+            if seen_files.insert(file.file_path.clone()) {
+                agents_files.push(file.clone());
+            }
+        }
+        for skill in &context.skills {
+            if seen_skills.insert(skill.name.clone()) {
+                skills.push(skill.clone());
+            }
+        }
+    }
+    (agents_files, skills)
 }
 
 const PM_PROMPT: &str = "## PM
@@ -219,16 +264,30 @@ fn render_skills_prompt(skills: &[rho_context_config::Skill]) -> Option<String> 
     Some(out)
 }
 
-fn render_environment_prompt(working_directory: &str) -> String {
-    format!(
+fn render_environment_prompt(workdirs: &[WorkdirPrompt]) -> String {
+    let working_directory = &workdirs[0].path;
+    let mut out = format!(
         "## Environment
 
 Working directory: {working_directory}
 
-Relative paths in commands and patches resolve against this directory. Stay \
-within it unless the user points you elsewhere.
+Relative paths in commands and patches resolve against this directory.
 "
-    )
+    );
+    if workdirs.len() > 1 {
+        out.push_str("\nAdditional workdirs in your working set:\n");
+        for workdir in &workdirs[1..] {
+            let binding = match &workdir.workspace_name {
+                Some(_) => "your own checkout",
+                None => "the live directory — edits are immediately visible to the user",
+            };
+            out.push_str(&format!("- {} ({binding})\n", workdir.path));
+        }
+        out.push_str("\nStay within these directories unless the user points you elsewhere.\n");
+    } else {
+        out.push_str("Stay within it unless the user points you elsewhere.\n");
+    }
+    out
 }
 
 const BASE_PROMPT: &str = "\
@@ -299,26 +358,46 @@ Before finalizing after an interrupt or context compaction, verify your answer a
 
 ";
 
-fn render_multi_agent_workspace_prompt(workspace_name: Option<&str>) -> String {
-    let own_workspace = match workspace_name {
-        Some(name) => format!(
-            "Your jj workspace id is `{name}`. In your own workspace, your current working-copy \
-             commit is `@`; other workspaces can refer to that same working-copy commit as \
-             `{name}@`.\n\n"
-        ),
-        None => "You are running in the user's checkout. Your current working-copy commit is `@`; \
-                 there is no separate jj workspace id for other workspaces to reference.\n\n"
-            .to_owned(),
+fn render_multi_agent_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
+    let own_workspace = if workdirs.len() == 1 {
+        match &workdirs[0].workspace_name {
+            Some(name) => format!(
+                "Your jj workspace id is `{name}`. In your own workspace, your current \
+                 working-copy commit is `@`; other workspaces can refer to that same \
+                 working-copy commit as `{name}@`.\n\n"
+            ),
+            None => "You are running in the user's checkout. Your current working-copy commit \
+                     is `@`; there is no separate jj workspace id for other workspaces to \
+                     reference.\n\n"
+                .to_owned(),
+        }
+    } else {
+        let mut out = String::from("Your workdirs and their jj workspace handles:\n");
+        for workdir in workdirs {
+            match &workdir.workspace_name {
+                Some(name) => out.push_str(&format!(
+                    "- {} — your jj workspace `{name}` (other workspaces address your \
+                     working-copy commit there as `{name}@`)\n",
+                    workdir.path
+                )),
+                None => out.push_str(&format!(
+                    "- {} — the live checkout, no separate jj workspace handle\n",
+                    workdir.path
+                )),
+            }
+        }
+        out.push('\n');
+        out
     };
     format!(
         "\
 ## Working With Workspaces
 
-This repository uses Jujutsu (`jj`) workspaces. Separate agents may run in separate jj workspaces that present the same working-directory path but do not share live filesystem edits. Use the workspace/revset handle rather than the path to inspect or transfer work.
+Repositories here use Jujutsu (`jj`) workspaces. Separate agents may run in separate jj workspaces that present the same working-directory path but do not share live filesystem edits. Use the workspace/revset handle rather than the path to inspect or transfer work; with several repositories involved, name the repository too.
 
 {own_workspace}
 
-- A workspace working-copy commit is addressable as `<workspace>@`.
+- A workspace working-copy commit is addressable as `<workspace>@` within its repository.
 - Inspect another workspace with commands such as `jj status --workspace <workspace>`, `jj log -r '<workspace>@'`, or `jj diff -r '<workspace>@' --stat`.
 - To take over another workspace's change, prefer explicit jj operations such as `jj edit '<workspace>@'` or `jj squash --from '<workspace>@' --into @`, depending on whether you want to move your workspace to that change or steal its diff into your current change.
 - Do not take, squash, abandon, or otherwise rewrite another agent's work unless the user or owning agent asked you to.
@@ -370,10 +449,17 @@ mod tests {
         assert!(prompt.contains("follow them unless they conflict"));
     }
 
+    fn workdir(path: &str, workspace_name: Option<&str>) -> WorkdirPrompt {
+        WorkdirPrompt {
+            path: path.to_owned(),
+            workspace_name: workspace_name.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn workspace_handoff_guidance_is_multi_agent_only() {
         assert!(!BASE_PROMPT.contains("## Working With Workspaces"));
-        let prompt = render_multi_agent_workspace_prompt(Some("agentws"));
+        let prompt = render_multi_agent_workspace_prompt(&[workdir("/repo", Some("agentws"))]);
         assert!(prompt.contains("## Working With Workspaces"));
         assert!(prompt.contains("Your jj workspace id is `agentws`"));
         assert!(prompt.contains("current working-copy commit is `@`"));
@@ -384,10 +470,20 @@ mod tests {
 
     #[test]
     fn workspace_prompt_mentions_user_checkout_without_workspace_id() {
-        let prompt = render_multi_agent_workspace_prompt(None);
+        let prompt = render_multi_agent_workspace_prompt(&[workdir("/repo", None)]);
         assert!(prompt.contains("user's checkout"));
         assert!(prompt.contains("current working-copy commit is `@`"));
         assert!(prompt.contains("no separate jj workspace id"));
+    }
+
+    #[test]
+    fn workspace_prompt_lists_multiple_workdirs() {
+        let prompt = render_multi_agent_workspace_prompt(&[
+            workdir("/repo", Some("agentws")),
+            workdir("/docs", None),
+        ]);
+        assert!(prompt.contains("- /repo — your jj workspace `agentws`"));
+        assert!(prompt.contains("- /docs — the live checkout"));
     }
 
     #[test]
@@ -401,8 +497,21 @@ mod tests {
 
     #[test]
     fn environment_prompt_mentions_working_directory() {
-        let prompt = render_environment_prompt("/repo");
+        let prompt = render_environment_prompt(&[workdir("/repo", Some("agentws"))]);
         assert!(prompt.contains("Working directory: /repo"));
         assert!(!prompt.contains("jj workspace id"));
+        assert!(!prompt.contains("Additional workdirs"));
+    }
+
+    #[test]
+    fn environment_prompt_lists_additional_workdirs() {
+        let prompt = render_environment_prompt(&[
+            workdir("/repo", Some("agentws")),
+            workdir("/lib", Some("agentws")),
+            workdir("/docs", None),
+        ]);
+        assert!(prompt.contains("Working directory: /repo"));
+        assert!(prompt.contains("- /lib (your own checkout)"));
+        assert!(prompt.contains("- /docs (the live directory"));
     }
 }

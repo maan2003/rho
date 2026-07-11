@@ -33,7 +33,7 @@ const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::n
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "a1f83c6d";
+const CURRENT_AGENT_DB_FORMAT: &str = "7c3e91af";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -49,7 +49,11 @@ pub struct MigrationRecoveryPoint {
     pub created_at: UnixMillis,
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "a1f83c6d",
+    to: "7c3e91af",
+    migrate: migrate_agent_workdirs,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -210,14 +214,15 @@ pub async fn prepare_agent_db_migration(db: &rho_db::RhoDb) {
     .await;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
-    /// Where this agent works. Fixed at creation: the accumulated model
-    /// context assumes one root for the agent's life (the workspace's repo
-    /// path). For pool workspaces the jj workspace name is this agent's own
-    /// id (or the joined agent's, for agents sharing a workspace).
-    pub workspace: WorkspaceInfo,
+    /// The agent's working set: where it works, primary workdir first.
+    /// Fixed at spawn — never removed or reordered, because accumulated
+    /// model context assumes the entries stay valid. For pool workspaces the
+    /// jj workspace name is this agent's own workspace id (or the joined
+    /// agent's, for agents sharing a workspace).
+    pub workdirs: Vec<WorkspaceInfo>,
     pub status: Status,
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
@@ -239,6 +244,71 @@ impl AgentRecord {
     pub fn config(&self) -> AgentRole {
         self.role
     }
+
+    /// The primary workdir (entry 0): default cwd, prompt header, UI label.
+    pub fn primary_workdir(&self) -> &WorkspaceInfo {
+        self.workdirs
+            .first()
+            .expect("agent has at least one workdir")
+    }
+}
+
+impl senax_encoder::Decoder for AgentRecord {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        #[derive(Decode)]
+        struct EncodedAgentRecord {
+            display_name: Option<String>,
+            /// Legacy single-workdir shape; superseded by `workdirs`.
+            workspace: Option<WorkspaceInfo>,
+            #[senax(default)]
+            workdirs: Vec<WorkspaceInfo>,
+            status: Status,
+            created_at: UnixMillis,
+            updated_at: UnixMillis,
+            current_lineage: AgentLineageId,
+            parent_agent: Option<AgentId>,
+            role: AgentRole,
+            binding: SessionBinding,
+            runtime: AgentRuntime,
+            #[senax(default)]
+            last_user_message: UnixMillis,
+            #[senax(default)]
+            disposition: AgentDisposition,
+        }
+
+        let encoded = EncodedAgentRecord::decode(reader)?;
+        let workdirs = if encoded.workdirs.is_empty() {
+            match encoded.workspace {
+                Some(workspace) => vec![workspace],
+                None => return Err(missing_agent_field("workdirs")),
+            }
+        } else {
+            encoded.workdirs
+        };
+        Ok(Self {
+            display_name: encoded.display_name,
+            workdirs,
+            status: encoded.status,
+            created_at: encoded.created_at,
+            updated_at: encoded.updated_at,
+            current_lineage: encoded.current_lineage,
+            parent_agent: encoded.parent_agent,
+            role: encoded.role,
+            binding: encoded.binding,
+            runtime: encoded.runtime,
+            last_user_message: encoded.last_user_message,
+            disposition: encoded.disposition,
+        })
+    }
+}
+
+fn missing_agent_field(field: &'static str) -> senax_encoder::EncoderError {
+    senax_encoder::EncoderError::StructDecode(
+        senax_encoder::StructDecodeError::MissingRequiredField {
+            field,
+            struct_name: "AgentRecord",
+        },
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -561,7 +631,7 @@ pub(crate) trait AgentProfileWriteTxnExt {
         agent_id: AgentId,
         topic_id: TopicId,
         display_name: Option<String>,
-        workspace: WorkspaceInfo,
+        workdirs: Vec<WorkspaceInfo>,
         mode: SessionBinding,
         runtime: AgentRuntime,
         parent_agent: Option<AgentId>,
@@ -575,16 +645,17 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         agent_id: AgentId,
         topic_id: TopicId,
         display_name: Option<String>,
-        workspace: WorkspaceInfo,
+        workdirs: Vec<WorkspaceInfo>,
         mode: SessionBinding,
         runtime: AgentRuntime,
         parent_agent: Option<AgentId>,
     ) -> AgentEventPos {
+        assert!(!workdirs.is_empty(), "agent needs at least one workdir");
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
         let agent = AgentRecord {
             display_name,
-            workspace,
+            workdirs,
             status: Status::Normal,
             created_at: now,
             updated_at: now,
@@ -602,6 +673,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             .insert(&TopicAgentKey::new(topic_id, agent_id), &());
         AgentEventPos::root(lineage_id)
     }
+
 }
 
 impl AgentReadTxnExt for ReadTxn {
@@ -950,6 +1022,23 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
+}
+
+/// Rewrites agent records so the legacy single `workspace` field is stored
+/// as the new `workdirs` list (the decoder accepts both; re-inserting
+/// normalizes the bytes).
+fn migrate_agent_workdirs(write: &mut WriteTxn) {
+    let records = {
+        let agents = write.open_table(AGENTS);
+        agents
+            .iter()
+            .map(|(id, record)| (id.value(), record.value().into_owned()))
+            .collect::<Vec<_>>()
+    };
+    let mut agents = write.open_table(AGENTS);
+    for (agent_id, record) in records {
+        agents.insert(&agent_id, SenValue::borrowed(&record));
+    }
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

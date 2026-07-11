@@ -12,7 +12,7 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
-use rho_workspaces::{PathOverrides, Repo, WorkspaceInfo};
+use rho_workspaces::{PathOverrides, Repo, View, WorkspaceInfo};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
@@ -22,7 +22,7 @@ use crate::db::{
 };
 use crate::{
     Agent, AgentInputId, AgentState, AgentToolExtension, AgentToolExtensionFactory, InputSourceId,
-    MessageDelivery, StartWorkspace,
+    MessageDelivery, StartWorkdir,
 };
 
 /// Runaway protection, not policy: children are user-visible agents.
@@ -77,18 +77,24 @@ pub struct AgentInputAccepted {
     pub source_id: Option<InputSourceId>,
 }
 
-/// Where a spawned child works, relative to its parent.
-pub enum SpawnWorkspace {
-    /// Share the parent's working copy.
-    Join,
-    /// Own jj workspace forked from the parent's current change.
-    Fork,
-    /// Own jj workspace on a new change atop `revset` (default `trunk()`).
-    /// When set, `repo` selects a different jj repository from the parent.
-    New {
-        revset: Option<String>,
-        repo: Option<Utf8PathBuf>,
-    },
+/// One entry of a spawned child's working set.
+pub struct SpawnWorkdir {
+    /// Absolute path anywhere inside the repository (or plain directory).
+    pub repo: Utf8PathBuf,
+    pub checkout: SpawnCheckout,
+}
+
+/// Which checkout a child workdir works in.
+pub enum SpawnCheckout {
+    /// The checkout the parent uses for this repo (its workspace or a live
+    /// checkout), or the user's live checkout when the repo is outside the
+    /// parent's working set.
+    Shared,
+    /// The child's own jj workspace on a new change atop `revset`, which
+    /// defaults to the parent's current change when the parent has this repo
+    /// and `trunk()` otherwise. Plain (non-jj) directories have no
+    /// workspaces and are shared instead.
+    Own { revset: Option<String> },
 }
 
 impl AgentPool {
@@ -191,7 +197,7 @@ impl AgentPool {
         topic_id: TopicId,
         config: AgentRole,
         display_name: Option<String>,
-        start: StartWorkspace,
+        start: Vec<StartWorkdir>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         self.create_with_parent(
             topic_id,
@@ -209,7 +215,7 @@ impl AgentPool {
         topic_id: TopicId,
         config: AgentRole,
         display_name: Option<String>,
-        start: StartWorkspace,
+        start: Vec<StartWorkdir>,
         tool_extension: AgentToolExtensionFactory,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         self.create_with_parent(
@@ -228,7 +234,7 @@ impl AgentPool {
         topic_id: TopicId,
         mode: SessionBinding,
         display_name: Option<String>,
-        start: StartWorkspace,
+        start: Vec<StartWorkdir>,
         parent: Option<AgentId>,
         tool_extension: Option<AgentToolExtensionFactory>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
@@ -280,45 +286,74 @@ impl AgentPool {
     }
 
     /// Create a child agent for `parent` in the parent's topic and mode, and
-    /// mail it its task. Returns once the child is running.
+    /// mail it its task. Returns once the child is running. An empty
+    /// `workdirs` forks the parent's whole working set.
     pub async fn spawn_child(
         self: &Arc<Self>,
         parent: AgentId,
         task_name: String,
         prompt: String,
-        workspace: SpawnWorkspace,
+        workdirs: Vec<SpawnWorkdir>,
         config: AgentRole,
     ) -> anyhow::Result<AgentId> {
-        let (topic_id, parent_workspace) = {
+        let (topic_id, parent_workdirs) = {
             let read = self.db.read();
             let topic_id = read
                 .agent_topic(parent)
                 .ok_or_else(|| anyhow::anyhow!("spawning agent belongs to no topic"))?;
             let record = read.get_agent(parent);
             self.enforce_spawn_limits(&read, parent)?;
-            (topic_id, record.workspace)
+            (topic_id, record.workdirs)
         };
-        let start = match workspace {
-            SpawnWorkspace::Join => {
-                StartWorkspace::Existing(self.open_workspace(&parent_workspace).await?)
-            }
-            SpawnWorkspace::Fork => StartWorkspace::Create {
-                repo: self.repo(parent_workspace.repo()).await?,
-                // The child's change forks off whatever the parent's checkout
-                // currently points at.
-                parent_revset: match parent_workspace.workspace_name() {
-                    Some(name) => format!("{name}@"),
-                    None => "@".to_owned(),
-                },
-            },
-            SpawnWorkspace::New { revset, repo } => StartWorkspace::Create {
-                repo: match repo {
-                    Some(repo) => self.repo(&repo).await?,
-                    None => self.repo(parent_workspace.repo()).await?,
-                },
-                parent_revset: revset.unwrap_or_else(|| "trunk()".to_owned()),
-            },
+        let workdirs = if workdirs.is_empty() {
+            parent_workdirs
+                .iter()
+                .map(|info| SpawnWorkdir {
+                    repo: info.repo().to_owned(),
+                    checkout: SpawnCheckout::Own { revset: None },
+                })
+                .collect()
+        } else {
+            workdirs
         };
+        let mut start = Vec::with_capacity(workdirs.len());
+        for entry in workdirs {
+            let repo = self.repo(&entry.repo).await?;
+            let parent_entry = parent_workdirs
+                .iter()
+                .find(|info| info.repo() == repo.root());
+            start.push(match entry.checkout {
+                SpawnCheckout::Own { revset } if repo.is_jj() => {
+                    // The child's change forks off whatever the parent's
+                    // checkout currently points at; repos outside the
+                    // parent's working set start from trunk.
+                    let parent_revset = revset.unwrap_or_else(|| match parent_entry {
+                        Some(info) => match info.workspace_name() {
+                            Some(name) => format!("{name}@"),
+                            None => "@".to_owned(),
+                        },
+                        None => "trunk()".to_owned(),
+                    });
+                    StartWorkdir::Create {
+                        repo,
+                        parent_revset,
+                    }
+                }
+                SpawnCheckout::Own { revset } => {
+                    anyhow::ensure!(
+                        revset.is_none(),
+                        "revset is only supported inside a jj repository: {}",
+                        repo.root()
+                    );
+                    // Plain directories have no workspaces to create.
+                    StartWorkdir::Existing(repo.user_checkout().await?)
+                }
+                SpawnCheckout::Shared => match parent_entry {
+                    Some(info) => StartWorkdir::Existing(self.open_workspace(info).await?),
+                    None => StartWorkdir::Existing(repo.user_checkout().await?),
+                },
+            });
+        }
         let (child_id, child) = self
             .create_with_parent(
                 topic_id,
@@ -403,9 +438,17 @@ impl AgentPool {
         agent_id.encoded()[..prefix_len].to_owned()
     }
 
-    /// The shared handle for the repo rooted at (or containing) `path`.
+    /// The shared handle for the workdir containing `path`: the enclosing jj
+    /// repo when there is one, otherwise the plain directory itself
+    /// (live-only, no separate workspaces). Cache-keyed by the resolved root
+    /// so agents in the same repo share one instance.
     pub async fn repo(&self, path: &Utf8Path) -> anyhow::Result<Arc<Repo>> {
-        let repo = Repo::open_with_path_overrides(path.as_std_path(), self.path_overrides.clone())?;
+        let (root, is_jj) = rho_workspaces::resolve_workdir_root(path.as_std_path())?;
+        let repo = if is_jj {
+            Repo::open_with_path_overrides(root.as_std_path(), self.path_overrides.clone())?
+        } else {
+            Repo::open_plain_with_path_overrides(root.as_std_path(), self.path_overrides.clone())?
+        };
         let mut repos = self.repos.lock().await;
         Ok(match repos.entry(repo.root().to_owned()) {
             std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
@@ -419,11 +462,21 @@ impl AgentPool {
         &self,
         info: &WorkspaceInfo,
     ) -> anyhow::Result<Arc<rho_workspaces::Workspace>> {
-        let repo = self.repo(info.repo()).await?;
         match info {
-            WorkspaceInfo::UserCheckout { .. } => repo.user_checkout().await,
-            WorkspaceInfo::Workspace { id, .. } => repo.open_workspace(*id).await,
+            WorkspaceInfo::UserCheckout { repo } => self.repo(repo).await?.user_checkout().await,
+            WorkspaceInfo::Workspace { repo, id } => {
+                self.repo(repo).await?.open_workspace(*id).await
+            }
         }
+    }
+
+    /// Materializes an agent's persisted working set into a live view.
+    pub async fn open_view(&self, workdirs: &[WorkspaceInfo]) -> anyhow::Result<Arc<View>> {
+        let mut entries = Vec::with_capacity(workdirs.len());
+        for info in workdirs {
+            entries.push(self.open_workspace(info).await?);
+        }
+        View::new(entries)
     }
 
     /// Loads a persisted agent if it is not already running. The returned
@@ -436,19 +489,19 @@ impl AgentPool {
             return Ok((agent_id, agent, false));
         }
         let record = self.db.read().get_agent(agent_id);
-        let workspace = self.open_workspace(&record.workspace).await?;
+        let view = self.open_view(&record.workdirs).await?;
         let agent = match record.runtime {
             AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load(
                 self.db.clone(),
                 self.auth.clone(),
                 agent_id,
-                workspace,
+                view,
                 Arc::downgrade(self),
                 self.tool_extension_for(agent_id),
             )),
             AgentRuntime::Claude { .. } => {
                 let agent =
-                    ClaudeAgent::load(self.db.clone(), agent_id, workspace, Arc::downgrade(self))
+                    ClaudeAgent::load(self.db.clone(), agent_id, view, Arc::downgrade(self))
                         .await?;
                 RunningAgent::Claude(agent)
             }
@@ -469,6 +522,14 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.state(),
             Self::Claude(agent) => agent.state(),
+        }
+    }
+
+    /// The agent's filesystem view (its working set of workdirs).
+    pub fn view(&self) -> &Arc<View> {
+        match self {
+            Self::Rho(agent) => agent.view(),
+            Self::Claude(agent) => agent.view(),
         }
     }
 
