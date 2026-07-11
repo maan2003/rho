@@ -72,10 +72,16 @@ pub fn render_agent_surface(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         Arc::clone(&view),
     );
-    let agent_tools_enabled = !matches!(role, db::AgentRole::Advisor { .. });
+    let agent_tools_enabled = true;
     Ok(RenderedAgentSurface {
         system_prompt: system_prompt::prompt(view.as_ref(), None, profile.code_mode, role),
-        tools: agent_tool_specs(&shell_tools, agent_tools_enabled, profile.code_mode, None),
+        tools: agent_tool_specs(
+            &shell_tools,
+            agent_tools_enabled,
+            profile.code_mode,
+            role,
+            None,
+        ),
     })
 }
 
@@ -656,7 +662,7 @@ impl Agent {
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
-        let agent_tools_enabled = !matches!(role, db::AgentRole::Advisor { .. });
+        let agent_tools_enabled = true;
         let pool_events = pool;
         let (control, control_rx) = mpsc::unbounded_channel();
         let code_mode = start_code_mode(
@@ -672,6 +678,7 @@ impl Agent {
                 &shell_tools,
                 multi_agent.is_some() && agent_tools_enabled,
                 code_mode.is_some(),
+                role,
                 tool_extension.as_ref(),
             ),
             system_prompt: system_prompt::prompt(
@@ -863,14 +870,16 @@ fn agent_tool_specs(
     shell_tools: &ShellTools,
     multi_agent: bool,
     code_mode: bool,
+    role: db::AgentRole,
     tool_extension: Option<&Arc<dyn AgentToolExtension>>,
 ) -> Arc<[ToolSpec]> {
     if code_mode {
-        return code_mode::tool_specs(shell_tools, multi_agent, tool_extension).into();
+        return code_mode::tool_specs(shell_tools, multi_agent.then_some(role), tool_extension)
+            .into();
     }
     let mut specs = shell_tools.specs();
     if multi_agent {
-        specs.extend(multi_agent_tools::agent_tool_specs());
+        specs.extend(multi_agent_tools::agent_tool_specs(role));
     }
     if let Some(extension) = tool_extension {
         specs.extend(extension.specs());

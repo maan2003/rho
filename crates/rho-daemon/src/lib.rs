@@ -705,8 +705,13 @@ impl AgentRegistry {
         if matches!(
             self.db.read().get_agent(self_agent_id).role,
             AgentRole::Advisor { .. }
+        ) && !matches!(
+            &request,
+            McpAgentToolRequest::MessageAgent { .. }
+                | McpAgentToolRequest::FollowupAdvisor { .. }
+                | McpAgentToolRequest::Wait { .. }
         ) {
-            anyhow::bail!("Advisor agents do not have multi-agent tools");
+            anyhow::bail!("Advisors may only message agents and wait for replies");
         }
         match request {
             McpAgentToolRequest::SpawnEngineer {
@@ -754,10 +759,7 @@ impl AgentRegistry {
                     workspace_note,
                 ))
             }
-            McpAgentToolRequest::MessageEngineer {
-                engineer_id: agent_id,
-                message,
-            } => {
+            McpAgentToolRequest::MessageAgent { agent_id, message } => {
                 if message.trim().is_empty() {
                     anyhow::bail!("message must not be empty");
                 }
@@ -866,10 +868,10 @@ impl AgentRegistry {
             .split_once('-')
             .ok_or_else(|| anyhow::anyhow!("invalid role-prefixed agent id"))?;
         let resolved = match self.pool.resolve_agent_id(raw_agent_id)? {
-            prefix_id::PrefixResolution::Unique(agent_id)
-            | prefix_id::PrefixResolution::Ambiguous {
-                first: agent_id, ..
-            } => agent_id,
+            prefix_id::PrefixResolution::Unique(agent_id) => agent_id,
+            prefix_id::PrefixResolution::Ambiguous { .. } => {
+                anyhow::bail!("ambiguous agent id {agent_id}")
+            }
             prefix_id::PrefixResolution::NotFound => {
                 anyhow::bail!("no agent with id {agent_id}")
             }

@@ -122,6 +122,41 @@ fn test_agent_runtime() -> AgentRuntime {
     }
 }
 
+#[tokio::test]
+async fn agent_spawned_by_is_stored_at_creation() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let topic = write.create_topic(UnixMs(1), "team".to_owned(), Status::Normal);
+    let pm = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        pm,
+        topic,
+        None,
+        vec![test_workspace()],
+        AgentRole::PM.session_profile().unwrap(),
+        test_agent_runtime(),
+        None,
+    );
+    let engineer = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(2),
+        engineer,
+        topic,
+        None,
+        vec![test_workspace()],
+        AgentRole::default().session_profile().unwrap(),
+        test_agent_runtime(),
+        Some(pm),
+    );
+    write.commit();
+
+    assert_eq!(db.read().get_agent(pm).spawned_by, AgentSpawnedBy::Direct);
+    assert_eq!(db.read().get_agent(engineer).spawned_by, AgentSpawnedBy::PM);
+}
+
 #[test]
 fn agent_db_migrations_eventually_reach_current_format() {
     let current = CURRENT_AGENT_DB_FORMAT;

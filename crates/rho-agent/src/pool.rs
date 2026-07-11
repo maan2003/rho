@@ -419,8 +419,8 @@ impl AgentPool {
             AgentRole::Advisor { .. }
         ) {
             body.push_str(&format!(
-                "\n\nAdvisor {sender_label} remains available. Use followup_advisor with this \
-                 ID to continue."
+                "\n\nAdvisor {sender_label} remains available. Use message_agent with this ID \
+                 to continue."
             ));
         }
         agent.send_agent_message(from, sender_label, body, delivery);

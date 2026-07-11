@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::db::AgentRole;
+use crate::db::{AgentRole, AgentSpawnedBy};
 use crate::multi_agent_tools::MultiAgentTools;
 
 /// `multi_agent` is set for pooled agents, which get the multi-agent tools and
@@ -22,20 +22,16 @@ pub fn prompt(
         .collect::<Vec<_>>();
     let (agents_files, skills) = merged_context(entries);
     let agents_md = render_agents_md_prompt(&agents_files).unwrap_or_default();
+    let skills = skills
+        .iter()
+        .filter(|skill| {
+            matches!(role, AgentRole::Engineer { .. }) || skill.name != "delegate-engineering"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let skills = render_skills_prompt(&skills).unwrap_or_default();
-    let multi_agent = multi_agent.map_or_else(String::new, |tools| {
+    let team_context = multi_agent.map_or_else(String::new, |tools| {
         let agent_id = tools.display_id(tools.self_id());
-        let agent_tool_usage = if code_mode {
-            "Collaboration tools live inside the `exec` `tools.*` namespace. Use \
-             `spawn_engineer`, `message_engineer`, `interrupt_engineer`, `ask_advisor`, and \
-             `followup_advisor` there. Call `await tools.wait_agent(...)` sparingly when blocked \
-             on agent mail; if the exec cell yields, use the model-facing `wait` with its cell \
-             id until it resumes."
-        } else {
-            "You can use `spawn_engineer`, `message_engineer`, `interrupt_engineer`, \
-             `ask_advisor`, and `followup_advisor`, plus `wait_agent` when you are blocked \
-             on agent results and have nothing else useful to do."
-        };
         let identity = match tools.parent() {
             Some(parent) => format!(
                 "You are an agent in a team of agents collaborating to complete a task. Your \
@@ -57,38 +53,34 @@ pub fn prompt(
 {identity}
 
 Complete your independent analysis and return it to your parent through your \
-final response.
+final response. You may use `message_agent` to request context from any known \
+agent and `wait_agent` when blocked on a reply.
 "
             );
         }
-        let delegation_policy = match role {
-            AgentRole::Engineer { .. } => {
-                "You may spawn another agent only when the user explicitly requests a team or \
-                 delegation, or when an active workflow skill explicitly authorizes fan-out. \
-                 Otherwise do the work yourself. When authorized, delegate only concrete, \
-                 bounded work that can run independently while you continue useful local work; \
-                 keep tightly coupled or immediately blocking work local."
+        let ownership = if matches!(role, AgentRole::PM) {
+            "You were started directly and own coordination of the user's outcome."
+        } else {
+            match tools.spawned_by() {
+                AgentSpawnedBy::Direct => {
+                    "You were started directly and own the user's technical outcome."
+                }
+                AgentSpawnedBy::PM => {
+                    "You were spawned by a PM. Own the assigned technical outcome; your final \
+                 response is mailed to that PM."
+                }
+                AgentSpawnedBy::Engineer => {
+                    "You were spawned by another Engineer. Own the bounded assignment in the \
+                 parent message; your final response is mailed to that Engineer."
+                }
             }
-            AgentRole::PM => {
-                "Use `spawn_engineer` to route substantive technical outcomes to an \
-                 Engineer. Do not delegate conversational work, status \
-                 updates, or clarification that belongs to you."
-            }
-            AgentRole::Advisor { .. } => unreachable!(),
         };
         format!(
-            "## Sub-Agents
+            "## Team Context
 
 {identity}
 
-{delegation_policy}
-
-Child agents have access to the same repo guidance, \
-skills, tools, and workspace instructions as you, so keep child prompts \
-focused on the task-specific goal and constraints instead of restating generic \
-process rules.
-
-{agent_tool_usage}
+{ownership}
 
 You will receive agent messages in this format:
 ```
@@ -98,22 +90,28 @@ Payload:
 <payload text>
 ```
 
-Mail does not interrupt an in-flight request, but it can start or continue \
-your next request. Do not ask sub-agents for boilerplate you can \
-get from tool responses, such as workspace handles, unless it is specifically \
-needed for the task.
+Use `message_agent` for bidirectional communication with any known agent. Mail \
+does not interrupt an in-flight request, but it can start or continue your next \
+request.
 
 "
         )
     });
     let code_mode = if code_mode { CODE_MODE_PROMPT } else { "" };
-    let role = match role {
+    let role_prompt = match role {
         AgentRole::Engineer { .. } => "",
-        AgentRole::PM => PM_PROMPT,
+        AgentRole::PM => "",
         AgentRole::Advisor { .. } => ADVISOR_PROMPT,
     };
     let environment = render_environment_prompt(&workdirs);
-    format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{multi_agent}{role}{environment}").into()
+    if matches!(role, AgentRole::PM) {
+        return format!(
+            "{PM_BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}{environment}"
+        )
+        .into();
+    }
+    format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}{role_prompt}{environment}")
+        .into()
 }
 
 /// Rho orchestration guidance for Claude Code. Claude supplies its own agent
@@ -186,15 +184,18 @@ fn merged_context(
     (agents_files, skills)
 }
 
-const PM_PROMPT: &str = "## PM
+const PM_BASE_PROMPT: &str = "You are Rho's user-facing project manager. Clarify \
+the outcome, communicate status, and route substantive technical work to an \
+Engineer. Do not inspect or modify repositories yourself.
 
-You are the user-facing project manager. Clarify outcomes, communicate status, \
-and route substantive technical work to an Engineer. Do not inspect or modify \
-repositories yourself.
+Use `spawn_engineer` for technical investigation, implementation, testing, and \
+review. Give each Engineer a complete outcome-focused assignment, use \
+`message_agent` to exchange context or steer work, and use `interrupt_engineer` \
+only when a turn must be stopped. Use `wait_agent` when the next step is blocked \
+on agent mail.
 
-Give the owning Engineer a complete outcome-focused prompt, track its progress, \
-and synthesize its results for the user. Never claim work is done before the \
-responsible Engineer reports it.
+Track the responsible Engineers and synthesize their reports for the user. \
+Never claim work is complete before the responsible Engineer reports it.
 
 ";
 
@@ -504,8 +505,8 @@ mod tests {
     fn role_guidance_is_separate_from_the_base_prompt() {
         assert!(!BASE_PROMPT.contains("## PM"));
         assert!(!BASE_PROMPT.contains("## Advisor"));
-        assert!(PM_PROMPT.contains("Do not inspect or modify"));
-        assert!(PM_PROMPT.contains("Never claim work is done"));
+        assert!(PM_BASE_PROMPT.contains("Do not inspect or modify"));
+        assert!(PM_BASE_PROMPT.contains("Never claim work is complete"));
         assert!(ADVISOR_PROMPT.contains("advisory only"));
     }
 

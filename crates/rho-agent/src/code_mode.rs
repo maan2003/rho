@@ -17,11 +17,25 @@ use crate::{AgentControl, AgentToolExtension, ToolUpdate};
 /// tools' TypeScript docs) and `wait`.
 pub(crate) fn tool_specs(
     shell_tools: &ShellTools,
-    multi_agent: bool,
+    role: Option<crate::db::AgentRole>,
     tool_extension: Option<&Arc<dyn AgentToolExtension>>,
 ) -> Vec<ToolSpec> {
+    let nested = nested_tools(shell_tools, role, tool_extension);
+    let documented = nested
+        .iter()
+        .filter(|tool| {
+            !matches!(role, Some(crate::db::AgentRole::Engineer { .. }))
+                || !matches!(
+                    tool.name.as_str(),
+                    multi_agent_tools::SPAWN_ENGINEER_TOOL_NAME
+                        | multi_agent_tools::INTERRUPT_ENGINEER_TOOL_NAME
+                        | multi_agent_tools::WAIT_TOOL_NAME
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     vec![
-        rho_code_mode::exec_tool_spec(&nested_tools(shell_tools, multi_agent, tool_extension)),
+        rho_code_mode::exec_tool_spec(&documented),
         rho_code_mode::wait_tool_spec(),
     ]
 }
@@ -30,12 +44,12 @@ pub(crate) fn tool_specs(
 /// model-facing `wait`, which observes a yielded JavaScript cell.
 fn nested_tools(
     shell_tools: &ShellTools,
-    multi_agent: bool,
+    role: Option<crate::db::AgentRole>,
     tool_extension: Option<&Arc<dyn AgentToolExtension>>,
 ) -> Vec<NestedTool> {
     let mut specs = shell_tools.specs();
-    if multi_agent {
-        specs.extend(multi_agent_tools::agent_tool_specs());
+    if let Some(role) = role {
+        specs.extend(multi_agent_tools::agent_tool_specs(role));
     }
     if let Some(extension) = tool_extension {
         specs.extend(extension.specs());
@@ -142,7 +156,11 @@ pub(crate) fn start_session(
         control,
     });
     CodeModeSession::new(
-        nested_tools(shell_tools, multi_agent.is_some(), tool_extension),
+        nested_tools(
+            shell_tools,
+            multi_agent.map(MultiAgentTools::role),
+            tool_extension,
+        ),
         dispatcher,
     )
 }
@@ -169,21 +187,38 @@ mod tests {
 
     #[test]
     fn code_mode_surface_is_exec_and_wait_with_nested_docs() {
-        let specs = super::tool_specs(&shell_tools(), true, None);
+        let specs = super::tool_specs(&shell_tools(), Some(crate::db::AgentRole::default()), None);
         let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
         assert_eq!(names, ["exec", "wait"]);
-        // Collaboration tools are nested alongside command tools.
+        // Optional Engineer team-management declarations live in its skill.
         let exec = &specs[0].description;
         assert!(exec.contains("exec_command"), "{exec}");
         assert!(exec.contains("write_stdin"), "{exec}");
-        assert!(exec.contains("spawn_engineer"), "{exec}");
-        assert!(exec.contains("wait_agent"), "{exec}");
+        assert!(!exec.contains("spawn_engineer"), "{exec}");
+        assert!(exec.contains("message_agent"), "{exec}");
+        assert!(!exec.contains("interrupt_engineer"), "{exec}");
+        assert!(!exec.contains("wait_agent"), "{exec}");
+        assert!(exec.contains("ask_advisor"), "{exec}");
         assert!(!exec.contains("async function wait"), "{exec}");
     }
 
     #[test]
+    fn pm_always_sees_engineer_management_declarations() {
+        let specs = super::tool_specs(&shell_tools(), Some(crate::db::AgentRole::PM), None);
+        let exec = &specs[0].description;
+        for name in [
+            "spawn_engineer",
+            "message_agent",
+            "interrupt_engineer",
+            "wait_agent",
+        ] {
+            assert!(exec.contains(name), "missing {name}: {exec}");
+        }
+    }
+
+    #[test]
     fn without_pool_no_agent_tools_are_nested() {
-        let specs = super::tool_specs(&shell_tools(), false, None);
+        let specs = super::tool_specs(&shell_tools(), None, None);
         assert!(!specs[0].description.contains("spawn_engineer"));
     }
 
@@ -215,7 +250,7 @@ mod tests {
     #[test]
     fn code_mode_nests_tool_extension_docs() {
         let extension: Arc<dyn AgentToolExtension> = Arc::new(TestExtension);
-        let specs = super::tool_specs(&shell_tools(), false, Some(&extension));
+        let specs = super::tool_specs(&shell_tools(), None, Some(&extension));
         let exec = &specs[0].description;
         assert!(exec.contains("platform_reply"), "{exec}");
         assert!(

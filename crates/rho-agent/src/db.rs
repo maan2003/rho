@@ -33,7 +33,7 @@ const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::n
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "d4a71c2e";
+const CURRENT_AGENT_DB_FORMAT: &str = "8f2c6a1d";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -59,6 +59,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         from: "7c3e91af",
         to: "d4a71c2e",
         migrate: |_| {},
+    },
+    AgentDbMigration {
+        from: "d4a71c2e",
+        to: "8f2c6a1d",
+        migrate: migrate_agent_spawned_by,
     },
 ];
 
@@ -235,6 +240,7 @@ pub struct AgentRecord {
     pub updated_at: UnixMillis,
     pub current_lineage: AgentLineageId,
     pub parent_agent: Option<AgentId>,
+    pub spawned_by: AgentSpawnedBy,
     pub role: AgentRole,
     pub(crate) binding: SessionBinding,
     pub runtime: AgentRuntime,
@@ -274,6 +280,8 @@ impl senax_encoder::Decoder for AgentRecord {
             updated_at: UnixMillis,
             current_lineage: AgentLineageId,
             parent_agent: Option<AgentId>,
+            #[senax(default)]
+            spawned_by: AgentSpawnedBy,
             role: AgentRole,
             binding: SessionBinding,
             runtime: AgentRuntime,
@@ -300,6 +308,7 @@ impl senax_encoder::Decoder for AgentRecord {
             updated_at: encoded.updated_at,
             current_lineage: encoded.current_lineage,
             parent_agent: encoded.parent_agent,
+            spawned_by: encoded.spawned_by,
             role: encoded.role,
             binding: encoded.binding,
             runtime: encoded.runtime,
@@ -322,6 +331,14 @@ fn missing_agent_field(field: &'static str) -> senax_encoder::EncoderError {
 pub enum AgentRuntime {
     Rho { prompt_cache_key: PromptCacheKey },
     Claude { session_id: Uuid },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub enum AgentSpawnedBy {
+    #[default]
+    Direct,
+    PM,
+    Engineer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -668,6 +685,20 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         assert!(!workdirs.is_empty(), "agent needs at least one workdir");
         let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
         self.open_table(LINEAGE_PARENTS);
+        let spawned_by = parent_agent.map_or(AgentSpawnedBy::Direct, |parent| {
+            match self
+                .open_table(AGENTS)
+                .get(&parent)
+                .expect("parent agent must exist")
+                .value()
+                .into_owned()
+                .role
+            {
+                AgentRole::PM => AgentSpawnedBy::PM,
+                AgentRole::Engineer { .. } => AgentSpawnedBy::Engineer,
+                AgentRole::Advisor { .. } => panic!("Advisors cannot spawn agents"),
+            }
+        });
         let agent = AgentRecord {
             display_name,
             workdirs,
@@ -676,6 +707,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             updated_at: now,
             current_lineage: lineage_id,
             parent_agent,
+            spawned_by,
             role: mode.agent_role(),
             binding: mode,
             runtime,
@@ -1049,6 +1081,41 @@ fn migrate_agent_workdirs(write: &mut WriteTxn) {
             .map(|(id, record)| (id.value(), record.value().into_owned()))
             .collect::<Vec<_>>()
     };
+    let mut agents = write.open_table(AGENTS);
+    for (agent_id, record) in records {
+        agents.insert(&agent_id, SenValue::borrowed(&record));
+    }
+}
+
+fn migrate_agent_spawned_by(write: &mut WriteTxn) {
+    let mut records = {
+        let agents = write.open_table(AGENTS);
+        agents
+            .iter()
+            .map(|(id, record)| (id.value(), record.value().into_owned()))
+            .collect::<Vec<_>>()
+    };
+    let roles = records
+        .iter()
+        .map(|(id, record)| (*id, record.role))
+        .collect::<std::collections::HashMap<_, _>>();
+    for (_, record) in &mut records {
+        record.spawned_by =
+            record
+                .parent_agent
+                .map_or(AgentSpawnedBy::Direct, |parent| {
+                    match roles
+                        .get(&parent)
+                        .expect("migrated parent agent must exist")
+                    {
+                        AgentRole::PM => AgentSpawnedBy::PM,
+                        AgentRole::Engineer { .. } => AgentSpawnedBy::Engineer,
+                        AgentRole::Advisor { .. } => {
+                            panic!("saved Advisor unexpectedly owns an agent")
+                        }
+                    }
+                });
+    }
     let mut agents = write.open_table(AGENTS);
     for (agent_id, record) in records {
         agents.insert(&agent_id, SenValue::borrowed(&record));

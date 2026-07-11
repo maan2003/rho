@@ -83,7 +83,7 @@ async fn handle_request(
             "serverInfo": {"name": "rho-agent-tools", "version": env!("CARGO_PKG_VERSION")},
         })),
         "tools/list" => Ok(json!({
-            "tools": multi_agent_tools::agent_tool_specs()
+            "tools": multi_agent_tools::agent_tool_specs(rho_agent::db::AgentRole::PM)
                 .into_iter()
                 .map(|tool| json!({
                     "name": tool.name.as_str(),
@@ -154,10 +154,10 @@ fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequ
                     .collect(),
             })
         }
-        multi_agent_tools::MESSAGE_ENGINEER_TOOL_NAME => {
+        multi_agent_tools::MESSAGE_AGENT_TOOL_NAME => {
             let args: SendArgs = serde_json::from_value(arguments)?;
-            Ok(McpAgentToolRequest::MessageEngineer {
-                engineer_id: args.engineer_id,
+            Ok(McpAgentToolRequest::MessageAgent {
+                agent_id: args.agent_id,
                 message: args.message,
             })
         }
@@ -170,13 +170,6 @@ fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequ
         multi_agent_tools::ASK_ADVISOR_TOOL_NAME => Ok(McpAgentToolRequest::AskAdvisor {
             message: serde_json::from_value::<AdvisorArgs>(arguments)?.message,
         }),
-        multi_agent_tools::FOLLOWUP_ADVISOR_TOOL_NAME => {
-            let args: AdvisorArgs = serde_json::from_value(arguments)?;
-            Ok(McpAgentToolRequest::FollowupAdvisor {
-                advisor_id: args.advisor_id.context("advisor_id required")?,
-                message: args.message,
-            })
-        }
         multi_agent_tools::WAIT_TOOL_NAME => {
             let args: WaitArgs = serde_json::from_value(arguments)?;
             Ok(McpAgentToolRequest::Wait {
@@ -213,7 +206,7 @@ struct SpawnArgs {
 
 #[derive(Deserialize)]
 struct SendArgs {
-    engineer_id: String,
+    agent_id: String,
     message: String,
 }
 
@@ -224,7 +217,6 @@ struct InterruptArgs {
 
 #[derive(Deserialize)]
 struct AdvisorArgs {
-    advisor_id: Option<String>,
     message: String,
 }
 

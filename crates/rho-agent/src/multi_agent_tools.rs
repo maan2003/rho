@@ -1,4 +1,4 @@
-//! Built-in multi-agent tools: `spawn_engineer`, `message_engineer`,
+//! Built-in multi-agent tools: `spawn_engineer`, `message_agent`,
 //! `interrupt_engineer`, `wait_agent`.
 //!
 //! These are ordinary fast tools (codex-v2 style): asynchrony lives in the
@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 
-use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
 use serde::Deserialize;
@@ -56,6 +55,24 @@ impl MultiAgentTools {
         self.parent
     }
 
+    pub(crate) fn spawned_by(&self) -> crate::db::AgentSpawnedBy {
+        self.pool()
+            .expect("multi-agent tools require a live agent pool")
+            .db()
+            .read()
+            .get_agent(self.self_id)
+            .spawned_by
+    }
+
+    pub(crate) fn role(&self) -> AgentRole {
+        self.pool()
+            .expect("multi-agent tools require a live agent pool")
+            .db()
+            .read()
+            .get_agent(self.self_id)
+            .role
+    }
+
     pub(crate) fn display_id(&self, agent_id: AgentId) -> String {
         let pool = self
             .pool()
@@ -83,10 +100,9 @@ impl MultiAgentTools {
 }
 
 pub const SPAWN_ENGINEER_TOOL_NAME: &str = "spawn_engineer";
-pub const MESSAGE_ENGINEER_TOOL_NAME: &str = "message_engineer";
+pub const MESSAGE_AGENT_TOOL_NAME: &str = "message_agent";
 pub const INTERRUPT_ENGINEER_TOOL_NAME: &str = "interrupt_engineer";
 pub const ASK_ADVISOR_TOOL_NAME: &str = "ask_advisor";
-pub const FOLLOWUP_ADVISOR_TOOL_NAME: &str = "followup_advisor";
 pub const WAIT_TOOL_NAME: &str = "wait_agent";
 
 const DEFAULT_WAIT_SECONDS: u64 = 300;
@@ -97,23 +113,24 @@ pub fn is_agent_tool(name: &str) -> bool {
     matches!(
         name,
         SPAWN_ENGINEER_TOOL_NAME
-            | MESSAGE_ENGINEER_TOOL_NAME
+            | MESSAGE_AGENT_TOOL_NAME
             | INTERRUPT_ENGINEER_TOOL_NAME
             | ASK_ADVISOR_TOOL_NAME
-            | FOLLOWUP_ADVISOR_TOOL_NAME
             | WAIT_TOOL_NAME
     )
 }
 
-pub fn agent_tool_specs() -> Vec<ToolSpec> {
-    vec![
-        spawn_engineer_spec(),
-        message_engineer_spec(),
-        interrupt_engineer_spec(),
-        advisor_spec(ASK_ADVISOR_TOOL_NAME, false),
-        advisor_spec(FOLLOWUP_ADVISOR_TOOL_NAME, true),
-        wait_spec(),
-    ]
+pub fn agent_tool_specs(role: AgentRole) -> Vec<ToolSpec> {
+    match role {
+        AgentRole::PM | AgentRole::Engineer { .. } => vec![
+            spawn_engineer_spec(),
+            message_agent_spec(),
+            interrupt_engineer_spec(),
+            advisor_spec(),
+            wait_spec(),
+        ],
+        AgentRole::Advisor { .. } => vec![message_agent_spec(), wait_spec()],
+    }
 }
 
 fn spawn_engineer_spec() -> ToolSpec {
@@ -127,7 +144,7 @@ fn spawn_engineer_spec() -> ToolSpec {
                       work; otherwise continue locally. The prompt must be self-contained and \
                       task-focused: the child already receives repo guidance, skills, tools, and \
                       workspace instructions, so do not restate generic process rules. The \
-                      child's turn results arrive later as agent mail; use `wait` when you are \
+                      child's turn results arrive later as agent mail; use `wait_agent` when you are \
                       blocked on those results."
             .to_owned(),
         input_schema: json!({
@@ -177,9 +194,9 @@ fn spawn_engineer_spec() -> ToolSpec {
     }
 }
 
-fn message_engineer_spec() -> ToolSpec {
+fn message_agent_spec() -> ToolSpec {
     ToolSpec {
-        name: ToolName::try_from(MESSAGE_ENGINEER_TOOL_NAME).expect("valid tool name"),
+        name: ToolName::try_from(MESSAGE_AGENT_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
         description: "Send an async message to another agent by id. Wakes an idle recipient; a \
                       busy recipient sees it at its next inference step. Returns immediately \
@@ -188,11 +205,11 @@ fn message_engineer_spec() -> ToolSpec {
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["engineer_id", "message"],
+            "required": ["agent_id", "message"],
             "properties": {
-                "engineer_id": {
+                "agent_id": {
                     "type": "string",
-                    "description": format!("example: {AGENT_ID_EXAMPLE}")
+                    "description": format!("Role-prefixed agent handle, for example {AGENT_ID_EXAMPLE} or adv-h6u7.")
                 },
                 "message": {
                     "type": "string",
@@ -227,28 +244,16 @@ fn interrupt_engineer_spec() -> ToolSpec {
     }
 }
 
-fn advisor_spec(name: &str, followup: bool) -> ToolSpec {
-    let mut properties = serde_json::Map::from_iter([(
+fn advisor_spec() -> ToolSpec {
+    let properties = serde_json::Map::from_iter([(
         "message".to_owned(),
         json!({"type": "string", "description": "Question or follow-up for the Advisor."}),
     )]);
-    let mut required = vec!["message"];
-    if followup {
-        properties.insert(
-            "advisor_id".to_owned(),
-            json!({"type": "string", "description": "Advisor handle returned by ask_advisor, for example adv-h6u7."}),
-        );
-        required.insert(0, "advisor_id");
-    }
+    let required = vec!["message"];
     ToolSpec {
-        name: ToolName::try_from(name).expect("valid tool name"),
+        name: ToolName::try_from(ASK_ADVISOR_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
-        description: if followup {
-            "Continue one of your existing Advisor consultations."
-        } else {
-            "Start a fresh independent Advisor consultation. The answer arrives later as mail."
-        }
-        .to_owned(),
+        description: "Start a fresh independent Advisor consultation. The answer arrives later as mail. Use message_agent with its handle for follow-up or context exchange.".to_owned(),
         input_schema: json!({
             "type": "object", "additionalProperties": false,
             "required": required, "properties": properties,
@@ -283,10 +288,9 @@ fn wait_spec() -> ToolSpec {
 pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: ToolCall) -> ToolOutput {
     let result = match call.name.as_str() {
         SPAWN_ENGINEER_TOOL_NAME => spawn_engineer(&tools, &call).await,
-        MESSAGE_ENGINEER_TOOL_NAME => message_engineer(&tools, &call).await,
+        MESSAGE_AGENT_TOOL_NAME => message_agent(&tools, &call).await,
         INTERRUPT_ENGINEER_TOOL_NAME => interrupt_engineer(&tools, &call).await,
         ASK_ADVISOR_TOOL_NAME => ask_advisor(&tools, &call).await,
-        FOLLOWUP_ADVISOR_TOOL_NAME => followup_advisor(&tools, &call).await,
         WAIT_TOOL_NAME => wait_agent(&tools, &call).await,
         _ => Err(anyhow::anyhow!(
             "unsupported tool call: {}",
@@ -319,7 +323,6 @@ async fn wait_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<
 
 #[derive(Deserialize)]
 struct AdvisorArgs {
-    advisor_id: Option<String>,
     message: String,
 }
 
@@ -353,40 +356,6 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
         "Advisor adv-{} is considering the question. Its answer will arrive as mail.",
         pool.agent_id_prefix(advisor)
     ))
-}
-
-async fn followup_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
-    let args: AdvisorArgs = serde_json::from_str(&call.arguments)?;
-    anyhow::ensure!(!args.message.trim().is_empty(), "message must not be empty");
-    let handle = args.advisor_id.context("advisor_id is required")?;
-    let raw = handle
-        .strip_prefix("adv-")
-        .context("advisor_id must start with adv-")?;
-    let pool = tools.pool()?;
-    let advisor = match pool.resolve_agent_id(raw)? {
-        prefix_id::PrefixResolution::Unique(id) => id,
-        prefix_id::PrefixResolution::Ambiguous { .. } => {
-            anyhow::bail!("ambiguous Advisor id {handle}")
-        }
-        prefix_id::PrefixResolution::NotFound => anyhow::bail!("no Advisor with id {handle}"),
-    };
-    let record = pool.db().read().get_agent(advisor);
-    anyhow::ensure!(
-        matches!(record.role, AgentRole::Advisor { .. }),
-        "target is not an Advisor"
-    );
-    anyhow::ensure!(
-        record.parent_agent == Some(tools.self_id),
-        "Advisor belongs to another agent"
-    );
-    pool.deliver_mail(
-        tools.self_id,
-        advisor,
-        args.message,
-        MessageDelivery::NextRequest,
-    )
-    .await?;
-    Ok(format!("Follow-up sent to Advisor {handle}."))
 }
 
 #[derive(Deserialize)]
@@ -455,46 +424,44 @@ async fn spawn_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Res
     let child_id = format!("eng-{}", pool.agent_id_prefix(child_id));
     Ok(format!(
         "Spawned agent {} for task \"{}\". It is working now; its results will arrive as mail \
-         from that Engineer.{} Use message_engineer to follow up.",
+         from that Engineer.{} Use message_agent to follow up.",
         child_id, task_name, workspace_note,
     ))
 }
 
 #[derive(Deserialize)]
 struct SendArgs {
-    engineer_id: String,
+    agent_id: String,
     message: String,
 }
 
-async fn message_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
+async fn message_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
     let args: SendArgs = serde_json::from_str(&call.arguments)?;
     if args.message.trim().is_empty() {
         anyhow::bail!("message must not be empty");
     }
     let pool = tools.pool()?;
-    let raw_agent_id = args
-        .engineer_id
-        .trim()
-        .strip_prefix("eng-")
-        .ok_or_else(|| anyhow::anyhow!("engineer_id must start with eng-"))?;
+    let handle = args.agent_id.trim();
+    let (_, raw_agent_id) = handle
+        .split_once('-')
+        .filter(|(prefix, _)| matches!(*prefix, "eng" | "pm" | "adv"))
+        .ok_or_else(|| anyhow::anyhow!("agent_id must use an eng-, pm-, or adv- handle"))?;
     let recipient = match pool.resolve_agent_id(raw_agent_id)? {
-        prefix_id::PrefixResolution::Unique(agent_id)
-        | prefix_id::PrefixResolution::Ambiguous {
-            first: agent_id, ..
-        } => agent_id,
+        prefix_id::PrefixResolution::Unique(agent_id) => agent_id,
+        prefix_id::PrefixResolution::Ambiguous { .. } => {
+            anyhow::bail!("ambiguous agent id {handle}")
+        }
         prefix_id::PrefixResolution::NotFound => {
-            anyhow::bail!("no agent with id {}", args.engineer_id)
+            anyhow::bail!("no agent with id {handle}")
         }
     };
     if !pool.agent_exists(recipient) {
-        anyhow::bail!("no agent with id {}", args.engineer_id);
+        anyhow::bail!("no agent with id {handle}");
     }
     anyhow::ensure!(
-        matches!(
-            pool.db().read().get_agent(recipient).role,
-            AgentRole::Engineer { .. }
-        ),
-        "target is not an Engineer"
+        pool.db().read().get_agent(recipient).role.handle_prefix()
+            == handle.split('-').next().unwrap(),
+        "agent handle role prefix does not match target"
     );
     if recipient == tools.self_id {
         anyhow::bail!("cannot send a message to yourself");
@@ -506,10 +473,7 @@ async fn message_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::R
         MessageDelivery::NextRequest,
     )
     .await?;
-    Ok(format!(
-        "Message sent to Engineer eng-{}.",
-        pool.agent_id_prefix(recipient)
-    ))
+    Ok(format!("Message sent to {}.", pool.agent_handle(recipient)))
 }
 
 #[derive(Deserialize)]

@@ -203,8 +203,8 @@ pub enum McpAgentToolRequest {
         /// agent's whole working set.
         workdirs: Vec<McpSpawnWorkdir>,
     },
-    MessageEngineer {
-        engineer_id: String,
+    MessageAgent {
+        agent_id: String,
         message: String,
     },
     InterruptEngineer {

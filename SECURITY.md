@@ -188,16 +188,23 @@ Claude Code MCP support is bound to the active Rho agent through
 `RHO_MCP_AGENT_ID`, which Rho sets when spawning the Claude process. A globally
 configured `rho mcp-agent-tools` stdio server inherits that environment and
 treats tool calls as provider-controlled input: the daemon validates
-role-prefixed handles, Engineer workdir choices, and Advisor ownership;
+role-prefixed handles and Engineer workdir choices;
 preserves the same spawn-depth/live-child limits as
 in-process Rho tools, bounds wait operations, and returns tool errors as data
 instead of panicking.
 
+Agent mail intentionally has no ownership or ancestry authorization: any agent
+that knows another agent's unambiguous role-prefixed handle may inject mail into
+its queue. This is a collaboration bus inside one trusted local pool, not a
+team-isolation boundary. Self-messaging and ambiguous or mismatched handles are
+rejected. Interrupt remains role-specific and separately validated.
+
 Spawned Engineers always receive isolated jj workspaces; the model cannot opt
 them into a shared jj checkout. Plain directories cannot be isolated and remain
 shared. Advisors intentionally join their caller's workdirs and keep shell and
-patch tools for read-oriented investigation and scratch experiments, but have
-no orchestration tools and are instructed not to implement changes.
+patch tools for read-oriented investigation and scratch experiments. They may
+message other agents and wait for replies, but cannot spawn or interrupt, and
+are instructed not to implement changes.
 
 ## Skills
 
@@ -228,6 +235,10 @@ do not restrict filesystem access or grant tools.
   process session ids), while direct command calls render the equivalent
   Codex-style status headers as text. Other nested tools return JSON strings;
   tool errors reject the JavaScript promise rather than becoming values.
+- `spawn_engineer` is installed in the nested runtime registry and listed by
+  `ALL_TOOLS`, but its full declaration and delegation guidance live in the
+  dynamically discovered `delegate-engineering` skill instead of every code
+  mode prompt. Runtime authorization and spawn validation are unchanged.
 - Trust boundaries: script source is model-controlled input; nested tool calls
   leave the isolate through the `ToolDispatcher`, which forwards to the agent's
   normal tool path with its existing controls. The JS environment strips
