@@ -172,6 +172,7 @@ impl ClaudeAgent {
         ))
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn new(
         workspace: Arc<rho_workspaces::Workspace>,
         model: Model,
