@@ -1671,8 +1671,7 @@ mod tests {
 
     use rho_agent::{AgentState, AgentStateKind, InputQueues};
     use rho_core::{
-        ContentPart, ContextBlock, InferenceResponseItem, MessagePhase, ToolSpec,
-        UnknownProviderSpecificData,
+        ContentPart, ContextBlock, InferenceResponseItem, MessagePhase, UnknownProviderSpecificData,
     };
 
     use super::{inference_response_count, latest_final_response};
@@ -1696,8 +1695,6 @@ mod tests {
                     })
                 })
                 .collect(),
-            tool_specs: Vec::<ToolSpec>::new().into(),
-            system_prompt: "".into(),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,

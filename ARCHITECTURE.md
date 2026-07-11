@@ -13,11 +13,13 @@ than by running a supervisor, extension protocol, or daemon process graph.
   back into `rho-core` items and updates.
 - `rho-agent` owns the opinionated harness policy: queueing, retries/tool
   scheduling, streamed transcript handling, inference response block recording,
-  and persistence hooks. It depends directly on the concrete `rho-inference`
-  session.
+  and persistence hooks. Loading restores that logical state cheaply; the
+  workspace-backed execution context (view, prompt, and tools) initializes
+  lazily at first inference. It depends directly on the concrete
+  `rho-inference` session.
 - `rho-workspaces` owns checkout materialization and filesystem views. A
   `Workspace` is one materialized checkout (a jj pool slot, the user's live
-  checkout, or a plain directory); a `View` is one agent's world: a working
+  checkout, or a plain directory). A `View` is one agent's world: a working
   set of workdir entries, fixed at spawn, realized as a private mount
   namespace with each entry's slot mounted over its origin path. Entry 0 is
   the primary workdir (default cwd, prompt header).

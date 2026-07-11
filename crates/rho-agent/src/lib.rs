@@ -23,12 +23,14 @@ use crate::db::{
     AgentEventPos, AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRuntime,
     AgentWriteTxnExt, InferenceModel, InferenceProfile, SessionBinding, UnixMillis,
 };
+use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::pool::AgentInputAccepted;
 
 mod claude;
 mod code_mode;
 pub mod db;
+mod lazy;
 pub mod multi_agent_tools;
 pub mod pool;
 pub mod system_prompt;
@@ -146,11 +148,6 @@ pub struct AgentState {
     /// replace this with a compacted transcript snapshot when the provider
     /// rewrites history.
     pub blocks: Vec<Arc<ContextBlock>>,
-    /// Invariant: immutable. Set once at construction and never changed for the
-    /// life of the agent. Enforced by exposing no mutator.
-    pub tool_specs: Arc<[ToolSpec]>,
-    /// Invariant: immutable
-    pub system_prompt: Arc<str>,
     /// Inputs waiting to enter model context. Persisted as
     /// `AgentEvent::Queued` at enqueue and replayed on load, so the pending
     /// queue survives restarts; delivery boundaries are marked by
@@ -483,7 +480,6 @@ pub struct Agent {
     state: Arc<RwLock<AgentState>>,
     control: mpsc::UnboundedSender<AgentControl>,
     notify: Arc<Notify>,
-    view: Arc<View>,
 }
 
 /// Where one of a new agent's workdirs comes from. Agents start from a
@@ -580,7 +576,7 @@ impl Agent {
             prompt_cache_key,
             agent_id,
             next_event,
-            view,
+            Arc::new(Lazy::ready(view)),
             parent,
             pool,
             tool_extension,
@@ -594,6 +590,24 @@ impl Agent {
         auth: InferenceAuth,
         agent_id: AgentId,
         view: Arc<View>,
+        pool: std::sync::Weak<pool::AgentPool>,
+        tool_extension: Option<Arc<dyn AgentToolExtension>>,
+    ) -> Self {
+        Self::load_lazy(
+            db,
+            auth,
+            agent_id,
+            Arc::new(Lazy::ready(view)),
+            pool,
+            tool_extension,
+        )
+    }
+
+    pub(crate) fn load_lazy(
+        db: RhoDb,
+        auth: InferenceAuth,
+        agent_id: AgentId,
+        view: Arc<Lazy<Arc<View>>>,
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
         // multi-agent tools are not offered.
         pool: std::sync::Weak<pool::AgentPool>,
@@ -644,49 +658,47 @@ impl Agent {
         prompt_cache_key: PromptCacheKey,
         agent_id: AgentId,
         next_event: AgentEventPos,
-        view: Arc<View>,
+        view: Arc<Lazy<Arc<View>>>,
         parent: Option<AgentId>,
         pool: std::sync::Weak<pool::AgentPool>,
         tool_extension: Option<Arc<dyn AgentToolExtension>>,
         restored: RestoredAgent,
     ) -> Self {
+        let code_mode_enabled = config.code_mode;
         let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
-        let mut shell_tools = ShellTools::new(
-            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            Arc::clone(&view),
-        )
-        .with_env("RHO_AGENT_ID", agent_id.encoded());
-        if let Ok(socket) = std::env::var("OCTO_SOCKET") {
-            shell_tools = shell_tools.with_env("OCTO_SOCKET", socket);
-        }
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
         let agent_tools_enabled = true;
         let pool_events = pool;
         let (control, control_rx) = mpsc::unbounded_channel();
-        let code_mode = start_code_mode(
-            config.code_mode,
-            &shell_tools,
-            agent_tools_enabled.then_some(()).and(multi_agent.as_ref()),
-            tool_extension.as_ref(),
-            control.clone(),
-        );
+        let execution = Arc::new(Lazy::new({
+            let view = Arc::clone(&view);
+            let multi_agent = multi_agent.clone();
+            let tool_extension = tool_extension.clone();
+            let control = control.clone();
+            move || {
+                let view = Arc::clone(&view);
+                let multi_agent = multi_agent.clone();
+                let tool_extension = tool_extension.clone();
+                let control = control.clone();
+                async move {
+                    let view = Arc::clone(view.get().await?);
+                    Ok(ExecutionContext::new(
+                        view,
+                        role,
+                        agent_id,
+                        code_mode_enabled,
+                        agent_tools_enabled,
+                        multi_agent.as_ref(),
+                        tool_extension.as_ref(),
+                        control,
+                    ))
+                }
+            }
+        }));
         let state = Arc::new(RwLock::new(AgentState {
             blocks: restored.blocks,
-            tool_specs: agent_tool_specs(
-                &shell_tools,
-                multi_agent.is_some() && agent_tools_enabled,
-                code_mode.is_some(),
-                role,
-                tool_extension.as_ref(),
-            ),
-            system_prompt: system_prompt::prompt(
-                view.as_ref(),
-                multi_agent.as_ref(),
-                code_mode.is_some(),
-                role,
-            ),
             queued_inputs: restored.queued_inputs,
             kind: restored.kind,
             context_used: restored.context_used,
@@ -698,8 +710,7 @@ impl Agent {
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
             control_rx,
-            shell_tools,
-            view: Arc::clone(&view),
+            execution,
             persistence: AgentPersistence {
                 db,
                 agent_id,
@@ -708,7 +719,6 @@ impl Agent {
             multi_agent,
             agent_tools_enabled,
             tool_extension,
-            code_mode,
             pool_events,
         };
         tokio::spawn(agent_loop.run());
@@ -716,13 +726,7 @@ impl Agent {
             state,
             control,
             notify,
-            view,
         }
-    }
-
-    /// The agent's filesystem view (its working set of workdirs).
-    pub fn view(&self) -> &Arc<View> {
-        &self.view
     }
 
     pub fn state(&self) -> AgentState {
@@ -945,8 +949,7 @@ struct AgentLoop {
     state: Arc<RwLock<AgentState>>,
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<AgentControl>,
-    shell_tools: ShellTools,
-    view: Arc<View>,
+    execution: Arc<Lazy<ExecutionContext>>,
     persistence: AgentPersistence,
     /// Present on pooled agents: identity + `Weak` pool handle for the
     /// built-in spawn/send/wait tools and parent result/error mail.
@@ -956,11 +959,61 @@ struct AgentLoop {
     agent_tools_enabled: bool,
     /// Integration-provided tools bound to this agent.
     tool_extension: Option<Arc<dyn AgentToolExtension>>,
-    /// Present when `InferenceProfile::code_mode` is on: the V8 session behind
-    /// the `exec`/`wait` tool surface. Pending exec futures hold their own
-    /// `Arc`, so toggling code mode off mid-turn lets them finish.
-    code_mode: Option<Arc<rho_code_mode::CodeModeSession>>,
     pool_events: std::sync::Weak<pool::AgentPool>,
+}
+
+struct ExecutionContext {
+    view: Arc<View>,
+    system_prompt: Arc<str>,
+    shell_tools: ShellTools,
+    tool_specs: Arc<[ToolSpec]>,
+    code_mode: Option<Arc<rho_code_mode::CodeModeSession>>,
+}
+
+impl ExecutionContext {
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        view: Arc<View>,
+        role: db::AgentRole,
+        agent_id: AgentId,
+        code_mode_enabled: bool,
+        agent_tools_enabled: bool,
+        multi_agent: Option<&MultiAgentTools>,
+        tool_extension: Option<&Arc<dyn AgentToolExtension>>,
+        control: mpsc::UnboundedSender<AgentControl>,
+    ) -> Self {
+        let mut shell_tools = ShellTools::new(
+            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            Arc::clone(&view),
+        )
+        .with_env("RHO_AGENT_ID", agent_id.encoded());
+        if let Ok(socket) = std::env::var("OCTO_SOCKET") {
+            shell_tools = shell_tools.with_env("OCTO_SOCKET", socket);
+        }
+        let code_mode = start_code_mode(
+            code_mode_enabled,
+            &shell_tools,
+            agent_tools_enabled.then_some(()).and(multi_agent),
+            tool_extension,
+            control,
+        );
+        let tool_specs = agent_tool_specs(
+            &shell_tools,
+            multi_agent.is_some() && agent_tools_enabled,
+            code_mode.is_some(),
+            role,
+            tool_extension,
+        );
+        let system_prompt =
+            system_prompt::prompt(view.as_ref(), multi_agent, code_mode.is_some(), role);
+        Self {
+            view,
+            system_prompt,
+            shell_tools,
+            tool_specs,
+            code_mode,
+        }
+    }
 }
 
 impl AgentLoop {
@@ -1025,11 +1078,7 @@ impl AgentLoop {
                                     assert!(self.pending_tools.is_empty());
                                     self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                         .await;
-                                    self.send_request(&state);
-                                    state.kind = AgentStateKind::ApiStreaming {
-                                        pending_response: PendingInferenceResponse::default(),
-                                        previous_attempt: None,
-                                    };
+                                    self.start_request(&mut state, None).await;
                                 }
                                 AgentStateKind::ApiStreaming { .. }
                                 | AgentStateKind::ToolCalling { .. }
@@ -1090,30 +1139,18 @@ impl AgentLoop {
                                     }
                                     self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                         .await;
-                                    self.send_request(&state);
-                                    state.kind = AgentStateKind::ApiStreaming {
-                                        pending_response: PendingInferenceResponse::default(),
-                                        previous_attempt: None,
-                                    };
+                                    self.start_request(&mut state, None).await;
                                 }
                                 AgentStateKind::Error(previous_attempt) => {
                                     self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                         .await;
-                                    self.send_request(&state);
-                                    state.kind = AgentStateKind::ApiStreaming {
-                                        pending_response: PendingInferenceResponse::default(),
-                                        previous_attempt: Some(previous_attempt),
-                                    };
+                                    self.start_request(&mut state, Some(previous_attempt)).await;
                                 }
                                 // Idle with restored mail: continue delivers it.
                                 AgentStateKind::Idle if !state.queued_inputs.is_empty() => {
                                     self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                         .await;
-                                    self.send_request(&state);
-                                    state.kind = AgentStateKind::ApiStreaming {
-                                        pending_response: PendingInferenceResponse::default(),
-                                        previous_attempt: None,
-                                    };
+                                    self.start_request(&mut state, None).await;
                                 }
                                 other => {
                                     state.kind = other;
@@ -1323,7 +1360,13 @@ impl AgentLoop {
                                     // Turn complete: commit the checkout's
                                     // state so the user's jj view follows the
                                     // agent's work (fire-and-forget).
-                                    let view = Arc::clone(&self.view);
+                                    let view = Arc::clone(
+                                        &self
+                                            .execution
+                                            .get_if_ready()
+                                            .expect("turn has an execution context")
+                                            .view,
+                                    );
                                     tokio::spawn(async move {
                                         if let Err(error) = view.snapshot().await {
                                             eprintln!("rho-agent: snapshot failed: {error:#}");
@@ -1347,18 +1390,18 @@ impl AgentLoop {
                                     } else {
                                         self.deliver_queued(&mut state, MessageDelivery::NextTurn)
                                             .await;
-                                        self.send_request(&state);
-                                        state.kind = AgentStateKind::ApiStreaming {
-                                            pending_response: PendingInferenceResponse::default(),
-                                            previous_attempt: None,
-                                        };
+                                        self.start_request(&mut state, None).await;
                                     }
                                 } else {
                                     let mut previews = BTreeMap::new();
                                     let mut waiting = None;
                                     for call in calls {
                                         let started_at = UnixMs::now();
-                                        let preview_metadata = self
+                                        let execution = self
+                                            .execution
+                                            .get_if_ready()
+                                            .expect("tool call has an execution context");
+                                        let preview_metadata = execution
                                             .shell_tools
                                             .preview_metadata(&call)
                                             .map(tool_preview_metadata);
@@ -1374,7 +1417,7 @@ impl AgentLoop {
                                         // to the V8 session; `wait` means the
                                         // cell wait there, so the multi-agent
                                         // wait arm below never sees it.
-                                        if let Some(session) = &self.code_mode
+                                        if let Some(session) = &execution.code_mode
                                             && (call.name.as_str()
                                                 == rho_code_mode::EXEC_TOOL_NAME
                                                 || call.name.as_str()
@@ -1414,7 +1457,7 @@ impl AgentLoop {
                                             }
                                             continue;
                                         }
-                                        let shell_tools = self.shell_tools.clone();
+                                        let shell_tools = execution.shell_tools.clone();
                                         let agent_tools = (self.agent_tools_enabled
                                             && multi_agent_tools::is_agent_tool(call.name.as_str()))
                                             .then(|| self.multi_agent.clone())
@@ -1559,11 +1602,7 @@ impl AgentLoop {
                 .push(Arc::new(ContextBlock::ToolResults { results }));
             self.deliver_queued(state, MessageDelivery::NextRequest)
                 .await;
-            self.send_request(state);
-            state.kind = AgentStateKind::ApiStreaming {
-                pending_response: PendingInferenceResponse::default(),
-                previous_attempt: None,
-            };
+            self.start_request(state, None).await;
         } else {
             state.kind = AgentStateKind::ToolCalling {
                 previews,
@@ -1627,7 +1666,11 @@ impl AgentLoop {
     /// observed cell to yield so the tool batch can finish and the queued input
     /// can enter the next request promptly.
     fn yield_code_mode_wait_for_queued(&self, state: &AgentState) {
-        let Some(session) = &self.code_mode else {
+        let Some(session) = self
+            .execution
+            .get_if_ready()
+            .and_then(|execution| execution.code_mode.as_ref())
+        else {
             return;
         };
         if !should_yield_code_mode_wait_for_queued(state) {
@@ -1667,11 +1710,7 @@ impl AgentLoop {
                 assert!(!self.inference_session.has_active_request());
                 assert!(self.pending_tools.is_empty());
                 self.deliver_queued(state, MessageDelivery::NextTurn).await;
-                self.send_request(state);
-                state.kind = AgentStateKind::ApiStreaming {
-                    pending_response: PendingInferenceResponse::default(),
-                    previous_attempt: None,
-                };
+                self.start_request(state, None).await;
             }
             AgentStateKind::UnfinishedTurn { .. } => {
                 assert!(!self.inference_session.has_active_request());
@@ -1698,22 +1737,43 @@ impl AgentLoop {
                         .push(Arc::new(ContextBlock::ToolResults { results }));
                 }
                 self.deliver_queued(state, MessageDelivery::NextTurn).await;
-                self.send_request(state);
-                state.kind = AgentStateKind::ApiStreaming {
-                    pending_response: PendingInferenceResponse::default(),
-                    previous_attempt: None,
-                };
+                self.start_request(state, None).await;
             }
         }
     }
 
-    fn send_request(&mut self, state: &AgentState) {
+    async fn start_request(
+        &mut self,
+        state: &mut AgentState,
+        previous_attempt: Option<FailedInferenceResponse>,
+    ) {
+        if self.send_request(state).await {
+            state.kind = AgentStateKind::ApiStreaming {
+                pending_response: PendingInferenceResponse::default(),
+                previous_attempt,
+            };
+        }
+    }
+
+    async fn send_request(&mut self, state: &mut AgentState) -> bool {
+        let execution = match self.execution.get().await {
+            Ok(execution) => execution,
+            Err(error) => {
+                state.kind = AgentStateKind::Error(FailedInferenceResponse {
+                    partial_response: PendingInferenceResponse::default(),
+                    attempt_count: NonZeroU64::MIN,
+                    error: Arc::new(format!("failed to initialize agent execution: {error:#}")),
+                });
+                return false;
+            }
+        };
         self.inference_session.request(InferenceRequest {
-            instructions: state.system_prompt.clone(),
+            instructions: Arc::clone(&execution.system_prompt),
             input: state.blocks.clone(),
             agent_id_labels: self.agent_id_labels(&state.blocks),
-            tools: Arc::clone(&state.tool_specs),
+            tools: Arc::clone(&execution.tool_specs),
         });
+        true
     }
 
     fn agent_id_labels(
@@ -2036,8 +2096,6 @@ mod tests {
         );
         AgentState {
             blocks: Vec::new(),
-            tool_specs: Arc::from([]),
-            system_prompt: Arc::from(""),
             queued_inputs: queue,
             kind: AgentStateKind::ToolCalling {
                 previews,

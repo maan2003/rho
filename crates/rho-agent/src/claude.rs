@@ -36,10 +36,11 @@ use projection::{
     user_output_to_block,
 };
 
+use crate::lazy::Lazy;
+
 #[derive(Clone)]
 pub struct ClaudeAgent {
     state: Arc<RwLock<AgentState>>,
-    view: Arc<rho_workspaces::View>,
     control: mpsc::UnboundedSender<ClaudeControl>,
     notify: Arc<Notify>,
     input_seq: Arc<AtomicU64>,
@@ -89,8 +90,6 @@ impl ClaudeAgent {
             .map(|_| MultiAgentTools::new(pool, agent_id, parent));
         let state = AgentState {
             blocks: Vec::new(),
-            tool_specs: Arc::from([]),
-            system_prompt: system_prompt::claude_prompt(multi_agent.as_ref(), role),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
@@ -98,7 +97,7 @@ impl ClaudeAgent {
         Ok((
             agent_id,
             Self::new(
-                view,
+                Arc::new(Lazy::ready(view)),
                 model,
                 effort,
                 session_id,
@@ -110,10 +109,10 @@ impl ClaudeAgent {
         ))
     }
 
-    pub async fn load(
+    pub(crate) async fn load(
         db: RhoDb,
         agent_id: AgentId,
-        view: Arc<rho_workspaces::View>,
+        view: Arc<Lazy<Arc<rho_workspaces::View>>>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
@@ -128,7 +127,7 @@ impl ClaudeAgent {
             .binding
             .claude_effort()
             .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
-        let primary = view.primary();
+        let primary = record.primary_workdir();
         let messages = rho_claude::read_session_messages_by_id(
             session_id,
             primary.repo(),
@@ -140,13 +139,6 @@ impl ClaudeAgent {
             rho_claude::read_session_context_used_by_id(session_id, primary.repo()).await?;
         let state = AgentState {
             blocks,
-            tool_specs: Arc::from([]),
-            system_prompt: {
-                let multi_agent = pool
-                    .upgrade()
-                    .map(|_| MultiAgentTools::new(pool.clone(), agent_id, record.parent_agent));
-                system_prompt::claude_prompt(multi_agent.as_ref(), record.role)
-            },
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used,
@@ -166,7 +158,7 @@ impl ClaudeAgent {
 
     #[expect(clippy::too_many_arguments)]
     fn new(
-        view: Arc<rho_workspaces::View>,
+        view: Arc<Lazy<Arc<rho_workspaces::View>>>,
         model: Model,
         effort: Effort,
         session_id: Uuid,
@@ -182,7 +174,7 @@ impl ClaudeAgent {
         let input_notify = Arc::new(Notify::new());
         let (control, control_rx) = mpsc::unbounded_channel();
         let loop_state = ClaudeLoop {
-            view: Arc::clone(&view),
+            view,
             model,
             effort,
             session_id,
@@ -209,17 +201,11 @@ impl ClaudeAgent {
             input_seq,
             wait_baseline_seq,
             input_notify,
-            view,
         }
     }
 
     pub fn state(&self) -> AgentState {
         self.state.read().expect("poison").clone()
-    }
-
-    /// The agent's filesystem view (its working set of workdirs).
-    pub fn view(&self) -> &Arc<rho_workspaces::View> {
-        &self.view
     }
 
     pub fn send_user_message(&self, text: impl Into<String>) {
@@ -306,7 +292,7 @@ enum ClaudeControl {
 }
 
 struct ClaudeLoop {
-    view: Arc<rho_workspaces::View>,
+    view: Arc<Lazy<Arc<rho_workspaces::View>>>,
     model: Model,
     effort: Effort,
     session_id: Uuid,
@@ -538,6 +524,7 @@ impl ClaudeLoop {
         if self.process.is_some() {
             return Ok(());
         }
+        let view = Arc::clone(self.view.get().await?);
         let session = match self.start_mode {
             ClaudeStartMode::New => Session::New {
                 session_id: self.session_id,
@@ -547,7 +534,7 @@ impl ClaudeLoop {
             },
         };
         let mut options = ClaudeCodeOptions::new(
-            self.view.primary().repo().to_owned(),
+            view.primary().repo().to_owned(),
             self.model,
             self.effort,
             self.session_id,
@@ -560,7 +547,7 @@ impl ClaudeLoop {
             options.set_env("RHO_AGENT_ID", tools.self_id().encoded());
             options.set_env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
         }
-        let file_mounts = self.write_claude_prompt_mount()?.into_iter().collect();
+        let file_mounts = self.write_claude_prompt_mount(&view)?.into_iter().collect();
         let mut command = match options.command().await {
             Ok(command) => command,
             Err(error) => {
@@ -568,11 +555,7 @@ impl ClaudeLoop {
                 return Err(error);
             }
         };
-        if let Err(error) = self
-            .view
-            .prepare_command(&mut command, None, file_mounts)
-            .await
-        {
+        if let Err(error) = view.prepare_command(&mut command, None, file_mounts).await {
             self.remove_claude_runtime_files();
             return Err(error);
         }
@@ -587,11 +570,13 @@ impl ClaudeLoop {
         Ok(())
     }
 
-    fn write_claude_prompt_mount(&mut self) -> anyhow::Result<Option<(Utf8PathBuf, Utf8PathBuf)>> {
+    fn write_claude_prompt_mount(
+        &mut self,
+        view: &rho_workspaces::View,
+    ) -> anyhow::Result<Option<(Utf8PathBuf, Utf8PathBuf)>> {
         // A view whose entries are all live checkouts has no private mount
         // namespace to bind the generated prompt into.
-        if self
-            .view
+        if view
             .entries()
             .iter()
             .all(|workspace| workspace.is_user_checkout())
@@ -714,12 +699,14 @@ impl ClaudeLoop {
                         self.stream_items.clear();
                         self.set_streaming_kind();
                     }
-                    let view = Arc::clone(&self.view);
-                    tokio::spawn(async move {
-                        if let Err(error) = view.snapshot().await {
-                            eprintln!("rho-agent Claude snapshot failed: {error:#}");
-                        }
-                    });
+                    if let Some(view) = self.view.get_if_ready() {
+                        let view = Arc::clone(view);
+                        tokio::spawn(async move {
+                            if let Err(error) = view.snapshot().await {
+                                eprintln!("rho-agent Claude snapshot failed: {error:#}");
+                            }
+                        });
+                    }
                 }
             }
             rho_claude::ClaudeEvent::StreamEvent(event) => {
@@ -956,8 +943,6 @@ mod tests {
     fn promotes_queued_user_message_from_uuid_matched_turn_content() {
         let mut state = AgentState {
             blocks: Vec::new(),
-            tool_specs: Arc::from([]),
-            system_prompt: Arc::from(""),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,

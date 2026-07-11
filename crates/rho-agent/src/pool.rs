@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
@@ -20,6 +21,7 @@ use crate::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime,
     AgentWriteTxnExt as _, InferenceModel, InferenceProfile, SessionBinding, TopicId,
 };
+use crate::lazy::Lazy;
 use crate::{
     Agent, AgentInputId, AgentState, AgentToolExtension, AgentToolExtensionFactory, InputSourceId,
     MessageDelivery, StartWorkdir,
@@ -512,6 +514,20 @@ impl AgentPool {
         View::new(entries)
     }
 
+    fn lazy_view(self: &Arc<Self>, workdirs: Vec<WorkspaceInfo>) -> Arc<Lazy<Arc<View>>> {
+        let pool = Arc::downgrade(self);
+        Arc::new(Lazy::new(move || {
+            let pool = pool.clone();
+            let workdirs = workdirs.clone();
+            async move {
+                pool.upgrade()
+                    .context("agent pool dropped")?
+                    .open_view(&workdirs)
+                    .await
+            }
+        }))
+    }
+
     /// Loads a persisted agent if it is not already running. The returned
     /// bool is true when this call started it.
     pub async fn load(
@@ -522,9 +538,9 @@ impl AgentPool {
             return Ok((agent_id, agent, false));
         }
         let record = self.db.read().get_agent(agent_id);
-        let view = self.open_view(&record.workdirs).await?;
+        let view = self.lazy_view(record.workdirs.clone());
         let agent = match record.runtime {
-            AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load(
+            AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load_lazy(
                 self.db.clone(),
                 self.auth.clone(),
                 agent_id,
@@ -555,14 +571,6 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.state(),
             Self::Claude(agent) => agent.state(),
-        }
-    }
-
-    /// The agent's filesystem view (its working set of workdirs).
-    pub fn view(&self) -> &Arc<View> {
-        match self {
-            Self::Rho(agent) => agent.view(),
-            Self::Claude(agent) => agent.view(),
         }
     }
 
