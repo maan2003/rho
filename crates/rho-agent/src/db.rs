@@ -33,7 +33,7 @@ const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::n
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "7c3e91af";
+const CURRENT_AGENT_DB_FORMAT: &str = "d4a71c2e";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -49,11 +49,18 @@ pub struct MigrationRecoveryPoint {
     pub created_at: UnixMillis,
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "a1f83c6d",
-    to: "7c3e91af",
-    migrate: migrate_agent_workdirs,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: "a1f83c6d",
+        to: "7c3e91af",
+        migrate: migrate_agent_workdirs,
+    },
+    AgentDbMigration {
+        from: "7c3e91af",
+        to: "d4a71c2e",
+        migrate: |_| {},
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -339,18 +346,18 @@ pub(crate) enum SessionBinding {
     CoordinatorSol(InferenceProfile),
     /// Ultra advisory agent. Kept distinct from an ultra engineer so its role
     /// survives session pinning.
-    ClaudeOracle {
+    ClaudeAdvisor {
         effort: ClaudeEffort,
     },
     /// Sol-backed advisory agent.
-    OracleSol(InferenceProfile),
+    AdvisorSol(InferenceProfile),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum AgentRole {
     Engineer { intelligence: EngineerIntelligence },
     PM,
-    Oracle { intelligence: OracleIntelligence },
+    Advisor { intelligence: AdvisorIntelligence },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -362,7 +369,7 @@ pub enum EngineerIntelligence {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum OracleIntelligence {
+pub enum AdvisorIntelligence {
     Medium,
     High,
 }
@@ -383,6 +390,14 @@ impl Default for AgentRole {
 }
 
 impl AgentRole {
+    pub fn handle_prefix(self) -> &'static str {
+        match self {
+            Self::Engineer { .. } => "eng",
+            Self::PM => "pm",
+            Self::Advisor { .. } => "adv",
+        }
+    }
+
     pub(crate) fn session_profile(self) -> anyhow::Result<SessionBinding> {
         let deep = |effort| InferenceProfile {
             effort,
@@ -405,12 +420,12 @@ impl AgentRole {
             } => SessionBinding::ClaudeFable {
                 effort: ClaudeEffort::High,
             },
-            AgentRole::Oracle {
-                intelligence: OracleIntelligence::Medium,
-            } => SessionBinding::OracleSol(deep(ReasoningEffort::Xhigh)),
-            AgentRole::Oracle {
-                intelligence: OracleIntelligence::High,
-            } => SessionBinding::ClaudeOracle {
+            AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::Medium,
+            } => SessionBinding::AdvisorSol(deep(ReasoningEffort::Xhigh)),
+            AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::High,
+            } => SessionBinding::ClaudeAdvisor {
                 effort: ClaudeEffort::High,
             },
         })
@@ -428,20 +443,20 @@ impl SessionBinding {
     pub fn agent_role(self) -> AgentRole {
         if self.is_coordinator() {
             return AgentRole::PM;
-        } else if matches!(self, Self::ClaudeOracle { .. }) {
-            return AgentRole::Oracle {
-                intelligence: OracleIntelligence::High,
+        } else if matches!(self, Self::ClaudeAdvisor { .. }) {
+            return AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::High,
             };
-        } else if matches!(self, Self::OracleSol(_)) {
-            return AgentRole::Oracle {
-                intelligence: OracleIntelligence::Medium,
+        } else if matches!(self, Self::AdvisorSol(_)) {
+            return AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::Medium,
             };
         }
         let (intelligence, _latency) = match self {
             Self::ClaudeFable {
                 effort: ClaudeEffort::High,
             }
-            | Self::ClaudeOracle {
+            | Self::ClaudeAdvisor {
                 effort: ClaudeEffort::High,
             } => (EngineerIntelligence::Ultra, Latency::Standard),
             Self::ResponsesSol(config) if config.effort == ReasoningEffort::Xhigh => (
@@ -466,7 +481,7 @@ impl SessionBinding {
             | Self::ResponsesTerra(config)
             | Self::CoordinatorTerra(config)
             | Self::CoordinatorSol(config)
-            | Self::OracleSol(config) => (
+            | Self::AdvisorSol(config) => (
                 match config.effort {
                     ReasoningEffort::Low => EngineerIntelligence::Low,
                     ReasoningEffort::Medium => EngineerIntelligence::Medium,
@@ -478,7 +493,7 @@ impl SessionBinding {
                     Latency::Standard
                 },
             ),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeOracle { .. } => {
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => {
                 (EngineerIntelligence::Ultra, Latency::Standard)
             }
         };
@@ -493,25 +508,25 @@ impl SessionBinding {
             | Self::ResponsesTerra(config)
             | Self::CoordinatorTerra(config)
             | Self::CoordinatorSol(config)
-            | Self::OracleSol(config) => Some(config),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeOracle { .. } => None,
+            | Self::AdvisorSol(config) => Some(config),
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
 
     pub fn deep_model(self) -> Option<InferenceModel> {
         match self {
             Self::ResponsesGpt55(_) => Some(InferenceModel::Gpt55),
-            Self::ResponsesSol(_) | Self::OracleSol(_) => Some(InferenceModel::Gpt56Sol),
+            Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt56Sol),
             Self::ResponsesLuna(_) => Some(InferenceModel::Gpt56Luna),
             Self::ResponsesTerra(_) | Self::CoordinatorTerra(_) => Some(InferenceModel::Gpt56Terra),
             Self::CoordinatorSol(_) => Some(InferenceModel::Gpt56Sol),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeOracle { .. } => None,
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
 
     pub fn claude_model(self) -> Option<rho_claude::Model> {
         match self {
-            Self::ClaudeFable { .. } | Self::ClaudeOracle { .. } => Some(rho_claude::Model::Fable),
+            Self::ClaudeFable { .. } | Self::ClaudeAdvisor { .. } => Some(rho_claude::Model::Fable),
             Self::ClaudeOpus { .. } => Some(rho_claude::Model::Opus),
             Self::ResponsesGpt55(_)
             | Self::ResponsesSol(_)
@@ -519,13 +534,13 @@ impl SessionBinding {
             | Self::ResponsesTerra(_)
             | Self::CoordinatorTerra(_)
             | Self::CoordinatorSol(_)
-            | Self::OracleSol(_) => None,
+            | Self::AdvisorSol(_) => None,
         }
     }
 
     pub fn claude_effort(self) -> Option<rho_claude::Effort> {
         match self {
-            Self::ClaudeFable { effort } | Self::ClaudeOracle { effort } => {
+            Self::ClaudeFable { effort } | Self::ClaudeAdvisor { effort } => {
                 Some(effort.to_claude_effort())
             }
             Self::ClaudeOpus { effort } => Some(effort.to_claude_effort()),
@@ -535,7 +550,7 @@ impl SessionBinding {
             | Self::ResponsesTerra(_)
             | Self::CoordinatorTerra(_)
             | Self::CoordinatorSol(_)
-            | Self::OracleSol(_) => None,
+            | Self::AdvisorSol(_) => None,
         }
     }
 

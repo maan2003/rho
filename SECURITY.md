@@ -146,10 +146,17 @@ external-provider exposure as other agent prompt text.
 Claude Code MCP support is bound to the active Rho agent through
 `RHO_MCP_AGENT_ID`, which Rho sets when spawning the Claude process. A globally
 configured `rho mcp-agent-tools` stdio server inherits that environment and
-treats tool calls as provider-controlled input: the daemon validates agent ids
-and workspace choices, preserves the same spawn-depth/live-child limits as
+treats tool calls as provider-controlled input: the daemon validates
+role-prefixed handles, Engineer workdir choices, and Advisor ownership;
+preserves the same spawn-depth/live-child limits as
 in-process Rho tools, bounds wait operations, and returns tool errors as data
 instead of panicking.
+
+Spawned Engineers always receive isolated jj workspaces; the model cannot opt
+them into a shared jj checkout. Plain directories cannot be isolated and remain
+shared. Advisors intentionally join their caller's workdirs and keep shell and
+patch tools for read-oriented investigation and scratch experiments, but have
+no orchestration tools and are instructed not to implement changes.
 
 ## Skills
 

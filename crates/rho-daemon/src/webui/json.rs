@@ -151,12 +151,12 @@ fn truncate(mut text: String, limit: usize) -> String {
 fn role_label(config: AgentRole) -> &'static str {
     match config {
         AgentRole::PM => "pm",
-        AgentRole::Oracle {
-            intelligence: rho_ui_proto::OracleIntelligence::Medium,
-        } => "oracle-medium",
-        AgentRole::Oracle {
-            intelligence: rho_ui_proto::OracleIntelligence::High,
-        } => "oracle-high",
+        AgentRole::Advisor {
+            intelligence: rho_ui_proto::AdvisorIntelligence::Medium,
+        } => "advisor",
+        AgentRole::Advisor {
+            intelligence: rho_ui_proto::AdvisorIntelligence::High,
+        } => "advisor-high",
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
             ..

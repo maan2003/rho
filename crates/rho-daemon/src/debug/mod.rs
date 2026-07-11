@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use rho_agent::db::{
-    AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWriteTxnExt as _, EngineerIntelligence,
-    OracleIntelligence, Status,
+    AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWriteTxnExt as _,
+    EngineerIntelligence, Status,
 };
 use rho_db::RhoDb;
 use rho_workspaces::WorkspaceInfo;
@@ -34,8 +34,8 @@ enum DebugCommand {
     Context,
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
-        /// Role text: eng, eng-low, eng-high, eng-ultra, pm, oracle, or
-        /// oracle-high.
+        /// Role text: eng, eng-low, eng-high, eng-ultra, pm, advisor, or
+        /// advisor-high.
         role: String,
     },
 }
@@ -107,14 +107,14 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
             intelligence: EngineerIntelligence::Ultra,
         },
         "pm" => AgentRole::PM,
-        "oracle" | "oracle-medium" => AgentRole::Oracle {
-            intelligence: OracleIntelligence::Medium,
+        "advisor" => AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::Medium,
         },
-        "oracle-high" => AgentRole::Oracle {
-            intelligence: OracleIntelligence::High,
+        "advisor-high" => AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::High,
         },
         _ => anyhow::bail!(
-            "unknown role `{text}`; use eng, eng-low, eng-high, eng-ultra, pm, oracle, or oracle-high"
+            "unknown role `{text}`; use eng, eng-low, eng-high, eng-ultra, pm, advisor, or advisor-high"
         ),
     })
 }
@@ -353,11 +353,11 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
     use rho_agent::db::{AgentRole, EngineerIntelligence};
     match config {
         AgentRole::PM => "pm".to_owned(),
-        AgentRole::Oracle { intelligence } => format!(
-            "oracle {}",
+        AgentRole::Advisor { intelligence } => format!(
+            "advisor {}",
             match intelligence {
-                rho_agent::db::OracleIntelligence::Medium => "medium",
-                rho_agent::db::OracleIntelligence::High => "high",
+                rho_agent::db::AdvisorIntelligence::Medium => "medium",
+                rho_agent::db::AdvisorIntelligence::High => "high",
             }
         ),
         AgentRole::Engineer { intelligence } => {
@@ -387,9 +387,9 @@ mod render_prompt_tests {
     fn parses_render_prompt_roles() {
         assert_eq!(parse_role("eng").unwrap(), AgentRole::default());
         assert_eq!(
-            parse_role("oracle-high").unwrap(),
-            AgentRole::Oracle {
-                intelligence: OracleIntelligence::High
+            parse_role("advisor-high").unwrap(),
+            AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::High
             }
         );
         assert!(parse_role("ultra").is_err());

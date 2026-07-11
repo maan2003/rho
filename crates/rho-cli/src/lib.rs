@@ -550,7 +550,7 @@ fn topic_of(agent: &AgentClient, agent_id: AgentId) -> Option<rho_ui_proto::Topi
 }
 
 fn short_agent_label(agent_id: AgentId) -> String {
-    format!("ag-{}", &agent_id.encoded()[..4])
+    agent_id.encoded()[..4].to_owned()
 }
 
 fn primary_state(states: &HashMap<AgentId, UiAgentState>) -> Option<&UiAgentState> {

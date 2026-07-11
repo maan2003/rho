@@ -15,7 +15,7 @@ use gpui::prelude::*;
 use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
 use rho_ui_proto::{
-    AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery, OracleIntelligence,
+    AdvisorIntelligence, AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery,
     VoiceRole, VoiceState, VoiceUiAction,
 };
 use theme::ActiveTheme as _;
@@ -1404,7 +1404,7 @@ fn cycle_agent_role_text(current: &str) -> &'static str {
             intelligence: EngineerIntelligence::Ultra,
             ..
         } => "pm",
-        AgentRole::Oracle { .. } => "eng",
+        AgentRole::Advisor { .. } => "eng",
         AgentRole::PM => "eng-low",
     }
 }
@@ -1420,13 +1420,13 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
             text: "pm".to_owned(),
             family: RoleFamily::Deep,
         },
-        AgentRole::Oracle { intelligence } => RoleLabel {
+        AgentRole::Advisor { intelligence } => RoleLabel {
             text: match intelligence {
-                OracleIntelligence::Medium => "oracle-medium",
-                OracleIntelligence::High => "oracle-high",
+                AdvisorIntelligence::Medium => "advisor",
+                AdvisorIntelligence::High => "advisor-high",
             }
             .to_owned(),
-            family: if intelligence == OracleIntelligence::High {
+            family: if intelligence == AdvisorIntelligence::High {
                 RoleFamily::Fable
             } else {
                 RoleFamily::Deep
@@ -1598,7 +1598,7 @@ mod tests {
         assert_eq!(parse_agent_role("pm").unwrap(), AgentRole::PM);
         assert!(parse_agent_role("pm ultra").is_err());
         assert!(parse_agent_role("eng-ultra-fast").is_err());
-        assert!(parse_agent_role("oracle high").is_err());
+        assert!(parse_agent_role("advisor high").is_err());
     }
 
     #[test]

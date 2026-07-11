@@ -56,6 +56,15 @@ daemon, and the daemon executes parent-scoped spawn, agent mail, interrupt, and
 wait against `AgentPool`. The MCP server must not reach into `rho-core` or
 provider crates.
 
+Collaboration is role-specific. `spawn_engineer` always gives jj-backed
+workdirs isolated child workspaces; detailed delegation and integration
+guidance lives in the `delegate-engineering` skill rather than every system
+prompt. `ask_advisor` creates a caller-owned advisory session and
+`followup_advisor` continues it by its `adv-*` handle. Advisors retain normal
+shell/patch capabilities but receive no orchestration tools. User-facing agent
+handles are role-prefixed (`eng-*`, `pm-*`, `adv-*`) over the same persisted
+`AgentId`.
+
 `rho-slack` is the in-process Slack surface. `SlackManager` is handed the
 daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
 secret storage (`SecretStore`), the Socket Mode reconnect loop, the persisted

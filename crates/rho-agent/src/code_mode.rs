@@ -156,14 +156,14 @@ mod tests {
         // tools but not the loop-resolved mail `wait`.
         let exec = &specs[0].description;
         assert!(exec.contains("shell_command"), "{exec}");
-        assert!(exec.contains("spawn_agent"), "{exec}");
+        assert!(exec.contains("spawn_engineer"), "{exec}");
         assert!(!exec.contains("async function wait"), "{exec}");
     }
 
     #[test]
     fn without_pool_no_agent_tools_are_nested() {
         let specs = super::tool_specs(&shell_tools(), false, None);
-        assert!(!specs[0].description.contains("spawn_agent"));
+        assert!(!specs[0].description.contains("spawn_engineer"));
     }
 
     struct TestExtension;

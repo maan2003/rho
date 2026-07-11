@@ -11,7 +11,7 @@ use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
 pub use rho_agent::MessageDelivery;
 pub use rho_agent::db::{
-    AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence, OracleIntelligence,
+    AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
     Status, TopicId, TopicIdDomain,
 };
 use rho_core::ContentPart;
@@ -192,20 +192,26 @@ pub enum ClientMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum McpAgentToolRequest {
-    SpawnAgent {
+    SpawnEngineer {
         task_name: String,
         prompt: String,
         /// The child's working set, primary first; empty forks the spawning
         /// agent's whole working set.
         workdirs: Vec<McpSpawnWorkdir>,
-        role: String,
     },
-    SendMessage {
-        agent_id: String,
+    MessageEngineer {
+        engineer_id: String,
         message: String,
     },
-    InterruptAgent {
-        agent_id: String,
+    InterruptEngineer {
+        engineer_id: String,
+    },
+    AskAdvisor {
+        message: String,
+    },
+    FollowupAdvisor {
+        advisor_id: String,
+        message: String,
     },
     Wait {
         timeout_seconds: Option<u64>,
@@ -217,7 +223,6 @@ pub enum McpAgentToolRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct McpSpawnWorkdir {
     pub repo: String,
-    pub checkout: Option<String>,
     pub revset: Option<String>,
 }
 

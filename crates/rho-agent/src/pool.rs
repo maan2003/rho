@@ -245,7 +245,7 @@ impl AgentPool {
             | SessionBinding::ResponsesTerra(_)
             | SessionBinding::CoordinatorTerra(_)
             | SessionBinding::CoordinatorSol(_)
-            | SessionBinding::OracleSol(_) => {
+            | SessionBinding::AdvisorSol(_) => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
                     self.auth.clone(),
@@ -262,7 +262,7 @@ impl AgentPool {
             }
             SessionBinding::ClaudeFable { .. }
             | SessionBinding::ClaudeOpus { .. }
-            | SessionBinding::ClaudeOracle { .. } => {
+            | SessionBinding::ClaudeAdvisor { .. } => {
                 let (agent_id, agent) = ClaudeAgent::create(
                     self.db.clone(),
                     topic_id,
@@ -364,7 +364,7 @@ impl AgentPool {
                 None,
             )
             .await?;
-        let parent_label = format!("ag-{}", self.agent_id_prefix(parent));
+        let parent_label = self.agent_handle(parent);
         child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);
         Ok(child_id)
     }
@@ -402,11 +402,20 @@ impl AgentPool {
         self: &Arc<Self>,
         from: AgentId,
         to: AgentId,
-        body: String,
+        mut body: String,
         delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
         let (_, agent, _) = self.load(to).await?;
-        let sender_label = format!("ag-{}", self.agent_id_prefix(from));
+        let sender_label = self.agent_handle(from);
+        if matches!(
+            self.db.read().get_agent(from).role,
+            AgentRole::Advisor { .. }
+        ) {
+            body.push_str(&format!(
+                "\n\nAdvisor {sender_label} remains available. Use followup_advisor with this \
+                 ID to continue."
+            ));
+        }
         agent.send_agent_message(from, sender_label, body, delivery);
         Ok(())
     }
@@ -436,6 +445,15 @@ impl AgentPool {
         let prefix_len =
             prefix_id::uniform_prefix_len(read.last_agent_counter(), ID_LABEL_HEADROOM).max(4);
         agent_id.encoded()[..prefix_len].to_owned()
+    }
+
+    pub fn agent_handle(&self, agent_id: AgentId) -> String {
+        let role = self.db.read().get_agent(agent_id).role;
+        format!(
+            "{}-{}",
+            role.handle_prefix(),
+            self.agent_id_prefix(agent_id)
+        )
     }
 
     /// The shared handle for the workdir containing `path`: the enclosing jj

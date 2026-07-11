@@ -643,16 +643,15 @@ impl AgentRegistry {
         }
         if matches!(
             self.db.read().get_agent(self_agent_id).role,
-            AgentRole::Oracle { .. }
+            AgentRole::Advisor { .. }
         ) {
-            anyhow::bail!("Oracle agents do not have multi-agent tools");
+            anyhow::bail!("Advisor agents do not have multi-agent tools");
         }
         match request {
-            McpAgentToolRequest::SpawnAgent {
+            McpAgentToolRequest::SpawnEngineer {
                 task_name,
                 prompt,
                 workdirs,
-                role,
             } => {
                 if prompt.trim().is_empty() {
                     anyhow::bail!("prompt must not be empty");
@@ -662,7 +661,7 @@ impl AgentRegistry {
                         .into_iter()
                         .map(|entry| rho_agent::multi_agent_tools::SpawnWorkdirArgs {
                             repo: entry.repo,
-                            checkout: entry.checkout,
+                            checkout: None,
                             revset: entry.revset,
                         })
                         .collect(),
@@ -674,7 +673,7 @@ impl AgentRegistry {
                         task_name.clone(),
                         prompt,
                         workdirs,
-                        rho_agent::multi_agent_tools::parse_spawn_role(&role)?,
+                        AgentRole::default(),
                     )
                     .await?;
                 let child_record = self.pool.db().read().get_agent(child_id);
@@ -688,15 +687,16 @@ impl AgentRegistry {
                         .to_owned(),
                 };
                 Ok(format!(
-                    "Spawned agent {} for task \"{}\". It is working now; its results will arrive \
-                     as mail from that agent.{} Use send_message to follow up and wait to block for \
-                     its results.",
+                    "Spawned Engineer {} for task \"{}\". Its results will arrive as mail.{}",
                     self.display_agent_id(child_id),
                     task_name,
                     workspace_note,
                 ))
             }
-            McpAgentToolRequest::SendMessage { agent_id, message } => {
+            McpAgentToolRequest::MessageEngineer {
+                engineer_id: agent_id,
+                message,
+            } => {
                 if message.trim().is_empty() {
                     anyhow::bail!("message must not be empty");
                 }
@@ -717,7 +717,9 @@ impl AgentRegistry {
                     self.display_agent_id(recipient)
                 ))
             }
-            McpAgentToolRequest::InterruptAgent { agent_id } => {
+            McpAgentToolRequest::InterruptEngineer {
+                engineer_id: agent_id,
+            } => {
                 let target = self.resolve_display_agent_id(&agent_id)?;
                 if target == self_agent_id {
                     anyhow::bail!("cannot interrupt yourself");
@@ -741,14 +743,67 @@ impl AgentRegistry {
                     Ok("Timed out waiting for agent messages or user input.".to_owned())
                 }
             }
+            McpAgentToolRequest::AskAdvisor { message } => {
+                let workdirs = self
+                    .db
+                    .read()
+                    .get_agent(self_agent_id)
+                    .workdirs
+                    .into_iter()
+                    .map(|info| rho_agent::pool::SpawnWorkdir {
+                        repo: info.repo().to_owned(),
+                        checkout: rho_agent::pool::SpawnCheckout::Shared,
+                    })
+                    .collect();
+                let advisor = self
+                    .pool
+                    .spawn_child(
+                        self_agent_id,
+                        "advisor".to_owned(),
+                        message,
+                        workdirs,
+                        AgentRole::Advisor {
+                            intelligence: rho_agent::db::AdvisorIntelligence::Medium,
+                        },
+                    )
+                    .await?;
+                Ok(format!(
+                    "Advisor {} is considering the question.",
+                    self.display_agent_id(advisor)
+                ))
+            }
+            McpAgentToolRequest::FollowupAdvisor {
+                advisor_id,
+                message,
+            } => {
+                let advisor = self.resolve_display_agent_id(&advisor_id)?;
+                let record = self.db.read().get_agent(advisor);
+                anyhow::ensure!(
+                    matches!(record.role, AgentRole::Advisor { .. }),
+                    "target is not an Advisor"
+                );
+                anyhow::ensure!(
+                    record.parent_agent == Some(self_agent_id),
+                    "Advisor belongs to another agent"
+                );
+                self.pool
+                    .deliver_mail(
+                        self_agent_id,
+                        advisor,
+                        message,
+                        MessageDelivery::NextRequest,
+                    )
+                    .await?;
+                Ok(format!("Follow-up sent to Advisor {advisor_id}."))
+            }
         }
     }
 
     fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
-        let raw_agent_id = agent_id
+        let (prefix, raw_agent_id) = agent_id
             .trim()
-            .strip_prefix("ag-")
-            .ok_or_else(|| anyhow::anyhow!("agent_id must start with ag-"))?;
+            .split_once('-')
+            .ok_or_else(|| anyhow::anyhow!("invalid role-prefixed agent id"))?;
         let resolved = match self.pool.resolve_agent_id(raw_agent_id)? {
             prefix_id::PrefixResolution::Unique(agent_id)
             | prefix_id::PrefixResolution::Ambiguous {
@@ -761,11 +816,16 @@ impl AgentRegistry {
         if !self.pool.agent_exists(resolved) {
             anyhow::bail!("no agent with id {agent_id}");
         }
+        let expected = self.db.read().get_agent(resolved).role.handle_prefix();
+        anyhow::ensure!(
+            prefix == expected,
+            "agent handle prefix does not match its role"
+        );
         Ok(resolved)
     }
 
     fn display_agent_id(&self, agent_id: AgentId) -> String {
-        format!("ag-{}", self.pool.agent_id_prefix(agent_id))
+        self.pool.agent_handle(agent_id)
     }
 
     async fn move_agent(

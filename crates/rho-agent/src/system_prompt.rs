@@ -25,18 +25,16 @@ pub fn prompt(
     let skills = render_skills_prompt(&skills).unwrap_or_default();
     let multi_agent = multi_agent.map_or_else(String::new, |tools| {
         let agent_id = tools.display_id(tools.self_id());
-        let workspace_prompt = render_multi_agent_workspace_prompt(&workdirs);
         // In code mode the agent tools live under `tools.*` in exec scripts
         // and `wait` means the exec-cell wait, so mail has no wait tool.
         let agent_tool_usage = if code_mode {
-            "You can use `spawn_agent` to create a new agent, `send_message` to steer or \
-             follow up with an agent, and `interrupt_agent` when an agent is clearly doing \
-             the wrong work and should stop its current turn. There is no tool for waiting \
+            "You can use `spawn_engineer` to create an Engineer, `message_engineer` to steer or \
+             follow up, `interrupt_engineer` to stop a turn, and `ask_advisor` or \
+             `followup_advisor` for independent advice. There is no tool for waiting \
              on agent results: finish your turn and their mail starts your next one."
         } else {
-            "You can use `spawn_agent` to create a new agent, `send_message` to steer or \
-             follow up with an agent, `interrupt_agent` when an agent is clearly doing the \
-             wrong work and should stop its current turn, and `wait` when you are blocked \
+            "You can use `spawn_engineer`, `message_engineer`, `interrupt_engineer`, \
+             `ask_advisor`, and `followup_advisor`, plus `wait` when you are blocked \
              on agent results and have nothing else useful to do."
         };
         let identity = match tools.parent() {
@@ -53,7 +51,7 @@ pub fn prompt(
                  are the active agent."
             ),
         };
-        if matches!(role, AgentRole::Oracle { .. }) {
+        if matches!(role, AgentRole::Advisor { .. }) {
             return format!(
                 "## Team Context
 
@@ -73,11 +71,11 @@ final response.
                  keep tightly coupled or immediately blocking work local."
             }
             AgentRole::PM => {
-                "Use `spawn_agent` with `role=eng` to route substantive technical outcomes to an \
-                 Engineer. Do not spawn an Oracle or delegate conversational work, status \
+                "Use `spawn_engineer` to route substantive technical outcomes to an \
+                 Engineer. Do not delegate conversational work, status \
                  updates, or clarification that belongs to you."
             }
-            AgentRole::Oracle { .. } => unreachable!(),
+            AgentRole::Advisor { .. } => unreachable!(),
         };
         format!(
             "## Sub-Agents
@@ -90,14 +88,6 @@ Child agents have access to the same repo guidance, \
 skills, tools, and workspace instructions as you, so keep child prompts \
 focused on the task-specific goal and constraints instead of restating generic \
 process rules.
-
-A child's `workdirs` define its working set, primary first. The default (no \
-`workdirs`) forks your whole working set: the child gets its own checkout of \
-your current change in each workdir, safe for concurrent edits. List entries \
-explicitly when the task needs something else: `checkout=shared` to work in \
-the same checkouts you see (read-mostly tasks), or a `repo`/`revset` entry \
-when the task should start from trunk, another revision, or another \
-repository.
 
 {agent_tool_usage}
 
@@ -114,7 +104,6 @@ your next request. Do not ask sub-agents for boilerplate you can \
 get from tool responses, such as workspace handles, unless it is specifically \
 needed for the task.
 
-{workspace_prompt}
 "
         )
     });
@@ -122,7 +111,7 @@ needed for the task.
     let role = match role {
         AgentRole::Engineer { .. } => "",
         AgentRole::PM => PM_PROMPT,
-        AgentRole::Oracle { .. } => ORACLE_PROMPT,
+        AgentRole::Advisor { .. } => ADVISOR_PROMPT,
     };
     let environment = render_environment_prompt(&workdirs);
     format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{multi_agent}{role}{environment}").into()
@@ -149,7 +138,7 @@ pub fn claude_prompt(multi_agent: Option<&MultiAgentTools>, role: AgentRole) -> 
     });
     let role = match role {
         AgentRole::Engineer { .. } | AgentRole::PM => "",
-        AgentRole::Oracle { .. } => ORACLE_PROMPT,
+        AgentRole::Advisor { .. } => ADVISOR_PROMPT,
     };
     format!("{team}{role}").into()
 }
@@ -210,7 +199,7 @@ responsible Engineer reports it.
 
 ";
 
-const ORACLE_PROMPT: &str = "## Oracle
+const ADVISOR_PROMPT: &str = "## Advisor
 
 You are an independent technical second opinion. Analyze the question deeply, \
 surface risks and tradeoffs, and recommend a path. You are advisory only: do \
@@ -383,6 +372,7 @@ Before finalizing after an interrupt or context compaction, verify your answer a
 
 ";
 
+#[cfg(test)]
 fn render_multi_agent_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
     let own_workspace = if workdirs.len() == 1 {
         match &workdirs[0].workspace_name {
@@ -514,10 +504,10 @@ mod tests {
     #[test]
     fn role_guidance_is_separate_from_the_base_prompt() {
         assert!(!BASE_PROMPT.contains("## PM"));
-        assert!(!BASE_PROMPT.contains("## Oracle"));
+        assert!(!BASE_PROMPT.contains("## Advisor"));
         assert!(PM_PROMPT.contains("Do not inspect or modify"));
         assert!(PM_PROMPT.contains("Never claim work is done"));
-        assert!(ORACLE_PROMPT.contains("advisory only"));
+        assert!(ADVISOR_PROMPT.contains("advisory only"));
     }
 
     #[test]

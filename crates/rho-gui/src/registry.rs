@@ -244,11 +244,14 @@ impl AgentRegistry {
             .map(|topic| topic.topic_id)
     }
 
-    /// The short display label of an agent: an `ag-`-prefixed slice of its
-    /// encoded ID, unique among all generated IDs.
+    /// The role-prefixed short display label, unique among generated IDs.
     pub fn agent_id_label(&self, agent_id: AgentId) -> String {
         let prefix_len = prefix_id::uniform_prefix_len(self.agent_counter, LABEL_HEADROOM).max(4);
-        format!("ag-{}", &agent_id.encoded()[..prefix_len])
+        let prefix = self
+            .agent_summary(agent_id)
+            .map(|agent| agent.role.handle_prefix())
+            .unwrap_or("eng");
+        format!("{prefix}-{}", &agent_id.encoded()[..prefix_len])
     }
 
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
@@ -851,7 +854,7 @@ mod tests {
 
         assert_eq!(
             registry.agent_id_label(id),
-            format!("ag-{}", &id.encoded()[..4])
+            format!("eng-{}", &id.encoded()[..4])
         );
     }
 

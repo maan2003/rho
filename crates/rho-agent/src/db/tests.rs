@@ -50,22 +50,22 @@ fn agent_role_resolves_opinionated_bindings() {
         }
     );
     assert_eq!(
-        AgentRole::Oracle {
-            intelligence: OracleIntelligence::High,
+        AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::High,
         }
         .session_profile()
         .unwrap(),
-        SessionBinding::ClaudeOracle {
+        SessionBinding::ClaudeAdvisor {
             effort: ClaudeEffort::High
         }
     );
     assert!(matches!(
-        AgentRole::Oracle {
-            intelligence: OracleIntelligence::Medium,
+        AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::Medium,
         }
         .session_profile()
         .unwrap(),
-        SessionBinding::OracleSol(InferenceProfile {
+        SessionBinding::AdvisorSol(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: false,
             ..

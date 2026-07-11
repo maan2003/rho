@@ -295,7 +295,7 @@ fn append_block_items(
             rho_core::MessageSender::Agent { id } => {
                 let sender = agent_id_labels
                     .get(id)
-                    .map_or_else(|| format!("ag-{}", id.encoded()), ToString::to_string);
+                    .map_or_else(|| id.encoded(), ToString::to_string);
                 let text = format!(
                     "Message Type: MESSAGE\nSender: {sender}\nPayload:\n{}",
                     rho_core::text_content(content)

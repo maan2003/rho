@@ -123,10 +123,10 @@ async fn handle_request(
 }
 
 fn resolve_agent_id(text: &str, machine_seed: u64, agent_counter: u64) -> anyhow::Result<AgentId> {
-    let raw = text
+    let (_, raw) = text
         .trim()
-        .strip_prefix("ag-")
-        .ok_or_else(|| anyhow::anyhow!("agent id must start with ag-"))?;
+        .split_once('-')
+        .ok_or_else(|| anyhow::anyhow!("invalid role-prefixed agent id"))?;
     let domain = AgentIdDomain(machine_seed);
     match AgentId::from_prefix(raw, agent_counter + 1, &domain)? {
         prefix_id::PrefixResolution::Unique(agent_id)
@@ -139,9 +139,9 @@ fn resolve_agent_id(text: &str, machine_seed: u64, agent_counter: u64) -> anyhow
 
 fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequest> {
     match name {
-        multi_agent_tools::SPAWN_AGENT_TOOL_NAME => {
+        multi_agent_tools::SPAWN_ENGINEER_TOOL_NAME => {
             let args: SpawnArgs = serde_json::from_value(arguments)?;
-            Ok(McpAgentToolRequest::SpawnAgent {
+            Ok(McpAgentToolRequest::SpawnEngineer {
                 task_name: args.task_name,
                 prompt: args.prompt,
                 workdirs: args
@@ -149,24 +149,32 @@ fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequ
                     .into_iter()
                     .map(|entry| McpSpawnWorkdir {
                         repo: entry.repo,
-                        checkout: entry.checkout,
                         revset: entry.revset,
                     })
                     .collect(),
-                role: args.role,
             })
         }
-        multi_agent_tools::SEND_MESSAGE_TOOL_NAME => {
+        multi_agent_tools::MESSAGE_ENGINEER_TOOL_NAME => {
             let args: SendArgs = serde_json::from_value(arguments)?;
-            Ok(McpAgentToolRequest::SendMessage {
-                agent_id: args.agent_id,
+            Ok(McpAgentToolRequest::MessageEngineer {
+                engineer_id: args.engineer_id,
                 message: args.message,
             })
         }
-        multi_agent_tools::INTERRUPT_AGENT_TOOL_NAME => {
+        multi_agent_tools::INTERRUPT_ENGINEER_TOOL_NAME => {
             let args: InterruptArgs = serde_json::from_value(arguments)?;
-            Ok(McpAgentToolRequest::InterruptAgent {
-                agent_id: args.agent_id,
+            Ok(McpAgentToolRequest::InterruptEngineer {
+                engineer_id: args.engineer_id,
+            })
+        }
+        multi_agent_tools::ASK_ADVISOR_TOOL_NAME => Ok(McpAgentToolRequest::AskAdvisor {
+            message: serde_json::from_value::<AdvisorArgs>(arguments)?.message,
+        }),
+        multi_agent_tools::FOLLOWUP_ADVISOR_TOOL_NAME => {
+            let args: AdvisorArgs = serde_json::from_value(arguments)?;
+            Ok(McpAgentToolRequest::FollowupAdvisor {
+                advisor_id: args.advisor_id.context("advisor_id required")?,
+                message: args.message,
             })
         }
         multi_agent_tools::WAIT_TOOL_NAME => {
@@ -201,18 +209,23 @@ struct SpawnArgs {
     prompt: String,
     #[serde(default)]
     workdirs: Vec<multi_agent_tools::SpawnWorkdirArgs>,
-    role: String,
 }
 
 #[derive(Deserialize)]
 struct SendArgs {
-    agent_id: String,
+    engineer_id: String,
     message: String,
 }
 
 #[derive(Deserialize)]
 struct InterruptArgs {
-    agent_id: String,
+    engineer_id: String,
+}
+
+#[derive(Deserialize)]
+struct AdvisorArgs {
+    advisor_id: Option<String>,
+    message: String,
 }
 
 #[derive(Deserialize)]

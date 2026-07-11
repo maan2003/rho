@@ -100,7 +100,7 @@ fn renders_agent_mail_with_supplied_short_label() {
     let session = test_inference_service("gpt-test");
     let agent_id = rho_core::AgentId::from_counter(1, &rho_core::AgentIdDomain(0)).unwrap();
     let mut agent_id_labels = std::collections::BTreeMap::new();
-    agent_id_labels.insert(agent_id, Arc::from("ag-h6u7"));
+    agent_id_labels.insert(agent_id, Arc::from("eng-h6u7"));
     let request = InferenceRequest {
         instructions: Arc::from("You are rho."),
         input: vec![Arc::new(ContextBlock::UserMessage {
@@ -118,7 +118,7 @@ fn renders_agent_mail_with_supplied_short_label() {
 
     assert_eq!(
         json["input"][0]["content"][0]["text"],
-        "Message Type: MESSAGE\nSender: ag-h6u7\nPayload:\ndone"
+        "Message Type: MESSAGE\nSender: eng-h6u7\nPayload:\ndone"
     );
 }
 

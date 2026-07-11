@@ -72,7 +72,7 @@ pub fn render_agent_surface(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         Arc::clone(&view),
     );
-    let agent_tools_enabled = !matches!(role, db::AgentRole::Oracle { .. });
+    let agent_tools_enabled = !matches!(role, db::AgentRole::Advisor { .. });
     Ok(RenderedAgentSurface {
         system_prompt: system_prompt::prompt(view.as_ref(), None, profile.code_mode, role),
         tools: agent_tool_specs(&shell_tools, agent_tools_enabled, profile.code_mode, None),
@@ -653,7 +653,7 @@ impl Agent {
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
-        let agent_tools_enabled = !matches!(role, db::AgentRole::Oracle { .. });
+        let agent_tools_enabled = !matches!(role, db::AgentRole::Advisor { .. });
         let pool_events = pool;
         let (control, control_rx) = mpsc::unbounded_channel();
         let code_mode = start_code_mode(
@@ -939,7 +939,7 @@ struct AgentLoop {
     /// Present on pooled agents: identity + `Weak` pool handle for the
     /// built-in spawn/send/wait tools and parent result/error mail.
     multi_agent: Option<MultiAgentTools>,
-    /// False for Oracle: retain parent-mail/team identity without exposing or
+    /// False for Advisor: retain parent-mail/team identity without exposing or
     /// dispatching agent-management tools.
     agent_tools_enabled: bool,
     /// Integration-provided tools bound to this agent.
