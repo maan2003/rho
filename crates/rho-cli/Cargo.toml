@@ -18,6 +18,7 @@ rho-agent.workspace = true
 rho-ci.workspace = true
 rho-cli-term-raw.workspace = true
 rho-commands.workspace = true
+rho-code-mode.workspace = true
 rho-core.workspace = true
 rho-daemon.workspace = true
 rho-db.workspace = true

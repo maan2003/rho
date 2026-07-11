@@ -10365,6 +10365,7 @@ dependencies = [
  "rho-agent",
  "rho-ci",
  "rho-cli-term-raw",
+ "rho-code-mode",
  "rho-commands",
  "rho-core",
  "rho-daemon",

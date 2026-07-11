@@ -93,10 +93,7 @@ const AGENT_ID_EXAMPLE: &str = "ag-h6u7";
 pub fn is_agent_tool(name: &str) -> bool {
     matches!(
         name,
-        SPAWN_AGENT_TOOL_NAME
-            | SEND_MESSAGE_TOOL_NAME
-            | INTERRUPT_AGENT_TOOL_NAME
-            | WAIT_TOOL_NAME
+        SPAWN_AGENT_TOOL_NAME | SEND_MESSAGE_TOOL_NAME | INTERRUPT_AGENT_TOOL_NAME | WAIT_TOOL_NAME
     )
 }
 
@@ -338,13 +335,7 @@ async fn spawn_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     let config = parse_spawn_role(&args.role)?;
     let pool = tools.pool()?;
     let child_id = pool
-        .spawn_child(
-            tools.self_id,
-            args.task_name,
-            args.prompt,
-            workdirs,
-            config,
-        )
+        .spawn_child(tools.self_id, args.task_name, args.prompt, workdirs, config)
         .await?;
     let child_record = pool.db().read().get_agent(child_id);
     let workspace_note = match child_record.primary_workdir().workspace_name() {

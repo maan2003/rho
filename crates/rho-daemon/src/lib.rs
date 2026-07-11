@@ -20,8 +20,8 @@ use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
-    McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention,
-    UiTopic, UiWorkdir, read_frame_counted, write_frame_counted,
+    McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiTopic,
+    UiWorkdir, read_frame_counted, write_frame_counted,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc};
 

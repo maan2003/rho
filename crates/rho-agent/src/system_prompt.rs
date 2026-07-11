@@ -129,6 +129,32 @@ needed for the task.
     format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{multi_agent}{role}{environment}").into()
 }
 
+/// Rho orchestration guidance for Claude Code. Claude supplies its own agent
+/// prompt and project discovery, so this contains only Rho team identity and
+/// the one Claude-backed specialized role.
+pub fn claude_prompt(multi_agent: Option<&MultiAgentTools>, role: AgentRole) -> Arc<str> {
+    let team = multi_agent.map_or_else(String::new, |tools| {
+        let identity = match tools.parent() {
+            Some(parent) => format!(
+                "Your Rho agent id is {}; your parent agent is {}. Your final response is mailed \
+                 to your parent automatically.",
+                tools.display_id(tools.self_id()),
+                tools.display_id(parent),
+            ),
+            None => format!(
+                "You are the primary Rho agent. Your agent id is {}.",
+                tools.display_id(tools.self_id())
+            ),
+        };
+        format!("## Rho Team Context\n\n{identity}\n\n")
+    });
+    let role = match role {
+        AgentRole::Engineer { .. } | AgentRole::PM => "",
+        AgentRole::Oracle { .. } => ORACLE_PROMPT,
+    };
+    format!("{team}{role}").into()
+}
+
 /// One workdir as the prompt renders it: the agent-visible path plus its jj
 /// workspace name (`None` for the user's checkout or a plain directory).
 struct WorkdirPrompt {

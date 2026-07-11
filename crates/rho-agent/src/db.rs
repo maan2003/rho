@@ -673,7 +673,6 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             .insert(&TopicAgentKey::new(topic_id, agent_id), &());
         AgentEventPos::root(lineage_id)
     }
-
 }
 
 impl AgentReadTxnExt for ReadTxn {

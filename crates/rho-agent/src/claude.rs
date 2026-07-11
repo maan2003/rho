@@ -90,7 +90,7 @@ impl ClaudeAgent {
         let state = AgentState {
             blocks: Vec::new(),
             tool_specs: Arc::from([]),
-            system_prompt: system_prompt::prompt(view.as_ref(), multi_agent.as_ref(), false, role),
+            system_prompt: system_prompt::claude_prompt(multi_agent.as_ref(), role),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
@@ -145,7 +145,7 @@ impl ClaudeAgent {
                 let multi_agent = pool
                     .upgrade()
                     .map(|_| MultiAgentTools::new(pool.clone(), agent_id, record.parent_agent));
-                system_prompt::prompt(view.as_ref(), multi_agent.as_ref(), false, record.role)
+                system_prompt::claude_prompt(multi_agent.as_ref(), record.role)
             },
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
@@ -564,6 +564,14 @@ impl ClaudeLoop {
         if let Some(tools) = &self.multi_agent {
             command.env("RHO_AGENT_ID", tools.self_id().encoded());
             command.env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
+            command.env(
+                "RHO_MCP_AGENT_TOOLS",
+                if matches!(self.role, crate::db::AgentRole::Oracle { .. }) {
+                    "0"
+                } else {
+                    "1"
+                },
+            );
         }
         if let Err(error) = self
             .view
@@ -619,8 +627,7 @@ impl ClaudeLoop {
                     .with_context(|| format!("create Claude prompt bind target {target}"));
             }
         }
-        let prompt =
-            system_prompt::prompt(self.view.as_ref(), self.multi_agent.as_ref(), false, self.role);
+        let prompt = system_prompt::claude_prompt(self.multi_agent.as_ref(), self.role);
         let mut source_file = tempfile::Builder::new()
             .prefix("rho-claude-prompt-")
             .suffix(".md")
