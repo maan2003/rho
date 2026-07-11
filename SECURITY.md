@@ -76,9 +76,15 @@ AI APIs.
   Its session is a reduced JSON command set (list/select agents, send
   message, new agent in a registered workdir, cancel turn) bridged onto a
   normal in-process UI protocol session; it grants nothing the full UI
-  protocol does not. The page holds no secrets beyond the browser's own
-  iroh key (kept in local storage, useless without enrollment) and sends
-  only user-authored text.
+  protocol does not. The browser uses a user-verifying WebAuthn credential's
+  PRF extension to derive a stable, daemon-specific iroh key on each connect;
+  only the non-secret credential id and daemon id are kept in local storage.
+  The PRF output and derived iroh key remain in browser memory and are never
+  persisted. The hosting origin and all JavaScript it serves are fully trusted:
+  code running after the user approves the WebAuthn prompt can read the
+  derived enrolled key and thereby gain persistent daemon access. Deploy the
+  page on a dedicated origin without third-party scripts and treat its build
+  and publishing pipeline as security-critical.
 - Inbound data on both ALPNs is remote, semi-trusted input: oversized UI
   protocol frames are rejected (`MAX_FRAME_LEN`), web UI JSON lines are
   length-bounded (`MAX_LINE_LEN`), malformed frames end the connection, and
