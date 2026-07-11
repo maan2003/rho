@@ -55,8 +55,12 @@ AI APIs.
 - The embedded Octo server listens only on a daemon-owned Unix socket whose path
   is passed to agent commands as `OCTO_SOCKET`. Octo uses the sealed platform
   secret store as its GitHub token source and has no token argv/env/file/admin
-  import path in Rho. GitHub API responses and errors are remote, semi-trusted
-  input and are returned to the calling command rather than panicking.
+  import path in Rho. Its Git remote-helper endpoint proxies smart-HTTP fetches
+  for repositories readable by that token while retaining it in the daemon. It
+  rejects every receive-pack command outside `refs/heads/rho/*`; command
+  framing is bounded before pack data is streamed. GitHub API and Git protocol
+  responses and errors are remote, semi-trusted input and are returned to the
+  calling command rather than panicking.
 
 ## Remote UI transports (iroh and web UI)
 

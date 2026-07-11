@@ -91,7 +91,11 @@ runs Octo as an in-process daemon Unix-socket server and exposes its socket path
 to agent commands via `OCTO_SOCKET`; the `oct` CLI is the agent-facing client.
 The daemon, not Octo, owns platform secret installation and fd-store resume, so
 Octo receives GitHub tokens only through a RAM-only callback into the sealed
-platform secret store.
+platform secret store. The `git-remote-octo` Git remote helper invokes a private
+Nix-patched `git-remote-http` whose libcurl connection uses that Unix socket; it
+does not replace Git globally. Octo proxies authenticated fetches for any
+repository available to its token, and pushes after restricting destination
+refs to `refs/heads/rho/*`.
 
 The daemon's UI protocol (`rho-ui-proto`) is served over two transports, all
 through the same per-connection handler: the local Unix socket, and iroh

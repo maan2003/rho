@@ -1,0 +1,29 @@
+--- a/http.c
++++ b/http.c
+@@ -1037,6 +1037,7 @@
+ static CURL *get_curl_handle(void)
+ {
+ 	CURL *result = curl_easy_init();
++	const char *unix_socket;
+ 
+ 	if (!result)
+ 		die("curl_easy_init failed");
+@@ -1059,6 +1060,18 @@
+ 		}
+     }
+ 
++	/*
++	 * Private transport hook used by git-remote-octo. The URL continues to
++	 * describe the HTTP request while curl connects to Octo's Unix socket.
++	 */
++	unix_socket = getenv("GIT_HTTP_UNIX_SOCKET");
++	if (unix_socket) {
++		if (!*unix_socket)
++			die("GIT_HTTP_UNIX_SOCKET is empty");
++		if (curl_easy_setopt(result, CURLOPT_UNIX_SOCKET_PATH, unix_socket))
++			die("failed to configure HTTP Unix socket");
++	}
++
+ 	curl_easy_setopt(result, CURLOPT_NETRC, CURL_NETRC_OPTIONAL);
+ 	curl_easy_setopt(result, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+ 

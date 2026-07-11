@@ -23,6 +23,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn github_git_url(&self, owner: &str, repo: &str, endpoint: &str) -> Result<Url> {
+        let mut url = self.github_api_url.clone();
+        if url.host_str() == Some("api.github.com") {
+            url.set_host(Some("github.com"))?;
+            url.set_path("");
+        }
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("GitHub URL cannot be a base"))?
+            .extend([owner, &format!("{repo}.git"), endpoint]);
+        Ok(url)
+    }
+
     pub(crate) async fn get_token(&self) -> Result<String> {
         (self.token_provider)()
             .map(|token| token.trim().to_owned())

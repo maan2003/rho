@@ -21,13 +21,17 @@ pub use state::TokenProvider;
 
 pub fn router(token_provider: TokenProvider, github_api_url: Url) -> Router {
     let state = Arc::new(AppState {
-        client: Client::new(),
+        client: Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("static Octo HTTP client configuration is valid"),
         token_provider,
         github_api_url,
     });
 
     Router::new()
         .merge(api::ci::router())
+        .merge(api::git::router())
         .merge(api::pr::router())
         .with_state(state)
 }

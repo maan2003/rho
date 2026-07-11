@@ -44,6 +44,11 @@
 
         projectName = "rho";
         cargoCrap = pkgs.callPackage ./nix/pkgs/cargo-crap.nix { };
+        octoGit = pkgs.git.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [
+            ./nix/patches/git-http-unix-socket.patch
+          ];
+        });
         selfciPkg = selfci.packages.${system}.default;
         selfciMq = selfci.packages.${system}.mq;
 
@@ -140,6 +145,7 @@
               buildInputs = guiBuildInputs;
               env.RUSTDOCFLAGS = "-D warnings";
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
+              env.OCTO_REMOTE_HTTP = "${octoGit}/libexec/git-core/git-remote-http";
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
             };
