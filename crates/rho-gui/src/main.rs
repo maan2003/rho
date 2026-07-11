@@ -23,7 +23,7 @@ mod workspace;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use gpui::{App, AppContext as _, KeyBinding, WindowOptions, actions};
 use settings::SettingsStore;
@@ -56,8 +56,12 @@ actions!(
 )]
 struct Args {
     /// Connect directly to this rho daemon Unix socket.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "iroh")]
     socket: Option<PathBuf>,
+
+    /// Connect to this rho daemon iroh endpoint id.
+    #[arg(long, value_name = "ENDPOINT_ID")]
+    iroh: Option<iroh::EndpointId>,
 }
 
 fn main() {
@@ -106,11 +110,19 @@ fn run() -> Result<()> {
 }
 
 fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
-    let socket_path = match args.socket {
-        Some(socket_path) => socket_path,
-        None => rho_daemon::default_socket_path()?,
-    };
-    Ok(AttachTarget { socket_path })
+    if let Some(endpoint_id) = args.iroh {
+        let state_dir = settings_path()?
+            .parent()
+            .context("rho-gui config directory")?
+            .to_path_buf();
+        return Ok(AttachTarget::Iroh {
+            endpoint_id,
+            secret_path: state_dir.join("iroh-secret.key"),
+        });
+    }
+    Ok(AttachTarget::Unix(
+        args.socket.unwrap_or(rho_daemon::default_socket_path()?),
+    ))
 }
 
 fn init_app(cx: &mut App) -> Result<()> {
@@ -175,13 +187,7 @@ const DEFAULT_SETTINGS: &str = r#"// Rho GUI user settings. Values here override
 "#;
 
 fn settings_path() -> Result<PathBuf> {
-    let config_dir = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(config_home) => PathBuf::from(config_home),
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(".config"))
-            .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME is set"))?,
-    };
+    let config_dir = dirs::config_dir().context("config directory not available")?;
     Ok(config_dir.join("rho-gui").join("settings.json"))
 }
 

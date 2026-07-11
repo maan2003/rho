@@ -41,9 +41,7 @@ fn bind_test_keymaps(cx: &mut App) {
 
 fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     cx.update(init_test_app);
-    let target = AttachTarget {
-        socket_path: std::env::temp_dir().join("rho-gui-test-nonexistent.sock"),
-    };
+    let target = AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock"));
     cx.add_window(|window, cx| Workspace::new(target, window, cx))
 }
 

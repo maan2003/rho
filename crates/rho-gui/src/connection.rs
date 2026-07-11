@@ -3,7 +3,9 @@
 //! [`ConnEvent`]s on a futures channel the workspace awaits (no polling);
 //! outbound commands are fire-and-forget.
 
-use std::path::PathBuf;
+use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use anyhow::Context as _;
 use futures::StreamExt as _;
@@ -16,6 +18,44 @@ use rho_ui_proto::{
     AgentId, ClientMessage, ServerMessage, UiTopic, UiWorkdir, VoiceRole, VoiceState,
     VoiceUiAction, read_frame, write_frame,
 };
+
+use crate::workspace::AttachTarget;
+
+trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncStream for T {}
+
+struct IrohStream {
+    inner: tokio::io::Join<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
+    _endpoint: iroh::Endpoint,
+}
+
+impl tokio::io::AsyncRead for IrohStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for IrohStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
 
 pub enum ConnEvent {
     Ready {
@@ -40,6 +80,7 @@ pub enum ConnEvent {
         attention: rho_ui_proto::UiAttention,
     },
     ServerError(String),
+    Enrollment(String),
     Disconnected(String),
     /// Assistant audio (wire-format PCM16) for immediate playback.
     VoiceAudio(Vec<u8>),
@@ -73,13 +114,13 @@ impl Connection {
 }
 
 pub fn spawn(
-    socket_path: PathBuf,
+    target: AttachTarget,
     cx: &App,
 ) -> (Connection, futures_mpsc::UnboundedReceiver<ConnEvent>) {
     let (event_tx, event_rx) = futures_mpsc::unbounded();
     let (command_tx, command_rx) = futures_mpsc::unbounded();
     let io_task = Tokio::spawn(cx, async move {
-        if let Err(error) = run(socket_path, &event_tx, command_rx).await {
+        if let Err(error) = run(target, &event_tx, command_rx).await {
             let _ = event_tx.unbounded_send(ConnEvent::Disconnected(format!("{error:#}")));
         }
     });
@@ -93,14 +134,22 @@ pub fn spawn(
 }
 
 async fn run(
-    socket_path: PathBuf,
+    target: AttachTarget,
     events: &futures_mpsc::UnboundedSender<ConnEvent>,
     mut commands: futures_mpsc::UnboundedReceiver<ClientMessage>,
 ) -> anyhow::Result<()> {
-    let client = Client::connect(&socket_path)
-        .await
-        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-    let mut stream = client.into_stream();
+    let mut stream = match target {
+        AttachTarget::Unix(socket_path) => {
+            let client = Client::connect(&socket_path)
+                .await
+                .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+            Box::new(client.into_stream()) as Box<dyn AsyncStream>
+        }
+        AttachTarget::Iroh {
+            endpoint_id,
+            secret_path,
+        } => connect_iroh(endpoint_id, &secret_path, events).await?,
+    };
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
     let ServerMessage::Ready {
@@ -128,7 +177,7 @@ async fn run(
         return Ok(());
     }
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let writer_task = tokio::spawn(async move {
         while let Some(message) = commands.next().await {
             if write_frame(&mut writer, &message).await.is_err() {
@@ -197,4 +246,59 @@ async fn run(
     }
     writer_task.abort();
     Ok(())
+}
+
+async fn connect_iroh(
+    daemon_id: iroh::EndpointId,
+    secret_path: &Path,
+    events: &futures_mpsc::UnboundedSender<ConnEvent>,
+) -> anyhow::Result<Box<dyn AsyncStream>> {
+    use rho_iroh_auth::EnrollmentCodeExt as _;
+
+    let secret = load_or_create_iroh_secret(secret_path)?;
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret)
+        .bind()
+        .await
+        .context("bind iroh client endpoint")?;
+    let connection = endpoint
+        .connect(daemon_id, rho_ui_proto::IROH_ALPN)
+        .await
+        .context("connect to daemon over iroh")?;
+    let code = connection.enrollment_code(endpoint.id());
+    let _ = events.unbounded_send(ConnEvent::Enrollment(code.to_string()));
+    let (send, recv) = connection.open_bi().await.context("open iroh UI stream")?;
+    Ok(Box::new(IrohStream {
+        inner: tokio::io::join(recv, send),
+        _endpoint: endpoint,
+    }))
+}
+
+fn load_or_create_iroh_secret(path: &Path) -> anyhow::Result<iroh::SecretKey> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!("iroh secret file {} is not 32 bytes", path.display())
+            })?;
+            Ok(iroh::SecretKey::from_bytes(&bytes))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).context("create rho-gui config directory")?;
+            }
+            let secret = iroh::SecretKey::generate();
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .context("create rho-gui iroh secret")?;
+            file.write_all(&secret.to_bytes())
+                .context("write rho-gui iroh secret")?;
+            Ok(secret)
+        }
+        Err(error) => Err(error).context("read rho-gui iroh secret"),
+    }
 }

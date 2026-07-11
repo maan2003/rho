@@ -40,8 +40,12 @@ const MAX_VOICE_TRANSCRIPT_LINES: usize = 12;
 /// home mean nothing to the daemon and must never leak into agent working
 /// directories.
 #[derive(Clone)]
-pub struct AttachTarget {
-    pub socket_path: PathBuf,
+pub enum AttachTarget {
+    Unix(PathBuf),
+    Iroh {
+        endpoint_id: iroh::EndpointId,
+        secret_path: PathBuf,
+    },
 }
 
 pub struct Workspace {
@@ -91,7 +95,7 @@ struct VoiceTranscriptLine {
 
 impl Workspace {
     pub fn new(attach_target: AttachTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (connection, events) = crate::connection::spawn(attach_target.socket_path.clone(), cx);
+        let (connection, events) = crate::connection::spawn(attach_target, cx);
         let workspace = cx.entity().downgrade();
         let draft_view = cx.new(|cx| DraftView::new(workspace, window, cx));
         let event_task = cx.spawn(async move |this, cx| {
@@ -273,6 +277,14 @@ impl Workspace {
                 self.notice_on(
                     None,
                     &format!("[rho daemon error: {message}]"),
+                    StyleClass::SystemImportant,
+                    cx,
+                );
+            }
+            ConnEvent::Enrollment(code) => {
+                self.notice_on(
+                    None,
+                    &format!("[iroh client needs approval: rho iroh approve {code}]"),
                     StyleClass::SystemImportant,
                     cx,
                 );

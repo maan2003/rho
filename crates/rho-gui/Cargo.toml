@@ -17,8 +17,10 @@ assets = { git = "https://github.com/maan2003/zed", branch = "rho" }
 camino.workspace = true
 clap.workspace = true
 command_palette = { git = "https://github.com/maan2003/zed", branch = "rho" }
+dirs.workspace = true
 editor = { git = "https://github.com/maan2003/zed", branch = "rho" }
 futures.workspace = true
+iroh = { workspace = true, features = ["tls-ring"] }
 gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
   "wayland",
 ] }
@@ -36,6 +38,7 @@ release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
 rho-commands.workspace = true
 rho-core.workspace = true
 rho-daemon.workspace = true
+rho-iroh-auth.workspace = true
 rho-ui-proto.workspace = true
 # Same revision the zed fork pins, so a future switch to its `audio` crate
 # (for the echo canceller) shares one rodio build.
