@@ -34,6 +34,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   own harness prompt.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
   rendering. They should not own inference protocol details.
+- The daemon snapshots the user's login-shell environment and passes it
+  explicitly to `rho-workspaces` for daemon-owned commands. Workspace-control
+  subprocesses use that environment directly; agent shell and Claude processes
+  add the primary project's environment through direnv.
 - `rho-voice` is a provider-protocol crate outside the inference contract: it
   speaks the xAI realtime voice WebSocket (audio streams, voice tool calls)
   and deliberately never touches `rho-core` transcript vocabulary. Voice is a

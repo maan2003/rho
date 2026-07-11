@@ -44,6 +44,51 @@ pub fn default_db_path() -> anyhow::Result<PathBuf> {
     Ok(base.join("rho").join("rho.redb"))
 }
 
+#[cfg(unix)]
+fn login_environment() -> anyhow::Result<Vec<(OsString, OsString)>> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let home = dirs::home_dir().context("home directory not available")?;
+    let mut command = std::process::Command::new("bash");
+    command
+        .args(["-lc", "exec env -0"])
+        .env_clear()
+        .env("HOME", &home)
+        .current_dir(&home);
+    for name in ["PATH", "USER", "LOGNAME", "SHELL"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let output = command
+        .output()
+        .context("capture login-shell environment")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "login shell failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let mut environment = Vec::new();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+            anyhow::bail!("login shell emitted malformed environment output");
+        };
+        let name = &entry[..separator];
+        if matches!(name, b"PWD" | b"OLDPWD" | b"SHLVL" | b"_") || name.starts_with(b"DIRENV_") {
+            continue;
+        }
+        environment.push((
+            OsString::from_vec(name.to_vec()),
+            OsString::from_vec(entry[separator + 1..].to_vec()),
+        ));
+    }
+    Ok(environment)
+}
+
 #[derive(Clone, Default)]
 struct PlatformSecrets {
     store: Arc<std::sync::Mutex<Option<Arc<rho_slack::SecretStore>>>>,
@@ -159,8 +204,14 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let platform_secrets = PlatformSecrets::from_fd_store();
     let octo_socket_path = socket_path.with_file_name("octo.sock");
     spawn_octo_server(&octo_socket_path, platform_secrets.clone())?;
-    // Safe before daemon worker tasks are spawned; child commands inherit this
-    // non-secret socket path unless a caller explicitly overrides it.
+    let mut user_environment = login_environment()?;
+    user_environment.push((
+        "OCTO_SOCKET".into(),
+        octo_socket_path.clone().into_os_string(),
+    ));
+    let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
+    // In-process agent assembly reads this daemon-owned, non-secret endpoint
+    // and passes it explicitly after direnv to agent commands.
     unsafe { std::env::set_var("OCTO_SOCKET", &octo_socket_path) };
 
     let db = RhoDb::open(default_db_path()?);
@@ -189,8 +240,17 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
 
     let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
-    let agents =
-        Arc::new(AgentRegistry::new(db, auth, path_overrides, platform_secrets, iroh_auth).await);
+    let agents = Arc::new(
+        AgentRegistry::new(
+            db,
+            auth,
+            path_overrides,
+            user_environment,
+            platform_secrets,
+            iroh_auth,
+        )
+        .await,
+    );
     agents.resume_platform_integrations();
 
     if let Some((secret, iroh_auth)) = iroh {
@@ -388,10 +448,11 @@ impl AgentRegistry {
         db: RhoDb,
         auth: InferenceAuth,
         path_overrides: PathOverrides,
+        user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
         iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     ) -> Self {
-        let pool = AgentPool::new(db.clone(), auth.clone(), path_overrides).await;
+        let pool = AgentPool::new(db.clone(), auth.clone(), path_overrides, user_environment).await;
         let machine_seed = db.read().machine_seed();
         // Topics are ad-hoc tab groups; every agent starts in the default
         // one (the oldest topic) until it is moved somewhere more specific.

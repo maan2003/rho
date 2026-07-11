@@ -645,11 +645,14 @@ impl Agent {
         restored: RestoredAgent,
     ) -> Self {
         let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
-        let shell_tools = ShellTools::new(
+        let mut shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             Arc::clone(&view),
         )
         .with_env("RHO_AGENT_ID", agent_id.encoded());
+        if let Ok(socket) = std::env::var("OCTO_SOCKET") {
+            shell_tools = shell_tools.with_env("OCTO_SOCKET", socket);
+        }
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));

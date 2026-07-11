@@ -12,7 +12,7 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
-use rho_workspaces::{PathOverrides, Repo, View, WorkspaceInfo};
+use rho_workspaces::{PathOverrides, Repo, UserEnvironment, View, WorkspaceInfo};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
@@ -34,6 +34,7 @@ pub struct AgentPool {
     db: RhoDb,
     auth: InferenceAuth,
     path_overrides: PathOverrides,
+    user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
     /// One shared handle per repo root: live-workspace sharing (joined
     /// agents get one checkout + namespace) only holds within one instance.
@@ -99,7 +100,12 @@ pub enum SpawnCheckout {
 
 impl AgentPool {
     /// Opens the pool over `db`, initializing the agent tables.
-    pub async fn new(db: RhoDb, auth: InferenceAuth, path_overrides: PathOverrides) -> Arc<Self> {
+    pub async fn new(
+        db: RhoDb,
+        auth: InferenceAuth,
+        path_overrides: PathOverrides,
+        user_environment: UserEnvironment,
+    ) -> Arc<Self> {
         crate::db::prepare_agent_db_migration(&db).await;
         let mut write = db.write().await;
         write.init_agent_tables();
@@ -108,6 +114,7 @@ impl AgentPool {
             db,
             auth,
             path_overrides,
+            user_environment,
             agents: Mutex::new(HashMap::new()),
             repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
@@ -463,9 +470,17 @@ impl AgentPool {
     pub async fn repo(&self, path: &Utf8Path) -> anyhow::Result<Arc<Repo>> {
         let (root, is_jj) = rho_workspaces::resolve_workdir_root(path.as_std_path())?;
         let repo = if is_jj {
-            Repo::open_with_path_overrides(root.as_std_path(), self.path_overrides.clone())?
+            Repo::open_with_environment(
+                root.as_std_path(),
+                self.path_overrides.clone(),
+                self.user_environment.clone(),
+            )?
         } else {
-            Repo::open_plain_with_path_overrides(root.as_std_path(), self.path_overrides.clone())?
+            Repo::open_plain_with_environment(
+                root.as_std_path(),
+                self.path_overrides.clone(),
+                self.user_environment.clone(),
+            )?
         };
         let mut repos = self.repos.lock().await;
         Ok(match repos.entry(repo.root().to_owned()) {

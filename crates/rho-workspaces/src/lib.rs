@@ -43,6 +43,42 @@ pub struct PathOverrides {
     pub after: Vec<PathBuf>,
 }
 
+/// Environment explicitly supplied to subprocesses owned by the daemon.
+#[derive(Clone, Debug, Default)]
+pub struct UserEnvironment(Arc<[(OsString, OsString)]>);
+
+impl UserEnvironment {
+    pub fn new(values: Vec<(OsString, OsString)>) -> Self {
+        Self(values.into())
+    }
+
+    pub fn apply(&self, command: &mut tokio::process::Command) {
+        let overrides = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<Vec<_>>();
+        command.env_clear();
+        command.envs(self.0.iter().map(|(name, value)| (name, value)));
+        for (name, value) in overrides {
+            match value {
+                Some(value) => {
+                    command.env(name, value);
+                }
+                None => {
+                    command.env_remove(name);
+                }
+            }
+        }
+    }
+
+    fn path(&self) -> Option<&OsStr> {
+        self.0
+            .iter()
+            .find_map(|(name, value)| (name == "PATH").then_some(value.as_os_str()))
+    }
+}
+
 impl PathOverrides {
     pub fn add_to(&self, from_env: &OsStr) -> OsString {
         let mut path = OsString::new();
@@ -134,6 +170,7 @@ pub struct Repo {
     is_jj: bool,
     /// PATH entries applied to commands prepared for this repo's workspaces.
     path_overrides: PathOverrides,
+    user_environment: Option<UserEnvironment>,
     /// Serializes jj invocations. jj's op log makes concurrent commands safe
     /// on its own; this is simplicity insurance while the fork's
     /// all-workspace snapshot path is young.
@@ -166,10 +203,21 @@ impl Repo {
             root: resolve_repo_root(path)?,
             is_jj: true,
             path_overrides,
+            user_environment: None,
             jj_lock: Mutex::new(()),
             workspaces: Mutex::new(HashMap::new()),
             reaped: OnceCell::new(),
         })
+    }
+
+    pub fn open_with_environment(
+        path: &Path,
+        path_overrides: PathOverrides,
+        user_environment: UserEnvironment,
+    ) -> anyhow::Result<Self> {
+        let mut repo = Self::open_with_path_overrides(path, path_overrides)?;
+        repo.user_environment = Some(user_environment);
+        Ok(repo)
     }
 
     /// Opens a plain directory (no jj repo) as a live-only workdir: agents
@@ -192,10 +240,21 @@ impl Repo {
             root,
             is_jj: false,
             path_overrides,
+            user_environment: None,
             jj_lock: Mutex::new(()),
             workspaces: Mutex::new(HashMap::new()),
             reaped: OnceCell::new(),
         })
+    }
+
+    pub fn open_plain_with_environment(
+        path: &Path,
+        path_overrides: PathOverrides,
+        user_environment: UserEnvironment,
+    ) -> anyhow::Result<Self> {
+        let mut repo = Self::open_plain_with_path_overrides(path, path_overrides)?;
+        repo.user_environment = Some(user_environment);
+        Ok(repo)
     }
 
     /// Whether this workdir is a jj repo (as opposed to a plain live
@@ -315,6 +374,9 @@ impl Repo {
     /// A jj command running against this repo.
     fn jj(&self) -> tokio::process::Command {
         let mut command = tokio::process::Command::new("jj");
+        if let Some(environment) = &self.user_environment {
+            environment.apply(&mut command);
+        }
         command.arg("--repository").arg(&self.root);
         command
     }
@@ -592,13 +654,16 @@ impl View {
         let mut ns_guard = self.mnt_ns.lock().await;
         let entries = self.entries();
         let primary = &entries[0];
-        command.env(
-            "PATH",
-            primary
-                .repo
-                .path_overrides()
-                .add_to(&std::env::var_os("PATH").expect("PATH must be set")),
-        );
+        let base_path = if let Some(environment) = &primary.repo.user_environment {
+            environment.apply(command);
+            environment
+                .path()
+                .context("user environment has no PATH")?
+                .to_owned()
+        } else {
+            std::env::var_os("PATH").context("PATH must be set")?
+        };
+        command.env("PATH", primary.repo.path_overrides().add_to(&base_path));
         let cwd = cwd.map_or_else(|| primary.repo().to_owned(), |cwd| primary.repo().join(cwd));
         if !entries.iter().any(|entry| entry.needs_mount()) {
             anyhow::ensure!(

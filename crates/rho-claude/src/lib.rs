@@ -34,6 +34,7 @@ pub struct ClaudeCodeOptions {
     pub effort: Effort,
     pub session: Session,
     pub path_overrides: PathOverrides,
+    pub env: Vec<(String, String)>,
 }
 
 impl ClaudeCodeOptions {
@@ -51,7 +52,12 @@ impl ClaudeCodeOptions {
             effort,
             session: Session::New { session_id },
             path_overrides: PathOverrides::default(),
+            env: Vec::new(),
         }
+    }
+
+    pub fn set_env(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.env.push((name.into(), value.into()));
     }
 
     fn args(&self) -> Vec<String> {
@@ -89,8 +95,8 @@ impl ClaudeCodeOptions {
     }
 
     pub async fn command(&self) -> Result<Command> {
-        let mut command = Command::new(self.command.as_std_path());
-        command.args(self.args());
+        let mut command = Command::new("direnv");
+        command.arg("exec").arg(&self.cwd);
         command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
         command.env("CLAUDE_AGENT_SDK_VERSION", CLAUDE_AGENT_SDK_VERSION);
         command.env(
@@ -99,6 +105,10 @@ impl ClaudeCodeOptions {
         );
         command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
         command.env("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", "1");
+        for (name, value) in &self.env {
+            command.env(name, value);
+        }
+        command.arg(self.command.as_std_path()).args(self.args());
         command.env(
             "PATH",
             self.path_overrides

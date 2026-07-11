@@ -139,7 +139,7 @@ impl ShellTools {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Command to run with sh -c"
+                        "description": "Command to run with bash -c"
                     },
                     "cwd": {
                         "type": "string",
@@ -229,11 +229,16 @@ impl ShellTools {
             return Err(anyhow!("timeout must be greater than zero"));
         }
 
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(&args.command);
+        let mut command = Command::new("direnv");
+        command.args(["exec", "."]);
+        command.env_remove("DIRENV_DIFF");
+        command.env_remove("DIRENV_DIR");
+        command.env_remove("DIRENV_FILE");
+        command.env_remove("DIRENV_WATCHES");
         for (name, value) in &self.env {
             command.env(name, value);
         }
+        command.args(["bash", "-c"]).arg(&args.command);
         command.kill_on_drop(true);
         let cwd = args.cwd.as_deref().map(Utf8Path::new);
         match &self.exec {

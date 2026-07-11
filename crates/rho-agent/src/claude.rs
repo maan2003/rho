@@ -553,6 +553,13 @@ impl ClaudeLoop {
             self.session_id,
         );
         options.session = session;
+        if let Ok(socket) = std::env::var("OCTO_SOCKET") {
+            options.set_env("OCTO_SOCKET", socket);
+        }
+        if let Some(tools) = &self.multi_agent {
+            options.set_env("RHO_AGENT_ID", tools.self_id().encoded());
+            options.set_env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
+        }
         let file_mounts = self.write_claude_prompt_mount()?.into_iter().collect();
         let mut command = match options.command().await {
             Ok(command) => command,
@@ -561,10 +568,6 @@ impl ClaudeLoop {
                 return Err(error);
             }
         };
-        if let Some(tools) = &self.multi_agent {
-            command.env("RHO_AGENT_ID", tools.self_id().encoded());
-            command.env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
-        }
         if let Err(error) = self
             .view
             .prepare_command(&mut command, None, file_mounts)

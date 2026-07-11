@@ -256,6 +256,8 @@ async fn shell_path_overrides_prepend_and_append_entries() {
         result
             .output
             .as_ref()
-            .contains("Output:\nbefore after-only")
+            .contains("Output:\nbefore after-only"),
+        "{}",
+        result.output
     );
 }

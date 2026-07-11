@@ -90,6 +90,22 @@ AI APIs.
 - Production paths should not panic on malformed inference data, bad local input,
   missing files, or network failures.
 
+### Daemon subprocess environments
+
+- The daemon captures a user environment once from a clean `bash -lc` at
+  startup. Every daemon-owned subprocess clears the daemon environment before
+  applying that snapshot, so service credentials and other incidental daemon
+  variables are not inherited.
+- Internal workspace-management commands receive only that user environment.
+  Agent shell commands and Claude Code additionally run through `direnv exec`
+  in their project directory. Project `.envrc` files are trusted local code and
+  have the same authority as the agent shell tools they configure.
+- Rho-owned agent variables (`RHO_AGENT_ID`, `RHO_MCP_AGENT_ID`, and
+  `OCTO_SOCKET`) are supplied explicitly to agent commands rather than copied
+  incidentally from the daemon environment.
+- CLI-local subprocesses, including land and selfci jobs, retain the invoking
+  CLI's environment; they are outside the daemon subprocess boundary.
+
 `rho debug render-prompt <role>` performs local context discovery in the
 current workdir and prints the resulting prompt and model-facing Rho tool
 specifications. Its output may contain repository instructions and user skill
