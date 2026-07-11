@@ -348,7 +348,7 @@ impl Repo {
         let slot = self.workspace_root(name).await?;
         self.rewrite_pointers(&slot)?;
         for filename in ["flake.nix", "flake.lock", ".envrc"] {
-            let _ = copy_mtime(self.root().join(filename), slot.join(filename));
+            let _ = copy_mtime_if_same(self.root().join(filename), slot.join(filename));
         }
         Ok(slot)
     }
@@ -887,7 +887,16 @@ fn gitdir_path(pointer: &str) -> Option<Utf8PathBuf> {
         .map(Utf8PathBuf::from)
 }
 
-fn copy_mtime(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Result<()> {
+/// Reuses a donor file's timestamps only when the checkout has identical
+/// bytes. Warm pool slots may contain direnv/nix caches keyed by these mtimes;
+/// preserving a timestamp across different contents would make a stale cache
+/// look current.
+fn copy_mtime_if_same(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Result<()> {
+    let source = source.as_ref();
+    let target = target.as_ref();
+    if std::fs::read(source)? != std::fs::read(target)? {
+        return Ok(());
+    }
     let meta = std::fs::metadata(source)?;
     let times = std::fs::FileTimes::new()
         .set_accessed(meta.accessed()?)
@@ -896,4 +905,60 @@ fn copy_mtime(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Re
         .write(true)
         .open(target)?
         .set_times(times)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::copy_mtime_if_same;
+
+    fn set_mtime(path: &std::path::Path, time: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(time))
+            .unwrap();
+    }
+
+    #[test]
+    fn copies_mtime_for_identical_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::write(&source, "same").unwrap();
+        std::fs::write(&target, "same").unwrap();
+        let source_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let target_time = source_time + Duration::from_secs(100);
+        set_mtime(&source, source_time);
+        set_mtime(&target, target_time);
+
+        copy_mtime_if_same(&source, &target).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(target).unwrap().modified().unwrap(),
+            source_time
+        );
+    }
+
+    #[test]
+    fn keeps_mtime_for_different_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::write(&source, "source").unwrap();
+        std::fs::write(&target, "target").unwrap();
+        let source_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let target_time = source_time + Duration::from_secs(100);
+        set_mtime(&source, source_time);
+        set_mtime(&target, target_time);
+
+        copy_mtime_if_same(&source, &target).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(target).unwrap().modified().unwrap(),
+            target_time
+        );
+    }
 }
