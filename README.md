@@ -89,7 +89,9 @@ file boundaries. User config instructions are listed before repo instructions.
 Rho discovers Markdown skills from project `.agents/skills` plus user
 `~/.config/agents/skills`. Skills are listed in the agent system prompt with
 names, descriptions, and file paths; the model reads the referenced files with
-normal shell tools when a task calls for them.
+normal shell tools when a task calls for them. The installed package also ships
+Rho's platform skills under `$out/share/rho/skills`; project and user skills
+with the same name take precedence.
 
 The daemon also runs an embedded Octo GitHub helper server for agent commands.
 Install its GitHub token with `rho octo init`; the token is read from stdin and

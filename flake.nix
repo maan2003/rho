@@ -49,6 +49,25 @@
             ./nix/patches/git-http-unix-socket.patch
           ];
         });
+        rustyV8Archives = {
+          x86_64-linux = pkgs.fetchurl {
+            url = "https://github.com/denoland/rusty_v8/releases/download/v149.4.0/librusty_v8_simdutf_release_x86_64-unknown-linux-gnu.a.gz";
+            hash = "sha256-qjDxmLbnviGI32SY+VBTxMBS8hIDegHywxQU16yoS1M=";
+          };
+          aarch64-linux = pkgs.fetchurl {
+            url = "https://github.com/denoland/rusty_v8/releases/download/v149.4.0/librusty_v8_simdutf_release_aarch64-unknown-linux-gnu.a.gz";
+            hash = "sha256-VPd5M2+oXRbqeVD4LTuLMTJq4JushNWXY9ssXOqgCUw=";
+          };
+          x86_64-darwin = pkgs.fetchurl {
+            url = "https://github.com/denoland/rusty_v8/releases/download/v149.4.0/librusty_v8_simdutf_release_x86_64-apple-darwin.a.gz";
+            hash = "sha256-GIl8QmcKyYhVB7bU02xd+7nEzBNjHMn8VqbohnS7Nkk=";
+          };
+          aarch64-darwin = pkgs.fetchurl {
+            url = "https://github.com/denoland/rusty_v8/releases/download/v149.4.0/librusty_v8_simdutf_release_aarch64-apple-darwin.a.gz";
+            hash = "sha256-1PPs3PF2RqmlcGbUTda2rvrChG+wb9RRuAiwOLiuvnM=";
+          };
+        };
+        rustyV8Archive = rustyV8Archives.${system};
         selfciPkg = selfci.packages.${system}.default;
         selfciMq = selfci.packages.${system}.mq;
 
@@ -146,6 +165,7 @@
               env.RUSTDOCFLAGS = "-D warnings";
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
               env.OCTO_REMOTE_HTTP = "${octoGit}/libexec/git-core/git-remote-http";
+              env.RUSTY_V8_ARCHIVE = rustyV8Archive;
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
             };
@@ -171,6 +191,20 @@
 
             workspace = craneLib.buildWorkspace {
               cargoArtifacts = workspaceDeps;
+            };
+
+            package = craneLib.buildPackage {
+              cargoArtifacts = workspaceDeps;
+              cargoExtraArgs = "-p rho-cli -p rho-daemon -p oct";
+              doCheck = false;
+              env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
+              postInstall = ''
+                mkdir -p $out/share/rho/skills
+                cp -r ${./.agents/skills/github} $out/share/rho/skills/github
+                cp -r ${./.agents/skills/delegate-engineering} \
+                  $out/share/rho/skills/delegate-engineering
+                chmod -R u+w $out/share/rho/skills
+              '';
             };
 
             tests = craneLib.cargoNextest {
@@ -250,7 +284,8 @@
       in
       {
         packages = {
-          default = multiBuild.workspace;
+          default = multiBuild.package;
+          rho = multiBuild.package;
           workspace = multiBuild.workspace;
           "cargo-crap" = cargoCrap;
         };

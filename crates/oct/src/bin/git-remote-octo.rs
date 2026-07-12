@@ -23,9 +23,8 @@ fn main() -> Result<()> {
     if !socket_type.is_socket() {
         anyhow::bail!("OCTO_SOCKET does not refer to a Unix socket");
     }
-    let remote_http: PathBuf = env::var_os("OCTO_REMOTE_HTTP")
+    let remote_http: PathBuf = option_env!("OCTO_REMOTE_HTTP")
         .map(PathBuf::from)
-        .or_else(|| option_env!("OCTO_REMOTE_HTTP").map(PathBuf::from))
         .context("git-remote-octo was built without Rho's patched git-remote-http")?;
     if !Path::new(&remote_http).is_file() {
         anyhow::bail!(

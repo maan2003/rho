@@ -27,7 +27,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `View`. All jj workspaces created for one agent share one workspace id, so
   the agent's jj workspace name is the same in every repo it forks.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
-  skill discovery/frontmatter parsing. Results are cached per
+  skill discovery/frontmatter parsing. Rho packages platform-owned skills under
+  `$out/share/rho/skills`; the final package build embeds that immutable root in
+  the binaries, below project and user skills in precedence. Results are cached per
   `rho-workspaces::Workspace` and merged across a view's workdirs;
   `rho-agent` owns system prompt rendering. Clients have no special skill or
   AGENTS.md command path. The native Rho inference loop and Claude Code use

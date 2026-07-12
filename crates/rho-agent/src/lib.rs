@@ -757,8 +757,9 @@ impl Agent {
         });
     }
 
-    /// Deliver mail from another agent. Enters context as an
-    /// [`ContextBlock::AgentMessage`] identifying the sender.
+    /// Deliver mail from another agent. Enters context as a
+    /// [`ContextBlock::UserMessage`] whose [`MessageSender`] identifies the
+    /// agent.
     pub fn send_agent_message(
         &self,
         sender: AgentId,

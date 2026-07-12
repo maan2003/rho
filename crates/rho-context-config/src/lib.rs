@@ -58,16 +58,23 @@ const SKILL_FILENAME: &str = "SKILL.md";
 
 const DISCOVERY_WARNING_AFTER: Duration = Duration::from_millis(100);
 const DISCOVERY_ERROR_AFTER: Duration = Duration::from_secs(1);
+const BUNDLED_SKILLS_DIR: Option<&str> = option_env!("RHO_BUNDLED_SKILLS_DIR");
 
 impl DiscoveredContext {
     pub fn discover(visible_repo_root: &Utf8Path, checkout_root: &Utf8Path) -> Self {
         let mut budget = DiscoveryBudget::new();
         let config_dir = dirs::config_dir();
         let config_dir = config_dir.as_deref();
+        let bundled_skills_dir = BUNDLED_SKILLS_DIR.map(Path::new);
         let agents_candidates = agents_md_candidates(visible_repo_root, checkout_root, config_dir);
         let (agents_files, mut diagnostics) =
             discover_agents_md_from_candidates(&agents_candidates, &mut budget);
-        let skill_roots = skill_root_pairs(visible_repo_root, checkout_root, config_dir);
+        let skill_roots = skill_root_pairs(
+            visible_repo_root,
+            checkout_root,
+            config_dir,
+            bundled_skills_dir,
+        );
         let (skills, skill_diagnostics) = discover_skills_from_roots(&skill_roots, &mut budget);
         diagnostics.extend(skill_diagnostics);
         Self {
@@ -233,6 +240,7 @@ fn skill_root_pairs(
     visible_repo_root: &Utf8Path,
     checkout_root: &Utf8Path,
     config_dir: Option<&Path>,
+    bundled_skills_dir: Option<&Path>,
 ) -> Vec<(PathBuf, PathBuf)> {
     let mut roots = Vec::new();
     let visible_project_root = visible_repo_root.as_std_path().join(".agents/skills");
@@ -243,6 +251,9 @@ fn skill_root_pairs(
     if let Some(config_dir) = config_dir {
         let path = config_dir.join("agents/skills");
         roots.push((path.clone(), path));
+    }
+    if let Some(path) = bundled_skills_dir {
+        roots.push((path.to_owned(), path.to_owned()));
     }
     roots
 }
@@ -881,7 +892,8 @@ mod tests {
             "Demo skill",
         );
         let repo = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
-        let (skills, diagnostics) = discover_skills_for_test(&skill_root_pairs(&repo, &repo, None));
+        let (skills, diagnostics) =
+            discover_skills_for_test(&skill_root_pairs(&repo, &repo, None, None));
         assert_eq!(diagnostics, Vec::new());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "demo");
@@ -906,6 +918,34 @@ mod tests {
         let (skills, _) = discover_skills_for_test(&[skill_root(temp.path())]);
         assert_eq!(skills[0].name, "alpha");
         assert_eq!(skills[1].name, "zeta");
+    }
+
+    #[test]
+    fn project_skills_override_bundled_skills() {
+        let project = tempfile::tempdir().unwrap();
+        let bundled = tempfile::tempdir().unwrap();
+        write_skill(
+            project.path(),
+            ".agents/skills/demo/SKILL.md",
+            "demo",
+            "Project skill",
+        );
+        write_skill(
+            bundled.path(),
+            ".agents/skills/demo/SKILL.md",
+            "demo",
+            "Bundled skill",
+        );
+        let roots = [skill_root(project.path()), skill_root(bundled.path())];
+        let (skills, diagnostics) = discover_skills_for_test(&roots);
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description, "Project skill");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == DiagnosticKind::Collision)
+        );
     }
 
     #[test]
@@ -1020,7 +1060,8 @@ mod tests {
             "Demo skill",
         );
 
-        let (skills, _) = discover_skills_for_test(&skill_root_pairs(&visible, &checkout, None));
+        let (skills, _) =
+            discover_skills_for_test(&skill_root_pairs(&visible, &checkout, None, None));
 
         assert_eq!(skills.len(), 1);
         assert_eq!(

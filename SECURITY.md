@@ -32,6 +32,9 @@ AI APIs.
 - User/repo `AGENTS.md` files and local/project Markdown skills are trusted
   prompt input when discovered. Treat them as useful local guidance, not a
   sandbox or permission boundary.
+- Rho's packaged skills are immutable package data at a store path embedded
+  when the final binaries are built. They are trusted prompt input, not a
+  security boundary.
 - Messaging-platform/API secrets (e.g. Slack tokens and Octo's GitHub token)
   reach the daemon over the UI socket (`rho slack init --dir <coordinator-repo>`
   and `rho octo init` read them from stdin) — never via argv, exec-time
