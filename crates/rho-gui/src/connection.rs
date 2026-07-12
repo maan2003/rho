@@ -146,7 +146,8 @@ async fn run(
         AttachTarget::Iroh {
             endpoint_id,
             ssh_destination,
-        } => connect_iroh(endpoint_id, &ssh_destination).await?,
+            remote_rho,
+        } => connect_iroh(endpoint_id, &ssh_destination, &remote_rho).await?,
     };
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
@@ -250,6 +251,7 @@ async fn run(
 async fn connect_iroh(
     daemon_id: iroh::EndpointId,
     ssh_destination: &str,
+    remote_rho: &str,
 ) -> anyhow::Result<Box<dyn AsyncStream>> {
     // The native client's identity intentionally lives only as long as this
     // process. The daemon can trust it in memory via an existing SSH login.
@@ -263,7 +265,7 @@ async fn connect_iroh(
         destination = ssh_destination,
         "trusting ephemeral iroh client over SSH"
     );
-    trust_in_memory_over_ssh(ssh_destination, endpoint.id()).await?;
+    trust_in_memory_over_ssh(ssh_destination, remote_rho, endpoint.id()).await?;
     tracing::info!(
         destination = ssh_destination,
         "ephemeral iroh client trusted over SSH"
@@ -291,16 +293,21 @@ async fn connect_iroh(
 
 async fn trust_in_memory_over_ssh(
     destination: &str,
+    remote_rho: &str,
     endpoint_id: iroh::EndpointId,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!destination.starts_with('-'), "invalid SSH destination");
+    anyhow::ensure!(
+        is_safe_remote_executable(remote_rho),
+        "invalid remote rho executable path"
+    );
     // EndpointId's text form has a fixed safe alphabet even though OpenSSH
     // sends the remote argv through the login shell.
     let endpoint_id = endpoint_id.to_string();
     let status = tokio::process::Command::new("ssh")
         .arg("--")
         .arg(destination)
-        .args(["rho", "iroh", "trust-in-memory", &endpoint_id])
+        .args([remote_rho, "iroh", "trust-in-memory", &endpoint_id])
         .status()
         .await
         .context("run SSH enrollment approval")?;
@@ -309,4 +316,12 @@ async fn trust_in_memory_over_ssh(
         "SSH enrollment approval failed with {status}"
     );
     Ok(())
+}
+
+fn is_safe_remote_executable(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'+' | b'-')
+        })
 }

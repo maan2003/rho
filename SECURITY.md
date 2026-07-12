@@ -101,6 +101,9 @@ AI APIs.
   insecure fallback is not attempted. Existing legacy key files are ignored
   and left untouched. Once the GUI process exits, the daemon retains only the
   unusable public endpoint id until idle expiry or daemon restart.
+  `--remote-rho <path>` selects the remote executable (default `rho`) and
+  accepts only a nonempty shell-safe path alphabet; it is not an arbitrary
+  remote shell command.
 - The web UI (a static Leptos/wasm page in `webui/`, hostable anywhere) is
   an iroh client like any other: it connects to the same endpoint on its own
   ALPN and passes the same per-key enrollment before the daemon serves it.

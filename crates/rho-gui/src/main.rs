@@ -72,6 +72,10 @@ struct Args {
     /// destination.
     #[arg(long, value_name = "DESTINATION", requires = "endpoint")]
     ssh: Option<String>,
+
+    /// Rho executable on the SSH host.
+    #[arg(long, value_name = "PATH", default_value = "rho")]
+    remote_rho: String,
 }
 
 fn main() {
@@ -124,6 +128,7 @@ fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
         return Ok(AttachTarget::Iroh {
             endpoint_id,
             ssh_destination: args.ssh.context("--ssh is required with --endpoint")?,
+            remote_rho: args.remote_rho,
         });
     }
     Ok(AttachTarget::Unix(

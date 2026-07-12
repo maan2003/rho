@@ -45,6 +45,7 @@ pub enum AttachTarget {
     Iroh {
         endpoint_id: iroh::EndpointId,
         ssh_destination: String,
+        remote_rho: String,
     },
 }
 
