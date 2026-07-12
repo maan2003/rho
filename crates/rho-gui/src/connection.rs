@@ -3,7 +3,6 @@
 //! [`ConnEvent`]s on a futures channel the workspace awaits (no polling);
 //! outbound commands are fire-and-forget.
 
-use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -147,8 +146,8 @@ async fn run(
         }
         AttachTarget::Iroh {
             endpoint_id,
-            secret_path,
-        } => connect_iroh(endpoint_id, &secret_path, events).await?,
+            ssh_destination,
+        } => connect_iroh(endpoint_id, ssh_destination.as_deref(), events).await?,
     };
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
@@ -236,7 +235,8 @@ async fn run(
             | ServerMessage::LandStatus { .. }
             | ServerMessage::McpAgentToolResult(_)
             | ServerMessage::PlatformStatus { .. }
-            | ServerMessage::IrohApproved { .. } => None,
+            | ServerMessage::IrohApproved { .. }
+            | ServerMessage::IrohRevoked { .. } => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()
@@ -250,14 +250,16 @@ async fn run(
 
 async fn connect_iroh(
     daemon_id: iroh::EndpointId,
-    secret_path: &Path,
+    ssh_destination: Option<&str>,
     events: &futures_mpsc::UnboundedSender<ConnEvent>,
 ) -> anyhow::Result<Box<dyn AsyncStream>> {
     use rho_iroh_auth::EnrollmentCodeExt as _;
 
-    let (secret, needs_persist) = load_iroh_secret(secret_path)?;
+    // The native client's identity intentionally lives only as long as this
+    // process. The daemon can trust it in memory via an existing SSH login.
+    let secret = iroh::SecretKey::generate();
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret.clone())
+        .secret_key(secret)
         .bind()
         .await
         .context("bind iroh client endpoint")?;
@@ -271,48 +273,36 @@ async fn connect_iroh(
         stream = &mut open_stream => stream,
         () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
             let code = connection.enrollment_code(endpoint.id());
-            let _ = events.unbounded_send(ConnEvent::Enrollment(code.to_string()));
+            if let Some(destination) = ssh_destination {
+                approve_in_memory_over_ssh(destination, &code.to_string()).await?;
+            } else {
+                let _ = events.unbounded_send(ConnEvent::Enrollment(code.to_string()));
+            }
             open_stream.await
         }
     }
     .context("open iroh UI stream")?;
-    if needs_persist {
-        persist_iroh_secret(secret_path, &secret)?;
-    }
     Ok(Box::new(IrohStream {
         inner: tokio::io::join(recv, send),
         _endpoint: endpoint,
     }))
 }
 
-fn load_iroh_secret(path: &Path) -> anyhow::Result<(iroh::SecretKey, bool)> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                anyhow::anyhow!("iroh secret file {} is not 32 bytes", path.display())
-            })?;
-            Ok((iroh::SecretKey::from_bytes(&bytes), false))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok((iroh::SecretKey::generate(), true))
-        }
-        Err(error) => Err(error).context("read rho-gui iroh secret"),
-    }
-}
-
-fn persist_iroh_secret(path: &Path, secret: &iroh::SecretKey) -> anyhow::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("create rho-gui state directory")?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .context("create rho-gui iroh secret")?;
-    file.write_all(&secret.to_bytes())
-        .context("write rho-gui iroh secret")
+async fn approve_in_memory_over_ssh(destination: &str, code: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!destination.starts_with('-'), "invalid SSH destination");
+    // `code` was produced by EnrollmentCode::Display and contains only the
+    // fixed Crockford alphabet and separators, so it is safe even though
+    // OpenSSH sends the remote argv through the login shell.
+    let status = tokio::process::Command::new("ssh")
+        .arg("--")
+        .arg(destination)
+        .args(["rho", "iroh", "approve-in-memory", code])
+        .status()
+        .await
+        .context("run SSH enrollment approval")?;
+    anyhow::ensure!(
+        status.success(),
+        "SSH enrollment approval failed with {status}"
+    );
+    Ok(())
 }

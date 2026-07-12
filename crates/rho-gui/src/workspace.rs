@@ -44,7 +44,7 @@ pub enum AttachTarget {
     Unix(PathBuf),
     Iroh {
         endpoint_id: iroh::EndpointId,
-        secret_path: PathBuf,
+        ssh_destination: Option<String>,
     },
 }
 
@@ -284,7 +284,7 @@ impl Workspace {
             ConnEvent::Enrollment(code) => {
                 self.notice_on(
                     None,
-                    &format!("[iroh client needs approval: rho iroh approve {code}]"),
+                    &format!("[iroh client needs approval: rho iroh approve-in-memory {code}]"),
                     StyleClass::SystemImportant,
                     cx,
                 );

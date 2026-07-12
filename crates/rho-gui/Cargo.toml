@@ -54,7 +54,7 @@ settings = { git = "https://github.com/maan2003/zed", branch = "rho" }
 text = { git = "https://github.com/maan2003/zed", branch = "rho" }
 theme = { git = "https://github.com/maan2003/zed", branch = "rho" }
 theme_settings = { git = "https://github.com/maan2003/zed", branch = "rho" }
-tokio = { workspace = true, features = ["io-util", "net", "rt"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }

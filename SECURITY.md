@@ -67,13 +67,24 @@ AI APIs.
 - With `rho daemon --iroh`, the daemon serves the full UI protocol over iroh
   (relay-backed QUIC). An enrolled client is fully privileged: everything a
   local UI client can do, including starting agents that run shell commands.
-  Trust is per client endpoint key, persisted in the local rho database, and
-  granted only by a local user running `rho iroh approve <code>` against the
-  Unix socket; codes are 60-bit, single-use, expire after a minute, and bind
+  Trust is per client endpoint key. `rho iroh approve <code>` persists trust
+  in the local rho database; `rho iroh approve-in-memory <code>` keeps it only
+  in daemon memory, bounded to 4096 keys and 24 idle hours, for clients that
+  obtain approval through an existing SSH login without storing their iroh
+  key. Both commands reach the daemon through its Unix socket; codes are
+  60-bit, single-use, expire after a minute, and bind
   the exact client key via a TLS exporter, so approval cannot be replayed or
   redirected. The daemon's iroh secret key lives in the local rho database.
   Enrollment approval is also accepted from already
   trusted remote clients (they are fully privileged anyway).
+- `rho-gui --endpoint <id>` generates its client key in process memory and
+  never persists it. With `--ssh <destination>`, it runs the user's OpenSSH
+  client to execute `rho iroh approve-in-memory <code>` on the daemon host;
+  without `--ssh`, it displays that command for manual approval. The SSH host
+  configuration and host-key verification are the authorization boundary and
+  insecure fallback is not attempted. Existing legacy key files are ignored
+  and left untouched. Once the GUI process exits, the daemon retains only the
+  unusable public endpoint id until idle expiry or daemon restart.
 - The web UI (a static Leptos/wasm page in `webui/`, hostable anywhere) is
   an iroh client like any other: it connects to the same endpoint on its own
   ALPN and passes the same per-key enrollment before the daemon serves it.
@@ -97,9 +108,10 @@ AI APIs.
   steal an unlocked key, so recovery requires revoking the endpoint, clearing
   the origin's browser site data, verifying the deployment, and enrolling a
   new identity.
-  `rho iroh revoke <endpoint-id>` removes persistent trust through the local
-  daemon socket; already-established connections are not forcibly closed and
-  must be disconnected (or the daemon restarted) during compromise recovery.
+  `rho iroh revoke <endpoint-id>` removes persistent and in-memory trust through
+  the local daemon socket; already-established connections are not forcibly
+  closed and must be disconnected (or the daemon restarted) during compromise
+  recovery. In-memory trust is always lost when the daemon exits.
 - Inbound data on both ALPNs is remote, semi-trusted input: oversized UI
   protocol frames are rejected (`MAX_FRAME_LEN`), web UI JSON lines are
   length-bounded (`MAX_LINE_LEN`), malformed frames end the connection, and

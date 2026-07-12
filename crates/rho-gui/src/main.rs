@@ -62,6 +62,11 @@ struct Args {
     /// Connect to this rho daemon iroh endpoint id.
     #[arg(long, visible_alias = "iroh", value_name = "ENDPOINT_ID")]
     endpoint: Option<iroh::EndpointId>,
+
+    /// Approve the in-memory iroh key by running rho through this SSH
+    /// destination.
+    #[arg(long, value_name = "DESTINATION", requires = "endpoint")]
+    ssh: Option<String>,
 }
 
 fn main() {
@@ -111,12 +116,9 @@ fn run() -> Result<()> {
 
 fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
     if let Some(endpoint_id) = args.endpoint {
-        let state_dir = dirs::state_dir()
-            .context("state directory not available")?
-            .join("rho-gui");
         return Ok(AttachTarget::Iroh {
             endpoint_id,
-            secret_path: state_dir.join("iroh-secret.key"),
+            ssh_destination: args.ssh,
         });
     }
     Ok(AttachTarget::Unix(

@@ -1582,6 +1582,23 @@ async fn handle_message(
             });
             Ok(Refresh::None)
         }
+        ClientMessage::IrohApproveInMemory { code } => {
+            let auth = agents
+                .iroh_auth
+                .as_ref()
+                .context("daemon is not listening over iroh (start it with --iroh)")?;
+            let code = code
+                .parse::<rho_iroh_auth::EnrollmentCode>()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let endpoint_id = auth
+                .approve_code_in_memory(&code)
+                .await
+                .map_err(|_| anyhow::anyhow!("no pending enrollment has this code"))?;
+            let _ = outgoing_tx.send(ServerMessage::IrohApproved {
+                endpoint_id: endpoint_id.to_string(),
+            });
+            Ok(Refresh::None)
+        }
         ClientMessage::IrohRevoke { endpoint_id } => {
             let auth = agents
                 .iroh_auth

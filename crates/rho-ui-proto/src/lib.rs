@@ -188,6 +188,10 @@ pub enum ClientMessage {
     IrohApprove {
         code: String,
     },
+    /// Approve a pending iroh client without persisting trust to disk.
+    IrohApproveInMemory {
+        code: String,
+    },
     /// Revoke persistent trust for an iroh client endpoint.
     IrohRevoke {
         endpoint_id: String,

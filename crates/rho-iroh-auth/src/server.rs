@@ -12,6 +12,8 @@ use crate::shared::{EnrollmentCode, enrollment_code};
 
 const TRUSTED_CLIENTS: TableDefinition<TrustedClientId, TrustedClientValue> =
     TableDefinition::new("rho_iroh_auth_trusted_clients_v1");
+const MEMORY_TRUST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_MEMORY_TRUSTED_CLIENTS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct TrustedClientId(EndpointId);
@@ -39,7 +41,13 @@ pub struct IrohAuth {
 struct IrohAuthInner {
     server_endpoint_id: EndpointId,
     trusted: TrustedClients,
+    memory_trusted: tokio::sync::Mutex<MemoryTrustedClients>,
     pending: tokio::sync::Mutex<PendingEnrollments>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryTrustedClients {
+    expires: HashMap<EndpointId, Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -227,12 +235,11 @@ impl PendingEnrollments {
         Ok(approval)
     }
 
-    fn approve(&mut self, code: &EnrollmentCode) -> Result<EndpointId, ApproveError> {
+    fn take_for_approval(&mut self, code: &EnrollmentCode) -> Result<PendingClient, ApproveError> {
         self.prune();
         let pending = self.active.remove(code).ok_or(ApproveError::UnknownCode)?;
         self.remember_recent(*code);
-        pending.approved.notify_waiters();
-        Ok(pending.client_endpoint_id)
+        Ok(pending)
     }
 
     fn prune(&mut self) {
@@ -263,6 +270,42 @@ impl PendingEnrollments {
     }
 }
 
+impl MemoryTrustedClients {
+    fn is_trusted(&mut self, client_endpoint_id: EndpointId) -> bool {
+        self.prune();
+        let Some(expires_at) = self.expires.get_mut(&client_endpoint_id) else {
+            return false;
+        };
+        *expires_at = Instant::now() + MEMORY_TRUST_TTL;
+        true
+    }
+
+    fn trust(&mut self, client_endpoint_id: EndpointId) {
+        self.prune();
+        if self.expires.len() >= MAX_MEMORY_TRUSTED_CLIENTS
+            && !self.expires.contains_key(&client_endpoint_id)
+            && let Some(oldest) = self
+                .expires
+                .iter()
+                .min_by_key(|(_, expires_at)| *expires_at)
+                .map(|(endpoint_id, _)| *endpoint_id)
+        {
+            self.expires.remove(&oldest);
+        }
+        self.expires
+            .insert(client_endpoint_id, Instant::now() + MEMORY_TRUST_TTL);
+    }
+
+    fn revoke(&mut self, client_endpoint_id: EndpointId) -> bool {
+        self.expires.remove(&client_endpoint_id).is_some()
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.expires.retain(|_, expires_at| *expires_at > now);
+    }
+}
+
 impl IrohAuth {
     pub fn new(db: RhoDb, server_endpoint_id: EndpointId) -> Self {
         Self::with_pending(db, server_endpoint_id, PendingEnrollments::default())
@@ -277,6 +320,7 @@ impl IrohAuth {
             inner: Arc::new(IrohAuthInner {
                 server_endpoint_id,
                 trusted: TrustedClients::new(db),
+                memory_trusted: tokio::sync::Mutex::new(MemoryTrustedClients::default()),
                 pending: tokio::sync::Mutex::new(pending),
             }),
         }
@@ -287,7 +331,7 @@ impl IrohAuth {
         client_endpoint_id: EndpointId,
         code: EnrollmentCode,
     ) -> Result<AuthDecision, BeginEnrollmentError> {
-        if self.inner.trusted.is_trusted(client_endpoint_id).await {
+        if self.is_trusted(client_endpoint_id).await {
             return Ok(AuthDecision::Trusted);
         }
 
@@ -309,17 +353,53 @@ impl IrohAuth {
         self.begin_enrollment(client_endpoint_id, code).await
     }
 
+    async fn is_trusted(&self, client_endpoint_id: EndpointId) -> bool {
+        if self
+            .inner
+            .memory_trusted
+            .lock()
+            .await
+            .is_trusted(client_endpoint_id)
+        {
+            return true;
+        }
+        self.inner.trusted.is_trusted(client_endpoint_id).await
+    }
+
     /// Trust the exact client key associated with this active code.
     pub async fn approve_code(&self, code: &EnrollmentCode) -> Result<EndpointId, ApproveError> {
-        let client_endpoint_id = self.inner.pending.lock().await.approve(code)?;
-        self.inner.trusted.trust(client_endpoint_id).await;
-        Ok(client_endpoint_id)
+        let pending = self.inner.pending.lock().await.take_for_approval(code)?;
+        self.inner.trusted.trust(pending.client_endpoint_id).await;
+        pending.approved.notify_waiters();
+        Ok(pending.client_endpoint_id)
+    }
+
+    /// Trust the exact client key in daemon memory for up to 24 idle hours.
+    /// The trust is never persisted and is lost when the daemon exits.
+    pub async fn approve_code_in_memory(
+        &self,
+        code: &EnrollmentCode,
+    ) -> Result<EndpointId, ApproveError> {
+        let pending = self.inner.pending.lock().await.take_for_approval(code)?;
+        self.inner
+            .memory_trusted
+            .lock()
+            .await
+            .trust(pending.client_endpoint_id);
+        pending.approved.notify_waiters();
+        Ok(pending.client_endpoint_id)
     }
 
     /// Remove persistent trust for a client endpoint. Existing connections
     /// close normally; subsequent connections require enrollment again.
     pub async fn revoke(&self, client_endpoint_id: EndpointId) -> bool {
-        self.inner.trusted.revoke(client_endpoint_id).await
+        let memory_removed = self
+            .inner
+            .memory_trusted
+            .lock()
+            .await
+            .revoke(client_endpoint_id);
+        self.inner.trusted.revoke(client_endpoint_id).await || memory_removed
     }
 }
 
@@ -333,7 +413,7 @@ impl EndpointHooks for IrohAuth {
                 let approved = tokio::time::timeout(approval.timeout, approval.approved.notified())
                     .await
                     .is_ok();
-                if approved && self.inner.trusted.is_trusted(conn.remote_id()).await {
+                if approved && self.is_trusted(conn.remote_id()).await {
                     AfterHandshakeOutcome::Accept
                 } else {
                     AfterHandshakeOutcome::Reject {
@@ -376,7 +456,10 @@ mod tests {
             pending.insert(endpoint_id(12), code),
             Err(BeginEnrollmentError::DuplicateCode)
         ));
-        assert_eq!(pending.approve(&code).unwrap(), endpoint_id(11));
+        assert_eq!(
+            pending.take_for_approval(&code).unwrap().client_endpoint_id,
+            endpoint_id(11)
+        );
         assert!(matches!(
             pending.insert(endpoint_id(12), code),
             Err(BeginEnrollmentError::DuplicateCode)
@@ -407,6 +490,33 @@ mod tests {
 
         assert!(auth.revoke(client).await);
         assert!(!auth.revoke(client).await);
+        assert!(matches!(
+            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JK25").unwrap())
+                .await
+                .unwrap(),
+            AuthDecision::Pending(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_memory_approval_is_trusted_without_persistence_and_can_be_revoked() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = endpoint_id(3);
+        let auth = IrohAuth::new(RhoDb::open(temp.path().join("auth.redb")), endpoint_id(1));
+        let code = EnrollmentCode::from_str("ABCD-EFGH-JK23").unwrap();
+        assert!(matches!(
+            auth.begin_enrollment(client, code).await.unwrap(),
+            AuthDecision::Pending(_)
+        ));
+
+        assert_eq!(auth.approve_code_in_memory(&code).await.unwrap(), client);
+        assert!(matches!(
+            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JK24").unwrap())
+                .await
+                .unwrap(),
+            AuthDecision::Trusted
+        ));
+        assert!(auth.revoke(client).await);
         assert!(matches!(
             auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JK25").unwrap())
                 .await
