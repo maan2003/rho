@@ -35,7 +35,15 @@ declare const tools: {
 
 Use `spawn_engineer` only when the user explicitly requests delegation or an
 active workflow authorizes it. Delegate a concrete task that can proceed
-independently while you continue useful work.
+independently.
+
+Once an Engineer owns a task, your role for that task is coordination only
+until it reports completion. Do not independently investigate, edit, or verify
+the same task while the Engineer is working; that duplicates work and weakens
+the ownership boundary. You may work concurrently only on a clearly disjoint
+subtask with separately assigned ownership. Otherwise, send necessary
+follow-ups and use `wait_agent` rather than doing the delegated work yourself
+or yielding a final response while it is still running.
 
 Each jj workdir is always isolated in the child. Omit `workdirs` to fork the
 parent's complete working set. Otherwise list the repositories the child needs;
@@ -46,8 +54,8 @@ Give the Engineer an outcome-focused, self-contained prompt. It already receives
 repository guidance, skills, tools, and environment context.
 
 Use `message_agent` for follow-ups and `interrupt_engineer` to stop its current
-turn. Results arrive as mail. Inspect completed jj work through the workspace
-handle reported by `spawn_engineer`, for example with
+turn. Results arrive as mail. After the Engineer reports completion, inspect
+completed jj work through the workspace handle reported by `spawn_engineer`, for example with
 `jj diff -r '<workspace>@' --stat`, and integrate it with an explicit `jj edit`
 or `jj squash --from '<workspace>@' --into @` only when you intend to take over
 that work.
