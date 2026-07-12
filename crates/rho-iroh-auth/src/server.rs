@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iroh::EndpointId;
-use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, VarInt};
+use iroh::endpoint::Connection;
 use redb::{TableDefinition, TypeName};
 use redb_derive::Value;
 use rho_db::RhoDb;
@@ -14,6 +14,7 @@ const TRUSTED_CLIENTS: TableDefinition<TrustedClientId, TrustedClientValue> =
     TableDefinition::new("rho_iroh_auth_trusted_clients_v1");
 const MEMORY_TRUST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_MEMORY_TRUSTED_CLIENTS: usize = 4096;
+const MAX_RECENT_ENROLLMENT_CODES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct TrustedClientId(EndpointId);
@@ -28,6 +29,14 @@ struct TrustedClientValue {
 pub enum ApproveError {
     /// No active pending enrollment has this code.
     UnknownCode,
+}
+
+/// Server-side result sent on the auth-only first stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServerAuthDecision {
+    Approved,
+    EnrollmentRequired(EnrollmentCode),
+    Unavailable,
 }
 
 /// Library-level authenticator combining persistent trust and pending
@@ -69,19 +78,6 @@ struct PendingEnrollments {
 struct PendingClient {
     client_endpoint_id: EndpointId,
     expires_at: Instant,
-    approved: Arc<tokio::sync::Notify>,
-}
-
-#[derive(Clone, Debug)]
-struct PendingApproval {
-    approved: Arc<tokio::sync::Notify>,
-    timeout: Duration,
-}
-
-#[derive(Clone, Debug)]
-enum AuthDecision {
-    Trusted,
-    Pending(PendingApproval),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,14 +196,12 @@ impl PendingEnrollments {
         &mut self,
         client_endpoint_id: EndpointId,
         code: EnrollmentCode,
-    ) -> Result<PendingApproval, BeginEnrollmentError> {
+    ) -> Result<(), BeginEnrollmentError> {
         self.prune();
         if let Some(existing_code) = self.active.iter().find_map(|(active_code, pending)| {
             (pending.client_endpoint_id == client_endpoint_id).then_some(*active_code)
         }) {
-            if let Some(existing) = self.active.remove(&existing_code) {
-                existing.approved.notify_waiters();
-            }
+            self.active.remove(&existing_code);
             self.remember_recent(existing_code);
         }
         if self.active.len() >= self.max_pending {
@@ -219,20 +213,14 @@ impl PendingEnrollments {
         {
             return Err(BeginEnrollmentError::DuplicateCode);
         }
-        let approved = Arc::new(tokio::sync::Notify::new());
-        let approval = PendingApproval {
-            approved: Arc::clone(&approved),
-            timeout: self.pending_ttl,
-        };
         self.active.insert(
             code,
             PendingClient {
                 client_endpoint_id,
                 expires_at: Instant::now() + self.pending_ttl,
-                approved,
             },
         );
-        Ok(approval)
+        Ok(())
     }
 
     fn take_for_approval(&mut self, code: &EnrollmentCode) -> Result<PendingClient, ApproveError> {
@@ -250,9 +238,7 @@ impl PendingEnrollments {
             .filter_map(|(code, pending)| (pending.expires_at <= now).then_some(*code))
             .collect::<Vec<_>>();
         for code in expired {
-            if let Some(expired) = self.active.remove(&code) {
-                expired.approved.notify_waiters();
-            }
+            self.active.remove(&code);
             self.remember_recent(code);
         }
         while self
@@ -265,6 +251,9 @@ impl PendingEnrollments {
     }
 
     fn remember_recent(&mut self, code: EnrollmentCode) {
+        while self.recent.len() >= MAX_RECENT_ENROLLMENT_CODES {
+            self.recent.pop_front();
+        }
         self.recent
             .push_back((code, Instant::now() + self.recent_ttl));
     }
@@ -326,31 +315,42 @@ impl IrohAuth {
         }
     }
 
+    #[cfg(test)]
     async fn begin_enrollment(
         &self,
         client_endpoint_id: EndpointId,
         code: EnrollmentCode,
-    ) -> Result<AuthDecision, BeginEnrollmentError> {
+    ) -> Result<bool, BeginEnrollmentError> {
         if self.is_trusted(client_endpoint_id).await {
-            return Ok(AuthDecision::Trusted);
+            return Ok(true);
         }
 
-        let approval = self
-            .inner
+        self.inner
             .pending
             .lock()
             .await
             .insert(client_endpoint_id, code)?;
-        Ok(AuthDecision::Pending(approval))
+        Ok(false)
     }
 
-    async fn begin_enrollment_for_connection(
-        &self,
-        conn: &Connection,
-    ) -> Result<AuthDecision, BeginEnrollmentError> {
+    /// Check trust and, for an unknown client, register the exporter-bound code
+    /// independently verifiable by that client.
+    pub async fn authenticate_connection(&self, conn: &Connection) -> ServerAuthDecision {
         let client_endpoint_id = conn.remote_id();
+        if self.is_trusted(client_endpoint_id).await {
+            return ServerAuthDecision::Approved;
+        }
         let code = enrollment_code(conn, self.inner.server_endpoint_id, client_endpoint_id);
-        self.begin_enrollment(client_endpoint_id, code).await
+        match self
+            .inner
+            .pending
+            .lock()
+            .await
+            .insert(client_endpoint_id, code)
+        {
+            Ok(()) => ServerAuthDecision::EnrollmentRequired(code),
+            Err(_) => ServerAuthDecision::Unavailable,
+        }
     }
 
     async fn is_trusted(&self, client_endpoint_id: EndpointId) -> bool {
@@ -370,24 +370,17 @@ impl IrohAuth {
     pub async fn approve_code(&self, code: &EnrollmentCode) -> Result<EndpointId, ApproveError> {
         let pending = self.inner.pending.lock().await.take_for_approval(code)?;
         self.inner.trusted.trust(pending.client_endpoint_id).await;
-        pending.approved.notify_waiters();
         Ok(pending.client_endpoint_id)
     }
 
-    /// Trust the exact client key in daemon memory for up to 24 idle hours.
-    /// The trust is never persisted and is lost when the daemon exits.
-    pub async fn approve_code_in_memory(
-        &self,
-        code: &EnrollmentCode,
-    ) -> Result<EndpointId, ApproveError> {
-        let pending = self.inner.pending.lock().await.take_for_approval(code)?;
+    /// Trust an endpoint directly in daemon memory. Intended for a local
+    /// control client reached through an already-authenticated SSH login.
+    pub async fn trust_in_memory(&self, client_endpoint_id: EndpointId) {
         self.inner
             .memory_trusted
             .lock()
             .await
-            .trust(pending.client_endpoint_id);
-        pending.approved.notify_waiters();
-        Ok(pending.client_endpoint_id)
+            .trust(client_endpoint_id);
     }
 
     /// Remove persistent trust for a client endpoint. Existing connections
@@ -400,33 +393,6 @@ impl IrohAuth {
             .await
             .revoke(client_endpoint_id);
         self.inner.trusted.revoke(client_endpoint_id).await || memory_removed
-    }
-}
-
-impl EndpointHooks for IrohAuth {
-    async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
-        const REJECT_ERROR_CODE: VarInt = VarInt::from_u32(0x5248_4155);
-
-        match self.begin_enrollment_for_connection(conn).await {
-            Ok(AuthDecision::Trusted) => AfterHandshakeOutcome::Accept,
-            Ok(AuthDecision::Pending(approval)) => {
-                let approved = tokio::time::timeout(approval.timeout, approval.approved.notified())
-                    .await
-                    .is_ok();
-                if approved && self.is_trusted(conn.remote_id()).await {
-                    AfterHandshakeOutcome::Accept
-                } else {
-                    AfterHandshakeOutcome::Reject {
-                        error_code: REJECT_ERROR_CODE,
-                        reason: b"client enrollment required".to_vec(),
-                    }
-                }
-            }
-            Err(_) => AfterHandshakeOutcome::Reject {
-                error_code: REJECT_ERROR_CODE,
-                reason: b"client enrollment unavailable".to_vec(),
-            },
-        }
     }
 }
 
@@ -450,7 +416,7 @@ mod tests {
     #[test]
     fn pending_rejects_duplicate_active_and_recent_codes() {
         let mut pending = PendingEnrollments::default();
-        let code = EnrollmentCode::from_str("ABCD-EFGH-JK23").unwrap();
+        let code = EnrollmentCode::from_str("ABCD-EFGH-JK").unwrap();
         pending.insert(endpoint_id(11), code).unwrap();
         assert!(matches!(
             pending.insert(endpoint_id(12), code),
@@ -469,60 +435,47 @@ mod tests {
     #[tokio::test]
     async fn approving_code_pins_exact_client_key() {
         let temp = tempfile::tempdir().unwrap();
-        let server = endpoint_id(1);
         let client = endpoint_id(2);
-        let auth = IrohAuth::new(RhoDb::open(temp.path().join("auth.redb")), server);
-        let code = EnrollmentCode::from_str("ABCD-EFGH-JK23").unwrap();
+        let auth = IrohAuth::new(RhoDb::open(temp.path().join("auth.redb")), endpoint_id(1));
+        let code = EnrollmentCode::from_str("ABCD-EFGH-JK").unwrap();
 
         assert!(matches!(
             auth.begin_enrollment(client, code).await.unwrap(),
-            AuthDecision::Pending(_)
+            false
         ));
         let approved = auth.approve_code(&code).await.unwrap();
         assert_eq!(approved, client);
 
         assert!(matches!(
-            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JK24").unwrap())
+            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JM").unwrap())
                 .await
                 .unwrap(),
-            AuthDecision::Trusted
+            true
         ));
 
         assert!(auth.revoke(client).await);
         assert!(!auth.revoke(client).await);
         assert!(matches!(
-            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JK25").unwrap())
+            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JN").unwrap())
                 .await
                 .unwrap(),
-            AuthDecision::Pending(_)
+            false
         ));
     }
 
     #[tokio::test]
-    async fn in_memory_approval_is_trusted_without_persistence_and_can_be_revoked() {
+    async fn direct_in_memory_trust_needs_no_pending_enrollment() {
         let temp = tempfile::tempdir().unwrap();
-        let client = endpoint_id(3);
+        let client = endpoint_id(4);
         let auth = IrohAuth::new(RhoDb::open(temp.path().join("auth.redb")), endpoint_id(1));
-        let code = EnrollmentCode::from_str("ABCD-EFGH-JK23").unwrap();
-        assert!(matches!(
-            auth.begin_enrollment(client, code).await.unwrap(),
-            AuthDecision::Pending(_)
-        ));
-
-        assert_eq!(auth.approve_code_in_memory(&code).await.unwrap(), client);
-        assert!(matches!(
-            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JK24").unwrap())
+        auth.trust_in_memory(client).await;
+        assert!(
+            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JK").unwrap())
                 .await
-                .unwrap(),
-            AuthDecision::Trusted
-        ));
+                .unwrap()
+        );
         assert!(auth.revoke(client).await);
-        assert!(matches!(
-            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JK25").unwrap())
-                .await
-                .unwrap(),
-            AuthDecision::Pending(_)
-        ));
+        assert!(!auth.is_trusted(client).await);
     }
 
     #[test]
@@ -532,15 +485,27 @@ mod tests {
         pending
             .insert(
                 endpoint_id(11),
-                EnrollmentCode::from_str("ABCD-EFGH-JK23").unwrap(),
+                EnrollmentCode::from_str("ABCD-EFGH-JK").unwrap(),
             )
             .unwrap();
         assert!(matches!(
             pending.insert(
                 endpoint_id(12),
-                EnrollmentCode::from_str("ABCD-EFGH-JK24").unwrap(),
+                EnrollmentCode::from_str("ABCD-EFGH-JM").unwrap(),
             ),
             Err(BeginEnrollmentError::PendingFull { max_pending: 1 })
         ));
+    }
+
+    #[test]
+    fn recent_code_cache_is_bounded_under_reconnect_flood() {
+        let mut pending = PendingEnrollments::default();
+        let client = endpoint_id(11);
+        for value in 0..(MAX_RECENT_ENROLLMENT_CODES + 100) {
+            let code = EnrollmentCode::from_str(&format!("{value:010X}")).unwrap();
+            pending.insert(client, code).unwrap();
+        }
+        assert_eq!(pending.active.len(), 1);
+        assert_eq!(pending.recent.len(), MAX_RECENT_ENROLLMENT_CODES);
     }
 }

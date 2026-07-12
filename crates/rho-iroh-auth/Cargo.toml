@@ -13,6 +13,7 @@ default = ["server"]
 server = ["dep:redb", "dep:redb-derive", "dep:rho-db", "dep:tokio"]
 
 [dependencies]
+anyhow.workspace = true
 iroh.workspace = true
 redb = { workspace = true, optional = true }
 redb-derive = { workspace = true, optional = true }

@@ -60,7 +60,12 @@ struct Args {
     socket: Option<PathBuf>,
 
     /// Connect to this rho daemon iroh endpoint id.
-    #[arg(long, visible_alias = "iroh", value_name = "ENDPOINT_ID")]
+    #[arg(
+        long,
+        visible_alias = "iroh",
+        value_name = "ENDPOINT_ID",
+        requires = "ssh"
+    )]
     endpoint: Option<iroh::EndpointId>,
 
     /// Approve the in-memory iroh key by running rho through this SSH
@@ -118,7 +123,7 @@ fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
     if let Some(endpoint_id) = args.endpoint {
         return Ok(AttachTarget::Iroh {
             endpoint_id,
-            ssh_destination: args.ssh,
+            ssh_destination: args.ssh.context("--ssh is required with --endpoint")?,
         });
     }
     Ok(AttachTarget::Unix(

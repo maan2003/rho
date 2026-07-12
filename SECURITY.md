@@ -67,20 +67,36 @@ AI APIs.
 - With `rho daemon --iroh`, the daemon serves the full UI protocol over iroh
   (relay-backed QUIC). An enrolled client is fully privileged: everything a
   local UI client can do, including starting agents that run shell commands.
-  Trust is per client endpoint key. `rho iroh approve <code>` persists trust
-  in the local rho database; `rho iroh approve-in-memory <code>` keeps it only
-  in daemon memory, bounded to 4096 keys and 24 idle hours, for clients that
-  obtain approval through an existing SSH login without storing their iroh
-  key. Both commands reach the daemon through its Unix socket; codes are
-  60-bit, single-use, expire after a minute, and bind
-  the exact client key via a TLS exporter, so approval cannot be replayed or
-  redirected. The daemon's iroh secret key lives in the local rho database.
+  Trust is per client endpoint key. `rho iroh approve <code>` persists a
+  pending enrollment in the local rho database; `rho iroh trust-in-memory
+  <endpoint-id>` directly trusts a key in daemon memory, bounded to 4096 keys
+  and 24 idle hours, and is intended for invocation through an existing SSH
+  login. Every connection's
+  first bi-stream is a bounded, ten-second auth-only exchange. The server
+  explicitly returns approved, enrollment-required, or unavailable, and waits
+  for a client acknowledgement before closing so the
+  response cannot be discarded. Only approved connections may open later UI streams. After
+  code approval, unknown clients reconnect with the same key. Both commands reach the daemon
+  through its Unix socket. Codes are 50 bits displayed as ten lowercase
+  Crockford Base32 characters, single-use, and expire after a minute. They are
+  derived independently by server and client from both endpoint identities and
+  the TLS exporter. The server registers its derivation but never sends it; the
+  client displays its own derivation only after enrollment-required confirms
+  registration succeeded, preventing cross-daemon code substitution.
+  Active pending enrollments are capped at 10 and the five-minute
+  recently-used collision cache at 4096 entries, including under repeated
+  reconnects from one endpoint. At most 64 pre-auth exchanges run concurrently,
+  each connection permits at most 16 queued bidirectional streams, and both
+  client and server bound the auth exchange to ten seconds. The daemon's iroh
+  secret key lives in the local rho database.
   Enrollment approval is also accepted from already
   trusted remote clients (they are fully privileged anyway).
 - `rho-gui --endpoint <id>` generates its client key in process memory and
   never persists it. With `--ssh <destination>`, it runs the user's OpenSSH
-  client to execute `rho iroh approve-in-memory <code>` on the daemon host;
-  without `--ssh`, it displays that command for manual approval. The SSH host
+  client to execute `rho iroh trust-in-memory <endpoint-id>` on the daemon host
+  before connecting, so no enrollment code or rejected connection is needed.
+  `--ssh` is required for native iroh connections because an ephemeral GUI key
+  cannot survive a manual approval/restart cycle. The SSH host
   configuration and host-key verification are the authorization boundary and
   insecure fallback is not attempted. Existing legacy key files are ignored
   and left untouched. Once the GUI process exits, the daemon retains only the

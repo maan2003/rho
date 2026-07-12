@@ -2,27 +2,28 @@ use std::fmt;
 
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
-use sha2::{Digest, Sha512};
+use sha2::{Digest as _, Sha512};
 
-const ENROLLMENT_CODE_LABEL: &[u8] = b"rho-iroh-auth enrollment code v1";
-const TLS_EXPORTER_LABEL: &[u8] = b"rho-iroh-auth tls exporter v1";
-const ENROLLMENT_CODE_CHARS: usize = 12;
+const ENROLLMENT_CODE_LABEL: &[u8] = b"rho-iroh-auth enrollment code v2";
+const TLS_EXPORTER_LABEL: &[u8] = b"rho-iroh-auth tls exporter v2";
+
+const ENROLLMENT_CODE_CHARS: usize = 10;
 const ENROLLMENT_CODE_BITS: usize = ENROLLMENT_CODE_CHARS * 5;
 const ENROLLMENT_CODE_MASK: u64 = (1u64 << ENROLLMENT_CODE_BITS) - 1;
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const CROCKFORD: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// A fixed-length, human-entered Crockford Base32 enrollment code.
 ///
-/// Private representation invariant: the `u64` contains exactly the 60 bits
-/// displayed as 12 Crockford Base32 symbols. The upper 4 bits are always zero.
+/// Private representation invariant: the `u64` contains exactly the 50 bits
+/// displayed as 10 Crockford Base32 symbols. The upper 14 bits are always zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EnrollmentCode(u64);
 
 impl EnrollmentCode {
-    fn from_60_bits(value: u64) -> Self {
+    fn from_bits(value: u64) -> Self {
         assert!(
             value <= ENROLLMENT_CODE_MASK,
-            "enrollment code exceeds 60 bits"
+            "enrollment code exceeds 50 bits"
         );
         Self(value)
     }
@@ -32,7 +33,7 @@ impl fmt::Display for EnrollmentCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         debug_assert!(self.0 <= ENROLLMENT_CODE_MASK);
         for index in 0..ENROLLMENT_CODE_CHARS {
-            if index > 0 && index % 4 == 0 {
+            if index == 5 {
                 f.write_str("-")?;
             }
             let shift = (ENROLLMENT_CODE_CHARS - index - 1) * 5;
@@ -53,10 +54,10 @@ impl std::str::FromStr for EnrollmentCode {
             if ch == '-' || ch.is_whitespace() {
                 continue;
             }
-            let ch = ch.to_ascii_uppercase();
+            let ch = ch.to_ascii_lowercase();
             let ch = match ch {
-                'O' => '0',
-                'I' | 'L' => '1',
+                'o' => '0',
+                'i' | 'l' => '1',
                 other => other,
             };
             let Some(symbol) = CROCKFORD.iter().position(|byte| *byte == ch as u8) else {
@@ -71,7 +72,7 @@ impl std::str::FromStr for EnrollmentCode {
         if chars != ENROLLMENT_CODE_CHARS {
             return Err(ParseEnrollmentCodeError);
         }
-        Ok(Self::from_60_bits(value))
+        Ok(Self::from_bits(value))
     }
 }
 
@@ -104,7 +105,7 @@ pub(crate) fn enrollment_code(
     hash_len_prefixed(&mut hasher, &exporter);
     let digest = hasher.finalize();
     let first_64 = u64::from_be_bytes(digest[..8].try_into().expect("8 bytes"));
-    EnrollmentCode::from_60_bits(first_64 >> 4)
+    EnrollmentCode::from_bits(first_64 >> 14)
 }
 
 fn exporter_context(server_endpoint_id: EndpointId, client_endpoint_id: EndpointId) -> Vec<u8> {
@@ -130,15 +131,15 @@ mod tests {
 
     #[test]
     fn code_parsing_accepts_human_variants() {
-        let code = EnrollmentCode::from_str("abcd efgh ijkl").unwrap();
-        assert_eq!(code.to_string(), "ABCD-EFGH-1JK1");
+        let code = EnrollmentCode::from_str("abcd efgh il").unwrap();
+        assert_eq!(code.to_string(), "abcde-fgh11");
         assert!(EnrollmentCode::from_str("too-short").is_err());
     }
 
     #[test]
     fn code_display_is_grouped_crockford() {
-        let code = EnrollmentCode::from_str("ABCD-EFGH-JK23").unwrap();
-        assert_eq!(code.to_string(), "ABCD-EFGH-JK23");
+        let code = EnrollmentCode::from_str("ABCD-EFGH-JK").unwrap();
+        assert_eq!(code.to_string(), "abcde-fghjk");
         let chars = code.to_string().replace('-', "").into_bytes();
         assert_eq!(chars.len(), ENROLLMENT_CODE_CHARS);
         assert!(chars.iter().all(|ch| CROCKFORD.contains(ch)));
@@ -146,7 +147,7 @@ mod tests {
 
     #[test]
     fn parser_rejects_non_crockford_and_wrong_lengths() {
-        let invalid = ["ABCD-EFGH-JK2!", "ABCD-EFGH-JK234", "ABCD-EFGH-JK2"];
+        let invalid = ["ABCD-EFGH-J!", "ABCD-EFGH-JK2", "ABCD-EFGH-J"];
         let rejected = invalid
             .into_iter()
             .filter(|code| EnrollmentCode::from_str(code).is_err())

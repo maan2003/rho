@@ -10560,6 +10560,7 @@ dependencies = [
 name = "rho-iroh-auth"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "iroh",
  "redb",
  "redb-derive",

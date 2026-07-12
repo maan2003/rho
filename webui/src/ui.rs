@@ -99,7 +99,12 @@ fn EnrollScreen(code: String) -> impl IntoView {
                     "daemon, run:"
                 </p>
                 <pre class="code approve">{format!("rho iroh approve {code}")}</pre>
-                <p class="muted spin-row"><span class="spinner"></span>"Waiting for approval… the code expires after a minute; reload to get a new one."</p>
+                <p class="muted">"After approval, reconnect with the same passkey before the code expires."</p>
+                <button class="primary" on:click=|_| {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.location().reload();
+                    }
+                }>"Reconnect after approval"</button>
             </div>
         </div>
     }

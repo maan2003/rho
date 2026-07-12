@@ -100,8 +100,8 @@ async fn run(command: Command) -> Result<()> {
 async fn run_iroh(args: IrohArgs) -> Result<()> {
     let request = match args.command {
         IrohCommand::Approve { code } => rho_ui_proto::ClientMessage::IrohApprove { code },
-        IrohCommand::ApproveInMemory { code } => {
-            rho_ui_proto::ClientMessage::IrohApproveInMemory { code }
+        IrohCommand::TrustInMemory { endpoint_id } => {
+            rho_ui_proto::ClientMessage::IrohTrustInMemory { endpoint_id }
         }
         IrohCommand::Revoke { endpoint_id } => {
             rho_ui_proto::ClientMessage::IrohRevoke { endpoint_id }
@@ -1219,9 +1219,8 @@ pub(crate) struct IrohArgs {
 pub(crate) enum IrohCommand {
     /// Approve a pending iroh client enrollment by its displayed code.
     Approve { code: String },
-    /// Approve a client in daemon memory only (lost on restart or after 24 idle
-    /// hours).
-    ApproveInMemory { code: String },
+    /// Directly trust an endpoint in daemon memory (for use through SSH).
+    TrustInMemory { endpoint_id: String },
     /// Revoke a previously enrolled iroh client endpoint.
     Revoke { endpoint_id: String },
 }

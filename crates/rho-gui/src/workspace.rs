@@ -44,7 +44,7 @@ pub enum AttachTarget {
     Unix(PathBuf),
     Iroh {
         endpoint_id: iroh::EndpointId,
-        ssh_destination: Option<String>,
+        ssh_destination: String,
     },
 }
 
@@ -277,14 +277,6 @@ impl Workspace {
                 self.notice_on(
                     None,
                     &format!("[rho daemon error: {message}]"),
-                    StyleClass::SystemImportant,
-                    cx,
-                );
-            }
-            ConnEvent::Enrollment(code) => {
-                self.notice_on(
-                    None,
-                    &format!("[iroh client needs approval: rho iroh approve-in-memory {code}]"),
                     StyleClass::SystemImportant,
                     cx,
                 );

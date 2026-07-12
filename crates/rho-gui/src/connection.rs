@@ -79,7 +79,6 @@ pub enum ConnEvent {
         attention: rho_ui_proto::UiAttention,
     },
     ServerError(String),
-    Enrollment(String),
     Disconnected(String),
     /// Assistant audio (wire-format PCM16) for immediate playback.
     VoiceAudio(Vec<u8>),
@@ -147,7 +146,7 @@ async fn run(
         AttachTarget::Iroh {
             endpoint_id,
             ssh_destination,
-        } => connect_iroh(endpoint_id, ssh_destination.as_deref(), events).await?,
+        } => connect_iroh(endpoint_id, &ssh_destination).await?,
     };
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
@@ -250,11 +249,8 @@ async fn run(
 
 async fn connect_iroh(
     daemon_id: iroh::EndpointId,
-    ssh_destination: Option<&str>,
-    events: &futures_mpsc::UnboundedSender<ConnEvent>,
+    ssh_destination: &str,
 ) -> anyhow::Result<Box<dyn AsyncStream>> {
-    use rho_iroh_auth::EnrollmentCodeExt as _;
-
     // The native client's identity intentionally lives only as long as this
     // process. The daemon can trust it in memory via an existing SSH login.
     let secret = iroh::SecretKey::generate();
@@ -263,40 +259,48 @@ async fn connect_iroh(
         .bind()
         .await
         .context("bind iroh client endpoint")?;
+    tracing::info!(
+        destination = ssh_destination,
+        "trusting ephemeral iroh client over SSH"
+    );
+    trust_in_memory_over_ssh(ssh_destination, endpoint.id()).await?;
+    tracing::info!(
+        destination = ssh_destination,
+        "ephemeral iroh client trusted over SSH"
+    );
     let connection = endpoint
         .connect(daemon_id, rho_ui_proto::IROH_ALPN)
         .await
         .context("connect to daemon over iroh")?;
-    let open_stream = connection.open_bi();
-    tokio::pin!(open_stream);
-    let (send, recv) = tokio::select! {
-        stream = &mut open_stream => stream,
-        () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-            let code = connection.enrollment_code(endpoint.id());
-            if let Some(destination) = ssh_destination {
-                approve_in_memory_over_ssh(destination, &code.to_string()).await?;
-            } else {
-                let _ = events.unbounded_send(ConnEvent::Enrollment(code.to_string()));
-            }
-            open_stream.await
-        }
-    }
-    .context("open iroh UI stream")?;
+    anyhow::ensure!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            rho_iroh_auth::authenticate_client(&connection, endpoint.id()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("iroh authentication timed out"))??
+            == rho_iroh_auth::ClientAuthResult::Approved,
+        "daemon did not approve SSH-trusted iroh client"
+    );
+    let (send, recv) = connection.open_bi().await.context("open iroh UI stream")?;
     Ok(Box::new(IrohStream {
         inner: tokio::io::join(recv, send),
         _endpoint: endpoint,
     }))
 }
 
-async fn approve_in_memory_over_ssh(destination: &str, code: &str) -> anyhow::Result<()> {
+async fn trust_in_memory_over_ssh(
+    destination: &str,
+    endpoint_id: iroh::EndpointId,
+) -> anyhow::Result<()> {
     anyhow::ensure!(!destination.starts_with('-'), "invalid SSH destination");
-    // `code` was produced by EnrollmentCode::Display and contains only the
-    // fixed Crockford alphabet and separators, so it is safe even though
-    // OpenSSH sends the remote argv through the login shell.
+    // EndpointId's text form has a fixed safe alphabet even though OpenSSH
+    // sends the remote argv through the login shell.
+    let endpoint_id = endpoint_id.to_string();
     let status = tokio::process::Command::new("ssh")
         .arg("--")
         .arg(destination)
-        .args(["rho", "iroh", "approve-in-memory", code])
+        .args(["rho", "iroh", "trust-in-memory", &endpoint_id])
         .status()
         .await
         .context("run SSH enrollment approval")?;

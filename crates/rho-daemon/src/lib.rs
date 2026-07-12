@@ -253,16 +253,20 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     if let Some((secret, iroh_auth)) = iroh {
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret)
+            .transport_config(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .max_concurrent_bidi_streams(16u8.into())
+                    .build(),
+            )
             .alpns(vec![
                 rho_ui_proto::IROH_ALPN.to_vec(),
                 rho_webui_messages::ALPN.to_vec(),
             ])
-            .hooks(iroh_auth)
             .bind()
             .await
             .context("bind iroh endpoint")?;
         eprintln!("rho daemon iroh endpoint: {}", endpoint.id());
-        tokio::spawn(run_iroh_listener(agents.clone(), endpoint));
+        tokio::spawn(run_iroh_listener(agents.clone(), endpoint, iroh_auth));
     }
 
     // Attention watchers: one per loaded agent, daemon-owned (not tied to
@@ -362,13 +366,25 @@ async fn load_or_create_iroh_secret(db: &RhoDb) -> anyhow::Result<iroh::SecretKe
     Ok(iroh::SecretKey::from_bytes(&secret))
 }
 
-/// Accepts enrolled iroh connections ([`rho_iroh_auth::IrohAuth`] gates them
-/// before they reach here) and serves one session per bi-stream: the full UI
-/// protocol on [`rho_ui_proto::IROH_ALPN`], the web UI JSON protocol on
-/// [`rho_webui_messages::ALPN`].
-async fn run_iroh_listener(agents: Arc<AgentRegistry>, endpoint: iroh::Endpoint) {
+/// Authenticates every iroh connection on its first bi-stream, then serves one
+/// session per later bi-stream: the full UI protocol on
+/// [`rho_ui_proto::IROH_ALPN`], the web UI JSON protocol on
+/// [`rho_webui_messages::ALPN`]. Unapproved connections never reach either
+/// application handler.
+async fn run_iroh_listener(
+    agents: Arc<AgentRegistry>,
+    endpoint: iroh::Endpoint,
+    auth: rho_iroh_auth::IrohAuth,
+) {
+    const MAX_CONCURRENT_PREAUTH: usize = 64;
+    let preauth = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PREAUTH));
     while let Some(incoming) = endpoint.accept().await {
+        let permit = match preauth.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         let agents = agents.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
             let connection = match incoming.await {
                 Ok(connection) => connection,
@@ -377,6 +393,23 @@ async fn run_iroh_listener(agents: Arc<AgentRegistry>, endpoint: iroh::Endpoint)
                     return;
                 }
             };
+            match rho_iroh_auth::authenticate_server_connection(&auth, &connection).await {
+                Ok(rho_iroh_auth::ServerAuthDecision::Approved) => {
+                    drop(permit);
+                }
+                Ok(
+                    rho_iroh_auth::ServerAuthDecision::EnrollmentRequired(_)
+                    | rho_iroh_auth::ServerAuthDecision::Unavailable,
+                ) => {
+                    connection.close(0u32.into(), b"iroh authentication required");
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("rho daemon iroh authentication error: {error:#}");
+                    connection.close(0u32.into(), b"iroh authentication failed");
+                    return;
+                }
+            }
             let webui = connection.alpn() == rho_webui_messages::ALPN;
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let agents = agents.clone();
@@ -1582,18 +1615,15 @@ async fn handle_message(
             });
             Ok(Refresh::None)
         }
-        ClientMessage::IrohApproveInMemory { code } => {
+        ClientMessage::IrohTrustInMemory { endpoint_id } => {
             let auth = agents
                 .iroh_auth
                 .as_ref()
                 .context("daemon is not listening over iroh (start it with --iroh)")?;
-            let code = code
-                .parse::<rho_iroh_auth::EnrollmentCode>()
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-            let endpoint_id = auth
-                .approve_code_in_memory(&code)
-                .await
-                .map_err(|_| anyhow::anyhow!("no pending enrollment has this code"))?;
+            let endpoint_id = endpoint_id
+                .parse::<iroh::EndpointId>()
+                .context("invalid iroh client endpoint id")?;
+            auth.trust_in_memory(endpoint_id).await;
             let _ = outgoing_tx.send(ServerMessage::IrohApproved {
                 endpoint_id: endpoint_id.to_string(),
             });

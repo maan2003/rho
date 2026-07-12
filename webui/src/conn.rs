@@ -5,14 +5,13 @@
 use std::cell::RefCell;
 use std::str::FromStr as _;
 
-use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
+use futures::{FutureExt as _, StreamExt as _};
 use hkdf::Hkdf;
 use iroh::EndpointId;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use rho_iroh_auth::EnrollmentCodeExt as _;
 use rho_webui_messages::{FromBrowser, MAX_LINE_LEN, ToBrowser};
 use sha2::{Digest as _, Sha256};
 use wasm_bindgen::{JsCast as _, JsValue};
@@ -118,12 +117,17 @@ async fn run(
         .await
         .map_err(|error| anyhow::anyhow!("connect to daemon: {error}"))?;
 
-    // Until the daemon trusts this browser's key, its auth hook holds the
-    // connection while `rho iroh approve <code>` is pending. Show the code;
-    // the first Hello replaces this screen. An empty line materializes the
-    // QUIC stream so the daemon sees the connection.
-    let code = connection.enrollment_code(endpoint.id());
-    app.phase.set(Phase::Enroll(code.to_string()));
+    match authenticate_client_bounded(&connection, endpoint.id()).await? {
+        rho_iroh_auth::ClientAuthResult::Approved => {}
+        rho_iroh_auth::ClientAuthResult::EnrollmentRequired(code) => {
+            app.phase.set(Phase::Enroll(code.to_string()));
+            return Ok(());
+        }
+        rho_iroh_auth::ClientAuthResult::Unavailable => {
+            anyhow::bail!("daemon cannot accept another enrollment right now");
+        }
+    }
+
     let (mut send, recv) = connection
         .open_bi()
         .await
@@ -146,6 +150,19 @@ async fn run(
     });
 
     read_loop(app, recv).await
+}
+
+async fn authenticate_client_bounded(
+    connection: &iroh::endpoint::Connection,
+    client_endpoint_id: iroh::EndpointId,
+) -> anyhow::Result<rho_iroh_auth::ClientAuthResult> {
+    let auth = rho_iroh_auth::authenticate_client(connection, client_endpoint_id).fuse();
+    let timeout = gloo_timers::future::TimeoutFuture::new(10_000).fuse();
+    futures::pin_mut!(auth, timeout);
+    futures::select! {
+        result = auth => result,
+        () = timeout => anyhow::bail!("iroh authentication timed out"),
+    }
 }
 
 async fn read_loop(app: App, mut recv: iroh::endpoint::RecvStream) -> anyhow::Result<()> {

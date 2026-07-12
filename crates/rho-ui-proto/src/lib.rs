@@ -188,9 +188,10 @@ pub enum ClientMessage {
     IrohApprove {
         code: String,
     },
-    /// Approve a pending iroh client without persisting trust to disk.
-    IrohApproveInMemory {
-        code: String,
+    /// Directly trust an iroh endpoint in daemon memory. This is a privileged
+    /// local-control operation intended to be invoked through SSH.
+    IrohTrustInMemory {
+        endpoint_id: String,
     },
     /// Revoke persistent trust for an iroh client endpoint.
     IrohRevoke {
