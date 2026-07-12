@@ -8,13 +8,13 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
-base64.workspace = true
 bytes.workspace = true
-futures-util.workspace = true
+clap.workspace = true
 octo-types.workspace = true
-reqwest = { workspace = true, features = ["stream"] }
+regex.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
-tracing.workspace = true
+zip.workspace = true

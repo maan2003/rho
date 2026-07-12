@@ -195,7 +195,7 @@
 
             package = craneLib.buildPackage {
               cargoArtifacts = workspaceDeps;
-              cargoExtraArgs = "-p rho-cli -p rho-daemon -p oct";
+              cargoExtraArgs = "-p rho-cli -p rho-daemon -p octo";
               doCheck = false;
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
               postInstall = ''

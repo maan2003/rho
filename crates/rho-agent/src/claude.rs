@@ -540,9 +540,6 @@ impl ClaudeLoop {
             self.session_id,
         );
         options.session = session;
-        if let Ok(socket) = std::env::var("OCTO_SOCKET") {
-            options.set_env("OCTO_SOCKET", socket);
-        }
         if let Some(tools) = &self.multi_agent {
             options.set_env("RHO_AGENT_ID", tools.self_id().encoded());
             options.set_env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));

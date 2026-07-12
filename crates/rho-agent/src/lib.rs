@@ -983,14 +983,11 @@ impl ExecutionContext {
         tool_extension: Option<&Arc<dyn AgentToolExtension>>,
         control: mpsc::UnboundedSender<AgentControl>,
     ) -> Self {
-        let mut shell_tools = ShellTools::new(
+        let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             Arc::clone(&view),
         )
         .with_env("RHO_AGENT_ID", agent_id.encoded());
-        if let Ok(socket) = std::env::var("OCTO_SOCKET") {
-            shell_tools = shell_tools.with_env("OCTO_SOCKET", socket);
-        }
         let code_mode = start_code_mode(
             code_mode_enabled,
             &shell_tools,

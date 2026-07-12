@@ -55,8 +55,9 @@ AI APIs.
   ignore its own accepted-input reports; other local-client user inputs to
   Slack-mapped agents are mirrored into the mapped thread with conservative
   attribution.
-- The embedded Octo server listens only on a daemon-owned Unix socket whose path
-  is passed to agent commands as `OCTO_SOCKET`. Octo uses the sealed platform
+- The embedded Octo server listens only on its fixed per-user Unix socket.
+  Clients derive that path from the same `octo-types` contract rather than an
+  environment variable. Octo uses the sealed platform
   secret store as its GitHub token source and has no token argv/env/file/admin
   import path in Rho. Its Git remote-helper endpoint proxies smart-HTTP fetches
   for repositories readable by that token while retaining it in the daemon. It
@@ -159,8 +160,8 @@ AI APIs.
   Agent shell commands and Claude Code additionally run through `direnv exec`
   in their project directory. Project `.envrc` files are trusted local code and
   have the same authority as the agent shell tools they configure.
-- Rho-owned agent variables (`RHO_AGENT_ID`, `RHO_MCP_AGENT_ID`, and
-  `OCTO_SOCKET`) are supplied explicitly to agent commands rather than copied
+- Rho-owned agent variables (`RHO_AGENT_ID` and `RHO_MCP_AGENT_ID`) are supplied
+  explicitly to agent commands rather than copied
   incidentally from the daemon environment.
 - CLI-local subprocesses, including land and selfci jobs, retain the invoking
   CLI's environment; they are outside the daemon subprocess boundary.

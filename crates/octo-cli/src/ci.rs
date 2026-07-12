@@ -74,7 +74,7 @@ fn run_failed(conclusion: Option<&str>) -> bool {
 }
 
 pub async fn status(args: StatusArgs) -> Result<()> {
-    let client = OctoClient::from_env()?;
+    let client = OctoClient::new()?;
     let resp = fetch_status(&client, &args.pr_spec).await?;
 
     print_status(&resp);
@@ -95,7 +95,7 @@ pub struct WaitArgs {
 
 pub async fn wait(args: WaitArgs) -> Result<()> {
     let (owner, repo) = resolve_repo()?;
-    let client = OctoClient::from_env()?;
+    let client = OctoClient::new()?;
 
     loop {
         let resp: WorkflowRunResponse = client
@@ -133,15 +133,15 @@ pub struct LogsArgs {
 
 pub async fn logs(args: LogsArgs) -> Result<()> {
     let (owner, repo) = resolve_repo()?;
-    let client = OctoClient::from_env()?;
+    let client = OctoClient::new()?;
 
     let bytes = client
         .get_bytes(&format!("/ci/logs/{}/{}/{}", owner, repo, args.run_id))
         .await?;
 
     let base_dir = match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(dir) => PathBuf::from(dir).join("oct/ci-logs"),
-        Err(_) => std::env::temp_dir().join("oct/ci-logs"),
+        Ok(dir) => PathBuf::from(dir).join("octo/ci-logs"),
+        Err(_) => std::env::temp_dir().join("octo/ci-logs"),
     };
     let extract_path = base_dir.join(args.run_id.to_string());
 
@@ -215,7 +215,7 @@ pub struct RerunArgs {
 
 pub async fn rerun(args: RerunArgs) -> Result<()> {
     let (owner, repo) = resolve_repo()?;
-    let client = OctoClient::from_env()?;
+    let client = OctoClient::new()?;
 
     client
         .post(&format!("/ci/rerun/{}/{}/{}", owner, repo, args.run_id))

@@ -1,6 +1,4 @@
-use std::env;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use reqwest::Url;
 use serde::Serialize;
@@ -12,12 +10,9 @@ pub struct OctoClient {
 }
 
 impl OctoClient {
-    pub fn from_env() -> Result<Self> {
-        let socket_path =
-            env::var("OCTO_SOCKET").context("OCTO_SOCKET environment variable not set")?;
-
+    pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
-            .unix_socket(socket_path)
+            .unix_socket(octo_types::socket_path())
             .build()?;
 
         let base_url = Url::parse("http://localhost")?;

@@ -27,7 +27,7 @@ pub struct CreateArgs {
 
 pub async fn create(args: CreateArgs) -> Result<()> {
     let (owner, repo) = resolve_repo()?;
-    let client = OctoClient::from_env()?;
+    let client = OctoClient::new()?;
     let base = match args.base {
         Some(base) => base,
         None => resolve_default_base_branch()?,

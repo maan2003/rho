@@ -7,7 +7,7 @@ mod pr;
 mod repo;
 
 #[derive(Parser)]
-#[command(name = "oct")]
+#[command(name = "octo")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

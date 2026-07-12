@@ -15,7 +15,8 @@ dirs.workspace = true
 futures.workspace = true
 iroh = { workspace = true, features = ["tls-ring"] }
 json-stream.workspace = true
-octo.workspace = true
+octo-server.workspace = true
+octo-types.workspace = true
 prefix-id.workspace = true
 rho-agent.workspace = true
 rho-claude.workspace = true

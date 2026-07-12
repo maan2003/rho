@@ -1,4 +1,3 @@
-use std::env;
 use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -7,21 +6,18 @@ use anyhow::{Context, Result};
 use reqwest::Url;
 
 fn main() -> Result<()> {
-    let mut args = env::args().skip(1);
+    let mut args = std::env::args().skip(1);
     let remote = args.next().context("missing remote name")?;
     let url = args.next().context("missing Octo remote URL")?;
     let (owner, repo) = parse_remote(&url)?;
-    let socket = env::var("OCTO_SOCKET").context("OCTO_SOCKET environment variable not set")?;
+    let socket = octo_types::socket_path();
     let socket_path = Path::new(&socket);
-    if !socket_path.is_absolute() {
-        anyhow::bail!("OCTO_SOCKET must be an absolute path");
-    }
     let socket_type = socket_path
         .metadata()
-        .context("OCTO_SOCKET is unavailable")?
+        .with_context(|| format!("Octo socket is unavailable at {}", socket.display()))?
         .file_type();
     if !socket_type.is_socket() {
-        anyhow::bail!("OCTO_SOCKET does not refer to a Unix socket");
+        anyhow::bail!("Octo socket path does not refer to a Unix socket");
     }
     let remote_http: PathBuf = option_env!("OCTO_REMOTE_HTTP")
         .map(PathBuf::from)
@@ -37,7 +33,7 @@ fn main() -> Result<()> {
     let status = Command::new(remote_http)
         .arg(remote)
         .arg(http_url)
-        .env("GIT_HTTP_UNIX_SOCKET", socket)
+        .env("GIT_HTTP_UNIX_SOCKET", &socket)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

@@ -8343,7 +8343,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "oct"
+name = "octo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -8360,7 +8360,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "octo"
+name = "octo-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -8380,6 +8380,8 @@ dependencies = [
 name = "octo-types"
 version = "0.1.0"
 dependencies = [
+ "dirs",
+ "libc",
  "serde",
 ]
 
@@ -10452,7 +10454,8 @@ dependencies = [
  "futures",
  "iroh",
  "json-stream",
- "octo",
+ "octo-server",
+ "octo-types",
  "prefix-id",
  "redb",
  "rho-agent",

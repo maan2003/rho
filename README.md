@@ -95,10 +95,10 @@ with the same name take precedence.
 
 The daemon also runs an embedded Octo GitHub helper server for agent commands.
 Install its GitHub token with `rho octo init`; the token is read from stdin and
-kept in the daemon's sealed RAM-only platform secret store. Agent shell and
-Claude commands receive the server path in `OCTO_SOCKET`, and can use the
-vendored `oct` CLI. Git and Jujutsu can fetch any repository available to the
-sealed token and push temporary collaboration branches by using an explicit
+kept in the daemon's sealed RAM-only platform secret store. The `octo` CLI and
+Git remote helper use the service's fixed local socket path. Git and Jujutsu can
+fetch any repository available to the sealed token and push temporary
+collaboration branches by using an explicit
 `octo://github.com/OWNER/REPOSITORY` remote:
 
 ```sh

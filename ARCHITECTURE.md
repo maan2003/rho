@@ -93,12 +93,12 @@ agent turn-completion and accepted-input reports through `AgentPool`; Slack uses
 completed-turn reports for reaction cleanup, not automatic final-answer posting,
 and the daemon does not own Slack routing policy.
 
-`octo`/`oct` are vendored GitHub helper crates from `~maan2003/claude`. Rho
-runs Octo as an in-process daemon Unix-socket server and exposes its socket path
-to agent commands via `OCTO_SOCKET`; the `oct` CLI is the agent-facing client.
-The daemon, not Octo, owns platform secret installation and fd-store resume, so
-Octo receives GitHub tokens only through a RAM-only callback into the sealed
-platform secret store. The `git-remote-octo` Git remote helper invokes a private
+`octo-server`/`octo` are vendored GitHub helper crates from `~maan2003/claude`.
+Rho runs `octo-server` in-process on the fixed per-user Octo Unix socket; the
+`octo` CLI is the agent-facing client. The daemon owns platform secret
+installation and fd-store resume, so the server receives GitHub tokens only
+through a RAM-only callback into the sealed platform secret store. The
+`git-remote-octo` Git remote helper invokes a private
 Nix-patched `git-remote-http` whose libcurl connection uses that Unix socket; it
 does not replace Git globally. Octo proxies authenticated fetches for any
 repository available to its token, and pushes after restricting destination

@@ -5,7 +5,7 @@ description: Work with GitHub repositories through Rho: clone or fetch with jj, 
 
 # GitHub workflow
 
-Use Jujutsu for repository operations and `oct` for GitHub operations.
+Use Jujutsu for repository operations and `octo` for GitHub operations.
 
 ## Clone and fetch
 
@@ -20,9 +20,9 @@ jj git fetch --remote origin
 Choose the destination explicitly and do not accidentally clone inside another
 repository. Jujutsu clones colocated repositories by default.
 
-If access fails, report the original error. A missing `OCTO_SOCKET` means the
-Rho daemon environment is unavailable; a missing token requires `rho octo
-init`. Do not silently switch credential sources.
+If access fails, report the original error. A missing local Octo socket means
+the Rho daemon is unavailable; a missing token requires `rho octo init`. Do not
+silently switch credential sources.
 
 ## Push and create a pull request
 
@@ -30,7 +30,7 @@ Octo permits pushes only below `refs/heads/rho/*`:
 
 ```bash
 jj git push --remote origin --named rho/CHANGE_NAME=@
-oct pr create --head rho/CHANGE_NAME --title "TITLE" --body "BODY"
+octo pr create --head rho/CHANGE_NAME --title "TITLE" --body "BODY"
 ```
 
 Inspect `jj log` first and push the intended change, not an incidental working
@@ -40,10 +40,10 @@ Never push a normal branch or tag through Octo.
 ## CI
 
 ```bash
-oct ci status PR_OR_BRANCH
-oct ci wait RUN_ID
-oct ci logs RUN_ID
-oct ci rerun RUN_ID
+octo ci status PR_OR_BRANCH
+octo ci wait RUN_ID
+octo ci logs RUN_ID
+octo ci rerun RUN_ID
 ```
 
 Wait for active runs before diagnosing failures. Read failed logs before

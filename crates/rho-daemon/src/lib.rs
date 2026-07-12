@@ -156,10 +156,10 @@ fn spawn_octo_server(
     let listener = tokio::net::UnixListener::bind(socket_path)
         .with_context(|| format!("bind octo socket {}", socket_path.display()))?;
     let github_api_url = url::Url::parse("https://api.github.com")?;
-    let token_provider: octo::TokenProvider =
+    let token_provider: octo_server::TokenProvider =
         Arc::new(move || secrets.get("GITHUB_TOKEN").context("reading GITHUB_TOKEN"));
     tokio::spawn(async move {
-        if let Err(error) = octo::serve(listener, token_provider, github_api_url).await {
+        if let Err(error) = octo_server::serve(listener, token_provider, github_api_url).await {
             tracing::error!(%error, "octo server stopped");
         }
     });
@@ -204,17 +204,9 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&socket_path);
     let server = Server::bind(&socket_path).context("bind rho daemon socket")?;
     let platform_secrets = PlatformSecrets::from_fd_store();
-    let octo_socket_path = socket_path.with_file_name("octo.sock");
+    let octo_socket_path = octo_types::socket_path();
     spawn_octo_server(&octo_socket_path, platform_secrets.clone())?;
-    let mut user_environment = login_environment()?;
-    user_environment.push((
-        "OCTO_SOCKET".into(),
-        octo_socket_path.clone().into_os_string(),
-    ));
-    let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
-    // In-process agent assembly reads this daemon-owned, non-secret endpoint
-    // and passes it explicitly after direnv to agent commands.
-    unsafe { std::env::set_var("OCTO_SOCKET", &octo_socket_path) };
+    let user_environment = rho_workspaces::UserEnvironment::new(login_environment()?);
 
     let db = RhoDb::open(default_db_path()?);
     let auth = InferenceAuth::named(&args.auth)?;
