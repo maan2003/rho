@@ -58,13 +58,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Pin/unpin a topic (default: the current one)",
     },
     CommandSpec {
-        name: "workdirs add",
-        usage: ":workdirs add [path] [name]",
+        name: "projects add",
+        usage: ":projects add [path] [name]",
         description: "Register a working directory (defaults to the current one)",
     },
     CommandSpec {
-        name: "workdirs rm",
-        usage: ":workdirs rm <path|name>",
+        name: "projects rm",
+        usage: ":projects rm <path|name>",
         description: "Unregister a working directory",
     },
     CommandSpec {
@@ -146,11 +146,12 @@ pub enum Command {
     TopicPin {
         name: Option<String>,
     },
-    WorkdirAdd {
+    ProjectAdd {
         path: Option<Utf8PathBuf>,
         name: Option<String>,
+        description: String,
     },
-    WorkdirRemove {
+    ProjectRemove {
         path: String,
     },
     VoiceToggle,
@@ -217,18 +218,23 @@ pub fn parse(line: &str) -> Option<Parsed> {
             }),
             _ => Parsed::Invalid(":topic new|move|rename|pin".to_owned()),
         },
-        "workdirs" => match tokens.next() {
-            Some("add") => Parsed::Command(Command::WorkdirAdd {
-                path: tokens.next().map(Utf8PathBuf::from),
-                name: tokens.next().map(str::to_owned),
-            }),
+        "projects" => match tokens.next() {
+            Some("add") => {
+                let path = tokens.next().map(Utf8PathBuf::from);
+                let name = tokens.next().map(str::to_owned);
+                Parsed::Command(Command::ProjectAdd {
+                    path,
+                    name,
+                    description: tokens.collect::<Vec<_>>().join(" "),
+                })
+            }
             Some("rm") => match tokens.next() {
-                Some(path) => Parsed::Command(Command::WorkdirRemove {
+                Some(path) => Parsed::Command(Command::ProjectRemove {
                     path: path.to_owned(),
                 }),
-                None => Parsed::Invalid(":workdirs rm <path|name>".to_owned()),
+                None => Parsed::Invalid(":projects rm <path|name>".to_owned()),
             },
-            _ => Parsed::Invalid(":workdirs add|rm".to_owned()),
+            _ => Parsed::Invalid(":projects add|rm".to_owned()),
         },
         "voice" => Parsed::Command(Command::VoiceToggle),
         "cancel" => Parsed::Command(Command::AgentCancel),
@@ -397,7 +403,7 @@ fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> 
                 description: "topic".to_owned(),
             })
             .collect(),
-        ["agent", "new"] | ["workdirs", "rm"] => ctx
+        ["agent", "new"] | ["projects", "rm"] => ctx
             .workdirs
             .iter()
             .filter(|(name, path)| fuzzy_contains(name, partial) || fuzzy_contains(path, partial))

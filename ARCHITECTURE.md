@@ -94,6 +94,12 @@ PMs do not receive `wait_agent`: they end their turn after delegation and agent
 mail wakes them for the next request. Their prompt states this asynchronous
 delegate, acknowledge, end-turn, wake-on-mail, and relay flow explicitly.
 
+The database also stores a global project registry, distinct from each agent's
+fixed execution `workdirs`. Projects are keyed by local repository path and
+carry a UI-only name plus a description. PM prompts receive only project paths
+and descriptions so they can route Engineers without repository access of
+their own; UI clients retain names for display and selection.
+
 `rho-slack` is the in-process Slack surface. `SlackManager` is handed the
 daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
 secret storage (`SecretStore`), the Socket Mode reconnect loop, the persisted

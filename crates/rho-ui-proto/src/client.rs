@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::remote::{AgentRemoteFrame, UiAgentState, UiBlock};
 use crate::{
     AgentRole, ClientMessage, IoCounters, MessageDelivery, ProtocolLogDirection, ServerMessage,
-    StartMode, UiTopic, UiWorkdir, append_protocol_log_record, protocol_frame_bytes,
+    StartMode, UiProject, UiTopic, append_protocol_log_record, protocol_frame_bytes,
     read_frame_counted, write_frame_counted,
 };
 
@@ -74,7 +74,7 @@ pub struct AgentClient {
     commands: mpsc::UnboundedSender<ClientMessage>,
     state: watch::Receiver<HashMap<AgentId, UiAgentState>>,
     topics: watch::Receiver<Vec<UiTopic>>,
-    workdirs: watch::Receiver<Vec<UiWorkdir>>,
+    projects: watch::Receiver<Vec<UiProject>>,
     default_topic_id: watch::Receiver<TopicId>,
     known_agent_ids: watch::Receiver<Vec<AgentId>>,
     frames: broadcast::Sender<(AgentId, AgentRemoteFrame)>,
@@ -106,7 +106,7 @@ impl AgentClient {
         }
         let ServerMessage::Ready {
             topics,
-            workdirs,
+            projects,
             default_topic_id,
             machine_seed,
             agent_counter,
@@ -121,7 +121,7 @@ impl AgentClient {
                 ProtocolLogDirection::ServerToClient,
                 &ServerMessage::Ready {
                     topics: topics.clone(),
-                    workdirs: workdirs.clone(),
+                    projects: projects.clone(),
                     default_topic_id,
                     machine_seed,
                     agent_counter,
@@ -133,7 +133,7 @@ impl AgentClient {
         let (reader, writer) = stream.into_split();
         let (state_tx, state_rx) = watch::channel(HashMap::new());
         let (topics_tx, topics_rx) = watch::channel(topics.clone());
-        let (workdirs_tx, workdirs_rx) = watch::channel(workdirs);
+        let (projects_tx, projects_rx) = watch::channel(projects);
         let (default_topic_tx, default_topic_rx) = watch::channel(default_topic_id);
         let (known_agent_ids_tx, known_agent_ids_rx) = watch::channel(agent_ids);
         let (frame_tx, _) = broadcast::channel::<(AgentId, AgentRemoteFrame)>(256);
@@ -170,7 +170,7 @@ impl AgentClient {
                     }
                     ServerMessage::Ready {
                         topics,
-                        workdirs,
+                        projects,
                         default_topic_id,
                         machine_seed: _,
                         agent_counter: _,
@@ -180,7 +180,7 @@ impl AgentClient {
                         if topics_tx.send(topics).is_err() {
                             break;
                         }
-                        if workdirs_tx.send(workdirs).is_err() {
+                        if projects_tx.send(projects).is_err() {
                             break;
                         }
                         if default_topic_tx.send(default_topic_id).is_err() {
@@ -274,7 +274,7 @@ impl AgentClient {
             commands: command_tx,
             state: state_rx,
             topics: topics_rx,
-            workdirs: workdirs_rx,
+            projects: projects_rx,
             default_topic_id: default_topic_rx,
             known_agent_ids: known_agent_ids_rx,
             frames: frame_tx,
@@ -330,8 +330,8 @@ impl AgentClient {
         self.topics.borrow().clone()
     }
 
-    pub fn workdirs(&self) -> Vec<UiWorkdir> {
-        self.workdirs.borrow().clone()
+    pub fn projects(&self) -> Vec<UiProject> {
+        self.projects.borrow().clone()
     }
 
     /// Where new agents land when no topic is chosen.
@@ -366,12 +366,16 @@ impl AgentClient {
         let _ = self.commands.send(ClientMessage::NewTopic { name });
     }
 
-    pub fn set_workdir(&self, path: Utf8PathBuf, name: Option<String>) {
-        let _ = self.commands.send(ClientMessage::WorkdirSet { path, name });
+    pub fn set_project(&self, path: Utf8PathBuf, name: Option<String>, description: String) {
+        let _ = self.commands.send(ClientMessage::ProjectSet {
+            path,
+            name,
+            description,
+        });
     }
 
-    pub fn remove_workdir(&self, path: Utf8PathBuf) {
-        let _ = self.commands.send(ClientMessage::WorkdirRemove { path });
+    pub fn remove_project(&self, path: Utf8PathBuf) {
+        let _ = self.commands.send(ClientMessage::ProjectRemove { path });
     }
 
     pub fn move_agent(&self, agent_id: AgentId, topic: crate::TopicTarget) {

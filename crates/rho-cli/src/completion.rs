@@ -39,7 +39,7 @@ pub(crate) fn completion_candidates(
         if !command.is_empty() {
             return command;
         }
-        // Path arguments (`:workdirs add ./x`, `:agent new ~/src/y`) fall
+        // Path arguments (`:projects add ./x`, `:agent new ~/src/y`) fall
         // through to filesystem completion below.
     }
     if token.prefix.starts_with('@') {

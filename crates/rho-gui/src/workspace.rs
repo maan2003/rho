@@ -60,7 +60,7 @@ pub struct Workspace {
     draft_view: Entity<DraftView>,
     /// Registered workdirs from the daemon; selection vocabulary for new
     /// agents.
-    workdirs: Vec<rho_ui_proto::UiWorkdir>,
+    workdirs: Vec<rho_ui_proto::UiProject>,
     /// Topic the draft inherits: whichever topic was focused when the draft
     /// was entered. Topics are ad-hoc tab groups — a new agent lands in the
     /// default topic unless created from inside one.
@@ -152,7 +152,7 @@ impl Workspace {
         match event {
             ConnEvent::Ready {
                 topics,
-                workdirs,
+                projects: workdirs,
                 default_topic_id,
                 machine_seed,
                 agent_counter,
@@ -493,7 +493,7 @@ impl Workspace {
         let require_workdir = || {
             workdir.clone().ok_or_else(|| {
                 "no working directory for the new agent: type one in the \
-                 Workdir field, or register one with :workdirs add <path>"
+                 Workdir field, or register one with :projects add <path>"
                     .to_owned()
             })
         };
@@ -727,31 +727,36 @@ impl Workspace {
                 self.connection
                     .send(ClientMessage::MoveAgent { agent_id, topic });
             }
-            Command::WorkdirAdd { path, name } => {
+            Command::ProjectAdd {
+                path,
+                name,
+                description,
+            } => {
                 // Unlike the CLI, the GUI may run on another machine, so
                 // there is no local directory to default to.
                 let Some(path) = path else {
                     self.notice_on(
                         source_agent.as_ref(),
-                        "usage: :workdirs add <path> [name]",
+                        "usage: :projects add <path> [name]",
                         StyleClass::SystemInfo,
                         cx,
                     );
                     return;
                 };
-                self.connection.send(ClientMessage::WorkdirSet {
+                self.connection.send(ClientMessage::ProjectSet {
                     path: self.resolve_workdir_path(path),
                     name,
+                    description,
                 });
             }
-            Command::WorkdirRemove { path } => {
+            Command::ProjectRemove { path } => {
                 match rho_commands::resolve_workdir(&path, &self.workdir_table()) {
                     Some(path) => {
                         self.connection
-                            .send(ClientMessage::WorkdirRemove { path: path.into() });
+                            .send(ClientMessage::ProjectRemove { path: path.into() });
                     }
                     None => {
-                        let message = format!("no registered workdir `{path}`");
+                        let message = format!("no registered project `{path}`");
                         self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
                     }
                 }
@@ -990,7 +995,7 @@ impl Workspace {
             .or_else(|| self.workdirs.first().map(|workdir| workdir.path.clone()))
     }
 
-    /// How a path reads in the draft header: its registered workdir name
+    /// How a path reads in the draft header: its registered project name
     /// when it has one, else the full path.
     fn workdir_label(&self, path: &Utf8Path) -> String {
         self.workdirs
@@ -1025,7 +1030,7 @@ impl Workspace {
             .collect()
     }
 
-    /// A registered workdir name resolves to its path; anything else passes
+    /// A registered project name resolves to its path; anything else passes
     /// through untouched. Paths name directories on the daemon's machine,
     /// so the GUI never joins its own cwd or expands its own home — the
     /// daemon expands `~` and validates.

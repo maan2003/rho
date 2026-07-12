@@ -416,11 +416,11 @@ async fn new_agent(
     topic: Option<String>,
     message: Option<String>,
 ) -> String {
-    let workdirs = registry.workdirs();
+    let projects = registry.projects();
     let path = match &workdir {
         Some(spoken) => {
             let needle = spoken.to_lowercase();
-            let matches: Vec<_> = workdirs
+            let matches: Vec<_> = projects
                 .iter()
                 .filter(|workdir| {
                     workdir.name.to_lowercase().contains(&needle)
@@ -429,14 +429,14 @@ async fn new_agent(
                 .collect();
             match matches.as_slice() {
                 [workdir] => workdir.path.clone(),
-                [] => return format!("no registered workdir matches '{spoken}'"),
+                [] => return format!("no registered project matches '{spoken}'"),
                 many => {
                     let names: Vec<_> = many.iter().map(|w| w.name.as_str()).collect();
                     return format!("'{spoken}' is ambiguous between: {}", names.join(", "));
                 }
             }
         }
-        None => match workdirs.as_slice() {
+        None => match projects.as_slice() {
             [workdir] => workdir.path.clone(),
             [] => return "no workdirs are registered; register one first".to_owned(),
             many => {

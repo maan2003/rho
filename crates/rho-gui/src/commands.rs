@@ -94,7 +94,7 @@ pub fn start_field_candidates(
     .collect()
 }
 
-/// Completion inside the draft's workdir field buffer: registered workdirs,
+/// Completion inside the draft's workdir field buffer: registered projects,
 /// filtered by the token being typed.
 pub fn workdir_field_candidates(
     text_before_cursor: &str,
@@ -140,7 +140,7 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
 pub struct WorkspaceCompletionProvider {
     workspace: WeakEntity<Workspace>,
     /// The draft view's workdir field buffer: completions in it come from
-    /// the registered workdirs, not the prompt grammar.
+    /// the registered projects, not the prompt grammar.
     workdir_buffer: Option<gpui::EntityId>,
     /// The draft view's role field buffer: completions are role/intelligence
     /// names.

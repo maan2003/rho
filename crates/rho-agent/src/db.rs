@@ -29,11 +29,13 @@ const TOPICS: TableDefinition<TopicId, Sen<TopicRecord>> = TableDefinition::new(
 const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("topic_agents");
 /// Keyed by the workdir's absolute path (UTF-8; paths are strings on disk
 /// and on the wire), making paths unique by construction.
-const WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> = TableDefinition::new("workdirs");
+const LEGACY_WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> =
+    TableDefinition::new("workdirs");
+const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::new("projects");
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "8f2c6a1d";
+const CURRENT_AGENT_DB_FORMAT: &str = "b6e40c7a";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -64,6 +66,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         from: "d4a71c2e",
         to: "8f2c6a1d",
         migrate: migrate_agent_spawned_by,
+    },
+    AgentDbMigration {
+        from: "8f2c6a1d",
+        to: "b6e40c7a",
+        migrate: migrate_projects,
     },
 ];
 
@@ -98,8 +105,15 @@ impl PrefixIdDomain for TopicIdDomain {
 /// working directory and the daemon never requires it to match a registered
 /// workdir.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct WorkdirRecord {
+struct WorkdirRecord {
     pub name: String,
+    pub created_at: UnixMillis,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct ProjectRecord {
+    pub name: String,
+    pub description: String,
     pub created_at: UnixMillis,
 }
 
@@ -602,7 +616,7 @@ pub trait AgentReadTxnExt {
     fn agent_topic(&self, agent_id: AgentId) -> Option<TopicId>;
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
     fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
-    fn list_workdirs(&self) -> Vec<(Utf8PathBuf, WorkdirRecord)>;
+    fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)>;
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
     fn agent_event_records(
         &self,
@@ -634,9 +648,9 @@ pub trait AgentWriteTxnExt {
     /// agents move into after the fact; nothing else about the agent changes.
     fn move_agent_to_topic(&mut self, agent_id: AgentId, topic_id: TopicId);
 
-    fn upsert_workdir(&mut self, now: UnixMillis, path: &str, name: String);
+    fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String);
 
-    fn remove_workdir(&mut self, path: &str);
+    fn remove_project(&mut self, path: &str);
 
     fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos;
 
@@ -795,8 +809,8 @@ impl AgentReadTxnExt for ReadTxn {
             .collect()
     }
 
-    fn list_workdirs(&self) -> Vec<(Utf8PathBuf, WorkdirRecord)> {
-        self.open_table(WORKDIRS)
+    fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)> {
+        self.open_table(PROJECTS)
             .iter()
             .map(|(key, value)| (Utf8PathBuf::from(key.value()), value.value().into_owned()))
             .collect()
@@ -865,7 +879,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENTS);
         self.open_table(TOPICS);
         self.open_table(TOPIC_AGENTS);
-        self.open_table(WORKDIRS);
+        self.open_table(PROJECTS);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
@@ -961,20 +975,24 @@ impl AgentWriteTxnExt for WriteTxn {
         topic_agents.insert(&TopicAgentKey::new(topic_id, agent_id), &());
     }
 
-    fn upsert_workdir(&mut self, now: UnixMillis, path: &str, name: String) {
-        let mut workdirs = self.open_table(WORKDIRS);
-        let created_at = workdirs
+    fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String) {
+        let mut projects = self.open_table(PROJECTS);
+        let created_at = projects
             .get(&path.to_owned())
             .map(|record| record.value().into_owned().created_at)
             .unwrap_or(now);
-        workdirs.insert(
+        projects.insert(
             &path.to_owned(),
-            SenValue::borrowed(&WorkdirRecord { name, created_at }),
+            SenValue::borrowed(&ProjectRecord {
+                name,
+                description,
+                created_at,
+            }),
         );
     }
 
-    fn remove_workdir(&mut self, path: &str) {
-        self.open_table(WORKDIRS).remove(&path.to_owned());
+    fn remove_project(&mut self, path: &str) {
+        self.open_table(PROJECTS).remove(&path.to_owned());
     }
 
     fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos {
@@ -1122,6 +1140,25 @@ fn migrate_agent_spawned_by(write: &mut WriteTxn) {
     let mut agents = write.open_table(AGENTS);
     for (agent_id, record) in records {
         agents.insert(&agent_id, SenValue::borrowed(&record));
+    }
+}
+
+fn migrate_projects(write: &mut WriteTxn) {
+    let records = write
+        .open_table(LEGACY_WORKDIRS)
+        .iter()
+        .map(|(path, record)| (path.value(), record.value().into_owned()))
+        .collect::<Vec<_>>();
+    let mut projects = write.open_table(PROJECTS);
+    for (path, record) in records {
+        projects.insert(
+            &path,
+            SenValue::borrowed(&ProjectRecord {
+                name: record.name,
+                description: String::new(),
+                created_at: record.created_at,
+            }),
+        );
     }
 }
 

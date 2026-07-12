@@ -5,8 +5,8 @@
 use rho_ui_proto::remote::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
-use rho_ui_proto::{AgentRole, EngineerIntelligence, UiAttention, UiTopic, UiWorkdir};
-use rho_webui_messages::{AgentState, AgentSummary, Block, ToBrowser, Topic, Workdir};
+use rho_ui_proto::{AgentRole, EngineerIntelligence, UiAttention, UiProject, UiTopic};
+use rho_webui_messages::{AgentState, AgentSummary, Block, Project, ToBrowser, Topic};
 
 /// Longest tool output/error forwarded to the browser, in bytes.
 const TOOL_TEXT_LIMIT: usize = 16 * 1024;
@@ -14,7 +14,7 @@ const TOOL_TEXT_LIMIT: usize = 16 * 1024;
 /// Longest one-line tool label, in bytes.
 const TOOL_LABEL_LIMIT: usize = 256;
 
-pub fn hello(topics: &[UiTopic], workdirs: &[UiWorkdir]) -> ToBrowser {
+pub fn hello(topics: &[UiTopic], projects: &[UiProject]) -> ToBrowser {
     ToBrowser::Hello {
         topics: topics
             .iter()
@@ -40,11 +40,12 @@ pub fn hello(topics: &[UiTopic], workdirs: &[UiWorkdir]) -> ToBrowser {
                     .collect(),
             })
             .collect(),
-        workdirs: workdirs
+        projects: projects
             .iter()
-            .map(|workdir| Workdir {
-                path: workdir.path.to_string(),
-                name: workdir.name.clone(),
+            .map(|project| Project {
+                path: project.path.to_string(),
+                name: project.name.clone(),
+                description: project.description.clone(),
             })
             .collect(),
     }

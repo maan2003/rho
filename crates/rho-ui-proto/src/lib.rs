@@ -134,13 +134,14 @@ pub enum ClientMessage {
         agent_id: AgentId,
         disposition: AgentDisposition,
     },
-    /// Registers a workdir, or renames it if `path` is already registered.
+    /// Registers a project, or updates it if `path` is already registered.
     /// `name` defaults to the path's basename.
-    WorkdirSet {
+    ProjectSet {
         path: Utf8PathBuf,
         name: Option<String>,
+        description: String,
     },
-    WorkdirRemove {
+    ProjectRemove {
         path: Utf8PathBuf,
     },
     AcquireLandLease {
@@ -322,7 +323,7 @@ pub enum ServerMessage {
     Pong,
     Ready {
         topics: Vec<UiTopic>,
-        workdirs: Vec<UiWorkdir>,
+        projects: Vec<UiProject>,
         /// Where new agents land when the client doesn't say otherwise (the
         /// daemon-created "default" topic). Identified explicitly so clients
         /// never have to guess from topic ordering.
@@ -472,12 +473,12 @@ pub enum UiAttention {
     NeedsInput,
 }
 
-/// A registered directory agents can be started in; selection vocabulary
-/// only, keyed by path.
+/// A registered project available for agent routing, keyed by path.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiWorkdir {
+pub struct UiProject {
     pub path: Utf8PathBuf,
     pub name: String,
+    pub description: String,
 }
 
 /// Encode and write one length-prefixed senax frame.

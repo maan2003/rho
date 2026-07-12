@@ -151,24 +151,26 @@ fn toggle_status_round_trips() {
 }
 
 #[test]
-fn parses_workdir_commands() {
+fn parses_project_commands() {
     assert_eq!(
-        parse(":workdirs add /home/u/src/rho rho"),
-        Some(Parsed::Command(Command::WorkdirAdd {
+        parse(":projects add /home/u/src/rho rho"),
+        Some(Parsed::Command(Command::ProjectAdd {
             path: Some(Utf8PathBuf::from("/home/u/src/rho")),
             name: Some("rho".to_owned()),
+            description: String::new(),
         }))
     );
     assert_eq!(
-        parse(":workdirs add"),
-        Some(Parsed::Command(Command::WorkdirAdd {
+        parse(":projects add"),
+        Some(Parsed::Command(Command::ProjectAdd {
             path: None,
-            name: None
+            name: None,
+            description: String::new(),
         }))
     );
     assert_eq!(
-        parse(":workdirs rm rho"),
-        Some(Parsed::Command(Command::WorkdirRemove {
+        parse(":projects rm rho"),
+        Some(Parsed::Command(Command::ProjectRemove {
             path: "rho".to_owned()
         }))
     );
@@ -184,7 +186,7 @@ fn completes_command_words_stepwise() {
     let ctx = CompletionCtx::default();
     let first = completion_candidates(":", &ctx);
     assert!(values(&first).contains(&"agent"));
-    assert!(values(&first).contains(&"workdirs"));
+    assert!(values(&first).contains(&"projects"));
     // Group words appear once, not per subcommand.
     assert_eq!(values(&first).iter().filter(|v| **v == "agent").count(), 1);
 
@@ -210,11 +212,11 @@ fn completes_arguments_from_context() {
         ["infra"]
     );
     assert_eq!(
-        values(&completion_candidates(":workdirs rm rh", &ctx)),
+        values(&completion_candidates(":projects rm rh", &ctx)),
         ["rho"]
     );
     // Paths for `workdirs add` come from the client's filesystem completion.
-    assert_eq!(completion_candidates(":workdirs add ", &ctx), Vec::new());
+    assert_eq!(completion_candidates(":projects add ", &ctx), Vec::new());
 }
 
 #[test]

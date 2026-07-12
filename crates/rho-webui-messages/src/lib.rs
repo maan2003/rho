@@ -23,7 +23,7 @@ pub const MAX_LINE_LEN: usize = 4 * 1024 * 1024;
 pub enum ToBrowser {
     Hello {
         topics: Vec<Topic>,
-        workdirs: Vec<Workdir>,
+        projects: Vec<Project>,
     },
     Agent {
         agent_id: String,
@@ -83,9 +83,10 @@ pub struct AgentSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Workdir {
+pub struct Project {
     pub path: String,
     pub name: String,
+    pub description: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

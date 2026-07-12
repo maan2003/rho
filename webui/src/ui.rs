@@ -555,10 +555,10 @@ fn autosize(element: &web_sys::HtmlTextAreaElement) {
 
 fn NewAgentPage(app: App) -> impl IntoView {
     let repo = RwSignal::new(
-        app.workdirs
+        app.projects
             .get_untracked()
             .first()
-            .map(|workdir| workdir.path.clone())
+            .map(|project| project.path.clone())
             .unwrap_or_default(),
     );
     let topics = app.topics.get_untracked();
@@ -619,8 +619,8 @@ fn NewAgentPage(app: App) -> impl IntoView {
                         <h2>"Location"</h2>
                         <label>"Repository"</label>
                 <select on:change=move |event| repo.set(event_target_value(&event))>
-                    {move || app.workdirs.get().into_iter().map(|workdir| {
-                        view! { <option value=workdir.path.clone()>{workdir.name}</option> }
+                    {move || app.projects.get().into_iter().map(|project| {
+                        view! { <option value=project.path.clone()>{project.name}</option> }
                     }).collect_view()}
                 </select>
                         <label>"Topic"</label>

@@ -16,8 +16,8 @@ use camino::Utf8PathBuf;
 use rho_core::ContentPart;
 use rho_ui_proto::remote::UiAgentState;
 use rho_ui_proto::{
-    AgentId, AgentRole, ClientMessage, MessageDelivery, ServerMessage, StartMode, UiTopic,
-    UiWorkdir, read_frame, write_frame,
+    AgentId, AgentRole, ClientMessage, MessageDelivery, ServerMessage, StartMode, UiProject,
+    UiTopic, read_frame, write_frame,
 };
 use rho_webui_messages::{FromBrowser, MAX_LINE_LEN, ToBrowser};
 use tokio::io::{
@@ -78,7 +78,7 @@ where
     });
 
     let mut topics: Vec<UiTopic> = Vec::new();
-    let mut workdirs: Vec<UiWorkdir> = Vec::new();
+    let mut projects: Vec<UiProject> = Vec::new();
     let mut default_topic = None;
     let mut agent_ids: HashMap<String, AgentId> = HashMap::new();
     let mut states: HashMap<AgentId, UiAgentState> = HashMap::new();
@@ -94,17 +94,17 @@ where
                     anyhow::bail!("daemon session closed");
                 };
                 match message {
-                    ServerMessage::Ready { topics: new_topics, workdirs: new_workdirs, default_topic_id, .. } => {
+                    ServerMessage::Ready { topics: new_topics, projects: new_projects, default_topic_id, .. } => {
                         topics = new_topics;
-                        workdirs = new_workdirs;
+                        projects = new_projects;
                         default_topic = Some(default_topic_id);
                         index_agent_ids(&topics, &mut agent_ids);
-                        send_json(&mut writer, &json::hello(&topics, &workdirs)).await?;
+                        send_json(&mut writer, &json::hello(&topics, &projects)).await?;
                     }
                     ServerMessage::TopicCreated { topic } => {
                         topics.push(topic);
                         index_agent_ids(&topics, &mut agent_ids);
-                        send_json(&mut writer, &json::hello(&topics, &workdirs)).await?;
+                        send_json(&mut writer, &json::hello(&topics, &projects)).await?;
                     }
                     ServerMessage::AgentAttention { agent_id, attention } => {
                         for topic in &mut topics {
@@ -114,7 +114,7 @@ where
                                 }
                             }
                         }
-                        send_json(&mut writer, &json::hello(&topics, &workdirs)).await?;
+                        send_json(&mut writer, &json::hello(&topics, &projects)).await?;
                     }
                     ServerMessage::Agent { agent_id, frame } => {
                         let state = states.entry(agent_id).or_insert_with(empty_state);

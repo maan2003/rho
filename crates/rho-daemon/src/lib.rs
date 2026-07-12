@@ -20,8 +20,8 @@ use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
-    McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiTopic,
-    UiWorkdir, read_frame_counted, write_frame_counted,
+    McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
+    UiTopic, read_frame_counted, write_frame_counted,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc};
 
@@ -594,25 +594,26 @@ impl AgentRegistry {
             .collect()
     }
 
-    fn workdirs(&self) -> Vec<UiWorkdir> {
-        let mut workdirs = self
+    fn projects(&self) -> Vec<UiProject> {
+        let mut projects = self
             .db
             .read()
-            .list_workdirs()
+            .list_projects()
             .into_iter()
-            .map(|(path, record)| UiWorkdir {
+            .map(|(path, record)| UiProject {
                 path,
                 name: record.name,
+                description: record.description,
             })
             .collect::<Vec<_>>();
-        workdirs.sort_by(|left, right| left.name.cmp(&right.name));
-        workdirs
+        projects.sort_by(|left, right| left.name.cmp(&right.name));
+        projects
     }
 
     async fn ready_message(&self) -> ServerMessage {
         ServerMessage::Ready {
             topics: self.topics(&self.agent_state_kinds().await),
-            workdirs: self.workdirs(),
+            projects: self.projects(),
             default_topic_id: self.default_topic_id,
             machine_seed: self.machine_seed,
             agent_counter: self.db.read().last_agent_counter(),
@@ -1010,7 +1011,12 @@ impl AgentRegistry {
         Ok(())
     }
 
-    async fn set_workdir(&self, path: Utf8PathBuf, name: Option<String>) -> anyhow::Result<()> {
+    async fn set_project(
+        &self,
+        path: Utf8PathBuf,
+        name: Option<String>,
+        description: String,
+    ) -> anyhow::Result<()> {
         let path = validate_repo_root(path)?;
         let name = match name {
             Some(name) => name,
@@ -1020,14 +1026,14 @@ impl AgentRegistry {
                 .ok_or_else(|| anyhow::anyhow!("workdir path has no basename: {path}"))?,
         };
         let mut write = self.db.write().await;
-        write.upsert_workdir(rho_core::UnixMs::now(), path.as_str(), name);
+        write.upsert_project(rho_core::UnixMs::now(), path.as_str(), name, description);
         write.commit();
         Ok(())
     }
 
-    async fn remove_workdir(&self, path: Utf8PathBuf) -> anyhow::Result<()> {
+    async fn remove_project(&self, path: Utf8PathBuf) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
-        write.remove_workdir(path.as_str());
+        write.remove_project(path.as_str());
         write.commit();
         Ok(())
     }
@@ -1415,12 +1421,16 @@ async fn handle_message(
             }
             Ok(Refresh::Ready)
         }
-        ClientMessage::WorkdirSet { path, name } => {
-            agents.set_workdir(path, name).await?;
+        ClientMessage::ProjectSet {
+            path,
+            name,
+            description,
+        } => {
+            agents.set_project(path, name, description).await?;
             Ok(Refresh::Ready)
         }
-        ClientMessage::WorkdirRemove { path } => {
-            agents.remove_workdir(path).await?;
+        ClientMessage::ProjectRemove { path } => {
+            agents.remove_project(path).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::AcquireLandLease { repo, agent_id } => {

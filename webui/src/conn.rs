@@ -193,9 +193,9 @@ async fn read_loop(app: App, mut recv: iroh::endpoint::RecvStream) -> anyhow::Re
 
 fn handle(app: App, message: ToBrowser) {
     match message {
-        ToBrowser::Hello { topics, workdirs } => {
+        ToBrowser::Hello { topics, projects } => {
             app.topics.set(topics);
-            app.workdirs.set(workdirs);
+            app.projects.set(projects);
             if app.phase.get_untracked() != Phase::Online {
                 app.phase.set(Phase::Online);
             }

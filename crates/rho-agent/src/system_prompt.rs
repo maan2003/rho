@@ -11,6 +11,7 @@ pub fn prompt(
     multi_agent: Option<&MultiAgentTools>,
     code_mode: bool,
     role: AgentRole,
+    projects: &[(camino::Utf8PathBuf, String)],
 ) -> Arc<str> {
     let entries = view.entries();
     let workdirs = entries
@@ -110,10 +111,26 @@ request.
     };
     let environment = render_environment_prompt(&workdirs);
     if matches!(role, AgentRole::PM) {
-        return format!("{PM_BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}").into();
+        let projects = render_projects_prompt(projects);
+        return format!("{PM_BASE_PROMPT}{projects}{agents_md}{skills}{code_mode}{team_context}")
+            .into();
     }
     format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}{role_prompt}{environment}")
         .into()
+}
+
+fn render_projects_prompt(projects: &[(camino::Utf8PathBuf, String)]) -> String {
+    if projects.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "## Projects\n\nRegistered projects available for routing technical work:\n\n",
+    );
+    for (path, description) in projects {
+        out.push_str(&format!("- Path: {path}\n  Description: {description}\n"));
+    }
+    out.push('\n');
+    out
 }
 
 /// Rho orchestration guidance for Claude Code. Claude supplies its own agent
@@ -481,6 +498,15 @@ mod tests {
                 .contains("<AGENTS_FILE path=\"/repo/AGENTS.md\">\nRead the docs.\n</AGENTS_FILE>")
         );
         assert!(prompt.contains("follow them unless they conflict"));
+    }
+
+    #[test]
+    fn project_prompt_omits_ui_name() {
+        let prompt =
+            render_projects_prompt(&[(Utf8PathBuf::from("/repo/rho"), "Agent runtime".to_owned())]);
+        assert!(prompt.contains("Path: /repo/rho"));
+        assert!(prompt.contains("Description: Agent runtime"));
+        assert!(!prompt.contains("name"));
     }
 
     fn workdir(path: &str, workspace_name: Option<&str>) -> WorkdirPrompt {

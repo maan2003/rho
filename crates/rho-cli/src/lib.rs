@@ -404,25 +404,29 @@ impl ChatApp {
                     .print_system(&format!("moving {agent_id:?} to topic `{name}`"));
                 self.agent.move_agent(agent_id, target);
             }
-            rho_commands::Command::WorkdirAdd { path, name } => {
+            rho_commands::Command::ProjectAdd {
+                path,
+                name,
+                description,
+            } => {
                 let Some(path) = resolve_working_directory(path, &[]) else {
                     self.term
                         .print_system("cannot determine a working directory");
                     return Ok(true);
                 };
                 self.term.print_system(&format!("registered {path}"));
-                self.agent.set_workdir(path, name);
+                self.agent.set_project(path, name, description);
             }
-            rho_commands::Command::WorkdirRemove { path } => {
+            rho_commands::Command::ProjectRemove { path } => {
                 let workdirs = workdir_table(&self.agent);
                 match rho_commands::resolve_workdir(&path, &workdirs) {
                     Some(resolved) => {
                         self.term.print_system(&format!("removed {resolved}"));
-                        self.agent.remove_workdir(resolved.into());
+                        self.agent.remove_project(resolved.into());
                     }
                     None => self
                         .term
-                        .print_system(&format!("no registered workdir `{path}`")),
+                        .print_system(&format!("no registered project `{path}`")),
                 }
             }
             rho_commands::Command::Clear => {
@@ -594,7 +598,7 @@ fn send_prompt(agent: &AgentClient, text: String) {
 /// resolution expect.
 fn workdir_table(agent: &AgentClient) -> Vec<(String, String)> {
     agent
-        .workdirs()
+        .projects()
         .into_iter()
         .map(|workdir| (workdir.name, workdir.path.into_string()))
         .collect()
@@ -609,7 +613,7 @@ fn topic_labels(agent: &AgentClient) -> Vec<(String, rho_ui_proto::TopicId)> {
         .collect()
 }
 
-/// Resolves a command's working-directory argument: a registered workdir
+/// Resolves a command's working-directory argument: a registered project
 /// name, `~`-expanded, or relative to where the CLI was launched. `None`
 /// falls back to the CLI's own cwd.
 fn resolve_working_directory(

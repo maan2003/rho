@@ -93,10 +93,10 @@ fn argument_completion_uses_live_workdirs() {
 
 #[test]
 fn command_path_argument_completion_is_filesystem() {
-    let buffer = ":workdirs add /t";
+    let buffer = ":projects add /t";
     let candidates = completion_candidates(buffer, buffer.len());
     assert!(candidates.iter().any(|candidate| {
-        candidate.label == "/tmp/" && candidate.replacement == ":workdirs add /tmp/"
+        candidate.label == "/tmp/" && candidate.replacement == ":projects add /tmp/"
     }));
 }
 

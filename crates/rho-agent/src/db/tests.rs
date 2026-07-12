@@ -445,31 +445,47 @@ async fn topic_and_agent_statuses_are_settable() {
 }
 
 #[tokio::test]
-async fn workdirs_upsert_by_path_and_remove() {
+async fn projects_upsert_by_path_and_remove() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    write.upsert_workdir(UnixMs(1), "/home/user/src/rho", "rho".to_owned());
-    write.upsert_workdir(UnixMs(2), "/home/user/src/zed", "zed".to_owned());
+    write.upsert_project(
+        UnixMs(1),
+        "/home/user/src/rho",
+        "rho".to_owned(),
+        "agents".to_owned(),
+    );
+    write.upsert_project(
+        UnixMs(2),
+        "/home/user/src/zed",
+        "zed".to_owned(),
+        "editor".to_owned(),
+    );
     // Re-adding the same path renames it and keeps created_at.
-    write.upsert_workdir(UnixMs(3), "/home/user/src/rho", "rho-main".to_owned());
+    write.upsert_project(
+        UnixMs(3),
+        "/home/user/src/rho",
+        "rho-main".to_owned(),
+        "runtime".to_owned(),
+    );
     write.commit();
 
-    let workdirs = db.read().list_workdirs();
-    assert_eq!(workdirs.len(), 2);
-    let rho = workdirs
+    let projects = db.read().list_projects();
+    assert_eq!(projects.len(), 2);
+    let rho = projects
         .iter()
         .find(|(path, _)| path == std::path::Path::new("/home/user/src/rho"))
         .unwrap();
     assert_eq!(rho.1.name, "rho-main");
+    assert_eq!(rho.1.description, "runtime");
     assert_eq!(rho.1.created_at, UnixMs(1));
 
     let mut write = db.write().await;
-    write.remove_workdir("/home/user/src/zed");
+    write.remove_project("/home/user/src/zed");
     write.commit();
-    assert_eq!(db.read().list_workdirs().len(), 1);
+    assert_eq!(db.read().list_projects().len(), 1);
 }
 
 #[tokio::test]

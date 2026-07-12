@@ -8,7 +8,7 @@ mod md;
 mod ui;
 
 use leptos::prelude::*;
-use rho_webui_messages::{AgentState, FromBrowser, Topic, Workdir};
+use rho_webui_messages::{AgentState, FromBrowser, Topic, Project};
 
 /// Connection lifecycle as shown to the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub enum Phase {
 pub struct App {
     pub phase: RwSignal<Phase>,
     pub topics: RwSignal<Vec<Topic>>,
-    pub workdirs: RwSignal<Vec<Workdir>>,
+    pub projects: RwSignal<Vec<Project>>,
     /// Encoded id of the agent open in the chat pane.
     pub selected: RwSignal<Option<String>>,
     /// Transcript of the selected agent, once the daemon has sent it.
@@ -45,7 +45,7 @@ impl App {
         Self {
             phase: RwSignal::new(Phase::NeedDaemon),
             topics: RwSignal::new(Vec::new()),
-            workdirs: RwSignal::new(Vec::new()),
+            projects: RwSignal::new(Vec::new()),
             selected: RwSignal::new(None),
             state: RwSignal::new(None),
             chat_open: RwSignal::new(false),

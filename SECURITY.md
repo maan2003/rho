@@ -219,6 +219,11 @@ slot, and it removes the generated source file when the Claude process exits or
 is cancelled. Loaded `AGENTS.md` content therefore has the same
 external-provider exposure as other agent prompt text.
 
+Registered project paths and descriptions are included in PM prompts and are
+therefore disclosed to the configured inference provider. Project UI names are
+not included in model context. Treat descriptions as prompt input rather than
+trusted instructions.
+
 Claude Code MCP support is bound to the active Rho agent through
 `RHO_MCP_AGENT_ID`, which Rho sets when spawning the Claude process. A globally
 configured `rho mcp-agent-tools` stdio server inherits that environment and

@@ -76,7 +76,7 @@ pub fn render_agent_surface(
     );
     let agent_tools_enabled = true;
     Ok(RenderedAgentSurface {
-        system_prompt: system_prompt::prompt(view.as_ref(), None, profile.code_mode, role),
+        system_prompt: system_prompt::prompt(view.as_ref(), None, profile.code_mode, role, &[]),
         tools: agent_tool_specs(
             &shell_tools,
             agent_tools_enabled,
@@ -672,6 +672,12 @@ impl Agent {
             .upgrade()
             .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
         let agent_tools_enabled = true;
+        let projects = db
+            .read()
+            .list_projects()
+            .into_iter()
+            .map(|(path, project)| (path, project.description))
+            .collect::<Vec<_>>();
         let pool_events = pool;
         let (control, control_rx) = mpsc::unbounded_channel();
         let execution = Arc::new(Lazy::new({
@@ -684,6 +690,7 @@ impl Agent {
                 let multi_agent = multi_agent.clone();
                 let tool_extension = tool_extension.clone();
                 let control = control.clone();
+                let projects = projects.clone();
                 async move {
                     let view = Arc::clone(view.get().await?);
                     Ok(ExecutionContext::new(
@@ -694,6 +701,7 @@ impl Agent {
                         agent_tools_enabled,
                         multi_agent.as_ref(),
                         tool_extension.as_ref(),
+                        &projects,
                         control,
                     ))
                 }
@@ -987,6 +995,7 @@ impl ExecutionContext {
         agent_tools_enabled: bool,
         multi_agent: Option<&MultiAgentTools>,
         tool_extension: Option<&Arc<dyn AgentToolExtension>>,
+        projects: &[(camino::Utf8PathBuf, String)],
         control: mpsc::UnboundedSender<AgentControl>,
     ) -> Self {
         let shell_tools = ShellTools::new(
@@ -1008,8 +1017,13 @@ impl ExecutionContext {
             role,
             tool_extension,
         );
-        let system_prompt =
-            system_prompt::prompt(view.as_ref(), multi_agent, code_mode.is_some(), role);
+        let system_prompt = system_prompt::prompt(
+            view.as_ref(),
+            multi_agent,
+            code_mode.is_some(),
+            role,
+            projects,
+        );
         Self {
             view,
             system_prompt,

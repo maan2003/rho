@@ -14,7 +14,7 @@ use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
-    AgentId, ClientMessage, ServerMessage, UiTopic, UiWorkdir, VoiceRole, VoiceState,
+    AgentId, ClientMessage, ServerMessage, UiProject, UiTopic, VoiceRole, VoiceState,
     VoiceUiAction, read_frame, write_frame,
 };
 
@@ -59,7 +59,7 @@ impl tokio::io::AsyncWrite for IrohStream {
 pub enum ConnEvent {
     Ready {
         topics: Vec<UiTopic>,
-        workdirs: Vec<UiWorkdir>,
+        projects: Vec<UiProject>,
         default_topic_id: rho_ui_proto::TopicId,
         machine_seed: u64,
         agent_counter: u64,
@@ -153,7 +153,7 @@ async fn run(
     let message: ServerMessage = read_frame(&mut stream).await?;
     let ServerMessage::Ready {
         topics,
-        workdirs,
+        projects,
         default_topic_id,
         machine_seed,
         agent_counter,
@@ -165,7 +165,7 @@ async fn run(
     if events
         .unbounded_send(ConnEvent::Ready {
             topics,
-            workdirs,
+            projects,
             default_topic_id,
             machine_seed,
             agent_counter,
@@ -196,14 +196,14 @@ async fn run(
         let event = match message {
             ServerMessage::Ready {
                 topics,
-                workdirs,
+                projects,
                 default_topic_id,
                 machine_seed,
                 agent_counter,
                 workspace_counter,
             } => Some(ConnEvent::Ready {
                 topics,
-                workdirs,
+                projects,
                 default_topic_id,
                 machine_seed,
                 agent_counter,
