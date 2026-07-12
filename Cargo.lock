@@ -10454,6 +10454,7 @@ dependencies = [
  "json-stream",
  "octo",
  "prefix-id",
+ "redb",
  "rho-agent",
  "rho-claude",
  "rho-core",

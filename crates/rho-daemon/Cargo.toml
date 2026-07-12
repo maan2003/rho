@@ -28,6 +28,7 @@ rho-ui-proto.workspace = true
 rho-voice.workspace = true
 rho-webui-messages.workspace = true
 rho-workspaces.workspace = true
+redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

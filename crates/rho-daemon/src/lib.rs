@@ -31,6 +31,8 @@ mod webui;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
+const IROH_SECRET: redb::TableDefinition<(), &[u8; 32]> =
+    redb::TableDefinition::new("rho_daemon_iroh_secret_v1");
 
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
     let base = dirs::runtime_dir()
@@ -227,12 +229,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .unwrap_or_default(),
     };
     let iroh = if args.iroh {
-        let state_dir = default_db_path()?
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .context("state directory for iroh secret")?;
-        std::fs::create_dir_all(&state_dir).context("create state directory")?;
-        let secret = load_or_create_iroh_secret(&state_dir.join("iroh-secret.key"))?;
+        let secret = load_or_create_iroh_secret(&db).await?;
         let iroh_auth = rho_iroh_auth::IrohAuth::new(db.clone(), secret.public());
         Some((secret, iroh_auth))
     } else {
@@ -350,32 +347,19 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
 }
 
-/// The daemon's iroh identity, raw 32 secret bytes owner-readable only.
-fn load_or_create_iroh_secret(path: &std::path::Path) -> anyhow::Result<iroh::SecretKey> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let bytes: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("iroh secret file {path:?} is not 32 bytes"))?;
-            Ok(iroh::SecretKey::from_bytes(&bytes))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let secret = iroh::SecretKey::generate();
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-                .context("create iroh secret file")?;
-            file.write_all(&secret.to_bytes())
-                .context("write iroh secret file")?;
-            Ok(secret)
-        }
-        Err(error) => Err(error).context("read iroh secret file"),
+/// Loads the daemon's iroh identity from the local database.
+async fn load_or_create_iroh_secret(db: &RhoDb) -> anyhow::Result<iroh::SecretKey> {
+    let mut write = db.write().await;
+    let mut table = write.open_table(IROH_SECRET);
+    if let Some(secret) = table.get(&()) {
+        return Ok(iroh::SecretKey::from_bytes(secret.value()));
     }
+
+    let secret = iroh::SecretKey::generate().to_bytes();
+    table.insert(&(), &secret);
+    drop(table);
+    write.commit();
+    Ok(iroh::SecretKey::from_bytes(&secret))
 }
 
 /// Accepts enrolled iroh connections ([`rho_iroh_auth::IrohAuth`] gates them
@@ -1673,8 +1657,20 @@ mod tests {
     use rho_core::{
         ContentPart, ContextBlock, InferenceResponseItem, MessagePhase, UnknownProviderSpecificData,
     };
+    use rho_db::RhoDb;
 
-    use super::{inference_response_count, latest_final_response};
+    use super::{inference_response_count, latest_final_response, load_or_create_iroh_secret};
+
+    #[tokio::test]
+    async fn iroh_secret_is_persisted_in_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(temp.path().join("rho.redb"));
+
+        let first = load_or_create_iroh_secret(&db).await.unwrap();
+        let second = load_or_create_iroh_secret(&db).await.unwrap();
+
+        assert_eq!(first.public(), second.public());
+    }
 
     fn state_with_responses(texts: &[&str]) -> AgentState {
         AgentState {

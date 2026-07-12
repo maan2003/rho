@@ -71,8 +71,8 @@ AI APIs.
   granted only by a local user running `rho iroh approve <code>` against the
   Unix socket; codes are 60-bit, single-use, expire after a minute, and bind
   the exact client key via a TLS exporter, so approval cannot be replayed or
-  redirected. The daemon's iroh secret key lives owner-readable-only in the
-  rho state directory. Enrollment approval is also accepted from already
+  redirected. The daemon's iroh secret key lives in the local rho database.
+  Enrollment approval is also accepted from already
   trusted remote clients (they are fully privileged anyway).
 - The web UI (a static Leptos/wasm page in `webui/`, hostable anywhere) is
   an iroh client like any other: it connects to the same endpoint on its own
