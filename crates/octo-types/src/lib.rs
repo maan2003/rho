@@ -1,21 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-/// Fixed socket shared by the Octo client, Git remote helper, and Rho daemon.
-pub fn socket_path() -> std::path::PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: `geteuid` has no preconditions and does not mutate memory.
-        let uid = unsafe { libc::geteuid() };
-        std::path::PathBuf::from(format!("/run/user/{uid}/rho/octo.sock"))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        dirs::state_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("rho")
-            .join("octo.sock")
-    }
+/// Socket shared by the Octo client, Git remote helper, and Rho daemon.
+pub fn socket_path() -> std::io::Result<std::path::PathBuf> {
+    dirs::runtime_dir()
+        .or_else(dirs::state_dir)
+        .map(|base| base.join("rho").join("octo.sock"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "neither runtime nor state directory is available",
+            )
+        })
 }
 
 #[derive(Debug, Serialize, Deserialize)]

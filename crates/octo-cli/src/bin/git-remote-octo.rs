@@ -10,7 +10,7 @@ fn main() -> Result<()> {
     let remote = args.next().context("missing remote name")?;
     let url = args.next().context("missing Octo remote URL")?;
     let (owner, repo) = parse_remote(&url)?;
-    let socket = octo_types::socket_path();
+    let socket = octo_types::socket_path()?;
     let socket_path = Path::new(&socket);
     let socket_type = socket_path
         .metadata()

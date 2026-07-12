@@ -12,7 +12,7 @@ pub struct OctoClient {
 impl OctoClient {
     pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
-            .unix_socket(octo_types::socket_path())
+            .unix_socket(octo_types::socket_path()?)
             .build()?;
 
         let base_url = Url::parse("http://localhost")?;

@@ -204,7 +204,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&socket_path);
     let server = Server::bind(&socket_path).context("bind rho daemon socket")?;
     let platform_secrets = PlatformSecrets::from_fd_store();
-    let octo_socket_path = octo_types::socket_path();
+    let octo_socket_path = octo_types::socket_path()?;
     spawn_octo_server(&octo_socket_path, platform_secrets.clone())?;
     let user_environment = rho_workspaces::UserEnvironment::new(login_environment()?);
 
