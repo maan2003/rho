@@ -200,7 +200,7 @@
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
               postInstall = ''
                 mkdir -p $out/share/rho/skills
-                cp -r ${./.agents/skills/github} $out/share/rho/skills/github
+                cp -r ${./.agents/skills/pr-workflow} $out/share/rho/skills/pr-workflow
                 cp -r ${./.agents/skills/delegate-engineering} \
                   $out/share/rho/skills/delegate-engineering
                 chmod -R u+w $out/share/rho/skills

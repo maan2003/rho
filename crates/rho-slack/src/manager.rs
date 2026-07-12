@@ -652,8 +652,8 @@ impl SlackManager {
             text.push_str(
                 "\n\n(This conversation comes from a Slack thread; your final \
                  response is not posted automatically. Use slack_reply({text}) \
-                 whenever you want to send a message to the thread. Keep \
-                 responses concise and self-contained.)",
+                 to relay Engineer results and every user-facing response to \
+                 the thread. Keep responses concise and self-contained.)",
             );
         }
         text

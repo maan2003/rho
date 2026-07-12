@@ -71,14 +71,14 @@ fn agent_role_resolves_opinionated_bindings() {
             ..
         })
     ));
-    assert!(
-        AgentRole::PM
-            .session_profile()
-            .unwrap()
-            .deep_config()
-            .unwrap()
-            .code_mode
-    );
+    assert!(matches!(
+        AgentRole::PM.session_profile().unwrap(),
+        SessionBinding::CoordinatorSol(InferenceProfile {
+            effort: ReasoningEffort::Low,
+            code_mode: false,
+            ..
+        })
+    ));
 }
 
 use crate::{MessageDelivery, MessageSender, QueuedItem, QueuedItemKind};

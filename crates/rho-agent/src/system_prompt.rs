@@ -20,16 +20,21 @@ pub fn prompt(
             workspace_name: workspace.info().workspace_name(),
         })
         .collect::<Vec<_>>();
-    let (agents_files, skills) = merged_context(entries);
-    let agents_md = render_agents_md_prompt(&agents_files).unwrap_or_default();
-    let skills = skills
-        .iter()
-        .filter(|skill| {
-            matches!(role, AgentRole::Engineer { .. }) || skill.name != "delegate-engineering"
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let skills = render_skills_prompt(&skills).unwrap_or_default();
+    let (agents_md, skills) = if matches!(role, AgentRole::PM) {
+        (String::new(), String::new())
+    } else {
+        let (agents_files, skills) = merged_context(entries);
+        let skills = skills
+            .into_iter()
+            .filter(|skill| {
+                matches!(role, AgentRole::Engineer { .. }) || skill.name != "delegate-engineering"
+            })
+            .collect::<Vec<_>>();
+        (
+            render_agents_md_prompt(&agents_files).unwrap_or_default(),
+            render_skills_prompt(&skills).unwrap_or_default(),
+        )
+    };
     let team_context = multi_agent.map_or_else(String::new, |tools| {
         let agent_id = tools.display_id(tools.self_id());
         let identity = match tools.parent() {
@@ -105,10 +110,7 @@ request.
     };
     let environment = render_environment_prompt(&workdirs);
     if matches!(role, AgentRole::PM) {
-        return format!(
-            "{PM_BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}{environment}"
-        )
-        .into();
+        return format!("{PM_BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}").into();
     }
     format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}{role_prompt}{environment}")
         .into()
@@ -184,18 +186,35 @@ fn merged_context(
     (agents_files, skills)
 }
 
-const PM_BASE_PROMPT: &str = "You are Rho's user-facing project manager. Clarify \
-the outcome, communicate status, and route substantive technical work to an \
-Engineer. Do not inspect or modify repositories yourself.
+const PM_BASE_PROMPT: &str = "You are Rho's user-facing project manager. Always \
+delegate technical requests to an Engineer; do not decide that a technical request \
+is too small or otherwise unsuitable for delegation. Handle nontechnical \
+conversation directly and communicate status. \
+Do not inspect or modify repositories yourself.
 
-Use `spawn_engineer` for technical investigation, implementation, testing, and \
-review. Give each Engineer a complete outcome-focused assignment, use \
-`message_agent` to exchange context or steer work, and use `interrupt_engineer` \
-only when a turn must be stopped. Use `wait_agent` when the next step is blocked \
-on agent mail.
+For a follow-up or continuation of an existing task, use `message_agent` to \
+send it to that task's responsible Engineer when that remains the best owner. \
+Use judgment rather than reusing an Engineer mechanically. Use `spawn_engineer` \
+when a technical task has no suitable responsible Engineer, when a fresh or \
+independent assignment is warranted, or when the user requests or suggests \
+another Engineer. In both spawned assignments and follow-up \
+messages, pass the user's instructions exactly, verbatim, and in full. Do not editorialize, \
+paraphrase, summarize, reinterpret, expand, or omit them. If clarification or \
+context is necessary, append it only after the verbatim instructions under an \
+`Additional context from PM:` heading. Use `message_agent` to exchange other \
+context or steer work, and use `interrupt_engineer` \
+only when a turn must be stopped.
 
-Track the responsible Engineers and synthesize their reports for the user. \
-Never claim work is complete before the responsible Engineer reports it.
+The intended asynchronous flow is: delegate the technical request, briefly \
+acknowledge the delegation or report useful status to the user, then end your \
+turn. Do not poll or wait. Engineer mail will wake you and start the next \
+request automatically; then relay the Engineer's report to the user through \
+the active user-facing surface.
+
+Track task ownership and relay Engineer reports faithfully. You may format \
+reports for clarity, but do not alter their substance, add unsupported technical \
+conclusions, or hide uncertainty, failed checks, or unresolved work. Never claim \
+work is complete before the responsible Engineer reports it.
 
 ";
 
@@ -506,6 +525,15 @@ mod tests {
         assert!(!BASE_PROMPT.contains("## PM"));
         assert!(!BASE_PROMPT.contains("## Advisor"));
         assert!(PM_BASE_PROMPT.contains("Do not inspect or modify"));
+        assert!(PM_BASE_PROMPT.contains("Always delegate technical requests"));
+        assert!(PM_BASE_PROMPT.contains("Use judgment"));
+        assert!(PM_BASE_PROMPT.contains("user requests or suggests"));
+        assert!(PM_BASE_PROMPT.contains("The intended asynchronous flow"));
+        assert!(PM_BASE_PROMPT.contains("Do not poll or wait"));
+        assert!(PM_BASE_PROMPT.contains("exactly, verbatim, and in full"));
+        assert!(PM_BASE_PROMPT.contains("Additional context from PM:"));
+        assert!(PM_BASE_PROMPT.contains("relay Engineer reports faithfully"));
+        assert!(PM_BASE_PROMPT.contains("failed checks, or unresolved work"));
         assert!(PM_BASE_PROMPT.contains("Never claim work is complete"));
         assert!(ADVISOR_PROMPT.contains("advisory only"));
     }

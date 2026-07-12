@@ -71,14 +71,28 @@ provider crates.
 Collaboration creation is role-specific while communication is shared.
 `spawn_engineer` always gives jj-backed workdirs isolated child workspaces;
 detailed delegation and integration guidance lives in the
-`delegate-engineering` skill rather than every Engineer prompt. `ask_advisor`
-creates an advisory session. `message_agent` is an unrestricted bidirectional
+`delegate-engineering` skill rather than every Engineer prompt. Engineers can
+use `ask_advisor` to create an advisory session; PMs cannot. `message_agent` is
+an unrestricted bidirectional
 mail bus for any known role-prefixed handle, including Advisor context requests;
 `wait_agent` waits for incoming mail. Each agent record stores whether it was
 created directly, by a PM, or by an Engineer so prompt ownership context is an
 immutable creation-time fact rather than inferred later. Advisors retain normal
 shell/patch capabilities plus messaging/waiting but cannot spawn or interrupt.
 User-facing handles remain `eng-*`, `pm-*`, and `adv-*` over `AgentId`.
+PMs run with the normal direct tool surface (never code mode), coordinate
+exclusively through collaboration tools, and do not receive shell command,
+process-input, or patch tools. Their prompts omit repository `AGENTS.md` content
+and skills as well as the working-directory Environment section; technical
+requests are delegated to Engineers carrying the user's instructions verbatim.
+PMs use judgment when routing follow-ups: they may reuse the responsible
+Engineer, but spawn a fresh one when warranted or requested or suggested by the
+user. Slack-bound PMs explicitly relay Engineer results and other user-facing
+responses through `slack_reply` because final responses are not posted to Slack
+automatically.
+PMs do not receive `wait_agent`: they end their turn after delegation and agent
+mail wakes them for the next request. Their prompt states this asynchronous
+delegate, acknowledge, end-turn, wake-on-mail, and relay flow explicitly.
 
 `rho-slack` is the in-process Slack surface. `SlackManager` is handed the
 daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd

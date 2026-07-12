@@ -47,7 +47,11 @@ fn nested_tools(
     role: Option<crate::db::AgentRole>,
     tool_extension: Option<&Arc<dyn AgentToolExtension>>,
 ) -> Vec<NestedTool> {
-    let mut specs = shell_tools.specs();
+    let mut specs = if matches!(role, Some(crate::db::AgentRole::PM)) {
+        Vec::new()
+    } else {
+        shell_tools.specs()
+    };
     if let Some(role) = role {
         specs.extend(multi_agent_tools::agent_tool_specs(role));
     }
@@ -206,13 +210,13 @@ mod tests {
     fn pm_always_sees_engineer_management_declarations() {
         let specs = super::tool_specs(&shell_tools(), Some(crate::db::AgentRole::PM), None);
         let exec = &specs[0].description;
-        for name in [
-            "spawn_engineer",
-            "message_agent",
-            "interrupt_engineer",
-            "wait_agent",
-        ] {
+        for name in ["spawn_engineer", "message_agent", "interrupt_engineer"] {
             assert!(exec.contains(name), "missing {name}: {exec}");
+        }
+        assert!(!exec.contains("wait_agent"), "{exec}");
+        assert!(!exec.contains("ask_advisor"), "{exec}");
+        for name in ["exec_command", "write_stdin", "apply_patch"] {
+            assert!(!exec.contains(name), "unexpected {name}: {exec}");
         }
     }
 

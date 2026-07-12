@@ -422,7 +422,10 @@ impl AgentRole {
             code_mode: true,
         };
         Ok(match self {
-            AgentRole::PM => SessionBinding::CoordinatorSol(deep(ReasoningEffort::Medium)),
+            AgentRole::PM => SessionBinding::CoordinatorSol(InferenceProfile {
+                code_mode: false,
+                ..deep(ReasoningEffort::Low)
+            }),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Low,
             } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low)),

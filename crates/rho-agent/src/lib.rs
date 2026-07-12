@@ -664,7 +664,9 @@ impl Agent {
         tool_extension: Option<Arc<dyn AgentToolExtension>>,
         restored: RestoredAgent,
     ) -> Self {
-        let code_mode_enabled = config.code_mode;
+        // Role policy wins over persisted profiles created before PM code mode
+        // was disabled.
+        let code_mode_enabled = config.code_mode && !matches!(role, db::AgentRole::PM);
         let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
         let multi_agent = pool
             .upgrade()
@@ -882,7 +884,11 @@ fn agent_tool_specs(
         return code_mode::tool_specs(shell_tools, multi_agent.then_some(role), tool_extension)
             .into();
     }
-    let mut specs = shell_tools.specs();
+    let mut specs = if matches!(role, db::AgentRole::PM) {
+        Vec::new()
+    } else {
+        shell_tools.specs()
+    };
     if multi_agent {
         specs.extend(multi_agent_tools::agent_tool_specs(role));
     }

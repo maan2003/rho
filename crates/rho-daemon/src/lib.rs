@@ -711,16 +711,24 @@ impl AgentRegistry {
         if !self.pool.agent_exists(self_agent_id) {
             anyhow::bail!("agent is not known: {self_agent_id:?}");
         }
-        if matches!(
-            self.db.read().get_agent(self_agent_id).role,
-            AgentRole::Advisor { .. }
-        ) && !matches!(
-            &request,
-            McpAgentToolRequest::MessageAgent { .. }
-                | McpAgentToolRequest::FollowupAdvisor { .. }
-                | McpAgentToolRequest::Wait { .. }
-        ) {
+        let role = self.db.read().get_agent(self_agent_id).role;
+        if matches!(role, AgentRole::Advisor { .. })
+            && !matches!(
+                &request,
+                McpAgentToolRequest::MessageAgent { .. }
+                    | McpAgentToolRequest::FollowupAdvisor { .. }
+                    | McpAgentToolRequest::Wait { .. }
+            )
+        {
             anyhow::bail!("Advisors may only message agents and wait for replies");
+        }
+        if matches!(role, AgentRole::PM)
+            && matches!(
+                &request,
+                McpAgentToolRequest::AskAdvisor { .. } | McpAgentToolRequest::Wait { .. }
+            )
+        {
+            anyhow::bail!("Project managers cannot ask Advisors or wait for agent mail");
         }
         match request {
             McpAgentToolRequest::SpawnEngineer {

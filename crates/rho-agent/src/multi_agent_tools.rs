@@ -122,12 +122,17 @@ pub fn is_agent_tool(name: &str) -> bool {
 
 pub fn agent_tool_specs(role: AgentRole) -> Vec<ToolSpec> {
     match role {
-        AgentRole::PM | AgentRole::Engineer { .. } => vec![
+        AgentRole::Engineer { .. } => vec![
             spawn_engineer_spec(),
             message_agent_spec(),
             interrupt_engineer_spec(),
             advisor_spec(),
             wait_spec(),
+        ],
+        AgentRole::PM => vec![
+            spawn_engineer_spec(),
+            message_agent_spec(),
+            interrupt_engineer_spec(),
         ],
         AgentRole::Advisor { .. } => vec![message_agent_spec(), wait_spec()],
     }
@@ -144,8 +149,7 @@ fn spawn_engineer_spec() -> ToolSpec {
                       work; otherwise continue locally. The prompt must be self-contained and \
                       task-focused: the child already receives repo guidance, skills, tools, and \
                       workspace instructions, so do not restate generic process rules. The \
-                      child's turn results arrive later as agent mail; use `wait_agent` when you are \
-                      blocked on those results."
+                      child's turn results arrive later as agent mail."
             .to_owned(),
         input_schema: json!({
             "type": "object",
