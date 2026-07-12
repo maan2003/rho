@@ -814,8 +814,6 @@ mod tests {
     fn streaming_state(text: &str) -> AgentState {
         AgentState {
             blocks: Vec::new(),
-            tool_specs: Arc::from([]),
-            system_prompt: Arc::from(""),
             queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::ApiStreaming {
                 pending_response: PendingInferenceResponse {
@@ -852,8 +850,6 @@ mod tests {
     fn error_state(partial_text: &str, message: &str) -> AgentState {
         AgentState {
             blocks: Vec::new(),
-            tool_specs: Arc::from([]),
-            system_prompt: Arc::from(""),
             queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Error(FailedInferenceResponse {
                 partial_response: PendingInferenceResponse {
@@ -884,8 +880,6 @@ mod tests {
                 }],
                 provider_response_id: None,
             })],
-            tool_specs: Arc::from([]),
-            system_prompt: Arc::from(""),
             queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
@@ -920,8 +914,6 @@ mod tests {
                     }],
                 }),
             ],
-            tool_specs: Arc::from([]),
-            system_prompt: Arc::from(""),
             queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
@@ -951,8 +943,6 @@ mod tests {
         );
         AgentState {
             blocks: Vec::new(),
-            tool_specs: Arc::from([]),
-            system_prompt: Arc::from(""),
             queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::ToolCalling {
                 previews,

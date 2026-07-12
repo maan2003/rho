@@ -439,28 +439,24 @@ mod tests {
         let auth = IrohAuth::new(RhoDb::open(temp.path().join("auth.redb")), endpoint_id(1));
         let code = EnrollmentCode::from_str("ABCD-EFGH-JK").unwrap();
 
-        assert!(matches!(
-            auth.begin_enrollment(client, code).await.unwrap(),
-            false
-        ));
+        assert!(!auth.begin_enrollment(client, code).await.unwrap());
         let approved = auth.approve_code(&code).await.unwrap();
         assert_eq!(approved, client);
 
-        assert!(matches!(
+        assert!(
             auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JM").unwrap())
                 .await
-                .unwrap(),
-            true
-        ));
+                .unwrap()
+        );
 
         assert!(auth.revoke(client).await);
         assert!(!auth.revoke(client).await);
-        assert!(matches!(
-            auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JN").unwrap())
+        assert!(
+            !auth
+                .begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JN").unwrap())
                 .await
-                .unwrap(),
-            false
-        ));
+                .unwrap()
+        );
     }
 
     #[tokio::test]
