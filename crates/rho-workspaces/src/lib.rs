@@ -290,12 +290,15 @@ impl Repo {
     ) -> anyhow::Result<Arc<Workspace>> {
         anyhow::ensure!(self.is_jj, "not a jj repository: {}", self.root);
         let info = self.workspace_info(id);
-        if let Some(workspace) = self.workspaces.lock().await.get(&info) {
+        let mut workspaces = self.workspaces.lock().await;
+        if let Some(workspace) = workspaces.get(&info) {
             return Ok(Arc::clone(workspace));
         }
         let name = id.encoded();
         let slot = self.attach(&name, None).await?;
-        self.cache_workspace(info, slot).await
+        let workspace = Arc::new(self.workspace(info.clone(), slot));
+        workspaces.insert(info, Arc::clone(&workspace));
+        Ok(workspace)
     }
 
     /// A workspace standing for the user's own checkout: the agent works
@@ -304,10 +307,13 @@ impl Repo {
         let info = WorkspaceInfo::UserCheckout {
             repo: self.root.clone(),
         };
-        if let Some(workspace) = self.workspaces.lock().await.get(&info) {
+        let mut workspaces = self.workspaces.lock().await;
+        if let Some(workspace) = workspaces.get(&info) {
             return Ok(Arc::clone(workspace));
         }
-        self.cache_workspace(info, self.root.clone()).await
+        let workspace = Arc::new(self.workspace(info.clone(), self.root.clone()));
+        workspaces.insert(info, Arc::clone(&workspace));
+        Ok(workspace)
     }
 
     /// The origin repo root (canonicalized).
@@ -358,17 +364,21 @@ impl Repo {
         info: WorkspaceInfo,
         slot: Utf8PathBuf,
     ) -> anyhow::Result<Arc<Workspace>> {
-        let workspace = Arc::new(Workspace {
-            info: info.clone(),
-            repo: Arc::clone(self),
-            slot,
-            context_config: OnceLock::new(),
-        });
+        let workspace = Arc::new(self.workspace(info.clone(), slot));
         self.workspaces
             .lock()
             .await
             .insert(info, Arc::clone(&workspace));
         Ok(workspace)
+    }
+
+    fn workspace(self: &Arc<Self>, info: WorkspaceInfo, slot: Utf8PathBuf) -> Workspace {
+        Workspace {
+            info: info.clone(),
+            repo: Arc::clone(self),
+            slot,
+            context_config: OnceLock::new(),
+        }
     }
 
     /// A jj command running against this repo.

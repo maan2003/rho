@@ -506,7 +506,7 @@ impl AgentPool {
     }
 
     /// Materializes an agent's persisted working set into a live view.
-    pub async fn open_view(&self, workdirs: &[WorkspaceInfo]) -> anyhow::Result<Arc<View>> {
+    pub async fn materialize_view(&self, workdirs: &[WorkspaceInfo]) -> anyhow::Result<Arc<View>> {
         let mut entries = Vec::with_capacity(workdirs.len());
         for info in workdirs {
             entries.push(self.open_workspace(info).await?);
@@ -522,7 +522,7 @@ impl AgentPool {
             async move {
                 pool.upgrade()
                     .context("agent pool dropped")?
-                    .open_view(&workdirs)
+                    .materialize_view(&workdirs)
                     .await
             }
         }))
