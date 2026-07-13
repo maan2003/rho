@@ -105,6 +105,7 @@ pub const INTERRUPT_ENGINEER_TOOL_NAME: &str = "interrupt_engineer";
 pub const ASK_ADVISOR_TOOL_NAME: &str = "ask_advisor";
 pub const WAIT_TOOL_NAME: &str = "wait_agent";
 
+const MIN_WAIT_SECONDS: u64 = 30;
 const DEFAULT_WAIT_SECONDS: u64 = 300;
 const MAX_WAIT_SECONDS: u64 = 3600;
 const AGENT_ID_EXAMPLE: &str = "eng-h6u7";
@@ -257,7 +258,11 @@ fn advisor_spec() -> ToolSpec {
     ToolSpec {
         name: ToolName::try_from(ASK_ADVISOR_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
-        description: "Start a fresh independent Advisor consultation. The answer arrives later as mail. Use message_agent with its handle for follow-up or context exchange.".to_owned(),
+        description: "Start a fresh independent Advisor consultation. The answer arrives later \
+                      as mail. Wait patiently for up to five minutes for its response; do not \
+                      keep messaging it while it is working. Use message_agent with its handle \
+                      only when genuine follow-up or additional context is needed."
+            .to_owned(),
         input_schema: json!({
             "type": "object", "additionalProperties": false,
             "required": required, "properties": properties,
@@ -272,8 +277,9 @@ fn wait_spec() -> ToolSpec {
         tool_type: ToolType::Function,
         description: "Wait for a mailbox update from any live agent, including queued messages \
                       and final responses. The wait also ends early when new user input is \
-                      steered into the active turn. Does not return the content; queued input \
-                      enters context after this tool returns."
+                      steered into the active turn, so prefer one longer timeout over repeated \
+                      short waits. Does not return the content; queued input enters context \
+                      after this tool returns."
             .to_owned(),
         input_schema: json!({
             "type": "object",
@@ -281,7 +287,9 @@ fn wait_spec() -> ToolSpec {
             "properties": {
                 "timeout_seconds": {
                     "type": "integer",
-                    "description": format!("Give up after this many seconds (default: {DEFAULT_WAIT_SECONDS}, min: 1, max: {MAX_WAIT_SECONDS}).")
+                    "minimum": MIN_WAIT_SECONDS,
+                    "maximum": MAX_WAIT_SECONDS,
+                    "description": format!("Give up after this many seconds (default: {DEFAULT_WAIT_SECONDS}, min: {MIN_WAIT_SECONDS}, max: {MAX_WAIT_SECONDS}). Prefer a longer timeout; the wait returns early when mail arrives.")
                 }
             }
         }),
@@ -536,12 +544,28 @@ pub(crate) fn parse_wait_timeout(arguments: &str) -> anyhow::Result<u64> {
     Ok(args
         .timeout_seconds
         .unwrap_or(DEFAULT_WAIT_SECONDS)
-        .clamp(1, MAX_WAIT_SECONDS))
+        .clamp(MIN_WAIT_SECONDS, MAX_WAIT_SECONDS))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisor_description_encourages_patient_waiting() {
+        let description = advisor_spec().description;
+        assert!(description.contains("Wait patiently for up to five minutes"));
+        assert!(description.contains("do not keep messaging it while it is working"));
+    }
+
+    #[test]
+    fn wait_uses_long_timeouts_with_a_thirty_second_minimum() {
+        let spec = wait_spec();
+        assert!(spec.description.contains("prefer one longer timeout"));
+        assert_eq!(parse_wait_timeout(r#"{"timeout_seconds":1}"#).unwrap(), 30);
+        assert_eq!(parse_wait_timeout(r#"{"timeout_seconds":60}"#).unwrap(), 60);
+        assert_eq!(parse_wait_timeout("{}").unwrap(), 300);
+    }
 
     #[test]
     fn parses_spawn_role() {

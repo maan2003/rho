@@ -271,6 +271,12 @@ communication. Do not ask about low-level implementation details, invent \
 choices where the design is already constrained, or bombard the user with \
 questions.
 
+## Advisor Review
+
+After implementing and locally verifying the changes, use `ask_advisor` for an \
+independent review. Wait for the review and address its actionable findings \
+before opening the pull request.
+
 ";
 
 const GITHUB_WORKFLOW_PROMPT: &str = "## GitHub Workflow
@@ -612,6 +618,11 @@ mod tests {
             PR_FRIENDLY_ENGINEER_PROMPT
                 .contains("Do not ask about low-level implementation details")
         );
+        assert!(PR_FRIENDLY_ENGINEER_PROMPT.contains("## Advisor Review"));
+        assert!(
+            PR_FRIENDLY_ENGINEER_PROMPT.contains("use `ask_advisor` for an independent review")
+        );
+        assert!(PR_FRIENDLY_ENGINEER_PROMPT.contains("before opening the pull request"));
         assert!(GITHUB_WORKFLOW_PROMPT.contains("`github-workflow` skill"));
         assert!(GITHUB_WORKFLOW_PROMPT.contains("Follow that skill through"));
         assert!(GITHUB_WORKFLOW_PROMPT.contains("Coordinating PMs"));

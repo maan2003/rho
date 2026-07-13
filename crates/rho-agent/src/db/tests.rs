@@ -30,6 +30,18 @@ fn agent_role_resolves_opinionated_bindings() {
         })
     ));
     assert!(matches!(
+        AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Medium,
+            workflow: AgentWorkflow::PrFriendly,
+        }
+        .session_profile()
+        .unwrap(),
+        SessionBinding::ResponsesSol(InferenceProfile {
+            effort: ReasoningEffort::High,
+            ..
+        })
+    ));
+    assert!(matches!(
         profile(EngineerIntelligence::High),
         SessionBinding::ResponsesSol(InferenceProfile {
             effort: ReasoningEffort::Xhigh,

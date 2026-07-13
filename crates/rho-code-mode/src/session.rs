@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 
 use crate::cell::{CellShared, CellStatus};
 use crate::description::{
-    DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_YIELD_TIME_MS, NestedTool, parse_exec_source,
+    DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_WAIT_YIELD_TIME_MS, DEFAULT_YIELD_TIME_MS, NestedTool,
+    parse_exec_source,
 };
 use crate::runtime::{self, Command, HEARTBEAT_STALE, RuntimeHandle};
 use crate::truncate::truncate_middle;
@@ -54,7 +55,7 @@ pub struct WaitArgs {
 }
 
 fn default_yield_time_ms() -> u64 {
-    DEFAULT_YIELD_TIME_MS
+    DEFAULT_WAIT_YIELD_TIME_MS
 }
 
 /// One persistent code-mode session (one V8 isolate on its own thread).

@@ -486,10 +486,14 @@ impl AgentRole {
             } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Medium,
-            }
-            | AgentRole::WorkflowEngineer {
+            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
+            AgentRole::WorkflowEngineer {
                 intelligence: EngineerIntelligence::Medium,
-                ..
+                workflow: AgentWorkflow::PrFriendly,
+            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::High)),
+            AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Medium,
+                workflow: AgentWorkflow::Default,
             } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::High,
@@ -572,6 +576,7 @@ impl SessionBinding {
                 match config.effort {
                     ReasoningEffort::Low => EngineerIntelligence::Low,
                     ReasoningEffort::Medium => EngineerIntelligence::Medium,
+                    ReasoningEffort::High => EngineerIntelligence::High,
                     ReasoningEffort::Xhigh => EngineerIntelligence::High,
                 },
                 if config.fast_mode {

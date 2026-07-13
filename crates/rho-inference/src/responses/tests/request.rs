@@ -168,7 +168,7 @@ fn serializes_configured_reasoning_context() {
     let mut session = InferenceSession::new_deep(
         auth,
         InferenceProfile {
-            effort: ReasoningEffort::Medium,
+            effort: ReasoningEffort::High,
             fast_mode: false,
             code_mode: false,
         },
@@ -184,6 +184,7 @@ fn serializes_configured_reasoning_context() {
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["reasoning"]["context"], "current_turn");
+    assert_eq!(json["reasoning"]["effort"], "high");
 }
 
 #[test]

@@ -236,6 +236,7 @@ pub(crate) enum ResponsesEffort {
     Low,
     Medium,
     Xhigh,
+    High,
 }
 
 impl From<ReasoningEffort> for ResponsesEffort {
@@ -244,6 +245,7 @@ impl From<ReasoningEffort> for ResponsesEffort {
             ReasoningEffort::Low => Self::Low,
             ReasoningEffort::Medium => Self::Medium,
             ReasoningEffort::Xhigh => Self::Xhigh,
+            ReasoningEffort::High => Self::High,
         }
     }
 }

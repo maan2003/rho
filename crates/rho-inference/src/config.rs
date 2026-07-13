@@ -8,6 +8,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     Xhigh,
+    High,
 }
 
 /// Which Responses-API model a deep session talks to. Not part of

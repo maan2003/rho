@@ -254,6 +254,7 @@ impl ResponsesRequest {
                     ResponsesEffort::Low => "low",
                     ResponsesEffort::Medium => "medium",
                     ResponsesEffort::Xhigh => "xhigh",
+                    ResponsesEffort::High => "high",
                 },
                 summary: "auto",
             }),
