@@ -115,16 +115,16 @@ impl SecretStore {
         let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") else {
             return Ok(false);
         };
-        let message = format!("FDSTORE=1\nFDNAME={name}");
-        send_with_fd(&socket_path, message.as_bytes(), self.memfd.as_raw_fd())
-            .context("sending FDSTORE notification")?;
+        replace_stored_fd(&socket_path, name, self.memfd.as_raw_fd())
+            .context("replacing stored fd")?;
         Ok(true)
     }
 }
 
-/// Send a datagram with one SCM_RIGHTS fd to a notify socket. Supports
-/// filesystem paths and abstract addresses (leading '@', systemd convention).
-fn send_with_fd(socket_path: &str, payload: &[u8], fd: i32) -> anyhow::Result<()> {
+/// Replace a named fd in systemd's store. The connected datagram socket keeps
+/// the removal ordered before the replacement. Supports filesystem paths and
+/// abstract addresses (leading '@', systemd convention).
+fn replace_stored_fd(socket_path: &str, name: &str, fd: i32) -> anyhow::Result<()> {
     let sock = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if sock == -1 {
         return Err(std::io::Error::last_os_error()).context("notify socket");
@@ -146,7 +146,31 @@ fn send_with_fd(socket_path: &str, payload: &[u8], fd: i32) -> anyhow::Result<()
     }
     let addr_len =
         (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len()) as libc::socklen_t;
+    if unsafe {
+        libc::connect(
+            sock.as_raw_fd(),
+            &addr as *const _ as *const libc::sockaddr,
+            addr_len,
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error()).context("connecting notify socket");
+    }
 
+    let remove = format!("FDSTOREREMOVE=1\nFDNAME={name}");
+    if unsafe {
+        libc::send(
+            sock.as_raw_fd(),
+            remove.as_ptr() as *const libc::c_void,
+            remove.len(),
+            0,
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error()).context("removing stored fd");
+    }
+
+    let payload = format!("FDSTORE=1\nFDNAME={name}");
     let mut iov = libc::iovec {
         iov_base: payload.as_ptr() as *mut libc::c_void,
         iov_len: payload.len(),
@@ -154,8 +178,6 @@ fn send_with_fd(socket_path: &str, payload: &[u8], fd: i32) -> anyhow::Result<()
     const CMSG_SPACE: usize = 24; // CMSG_SPACE(sizeof(int)) on 64-bit linux
     let mut cmsg_buf = [0u8; CMSG_SPACE];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_name = &mut addr as *mut _ as *mut libc::c_void;
-    msg.msg_namelen = addr_len;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
@@ -215,6 +237,12 @@ mod tests {
         assert!(store.stash_in_fd_store("slack").unwrap());
         unsafe { std::env::remove_var("NOTIFY_SOCKET") };
 
+        let mut remove = [0u8; 256];
+        let len = receiver.recv(&mut remove).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&remove[..len]).unwrap(),
+            "FDSTOREREMOVE=1\nFDNAME=slack"
+        );
         let (payload, fd) = recv_with_fd(&receiver);
         assert_eq!(payload, "FDSTORE=1\nFDNAME=slack");
         let restored = SecretStore::from_fd(fd);
