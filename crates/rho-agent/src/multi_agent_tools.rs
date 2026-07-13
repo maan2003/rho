@@ -122,14 +122,14 @@ pub fn is_agent_tool(name: &str) -> bool {
 
 pub fn agent_tool_specs(role: AgentRole) -> Vec<ToolSpec> {
     match role {
-        AgentRole::Engineer { .. } => vec![
+        AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => vec![
             spawn_engineer_spec(),
             message_agent_spec(),
             interrupt_engineer_spec(),
             advisor_spec(),
             wait_spec(),
         ],
-        AgentRole::PM => vec![
+        AgentRole::PM | AgentRole::WorkflowPM { .. } => vec![
             spawn_engineer_spec(),
             message_agent_spec(),
             interrupt_engineer_spec(),
@@ -506,10 +506,7 @@ async fn interrupt_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow:
         anyhow::bail!("no agent with id {}", args.engineer_id);
     }
     anyhow::ensure!(
-        matches!(
-            pool.db().read().get_agent(target).role,
-            AgentRole::Engineer { .. }
-        ),
+        pool.db().read().get_agent(target).role.is_engineer(),
         "target is not an Engineer"
     );
     if target == tools.self_id {

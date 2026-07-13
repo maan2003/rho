@@ -20,7 +20,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{
-    AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRuntime, AgentWriteTxnExt,
+    AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRuntime, AgentWriteTxnExt,
     SessionBinding, TopicId, UnixMillis,
 };
 use crate::multi_agent_tools::MultiAgentTools;
@@ -55,6 +55,7 @@ impl ClaudeAgent {
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         mode: SessionBinding,
+        role: AgentRole,
         parent: Option<AgentId>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<(AgentId, Self)> {
@@ -64,7 +65,6 @@ impl ClaudeAgent {
         let effort = mode
             .claude_effort()
             .ok_or_else(|| anyhow::anyhow!("cannot create Claude runtime for Rho agent mode"))?;
-        let role = mode.agent_role();
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
         let entries = crate::materialize_workdirs(&mut write, start).await?;
@@ -83,6 +83,7 @@ impl ClaudeAgent {
             AgentRuntime::Claude { session_id },
             parent,
         );
+        write.set_agent_role(agent_id, role);
         write.commit();
 
         let multi_agent = pool

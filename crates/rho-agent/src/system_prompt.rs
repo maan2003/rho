@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::db::{AgentRole, AgentSpawnedBy};
+use crate::db::{AgentRole, AgentSpawnedBy, AgentWorkflow};
 use crate::multi_agent_tools::MultiAgentTools;
 
 /// `multi_agent` is set for pooled agents, which get the multi-agent tools and
@@ -21,15 +21,13 @@ pub fn prompt(
             workspace_name: workspace.info().workspace_name(),
         })
         .collect::<Vec<_>>();
-    let (agents_md, skills) = if matches!(role, AgentRole::PM) {
+    let (agents_md, skills) = if role.is_pm() {
         (String::new(), String::new())
     } else {
         let (agents_files, skills) = merged_context(entries);
         let skills = skills
             .into_iter()
-            .filter(|skill| {
-                matches!(role, AgentRole::Engineer { .. }) || skill.name != "delegate-engineering"
-            })
+            .filter(|skill| role.is_engineer() || skill.name != "delegate-engineering")
             .collect::<Vec<_>>();
         (
             render_agents_md_prompt(&agents_files).unwrap_or_default(),
@@ -64,7 +62,7 @@ agent and `wait_agent` when blocked on a reply.
 "
             );
         }
-        let ownership = if matches!(role, AgentRole::PM) {
+        let ownership = if role.is_pm() {
             "You were started directly and own coordination of the user's outcome."
         } else {
             match tools.spawned_by() {
@@ -104,15 +102,19 @@ request.
         )
     });
     let code_mode = if code_mode { CODE_MODE_PROMPT } else { "" };
+    let workflow_prompt = match role.workflow() {
+        AgentWorkflow::Default => "",
+        AgentWorkflow::PrFriendly => PR_FRIENDLY_PROMPT,
+    };
     let role_prompt = match role {
-        AgentRole::Engineer { .. } => "",
-        AgentRole::PM => "",
+        AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => workflow_prompt,
+        AgentRole::PM | AgentRole::WorkflowPM { .. } => "",
         AgentRole::Advisor { .. } => ADVISOR_PROMPT,
     };
     let environment = render_environment_prompt(&workdirs);
-    if matches!(role, AgentRole::PM) {
+    if role.is_pm() {
         let projects = render_projects_prompt(projects);
-        return format!("{PM_BASE_PROMPT}{projects}{agents_md}{skills}{code_mode}{team_context}")
+        return format!("{PM_BASE_PROMPT}{workflow_prompt}{projects}{agents_md}{skills}{code_mode}{team_context}")
             .into();
     }
     format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}{role_prompt}{environment}")
@@ -153,7 +155,13 @@ pub fn claude_prompt(multi_agent: Option<&MultiAgentTools>, role: AgentRole) -> 
         format!("## Rho Team Context\n\n{identity}\n\n")
     });
     let role = match role {
-        AgentRole::Engineer { .. } | AgentRole::PM => "",
+        AgentRole::Engineer { .. }
+        | AgentRole::WorkflowEngineer { .. }
+        | AgentRole::PM
+        | AgentRole::WorkflowPM { .. } => match role.workflow() {
+            AgentWorkflow::Default => "",
+            AgentWorkflow::PrFriendly => PR_FRIENDLY_PROMPT,
+        },
         AgentRole::Advisor { .. } => ADVISOR_PROMPT,
     };
     format!("{team}{role}").into()
@@ -240,6 +248,17 @@ const ADVISOR_PROMPT: &str = "## Advisor
 You are an independent technical second opinion. Analyze the question deeply, \
 surface risks and tradeoffs, and recommend a path. You are advisory only: do \
 not implement changes.
+
+";
+
+const PR_FRIENDLY_PROMPT: &str = "## PR-Friendly Workflow
+
+Work in a GitHub-centered delivery flow. For completed tasks containing code \
+changes, use the `pr-workflow` skill to create a pull request unless the user \
+explicitly opted out. Do not ask for separate confirmation. Continue through \
+CI monitoring and report the pull request URL and terminal CI result. If you \
+are coordinating Engineers, treat their PR-creation and CI milestone messages \
+as user-facing updates and relay them promptly through the active surface.
 
 ";
 
@@ -562,6 +581,8 @@ mod tests {
         assert!(PM_BASE_PROMPT.contains("failed checks, or unresolved work"));
         assert!(PM_BASE_PROMPT.contains("Never claim work is complete"));
         assert!(ADVISOR_PROMPT.contains("advisory only"));
+        assert!(PR_FRIENDLY_PROMPT.contains("`pr-workflow` skill"));
+        assert!(PR_FRIENDLY_PROMPT.contains("terminal CI result"));
     }
 
     #[test]

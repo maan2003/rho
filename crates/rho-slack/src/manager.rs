@@ -445,15 +445,23 @@ impl SlackManager {
                 }];
                 let (agent_id, agent) = self
                     .pool
-                    .create_with_tool_extension(self.topic_id, AgentRole::PM, None, start, {
-                        let manager = Arc::downgrade(self);
-                        Arc::new(move |agent_id| {
-                            Arc::new(SlackTool {
-                                manager: manager.clone(),
-                                agent_id,
-                            }) as Arc<dyn AgentToolExtension>
-                        })
-                    })
+                    .create_with_tool_extension(
+                        self.topic_id,
+                        AgentRole::WorkflowPM {
+                            workflow: rho_agent::db::AgentWorkflow::PrFriendly,
+                        },
+                        None,
+                        start,
+                        {
+                            let manager = Arc::downgrade(self);
+                            Arc::new(move |agent_id| {
+                                Arc::new(SlackTool {
+                                    manager: manager.clone(),
+                                    agent_id,
+                                }) as Arc<dyn AgentToolExtension>
+                            })
+                        },
+                    )
                     .await
                     .context("creating slack session agent")?;
                 let mut write = self.db.write().await;

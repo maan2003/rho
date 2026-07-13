@@ -72,7 +72,7 @@ fn agent_role_resolves_opinionated_bindings() {
         })
     ));
     assert!(matches!(
-        AgentRole::PM.session_profile().unwrap(),
+        AgentRole::pm().session_profile().unwrap(),
         SessionBinding::CoordinatorSol(InferenceProfile {
             effort: ReasoningEffort::Low,
             code_mode: false,
@@ -136,7 +136,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
         topic,
         None,
         vec![test_workspace()],
-        AgentRole::PM.session_profile().unwrap(),
+        AgentRole::pm().session_profile().unwrap(),
         test_agent_runtime(),
         None,
     );

@@ -1389,7 +1389,7 @@ fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
         "eng-ultra" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Ultra,
         }),
-        "pm" => Ok(AgentRole::PM),
+        "pm" => Ok(AgentRole::pm()),
         other => Err(format!(
             "unknown role `{other}`; use eng, eng-low, eng-high, eng-ultra, or pm"
         )),
@@ -1401,21 +1401,37 @@ fn cycle_agent_role_text(current: &str) -> &'static str {
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
             ..
+        }
+        | AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Low,
+            ..
         } => "eng",
         AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
+            ..
+        }
+        | AgentRole::WorkflowEngineer {
             intelligence: EngineerIntelligence::Medium,
             ..
         } => "eng-high",
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
             ..
+        }
+        | AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::High,
+            ..
         } => "eng-ultra",
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Ultra,
             ..
+        }
+        | AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Ultra,
+            ..
         } => "pm",
         AgentRole::Advisor { .. } => "eng",
-        AgentRole::PM => "eng-low",
+        AgentRole::PM | AgentRole::WorkflowPM { .. } => "eng-low",
     }
 }
 
@@ -1426,7 +1442,7 @@ struct RoleLabel {
 
 fn agent_role_label(config: AgentRole) -> RoleLabel {
     match config {
-        AgentRole::PM => RoleLabel {
+        AgentRole::PM | AgentRole::WorkflowPM { .. } => RoleLabel {
             text: "pm".to_owned(),
             family: RoleFamily::Deep,
         },
@@ -1442,20 +1458,22 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
                 RoleFamily::Deep
             },
         },
-        AgentRole::Engineer { intelligence } => RoleLabel {
-            text: match intelligence {
-                EngineerIntelligence::Low => "eng-low",
-                EngineerIntelligence::Medium => "eng",
-                EngineerIntelligence::High => "eng-high",
-                EngineerIntelligence::Ultra => "eng-ultra",
+        AgentRole::Engineer { intelligence } | AgentRole::WorkflowEngineer { intelligence, .. } => {
+            RoleLabel {
+                text: match intelligence {
+                    EngineerIntelligence::Low => "eng-low",
+                    EngineerIntelligence::Medium => "eng",
+                    EngineerIntelligence::High => "eng-high",
+                    EngineerIntelligence::Ultra => "eng-ultra",
+                }
+                .to_owned(),
+                family: if intelligence == EngineerIntelligence::Ultra {
+                    RoleFamily::Fable
+                } else {
+                    RoleFamily::Deep
+                },
             }
-            .to_owned(),
-            family: if intelligence == EngineerIntelligence::Ultra {
-                RoleFamily::Fable
-            } else {
-                RoleFamily::Deep
-            },
-        },
+        }
     }
 }
 
@@ -1605,7 +1623,7 @@ mod tests {
                 intelligence: EngineerIntelligence::Low,
             }
         );
-        assert_eq!(parse_agent_role("pm").unwrap(), AgentRole::PM);
+        assert_eq!(parse_agent_role("pm").unwrap(), AgentRole::pm());
         assert!(parse_agent_role("pm ultra").is_err());
         assert!(parse_agent_role("eng-ultra-fast").is_err());
         assert!(parse_agent_role("advisor high").is_err());
@@ -1613,7 +1631,7 @@ mod tests {
 
     #[test]
     fn labels_agent_role() {
-        let label = agent_role_label(AgentRole::PM);
+        let label = agent_role_label(AgentRole::pm());
         assert_eq!(label.text, "pm");
     }
 }

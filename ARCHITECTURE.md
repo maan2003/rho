@@ -100,6 +100,13 @@ carry a UI-only name plus a description. PM prompts receive only project paths
 and descriptions so they can route Engineers without repository access of
 their own; UI clients retain names for display and selection.
 
+`AgentRole` also carries a persistence-compatible workflow distinction:
+existing Engineer/PM variants are the default workflow, while appended
+workflow-bearing Engineer/PM variants carry `AgentWorkflow`. Slack creates PMs
+with `PrFriendly`, and only Engineers spawned directly by those PMs inherit the
+workflow. The workflow adds `pr-workflow` guidance without changing the visible
+role label or model binding.
+
 `rho-slack` is the in-process Slack surface. `SlackManager` is handed the
 daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
 secret storage (`SecretStore`), the Socket Mode reconnect loop, the persisted

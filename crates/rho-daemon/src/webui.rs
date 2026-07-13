@@ -232,7 +232,7 @@ fn parse_role(role: &str) -> Option<AgentRole> {
         "eng-ultra" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Ultra,
         },
-        "pm" => AgentRole::PM,
+        "pm" => AgentRole::pm(),
         _ => return None,
     })
 }

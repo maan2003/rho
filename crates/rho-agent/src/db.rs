@@ -386,9 +386,27 @@ pub(crate) enum SessionBinding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum AgentRole {
-    Engineer { intelligence: EngineerIntelligence },
+    Engineer {
+        intelligence: EngineerIntelligence,
+    },
     PM,
-    Advisor { intelligence: AdvisorIntelligence },
+    Advisor {
+        intelligence: AdvisorIntelligence,
+    },
+    WorkflowEngineer {
+        intelligence: EngineerIntelligence,
+        workflow: AgentWorkflow,
+    },
+    WorkflowPM {
+        workflow: AgentWorkflow,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum AgentWorkflow {
+    #[default]
+    Default,
+    PrFriendly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -421,10 +439,27 @@ impl Default for AgentRole {
 }
 
 impl AgentRole {
+    pub fn pm() -> Self {
+        Self::PM
+    }
+
+    pub fn workflow(self) -> AgentWorkflow {
+        match self {
+            Self::WorkflowEngineer { workflow, .. } | Self::WorkflowPM { workflow } => workflow,
+            Self::Engineer { .. } | Self::PM | Self::Advisor { .. } => AgentWorkflow::Default,
+        }
+    }
+    pub fn is_pm(self) -> bool {
+        matches!(self, Self::PM | Self::WorkflowPM { .. })
+    }
+
+    pub fn is_engineer(self) -> bool {
+        matches!(self, Self::Engineer { .. } | Self::WorkflowEngineer { .. })
+    }
     pub fn handle_prefix(self) -> &'static str {
         match self {
-            Self::Engineer { .. } => "eng",
-            Self::PM => "pm",
+            Self::Engineer { .. } | Self::WorkflowEngineer { .. } => "eng",
+            Self::PM | Self::WorkflowPM { .. } => "pm",
             Self::Advisor { .. } => "adv",
         }
     }
@@ -436,21 +471,39 @@ impl AgentRole {
             code_mode: true,
         };
         Ok(match self {
-            AgentRole::PM => SessionBinding::CoordinatorSol(InferenceProfile {
-                code_mode: false,
-                ..deep(ReasoningEffort::Low)
-            }),
+            AgentRole::PM | AgentRole::WorkflowPM { .. } => {
+                SessionBinding::CoordinatorSol(InferenceProfile {
+                    code_mode: false,
+                    ..deep(ReasoningEffort::Low)
+                })
+            }
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Low,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Low,
+                ..
             } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Medium,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Medium,
+                ..
             } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::High,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::High,
+                ..
             } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Xhigh)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Ultra,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Ultra,
+                ..
             } => SessionBinding::ClaudeFable {
                 effort: ClaudeEffort::High,
             },
@@ -476,7 +529,7 @@ pub(crate) enum ClaudeEffort {
 impl SessionBinding {
     pub fn agent_role(self) -> AgentRole {
         if self.is_coordinator() {
-            return AgentRole::PM;
+            return AgentRole::pm();
         } else if matches!(self, Self::ClaudeAdvisor { .. }) {
             return AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::High,
@@ -637,6 +690,7 @@ pub trait AgentWriteTxnExt {
     fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status);
 
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
+    fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole);
 
     fn alloc_agent_id(&mut self) -> AgentId;
 
@@ -711,8 +765,10 @@ impl AgentProfileWriteTxnExt for WriteTxn {
                 .into_owned()
                 .role
             {
-                AgentRole::PM => AgentSpawnedBy::PM,
-                AgentRole::Engineer { .. } => AgentSpawnedBy::Engineer,
+                AgentRole::PM | AgentRole::WorkflowPM { .. } => AgentSpawnedBy::PM,
+                AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => {
+                    AgentSpawnedBy::Engineer
+                }
                 AgentRole::Advisor { .. } => panic!("Advisors cannot spawn agents"),
             }
         });
@@ -950,6 +1006,17 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
+    fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent missing")
+            .value()
+            .into_owned();
+        agent.role = role;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
     fn alloc_agent_id(&mut self) -> AgentId {
         let domain = AgentIdDomain(machine_seed(self));
         AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
@@ -1129,8 +1196,10 @@ fn migrate_agent_spawned_by(write: &mut WriteTxn) {
                         .get(&parent)
                         .expect("migrated parent agent must exist")
                     {
-                        AgentRole::PM => AgentSpawnedBy::PM,
-                        AgentRole::Engineer { .. } => AgentSpawnedBy::Engineer,
+                        AgentRole::PM | AgentRole::WorkflowPM { .. } => AgentSpawnedBy::PM,
+                        AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => {
+                            AgentSpawnedBy::Engineer
+                        }
                         AgentRole::Advisor { .. } => {
                             panic!("saved Advisor unexpectedly owns an agent")
                         }

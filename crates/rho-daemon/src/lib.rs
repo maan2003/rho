@@ -723,7 +723,7 @@ impl AgentRegistry {
         {
             anyhow::bail!("Advisors may only message agents and wait for replies");
         }
-        if matches!(role, AgentRole::PM)
+        if role.is_pm()
             && matches!(
                 &request,
                 McpAgentToolRequest::AskAdvisor { .. } | McpAgentToolRequest::Wait { .. }

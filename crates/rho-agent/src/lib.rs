@@ -529,6 +529,7 @@ impl Agent {
         db: RhoDb,
         auth: InferenceAuth,
         mode: SessionBinding,
+        role: db::AgentRole,
         topic_id: db::TopicId,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
@@ -566,13 +567,14 @@ impl Agent {
             AgentRuntime::Rho { prompt_cache_key },
             parent,
         );
+        write.set_agent_role(agent_id, role);
         write.commit();
         let agent = Self::new(
             db,
             auth,
             config,
             model,
-            mode.agent_role(),
+            role,
             prompt_cache_key,
             agent_id,
             next_event,
@@ -666,7 +668,7 @@ impl Agent {
     ) -> Self {
         // Role policy wins over persisted profiles created before PM code mode
         // was disabled.
-        let code_mode_enabled = config.code_mode && !matches!(role, db::AgentRole::PM);
+        let code_mode_enabled = config.code_mode && !role.is_pm();
         let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
         let multi_agent = pool
             .upgrade()
@@ -892,7 +894,7 @@ fn agent_tool_specs(
         return code_mode::tool_specs(shell_tools, multi_agent.then_some(role), tool_extension)
             .into();
     }
-    let mut specs = if matches!(role, db::AgentRole::PM) {
+    let mut specs = if role.is_pm() {
         Vec::new()
     } else {
         shell_tools.specs()

@@ -24,7 +24,7 @@ pub(crate) fn tool_specs(
     let documented = nested
         .iter()
         .filter(|tool| {
-            !matches!(role, Some(crate::db::AgentRole::Engineer { .. }))
+            !role.is_some_and(crate::db::AgentRole::is_engineer)
                 || !matches!(
                     tool.name.as_str(),
                     multi_agent_tools::SPAWN_ENGINEER_TOOL_NAME
@@ -47,7 +47,7 @@ fn nested_tools(
     role: Option<crate::db::AgentRole>,
     tool_extension: Option<&Arc<dyn AgentToolExtension>>,
 ) -> Vec<NestedTool> {
-    let mut specs = if matches!(role, Some(crate::db::AgentRole::PM)) {
+    let mut specs = if role.is_some_and(crate::db::AgentRole::is_pm) {
         Vec::new()
     } else {
         shell_tools.specs()
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn pm_always_sees_engineer_management_declarations() {
-        let specs = super::tool_specs(&shell_tools(), Some(crate::db::AgentRole::PM), None);
+        let specs = super::tool_specs(&shell_tools(), Some(crate::db::AgentRole::pm()), None);
         let exec = &specs[0].description;
         for name in ["spawn_engineer", "message_agent", "interrupt_engineer"] {
             assert!(exec.contains(name), "missing {name}: {exec}");

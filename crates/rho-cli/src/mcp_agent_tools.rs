@@ -83,7 +83,7 @@ async fn handle_request(
             "serverInfo": {"name": "rho-agent-tools", "version": env!("CARGO_PKG_VERSION")},
         })),
         "tools/list" => Ok(json!({
-            "tools": multi_agent_tools::agent_tool_specs(rho_agent::db::AgentRole::PM)
+            "tools": multi_agent_tools::agent_tool_specs(rho_agent::db::AgentRole::pm())
                 .into_iter()
                 .map(|tool| json!({
                     "name": tool.name.as_str(),

@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
 use crate::db::{
-    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime,
+    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWorkflow,
     AgentWriteTxnExt as _, InferenceModel, InferenceProfile, SessionBinding, TopicId,
 };
 use crate::lazy::Lazy;
@@ -208,15 +208,8 @@ impl AgentPool {
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        self.create_with_parent(
-            topic_id,
-            config.session_profile()?,
-            display_name,
-            start,
-            None,
-            None,
-        )
-        .await
+        self.create_with_parent(topic_id, config, display_name, start, None, None)
+            .await
     }
 
     pub async fn create_with_tool_extension(
@@ -229,7 +222,7 @@ impl AgentPool {
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         self.create_with_parent(
             topic_id,
-            config.session_profile()?,
+            config,
             display_name,
             start,
             None,
@@ -241,12 +234,13 @@ impl AgentPool {
     async fn create_with_parent(
         self: &Arc<Self>,
         topic_id: TopicId,
-        mode: SessionBinding,
+        config: AgentRole,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         parent: Option<AgentId>,
         tool_extension: Option<AgentToolExtensionFactory>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
+        let mode = config.session_profile()?;
         let (agent_id, agent) = match mode {
             SessionBinding::ResponsesGpt55(_)
             | SessionBinding::ResponsesSol(_)
@@ -259,6 +253,7 @@ impl AgentPool {
                     self.db.clone(),
                     self.auth.clone(),
                     mode,
+                    config,
                     topic_id,
                     display_name,
                     start,
@@ -278,6 +273,7 @@ impl AgentPool {
                     display_name,
                     start,
                     mode,
+                    config,
                     parent,
                     Arc::downgrade(self),
                 )
@@ -305,14 +301,14 @@ impl AgentPool {
         workdirs: Vec<SpawnWorkdir>,
         config: AgentRole,
     ) -> anyhow::Result<AgentId> {
-        let (topic_id, parent_workdirs) = {
+        let (topic_id, parent_workdirs, parent_role) = {
             let read = self.db.read();
             let topic_id = read
                 .agent_topic(parent)
                 .ok_or_else(|| anyhow::anyhow!("spawning agent belongs to no topic"))?;
             let record = read.get_agent(parent);
             self.enforce_spawn_limits(&read, parent)?;
-            (topic_id, record.workdirs)
+            (topic_id, record.workdirs, record.role)
         };
         let workdirs = if workdirs.is_empty() {
             parent_workdirs
@@ -363,15 +359,9 @@ impl AgentPool {
                 },
             });
         }
+        let config = child_role(parent_role, config);
         let (child_id, child) = self
-            .create_with_parent(
-                topic_id,
-                config.session_profile()?,
-                Some(task_name),
-                start,
-                Some(parent),
-                None,
-            )
+            .create_with_parent(topic_id, config, Some(task_name), start, Some(parent), None)
             .await?;
         let parent_label = self.agent_handle(parent);
         child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);
@@ -560,6 +550,30 @@ impl AgentPool {
     }
 }
 
+fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
+    match (parent, child) {
+        (
+            AgentRole::WorkflowPM {
+                workflow: AgentWorkflow::PrFriendly,
+            },
+            AgentRole::Engineer { intelligence, .. },
+        ) => AgentRole::WorkflowEngineer {
+            intelligence,
+            workflow: AgentWorkflow::PrFriendly,
+        },
+        (
+            AgentRole::WorkflowPM {
+                workflow: AgentWorkflow::PrFriendly,
+            },
+            AgentRole::WorkflowEngineer { intelligence, .. },
+        ) => AgentRole::WorkflowEngineer {
+            intelligence,
+            workflow: AgentWorkflow::PrFriendly,
+        },
+        (_, child) => child,
+    }
+}
+
 #[derive(Clone)]
 pub enum RunningAgent {
     Rho(Agent),
@@ -688,5 +702,34 @@ impl RunningAgent {
             Self::Rho(agent) => agent.subscribe().boxed(),
             Self::Claude(agent) => agent.subscribe().boxed(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{AgentWorkflow, EngineerIntelligence};
+
+    #[test]
+    fn pr_friendly_workflow_only_flows_from_pm_to_engineer() {
+        let engineer = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
+        };
+        let pr_pm = AgentRole::WorkflowPM {
+            workflow: AgentWorkflow::PrFriendly,
+        };
+        assert_eq!(
+            child_role(pr_pm, engineer).workflow(),
+            AgentWorkflow::PrFriendly
+        );
+
+        let pr_engineer = AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Medium,
+            workflow: AgentWorkflow::PrFriendly,
+        };
+        assert_eq!(
+            child_role(pr_engineer, engineer).workflow(),
+            AgentWorkflow::Default
+        );
     }
 }

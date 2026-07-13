@@ -106,7 +106,7 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
         "eng-ultra" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Ultra,
         },
-        "pm" => AgentRole::PM,
+        "pm" => AgentRole::pm(),
         "advisor" => AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
         },
@@ -352,7 +352,7 @@ fn status_name(status: Status) -> &'static str {
 fn config_name(config: rho_agent::db::AgentRole) -> String {
     use rho_agent::db::{AgentRole, EngineerIntelligence};
     match config {
-        AgentRole::PM => "pm".to_owned(),
+        AgentRole::PM | AgentRole::WorkflowPM { .. } => "pm".to_owned(),
         AgentRole::Advisor { intelligence } => format!(
             "advisor {}",
             match intelligence {
@@ -360,7 +360,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
                 rho_agent::db::AdvisorIntelligence::High => "high",
             }
         ),
-        AgentRole::Engineer { intelligence } => {
+        AgentRole::Engineer { intelligence } | AgentRole::WorkflowEngineer { intelligence, .. } => {
             let intelligence = match intelligence {
                 EngineerIntelligence::Low => "low",
                 EngineerIntelligence::Medium => "medium",
