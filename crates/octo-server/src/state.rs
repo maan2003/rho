@@ -29,9 +29,13 @@ impl AppState {
             url.set_host(Some("github.com"))?;
             url.set_path("");
         }
-        url.path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("GitHub URL cannot be a base"))?
-            .extend([owner, &format!("{repo}.git"), endpoint]);
+        let repo = format!("{repo}.git");
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("GitHub URL cannot be a base"))?;
+        segments.extend([owner, &repo]);
+        segments.extend(endpoint.split('/'));
+        drop(segments);
         Ok(url)
     }
 
@@ -195,7 +199,11 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use reqwest::Url;
+
+    use super::AppState;
 
     fn build_url(base: &str, segments: &[&str]) -> String {
         let mut url = Url::parse(base).unwrap();
@@ -218,6 +226,23 @@ mod tests {
         assert_eq!(
             build_url("https://api.github.com", &["repos", "owner/evil", "repo"]),
             "https://api.github.com/repos/owner%2Fevil/repo"
+        );
+    }
+
+    #[test]
+    fn github_git_url_preserves_endpoint_path_segments() {
+        let state = AppState {
+            client: reqwest::Client::new(),
+            token_provider: Arc::new(|| Ok("token".to_owned())),
+            github_api_url: Url::parse("https://api.github.com").unwrap(),
+        };
+
+        assert_eq!(
+            state
+                .github_git_url("fedimint", "fedimint", "info/refs")
+                .unwrap()
+                .as_str(),
+            "https://github.com/fedimint/fedimint.git/info/refs"
         );
     }
 
