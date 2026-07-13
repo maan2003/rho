@@ -82,7 +82,7 @@ impl SlackManager {
             topic_id,
             user_names: tokio::sync::Mutex::new(HashMap::new()),
             in_progress: tokio::sync::Mutex::new(HashMap::new()),
-            source_id: next_source_id(),
+            source_id: InputSourceId::fresh(),
             secrets: std::sync::Mutex::new(None),
             run_task: std::sync::Mutex::new(None),
         });
@@ -490,11 +490,6 @@ impl SlackManager {
     }
 }
 
-fn next_source_id() -> InputSourceId {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    InputSourceId::from_raw(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-}
-
 fn should_relay_input(
     report: &rho_agent::pool::AgentInputAccepted,
     own_source_id: InputSourceId,
@@ -507,7 +502,9 @@ fn should_relay_input_source(
     source_id: Option<InputSourceId>,
     own_source_id: InputSourceId,
 ) -> bool {
-    sender == MessageSender::User && source_id != Some(own_source_id)
+    sender == MessageSender::User
+        && source_id != Some(own_source_id)
+        && !source_id.is_some_and(InputSourceId::is_internal)
 }
 
 fn local_input_relay_text(text: &str) -> String {
@@ -778,6 +775,11 @@ mod tests {
             own
         ));
         assert!(should_relay_input_source(MessageSender::User, None, own));
+        assert!(!should_relay_input_source(
+            MessageSender::User,
+            Some(InputSourceId::fresh_internal()),
+            own
+        ));
         assert!(!should_relay_input_source(
             MessageSender::Agent {
                 id: rho_agent::db::AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(0))

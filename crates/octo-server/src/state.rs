@@ -4,14 +4,12 @@ use anyhow::Result;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt as _;
 use reqwest::{Client, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::AppError;
-
-#[allow(dead_code)]
-const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 
 pub type TokenProvider = Arc<dyn Fn() -> Result<String> + Send + Sync>;
 
@@ -23,6 +21,8 @@ pub struct AppState {
 }
 
 impl AppState {
+    const MAX_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
     pub(crate) fn github_git_url(&self, owner: &str, repo: &str, endpoint: &str) -> Result<Url> {
         let mut url = self.github_api_url.clone();
         if url.host_str() == Some("api.github.com") {
@@ -50,7 +50,6 @@ impl AppState {
             })
     }
 
-    #[allow(dead_code)]
     pub async fn execute_graphql<T: DeserializeOwned>(
         &self,
         query: &str,
@@ -63,17 +62,41 @@ impl AppState {
             "variables": variables,
         });
 
+        let mut url = self.github_api_url.clone();
+        url.set_path("/graphql");
+        url.set_query(None);
         let resp = self
             .client
-            .post(GITHUB_GRAPHQL_URL)
+            .post(url)
             .header("Authorization", format!("Bearer {}", token))
             .header("User-Agent", "octo")
             .json(&body)
             .send()
             .await?;
-
-        let result: T = resp.json().await?;
+        let status = resp.status();
+        let bytes = Self::bounded_response_bytes(resp).await?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "GitHub GraphQL returned {}: {}",
+                status,
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let result: T = serde_json::from_slice(&bytes)?;
         Ok(result)
+    }
+
+    async fn bounded_response_bytes(mut response: reqwest::Response) -> Result<bytes::Bytes> {
+        let mut body = bytes::BytesMut::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                body.len().saturating_add(chunk.len()) <= Self::MAX_JSON_RESPONSE_BYTES,
+                "GitHub JSON response exceeded {} bytes",
+                Self::MAX_JSON_RESPONSE_BYTES
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body.freeze())
     }
 
     fn build_url(&self, segments: &[&str], query: Option<&str>) -> Url {
@@ -102,13 +125,28 @@ impl AppState {
     fn reqwest_to_response(
         resp: reqwest::Response,
     ) -> impl std::future::Future<Output = Result<Response, AppError>> {
+        const MAX_PROXY_BYTES: usize = 48 * 1024 * 1024;
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
         let mut headers = HeaderMap::new();
         if let Some(ct) = resp.headers().get("content-type") {
             headers.insert("content-type", ct.clone());
         }
         async move {
-            let body = Body::from(resp.bytes().await?);
+            let mut received = 0_usize;
+            let stream = resp.bytes_stream().map(move |chunk| match chunk {
+                Ok(chunk) => {
+                    received = received.saturating_add(chunk.len());
+                    if received > MAX_PROXY_BYTES {
+                        Err(std::io::Error::other(
+                            "GitHub response exceeded the 48 MiB proxy limit",
+                        ))
+                    } else {
+                        Ok(chunk)
+                    }
+                }
+                Err(error) => Err(std::io::Error::other(error)),
+            });
+            let body = Body::from_stream(stream);
             Ok((status, headers, body).into_response())
         }
     }
@@ -161,13 +199,45 @@ impl AppState {
             .await?;
 
         let status = resp.status();
+        let bytes = Self::bounded_response_bytes(resp).await?;
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub returned {}: {}", status, text);
+            anyhow::bail!(
+                "GitHub returned {}: {}",
+                status,
+                String::from_utf8_lossy(&bytes)
+            );
         }
-
-        let result = resp.json().await?;
+        let result = serde_json::from_slice(&bytes)?;
         Ok(result)
+    }
+
+    /// Fetch a bounded GitHub REST collection. The bound prevents a watched
+    /// PR with pathological history from monopolizing the daemon.
+    pub async fn github_get_json_pages(
+        &self,
+        segments: &[&str],
+        max_pages: usize,
+    ) -> Result<serde_json::Value> {
+        let mut values = Vec::new();
+        for page in 1..=max_pages {
+            let value = self
+                .github_get_json(segments, Some(&format!("per_page=100&page={page}")))
+                .await?;
+            let page_values = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("GitHub collection response was not an array"))?;
+            let complete = page_values.len() < 100;
+            values.extend(page_values.iter().cloned());
+            if complete {
+                break;
+            }
+            if page == max_pages {
+                anyhow::bail!(
+                    "GitHub collection exceeds the configured {max_pages}-page safety bound"
+                );
+            }
+        }
+        Ok(serde_json::Value::Array(values))
     }
 
     pub async fn github_post_json<B: Serialize>(
@@ -187,12 +257,15 @@ impl AppState {
             .await?;
 
         let status = resp.status();
+        let bytes = Self::bounded_response_bytes(resp).await?;
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub returned {}: {}", status, text);
+            anyhow::bail!(
+                "GitHub returned {}: {}",
+                status,
+                String::from_utf8_lossy(&bytes)
+            );
         }
-
-        let result = resp.json().await?;
+        let result = serde_json::from_slice(&bytes)?;
         Ok(result)
     }
 }

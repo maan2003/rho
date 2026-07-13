@@ -236,7 +236,8 @@ async fn run(
             | ServerMessage::McpAgentToolResult(_)
             | ServerMessage::PlatformStatus { .. }
             | ServerMessage::IrohApproved { .. }
-            | ServerMessage::IrohRevoked { .. } => None,
+            | ServerMessage::IrohRevoked { .. }
+            | ServerMessage::PrCommandResult { .. } => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()

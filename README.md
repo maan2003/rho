@@ -94,9 +94,10 @@ Rho's platform skills under `$out/share/rho/skills`; project and user skills
 with the same name take precedence.
 
 The daemon also runs an embedded Octo GitHub helper server for agent commands.
-Install its GitHub token with `rho octo init`; the token is read from stdin and
-kept in the daemon's sealed RAM-only platform secret store. The `octo` CLI and
-Git remote helper use the service's fixed local socket path. Git and Jujutsu can
+Install its GitHub token with `rho pr init`; the token is read from stdin and
+kept in the daemon's sealed RAM-only platform secret store. `rho pr` uses the
+normal daemon socket, while the Git remote helper uses Octo's private socket.
+Git and Jujutsu can
 fetch any repository available to the sealed token and push temporary
 collaboration branches by using an explicit
 `octo://github.com/OWNER/REPOSITORY` remote:
@@ -114,6 +115,26 @@ The installed `git-remote-octo` helper uses Rho's private Unix-socket-enabled
 Fetches are read-only and authorized by the token's repository access. Octo
 accepts writes only below `refs/heads/rho/`; normal branches and tags are
 rejected by the daemon.
+
+Engineers create or adopt pull requests with `rho pr`; `rho-pr-monitor`
+persists the resulting subscription, checks CI, published review feedback,
+mergeability, and terminal state every two minutes, and wakes the Engineer
+only for meaningful changes. Monitoring
+continues after CI turns green and ends when the PR merges, closes, or is
+explicitly detached. Octo remains the authenticated GitHub API transport;
+subscription ownership and replies are constrained through normal daemon
+commands.
+
+```sh
+rho pr create --head rho/my-change --title "..." --body "..."
+rho pr subscribe https://github.com/acme/library/pull/123 --replay-existing
+rho pr status https://github.com/acme/library/pull/123
+rho pr logs https://github.com/acme/library/pull/123 RUN_ID
+rho pr comment https://github.com/acme/library/pull/123 --reply EVENT_ID --body "Addressed in COMMIT."
+```
+
+Agent subprocesses infer the subscriber from `RHO_AGENT_ID`; an interactive
+user can select one explicitly with `rho pr --agent eng-ID ...`.
 
 For one-shot use:
 

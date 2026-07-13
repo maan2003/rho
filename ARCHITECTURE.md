@@ -103,9 +103,10 @@ their own; UI clients retain names for display and selection.
 `AgentRole` also carries a persistence-compatible workflow distinction:
 existing Engineer/PM variants are the default workflow, while appended
 workflow-bearing Engineer/PM variants carry `AgentWorkflow`. Slack creates PMs
-with `PrFriendly`, and only Engineers spawned directly by those PMs inherit the
-workflow. The workflow adds `pr-workflow` guidance without changing the visible
-role label or model binding.
+with the persistence-compatible `AgentWorkflow::PrFriendly` marker, and only
+Engineers spawned directly by those PMs inherit it. The marker activates
+`github-workflow` guidance without changing the visible role label or model
+binding.
 
 `rho-slack` is the in-process Slack surface. `SlackManager` is handed the
 daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
@@ -120,9 +121,10 @@ agent turn-completion and accepted-input reports through `AgentPool`; Slack uses
 completed-turn reports for reaction cleanup, not automatic final-answer posting,
 and the daemon does not own Slack routing policy.
 
-`octo-server`/`octo` are vendored GitHub helper crates from `~maan2003/claude`.
-Rho runs `octo-server` in-process on the fixed per-user Octo Unix socket; the
-`octo` CLI is the agent-facing client. The daemon owns platform secret
+`octo-server` and its Git remote helper are vendored GitHub helper components.
+Rho runs `octo-server` in-process on the fixed per-user Octo Unix socket. The
+user- and agent-facing PR client is `rho pr` over the normal daemon socket;
+Octo remains an internal authenticated API/Git transport. The daemon owns platform secret
 installation and fd-store resume, so the server receives GitHub tokens only
 through a RAM-only callback into the sealed platform secret store. The
 `git-remote-octo` Git remote helper invokes a private
@@ -130,6 +132,27 @@ Nix-patched `git-remote-http` whose libcurl connection uses that Unix socket; it
 does not replace Git globally. Octo proxies authenticated fetches for any
 repository available to its token, and pushes after restricting destination
 refs to `refs/heads/rho/*`.
+
+`rho-pr-monitor` owns long-lived pull-request policy while Octo remains only
+the authenticated GitHub API boundary. Engineers create or adopt PRs through
+`rho pr`, which persists the stable GitHub repository id and PR number,
+registration generation, subscriber Engineer, feedback revisions, CI/check
+state, mergeability, and constrained reply targets in `rho-db`. A daemon task
+polls at most 16 open watches every two minutes, filters pending reviews and
+untrusted human authors, wakes the subscribed Engineer on meaningful CI,
+review, mergeability, or terminal changes, and keeps watching after CI turns
+green until merge/close.
+The Engineer handles repository work and GitHub replies directly, then sends
+concise milestones to its parent so Slack-bound PMs can relay them. The
+standalone `octo` CLI is not installed; only `git-remote-octo` uses Octo's
+private socket directly.
+
+The normal UI protocol carries request-id-scoped `rho pr` commands and their
+text or bounded log-archive results. Agent-side commands identify the
+subscriber from `RHO_AGENT_ID`; the daemon resolves and validates the Engineer
+before calling `rho-pr-monitor`. The CLI process never owns a polling loop:
+subscribe/create return immediately, while the daemon later loads and wakes
+the persisted Engineer through `AgentPool`.
 
 The daemon's UI protocol (`rho-ui-proto`) is served over two transports, all
 through the same per-connection handler: the local Unix socket, and iroh

@@ -37,7 +37,7 @@ AI APIs.
   security boundary.
 - Messaging-platform/API secrets (e.g. Slack tokens and Octo's GitHub token)
   reach the daemon over the UI socket (`rho slack init --dir <coordinator-repo>`
-  and `rho octo init` read them from stdin) — never via argv, exec-time
+  and `rho pr init` read them from stdin) — never via argv, exec-time
   environment, or files. `rho_slack::SecretStore` holds them in a sealed memfd
   and stashes/reclaims it via the systemd fd store (`FDSTORE=1`/`$LISTEN_FDS`),
   so tokens never touch disk and survive daemon restarts but not reboots. The
@@ -54,7 +54,9 @@ AI APIs.
   inputs are tagged with a private in-memory source id so the Slack relay can
   ignore its own accepted-input reports; other local-client user inputs to
   Slack-mapped agents are mirrored into the mapped thread with conservative
-  attribution.
+  attribution. Integration-internal control inputs (including PR-monitor
+  wakeups) carry a process-local internal source tag and are not mirrored
+  verbatim; the PM must relay an appropriate user-facing summary explicitly.
 - The embedded Octo server listens only on its fixed per-user Unix socket.
   Clients derive that path from the same `octo-types` contract rather than an
   environment variable. Octo uses the sealed platform
@@ -65,6 +67,38 @@ AI APIs.
   framing is bounded before pack data is streamed. GitHub API and Git protocol
   responses and errors are remote, semi-trusted input and are returned to the
   calling command rather than panicking.
+- `rho-pr-monitor` uses Octo only for bounded authenticated GitHub API calls;
+  subscription ownership and operations stay behind `rho pr` on the normal
+  daemon socket. Agent invocations identify the subscriber with
+  `RHO_AGENT_ID`; interactive invocations may use `--agent`. The daemon
+  resolves that handle, requires an Engineer role, and generation-binds every
+  subscription and feedback target. This is request scoping, not a new local
+  authorization boundary: clients able to reach the privileged daemon socket
+  already have equivalent control.
+  Watches accept only canonical HTTPS GitHub PR URLs and bind replies to the
+  Engineer that registered the stable repository-id/PR-number pair. Human
+  feedback wakes an agent only for the PR author or OWNER/MEMBER/COLLABORATOR
+  associations; bot feedback requires an exact per-watch login allowlist.
+  Bodies and diff context are length-bounded and explicitly labeled untrusted
+  before entering an Engineer prompt. Pending reviews are not delivered.
+  Top-level comments require an active subscription owned by the calling
+  Engineer. When replying to feedback, the event must also belong to that same
+  PR and subscription generation.
+  Outbound markers suppress input only when the comment author matches GitHub's
+  authenticated viewer id. Event replies carry a reserved random operation
+  marker for ambiguous retry recovery; reply commands revalidate subscription
+  ownership and stored targets, limiting loops and preventing arbitrary GitHub
+  comments through the CLI surface.
+  Polling is capped at 16 active watches, two pages per feedback surface, 100
+  CI records per API family, and 4 MiB per GitHub JSON response. It uses
+  request timeouts and exponential error backoff, emits only state changes,
+  and stops on merge/close. CI log archives are stream-limited to 48 MiB on
+  both socket hops; extraction permits at most 1,000 files, 16 MiB per entry,
+  and 128 MiB total expanded data. GitHub comments, bot output, paths, links, and diff
+  hunks remain prompt-injection-capable input;
+  Engineers must validate claims against the repository before changing or
+  executing code, and summarize meaningful milestones to their parent rather
+  than forwarding raw review text.
 
 ## Remote UI transports (iroh and web UI)
 

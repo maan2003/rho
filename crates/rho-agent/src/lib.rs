@@ -128,15 +128,31 @@ pub struct AgentInputId {
 
 /// Opaque tag for the surface that submitted an input.
 ///
-/// The value is deliberately policy-free: consumers can compare it for equality
-/// with a private value they own, but should not infer a user-visible origin
-/// from it.
+/// Consumers may compare private source values or honor the internal-routing
+/// bit, but should not infer a user-visible platform identity from the value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub struct InputSourceId(u64);
 
 impl InputSourceId {
     pub fn from_raw(raw: u64) -> Self {
         Self(raw)
+    }
+
+    /// Allocate a process-local source id shared by external integrations.
+    pub fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Allocate an input source for integration-to-agent control messages
+    /// that should not be mirrored verbatim onto external chat surfaces.
+    pub fn fresh_internal() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self((1_u64 << 63) | NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn is_internal(self) -> bool {
+        self.0 & (1_u64 << 63) != 0
     }
 }
 

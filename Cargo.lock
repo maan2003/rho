@@ -4570,6 +4570,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-remote-octo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "octo-types",
+ "reqwest 0.12.28",
+]
+
+[[package]]
 name = "git_hosting_providers"
 version = "0.1.0"
 source = "git+https://github.com/maan2003/zed?branch=rho#dfc715bd07444fbc0736e0c3fe09efc8b7c30598"
@@ -8343,23 +8352,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "octo"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "octo-types",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "zip",
-]
-
-[[package]]
 name = "octo-server"
 version = "0.1.0"
 dependencies = [
@@ -10381,6 +10373,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]
@@ -10463,6 +10456,7 @@ dependencies = [
  "rho-db",
  "rho-inference",
  "rho-iroh-auth",
+ "rho-pr-monitor",
  "rho-slack",
  "rho-ui-proto",
  "rho-voice",
@@ -10570,6 +10564,28 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "rho-pr-monitor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures-util",
+ "octo-types",
+ "rand 0.8.6",
+ "redb",
+ "reqwest 0.12.28",
+ "rho-agent",
+ "rho-db",
+ "senax-encoder",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

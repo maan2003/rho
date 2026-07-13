@@ -198,6 +198,49 @@ pub enum ClientMessage {
     IrohRevoke {
         endpoint_id: String,
     },
+    PrCommand {
+        request_id: u64,
+        agent_id: Option<String>,
+        command: PrCommand,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum PrCommand {
+    Create {
+        owner: String,
+        repo: String,
+        head: String,
+        base: String,
+        title: String,
+        body: String,
+        review_bots: Vec<String>,
+    },
+    Subscribe {
+        url: String,
+        replay_existing: bool,
+        review_bots: Vec<String>,
+    },
+    Status {
+        url: String,
+    },
+    List,
+    Stop {
+        url: String,
+    },
+    Comment {
+        url: String,
+        reply: Option<String>,
+        body: String,
+    },
+    Rerun {
+        url: String,
+        run_id: u64,
+    },
+    Logs {
+        url: String,
+        run_id: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -406,6 +449,12 @@ pub enum ServerMessage {
     },
     IrohRevoked {
         endpoint_id: String,
+    },
+    PrCommandResult {
+        request_id: u64,
+        output: String,
+        data: Vec<u8>,
+        is_error: bool,
     },
 }
 
@@ -735,5 +784,22 @@ mod tests {
         let mut payload = &recorded_frame[4..];
         let message: ClientMessage = senax_encoder::unpack(&mut payload).unwrap();
         assert_eq!(message, ClientMessage::Ping);
+    }
+
+    #[test]
+    fn pr_command_round_trips() {
+        let message = ClientMessage::PrCommand {
+            request_id: 7,
+            agent_id: Some("eng-abcd".into()),
+            command: PrCommand::Comment {
+                url: "https://github.com/acme/widgets/pull/1".into(),
+                reply: Some("inline:9:v1".into()),
+                body: "addressed".into(),
+            },
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
     }
 }

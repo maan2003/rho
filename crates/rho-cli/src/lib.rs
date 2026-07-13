@@ -32,7 +32,7 @@ mod completion;
 mod land;
 mod markdown;
 mod mcp_agent_tools;
-mod octo_cli;
+mod pr;
 mod slack;
 mod tool_render;
 
@@ -85,7 +85,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Iroh(args) => run_iroh(args).await,
         Command::Land(args) => land::run(args).await,
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
-        Command::Octo(args) => octo_cli::run(args).await,
+        Command::Pr(args) => pr::run(args).await,
         Command::Slack(args) => slack::run(args).await,
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
@@ -1176,7 +1176,7 @@ enum Command {
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
-    Octo(OctoArgs),
+    Pr(PrArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
 }
@@ -1206,7 +1206,7 @@ enum CliCommand {
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
-    Octo(OctoArgs),
+    Pr(PrArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
 }
@@ -1250,19 +1250,60 @@ pub(crate) enum SlackCommand {
 }
 
 #[derive(Clone, clap::Args)]
-pub(crate) struct OctoArgs {
+pub(crate) struct PrArgs {
     #[arg(long = "auth", default_value = "default")]
     auth: String,
     #[arg(long = "socket-path")]
     socket_path: Option<PathBuf>,
+    #[arg(long)]
+    agent: Option<String>,
     #[command(subcommand)]
-    command: OctoCommand,
+    command: PrCliCommand,
 }
 
 #[derive(Clone, Subcommand)]
-pub(crate) enum OctoCommand {
-    /// Install a GitHub token (read from stdin) for the daemon's Octo server.
+pub(crate) enum PrCliCommand {
+    /// Install the GitHub token used for PR and Git transport operations.
     Init,
+    /// Create a draft pull request and subscribe the current Engineer.
+    Create {
+        #[arg(short = 'H', long)]
+        head: String,
+        #[arg(short = 'B', long)]
+        base: Option<String>,
+        #[arg(short = 't', long)]
+        title: String,
+        #[arg(short = 'b', long)]
+        body: String,
+        #[arg(long = "review-bot")]
+        review_bots: Vec<String>,
+    },
+    /// Subscribe the current Engineer to an existing pull request.
+    Subscribe {
+        url: String,
+        #[arg(long)]
+        replay_existing: bool,
+        #[arg(long = "review-bot")]
+        review_bots: Vec<String>,
+    },
+    /// Fetch the current PR, CI, and review snapshot.
+    Status { url: String },
+    /// List this Engineer's persisted PR subscriptions.
+    List,
+    /// Stop monitoring an open pull request.
+    Stop { url: String },
+    /// Add a PR comment, optionally replying to a delivered feedback event.
+    Comment {
+        url: String,
+        #[arg(long)]
+        reply: Option<String>,
+        #[arg(short = 'b', long)]
+        body: String,
+    },
+    /// Rerun failed jobs in a GitHub Actions workflow run.
+    Rerun { url: String, run_id: u64 },
+    /// Download and extract logs for a GitHub Actions workflow run.
+    Logs { url: String, run_id: u64 },
 }
 
 #[derive(Clone, clap::Args)]
@@ -1314,7 +1355,7 @@ impl Args {
             Some(CliCommand::Iroh(args)) => Command::Iroh(args),
             Some(CliCommand::Land(args)) => Command::Land(args),
             Some(CliCommand::McpAgentTools(args)) => Command::McpAgentTools(args),
-            Some(CliCommand::Octo(args)) => Command::Octo(args),
+            Some(CliCommand::Pr(args)) => Command::Pr(args),
             Some(CliCommand::ProtocolLog(args)) => Command::ProtocolLog(args),
             Some(CliCommand::Slack(args)) => Command::Slack(args),
             None => Command::Chat(cli.chat),

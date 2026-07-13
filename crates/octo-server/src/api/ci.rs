@@ -89,6 +89,8 @@ fn extract_runs(runs_json: &serde_json::Value) -> Vec<WorkflowRun> {
                 .map(|r| WorkflowRun {
                     id: r["id"].as_u64().unwrap_or(0),
                     name: r["name"].as_str().unwrap_or("").to_string(),
+                    kind: "workflow".to_owned(),
+                    url: r["html_url"].as_str().unwrap_or("").to_owned(),
                     status: r["status"].as_str().unwrap_or("").to_string(),
                     conclusion: r["conclusion"].as_str().map(|s| s.to_string()),
                 })
@@ -101,6 +103,8 @@ fn extract_run(run_json: &serde_json::Value) -> WorkflowRun {
     WorkflowRun {
         id: run_json["id"].as_u64().unwrap_or(0),
         name: run_json["name"].as_str().unwrap_or("").to_string(),
+        kind: "workflow".to_owned(),
+        url: run_json["html_url"].as_str().unwrap_or("").to_owned(),
         status: run_json["status"].as_str().unwrap_or("").to_string(),
         conclusion: run_json["conclusion"].as_str().map(|s| s.to_string()),
     }

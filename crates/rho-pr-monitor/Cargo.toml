@@ -1,0 +1,29 @@
+[package]
+name = "rho-pr-monitor"
+description = "Durable GitHub pull-request monitoring and Engineer wakeups for Rho"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+octo-types.workspace = true
+redb.workspace = true
+rand.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+rho-agent.workspace = true
+rho-db.workspace = true
+senax-encoder.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

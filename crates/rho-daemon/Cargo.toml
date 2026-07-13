@@ -24,6 +24,7 @@ rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
 rho-iroh-auth.workspace = true
+rho-pr-monitor.workspace = true
 rho-slack.workspace = true
 rho-ui-proto.workspace = true
 rho-voice.workspace = true

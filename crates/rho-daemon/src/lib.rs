@@ -238,7 +238,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             platform_secrets,
             iroh_auth,
         )
-        .await,
+        .await?,
     );
     agents.resume_platform_integrations();
 
@@ -442,6 +442,8 @@ struct AgentRegistry {
     /// In-process Slack connection and its thread sessions
     /// (see [`rho_slack::SlackManager`]).
     slack: Arc<rho_slack::SlackManager>,
+    /// Durable CI and review-feedback watches owned by PR-friendly PMs.
+    pr_monitor: Arc<rho_pr_monitor::PrMonitor>,
     /// Shared sealed platform secret store used by Slack and Octo.
     platform_secrets: PlatformSecrets,
     /// Daemon-wide fanout for messages every client must hear regardless of
@@ -460,7 +462,7 @@ impl AgentRegistry {
         user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
         iroh_auth: Option<rho_iroh_auth::IrohAuth>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let pool = AgentPool::new(db.clone(), auth.clone(), path_overrides, user_environment).await;
         let machine_seed = db.read().machine_seed();
         // Topics are ad-hoc tab groups; every agent starts in the default
@@ -484,6 +486,7 @@ impl AgentRegistry {
             }
         };
         let slack = rho_slack::SlackManager::new(pool.clone(), db.clone()).await;
+        let pr_monitor = rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone()).await?;
         let registry = Self {
             pool,
             db,
@@ -496,12 +499,13 @@ impl AgentRegistry {
             land_statuses: Mutex::new(HashMap::new()),
             voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             slack,
+            pr_monitor,
             platform_secrets,
             events: broadcast::channel(1024).0,
             iroh_auth,
         };
         registry.pool.load_non_hidden_agents().await;
-        registry
+        Ok(registry)
     }
 
     fn resume_platform_integrations(self: &Arc<Self>) {
@@ -881,10 +885,11 @@ impl AgentRegistry {
     }
 
     fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
-        let (prefix, raw_agent_id) = agent_id
-            .trim()
-            .split_once('-')
-            .ok_or_else(|| anyhow::anyhow!("invalid role-prefixed agent id"))?;
+        let text = agent_id.trim();
+        let (prefix, raw_agent_id) = match text.split_once('-') {
+            Some((prefix, raw)) => (Some(prefix), raw),
+            None => (None, text),
+        };
         let resolved = match self.pool.resolve_agent_id(raw_agent_id)? {
             prefix_id::PrefixResolution::Unique(agent_id) => agent_id,
             prefix_id::PrefixResolution::Ambiguous { .. } => {
@@ -897,11 +902,13 @@ impl AgentRegistry {
         if !self.pool.agent_exists(resolved) {
             anyhow::bail!("no agent with id {agent_id}");
         }
-        let expected = self.db.read().get_agent(resolved).role.handle_prefix();
-        anyhow::ensure!(
-            prefix == expected,
-            "agent handle prefix does not match its role"
-        );
+        if let Some(prefix) = prefix {
+            let expected = self.db.read().get_agent(resolved).role.handle_prefix();
+            anyhow::ensure!(
+                prefix == expected,
+                "agent handle prefix does not match its role"
+            );
+        }
         Ok(resolved)
     }
 
@@ -1386,7 +1393,7 @@ async fn handle_message(
                             Err(error) => (false, format!("{error:#}")),
                         }
                     } else if wants_octo && store.read()?.contains_key("GITHUB_TOKEN") {
-                        (true, format!("octo secrets installed{persistence}"))
+                        (true, format!("GitHub secrets installed{persistence}"))
                     } else {
                         (true, format!("platform secrets installed{persistence}"))
                     }
@@ -1394,6 +1401,93 @@ async fn handle_message(
                 Err(error) => (false, format!("{error:#}")),
             };
             let _ = outgoing_tx.send(ServerMessage::PlatformStatus { running, detail });
+            Ok(Refresh::None)
+        }
+        ClientMessage::PrCommand {
+            request_id,
+            agent_id,
+            command,
+        } => {
+            let result = async {
+                let raw_agent_id =
+                    agent_id.ok_or_else(|| anyhow::anyhow!("missing --agent or RHO_AGENT_ID"))?;
+                let agent_id = agents.resolve_display_agent_id(&raw_agent_id)?;
+                match command {
+                    rho_ui_proto::PrCommand::Create {
+                        owner,
+                        repo,
+                        head,
+                        base,
+                        title,
+                        body,
+                        review_bots,
+                    } => agents
+                        .pr_monitor
+                        .create_and_subscribe(
+                            agent_id,
+                            rho_pr_monitor::CreatePullRequest {
+                                owner,
+                                repo,
+                                head,
+                                base,
+                                title,
+                                body,
+                                approved_review_bots: review_bots,
+                            },
+                        )
+                        .await
+                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Subscribe {
+                        url,
+                        replay_existing,
+                        review_bots,
+                    } => agents
+                        .pr_monitor
+                        .subscribe(agent_id, &url, replay_existing, review_bots)
+                        .await
+                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Status { url } => agents
+                        .pr_monitor
+                        .status(agent_id, &url)
+                        .await
+                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::List => agents
+                        .pr_monitor
+                        .list(agent_id)
+                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Stop { url } => agents
+                        .pr_monitor
+                        .stop(agent_id, &url)
+                        .await
+                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Comment { url, reply, body } => agents
+                        .pr_monitor
+                        .comment(agent_id, &url, &body, reply.as_deref())
+                        .await
+                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Rerun { url, run_id } => agents
+                        .pr_monitor
+                        .rerun(agent_id, &url, run_id)
+                        .await
+                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Logs { url, run_id } => agents
+                        .pr_monitor
+                        .logs(agent_id, &url, run_id)
+                        .await
+                        .map(|data| (format!("downloaded logs for run {run_id}"), data.to_vec())),
+                }
+            }
+            .await;
+            let (output, data, is_error) = match result {
+                Ok((output, data)) => (output, data, false),
+                Err(error) => (format!("{error:#}"), Vec::new(), true),
+            };
+            let _ = outgoing_tx.send(ServerMessage::PrCommandResult {
+                request_id,
+                output,
+                data,
+                is_error,
+            });
             Ok(Refresh::None)
         }
         ClientMessage::Subscribe => Ok(Refresh::None),

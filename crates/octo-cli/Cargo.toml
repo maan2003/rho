@@ -1,5 +1,5 @@
 [package]
-name = "octo"
+name = "git-remote-octo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,5 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bytes.workspace = true
-clap.workspace = true
 octo-types.workspace = true
-regex.workspace = true
 reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tempfile.workspace = true
-tokio.workspace = true
-zip.workspace = true

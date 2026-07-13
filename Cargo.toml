@@ -20,6 +20,7 @@ members = [
   "crates/rho-gui",
   "crates/rho-inference",
   "crates/rho-iroh-auth",
+  "crates/rho-pr-monitor",
   "crates/rho-slack",
   "crates/rho-term-screen",
   "crates/rho-tool-shell",
@@ -90,6 +91,7 @@ rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
 rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
+rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-slack = { path = "crates/rho-slack" }
 rho-term-screen = { path = "crates/rho-term-screen" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }

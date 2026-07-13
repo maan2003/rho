@@ -248,7 +248,8 @@ impl AgentClient {
                     | ServerMessage::McpAgentToolResult(_)
                     | ServerMessage::PlatformStatus { .. }
                     | ServerMessage::IrohApproved { .. }
-                    | ServerMessage::IrohRevoked { .. } => {}
+                    | ServerMessage::IrohRevoked { .. }
+                    | ServerMessage::PrCommandResult { .. } => {}
                 }
             }
         });

@@ -711,7 +711,7 @@ mod tests {
     use crate::db::{AgentWorkflow, EngineerIntelligence};
 
     #[test]
-    fn pr_friendly_workflow_only_flows_from_pm_to_engineer() {
+    fn github_workflow_only_flows_from_pm_to_engineer() {
         let engineer = AgentRole::Engineer {
             intelligence: EngineerIntelligence::Medium,
         };
