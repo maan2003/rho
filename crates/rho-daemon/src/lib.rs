@@ -57,7 +57,7 @@ fn login_environment() -> anyhow::Result<Vec<(OsString, OsString)>> {
         .env_clear()
         .env("HOME", &home)
         .current_dir(&home);
-    for name in ["PATH", "USER", "LOGNAME", "SHELL"] {
+    for name in ["PATH", "USER", "LOGNAME", "SHELL", "XDG_RUNTIME_DIR"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }

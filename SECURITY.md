@@ -163,6 +163,9 @@ AI APIs.
 - Rho-owned agent variables (`RHO_AGENT_ID` and `RHO_MCP_AGENT_ID`) are supplied
   explicitly to agent commands rather than copied
   incidentally from the daemon environment.
+- When present, `XDG_RUNTIME_DIR` is seeded into the login shell alongside the
+  basic identity and shell variables so user-scoped runtime sockets remain
+  reachable from agent subprocesses.
 - CLI-local subprocesses, including land and selfci jobs, retain the invoking
   CLI's environment; they are outside the daemon subprocess boundary.
 
