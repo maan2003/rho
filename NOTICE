@@ -1,0 +1,17 @@
+Rho's original source code is licensed under the Mozilla Public License,
+version 2.0 (MPL-2.0). A copy of that license is in LICENSE.
+
+Exceptions:
+
+- crates/rho-ci contains vendored selfci source code and is licensed under
+  MPL-2.0.
+- crates/rho-gui is licensed under GPL-3.0-or-later because it links
+  GPL-licensed Zed-derived dependencies. Its license text is in
+  crates/rho-gui/LICENSE.
+- crates/senax-encoder and crates/senax-encoder/derive are vendored upstream
+  projects licensed under MIT OR Apache-2.0. Their license texts remain in
+  crates/senax-encoder/LICENSE-MIT and crates/senax-encoder/LICENSE-APACHE.
+
+The Mozilla Public License requires distributors of executable forms to inform
+recipients how to obtain the corresponding source. The canonical Rho source is
+available from rad:z4YsonAHer9ugHczb8NC78JY9QXVd.
