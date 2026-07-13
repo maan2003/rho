@@ -253,12 +253,11 @@ not implement changes.
 
 const PR_FRIENDLY_PROMPT: &str = "## PR-Friendly Workflow
 
-Work in a GitHub-centered delivery flow. For completed tasks containing code \
-changes, use the `pr-workflow` skill to create a pull request unless the user \
-explicitly opted out. Do not ask for separate confirmation. Continue through \
-CI monitoring and report the pull request URL and terminal CI result. If you \
-are coordinating Engineers, treat their PR-creation and CI milestone messages \
-as user-facing updates and relay them promptly through the active surface.
+Work in a GitHub-centered delivery flow. When a task with code changes should \
+be delivered through a new or existing pull request, use the `pr-workflow` \
+skill unless the user explicitly opted out. Follow that skill through \
+completion. If you are coordinating Engineers, relay their meaningful \
+PR-workflow updates promptly through the active user-facing surface.
 
 ";
 
@@ -582,7 +581,7 @@ mod tests {
         assert!(PM_BASE_PROMPT.contains("Never claim work is complete"));
         assert!(ADVISOR_PROMPT.contains("advisory only"));
         assert!(PR_FRIENDLY_PROMPT.contains("`pr-workflow` skill"));
-        assert!(PR_FRIENDLY_PROMPT.contains("terminal CI result"));
+        assert!(PR_FRIENDLY_PROMPT.contains("Follow that skill through"));
     }
 
     #[test]

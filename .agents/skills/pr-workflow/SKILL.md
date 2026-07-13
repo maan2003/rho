@@ -13,13 +13,15 @@ terminal CI result; creating the pull request alone is not completion.
 
 1. Verify the implementation and inspect `jj status`, `jj diff`, and `jj log`.
 2. Identify the intended change. Do not push incidental working-copy changes.
-3. Push it below the only branch namespace Octo permits:
+3. Check whether the work already has a pull request. If it does, update its
+   existing branch rather than creating a duplicate PR. Otherwise push it below
+   the only branch namespace Octo permits:
 
 ```bash
 jj git push --remote origin --named rho/CHANGE_NAME=REVSET
 ```
 
-4. Create the pull request:
+4. When no PR exists yet, create it:
 
 ```bash
 octo pr create --head rho/CHANGE_NAME --title "TITLE" --body "BODY"
@@ -41,8 +43,10 @@ Do not silently switch credential sources.
 
 ## Monitor CI
 
-After creating the pull request, monitor its CI automatically. Do not ask for a
-separate confirmation and do not stop merely because the pull request exists.
+After creating or updating the pull request, monitor its CI automatically. Do
+not ask for separate confirmation and do not stop merely because the pull
+request exists. Every later push starts a new CI obligation: wait for the new
+run to reach a terminal state before reporting completion.
 
 ```bash
 octo ci status PR_OR_BRANCH
