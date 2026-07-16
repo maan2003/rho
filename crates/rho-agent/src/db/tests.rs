@@ -19,6 +19,7 @@ fn agent_role_resolves_opinionated_bindings() {
         profile(EngineerIntelligence::Mini),
         SessionBinding::ResponsesLuna(InferenceProfile {
             effort: ReasoningEffort::Medium,
+            code_mode: false,
             ..
         })
     ));
@@ -56,7 +57,6 @@ fn agent_role_resolves_opinionated_bindings() {
         })
     ));
     for intelligence in [
-        EngineerIntelligence::Mini,
         EngineerIntelligence::Low,
         EngineerIntelligence::Medium,
         EngineerIntelligence::High,

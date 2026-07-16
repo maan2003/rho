@@ -302,8 +302,9 @@ do not restrict filesystem access or grant tools.
   access to the host through the nested tool dispatcher — the same access the
   model already has through shell tools. Code mode is not a sandbox and adds no
   new privilege beyond the existing tool surface.
-- Code mode is used by every GPT-5.6-backed role and is fixed at agent
-  creation; the daemon rejects changing the role on a running agent. When on,
+- Code mode is used by GPT-5.6-backed roles except `eng-mini`, which uses the
+  direct tool surface, and is fixed at agent creation; the daemon rejects
+  changing the role on a running agent. When on,
   the model-facing tools are only
   `exec`/`wait`, and
   shell plus multi-agent tools are dispatched from scripts on the agent's

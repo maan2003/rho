@@ -484,7 +484,10 @@ impl AgentRole {
             | AgentRole::WorkflowEngineer {
                 intelligence: EngineerIntelligence::Mini,
                 ..
-            } => SessionBinding::ResponsesLuna(deep(ReasoningEffort::Medium)),
+            } => SessionBinding::ResponsesLuna(InferenceProfile {
+                code_mode: false,
+                ..deep(ReasoningEffort::Medium)
+            }),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Low,
             }
