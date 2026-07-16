@@ -18,7 +18,7 @@ fn agent_role_resolves_opinionated_bindings() {
     assert!(matches!(
         profile(EngineerIntelligence::Mini),
         SessionBinding::ResponsesLuna(InferenceProfile {
-            effort: ReasoningEffort::Medium,
+            effort: ReasoningEffort::Xhigh,
             fast_mode: true,
             code_mode: false,
         })

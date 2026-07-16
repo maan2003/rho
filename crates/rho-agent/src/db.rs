@@ -487,7 +487,7 @@ impl AgentRole {
             } => SessionBinding::ResponsesLuna(InferenceProfile {
                 fast_mode: true,
                 code_mode: false,
-                ..deep(ReasoningEffort::Medium)
+                ..deep(ReasoningEffort::Xhigh)
             }),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Low,

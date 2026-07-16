@@ -19,7 +19,8 @@ use tokio::sync::{Mutex, broadcast};
 use crate::claude::ClaudeAgent;
 use crate::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWorkflow,
-    AgentWriteTxnExt as _, InferenceModel, InferenceProfile, SessionBinding, TopicId,
+    AgentWriteTxnExt as _, EngineerIntelligence, InferenceModel, InferenceProfile, SessionBinding,
+    TopicId,
 };
 use crate::lazy::Lazy;
 use crate::{
@@ -566,6 +567,18 @@ impl AgentPool {
 fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
     match (parent, child) {
         (
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Mini,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Mini,
+                ..
+            },
+            AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. },
+        ) => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Mini,
+        },
+        (
             AgentRole::WorkflowPM {
                 workflow: AgentWorkflow::PrFriendly,
             },
@@ -743,6 +756,29 @@ mod tests {
         assert_eq!(
             child_role(pr_engineer, engineer).workflow(),
             AgentWorkflow::Default
+        );
+    }
+
+    #[test]
+    fn mini_engineers_spawn_mini_engineers() {
+        let mini = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Mini,
+        };
+        let engineer = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
+        };
+
+        assert_eq!(child_role(mini, engineer), mini);
+        assert_eq!(
+            child_role(
+                mini,
+                AgentRole::Advisor {
+                    intelligence: crate::db::AdvisorIntelligence::Medium,
+                }
+            ),
+            AgentRole::Advisor {
+                intelligence: crate::db::AdvisorIntelligence::Medium,
+            }
         );
     }
 }
