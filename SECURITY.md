@@ -29,6 +29,20 @@ AI APIs.
   Apply-patch translates absolute paths inside any workdir to that workdir's
   checkout, so in-process file writes follow the same redirection as
   namespaced commands.
+- Sandbox workspaces are a narrower, opt-in boundary for native agents. Rho
+  creates a normal isolated jj pool workspace, masks its original `.jj` and
+  colocated `.git` metadata in the command mount namespace, and points Git at
+  a separate synthetic baseline. Child commands receive a fail-closed Landlock policy: sandbox
+  workdirs/home/temp/runtime directories are writable, explicit system and
+  toolchain paths are read-only, other filesystem access is denied, and new
+  TCP bind/connect operations are denied; a seccomp filter permits creation
+  of Unix sockets only, covering UDP and other network families unavailable
+  to Landlock ABI 7. The policy requires Landlock ABI 7. In-process patch
+  writes separately reject paths outside the
+  sandbox workdirs. Sandbox views never mix sandbox and ordinary workdirs.
+  This is practical containment for evaluation workloads, not a hardened
+  multi-tenant boundary: Landlock does not govern every metadata syscall or
+  resource-exhaustion vector, and selected runtime paths remain readable.
 - User/repo `AGENTS.md` files and local/project Markdown skills are trusted
   prompt input when discovered. Treat them as useful local guidance, not a
   sandbox or permission boundary.

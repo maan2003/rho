@@ -328,6 +328,18 @@ impl AgentPool {
                 .iter()
                 .find(|info| info.repo() == repo.root());
             start.push(match entry.checkout {
+                SpawnCheckout::Own { revset }
+                    if matches!(parent_entry, Some(WorkspaceInfo::Sandbox { .. })) =>
+                {
+                    let parent_revset = revset.unwrap_or_else(|| match parent_entry {
+                        Some(WorkspaceInfo::Sandbox { id, .. }) => format!("{}@", id.encoded()),
+                        _ => unreachable!("guard requires sandbox parent"),
+                    });
+                    StartWorkdir::Sandbox {
+                        repo,
+                        parent_revset,
+                    }
+                }
                 SpawnCheckout::Own { revset } if repo.is_jj() => {
                     // The child's change forks off whatever the parent's
                     // checkout currently points at; repos outside the
@@ -492,6 +504,7 @@ impl AgentPool {
             WorkspaceInfo::Workspace { repo, id } => {
                 self.repo(repo).await?.open_workspace(*id).await
             }
+            WorkspaceInfo::Sandbox { repo, id } => self.repo(repo).await?.open_sandbox(*id).await,
         }
     }
 

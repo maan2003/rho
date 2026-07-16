@@ -55,6 +55,10 @@ pub enum FromBrowser {
         /// Work directly in the registered checkout instead of creating an
         /// isolated workspace.
         join: bool,
+        /// Export tracked files into a provenance-free, network-disabled
+        /// Landlock workspace.
+        #[serde(default)]
+        sandbox: bool,
         revset: String,
         text: String,
     },

@@ -503,15 +503,38 @@ impl Workspace {
             .and_then(|agent_id| self.registry.agent_workspace(agent_id))
             .cloned();
         Ok(match (mode, target, workspace) {
+            (StartFieldMode::Sandbox, "", _) => {
+                return Err("pick a sandbox base: a revset like `@-` or an agent label".to_owned());
+            }
+            (
+                StartFieldMode::Sandbox,
+                _,
+                Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }),
+            ) => StartMode::Sandbox {
+                repo,
+                revset: format!("{}@", id.encoded()),
+            },
+            (StartFieldMode::Sandbox, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
+                StartMode::Sandbox {
+                    repo,
+                    revset: "@".to_owned(),
+                }
+            }
+            (StartFieldMode::Sandbox, _, None) => StartMode::Sandbox {
+                repo: require_workdir()?,
+                revset: target.to_owned(),
+            },
             (StartFieldMode::NewOn, "", _) => {
                 return Err("pick a base: a revset like `@-` or an agent label".to_owned());
             }
-            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workspace { repo, id })) => {
-                StartMode::NewOn {
-                    repo,
-                    revset: format!("{}@", id.encoded()),
-                }
-            }
+            (
+                StartFieldMode::NewOn,
+                _,
+                Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }),
+            ) => StartMode::NewOn {
+                repo,
+                revset: format!("{}@", id.encoded()),
+            },
             // An agent in the user's checkout works on the user's own change.
             (StartFieldMode::NewOn, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
                 StartMode::NewOn {
@@ -950,7 +973,7 @@ impl Workspace {
         }
     }
 
-    /// Shift-Tab in the draft: with the cursor in the start field, flip its
+    /// Shift-Tab in the draft: with the cursor in the start field, cycle its
     /// mode (on top of ↔ join); anywhere else, cycle fields like Tab. On agent
     /// views it does nothing.
     fn cycle_draft_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {

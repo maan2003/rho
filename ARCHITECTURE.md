@@ -19,13 +19,18 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `rho-inference` session.
 - `rho-workspaces` owns checkout materialization and filesystem views. A
   `Workspace` is one materialized checkout (a jj pool slot, the user's live
-  checkout, or a plain directory). A `View` is one agent's world: a working
+  checkout, a VCS-masked sandbox workspace, or a plain directory). Sandbox
+  workspaces use normal jj pool slots while masking their `.jj` and colocated
+  `.git` metadata from child commands, expose a separate synthetic Git
+  baseline, and install a Landlock filesystem/network policy on every prepared
+  child command. A `View` is one agent's world: a working
   set of workdir entries, fixed at spawn, realized as a private mount
   namespace with each entry's slot mounted over its origin path. Entry 0 is
   the primary workdir (default cwd, prompt header).
   Agents joining a workspace share the `Workspace`; each agent has its own
   `View`. All jj workspaces created for one agent share one workspace id, so
   the agent's jj workspace name is the same in every repo it forks.
+  Sandbox and ordinary workspaces cannot be mixed in one view.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Rho packages platform-owned skills under
   `$out/share/rho/skills`; the final package build embeds that immutable root in

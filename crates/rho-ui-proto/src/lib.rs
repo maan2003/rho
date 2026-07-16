@@ -319,6 +319,8 @@ pub enum StartMode {
     /// Clients resolve agent targets to `<workspace name>@` themselves
     /// (workspace names arrive on [`UiAgentSummary`]).
     NewOn { repo: Utf8PathBuf, revset: String },
+    /// A fresh restricted workspace in `repo` on top of the revset.
+    Sandbox { repo: Utf8PathBuf, revset: String },
     /// The SAME workspace as the target: no new checkout — agents share the
     /// directory (and namespace), seeing each other's edits instantly.
     /// Joining the user means working directly in the user's checkout.

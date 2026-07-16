@@ -506,6 +506,12 @@ pub enum StartWorkdir {
         repo: Arc<Repo>,
         parent_revset: String,
     },
+    /// Create a jj workspace whose original VCS metadata is masked and whose
+    /// child commands are Landlock-restricted.
+    Sandbox {
+        repo: Arc<Repo>,
+        parent_revset: String,
+    },
     /// Work in an existing workspace (joining another agent, the user's
     /// checkout, or a plain live directory).
     Existing(Arc<Workspace>),
@@ -521,7 +527,12 @@ pub(crate) async fn materialize_workdirs(
     anyhow::ensure!(!start.is_empty(), "an agent needs at least one workdir");
     let workspace_id = start
         .iter()
-        .any(|entry| matches!(entry, StartWorkdir::Create { .. }))
+        .any(|entry| {
+            matches!(
+                entry,
+                StartWorkdir::Create { .. } | StartWorkdir::Sandbox { .. }
+            )
+        })
         .then(|| write.alloc_workspace_id());
     let mut entries = Vec::with_capacity(start.len());
     for entry in start {
@@ -532,6 +543,13 @@ pub(crate) async fn materialize_workdirs(
             } => {
                 let id = workspace_id.expect("allocated for Create entries");
                 repo.create_workspace(id, &parent_revset).await?
+            }
+            StartWorkdir::Sandbox {
+                repo,
+                parent_revset,
+            } => {
+                let id = workspace_id.expect("allocated for Sandbox entries");
+                repo.create_sandbox(id, &parent_revset).await?
             }
             StartWorkdir::Existing(workspace) => workspace,
         });

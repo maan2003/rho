@@ -56,6 +56,12 @@ pub unsafe fn init_daemon_namespace() -> anyhow::Result<()> {
 /// [`create_workspace_ns`] binds the real origin.
 pub const WS_PARENT: &str = "ws-parent";
 
+pub struct ViewMount {
+    pub repo: PathBuf,
+    pub slot: PathBuf,
+    pub metadata_masks: Option<(PathBuf, PathBuf)>,
+}
+
 /// Creates the mount namespace for one agent view: a copy of the daemon's
 /// namespace with each entry's slot checkout mounted over its origin repo
 /// path, and each origin bound back in at `.jj/ws-parent` for the slot's
@@ -63,13 +69,22 @@ pub const WS_PARENT: &str = "ws-parent";
 /// permanently inside the new namespace — the returned
 /// `/proc/thread-self/ns/mnt` fd is what keeps it alive after the thread
 /// exits.
-pub fn create_view_ns(mounts: Vec<(PathBuf, PathBuf)>) -> anyhow::Result<OwnedFd> {
+pub fn create_view_ns(mounts: Vec<ViewMount>) -> anyhow::Result<OwnedFd> {
     std::thread::spawn(move || -> anyhow::Result<OwnedFd> {
         // SAFETY: NEWNS implies unsharing fs state for this thread only; the
         // thread exits immediately after and shares nothing else.
         unsafe { unshare_unsafe(UnshareFlags::NEWNS) }.context("unshare mount namespace")?;
-        for (repo, slot) in &mounts {
-            cover_origin_with_slot(repo, slot)?;
+        for mount in &mounts {
+            cover_origin_with_slot(&mount.repo, &mount.slot, mount.metadata_masks.is_none())?;
+            if let Some((jj_mask, git_mask)) = &mount.metadata_masks {
+                rustix::mount::mount_bind(jj_mask, mount.repo.join(".jj"))
+                    .context("mask sandbox .jj metadata")?;
+                // Pure jj repositories have no colocated `.git` entry.
+                if mount.repo.join(".git").exists() {
+                    rustix::mount::mount_bind(git_mask, mount.repo.join(".git"))
+                        .context("mask sandbox .git metadata")?;
+                }
+            }
         }
         let fd = File::open("/proc/thread-self/ns/mnt").context("open mount namespace fd")?;
         Ok(fd.into())
@@ -81,7 +96,7 @@ pub fn create_view_ns(mounts: Vec<(PathBuf, PathBuf)>) -> anyhow::Result<OwnedFd
 /// The per-entry mount dance, in whatever namespace this thread is in:
 /// mount the slot checkout over the origin repo path and bind the origin
 /// back in at the slot's `.jj/ws-parent`.
-fn cover_origin_with_slot(repo: &Path, slot: &Path) -> anyhow::Result<()> {
+fn cover_origin_with_slot(repo: &Path, slot: &Path, bind_origin_back: bool) -> anyhow::Result<()> {
     // Clone both trees before the cover mount hides the origin.
     let clone = |path: &Path| {
         open_tree(
@@ -92,7 +107,9 @@ fn cover_origin_with_slot(repo: &Path, slot: &Path) -> anyhow::Result<()> {
                 | OpenTreeFlags::OPEN_TREE_CLOEXEC,
         )
     };
-    let origin_tree = clone(repo).context("open repo tree")?;
+    let origin_tree = bind_origin_back
+        .then(|| clone(repo).context("open repo tree"))
+        .transpose()?;
     let slot_tree = clone(slot).context("open slot tree")?;
     move_mount(
         slot_tree.as_fd(),
@@ -103,13 +120,15 @@ fn cover_origin_with_slot(repo: &Path, slot: &Path) -> anyhow::Result<()> {
     )
     .context("mount slot over repo path")?;
     // The path now resolves inside the slot: its empty ws-parent dir.
-    move_mount(
-        origin_tree.as_fd(),
-        "",
-        CWD,
-        repo.join(".jj").join(WS_PARENT),
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )
-    .context("bind origin at ws-parent")?;
+    if let Some(origin_tree) = origin_tree {
+        move_mount(
+            origin_tree.as_fd(),
+            "",
+            CWD,
+            repo.join(".jj").join(WS_PARENT),
+            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+        )
+        .context("bind origin at ws-parent")?;
+    }
     Ok(())
 }

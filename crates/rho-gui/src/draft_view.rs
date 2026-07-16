@@ -33,7 +33,7 @@ const START_TARGET_HINT_INLAY_ID: usize = 4;
 pub const DEFAULT_START: &str = "@-";
 pub const DEFAULT_ROLE: &str = "eng";
 
-/// How the start field's target is interpreted; toggled with Shift-Tab while
+/// How the start field's target is interpreted; cycled with Shift-Tab while
 /// the cursor is in the field. The field label shows the current mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartFieldMode {
@@ -41,6 +41,8 @@ pub enum StartFieldMode {
     NewOn,
     /// The same workspace as the target: shared checkout and namespace.
     Join,
+    /// A VCS-masked workspace with restricted filesystem and network access.
+    Sandbox,
 }
 
 impl StartFieldMode {
@@ -48,6 +50,7 @@ impl StartFieldMode {
         match self {
             Self::NewOn => "On top of: ",
             Self::Join => "Join: ",
+            Self::Sandbox => "Sandbox: ",
         }
     }
 }
@@ -246,12 +249,13 @@ impl DraftView {
         self.update_start_target_hint(cx);
     }
 
-    /// Shift-Tab while the cursor is in the start field: flip how the
+    /// Shift-Tab while the cursor is in the start field: cycle how the
     /// target is interpreted (the field label shows the mode).
     pub fn cycle_start_mode(&mut self, cx: &mut Context<Self>) {
         self.start_mode = match self.start_mode {
             StartFieldMode::NewOn => StartFieldMode::Join,
-            StartFieldMode::Join => StartFieldMode::NewOn,
+            StartFieldMode::Join => StartFieldMode::Sandbox,
+            StartFieldMode::Sandbox => StartFieldMode::NewOn,
         };
         self.insert_start_label(cx);
         self.update_start_target_hint(cx);

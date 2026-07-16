@@ -577,6 +577,7 @@ fn NewAgentPage(app: App) -> impl IntoView {
     );
     let role = RwSignal::new("eng".to_owned());
     let join = RwSignal::new(false);
+    let sandbox = RwSignal::new(false);
     let revset = RwSignal::new("@-".to_owned());
     let area: NodeRef<html::Textarea> = NodeRef::new();
     let create = move || {
@@ -595,6 +596,7 @@ fn NewAgentPage(app: App) -> impl IntoView {
             repo,
             role: role.get_untracked(),
             join: join.get_untracked(),
+            sandbox: sandbox.get_untracked(),
             revset: revset.get_untracked(),
             text: text.to_owned(),
         });
@@ -648,13 +650,18 @@ fn NewAgentPage(app: App) -> impl IntoView {
                         <h2>"Workspace"</h2>
                         <label class="choice">
                             <input type="radio" name="workspace" value="new" checked
-                                on:change=move |_| join.set(false) />
+                                on:change=move |_| { join.set(false); sandbox.set(false); } />
                             <span><strong>"New isolated workspace"</strong><small>"Recommended · keeps changes separate"</small></span>
                         </label>
                         <label class="choice">
                             <input type="radio" name="workspace" value="join"
-                                on:change=move |_| join.set(true) />
+                                on:change=move |_| { join.set(true); sandbox.set(false); } />
                             <span><strong>"Work in my checkout"</strong><small>"Shares files and uncommitted changes"</small></span>
+                        </label>
+                        <label class="choice">
+                            <input type="radio" name="workspace" value="sandbox"
+                                on:change=move |_| { join.set(false); sandbox.set(true); } />
+                            <span><strong>"Restricted sandbox"</strong><small>"Fresh Git history · no network · restricted filesystem"</small></span>
                         </label>
                         <div class="revset" class:hidden=move || join.get()>
                             <label>"Base revision"</label>

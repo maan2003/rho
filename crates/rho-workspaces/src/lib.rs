@@ -29,9 +29,11 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use prefix_id::{PrefixId, PrefixIdDomain};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, OnceCell};
 
 mod ns;
+mod sandbox;
 
 pub use ns::init_daemon_namespace;
 
@@ -128,12 +130,17 @@ pub enum WorkspaceInfo {
         #[senax(rename = "name")]
         id: WorkspaceId,
     },
+    /// A jj pool workspace whose original VCS metadata is masked from child
+    /// commands and replaced by a synthetic Git baseline.
+    Sandbox { repo: Utf8PathBuf, id: WorkspaceId },
 }
 
 impl WorkspaceInfo {
     pub fn repo(&self) -> &Utf8Path {
         match self {
-            Self::UserCheckout { repo } | Self::Workspace { repo, .. } => repo,
+            Self::UserCheckout { repo }
+            | Self::Workspace { repo, .. }
+            | Self::Sandbox { repo, .. } => repo,
         }
     }
 
@@ -144,12 +151,19 @@ impl WorkspaceInfo {
     pub fn workspace_id(&self) -> Option<WorkspaceId> {
         match self {
             Self::UserCheckout { .. } => None,
-            Self::Workspace { id, .. } => Some(*id),
+            Self::Workspace { id, .. } | Self::Sandbox { id, .. } => Some(*id),
         }
     }
 
     pub fn workspace_name(&self) -> Option<String> {
-        self.workspace_id().map(|id| id.encoded())
+        match self {
+            Self::Workspace { id, .. } => Some(id.encoded()),
+            Self::UserCheckout { .. } | Self::Sandbox { .. } => None,
+        }
+    }
+
+    pub fn is_sandbox(&self) -> bool {
+        matches!(self, Self::Sandbox { .. })
     }
 }
 
@@ -280,6 +294,48 @@ impl Repo {
         self.cache_workspace(self.workspace_info(id), slot).await
     }
 
+    /// Creates a jj pool workspace, masks its original VCS metadata from
+    /// child commands, and creates a synthetic Git baseline for them.
+    pub async fn create_sandbox(
+        self: &Arc<Self>,
+        id: WorkspaceId,
+        parent_revset: &str,
+    ) -> anyhow::Result<Arc<Workspace>> {
+        anyhow::ensure!(
+            self.is_jj,
+            "sandbox source is not a jj repository: {}",
+            self.root
+        );
+        let info = WorkspaceInfo::Sandbox {
+            repo: self.root.clone(),
+            id,
+        };
+        let base = sandbox_base(&self.root, id)?;
+        anyhow::ensure!(!base.exists(), "sandbox already exists: {base}");
+        let slot = self.attach(&id.encoded(), Some(parent_revset)).await?;
+        let result = async {
+            for dir in [
+                base.join("home"),
+                base.join("tmp"),
+                base.join("run"),
+                base.join("masks/.jj"),
+            ] {
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("create sandbox directory {dir}"))?;
+            }
+            std::fs::write(base.join("masks/.git"), "")
+                .context("create sandbox Git metadata mask")?;
+            self.initialize_sandbox_git(&slot, &base.join("git")).await
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = std::fs::remove_dir_all(&base);
+            return Err(error);
+        }
+        self.warm_pool();
+        self.cache_workspace(info, slot).await
+    }
+
     /// Opens an existing workspace, returning the live shared instance when
     /// one exists — agents in the same workspace share one checkout and one
     /// mount namespace. A pool workspace is (re)attached idempotently, so a
@@ -296,6 +352,26 @@ impl Repo {
         }
         let name = id.encoded();
         let slot = self.attach(&name, None).await?;
+        let workspace = Arc::new(self.workspace(info.clone(), slot));
+        workspaces.insert(info, Arc::clone(&workspace));
+        Ok(workspace)
+    }
+
+    pub async fn open_sandbox(self: &Arc<Self>, id: WorkspaceId) -> anyhow::Result<Arc<Workspace>> {
+        let info = WorkspaceInfo::Sandbox {
+            repo: self.root.clone(),
+            id,
+        };
+        let mut workspaces = self.workspaces.lock().await;
+        if let Some(workspace) = workspaces.get(&info) {
+            return Ok(Arc::clone(workspace));
+        }
+        let base = sandbox_base(&self.root, id)?;
+        let slot = self.attach(&id.encoded(), None).await?;
+        anyhow::ensure!(
+            base.join("git/HEAD").is_file(),
+            "sandbox Git baseline is missing: {base}"
+        );
         let workspace = Arc::new(self.workspace(info.clone(), slot));
         workspaces.insert(info, Arc::clone(&workspace));
         Ok(workspace)
@@ -389,6 +465,47 @@ impl Repo {
         }
         command.arg("--repository").arg(&self.root);
         command
+    }
+
+    async fn initialize_sandbox_git(
+        &self,
+        slot: &Utf8Path,
+        git_dir: &Utf8Path,
+    ) -> anyhow::Result<()> {
+        for args in [
+            &["init", "-b", "main"][..],
+            &["add", "-A"][..],
+            &[
+                "-c",
+                "user.name=rho sandbox",
+                "-c",
+                "user.email=sandbox@rho.invalid",
+                "commit",
+                "-m",
+                "sandbox baseline",
+            ][..],
+        ] {
+            let mut command = tokio::process::Command::new("git");
+            if let Some(environment) = &self.user_environment {
+                environment.apply(&mut command);
+            }
+            command
+                .env("GIT_DIR", git_dir)
+                .env("GIT_WORK_TREE", slot)
+                .current_dir(slot)
+                .args(args);
+            let output = command.output().await.context("spawn sandbox git")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "sandbox git failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            if args.first() == Some(&"init") {
+                std::fs::write(git_dir.join("info/exclude"), "/.git\n/.jj\n")
+                    .context("exclude hidden workspace metadata from sandbox Git")?;
+            }
+        }
+        Ok(())
     }
 
     /// Once per daemon lifetime, detaches every pool-attached workspace (one
@@ -510,6 +627,17 @@ impl Workspace {
         self.info.is_user_checkout()
     }
 
+    pub fn is_sandbox(&self) -> bool {
+        self.info.is_sandbox()
+    }
+
+    fn sandbox_base(&self) -> Option<Utf8PathBuf> {
+        match self.info() {
+            WorkspaceInfo::Sandbox { id, .. } => sandbox_base(self.repo(), *id).ok(),
+            WorkspaceInfo::UserCheckout { .. } | WorkspaceInfo::Workspace { .. } => None,
+        }
+    }
+
     /// The origin repo root — the path agents see and the system prompt
     /// reports (the slot is mounted over it in the agent's namespace).
     pub fn repo(&self) -> &Utf8Path {
@@ -629,6 +757,11 @@ impl View {
     /// A view over `entries` (nonempty; entry 0 is the primary workdir).
     /// Entries must have disjoint origin roots.
     pub fn new(entries: Vec<Arc<Workspace>>) -> anyhow::Result<Arc<Self>> {
+        let sandboxed = entries.iter().filter(|entry| entry.is_sandbox()).count();
+        anyhow::ensure!(
+            sandboxed == 0 || sandboxed == entries.len(),
+            "sandbox and ordinary workdirs cannot be mixed in one view"
+        );
         Ok(Arc::new(Self {
             entries: WorkingSet::new(entries)?,
             mnt_ns: Mutex::new(None),
@@ -674,6 +807,30 @@ impl View {
             std::env::var_os("PATH").context("PATH must be set")?
         };
         command.env("PATH", primary.repo.path_overrides().add_to(&base_path));
+        let landlock = if primary.is_sandbox() {
+            let base = primary.sandbox_base().expect("sandbox has base");
+            command
+                .env("HOME", base.join("home"))
+                .env("TMPDIR", base.join("tmp"))
+                .env("XDG_RUNTIME_DIR", base.join("run"))
+                .env("XDG_CACHE_HOME", base.join("home/.cache"))
+                .env("XDG_CONFIG_HOME", base.join("home/.config"))
+                .env("GIT_DIR", base.join("git"))
+                .env("GIT_WORK_TREE", primary.repo());
+            let mut writable = Vec::new();
+            for entry in entries {
+                writable.push(entry.slot().as_std_path().to_owned());
+                let base = entry.sandbox_base().expect("sandbox has base");
+                writable.extend(
+                    ["home", "tmp", "run", "git"]
+                        .into_iter()
+                        .map(|name| base.join(name).into_std_path_buf()),
+                );
+            }
+            Some(sandbox::Policy::new(&writable, &base_path)?)
+        } else {
+            None
+        };
         let cwd = cwd.map_or_else(|| primary.repo().to_owned(), |cwd| primary.repo().join(cwd));
         if !entries.iter().any(|entry| entry.needs_mount()) {
             anyhow::ensure!(
@@ -696,7 +853,13 @@ impl View {
             ));
         }
         unsafe {
-            command.pre_exec(move || enter_workspace_ns(ns_fd, &cwd, &mounts));
+            command.pre_exec(move || {
+                enter_workspace_ns(ns_fd, &cwd, &mounts)?;
+                if let Some(policy) = &landlock {
+                    policy.restrict_self()?;
+                }
+                Ok(())
+            });
         }
         Ok(())
     }
@@ -712,6 +875,24 @@ impl View {
             }
         }
         path.to_owned()
+    }
+
+    pub fn resolve_host_path_checked(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        if !self.entries[0].is_sandbox() {
+            return Ok(self.resolve_host_path(path));
+        }
+        if path.is_absolute() {
+            for entry in self.entries() {
+                if let Ok(rel) = path.strip_prefix(entry.repo().as_std_path()) {
+                    return sandbox_join(entry.slot().as_std_path(), rel);
+                }
+            }
+            anyhow::bail!(
+                "sandbox patch path is outside every workdir: {}",
+                path.display()
+            );
+        }
+        sandbox_join(self.entries[0].slot().as_std_path(), path)
     }
 
     /// Commits every jj entry's checkout state into its repo. Called at turn
@@ -748,11 +929,15 @@ async fn ensure_ns<'ns>(
         let mounts = entries
             .iter()
             .filter(|entry| entry.needs_mount())
-            .map(|entry| {
-                (
-                    entry.repo().as_std_path().to_owned(),
-                    entry.slot().as_std_path().to_owned(),
-                )
+            .map(|entry| ns::ViewMount {
+                repo: entry.repo().as_std_path().to_owned(),
+                slot: entry.slot().as_std_path().to_owned(),
+                metadata_masks: entry.sandbox_base().map(|base| {
+                    (
+                        base.join("masks/.jj").into_std_path_buf(),
+                        base.join("masks/.git").into_std_path_buf(),
+                    )
+                }),
             })
             .collect::<Vec<_>>();
         let ns = tokio::task::spawn_blocking(move || ns::create_view_ns(mounts))
@@ -897,6 +1082,35 @@ fn gitdir_path(pointer: &str) -> Option<Utf8PathBuf> {
         .map(Utf8PathBuf::from)
 }
 
+fn sandbox_base(repo: &Utf8Path, id: WorkspaceId) -> anyhow::Result<Utf8PathBuf> {
+    let state = dirs::state_dir().context("state directory not available")?;
+    let state = Utf8PathBuf::try_from(state).context("state directory is not valid UTF-8")?;
+    let digest = Sha256::digest(repo.as_str().as_bytes());
+    Ok(state.join("rho/sandboxes").join(format!(
+        "{}-{}",
+        id.encoded(),
+        &format!("{digest:x}")[..16]
+    )))
+}
+
+fn sandbox_join(root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    let mut joined = root.to_owned();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => joined.push(component),
+            std::path::Component::ParentDir => {
+                anyhow::ensure!(joined != root, "sandbox patch path escapes its workdir");
+                joined.pop();
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                anyhow::bail!("sandbox patch path is not relative")
+            }
+        }
+    }
+    Ok(joined)
+}
+
 /// Reuses a donor file's timestamps only when the checkout has identical
 /// bytes. Warm pool slots may contain direnv/nix caches keyed by these mtimes;
 /// preserving a timestamp across different contents would make a stale cache
@@ -919,9 +1133,79 @@ fn copy_mtime_if_same(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    use super::copy_mtime_if_same;
+    use super::{Repo, WorkspaceId, WorkspaceIdDomain, copy_mtime_if_same, sandbox_join};
+
+    #[tokio::test]
+    async fn creates_provenance_free_git_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(
+            std::process::Command::new("jj")
+                .current_dir(&repo)
+                .args(["git", "init", "--no-colocate"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo.join("tracked"), "baseline").unwrap();
+        assert!(
+            std::process::Command::new("jj")
+                .current_dir(&repo)
+                .args(["commit", "-m", "source"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo.join("tracked"), "working copy").unwrap();
+        std::fs::write(repo.join(".gitignore"), "ignored-secret\n").unwrap();
+        std::fs::write(repo.join("ignored-secret"), "secret").unwrap();
+
+        let repo = Arc::new(Repo::open(&repo).unwrap());
+        let id = WorkspaceId::from_counter(9_876_543, &WorkspaceIdDomain(123)).unwrap();
+        let workspace = repo.create_sandbox(id, "@").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.slot().join("tracked")).unwrap(),
+            "working copy"
+        );
+        assert!(!workspace.slot().join("ignored-secret").exists());
+        assert!(workspace.slot().join(".jj").is_dir());
+        let sandbox_git = workspace.sandbox_base().unwrap().join("git");
+        let commits = std::process::Command::new("git")
+            .env("GIT_DIR", &sandbox_git)
+            .env("GIT_WORK_TREE", workspace.slot())
+            .current_dir(workspace.slot())
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(commits.status.success());
+        assert_eq!(String::from_utf8(commits.stdout).unwrap().trim(), "1");
+        assert!(
+            std::process::Command::new("git")
+                .env("GIT_DIR", &sandbox_git)
+                .env("GIT_WORK_TREE", workspace.slot())
+                .current_dir(workspace.slot())
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
+        std::fs::remove_dir_all(workspace.sandbox_base().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sandbox_paths_cannot_escape() {
+        let root = std::path::Path::new("/sandbox");
+        assert_eq!(
+            sandbox_join(root, std::path::Path::new("src/../file")).unwrap(),
+            std::path::Path::new("/sandbox/file")
+        );
+        assert!(sandbox_join(root, std::path::Path::new("../secret")).is_err());
+    }
 
     fn set_mtime(path: &std::path::Path, time: SystemTime) {
         std::fs::File::options()

@@ -380,6 +380,7 @@ fn workspace_name(workspace: &WorkspaceInfo) -> String {
     match workspace {
         WorkspaceInfo::UserCheckout { repo } => format!("user-checkout {repo}"),
         WorkspaceInfo::Workspace { repo, id } => format!("workspace {} in {repo}", id.encoded()),
+        WorkspaceInfo::Sandbox { repo, id } => format!("sandbox {} from {repo}", id.encoded()),
     }
 }
 

@@ -692,6 +692,13 @@ impl AgentRegistry {
                     parent_revset: revset,
                 }]
             }
+            StartMode::Sandbox { repo, revset } => {
+                let repo = validate_repo_root(repo)?;
+                vec![rho_agent::StartWorkdir::Sandbox {
+                    repo: self.pool.repo(&repo).await?,
+                    parent_revset: revset,
+                }]
+            }
             StartMode::Join(JoinTarget::Workspace(info)) => {
                 vec![rho_agent::StartWorkdir::Existing(
                     self.pool.open_workspace(&info).await?,

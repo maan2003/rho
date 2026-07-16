@@ -13,7 +13,7 @@ pub(crate) const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("apply_patch.lark
 
 #[allow(dead_code)]
 pub(crate) fn apply_patch(patch: &str, cwd: &Path) -> Result<String> {
-    let resolve = |path: &Path| resolve_path(cwd, path);
+    let resolve = |path: &Path| Ok(resolve_path(cwd, path));
     apply_patch_with_metadata(patch, &resolve).map(|(output, _)| output)
 }
 
@@ -26,7 +26,7 @@ pub(crate) fn preview_metadata(patch: &str) -> Result<ApplyPatchMetadata> {
 
 pub(crate) fn apply_patch_with_metadata(
     patch: &str,
-    resolve: &dyn Fn(&Path) -> PathBuf,
+    resolve: &dyn Fn(&Path) -> Result<PathBuf, String>,
 ) -> Result<(String, ApplyPatchMetadata)> {
     let hunks = parse_patch(patch).map_err(anyhow::Error::msg)?;
     let changes = match apply_hunks(&hunks, resolve) {
@@ -148,7 +148,7 @@ impl ApplyPatchFailure {
 
 fn apply_hunks(
     hunks: &[Hunk],
-    resolve: &dyn Fn(&Path) -> PathBuf,
+    resolve: &dyn Fn(&Path) -> Result<PathBuf, String>,
 ) -> Result<Vec<AppliedChange>, ApplyPatchFailure> {
     if hunks.is_empty() {
         return Err(ApplyPatchFailure::new("No files were modified.", &[]));
@@ -159,7 +159,8 @@ fn apply_hunks(
     for hunk in hunks {
         match hunk {
             Hunk::Add { path, contents } => {
-                let abs = resolve(path);
+                let abs =
+                    resolve(path).map_err(|message| ApplyPatchFailure::new(message, &changes))?;
                 if read_optional_file(&abs)
                     .map_err(|message| ApplyPatchFailure::new(message, &changes))?
                     .is_some()
@@ -185,7 +186,8 @@ fn apply_hunks(
                 });
             }
             Hunk::Delete { path } => {
-                let abs = resolve(path);
+                let abs =
+                    resolve(path).map_err(|message| ApplyPatchFailure::new(message, &changes))?;
                 if abs.is_dir() {
                     return Err(ApplyPatchFailure::new(
                         format!("Failed to delete file {}", render_path(&abs)),
@@ -214,7 +216,8 @@ fn apply_hunks(
                 move_path,
                 chunks,
             } => {
-                let abs = resolve(path);
+                let abs =
+                    resolve(path).map_err(|message| ApplyPatchFailure::new(message, &changes))?;
                 let old_content = read_to_string_limited(&abs).map_err(|error| {
                     ApplyPatchFailure::new(
                         format!(
@@ -229,7 +232,8 @@ fn apply_hunks(
                     .map_err(|message| ApplyPatchFailure::new(message, &changes))?;
 
                 if let Some(move_path) = move_path {
-                    let dest_abs = resolve(move_path);
+                    let dest_abs = resolve(move_path)
+                        .map_err(|message| ApplyPatchFailure::new(message, &changes))?;
                     if read_optional_file(&dest_abs)
                         .map_err(|message| ApplyPatchFailure::new(message, &changes))?
                         .is_some()

@@ -240,24 +240,18 @@ impl ShellTools {
     /// real checkout files, never a namespace-relative path. Relative paths
     /// land in the primary workdir's checkout; absolute paths inside any
     /// workdir are translated to that workdir's checkout.
-    fn resolve_patch_path(&self, path: &Path) -> std::path::PathBuf {
+    fn resolve_patch_path(&self, path: &Path) -> Result<std::path::PathBuf, String> {
         match &self.exec {
             ExecContext::Directory {
                 working_directory, ..
-            } => {
-                if path.is_absolute() {
-                    path.to_owned()
-                } else {
-                    working_directory.as_std_path().join(path)
-                }
-            }
-            ExecContext::View(view) => {
-                if path.is_absolute() {
-                    view.resolve_host_path(path)
-                } else {
-                    view.primary().slot().as_std_path().join(path)
-                }
-            }
+            } => Ok(if path.is_absolute() {
+                path.to_owned()
+            } else {
+                working_directory.as_std_path().join(path)
+            }),
+            ExecContext::View(view) => view
+                .resolve_host_path_checked(path)
+                .map_err(|error| error.to_string()),
         }
     }
 

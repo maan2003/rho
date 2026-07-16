@@ -10687,10 +10687,13 @@ dependencies = [
  "anyhow",
  "bytes",
  "camino",
+ "dirs",
+ "libc",
  "prefix-id",
  "rho-context-config",
  "rustix 1.1.4",
  "senax-encoder",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]

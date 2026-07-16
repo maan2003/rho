@@ -170,7 +170,7 @@ where
                             delivery: MessageDelivery::Immediate,
                         }).await?;
                     }
-                    FromBrowser::NewAgent { topic_id, repo, role, join, revset, text } => {
+                    FromBrowser::NewAgent { topic_id, repo, role, join, sandbox, revset, text } => {
                         let topic_id = topics.iter()
                             .find(|topic| topic.topic_id.encoded() == topic_id)
                             .map(|topic| topic.topic_id)
@@ -184,7 +184,9 @@ where
                             }
                         };
                         let repo = Utf8PathBuf::from(repo);
-                        let start = if join {
+                        let start = if sandbox {
+                            StartMode::Sandbox { repo, revset }
+                        } else if join {
                             StartMode::Join(rho_ui_proto::JoinTarget::User { repo })
                         } else {
                             StartMode::NewOn { repo, revset }
