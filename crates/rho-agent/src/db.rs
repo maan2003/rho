@@ -415,6 +415,7 @@ pub enum EngineerIntelligence {
     Medium,
     High,
     Ultra,
+    Mini,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -477,6 +478,13 @@ impl AgentRole {
                     ..deep(ReasoningEffort::Low)
                 })
             }
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Mini,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Mini,
+                ..
+            } => SessionBinding::ResponsesLuna(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Low,
             }
@@ -544,6 +552,14 @@ impl SessionBinding {
             };
         }
         let (intelligence, _latency) = match self {
+            Self::ResponsesLuna(config) => (
+                EngineerIntelligence::Mini,
+                if config.fast_mode {
+                    Latency::Fast
+                } else {
+                    Latency::Standard
+                },
+            ),
             Self::ClaudeFable {
                 effort: ClaudeEffort::High,
             }
@@ -568,7 +584,6 @@ impl SessionBinding {
             ),
             Self::ResponsesGpt55(config)
             | Self::ResponsesSol(config)
-            | Self::ResponsesLuna(config)
             | Self::ResponsesTerra(config)
             | Self::CoordinatorTerra(config)
             | Self::CoordinatorSol(config)

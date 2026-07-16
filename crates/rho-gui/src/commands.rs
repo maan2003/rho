@@ -121,7 +121,7 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
         .is_none_or(char::is_whitespace);
     let words = trimmed.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() || (words.len() == 1 && !typing_new_token) {
-        return ["eng", "eng-low", "eng-high", "eng-ultra", "pm"]
+        return ["eng", "eng-mini", "eng-low", "eng-high", "eng-ultra", "pm"]
             .into_iter()
             .filter(|mode| fuzzy_contains(mode, token))
             .map(|mode| Candidate {

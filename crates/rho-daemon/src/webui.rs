@@ -220,6 +220,9 @@ where
 fn parse_role(role: &str) -> Option<AgentRole> {
     use rho_ui_proto::EngineerIntelligence;
     Some(match role {
+        "eng-mini" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Mini,
+        },
         "eng-low" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
         },

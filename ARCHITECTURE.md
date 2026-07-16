@@ -80,6 +80,7 @@ created directly, by a PM, or by an Engineer so prompt ownership context is an
 immutable creation-time fact rather than inferred later. Advisors retain normal
 shell/patch capabilities plus messaging/waiting but cannot spawn or interrupt.
 User-facing handles remain `eng-*`, `pm-*`, and `adv-*` over `AgentId`.
+The `eng-mini` tier uses the GPT-5.6 Luna Responses model with code mode.
 PMs run with the normal direct tool surface (never code mode), coordinate
 exclusively through collaboration tools, and do not receive shell command,
 process-input, or patch tools. Their prompts omit repository `AGENTS.md` content

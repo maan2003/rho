@@ -635,6 +635,7 @@ fn NewAgentPage(app: App) -> impl IntoView {
                         <h2>"Role"</h2>
                         <label>"Responsibility and intelligence"</label>
                         <select on:change=move |event| role.set(event_target_value(&event))>
+                            <option value="eng-mini">"Engineer · Mini"</option>
                             <option value="eng-low">"Engineer · Low"</option>
                             <option value="eng" selected>"Engineer · Standard"</option>
                             <option value="eng-high">"Engineer · High"</option>

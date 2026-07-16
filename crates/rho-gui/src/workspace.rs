@@ -1380,6 +1380,9 @@ impl Workspace {
 fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
     match text.trim().to_ascii_lowercase().as_str() {
         "" | "eng" => Ok(AgentRole::default()),
+        "eng-mini" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Mini,
+        }),
         "eng-low" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
         }),
@@ -1391,13 +1394,21 @@ fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
         }),
         "pm" => Ok(AgentRole::pm()),
         other => Err(format!(
-            "unknown role `{other}`; use eng, eng-low, eng-high, eng-ultra, or pm"
+            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-high, eng-ultra, or pm"
         )),
     }
 }
 
 fn cycle_agent_role_text(current: &str) -> &'static str {
     match parse_agent_role(current).unwrap_or_default() {
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Mini,
+            ..
+        }
+        | AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Mini,
+            ..
+        } => "eng-low",
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
             ..
@@ -1431,7 +1442,7 @@ fn cycle_agent_role_text(current: &str) -> &'static str {
             ..
         } => "pm",
         AgentRole::Advisor { .. } => "eng",
-        AgentRole::PM | AgentRole::WorkflowPM { .. } => "eng-low",
+        AgentRole::PM | AgentRole::WorkflowPM { .. } => "eng-mini",
     }
 }
 
@@ -1461,6 +1472,7 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
         AgentRole::Engineer { intelligence } | AgentRole::WorkflowEngineer { intelligence, .. } => {
             RoleLabel {
                 text: match intelligence {
+                    EngineerIntelligence::Mini => "eng-mini",
                     EngineerIntelligence::Low => "eng-low",
                     EngineerIntelligence::Medium => "eng",
                     EngineerIntelligence::High => "eng-high",

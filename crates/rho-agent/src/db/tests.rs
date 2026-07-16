@@ -16,6 +16,13 @@ fn agent_role_resolves_opinionated_bindings() {
             .unwrap()
     };
     assert!(matches!(
+        profile(EngineerIntelligence::Mini),
+        SessionBinding::ResponsesLuna(InferenceProfile {
+            effort: ReasoningEffort::Medium,
+            ..
+        })
+    ));
+    assert!(matches!(
         profile(EngineerIntelligence::Low),
         SessionBinding::ResponsesTerra(InferenceProfile {
             effort: ReasoningEffort::Low,
@@ -49,6 +56,7 @@ fn agent_role_resolves_opinionated_bindings() {
         })
     ));
     for intelligence in [
+        EngineerIntelligence::Mini,
         EngineerIntelligence::Low,
         EngineerIntelligence::Medium,
         EngineerIntelligence::High,

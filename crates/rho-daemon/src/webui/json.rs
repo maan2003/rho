@@ -163,6 +163,14 @@ fn role_label(config: AgentRole) -> &'static str {
             intelligence: rho_ui_proto::AdvisorIntelligence::High,
         } => "advisor-high",
         AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Mini,
+            ..
+        }
+        | AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Mini,
+            ..
+        } => "eng-mini",
+        AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
             ..
         }
