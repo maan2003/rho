@@ -9,7 +9,6 @@
 //! `+` row opens the draft compose view and doubles as its selection
 //! indicator.
 
-use std::cmp::Reverse;
 use std::collections::HashSet;
 
 use gpui::prelude::*;
@@ -363,14 +362,7 @@ fn split_agents<'a>(
     topic: &'a UiTopic,
     registry: &AgentRegistry,
 ) -> (Vec<&'a UiAgentSummary>, Vec<&'a UiAgentSummary>) {
-    let (mut agents, mut folded): (Vec<_>, Vec<_>) = topic
-        .agents
-        .iter()
-        .filter(|summary| !registry.agent_auto_collapsed(summary.agent_id))
-        .partition(|summary| !registry.agent_folded(summary.agent_id));
-    agents = registry.order_topic_agents(topic, agents);
-    folded.sort_by_key(|summary| Reverse(summary.updated_at));
-    (agents, folded)
+    registry.split_topic_agents(topic)
 }
 
 /// Lamp palette for attention levels; Quiet has no lamp.
@@ -394,7 +386,7 @@ impl LampColors {
 
 #[allow(clippy::too_many_arguments)]
 fn render_topic_rows<'a>(
-    topic: &UiTopic,
+    topic: &'a UiTopic,
     mut agents: Vec<&'a UiAgentSummary>,
     folded: Vec<&'a UiAgentSummary>,
     expanded: bool,
@@ -408,9 +400,8 @@ fn render_topic_rows<'a>(
     let name = topic.name.clone();
     let folded_count = folded.len();
     if expanded {
-        agents.extend(folded);
+        agents = registry.expanded_topic_agents(topic);
     }
-    agents = registry.order_topic_agents(topic, agents);
     let fold = (folded_count > 0)
         .then(|| fold_row(topic.topic_id, folded_count, expanded, text_style, cx));
     // Roll the topic's most urgent agent up into the header, so a collapsed

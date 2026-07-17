@@ -38,6 +38,12 @@ pub struct AgentRegistry {
     /// stable sort, so agents only move when their coarse rail bucket changes
     /// or when they are first seen.
     rail_order: Vec<AgentId>,
+    /// Cached positions in `rail_order`, avoiding a linear scan for every row
+    /// while constructing the topic rail.
+    rail_ranks: BTreeMap<AgentId, usize>,
+    /// Derived row membership and ordering, rebuilt only when rail-relevant
+    /// state changes rather than on every window draw.
+    topic_rail_layouts: BTreeMap<rho_ui_proto::TopicId, TopicRailLayout>,
     /// When the user last engaged each agent: seeded from summaries, bumped
     /// locally on send. Selects quiet agents for the active rail bucket.
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
@@ -52,6 +58,131 @@ pub struct AgentRegistry {
     /// Last workspace id counter, from `Ready`; keys uniform workspace label
     /// prefix length just like the generated-agent population does for agents.
     workspace_counter: u64,
+}
+
+#[derive(Default)]
+struct TopicRailLayout {
+    listed: Vec<(AgentId, usize)>,
+    folded: Vec<(AgentId, usize)>,
+    expanded: Vec<(AgentId, usize)>,
+}
+
+struct TopicRailState<'a> {
+    by_id: BTreeMap<AgentId, &'a rho_ui_proto::UiAgentSummary>,
+    root_by_id: BTreeMap<AgentId, AgentId>,
+    selected_root: Option<AgentId>,
+    top_roots: BTreeSet<AgentId>,
+    extra_roots: BTreeSet<AgentId>,
+}
+
+impl<'a> TopicRailState<'a> {
+    fn new(registry: &AgentRegistry, topic: &'a UiTopic) -> Self {
+        let by_id = topic
+            .agents
+            .iter()
+            .map(|agent| (agent.agent_id, agent))
+            .collect::<BTreeMap<_, _>>();
+        let root_by_id = topic
+            .agents
+            .iter()
+            .map(|agent| {
+                let mut root = agent.agent_id;
+                let mut seen = BTreeSet::new();
+                while seen.insert(root) {
+                    let Some(parent) = by_id.get(&root).and_then(|agent| agent.parent_agent) else {
+                        break;
+                    };
+                    if !by_id.contains_key(&parent) {
+                        break;
+                    }
+                    root = parent;
+                }
+                (agent.agent_id, root)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let selected_root = registry
+            .selected_agent()
+            .and_then(|selected| root_by_id.get(selected))
+            .copied();
+        let roots = topic
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent
+                    .parent_agent
+                    .is_none_or(|parent| !by_id.contains_key(&parent))
+            })
+            .collect::<Vec<_>>();
+        let top_roots = registry.top_bucket(roots.iter().copied());
+        let mut extra = roots
+            .into_iter()
+            .filter(|agent| {
+                agent.status != rho_ui_proto::Status::Pinned
+                    && !agent.hidden
+                    && !top_roots.contains(&agent.agent_id)
+            })
+            .collect::<Vec<_>>();
+        extra.sort_by_key(|agent| {
+            registry
+                .rail_ranks
+                .get(&agent.agent_id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        let extra_roots = extra
+            .into_iter()
+            .take(5)
+            .map(|agent| agent.agent_id)
+            .collect();
+
+        Self {
+            by_id,
+            root_by_id,
+            selected_root,
+            top_roots,
+            extra_roots,
+        }
+    }
+
+    fn auto_collapsed(&self, agent_id: AgentId) -> bool {
+        let Some(root) = self.root_by_id.get(&agent_id).copied() else {
+            return false;
+        };
+        root != agent_id && self.selected_root != Some(root)
+    }
+
+    fn folded(&self, agent_id: AgentId) -> bool {
+        let Some(root_id) = self.root_by_id.get(&agent_id).copied() else {
+            return false;
+        };
+        if self.auto_collapsed(agent_id) {
+            return true;
+        }
+
+        let mut cursor = agent_id;
+        let mut seen = BTreeSet::new();
+        while seen.insert(cursor) {
+            let Some(agent) = self.by_id.get(&cursor) else {
+                break;
+            };
+            if agent.hidden {
+                return true;
+            }
+            let Some(parent) = agent
+                .parent_agent
+                .filter(|parent| self.by_id.contains_key(parent))
+            else {
+                break;
+            };
+            cursor = parent;
+        }
+
+        let root = self.by_id[&root_id];
+        if root.status == rho_ui_proto::Status::Pinned || self.selected_root == Some(root_id) {
+            return false;
+        }
+        !self.top_roots.contains(&root_id) && !self.extra_roots.contains(&root_id)
+    }
 }
 
 impl AgentRegistry {
@@ -83,7 +214,7 @@ impl AgentRegistry {
                     .entry(agent.agent_id)
                     .or_insert(rho_core::UnixMs(0));
                 *last_active = (*last_active).max(agent.last_active);
-                if !self.rail_order.contains(&agent.agent_id) {
+                if !self.rail_ranks.contains_key(&agent.agent_id) {
                     unseen.push((agent.last_active, agent.agent_id));
                 }
             }
@@ -94,30 +225,32 @@ impl AgentRegistry {
         unseen.sort_by_key(|(last_active, agent_id)| (Reverse(*last_active), *agent_id));
         self.rail_order
             .splice(0..0, unseen.into_iter().map(|(_, agent_id)| agent_id));
+        self.rail_ranks = self
+            .rail_order
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(rank, agent_id)| (agent_id, rank))
+            .collect();
         self.topics = topics;
+        self.rebuild_topic_rail_layouts();
     }
 
     pub fn set_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
-        self.attention.insert(agent_id, attention);
+        if self.attention.insert(agent_id, attention) != Some(attention) {
+            self.rebuild_topic_rail_layouts();
+        }
     }
 
     pub fn attention(&self, agent_id: AgentId) -> rho_ui_proto::UiAttention {
         self.attention.get(&agent_id).copied().unwrap_or_default()
     }
 
-    /// Retained top-to-bottom position used as the stable tie-break inside
-    /// rail buckets.
-    pub fn rail_rank(&self, agent_id: AgentId) -> usize {
-        self.rail_order
-            .iter()
-            .position(|id| *id == agent_id)
-            .unwrap_or(usize::MAX)
-    }
-
     /// The user engaged this agent right now (sent it a message).
     pub fn touch_agent(&mut self, agent_id: AgentId) {
         self.last_active
             .insert(agent_id, rho_core::UnixMs(crate::workspace::now_ms()));
+        self.rebuild_topic_rail_layouts();
     }
 
     /// Folded under the topic's collapsed tail instead of listed. Explicitly
@@ -132,82 +265,9 @@ impl AgentRegistry {
         else {
             return false;
         };
-        let topic_ids = topic.agent_ids().collect::<BTreeSet<_>>();
-        let root_id = Self::topic_root(topic, agent_id);
-        if self.agent_auto_collapsed(agent_id) {
-            return true;
-        }
-        let mut cursor = agent_id;
-        let mut lineage = BTreeSet::new();
-        while lineage.insert(cursor) {
-            let Some(agent) = topic.agents.iter().find(|agent| agent.agent_id == cursor) else {
-                break;
-            };
-            if agent.hidden {
-                return true;
-            }
-            let Some(parent) = agent
-                .parent_agent
-                .filter(|parent| topic_ids.contains(parent))
-            else {
-                break;
-            };
-            cursor = parent;
-        }
-        let selected_root = self
-            .selected_agent()
-            .map(|selected| Self::topic_root(topic, *selected));
-        if self.attention(root_id) != rho_ui_proto::UiAttention::Quiet
-            || self.agent_status(root_id) == rho_ui_proto::Status::Pinned
-            || selected_root == Some(root_id)
-        {
-            return false;
-        }
-        let roots = || {
-            topic.agents.iter().filter(|agent| {
-                !agent
-                    .parent_agent
-                    .is_some_and(|parent| topic_ids.contains(&parent))
-            })
-        };
-        !self.top_bucket(roots()).contains(&root_id)
-            && !self.extra_bucket(roots(), 5).contains(&root_id)
-    }
-
-    /// Descendants are shown only for the selected root subtree. They are
-    /// separate from the topic's manual folded tail and its "more" count.
-    pub(crate) fn agent_auto_collapsed(&self, agent_id: AgentId) -> bool {
-        let Some(topic) = self
-            .topics
-            .iter()
-            .find(|topic| topic.agent_ids().any(|id| id == agent_id))
-        else {
-            return false;
-        };
-        let root = Self::topic_root(topic, agent_id);
-        root != agent_id
-            && self
-                .selected_agent()
-                .is_none_or(|selected| Self::topic_root(topic, *selected) != root)
-    }
-
-    fn topic_root(topic: &UiTopic, agent_id: AgentId) -> AgentId {
-        let topic_ids = topic.agent_ids().collect::<BTreeSet<_>>();
-        let mut root = agent_id;
-        let mut seen = BTreeSet::new();
-        while seen.insert(root) {
-            let Some(parent) = topic
-                .agents
-                .iter()
-                .find(|agent| agent.agent_id == root)
-                .and_then(|agent| agent.parent_agent)
-                .filter(|parent| topic_ids.contains(parent))
-            else {
-                break;
-            };
-            root = parent;
-        }
-        root
+        self.topic_rail_layouts
+            .get(&topic.topic_id)
+            .is_some_and(|layout| layout.listed.iter().all(|(id, _)| *id != agent_id))
     }
 
     /// The rail-visible agent most in need of the user, excluding the one
@@ -340,11 +400,18 @@ impl AgentRegistry {
     }
 
     pub fn select_agent(&mut self, agent_id: AgentId) {
-        self.active = ActivePane::Agent(agent_id);
+        let active = ActivePane::Agent(agent_id);
+        if self.active != active {
+            self.active = active;
+            self.rebuild_topic_rail_layouts();
+        }
     }
 
     pub fn enter_draft(&mut self) {
-        self.active = ActivePane::Draft;
+        if self.active != ActivePane::Draft {
+            self.active = ActivePane::Draft;
+            self.rebuild_topic_rail_layouts();
+        }
     }
 
     /// Cycles through live, rail-visible agents by `delta`, starting from
@@ -379,8 +446,9 @@ impl AgentRegistry {
 
         let mut candidates = Vec::new();
         for topic in topics {
-            let agents = self.order_topic_agents(topic, topic.agents.iter().collect());
-            candidates.extend(agents.into_iter().map(|agent| agent.agent_id));
+            if let Some(layout) = self.topic_rail_layouts.get(&topic.topic_id) {
+                candidates.extend(layout.listed.iter().map(|(agent_id, _)| *agent_id));
+            }
         }
         for agent_id in self.agents.keys() {
             if !candidates.contains(agent_id) {
@@ -390,25 +458,19 @@ impl AgentRegistry {
         candidates
     }
 
-    /// Orders a subset of a topic as a tree. Roots and siblings retain the
-    /// rail's pin/attention/recency ordering; same-topic children immediately
-    /// follow their parent. Missing or cross-topic parents are roots.
-    pub(crate) fn order_topic_agents<'a>(
+    fn order_topic_agents_with_state<'a>(
         &self,
-        topic: &UiTopic,
+        state: &TopicRailState<'_>,
         mut agents: Vec<&'a rho_ui_proto::UiAgentSummary>,
     ) -> Vec<&'a rho_ui_proto::UiAgentSummary> {
-        let topic_ids = topic.agent_ids().collect::<BTreeSet<_>>();
-        let top_bucket = self.top_bucket(agents.iter().copied().filter(|agent| {
-            !agent
-                .parent_agent
-                .is_some_and(|parent| topic_ids.contains(&parent))
-        }));
         agents.sort_by_key(|agent| {
             (
                 agent.status != rho_ui_proto::Status::Pinned,
-                !top_bucket.contains(&agent.agent_id),
-                self.rail_rank(agent.agent_id),
+                !state.top_roots.contains(&agent.agent_id),
+                self.rail_ranks
+                    .get(&agent.agent_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
             )
         });
 
@@ -420,7 +482,7 @@ impl AgentRegistry {
         for agent in agents {
             let parent = agent
                 .parent_agent
-                .filter(|parent| topic_ids.contains(parent) && visible_ids.contains(parent));
+                .filter(|parent| state.by_id.contains_key(parent) && visible_ids.contains(parent));
             children.entry(parent).or_default().push(agent);
         }
 
@@ -451,6 +513,99 @@ impl AgentRegistry {
             }
         }
         ordered
+    }
+
+    fn rebuild_topic_rail_layouts(&mut self) {
+        let layouts = self
+            .topics
+            .iter()
+            .map(|topic| {
+                let state = TopicRailState::new(self, topic);
+                let (listed, mut folded): (Vec<_>, Vec<_>) = topic
+                    .agents
+                    .iter()
+                    .filter(|agent| !state.auto_collapsed(agent.agent_id))
+                    .partition(|agent| !state.folded(agent.agent_id));
+                let listed = self.order_topic_agents_with_state(&state, listed);
+                let expanded = self.order_topic_agents_with_state(
+                    &state,
+                    listed
+                        .iter()
+                        .copied()
+                        .chain(folded.iter().copied())
+                        .collect(),
+                );
+                folded.sort_by_key(|agent| Reverse(agent.updated_at));
+                let indexes = topic
+                    .agents
+                    .iter()
+                    .enumerate()
+                    .map(|(index, agent)| (agent.agent_id, index))
+                    .collect::<BTreeMap<_, _>>();
+                let cache = |agents: Vec<&rho_ui_proto::UiAgentSummary>| {
+                    agents
+                        .into_iter()
+                        .map(|agent| (agent.agent_id, indexes[&agent.agent_id]))
+                        .collect()
+                };
+                (
+                    topic.topic_id,
+                    TopicRailLayout {
+                        listed: cache(listed),
+                        folded: cache(folded),
+                        expanded: cache(expanded),
+                    },
+                )
+            })
+            .collect();
+        self.topic_rail_layouts = layouts;
+    }
+
+    fn resolve_cached_agents<'a>(
+        topic: &'a UiTopic,
+        cached: &[(AgentId, usize)],
+    ) -> Vec<&'a rho_ui_proto::UiAgentSummary> {
+        cached
+            .iter()
+            .filter_map(|(agent_id, index)| {
+                topic
+                    .agents
+                    .get(*index)
+                    .filter(|agent| agent.agent_id == *agent_id)
+                    .or_else(|| {
+                        topic
+                            .agents
+                            .iter()
+                            .find(|agent| agent.agent_id == *agent_id)
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn split_topic_agents<'a>(
+        &self,
+        topic: &'a UiTopic,
+    ) -> (
+        Vec<&'a rho_ui_proto::UiAgentSummary>,
+        Vec<&'a rho_ui_proto::UiAgentSummary>,
+    ) {
+        let Some(layout) = self.topic_rail_layouts.get(&topic.topic_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        (
+            Self::resolve_cached_agents(topic, &layout.listed),
+            Self::resolve_cached_agents(topic, &layout.folded),
+        )
+    }
+
+    pub(crate) fn expanded_topic_agents<'a>(
+        &self,
+        topic: &'a UiTopic,
+    ) -> Vec<&'a rho_ui_proto::UiAgentSummary> {
+        self.topic_rail_layouts
+            .get(&topic.topic_id)
+            .map(|layout| Self::resolve_cached_agents(topic, &layout.expanded))
+            .unwrap_or_default()
     }
 
     pub(crate) fn topic_agent_depth(&self, topic: &UiTopic, agent_id: AgentId) -> usize {
@@ -513,29 +668,6 @@ impl AgentRegistry {
         top
     }
 
-    fn extra_bucket<'a>(
-        &self,
-        agents: impl IntoIterator<Item = &'a rho_ui_proto::UiAgentSummary>,
-        limit: usize,
-    ) -> BTreeSet<AgentId> {
-        let agents = agents.into_iter().collect::<Vec<_>>();
-        let top = self.top_bucket(agents.iter().copied());
-        let mut extra = agents
-            .into_iter()
-            .filter(|agent| {
-                agent.status != rho_ui_proto::Status::Pinned
-                    && !agent.hidden
-                    && !top.contains(&agent.agent_id)
-            })
-            .collect::<Vec<_>>();
-        extra.sort_by_key(|agent| self.rail_rank(agent.agent_id));
-        extra
-            .into_iter()
-            .take(limit)
-            .map(|agent| agent.agent_id)
-            .collect()
-    }
-
     /// Resolves an agent label (as produced by [`Self::agent_id_label`],
     /// with or without a leading `@`) or display name back to the agent id.
     pub fn agent_by_label(&self, label: &str) -> Option<AgentId> {
@@ -571,8 +703,8 @@ mod tests {
         AgentId::from_counter(id, &AgentIdDomain(0)).unwrap()
     }
 
-    /// Freshly-engaged fixture: `last_active` anchors at now (offset by
-    /// `id` for deterministic seeding order.
+    /// Freshly-engaged fixture: `last_active` stays below now while `id`
+    /// provides deterministic seeding order.
     fn agent(id: u64, status: Status) -> UiAgentSummary {
         UiAgentSummary {
             agent_id: agent_id(id),
@@ -586,7 +718,11 @@ mod tests {
             },
             status,
             attention: rho_ui_proto::UiAttention::Quiet,
-            last_active: rho_core::UnixMs(crate::workspace::now_ms() + id),
+            last_active: rho_core::UnixMs(
+                crate::workspace::now_ms()
+                    .saturating_sub(10_000)
+                    .saturating_add(id),
+            ),
             hidden: false,
         }
     }
@@ -809,10 +945,7 @@ mod tests {
         assert!(registry.agent_folded(agent_id(1)));
         assert!(!registry.agent_folded(agent_id(2)));
         assert!(!registry.agent_folded(agent_id(13)));
-        registry.last_active.insert(
-            agent_id(1),
-            rho_core::UnixMs(crate::workspace::now_ms() + 100),
-        );
+        registry.touch_agent(agent_id(1));
         assert!(!registry.agent_folded(agent_id(1)));
     }
 

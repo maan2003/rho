@@ -116,11 +116,28 @@ fn run() -> Result<()> {
                 .context("failed to start in-process CPU profiler")
         })
         .transpose()?;
+    let cpu_profile = cpu_profile.zip(profiler);
     let attach_target = attach_target_from_args(args)?;
 
     gpui_platform::application()
         .with_assets(RhoAssets)
         .run(move |cx: &mut App| {
+            let mut cpu_profile = cpu_profile;
+            cx.on_app_quit(move |_| {
+                if let Some((path, profiler)) = cpu_profile.take() {
+                    match export_cpu_profile(&path, &profiler) {
+                        Ok(()) => {
+                            eprintln!("rho-gui: wrote CPU profile to {}", path.display());
+                        }
+                        Err(error) => {
+                            eprintln!("rho-gui: failed to write CPU profile: {error:#}");
+                        }
+                    }
+                }
+                std::future::ready(())
+            })
+            .detach();
+
             if let Err(error) = init_app(cx) {
                 eprintln!("rho-gui: {error:#}");
                 cx.quit();
@@ -136,11 +153,6 @@ fn run() -> Result<()> {
                 cx.quit();
             }
         });
-
-    if let (Some(path), Some(profiler)) = (cpu_profile, profiler) {
-        export_cpu_profile(&path, &profiler)?;
-        eprintln!("rho-gui: wrote CPU profile to {}", path.display());
-    }
 
     Ok(())
 }
