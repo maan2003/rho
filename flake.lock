@@ -167,26 +167,6 @@
         "type": "github"
       }
     },
-    "dpc-public-skills": {
-      "inputs": {
-        "nixpkgs": [
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1781290097,
-        "narHash": "sha256-hyPezu5/FDdCAUTQDjbQnLSQl774dkpVfKgcP5nxlSc=",
-        "ref": "refs/heads/master",
-        "rev": "64bb25e97be1b4907721257bc845de2417ec8359",
-        "revCount": 12,
-        "type": "git",
-        "url": "https://radicle.dpc.pw/z2HR882B4c4mTdAgdt4SozpdeTuMf.git"
-      },
-      "original": {
-        "type": "git",
-        "url": "https://radicle.dpc.pw/z2HR882B4c4mTdAgdt4SozpdeTuMf.git"
-      }
-    },
     "fenix": {
       "inputs": {
         "nixpkgs": [
@@ -466,12 +446,32 @@
         "type": "github"
       }
     },
+    "public-skills": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1784200715,
+        "narHash": "sha256-m7h2VBNZnoQJ3hyWHXmzwxqS8WXu/AfM+dhjVN024Bc=",
+        "owner": "maan2003",
+        "repo": "public-skills",
+        "rev": "621919e19ffa0087c149d5456855360f7ec0937b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "maan2003",
+        "repo": "public-skills",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
-        "dpc-public-skills": "dpc-public-skills",
         "flake-utils": "flake-utils",
         "flakebox": "flakebox",
         "nixpkgs": "nixpkgs",
+        "public-skills": "public-skills",
         "selfci": "selfci"
       }
     },

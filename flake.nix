@@ -9,8 +9,8 @@
       url = "github:rustshop/flakebox?rev=cf89db7a3ac6b1431693d17276225ba352e48a5c";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    dpc-public-skills = {
-      url = "git+https://radicle.dpc.pw/z2HR882B4c4mTdAgdt4SozpdeTuMf.git";
+    public-skills = {
+      url = "github:maan2003/public-skills";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     selfci = {
@@ -28,7 +28,7 @@
       nixpkgs,
       flake-utils,
       flakebox,
-      dpc-public-skills,
+      public-skills,
       selfci,
       ...
     }:
@@ -326,7 +326,7 @@
           LD_LIBRARY_PATH = guiLibraryPath;
           NIX_LD_LIBRARY_PATH = guiLibraryPath;
           shellHook = ''
-            ${dpc-public-skills.packages.${system}.install}/bin/install-dpc-public-skills
+            ${public-skills.packages.${system}.install}/bin/install-maan2003-skills
           '';
         };
       }
