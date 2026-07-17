@@ -116,7 +116,6 @@
           "README.md"
           ".config/nextest.toml"
           "crates"
-          "vendor/pprof"
         ];
 
         buildSrc = flakeboxLib.filterSubPaths {
