@@ -277,7 +277,7 @@ mod tests {
     fn root_commands_complete_by_prefix() {
         let candidates = completions_for(":", &[], &[], &[]);
         assert!(candidates.iter().any(|c| c.value == ":agent"));
-        assert!(candidates.iter().any(|c| c.value == ":workdirs"));
+        assert!(candidates.iter().any(|c| c.value == ":projects"));
         let candidates = completions_for(":agent re", &[], &[], &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "rename");

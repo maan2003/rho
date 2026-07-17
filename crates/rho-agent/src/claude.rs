@@ -49,6 +49,7 @@ pub struct ClaudeAgent {
 }
 
 impl ClaudeAgent {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create(
         db: RhoDb,
         topic_id: TopicId,
