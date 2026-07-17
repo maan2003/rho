@@ -1,8 +1,9 @@
 //! Root entity: owns the daemon connection, the canonical agent states, the
 //! registry, and one persistent [`AgentView`] per opened agent.
 //!
-//! All protocol events flow through [`Workspace::handle_event`]; views receive
-//! already-summarized state changes and never see the protocol.
+//! All protocol events flow through [`Workspace`]; queued frame runs are
+//! merged per agent, and views receive summarized changes rather than the
+//! protocol itself.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -107,9 +108,7 @@ impl Workspace {
                     batch.push(event);
                 }
                 let updated = this.update_in(cx, |this, window, cx| {
-                    for event in batch {
-                        this.handle_event(event, window, cx);
-                    }
+                    this.handle_events(batch, window, cx);
                 });
                 if updated.is_err() {
                     break;
@@ -141,6 +140,117 @@ impl Workspace {
         this.seed_draft(false, window, cx);
         this.focus_active_editor(window, cx);
         this
+    }
+
+    pub(crate) fn handle_events(
+        &mut self,
+        events: Vec<ConnEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut frames = Vec::new();
+        for event in events {
+            match event {
+                ConnEvent::Frame { agent_id, frame } => frames.push((agent_id, frame)),
+                event => {
+                    if !frames.is_empty() {
+                        self.handle_frame_batch(std::mem::take(&mut frames), window, cx);
+                    }
+                    self.handle_event(event, window, cx);
+                }
+            }
+        }
+        if !frames.is_empty() {
+            self.handle_frame_batch(frames, window, cx);
+        }
+    }
+
+    fn handle_frame_batch(
+        &mut self,
+        frames: Vec<(AgentId, rho_ui_proto::remote::AgentRemoteFrame)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let startup_agent =
+            matches!(self.registry.active_pane(), ActivePane::Startup).then(|| frames[0].0);
+        let mut order = Vec::new();
+        let mut changes: HashMap<AgentId, (FrameSummary, Option<u64>)> = HashMap::new();
+        let mut live_changed = false;
+
+        for (agent_id, frame) in frames {
+            let old_context = self
+                .store
+                .get(&agent_id)
+                .and_then(|state| state.context_used);
+            let summary = self.store.apply(agent_id, frame);
+            live_changed |= self.registry.mark_live(agent_id);
+            changes
+                .entry(agent_id)
+                .and_modify(|(pending, _)| *pending = pending.merge(summary))
+                .or_insert_with(|| {
+                    order.push(agent_id);
+                    (summary, old_context)
+                });
+        }
+
+        if live_changed {
+            self.refresh_draft_agent_targets(cx);
+        }
+
+        for agent_id in &order {
+            let old_context = changes[agent_id].1;
+            let new_context = self
+                .store
+                .get(agent_id)
+                .and_then(|state| state.context_used);
+            if old_context != new_context
+                && let Some(view) = self.views.get(agent_id).cloned()
+            {
+                self.refresh_view_status(agent_id, &view, cx);
+            }
+        }
+
+        if let Some(agent_id) = startup_agent {
+            // Materializing after applying the whole batch renders the final
+            // state directly, avoiding one editor sync per queued frame.
+            self.select_agent(Some(agent_id), window, cx);
+        }
+
+        let selected = self.registry.selected_agent().copied();
+        for agent_id in order {
+            let summary = changes[&agent_id].0;
+            if Some(agent_id) == startup_agent {
+                continue;
+            }
+            if selected == Some(agent_id) {
+                if let Some(view) = self.views.get(&agent_id).cloned()
+                    && let Some(state) = self.store.get(&agent_id)
+                {
+                    view.update(cx, |view, cx| {
+                        view.sync(
+                            state,
+                            summary,
+                            now_ms(),
+                            &|id| self.registry.agent_display_label(id),
+                            cx,
+                        )
+                    });
+                }
+            } else if self.views.contains_key(&agent_id) {
+                self.pending_syncs
+                    .entry(agent_id)
+                    .and_modify(|pending| *pending = pending.merge(summary))
+                    .or_insert(summary);
+            }
+        }
+
+        self.ensure_duration_timer(cx);
+        // Selected views notify themselves when their editor changes. Only a
+        // newly-live agent changes workspace chrome; background transcript
+        // frames should not dirty the window.
+        if live_changed && startup_agent.is_none() {
+            cx.notify();
+        }
     }
 
     pub(crate) fn handle_event(
@@ -205,49 +315,7 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::Frame { agent_id, frame } => {
-                let old_context = self
-                    .store
-                    .get(&agent_id)
-                    .and_then(|state| state.context_used);
-                let summary = self.store.apply(agent_id, frame);
-                if self.registry.mark_live(agent_id) {
-                    self.refresh_draft_agent_targets(cx);
-                }
-                let new_context = self
-                    .store
-                    .get(&agent_id)
-                    .and_then(|state| state.context_used);
-                if old_context != new_context
-                    && let Some(view) = self.views.get(&agent_id).cloned()
-                {
-                    self.refresh_view_status(&agent_id, &view, cx);
-                }
-                if matches!(self.registry.active_pane(), ActivePane::Startup) {
-                    // First live agent: show it. Materialization renders the
-                    // full state, so the per-frame sync below is unnecessary.
-                    self.select_agent(Some(agent_id), window, cx);
-                } else if self.registry.selected_agent() == Some(&agent_id) {
-                    if let Some(view) = self.views.get(&agent_id).cloned()
-                        && let Some(state) = self.store.get(&agent_id)
-                    {
-                        view.update(cx, |view, cx| {
-                            view.sync(
-                                state,
-                                summary,
-                                now_ms(),
-                                &|id| self.registry.agent_display_label(id),
-                                cx,
-                            )
-                        });
-                    }
-                } else if self.views.contains_key(&agent_id) {
-                    self.pending_syncs
-                        .entry(agent_id)
-                        .and_modify(|pending| *pending = pending.merge(summary))
-                        .or_insert(summary);
-                }
-                self.ensure_duration_timer(cx);
-                cx.notify();
+                self.handle_frame_batch(vec![(agent_id, frame)], window, cx);
             }
             ConnEvent::AgentAttention {
                 agent_id,

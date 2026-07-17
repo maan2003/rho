@@ -15,9 +15,9 @@ pub struct FrameSummary {
     /// from here to the end of the transcript needs re-rendering. `None`
     /// means nothing visible changed.
     pub first_changed_block: Option<usize>,
-    /// A single protocol block update that may be safe to apply as a targeted
-    /// rendered-text patch. Merged/structural summaries drop this hint and
-    /// fall back to suffix re-rendering.
+    /// A single block that may be safe to apply as a targeted rendered-text
+    /// patch. Merging updates to different blocks drops this hint and falls
+    /// back to suffix re-rendering.
     pub incremental: Option<IncrementalUpdate>,
 }
 
@@ -39,12 +39,18 @@ impl FrameSummary {
     /// Combines two summaries into one covering both changes, so hidden
     /// views can accumulate frames and render once when shown.
     pub fn merge(self, other: Self) -> Self {
+        let incremental = match (self.incremental, other.incremental) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            (Some(a), None) if other.first_changed_block.is_none() => Some(a),
+            (None, Some(b)) if self.first_changed_block.is_none() => Some(b),
+            _ => None,
+        };
         Self {
             first_changed_block: match (self.first_changed_block, other.first_changed_block) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             },
-            incremental: None,
+            incremental,
         }
     }
 }
@@ -222,6 +228,34 @@ mod tests {
             FrameSummary {
                 first_changed_block: Some(2),
                 incremental: Some(IncrementalUpdate::Tool { index: 2 }),
+            }
+        );
+    }
+
+    #[test]
+    fn merging_updates_to_the_same_block_keeps_incremental_hint() {
+        let update = FrameSummary {
+            first_changed_block: Some(4),
+            incremental: Some(IncrementalUpdate::AssistantText { index: 4 }),
+        };
+        assert_eq!(update.merge(update), update);
+    }
+
+    #[test]
+    fn merging_updates_to_different_blocks_drops_incremental_hint() {
+        let first = FrameSummary {
+            first_changed_block: Some(4),
+            incremental: Some(IncrementalUpdate::AssistantText { index: 4 }),
+        };
+        let second = FrameSummary {
+            first_changed_block: Some(5),
+            incremental: Some(IncrementalUpdate::AssistantText { index: 5 }),
+        };
+        assert_eq!(
+            first.merge(second),
+            FrameSummary {
+                first_changed_block: Some(4),
+                incremental: None,
             }
         );
     }

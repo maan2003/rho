@@ -166,6 +166,11 @@ impl ElisionSync {
             }
         }
 
+        if removed_ids.is_empty() && updates.is_empty() && inserted_properties.is_empty() {
+            self.active = next_active;
+            return;
+        }
+
         let inserted_ids = editor.update(cx, |editor, cx| {
             if !removed_ids.is_empty() {
                 editor.remove_display_elisions(removed_ids, None, cx);

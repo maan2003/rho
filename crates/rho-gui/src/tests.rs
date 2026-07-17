@@ -77,6 +77,22 @@ fn feed_frame(
         .expect("update workspace");
 }
 
+fn feed_frames(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    frames: impl IntoIterator<Item = (AgentId, AgentRemoteFrame)>,
+) {
+    let events = frames
+        .into_iter()
+        .map(|(agent_id, frame)| ConnEvent::Frame { agent_id, frame })
+        .collect();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_events(events, window, cx);
+        })
+        .expect("update workspace");
+}
+
 fn active_editor(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> Entity<Editor> {
     workspace
         .update(cx, |workspace, _, cx| workspace.active_editor(cx))
@@ -232,6 +248,46 @@ fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
     assert!(
         text.contains("hello world"),
         "streamed suffix should append to the frontier: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn queued_streaming_updates_to_one_block_render_once_to_final_state(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant("hel", Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+
+    let update = |keep_bytes, value: &str| AgentRemoteFrame::Diff {
+        blocks: UiBlocksDiff {
+            truncate_to: None,
+            updates: vec![UiBlockUpdate {
+                index: 1,
+                block: UiBlockDiff::AssistantText(UiTextDiff {
+                    keep_bytes,
+                    value: value.to_owned(),
+                }),
+            }],
+        },
+        status: None,
+        context_used: None,
+    };
+    feed_frames(
+        &workspace,
+        cx,
+        [(agent(1), update(3, "lo")), (agent(1), update(5, " world"))],
+    );
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("hello world"),
+        "queued updates should render their final merged state: {text:?}"
     );
 }
 
