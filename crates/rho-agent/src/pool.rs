@@ -30,7 +30,7 @@ use crate::{
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
-const MAX_LIVE_CHILDREN: usize = 8;
+const MAX_LIVE_CHILDREN: usize = 50;
 const ID_LABEL_HEADROOM: u64 = 200;
 
 pub struct AgentPool {
