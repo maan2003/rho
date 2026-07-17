@@ -352,6 +352,15 @@ impl ChatApp {
                     .print_system(&format!("renamed {agent_id:?} to `{name}`"));
                 self.agent.rename_agent(agent_id, name);
             }
+            rho_commands::Command::AgentChangePromptCacheKey => {
+                let Some(agent_id) = primary_agent_id(&self.agent) else {
+                    self.term
+                        .print_system(":agent change-prompt-cache-key: no agent yet");
+                    return Ok(true);
+                };
+                self.agent.change_prompt_cache_key(agent_id);
+                self.term.print_system("changed prompt cache key");
+            }
             rho_commands::Command::AgentPin => {
                 self.toggle_agent_status(rho_ui_proto::Status::Pinned);
             }

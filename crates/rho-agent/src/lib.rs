@@ -839,6 +839,12 @@ impl Agent {
             .send(AgentControl::SetDeepConfig(config, model));
     }
 
+    pub fn change_prompt_cache_key(&self) {
+        let _ = self.control.send(AgentControl::ChangePromptCacheKey(
+            PromptCacheKey::generate(),
+        ));
+    }
+
     pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
         self.control
@@ -983,6 +989,7 @@ enum AgentControl {
     /// Dropped when no turn is active, matching Codex.
     ToolUpdate(ToolUpdate),
     SetDeepConfig(InferenceProfile, InferenceModel),
+    ChangePromptCacheKey(PromptCacheKey),
     Rewind {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -1214,6 +1221,15 @@ impl AgentLoop {
                         }
                         AgentControl::SetDeepConfig(config, model) => {
                             let _ = self.inference_session.set_deep_config(config, model);
+                        }
+                        AgentControl::ChangePromptCacheKey(prompt_cache_key) => {
+                            let mut write = self.persistence.db.write().await;
+                            write.set_agent_prompt_cache_key(
+                                self.persistence.agent_id,
+                                prompt_cache_key,
+                            );
+                            write.commit();
+                            self.inference_session.set_prompt_cache_key(prompt_cache_key);
                         }
                         AgentControl::Rewind { turns, reply } => {
                             let result = if turns == 0 {

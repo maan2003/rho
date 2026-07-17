@@ -1691,6 +1691,14 @@ async fn handle_message(
             agents.rename_agent(agent_id, name).await?;
             Ok(Refresh::Ready)
         }
+        ClientMessage::ChangePromptCacheKey { agent_id } => {
+            let agent = agents
+                .get(agent_id)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
+            agent.change_prompt_cache_key()?;
+            Ok(Refresh::None)
+        }
         ClientMessage::RenameTopic { topic_id, name } => {
             agents.rename_topic(topic_id, name).await?;
             Ok(Refresh::Ready)

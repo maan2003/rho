@@ -716,6 +716,18 @@ impl RunningAgent {
         }
     }
 
+    pub fn change_prompt_cache_key(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Rho(agent) => {
+                agent.change_prompt_cache_key();
+                Ok(())
+            }
+            Self::Claude(_) => {
+                anyhow::bail!("prompt cache keys are only available for Rho agents")
+            }
+        }
+    }
+
     pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
         match self {
             Self::Rho(agent) => agent.rewind(turns).await,

@@ -715,6 +715,7 @@ pub trait AgentWriteTxnExt {
 
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
     fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole);
+    fn set_agent_prompt_cache_key(&mut self, agent_id: AgentId, key: PromptCacheKey);
 
     fn alloc_agent_id(&mut self) -> AgentId;
 
@@ -1038,6 +1039,19 @@ impl AgentWriteTxnExt for WriteTxn {
             .value()
             .into_owned();
         agent.role = role;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
+    fn set_agent_prompt_cache_key(&mut self, agent_id: AgentId, key: PromptCacheKey) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent missing")
+            .value()
+            .into_owned();
+        agent.runtime = AgentRuntime::Rho {
+            prompt_cache_key: key,
+        };
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 

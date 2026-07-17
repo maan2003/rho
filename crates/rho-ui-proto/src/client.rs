@@ -397,6 +397,12 @@ impl AgentClient {
             .send(ClientMessage::RenameAgent { agent_id, name });
     }
 
+    pub fn change_prompt_cache_key(&self, agent_id: AgentId) {
+        let _ = self
+            .commands
+            .send(ClientMessage::ChangePromptCacheKey { agent_id });
+    }
+
     pub fn rename_topic(&self, topic_id: TopicId, name: String) {
         let _ = self
             .commands

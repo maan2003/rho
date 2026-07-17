@@ -203,6 +203,10 @@ pub enum ClientMessage {
         agent_id: Option<String>,
         command: PrCommand,
     },
+    /// Give a Rho-runtime agent a fresh key for subsequent provider requests.
+    ChangePromptCacheKey {
+        agent_id: AgentId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

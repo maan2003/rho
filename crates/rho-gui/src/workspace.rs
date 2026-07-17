@@ -693,6 +693,27 @@ impl Workspace {
                     ),
                 }
             }
+            Command::AgentChangePromptCacheKey => {
+                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
+                match target {
+                    Some(agent_id) => {
+                        self.connection
+                            .send(ClientMessage::ChangePromptCacheKey { agent_id });
+                        self.notice_on(
+                            source_agent.as_ref(),
+                            "changed prompt cache key",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                    None => self.notice_on(
+                        None,
+                        ":agent change-prompt-cache-key: no agent selected",
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            }
             Command::TopicNew { name } => {
                 self.connection.send(ClientMessage::NewTopic { name });
             }

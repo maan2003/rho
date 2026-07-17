@@ -46,6 +46,10 @@ fn parses_agent_commands() {
         Some(Parsed::Invalid(":agent rename <name>".to_owned()))
     );
     assert_eq!(
+        parse(":agent change-prompt-cache-key"),
+        Some(Parsed::Command(Command::AgentChangePromptCacheKey))
+    );
+    assert_eq!(
         parse(":rewind"),
         Some(Parsed::Command(Command::Rewind { turns: 1 }))
     );
@@ -191,7 +195,10 @@ fn completes_command_words_stepwise() {
     assert_eq!(values(&first).iter().filter(|v| **v == "agent").count(), 1);
 
     let second = completion_candidates(":agent ", &ctx);
-    assert_eq!(values(&second), ["new", "cancel", "rename", "pin"]);
+    assert_eq!(
+        values(&second),
+        ["new", "cancel", "rename", "change-prompt-cache-key", "pin"]
+    );
 
     let partial = completion_candidates(":agent re", &ctx);
     assert_eq!(values(&partial), ["rename"]);

@@ -33,6 +33,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Rename the current agent",
     },
     CommandSpec {
+        name: "agent change-prompt-cache-key",
+        usage: ":agent change-prompt-cache-key",
+        description: "Give the current agent a fresh prompt cache key",
+    },
+    CommandSpec {
         name: "agent pin",
         usage: ":agent pin",
         description: "Pin/unpin the current agent",
@@ -133,6 +138,7 @@ pub enum Command {
         name: String,
     },
     AgentCancel,
+    AgentChangePromptCacheKey,
     AgentPin,
     TopicNew {
         name: String,
@@ -197,8 +203,9 @@ pub fn parse(line: &str) -> Option<Parsed> {
                 None => Parsed::Invalid(":agent rename <name>".to_owned()),
             },
             Some("cancel") => Parsed::Command(Command::AgentCancel),
+            Some("change-prompt-cache-key") => Parsed::Command(Command::AgentChangePromptCacheKey),
             Some("pin") => Parsed::Command(Command::AgentPin),
-            _ => Parsed::Invalid(":agent new|rename|cancel|pin".to_owned()),
+            _ => Parsed::Invalid(":agent new|rename|cancel|change-prompt-cache-key|pin".to_owned()),
         },
         "topic" => match tokens.next() {
             Some("new") => match joined_name(rest) {

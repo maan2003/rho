@@ -323,6 +323,10 @@ impl InferenceSession {
         self.prompt_cache_key
     }
 
+    pub fn set_prompt_cache_key(&mut self, prompt_cache_key: PromptCacheKey) {
+        self.prompt_cache_key = prompt_cache_key;
+    }
+
     pub fn has_active_request(&self) -> bool {
         self.turn.is_some()
     }
