@@ -9,7 +9,10 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+backtrace = "0.3"
+libc.workspace = true
 pprof = { version = "0.15", default-features = false }
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

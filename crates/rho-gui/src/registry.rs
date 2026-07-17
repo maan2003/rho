@@ -48,6 +48,8 @@ pub struct AgentRegistry {
     /// locally on send. Selects quiet agents for the active rail bucket.
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
     topics: Vec<UiTopic>,
+    /// Positions in the latest topic snapshot, used by all summary lookups.
+    agent_locations: BTreeMap<AgentId, (usize, usize)>,
     active: ActivePane,
     /// The daemon database's machine seed, from `Ready`; kept for consumers
     /// that resolve ids.
@@ -232,6 +234,17 @@ impl AgentRegistry {
             .enumerate()
             .map(|(rank, agent_id)| (agent_id, rank))
             .collect();
+        self.agent_locations = topics
+            .iter()
+            .enumerate()
+            .flat_map(|(topic_index, topic)| {
+                topic
+                    .agents
+                    .iter()
+                    .enumerate()
+                    .map(move |(agent_index, agent)| (agent.agent_id, (topic_index, agent_index)))
+            })
+            .collect();
         self.topics = topics;
         self.rebuild_topic_rail_layouts();
     }
@@ -298,10 +311,8 @@ impl AgentRegistry {
 
     /// The topic an agent currently belongs to, from topic summaries.
     pub fn topic_of(&self, agent_id: AgentId) -> Option<rho_ui_proto::TopicId> {
-        self.topics
-            .iter()
-            .find(|topic| topic.agent_ids().any(|id| id == agent_id))
-            .map(|topic| topic.topic_id)
+        let (topic_index, _) = self.agent_locations.get(&agent_id)?;
+        Some(self.topics[*topic_index].topic_id)
     }
 
     /// The role-prefixed short display label, unique among generated IDs.
@@ -344,10 +355,8 @@ impl AgentRegistry {
     }
 
     fn agent_summary(&self, agent_id: AgentId) -> Option<&rho_ui_proto::UiAgentSummary> {
-        self.topics
-            .iter()
-            .flat_map(|topic| topic.agents.iter())
-            .find(|agent| agent.agent_id == agent_id)
+        let (topic_index, agent_index) = self.agent_locations.get(&agent_id)?;
+        self.topics.get(*topic_index)?.agents.get(*agent_index)
     }
 
     pub fn agent_display_name(&self, agent_id: AgentId) -> Option<&str> {
@@ -380,8 +389,8 @@ impl AgentRegistry {
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
     }
 
-    pub fn mark_live(&mut self, agent_id: AgentId) {
-        self.agents.insert(agent_id, AgentLife::Live);
+    pub fn mark_live(&mut self, agent_id: AgentId) -> bool {
+        self.agents.insert(agent_id, AgentLife::Live) != Some(AgentLife::Live)
     }
 
     pub fn is_live(&self, agent_id: AgentId) -> bool {

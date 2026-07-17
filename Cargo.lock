@@ -9236,8 +9236,6 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 [[package]]
 name = "pprof"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38a01da47675efa7673b032bf8efd8214f1917d89685e07e395ab125ea42b187"
 dependencies = [
  "aligned-vec",
  "backtrace",
@@ -10641,7 +10639,10 @@ name = "rho-profiling"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "backtrace",
+ "libc",
  "pprof",
+ "serde_json",
  "tempfile",
 ]
 

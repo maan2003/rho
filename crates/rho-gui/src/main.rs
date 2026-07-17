@@ -23,6 +23,8 @@ mod workspace;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -78,7 +80,7 @@ struct Args {
     #[arg(long, value_name = "PATH", default_value = "rho")]
     remote_rho: String,
 
-    /// Sample CPU stacks in-process and write folded stacks when the GUI exits.
+    /// Write folded CPU stacks and a timestamped frame/CPU timeline on exit.
     #[arg(long, value_name = "FILE")]
     cpu_profile: Option<PathBuf>,
 }
@@ -87,6 +89,8 @@ struct GuiProfiler {
     cpu: rho_profiling::CpuProfiler,
     frames: gpui::profiler::FrameTimingCollector,
     frame_path: PathBuf,
+    draw_tid: u64,
+    collected_frames: Arc<Mutex<Vec<gpui::profiler::FrameTiming>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -155,6 +159,8 @@ fn run() -> Result<()> {
                 cpu,
                 frames: gpui::profiler::FrameTimingCollector::new(),
                 frame_path,
+                draw_tid: 0,
+                collected_frames: Arc::default(),
             })
         })
         .transpose()?;
@@ -164,6 +170,23 @@ fn run() -> Result<()> {
         .with_assets(RhoAssets)
         .run(move |cx: &mut App| {
             let mut profiler = profiler;
+            if let Some(profiler) = &mut profiler {
+                // Window drawing and this application callback share GPUI's
+                // foreground thread.
+                profiler.draw_tid = rho_profiling::current_tid();
+                let collected_frames = profiler.collected_frames.clone();
+                cx.spawn(async move |cx| {
+                    let mut collector = gpui::profiler::FrameTimingCollector::new();
+                    loop {
+                        cx.background_executor().timer(Duration::from_secs(5)).await;
+                        collected_frames
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .extend(collector.collect_unseen());
+                    }
+                })
+                .detach();
+            }
             cx.on_app_quit(move |_| {
                 if let Some(profiler) = profiler.take() {
                     finish_profiling(profiler);
@@ -192,9 +215,20 @@ fn run() -> Result<()> {
 }
 
 fn finish_profiling(mut profiler: GuiProfiler) {
-    let frames = profiler.frames.collect_unseen();
+    let mut frames = std::mem::take(
+        &mut *profiler
+            .collected_frames
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+    );
+    frames.extend(profiler.frames.collect_unseen());
+    frames.sort_unstable_by_key(|frame| (frame.draw_start, frame.window_id.as_u64()));
+    frames.dedup_by_key(|frame| (frame.draw_start, frame.window_id.as_u64()));
     gpui::profiler::set_frame_trace_enabled(false);
-    match profiler.cpu.finish() {
+    match profiler
+        .cpu
+        .finish_with_spans(frame_timeline_spans(&frames, profiler.draw_tid))
+    {
         Ok(path) => eprintln!("rho-gui: wrote CPU profile to {}", path.display()),
         Err(error) => eprintln!("rho-gui: failed to write CPU profile: {error:#}"),
     }
@@ -205,6 +239,41 @@ fn finish_profiling(mut profiler: GuiProfiler) {
         ),
         Err(error) => eprintln!("rho-gui: failed to write frame profile: {error:#}"),
     }
+}
+
+fn frame_timeline_spans(
+    frames: &[gpui::profiler::FrameTiming],
+    draw_tid: u64,
+) -> Vec<rho_profiling::TimelineSpan> {
+    let mut spans = Vec::with_capacity(frames.len() * 2);
+    for (frame_index, frame) in frames.iter().enumerate() {
+        let args = || {
+            serde_json::Map::from_iter([
+                ("frame".to_owned(), frame_index.into()),
+                ("window".to_owned(), frame.window_id.as_u64().into()),
+                ("invalidations".to_owned(), frame.invalidations.into()),
+            ])
+        };
+        if let Some(dirty_at) = frame.dirty_at {
+            spans.push(rho_profiling::TimelineSpan {
+                name: "rho.gpui.latency.v1".to_owned(),
+                category: "rho.gpui",
+                start: dirty_at,
+                end: frame.draw_end,
+                tid: draw_tid,
+                args: args(),
+            });
+        }
+        spans.push(rho_profiling::TimelineSpan {
+            name: "rho.gpui.draw.v1".to_owned(),
+            category: "rho.gpui",
+            start: frame.draw_start,
+            end: frame.draw_end,
+            tid: draw_tid,
+            args: args(),
+        });
+    }
+    spans
 }
 
 fn export_frame_profile(path: &Path, timings: Vec<gpui::profiler::FrameTiming>) -> Result<()> {

@@ -17,9 +17,14 @@ AI APIs.
   request bodies, tool results, and raw provider events; treat them like
   transcripts.
 - Opt-in GUI and daemon CPU profiles contain thread names, function symbols,
-  and local source paths. They do not intentionally include transcript data,
-  but remain local diagnostic files whose destination and retention are the
-  user's responsibility.
+  local source paths, precise activity timing, and frontend marker metadata.
+  They do not intentionally include transcript data, but remain local
+  diagnostic files whose destination and retention are the user's
+  responsibility. The in-process sampler owns process-global `SIGPROF` and
+  `ITIMER_PROF` while active and must not run alongside another in-process
+  profiler using them. Temporal samples and GUI frame timings are retained in
+  memory until shutdown, and trace output grows linearly with profiled
+  CPU/frame activity; profiling is intended only for bounded diagnostic runs.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
   explicit user-facing capabilities.
 - Long-running `exec_command` processes are retained only in their owning

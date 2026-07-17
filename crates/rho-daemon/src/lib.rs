@@ -189,7 +189,8 @@ pub struct DaemonArgs {
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
     pub extra_after_path: Option<OsString>,
-    /// Sample all daemon threads and write folded CPU stacks on shutdown.
+    /// Write folded CPU stacks and an all-thread timestamped timeline on
+    /// shutdown.
     #[arg(long, value_name = "FILE")]
     pub cpu_profile: Option<PathBuf>,
 }

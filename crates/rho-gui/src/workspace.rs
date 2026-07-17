@@ -210,8 +210,9 @@ impl Workspace {
                     .get(&agent_id)
                     .and_then(|state| state.context_used);
                 let summary = self.store.apply(agent_id, frame);
-                self.registry.mark_live(agent_id);
-                self.refresh_draft_agent_targets(cx);
+                if self.registry.mark_live(agent_id) {
+                    self.refresh_draft_agent_targets(cx);
+                }
                 let new_context = self
                     .store
                     .get(&agent_id)

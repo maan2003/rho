@@ -55,8 +55,13 @@ than by running a supervisor, extension protocol, or daemon process graph.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
   execution.
 - `rho-profiling` owns the opt-in, unprivileged in-process CPU sampler shared
-  by the native GUI and daemon. Frontends own their lifecycle hooks and any
-  domain-specific timing data, such as GPUI frame timings.
+  by the native GUI and daemon. A narrowly vendored `pprof-rs` records raw
+  timestamped stacks into a bounded, preallocated signal-handler ring; an
+  ordinary drain thread interns them outside the handler. `rho-profiling`
+  exports the canonical monotonic timeline as Perfetto-compatible Chrome Trace
+  JSON and derives folded aggregate stacks for compatibility. Frontends own
+  lifecycle hooks and contribute domain spans, such as GPUI dirty-to-draw and
+  draw intervals, using the session clock.
 - `rho-tool-shell` owns Codex-compatible unified command sessions:
   `exec_command` yields a process session id when a command remains live and
   `write_stdin` writes to or polls that session. Command continuation state is
