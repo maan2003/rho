@@ -20,7 +20,9 @@ mod transcript;
 mod voice_audio;
 mod workspace;
 
-use std::fs;
+use std::fmt::Write as _;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -76,6 +78,10 @@ struct Args {
     /// Rho executable on the SSH host.
     #[arg(long, value_name = "PATH", default_value = "rho")]
     remote_rho: String,
+
+    /// Sample CPU stacks in-process and write folded stacks when the GUI exits.
+    #[arg(long, value_name = "FILE")]
+    cpu_profile: Option<PathBuf>,
 }
 
 fn main() {
@@ -99,7 +105,18 @@ fn init_tracing() {
 }
 
 fn run() -> Result<()> {
-    let attach_target = attach_target_from_args(Args::parse())?;
+    let args = Args::parse();
+    let cpu_profile = args.cpu_profile.clone();
+    let profiler = cpu_profile
+        .as_ref()
+        .map(|_| {
+            pprof::ProfilerGuardBuilder::default()
+                .frequency(100)
+                .build()
+                .context("failed to start in-process CPU profiler")
+        })
+        .transpose()?;
+    let attach_target = attach_target_from_args(args)?;
 
     gpui_platform::application()
         .with_assets(RhoAssets)
@@ -120,7 +137,54 @@ fn run() -> Result<()> {
             }
         });
 
+    if let (Some(path), Some(profiler)) = (cpu_profile, profiler) {
+        export_cpu_profile(&path, &profiler)?;
+        eprintln!("rho-gui: wrote CPU profile to {}", path.display());
+    }
+
     Ok(())
+}
+
+fn export_cpu_profile(path: &Path, profiler: &pprof::ProfilerGuard<'_>) -> Result<()> {
+    let report = profiler
+        .report()
+        .build()
+        .context("failed to build CPU profile")?;
+    let mut stacks = report
+        .data
+        .iter()
+        .map(|(frames, count)| {
+            let mut stack = String::new();
+            push_folded_name(&mut stack, &frames.thread_name_or_id());
+            for frame in frames.frames.iter().rev() {
+                for symbol in frame.iter().rev() {
+                    stack.push(';');
+                    push_folded_name(&mut stack, &symbol.name());
+                    if symbol.lineno() != 0 {
+                        write!(stack, " [{}:{}]", symbol.filename(), symbol.lineno()).unwrap();
+                    }
+                }
+            }
+            (stack, count)
+        })
+        .collect::<Vec<_>>();
+    stacks.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
+    let file = File::create(path)
+        .with_context(|| format!("failed to create CPU profile {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for (stack, count) in stacks {
+        writeln!(writer, "{stack} {count}")
+            .with_context(|| format!("failed to write CPU profile {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn push_folded_name(output: &mut String, name: &str) {
+    output.extend(name.chars().map(|character| match character {
+        ';' | '\n' | '\r' => ' ',
+        character => character,
+    }));
 }
 
 fn attach_target_from_args(args: Args) -> Result<AttachTarget> {

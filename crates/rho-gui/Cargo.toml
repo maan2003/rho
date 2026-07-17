@@ -33,6 +33,7 @@ json-stream.workspace = true
 language = { git = "https://github.com/maan2003/zed", branch = "rho" }
 multi_buffer = { git = "https://github.com/maan2003/zed", branch = "rho" }
 prefix-id = { workspace = true, features = ["redb"] }
+pprof = { version = "0.15", default-features = false }
 project = { git = "https://github.com/maan2003/zed", branch = "rho" }
 release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
 rho-commands.workspace = true
