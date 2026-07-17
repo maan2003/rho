@@ -8,4 +8,5 @@
 /tmp
 /tmp/
 /.isolate
-/rho-gui-profile.folded
+/rho-daemon-profile.folded
+/rho-gui-profile.folded*

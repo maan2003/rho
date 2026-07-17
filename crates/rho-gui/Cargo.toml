@@ -33,13 +33,13 @@ json-stream.workspace = true
 language = { git = "https://github.com/maan2003/zed", branch = "rho" }
 multi_buffer = { git = "https://github.com/maan2003/zed", branch = "rho" }
 prefix-id = { workspace = true, features = ["redb"] }
-pprof = { version = "0.15", default-features = false }
 project = { git = "https://github.com/maan2003/zed", branch = "rho" }
 release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
 rho-commands.workspace = true
 rho-core.workspace = true
 rho-daemon.workspace = true
 rho-iroh-auth.workspace = true
+rho-profiling.workspace = true
 rho-ui-proto.workspace = true
 # Same revision the zed fork pins, so a future switch to its `audio` crate
 # (for the echo canceller) shares one rodio build.
@@ -51,6 +51,8 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
 rustc-hash = "2.1.0"
 search = { git = "https://github.com/maan2003/zed", branch = "rho" }
 semver = { version = "1.0", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
 settings = { git = "https://github.com/maan2003/zed", branch = "rho" }
 text = { git = "https://github.com/maan2003/zed", branch = "rho" }
 theme = { git = "https://github.com/maan2003/zed", branch = "rho" }

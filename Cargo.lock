@@ -10501,6 +10501,7 @@ dependencies = [
  "rho-inference",
  "rho-iroh-auth",
  "rho-pr-monitor",
+ "rho-profiling",
  "rho-slack",
  "rho-ui-proto",
  "rho-voice",
@@ -10545,7 +10546,6 @@ dependencies = [
  "json-stream",
  "language",
  "multi_buffer",
- "pprof",
  "prefix-id",
  "project",
  "release_channel",
@@ -10553,11 +10553,14 @@ dependencies = [
  "rho-core",
  "rho-daemon",
  "rho-iroh-auth",
+ "rho-profiling",
  "rho-ui-proto",
  "rodio",
  "rustc-hash 2.1.2",
  "search",
  "semver",
+ "serde",
+ "serde_json",
  "settings",
  "text",
  "theme",
@@ -10631,6 +10634,15 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rho-profiling"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pprof",
+ "tempfile",
 ]
 
 [[package]]

@@ -25,6 +25,7 @@ rho-db.workspace = true
 rho-inference.workspace = true
 rho-iroh-auth.workspace = true
 rho-pr-monitor.workspace = true
+rho-profiling.workspace = true
 rho-slack.workspace = true
 rho-ui-proto.workspace = true
 rho-voice.workspace = true
@@ -34,6 +35,6 @@ redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 url.workspace = true

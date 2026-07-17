@@ -189,9 +189,31 @@ pub struct DaemonArgs {
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
     pub extra_after_path: Option<OsString>,
+    /// Sample all daemon threads and write folded CPU stacks on shutdown.
+    #[arg(long, value_name = "FILE")]
+    pub cpu_profile: Option<PathBuf>,
 }
 
-pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
+pub async fn run(mut args: DaemonArgs) -> anyhow::Result<()> {
+    let profiler = args
+        .cpu_profile
+        .take()
+        .map(rho_profiling::CpuProfiler::start)
+        .transpose()?;
+    let result = run_inner(args).await;
+    if let Some(profiler) = profiler {
+        match profiler.finish() {
+            Ok(path) => eprintln!("rho daemon: wrote CPU profile to {}", path.display()),
+            Err(error) if result.is_err() => {
+                eprintln!("rho daemon: failed to write CPU profile: {error:#}");
+            }
+            Err(error) => return Err(error.context("write daemon CPU profile")),
+        }
+    }
+    result
+}
+
+async fn run_inner(args: DaemonArgs) -> anyhow::Result<()> {
     // The daemon's own cwd must never matter: agents each carry their own
     // working directory. Park the process somewhere empty and read-only so
     // any code still depending on process cwd fails loudly.
@@ -313,6 +335,8 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let active_connections = Arc::new(AtomicUsize::new(0));
     let connection_closed = Arc::new(Notify::new());
     let mut accepted_connection = false;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         if args.die_on_detached
@@ -323,6 +347,10 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         }
 
         tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                return Ok(());
+            }
             connection = server.accept() => {
                 let connection = connection?;
                 accepted_connection = true;
@@ -340,6 +368,23 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             }
             () = connection_closed.notified(), if active_connections.load(Ordering::Relaxed) > 0 => {}
         }
+    }
+}
+
+async fn shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("register SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("wait for SIGINT"),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("wait for Ctrl-C")
     }
 }
 

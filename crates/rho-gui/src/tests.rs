@@ -14,6 +14,17 @@ use settings::SettingsStore;
 use crate::connection::ConnEvent;
 use crate::workspace::{AttachTarget, Workspace};
 
+#[test]
+fn frame_distribution_reports_nearest_rank_percentiles() {
+    let distribution = crate::distribution([1, 2, 3, 4, 100], 1.0);
+    assert_eq!(distribution.count, 5);
+    assert_eq!(distribution.mean, 22.0);
+    assert_eq!(distribution.p50, 3.0);
+    assert_eq!(distribution.p95, 100.0);
+    assert_eq!(distribution.p99, 100.0);
+    assert_eq!(distribution.max, 100.0);
+}
+
 fn init_test_app(cx: &mut App) {
     gpui_tokio::init(cx);
     assets::Assets.load_test_fonts(cx);

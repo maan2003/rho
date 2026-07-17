@@ -20,9 +20,8 @@ mod transcript;
 mod voice_audio;
 mod workspace;
 
-use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write as _};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -84,6 +83,45 @@ struct Args {
     cpu_profile: Option<PathBuf>,
 }
 
+struct GuiProfiler {
+    cpu: rho_profiling::CpuProfiler,
+    frames: gpui::profiler::FrameTimingCollector,
+    frame_path: PathBuf,
+}
+
+#[derive(serde::Serialize)]
+struct FrameProfile {
+    summary: FrameSummary,
+    frames: Vec<FrameRecord>,
+}
+
+#[derive(serde::Serialize)]
+struct FrameSummary {
+    frame_count: usize,
+    draw_ms: Distribution,
+    dirty_to_draw_ms: Distribution,
+    invalidations: Distribution,
+}
+
+#[derive(serde::Serialize)]
+struct Distribution {
+    count: usize,
+    mean: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+}
+
+#[derive(serde::Serialize)]
+struct FrameRecord {
+    window_id: u64,
+    draw_start_ns: u64,
+    draw_ns: u64,
+    dirty_to_draw_ns: Option<u64>,
+    invalidations: u64,
+}
+
 fn main() {
     init_tracing();
     if let Err(error) = run() {
@@ -106,33 +144,29 @@ fn init_tracing() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
-    let cpu_profile = args.cpu_profile.clone();
-    let profiler = cpu_profile
-        .as_ref()
-        .map(|_| {
-            pprof::ProfilerGuardBuilder::default()
-                .frequency(100)
-                .build()
-                .context("failed to start in-process CPU profiler")
+    let profiler = args
+        .cpu_profile
+        .clone()
+        .map(|path| {
+            let cpu = rho_profiling::CpuProfiler::start(path)?;
+            let frame_path = rho_profiling::sidecar_path(cpu.path(), ".frames.json");
+            gpui::profiler::set_frame_trace_enabled(true);
+            Ok::<_, anyhow::Error>(GuiProfiler {
+                cpu,
+                frames: gpui::profiler::FrameTimingCollector::new(),
+                frame_path,
+            })
         })
         .transpose()?;
-    let cpu_profile = cpu_profile.zip(profiler);
     let attach_target = attach_target_from_args(args)?;
 
     gpui_platform::application()
         .with_assets(RhoAssets)
         .run(move |cx: &mut App| {
-            let mut cpu_profile = cpu_profile;
+            let mut profiler = profiler;
             cx.on_app_quit(move |_| {
-                if let Some((path, profiler)) = cpu_profile.take() {
-                    match export_cpu_profile(&path, &profiler) {
-                        Ok(()) => {
-                            eprintln!("rho-gui: wrote CPU profile to {}", path.display());
-                        }
-                        Err(error) => {
-                            eprintln!("rho-gui: failed to write CPU profile: {error:#}");
-                        }
-                    }
+                if let Some(profiler) = profiler.take() {
+                    finish_profiling(profiler);
                 }
                 std::future::ready(())
             })
@@ -157,46 +191,81 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn export_cpu_profile(path: &Path, profiler: &pprof::ProfilerGuard<'_>) -> Result<()> {
-    let report = profiler
-        .report()
-        .build()
-        .context("failed to build CPU profile")?;
-    let mut stacks = report
-        .data
-        .iter()
-        .map(|(frames, count)| {
-            let mut stack = String::new();
-            push_folded_name(&mut stack, &frames.thread_name_or_id());
-            for frame in frames.frames.iter().rev() {
-                for symbol in frame.iter().rev() {
-                    stack.push(';');
-                    push_folded_name(&mut stack, &symbol.name());
-                    if symbol.lineno() != 0 {
-                        write!(stack, " [{}:{}]", symbol.filename(), symbol.lineno()).unwrap();
-                    }
-                }
-            }
-            (stack, count)
-        })
-        .collect::<Vec<_>>();
-    stacks.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-
-    let file = File::create(path)
-        .with_context(|| format!("failed to create CPU profile {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    for (stack, count) in stacks {
-        writeln!(writer, "{stack} {count}")
-            .with_context(|| format!("failed to write CPU profile {}", path.display()))?;
+fn finish_profiling(mut profiler: GuiProfiler) {
+    let frames = profiler.frames.collect_unseen();
+    gpui::profiler::set_frame_trace_enabled(false);
+    match profiler.cpu.finish() {
+        Ok(path) => eprintln!("rho-gui: wrote CPU profile to {}", path.display()),
+        Err(error) => eprintln!("rho-gui: failed to write CPU profile: {error:#}"),
     }
-    Ok(())
+    match export_frame_profile(&profiler.frame_path, frames) {
+        Ok(()) => eprintln!(
+            "rho-gui: wrote frame profile to {}",
+            profiler.frame_path.display()
+        ),
+        Err(error) => eprintln!("rho-gui: failed to write frame profile: {error:#}"),
+    }
 }
 
-fn push_folded_name(output: &mut String, name: &str) {
-    output.extend(name.chars().map(|character| match character {
-        ';' | '\n' | '\r' => ' ',
-        character => character,
-    }));
+fn export_frame_profile(path: &Path, timings: Vec<gpui::profiler::FrameTiming>) -> Result<()> {
+    let anchor = timings.first().map(|timing| timing.draw_start);
+    let frames = timings
+        .into_iter()
+        .map(|timing| FrameRecord {
+            window_id: timing.window_id.as_u64(),
+            draw_start_ns: anchor
+                .map(|anchor| duration_ns(timing.draw_start.duration_since(anchor)))
+                .unwrap_or(0),
+            draw_ns: duration_ns(timing.draw_duration()),
+            dirty_to_draw_ns: timing.dirty_to_draw_duration().map(duration_ns),
+            invalidations: timing.invalidations,
+        })
+        .collect::<Vec<_>>();
+    let summary = FrameSummary {
+        frame_count: frames.len(),
+        draw_ms: distribution(frames.iter().map(|frame| frame.draw_ns), 1_000_000.0),
+        dirty_to_draw_ms: distribution(
+            frames.iter().filter_map(|frame| frame.dirty_to_draw_ns),
+            1_000_000.0,
+        ),
+        invalidations: distribution(frames.iter().map(|frame| frame.invalidations), 1.0),
+    };
+    let file = File::create(path)
+        .with_context(|| format!("failed to create frame profile {}", path.display()))?;
+    serde_json::to_writer_pretty(BufWriter::new(file), &FrameProfile { summary, frames })
+        .with_context(|| format!("failed to write frame profile {}", path.display()))
+}
+
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn distribution(values: impl IntoIterator<Item = u64>, scale: f64) -> Distribution {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    let count = values.len();
+    if count == 0 {
+        return Distribution {
+            count,
+            mean: 0.0,
+            p50: 0.0,
+            p95: 0.0,
+            p99: 0.0,
+            max: 0.0,
+        };
+    }
+    let percentile = |percent: usize| {
+        let index = (count * percent).div_ceil(100).saturating_sub(1);
+        values[index] as f64 / scale
+    };
+    Distribution {
+        count,
+        mean: values.iter().map(|value| *value as f64).sum::<f64>() / count as f64 / scale,
+        p50: percentile(50),
+        p95: percentile(95),
+        p99: percentile(99),
+        max: values[count - 1] as f64 / scale,
+    }
 }
 
 fn attach_target_from_args(args: Args) -> Result<AttachTarget> {

@@ -16,6 +16,10 @@ AI APIs.
 - Provider debug logs under the rho state directory may contain full inference
   request bodies, tool results, and raw provider events; treat them like
   transcripts.
+- Opt-in GUI and daemon CPU profiles contain thread names, function symbols,
+  and local source paths. They do not intentionally include transcript data,
+  but remain local diagnostic files whose destination and retention are the
+  user's responsibility.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
   explicit user-facing capabilities.
 - Long-running `exec_command` processes are retained only in their owning
