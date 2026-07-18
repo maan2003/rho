@@ -9,10 +9,11 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-backtrace = "0.3"
+dial9-tokio-telemetry = { version = "0.3.14", features = ["cpu-profiling"] }
+dial9-trace-format = "0.4.1"
+flate2 = "1"
 libc.workspace = true
-pprof.workspace = true
-serde_json.workspace = true
+
 
 [dev-dependencies]
 tempfile.workspace = true

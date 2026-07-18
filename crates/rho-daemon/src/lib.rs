@@ -188,8 +188,7 @@ pub struct DaemonArgs {
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
     pub extra_after_path: Option<OsString>,
-    /// Write folded CPU stacks and an all-thread timestamped timeline on
-    /// shutdown.
+    /// Write a Dial9 CPU trace on shutdown (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     pub cpu_profile: Option<PathBuf>,
 }
@@ -203,27 +202,35 @@ pub fn install_crypto_provider() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn run(mut args: DaemonArgs) -> anyhow::Result<()> {
-    install_crypto_provider()?;
-    let profiler = args
-        .cpu_profile
-        .take()
-        .map(rho_profiling::CpuProfiler::start)
-        .transpose()?;
-    let result = run_inner(args).await;
-    if let Some(profiler) = profiler {
-        match profiler.finish() {
-            Ok(path) => eprintln!("rho daemon: wrote CPU profile to {}", path.display()),
-            Err(error) if result.is_err() => {
-                eprintln!("rho daemon: failed to write CPU profile: {error:#}");
-            }
-            Err(error) => return Err(error.context("write daemon CPU profile")),
-        }
+pub struct DaemonProfiler(Option<rho_profiling::CpuProfiler>);
+
+impl DaemonProfiler {
+    /// Start profiling before the async runtime creates worker threads.
+    pub fn start(args: &mut DaemonArgs) -> anyhow::Result<Self> {
+        Ok(Self(
+            args.cpu_profile
+                .take()
+                .map(rho_profiling::CpuProfiler::start)
+                .transpose()?,
+        ))
     }
-    result
+
+    pub fn finish(self, result: anyhow::Result<()>) -> anyhow::Result<()> {
+        if let Some(profiler) = self.0 {
+            match profiler.finish() {
+                Ok(path) => eprintln!("rho daemon: wrote CPU profile to {}", path.display()),
+                Err(error) if result.is_err() => {
+                    eprintln!("rho daemon: failed to write CPU profile: {error:#}");
+                }
+                Err(error) => return Err(error.context("write daemon CPU profile")),
+            }
+        }
+        result
+    }
 }
 
-async fn run_inner(args: DaemonArgs) -> anyhow::Result<()> {
+pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
+    install_crypto_provider()?;
     // The daemon's own cwd must never matter: agents each carry their own
     // working directory. Park the process somewhere empty and read-only so
     // any code still depending on process cwd fails loudly.
@@ -1246,17 +1253,17 @@ where
     let result = loop {
         let message = match first.take() {
             Some(message) => message,
-            None => match read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters))
-                .await
-            {
-                Ok(message) => message,
-                Err(error) => {
-                    for (repo, _) in &land_leases {
-                        agents.clear_land_holder(repo).await;
+            None => {
+                match read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await {
+                    Ok(message) => message,
+                    Err(error) => {
+                        for (repo, _) in &land_leases {
+                            agents.clear_land_holder(repo).await;
+                        }
+                        break Err(error);
                     }
-                    break Err(error);
                 }
-            },
+            }
         };
         match handle_message(
             &agents,
@@ -1877,10 +1884,12 @@ where
 
     let (to_host_tx, to_host_rx) = futures::channel::mpsc::unbounded();
     let (from_host_tx, mut from_host_rx) = futures::channel::mpsc::unbounded();
-    let session_id = agents.zed_host().open_session(rho_zed_host::SessionStreams {
-        incoming: to_host_rx,
-        outgoing: from_host_tx,
-    });
+    let session_id = agents
+        .zed_host()
+        .open_session(rho_zed_host::SessionStreams {
+            incoming: to_host_rx,
+            outgoing: from_host_tx,
+        });
 
     write_frame(&mut writer, &ServerMessage::ChannelOpened { root }).await?;
 

@@ -89,7 +89,7 @@ struct Args {
     #[arg(long, value_name = "PATH", default_value = "rho")]
     remote_rho: String,
 
-    /// Write folded CPU stacks and a timestamped frame/CPU timeline on exit.
+    /// Write a Dial9 CPU/frame trace on exit (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     cpu_profile: Option<PathBuf>,
 }
@@ -237,7 +237,7 @@ fn finish_profiling(mut profiler: GuiProfiler) {
     gpui::profiler::set_frame_trace_enabled(false);
     match profiler
         .cpu
-        .finish_with_spans(frame_timeline_spans(&frames, profiler.draw_tid))
+        .finish_with_gpui_spans(frame_timeline_spans(&frames, profiler.draw_tid))
     {
         Ok(path) => eprintln!("rho-gui: wrote CPU profile to {}", path.display()),
         Err(error) => eprintln!("rho-gui: failed to write CPU profile: {error:#}"),
@@ -254,34 +254,25 @@ fn finish_profiling(mut profiler: GuiProfiler) {
 fn frame_timeline_spans(
     frames: &[gpui::profiler::FrameTiming],
     draw_tid: u64,
-) -> Vec<rho_profiling::TimelineSpan> {
+) -> Vec<rho_profiling::GpuiFrameSpan> {
     let mut spans = Vec::with_capacity(frames.len() * 2);
     for (frame_index, frame) in frames.iter().enumerate() {
-        let args = || {
-            serde_json::Map::from_iter([
-                ("frame".to_owned(), frame_index.into()),
-                ("window".to_owned(), frame.window_id.as_u64().into()),
-                ("invalidations".to_owned(), frame.invalidations.into()),
-            ])
-        };
-        if let Some(dirty_at) = frame.dirty_at {
-            spans.push(rho_profiling::TimelineSpan {
-                name: "rho.gpui.latency.v1".to_owned(),
-                category: "rho.gpui",
-                start: dirty_at,
-                end: frame.draw_end,
-                tid: draw_tid,
-                args: args(),
-            });
-        }
-        spans.push(rho_profiling::TimelineSpan {
-            name: "rho.gpui.draw.v1".to_owned(),
-            category: "rho.gpui",
-            start: frame.draw_start,
+        let span = |kind, start| rho_profiling::GpuiFrameSpan {
+            kind,
+            start,
             end: frame.draw_end,
             tid: draw_tid,
-            args: args(),
-        });
+            frame: frame_index as u64,
+            window: frame.window_id.as_u64(),
+            invalidations: frame.invalidations,
+        };
+        if let Some(dirty_at) = frame.dirty_at {
+            spans.push(span(rho_profiling::GpuiFrameSpanKind::Latency, dirty_at));
+        }
+        spans.push(span(
+            rho_profiling::GpuiFrameSpanKind::Draw,
+            frame.draw_start,
+        ));
     }
     spans
 }

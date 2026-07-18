@@ -103,7 +103,7 @@
                     CC = "${pkgs.stdenv.cc}/bin/cc";
                     CXX = "${pkgs.stdenv.cc}/bin/c++";
                     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc";
-                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "";
+                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "--cfg tokio_unstable";
                   };
                 };
               };
@@ -179,8 +179,8 @@
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
               env.OCTO_REMOTE_HTTP = "${octoGit}/libexec/git-core/git-remote-http";
               env.RUSTY_V8_ARCHIVE = rustyV8Archive;
-              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
-              CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "";
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
+              CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
             };
             cargoVendorDirBase = craneLibBase.vendorCargoDeps { };
             cargoVendorDir = pkgs.runCommand "rho-cargo-vendor-deps" { } ''

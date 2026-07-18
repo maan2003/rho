@@ -9,3 +9,6 @@ codegen-backend = "cranelift"
 
 [profile.dev.package."*"]
 codegen-backend = "llvm"
+
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

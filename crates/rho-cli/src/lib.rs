@@ -48,10 +48,18 @@ const UI_IO_BUCKETS: usize = (UI_IO_WINDOW_SECS / UI_IO_BUCKET_SECS) as usize;
 pub fn main() -> Result<()> {
     rho_daemon::install_crypto_provider()?;
     let args = Args::parse_or_exit(std::env::args().skip(1));
-    if matches!(args.command, Command::Daemon(_)) {
+    if let Command::Daemon(mut daemon_args) = args.command {
         // SAFETY: top of main, before the runtime — no threads exist yet and
         // nothing has captured pre-namespace state.
         unsafe { rho_daemon::init_daemon_namespace() }.expect("set up daemon namespace");
+        let profiler = rho_daemon::DaemonProfiler::start(&mut daemon_args)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(rho_daemon::run(daemon_args));
+        drop(runtime);
+        return profiler.finish(result);
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -73,7 +81,7 @@ async fn run(command: Command) -> Result<()> {
             run_auth_cli(auth)?;
             Ok(())
         }
-        Command::Daemon(args) => rho_daemon::run(args).await,
+        Command::Daemon(_) => unreachable!("daemon runs before the shared async runtime"),
         Command::Debug(args) => {
             rho_daemon::debug::run(args).await?;
             Ok(())

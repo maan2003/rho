@@ -33,7 +33,7 @@ members = [
   "crates/senax-encoder/derive",
 ]
 # The web UI is its own workspace: it targets wasm32 and is built with trunk.
-exclude = ["crates/pprof", "webui"]
+exclude = ["webui"]
 resolver = "2"
 
 [workspace.package]
@@ -136,8 +136,10 @@ unicode-width = { version = "0.2", default-features = false }
 url = { version = "2", default-features = false }
 uuid = { version = "1", features = ["serde", "v4"] }
 vt100 = { version = "0.16", default-features = false }
-zip = { version = "2", default-features = false, features = ["deflate", "time"] }
-
+zip = { version = "2", default-features = false, features = [
+  "deflate",
+  "time",
+]}
 [profile.ci]
 debug = "line-tables-only"
 incremental = false

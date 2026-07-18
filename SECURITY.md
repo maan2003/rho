@@ -16,15 +16,22 @@ AI APIs.
 - Provider debug logs under the rho state directory may contain full inference
   request bodies, tool results, and raw provider events; treat them like
   transcripts.
-- Opt-in GUI and daemon CPU profiles contain thread names, function symbols,
+- Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
   They do not intentionally include transcript data, but remain local
   diagnostic files whose destination and retention are the user's
-  responsibility. The in-process sampler owns process-global `SIGPROF` and
-  `ITIMER_PROF` while active and must not run alongside another in-process
-  profiler using them. Temporal samples and GUI frame timings are retained in
-  memory until shutdown, and trace output grows linearly with profiled
-  CPU/frame activity; profiling is intended only for bounded diagnostic runs.
+  responsibility. On Linux, Dial9 normally samples through `perf_event_open`;
+  its clock-timer fallback owns process-global `SIGPROF`, installs a chained
+  process-global `SIGSEGV` handler for safe stack reads, and samples only
+  registered threads. The `SIGSEGV` handler is not restored, but profiling
+  runs until process shutdown. The fallback must not run alongside another
+  in-process profiler using `SIGPROF`. Perf sampling frequency is per
+  inherited thread, and inherited child-process samples are collected before
+  Dial9 discards them, so overhead can scale with process and subprocess
+  parallelism. GUI frame timings are retained in memory until shutdown, and
+  the single-file trace grows linearly with profiled CPU/frame activity.
+  Dial9 symbolization and compression materialize the whole segment in memory
+  during shutdown; profiling is intended only for bounded diagnostic runs.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
   explicit user-facing capabilities.
 - Long-running `exec_command` processes are retained only in their owning
