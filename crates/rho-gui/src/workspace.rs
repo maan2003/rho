@@ -1326,6 +1326,17 @@ impl Workspace {
         {
             Some(pane) => self.active_tree_mut().focus(pane),
             None => {
+                // Opened files stay put: when the focused pane shows a file,
+                // the incoming transcript lands in a pane already hosting
+                // conversation surfaces (falling back to the focused pane
+                // only when every pane shows a file).
+                if let Some(tree) = self.contexts.get(&self.active_context)
+                    && matches!(tree.focused().surface.key, SurfaceKey::File { .. })
+                    && let Some(pane) =
+                        tree.pane_showing(|s| !matches!(s.key, SurfaceKey::File { .. }))
+                {
+                    self.active_tree_mut().focus(pane);
+                }
                 let surface = self.make_surface(key, window, cx);
                 self.show_surface(surface);
             }
