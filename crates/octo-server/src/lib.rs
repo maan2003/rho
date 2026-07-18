@@ -53,6 +53,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_provider_is_used_without_persistence() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
         let state = AppState {

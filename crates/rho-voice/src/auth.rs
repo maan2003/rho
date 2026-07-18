@@ -353,24 +353,29 @@ pub(crate) fn oauth_token_should_refresh(access_token: &str, expires_at_ms: u64)
 }
 
 fn post_form(url: &str, body: &str) -> io::Result<Value> {
-    let resp = ureq::post(url)
-        .content_type("application/x-www-form-urlencoded")
-        .send(body)
+    let resp = reqwest::blocking::Client::new()
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .timeout(Duration::from_secs(30))
+        .body(body.to_owned())
+        .send()
         .map_err(|error| io::Error::other(format!("{url}: {error}")))?;
     read_success_json(url, resp)
 }
 
-fn read_success_json(url: &str, mut resp: ureq::http::Response<ureq::Body>) -> io::Result<Value> {
+fn read_success_json(url: &str, resp: reqwest::blocking::Response) -> io::Result<Value> {
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let text = resp
+        .text()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !status.is_success() {
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_owned();
-        let body = resp.body_mut().read_to_string().unwrap_or_default();
-        let detail = format_error_body(&content_type, &body);
+        let detail = format_error_body(&content_type, &text);
         let message = if detail.is_empty() {
             format!("{url}: HTTP {} (empty response body)", status.as_u16())
         } else {
@@ -379,10 +384,6 @@ fn read_success_json(url: &str, mut resp: ureq::http::Response<ureq::Body>) -> i
         return Err(io::Error::other(message));
     }
 
-    let text = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     serde_json::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 

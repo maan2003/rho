@@ -135,6 +135,7 @@ async fn expect_ack(
 
 #[tokio::test]
 async fn socket_mode_round_trip() -> anyhow::Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
     let ws_url = format!("ws://{}", ws_listener.local_addr()?);
     let api_listener = TcpListener::bind("127.0.0.1:0").await?;

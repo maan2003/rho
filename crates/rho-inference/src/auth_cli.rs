@@ -305,7 +305,8 @@ fn fetch_rate_limit_status(
 ) -> io::Result<RateLimitStatus> {
     let url = format!("{DEFAULT_CHATGPT_BASE_URL}/wham/usage");
     let authorization = format!("Bearer {bearer_token}");
-    let mut request = ureq::get(&url)
+    let mut request = reqwest::blocking::Client::new()
+        .get(&url)
         .header("Authorization", &authorization)
         .header("User-Agent", USER_AGENT);
     if let Some(account_id) = account_id {
@@ -314,7 +315,8 @@ fn fetch_rate_limit_status(
     let json = read_success_json(
         &url,
         request
-            .call()
+            .timeout(Duration::from_secs(30))
+            .send()
             .map_err(|error| io::Error::other(format!("{url}: {error}")))?,
     )?;
     serde_json::from_value(json).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))

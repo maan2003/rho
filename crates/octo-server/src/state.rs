@@ -304,6 +304,7 @@ mod tests {
 
     #[test]
     fn github_git_url_preserves_endpoint_path_segments() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let state = AppState {
             client: reqwest::Client::new(),
             token_provider: Arc::new(|| Ok("token".to_owned())),

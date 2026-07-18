@@ -78,6 +78,7 @@ redb = "4.1.0"
 redb-derive = "0.1.0"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
   "json",
   "rustls-tls-native-roots-no-provider",
 ] }
@@ -134,11 +135,6 @@ tracing = { version = "0.1", default-features = false, features = [
 ] }
 unicode-segmentation = { version = "1", default-features = false }
 unicode-width = { version = "0.2", default-features = false }
-ureq = { version = "3", default-features = false, features = [
-  "platform-verifier",
-  "rustls-no-provider",
-  "rustls-webpki-roots",
-] }
 url = { version = "2", default-features = false }
 uuid = { version = "1", features = ["serde", "v4"] }
 vt100 = { version = "0.16", default-features = false }
