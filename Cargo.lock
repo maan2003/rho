@@ -12028,6 +12028,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
+ "libc",
  "prefix-id",
  "rho-agent",
  "rho-ci",
@@ -12110,6 +12111,7 @@ dependencies = [
 name = "rho-daemon"
 version = "0.1.0"
 dependencies = [
+ "alacritty_terminal",
  "anyhow",
  "camino",
  "clap",
@@ -12117,6 +12119,7 @@ dependencies = [
  "futures",
  "iroh",
  "json-stream",
+ "libc",
  "noq-proto",
  "octo-server",
  "octo-types",
@@ -12137,6 +12140,7 @@ dependencies = [
  "rho-workspaces",
  "rho-zed-host",
  "rpc",
+ "rustix-openpty",
  "rustls",
  "serde",
  "serde_json",

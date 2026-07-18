@@ -18,8 +18,7 @@ use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
     AgentId, ClientMessage, ServerMessage, UiAgentSummary, UiProject, UiTag, WorkspaceInfo,
-    read_frame,
-    write_frame,
+    read_frame, write_frame,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -157,7 +156,10 @@ async fn dial_channel(
     });
     tokio::spawn(async move {
         while let Some(payload) = outgoing_rx.next().await {
-            if rho_ui_proto::write_raw_frame(&mut writer, &payload).await.is_err() {
+            if rho_ui_proto::write_raw_frame(&mut writer, &payload)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -168,6 +170,129 @@ async fn dial_channel(
         root,
         outgoing: outgoing_tx,
         incoming: incoming_rx,
+    })
+}
+
+/// One attached terminal: a dedicated stream carrying [`rho_ui_proto::term`]
+/// frames after the handshake. Dropping `input` half-closes the stream,
+/// which only detaches — the terminal keeps running in the daemon.
+pub struct TerminalChannel {
+    pub terminal_id: u64,
+    pub frames: futures_mpsc::UnboundedReceiver<rho_ui_proto::term::TermServerFrame>,
+    pub input: futures_mpsc::UnboundedSender<rho_ui_proto::term::TermClientFrame>,
+}
+
+async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<Box<dyn AsyncStream>> {
+    Ok(match dialer {
+        ChannelDialer::Unix(socket_path) => {
+            let client = Client::connect(&socket_path)
+                .await
+                .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+            Box::new(client.into_stream()) as Box<dyn AsyncStream>
+        }
+        ChannelDialer::Iroh(connection) => {
+            let (send, recv) = connection
+                .open_bi()
+                .await
+                .context("open iroh terminal stream")?;
+            // Interactive terminals outrank the control session (priority 1).
+            send.set_priority(50)
+                .context("set iroh terminal stream priority")?;
+            Box::new(tokio::io::join(recv, send)) as Box<dyn AsyncStream>
+        }
+    })
+}
+
+/// One-shot `TerminalList` request for one agent's running terminals.
+async fn dial_terminal_list(
+    dialer: ChannelDialer,
+    agent: String,
+) -> anyhow::Result<Vec<rho_ui_proto::term::TerminalInfo>> {
+    let mut stream = dial_stream(dialer).await?;
+    write_frame(
+        &mut stream,
+        &ClientMessage::TerminalList { agent: Some(agent) },
+    )
+    .await?;
+    match read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::TerminalList { terminals } => Ok(terminals),
+        ServerMessage::TerminalRefused { reason } => anyhow::bail!("{reason}"),
+        _ => anyhow::bail!("unexpected reply to TerminalList"),
+    }
+}
+
+/// Dials a dedicated terminal stream: attach the agent's first running
+/// terminal (creating id 0 when none run), or spawn a fresh one with `new`.
+async fn dial_terminal(
+    dialer: ChannelDialer,
+    agent: String,
+    new: bool,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<TerminalChannel> {
+    let running = dial_terminal_list(dialer.clone(), agent.clone()).await?;
+    let (terminal_id, create) = if new {
+        let next = running
+            .iter()
+            .map(|info| info.terminal_id.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        (next, true)
+    } else {
+        match running.first() {
+            Some(info) => (info.terminal_id, false),
+            None => (0, true),
+        }
+    };
+    let open = if create {
+        ClientMessage::TerminalCreate {
+            agent,
+            terminal_id,
+            attach: true,
+            cols,
+            rows,
+        }
+    } else {
+        ClientMessage::TerminalAttach {
+            agent,
+            terminal_id,
+            cols,
+            rows,
+        }
+    };
+    let mut stream = dial_stream(dialer).await?;
+    write_frame(&mut stream, &open).await?;
+    match read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::TerminalOpened { .. } => {}
+        ServerMessage::TerminalRefused { reason } => anyhow::bail!("{reason}"),
+        _ => anyhow::bail!("unexpected reply on terminal stream"),
+    }
+
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (frames_tx, frames_rx) = futures_mpsc::unbounded();
+    let (input_tx, mut input_rx) = futures_mpsc::unbounded::<rho_ui_proto::term::TermClientFrame>();
+    tokio::spawn(async move {
+        while let Ok(frame) =
+            read_frame::<_, rho_ui_proto::term::TermServerFrame>(&mut reader).await
+        {
+            if frames_tx.unbounded_send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(frame) = input_rx.next().await {
+            if write_frame(&mut writer, &frame).await.is_err() {
+                break;
+            }
+        }
+        // Half-close so the daemon sees EOF and detaches this client.
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    });
+    Ok(TerminalChannel {
+        terminal_id,
+        frames: frames_rx,
+        input: input_tx,
     })
 }
 
@@ -190,6 +315,24 @@ impl Connection {
         if self.iroh {
             self.send(ClientMessage::AgentStreamFocus { agent_id });
         }
+    }
+
+    /// Dials a dedicated terminal stream for an agent and runs the
+    /// handshake: attach its first running terminal (spawning the default
+    /// one when none run), or spawn a fresh one with `new`.
+    pub fn open_terminal(
+        &self,
+        agent: String,
+        new: bool,
+        cols: u16,
+        rows: u16,
+        cx: &App,
+    ) -> Task<Result<anyhow::Result<TerminalChannel>, gpui_tokio::JoinError>> {
+        let dialer = self.dialer.lock().unwrap().clone();
+        Tokio::spawn(cx, async move {
+            let dialer = dialer.context("not connected to rho-daemon")?;
+            dial_terminal(dialer, agent, new, cols, rows).await
+        })
     }
 
     /// Dials a dedicated stream for a zed channel onto `workspace` and runs
@@ -350,10 +493,13 @@ async fn run(
             | ServerMessage::IrohApproved { .. }
             | ServerMessage::IrohRevoked { .. }
             | ServerMessage::PrCommandResult { .. } => None,
-            // Zed channel handshake replies belong to dedicated channel
+            // Zed channel and terminal handshake replies belong to dedicated
             // streams, never the UI session.
             ServerMessage::ChannelOpened { .. }
             | ServerMessage::ChannelClosed { .. }
+            | ServerMessage::TerminalOpened { .. }
+            | ServerMessage::TerminalRefused { .. }
+            | ServerMessage::TerminalList { .. }
             | ServerMessage::AgentStreamOpened { .. } => None,
         };
         if let Some(event) = event

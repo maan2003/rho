@@ -75,9 +75,13 @@ impl UserEnvironment {
     }
 
     fn path(&self) -> Option<&OsStr> {
+        self.get("PATH")
+    }
+
+    pub fn get(&self, name: &str) -> Option<&OsStr> {
         self.0
             .iter()
-            .find_map(|(name, value)| (name == "PATH").then_some(value.as_os_str()))
+            .find_map(|(key, value)| (key == name).then_some(value.as_os_str()))
     }
 }
 

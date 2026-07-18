@@ -33,6 +33,7 @@ mod markdown;
 mod mcp_agent_tools;
 mod pr;
 mod slack;
+mod term;
 mod tool_render;
 
 #[cfg(test)]
@@ -91,6 +92,7 @@ async fn run(command: Command) -> Result<()> {
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
         Command::Pr(args) => pr::run(args).await,
         Command::Slack(args) => slack::run(args).await,
+        Command::Term(args) => term::run(args).await,
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
             rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
@@ -301,6 +303,10 @@ impl ChatApp {
             rho_commands::Command::Open { .. } => {
                 self.term.print_system(":open is GUI-only");
             }
+            rho_commands::Command::Term { .. } => {
+                self.term
+                    .print_system(":term is GUI-only; use `rho term <agent>`");
+            }
             rho_commands::Command::AgentCancel => {
                 self.cancel_running_turn().await;
             }
@@ -399,10 +405,18 @@ impl ChatApp {
                 self.toggle_tag_status(name, rho_ui_proto::Status::Pinned);
             }
             rho_commands::Command::TagMove { name } => {
-                self.tag_by_name(name, rho_ui_proto::TagKind::Workstream, "moving to workstream");
+                self.tag_by_name(
+                    name,
+                    rho_ui_proto::TagKind::Workstream,
+                    "moving to workstream",
+                );
             }
             rho_commands::Command::TagGroup { name } => {
-                self.tag_by_name(name, rho_ui_proto::TagKind::WorkstreamGroup, "grouping under");
+                self.tag_by_name(
+                    name,
+                    rho_ui_proto::TagKind::WorkstreamGroup,
+                    "grouping under",
+                );
             }
             rho_commands::Command::TagLabel { name } => {
                 self.tag_by_name(name, rho_ui_proto::TagKind::Label, "labelling");
@@ -492,10 +506,8 @@ impl ChatApp {
         };
         self.term
             .print_system(&format!("{verb} `{name}` for {agent_id:?}"));
-        self.agent.tag_agent(
-            agent_id,
-            rho_ui_proto::TagTarget::Named { name, kind },
-        );
+        self.agent
+            .tag_agent(agent_id, rho_ui_proto::TagTarget::Named { name, kind });
     }
 
     /// Pin toggles for a workstream named by argument, defaulting to the
@@ -596,9 +608,8 @@ fn workstream_of(agent: &AgentClient, agent_id: AgentId) -> Option<rho_ui_proto:
         .find(|summary| summary.agent_id == agent_id)?;
     let tags = agent.tags();
     member.tags.into_iter().find(|tag_id| {
-        tags.iter().any(|tag| {
-            tag.tag_id == *tag_id && tag.kind == rho_ui_proto::TagKind::Workstream
-        })
+        tags.iter()
+            .any(|tag| tag.tag_id == *tag_id && tag.kind == rho_ui_proto::TagKind::Workstream)
     })
 }
 
@@ -641,7 +652,10 @@ fn workdir_table(agent: &AgentClient) -> Vec<(String, String)> {
 
 /// Tags of one kind as the `(name, id)` pairs shared completion and
 /// resolution expect.
-fn tag_labels(agent: &AgentClient, kind: rho_ui_proto::TagKind) -> Vec<(String, rho_ui_proto::TagId)> {
+fn tag_labels(
+    agent: &AgentClient,
+    kind: rho_ui_proto::TagKind,
+) -> Vec<(String, rho_ui_proto::TagId)> {
     agent
         .tags()
         .into_iter()
@@ -1222,6 +1236,7 @@ enum Command {
     Pr(PrArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
+    Term(term::TermArgs),
 }
 
 #[derive(Parser)]
@@ -1248,6 +1263,8 @@ enum CliCommand {
     Pr(PrArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
+    /// Attach this terminal to an agent's daemon-owned terminal.
+    Term(term::TermArgs),
 }
 
 #[derive(Clone, clap::Args)]
@@ -1396,6 +1413,7 @@ impl Args {
             Some(CliCommand::Pr(args)) => Command::Pr(args),
             Some(CliCommand::ProtocolLog(args)) => Command::ProtocolLog(args),
             Some(CliCommand::Slack(args)) => Command::Slack(args),
+            Some(CliCommand::Term(args)) => Command::Term(args),
             None => Command::Chat(cli.chat),
         };
         Ok(Self { command })

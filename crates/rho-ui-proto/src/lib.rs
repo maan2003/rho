@@ -21,6 +21,7 @@ use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 pub mod client;
 pub mod remote;
 pub mod server;
+pub mod term;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 /// Maximum accepted frame payload size.
@@ -219,6 +220,44 @@ pub enum ClientMessage {
     /// Ignored on transports that carry agent state in the control session.
     AgentStreamFocus {
         agent_id: Option<AgentId>,
+    },
+    /// Spawns a daemon-owned terminal for an agent: sent as the *first*
+    /// message on a fresh stream, like [`ClientMessage::ChannelOpen`].
+    /// Refused ([`ServerMessage::TerminalRefused`]) if `terminal_id` is
+    /// already running. On success the daemon replies
+    /// [`ServerMessage::TerminalOpened`]; with `attach` the stream then
+    /// carries senax frames of [`term::TermClientFrame`] /
+    /// [`term::TermServerFrame`], otherwise the terminal runs headless and
+    /// the stream closes.
+    TerminalCreate {
+        /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
+        agent: String,
+        /// Client-chosen id, unique among the agent's running terminals
+        /// ([`ClientMessage::TerminalList`] enumerates them).
+        terminal_id: u64,
+        /// Continue this stream as an attached terminal stream.
+        attach: bool,
+        /// Initial PTY size.
+        cols: u16,
+        rows: u16,
+    },
+    /// Attaches this whole stream to a *running* terminal (refused if it is
+    /// not running): handshake and frames as in
+    /// [`ClientMessage::TerminalCreate`] with `attach`. Closing the stream
+    /// detaches; the terminal keeps running.
+    TerminalAttach {
+        agent: String,
+        terminal_id: u64,
+        /// The client's viewport, applied to the PTY (last writer wins).
+        cols: u16,
+        rows: u16,
+    },
+    /// One-shot request on a fresh stream: the daemon replies with a single
+    /// [`ServerMessage::TerminalList`] (or [`ServerMessage::TerminalRefused`]
+    /// if `agent` does not resolve) and closes the stream.
+    TerminalList {
+        /// Restrict to one agent's terminals (display handle or id prefix).
+        agent: Option<String>,
     },
 }
 
@@ -449,6 +488,24 @@ pub enum ServerMessage {
     /// frame on that stream is [`ServerMessage::Agent`] for this agent.
     AgentStreamOpened {
         agent_id: AgentId,
+    },
+    /// Handshake reply on a terminal stream (see
+    /// [`ClientMessage::TerminalCreate`] and
+    /// [`ClientMessage::TerminalAttach`]). On an attached stream the first
+    /// [`term::TermServerFrame`] after it is a snapshot of the current screen
+    /// preceded by history.
+    TerminalOpened {
+        terminal_id: u64,
+    },
+    /// Handshake refusal on a terminal stream; the daemon closes the stream
+    /// after sending it.
+    TerminalRefused {
+        reason: String,
+    },
+    /// Reply to [`ClientMessage::TerminalList`]: every running terminal
+    /// (of one agent, if the request named one).
+    TerminalList {
+        terminals: Vec<term::TerminalInfo>,
     },
 }
 

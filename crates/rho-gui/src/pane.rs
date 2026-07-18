@@ -24,6 +24,8 @@ pub enum SurfaceKey {
         agent_id: AgentId,
         path: Utf8PathBuf,
     },
+    /// A daemon-owned terminal attached over a dedicated stream.
+    Terminal { agent_id: AgentId, terminal_id: u64 },
 }
 
 pub type PaneId = u64;
@@ -67,7 +69,10 @@ impl<S: PartialEq> Pane<S> {
 
 enum Node<S> {
     Leaf(Pane<S>),
-    Split { axis: SplitAxis, children: Vec<Node<S>> },
+    Split {
+        axis: SplitAxis,
+        children: Vec<Node<S>>,
+    },
 }
 
 /// A binary-ish split tree of panes plus a focus.
@@ -196,7 +201,10 @@ impl<S: PartialEq> PaneTree<S> {
                     Ok(())
                 }
                 Node::Leaf(_) => Err(sibling),
-                Node::Split { axis: node_axis, children } => {
+                Node::Split {
+                    axis: node_axis,
+                    children,
+                } => {
                     // Splitting along the parent's own axis just inserts a
                     // sibling instead of nesting another level.
                     if *node_axis == axis

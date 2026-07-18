@@ -137,6 +137,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: ":open <path>",
         description: "Open a file from the agent's workspace",
     },
+    CommandSpec {
+        name: "term",
+        usage: ":term [new]",
+        description: "Attach the agent's terminal (`new` starts another)",
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -191,6 +196,9 @@ pub enum Command {
 
     Open {
         path: Utf8PathBuf,
+    },
+    Term {
+        new: bool,
     },
     Quit,
     Clear,
@@ -280,6 +288,11 @@ pub fn parse(line: &str) -> Option<Parsed> {
                 path: Utf8PathBuf::from(path),
             }),
             None => Parsed::Invalid(":open <path>".to_owned()),
+        },
+        "term" => match tokens.next() {
+            None => Parsed::Command(Command::Term { new: false }),
+            Some("new") => Parsed::Command(Command::Term { new: true }),
+            Some(_) => Parsed::Invalid(":term [new]".to_owned()),
         },
         "quit" | "exit" => Parsed::Command(Command::Quit),
         "clear" => Parsed::Command(Command::Clear),

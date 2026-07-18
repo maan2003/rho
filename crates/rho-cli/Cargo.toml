@@ -13,6 +13,7 @@ camino.workspace = true
 clap.workspace = true
 dirs.workspace = true
 futures.workspace = true
+libc.workspace = true
 prefix-id.workspace = true
 rho-agent.workspace = true
 rho-ci.workspace = true

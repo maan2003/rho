@@ -26,10 +26,10 @@ use crate::connection::{ConnEvent, Connection};
 use crate::draft_view::DraftView;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer};
 use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
-use crate::zed_remote::FileView;
 use crate::registry::{ActivePane, AgentRegistry};
 use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
+use crate::zed_remote::FileView;
 use crate::{
     AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, MinibufferCancel,
     MinibufferCommand, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
@@ -59,6 +59,7 @@ enum SurfaceView {
     Draft(Entity<DraftView>),
     Transcript(Entity<AgentView>),
     File(Entity<FileView>),
+    Terminal(Entity<crate::terminal_view::TerminalView>),
 }
 
 impl PartialEq for Surface {
@@ -849,7 +850,12 @@ impl Workspace {
                 self.tag_by_name(source_agent, name, rho_ui_proto::TagKind::Workstream, cx);
             }
             Command::TagGroup { name } => {
-                self.tag_by_name(source_agent, name, rho_ui_proto::TagKind::WorkstreamGroup, cx);
+                self.tag_by_name(
+                    source_agent,
+                    name,
+                    rho_ui_proto::TagKind::WorkstreamGroup,
+                    cx,
+                );
             }
             Command::TagLabel { name } => {
                 self.tag_by_name(source_agent, name, rho_ui_proto::TagKind::Label, cx);
@@ -929,6 +935,14 @@ impl Workspace {
                     return;
                 };
                 self.open_file_surface(agent_id, workspace, path, cx);
+            }
+            Command::Term { new } => {
+                let target = source_agent.or_else(|| self.registry.selected_agent().copied());
+                let Some(agent_id) = target else {
+                    self.notice_on(None, ":term: no agent selected", StyleClass::SystemInfo, cx);
+                    return;
+                };
+                self.open_terminal_surface(agent_id, new, cx);
             }
 
             Command::Quit => cx.quit(),
@@ -1362,13 +1376,68 @@ impl Workspace {
         }
         let task =
             crate::zed_remote::open_file_buffer(&self.connection, workspace, path.clone(), cx);
+        cx.spawn(async move |this, cx| match task.await {
+            Ok((project, buffer)) => {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
+                    let surface = Self::wrap_surface(key, SurfaceView::File(view), window, cx);
+                    this.show_surface(surface);
+                    this.focus_active_surface(window, cx);
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.notice_on(
+                        None,
+                        &format!(":open failed: {error:#}"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// `:term`: dials a dedicated terminal stream for the agent (attaching
+    /// its first running terminal, spawning the default one when none run,
+    /// or a fresh one with `new`) and shows the terminal surface.
+    fn open_terminal_surface(&mut self, agent_id: AgentId, new: bool, cx: &mut Context<Self>) {
+        if !new
+            && let Some(surface) = self
+                .contexts
+                .get(&self.active_context)
+                .and_then(|tree| {
+                    tree.find_surface(|s| {
+                        matches!(s.key, SurfaceKey::Terminal { agent_id: id, .. } if id == agent_id)
+                    })
+                })
+                .cloned()
+        {
+            self.show_surface(surface);
+            cx.notify();
+            return;
+        }
+        let task = self
+            .connection
+            .open_terminal(agent_id.encoded(), new, 80, 24, cx);
         cx.spawn(async move |this, cx| {
-            match task.await {
-                Ok((project, buffer)) => {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(join_error) => Err(anyhow::anyhow!("terminal dial failed: {join_error}")),
+            };
+            match result {
+                Ok(channel) => {
                     let _ = this.update_in(cx, |this, window, cx| {
-                        let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
+                        let key = SurfaceKey::Terminal {
+                            agent_id,
+                            terminal_id: channel.terminal_id,
+                        };
+                        let view =
+                            cx.new(|cx| crate::terminal_view::TerminalView::new(channel, cx));
                         let surface =
-                            Self::wrap_surface(key, SurfaceView::File(view), window, cx);
+                            Self::wrap_surface(key, SurfaceView::Terminal(view), window, cx);
                         this.show_surface(surface);
                         this.focus_active_surface(window, cx);
                         cx.notify();
@@ -1378,7 +1447,7 @@ impl Workspace {
                     let _ = this.update(cx, |this, cx| {
                         this.notice_on(
                             None,
-                            &format!(":open failed: {error:#}"),
+                            &format!(":term failed: {error:#}"),
                             StyleClass::SystemInfo,
                             cx,
                         );
@@ -1502,15 +1571,12 @@ impl Workspace {
     /// Moves gpui focus to the focused pane's surface.
     fn focus_active_surface(&self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.active_tree().focused().surface.view {
-            SurfaceView::Draft(view) => {
-                window.focus(&view.read(cx).editor().focus_handle(cx), cx)
-            }
+            SurfaceView::Draft(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
             SurfaceView::Transcript(view) => {
                 window.focus(&view.read(cx).editor().focus_handle(cx), cx)
             }
-            SurfaceView::File(view) => {
-                window.focus(&view.read(cx).editor().focus_handle(cx), cx)
-            }
+            SurfaceView::File(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
+            SurfaceView::Terminal(view) => window.focus(&view.read(cx).focus_handle(cx), cx),
         }
     }
 
@@ -1540,6 +1606,9 @@ impl Workspace {
             SurfaceKey::File { .. } => {
                 unreachable!("file surfaces are created by open_file_surface")
             }
+            SurfaceKey::Terminal { .. } => {
+                unreachable!("terminal surfaces are created by open_terminal_surface")
+            }
         };
         Self::wrap_surface(key, view, window, cx)
     }
@@ -1560,7 +1629,11 @@ impl Workspace {
                 let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
                 Self::wrap_surface(surface.key.clone(), SurfaceView::File(view), window, cx)
             }
-            SurfaceView::Draft(_) | SurfaceView::Transcript(_) => surface,
+            // Terminals share their view between panes: splitting a pane
+            // does not attach a second wire client.
+            SurfaceView::Draft(_) | SurfaceView::Transcript(_) | SurfaceView::Terminal(_) => {
+                surface
+            }
         }
     }
 
@@ -1573,13 +1646,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Surface {
-        let editor = match &view {
-            SurfaceView::Draft(view) => view.read(cx).editor().clone(),
-            SurfaceView::Transcript(view) => view.read(cx).editor().clone(),
-            SurfaceView::File(view) => view.read(cx).editor().clone(),
+        let (handle, editor_id) = match &view {
+            SurfaceView::Draft(view) => {
+                let editor = view.read(cx).editor();
+                (editor.focus_handle(cx), editor.entity_id())
+            }
+            SurfaceView::Transcript(view) => {
+                let editor = view.read(cx).editor();
+                (editor.focus_handle(cx), editor.entity_id())
+            }
+            SurfaceView::File(view) => {
+                let editor = view.read(cx).editor();
+                (editor.focus_handle(cx), editor.entity_id())
+            }
+            // Terminals have no editor; the view itself carries focus.
+            SurfaceView::Terminal(view) => (view.read(cx).focus_handle(cx), view.entity_id()),
         };
-        let handle = editor.focus_handle(cx);
-        let editor_id = editor.entity_id();
         let focus_follow = cx.on_focus_in(&handle, window, move |this, _window, cx| {
             this.surface_focused(editor_id, cx);
         });
@@ -1607,6 +1689,7 @@ impl Workspace {
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
         match self.active_tree().focused().surface.key.clone() {
             SurfaceKey::Transcript(agent_id) => self.registry.select_agent(agent_id),
+            SurfaceKey::Terminal { agent_id, .. } => self.registry.select_agent(agent_id),
             SurfaceKey::Draft => self.registry.enter_draft(),
             // Files keep whatever agent context was current.
             SurfaceKey::File { .. } => {}
@@ -1744,7 +1827,11 @@ impl Workspace {
 
     /// The ambient rail beside the active context's tree: reachable by
     /// `space r` or the mouse, outside the pane cycle.
-    fn render_rail(&self, text_style: &gpui::TextStyle, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_rail(
+        &self,
+        text_style: &gpui::TextStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         div()
             .h_full()
             .flex_none()
@@ -1822,6 +1909,12 @@ impl Workspace {
                 .into_any_element(),
             SurfaceView::File(view) => div()
                 .id("rho-surface-file")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
+            SurfaceView::Terminal(view) => div()
+                .id("rho-surface-terminal")
                 .size_full()
                 .overflow_hidden()
                 .child(view.clone())

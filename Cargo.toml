@@ -45,6 +45,7 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
 anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"
@@ -72,7 +73,6 @@ octo-server = { path = "crates/octo-server" }
 octo-types = { path = "crates/octo-types" }
 pprof = { path = "crates/pprof", default-features = false }
 prefix-id = { path = "crates/prefix-id", default-features = false }
-rho-zed-host = { path = "crates/rho-zed-host" }
 rand = "0.8"
 redb = "4.1.0"
 redb-derive = "0.1.0"
@@ -104,6 +104,13 @@ rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
 rho-webui-messages = { path = "crates/rho-webui-messages" }
 rho-workspaces = { path = "crates/rho-workspaces" }
+rho-zed-host = { path = "crates/rho-zed-host" }
+rustix-openpty = "0.2"
+rustls = { version = "0.23", default-features = false, features = [
+  "aws_lc_rs",
+  "std",
+  "tls12",
+] }
 senax-encoder = { path = "crates/senax-encoder" }
 senax-encoder-derive = { path = "crates/senax-encoder/derive" }
 serde = { version = "1", features = ["derive"] }
@@ -127,7 +134,6 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
   "handshake",
   "rustls-tls-native-roots",
 ] }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tracing = { version = "0.1", default-features = false, features = [
   "attributes",
   "std",
@@ -140,7 +146,7 @@ vt100 = { version = "0.16", default-features = false }
 zip = { version = "2", default-features = false, features = [
   "deflate",
   "time",
-]}
+] }
 [profile.ci]
 debug = "line-tables-only"
 incremental = false

@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+alacritty_terminal.workspace = true
 anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
@@ -15,10 +16,12 @@ dirs.workspace = true
 futures.workspace = true
 iroh = { workspace = true, features = ["qlog", "tls-aws-lc-rs"] }
 json-stream.workspace = true
+libc.workspace = true
 noq-proto.workspace = true
 octo-server.workspace = true
 octo-types.workspace = true
 prefix-id.workspace = true
+redb.workspace = true
 rho-agent.workspace = true
 rho-claude.workspace = true
 rho-core.workspace = true
@@ -31,11 +34,11 @@ rho-slack.workspace = true
 rho-ui-proto.workspace = true
 rho-webui-messages.workspace = true
 rho-workspaces.workspace = true
-redb.workspace = true
+rho-zed-host.workspace = true
+rustix-openpty.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rho-zed-host.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true

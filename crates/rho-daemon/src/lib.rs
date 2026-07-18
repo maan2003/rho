@@ -21,12 +21,13 @@ use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
-    McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
-    UiTag, WorkspaceInfo, read_frame_counted, write_frame, write_frame_counted,
+    McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject, UiTag,
+    WorkspaceInfo, read_frame, read_frame_counted, write_frame, write_frame_counted,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, watch};
 
 pub mod debug;
+mod terminal;
 mod webui;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
@@ -487,7 +488,17 @@ async fn run_iroh_listener(
                             let first =
                                 read_frame_counted::<_, ClientMessage>(&mut recv, Some(&counters))
                                     .await?;
-                            let control = if !matches!(&first, ClientMessage::ChannelOpen { .. }) {
+                            // Dedicated streams (zed channels, terminals,
+                            // one-shot queries) are not the UI control
+                            // session and must not claim it.
+                            let dedicated = matches!(
+                                &first,
+                                ClientMessage::ChannelOpen { .. }
+                                    | ClientMessage::TerminalCreate { .. }
+                                    | ClientMessage::TerminalAttach { .. }
+                                    | ClientMessage::TerminalList { .. }
+                            );
+                            let control = if !dedicated {
                                 let streams = agent_streams
                                     .clone()
                                     .context("iroh agent streams missing")?;
@@ -501,6 +512,14 @@ async fn run_iroh_listener(
                             } else {
                                 None
                             };
+                            if matches!(
+                                &first,
+                                ClientMessage::TerminalCreate { .. }
+                                    | ClientMessage::TerminalAttach { .. }
+                            ) {
+                                send.set_priority(50)
+                                    .context("set iroh terminal stream priority")?;
+                            }
                             let result = serve_connection_io(
                                 agents,
                                 recv,
@@ -739,6 +758,10 @@ struct AgentRegistry {
     /// first channel open so daemons that never serve an editing client
     /// never start it.
     zed_host: std::sync::OnceLock<rho_zed_host::ZedHost>,
+    /// Daemon-owned terminal sessions, keyed per agent.
+    terminals: Arc<terminal::TerminalRegistry>,
+    /// The snapshotted login environment, for terminal shells.
+    user_environment: rho_workspaces::UserEnvironment,
 }
 
 impl AgentRegistry {
@@ -750,7 +773,13 @@ impl AgentRegistry {
         platform_secrets: PlatformSecrets,
         iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     ) -> anyhow::Result<Self> {
-        let pool = AgentPool::new(db.clone(), auth.clone(), path_overrides, user_environment).await;
+        let pool = AgentPool::new(
+            db.clone(),
+            auth.clone(),
+            path_overrides,
+            user_environment.clone(),
+        )
+        .await;
         let machine_seed = db.read().machine_seed();
         let slack = rho_slack::SlackManager::new(pool.clone(), db.clone()).await;
         let pr_monitor = rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone()).await?;
@@ -769,6 +798,8 @@ impl AgentRegistry {
             events: broadcast::channel(1024).0,
             iroh_auth,
             zed_host: std::sync::OnceLock::new(),
+            terminals: Arc::new(terminal::TerminalRegistry::default()),
+            user_environment,
         };
         registry.pool.load_non_hidden_agents().await;
         Ok(registry)
@@ -1215,10 +1246,7 @@ impl AgentRegistry {
         let now = rho_core::UnixMs::now();
         let mut write = self.db.write().await;
         let read = self.db.read();
-        let tags = read
-            .list_tags()
-            .into_iter()
-            .collect::<HashMap<TagId, _>>();
+        let tags = read.list_tags().into_iter().collect::<HashMap<TagId, _>>();
         let (tag_id, kind) = match target {
             rho_ui_proto::TagTarget::Existing(tag_id) => {
                 let tag = tags
@@ -1458,6 +1486,30 @@ where
     };
     if let ClientMessage::ChannelOpen { workspace } = first {
         return serve_zed_channel(agents, reader, writer, workspace).await;
+    }
+    if let ClientMessage::TerminalCreate {
+        agent,
+        terminal_id,
+        attach,
+        cols,
+        rows,
+    } = first
+    {
+        let open = TerminalOpenKind::Create { attach };
+        return serve_terminal(agents, reader, writer, agent, terminal_id, open, cols, rows).await;
+    }
+    if let ClientMessage::TerminalAttach {
+        agent,
+        terminal_id,
+        cols,
+        rows,
+    } = first
+    {
+        let open = TerminalOpenKind::Attach;
+        return serve_terminal(agents, reader, writer, agent, terminal_id, open, cols, rows).await;
+    }
+    if let ClientMessage::TerminalList { agent } = first {
+        return serve_terminal_list(agents, writer, agent).await;
     }
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerMessage>();
@@ -1914,7 +1966,12 @@ async fn handle_message(
             // verbatim. Without a workstream, the agent founds its own,
             // provisionally named after its first message until the
             // generated title lands.
-            let known = agents.db.read().list_tags().into_iter().collect::<HashMap<TagId, _>>();
+            let known = agents
+                .db
+                .read()
+                .list_tags()
+                .into_iter()
+                .collect::<HashMap<TagId, _>>();
             let mut workstream = None;
             let mut group = None;
             let mut labels = Vec::new();
@@ -2228,7 +2285,181 @@ async fn handle_message(
         ClientMessage::ChannelOpen { .. } => {
             anyhow::bail!("ChannelOpen must be the first frame on a dedicated stream")
         }
+        ClientMessage::TerminalCreate { .. }
+        | ClientMessage::TerminalAttach { .. }
+        | ClientMessage::TerminalList { .. } => {
+            anyhow::bail!("terminal messages must be the first frame on a dedicated stream")
+        }
     }
+}
+
+/// How a terminal stream's first frame opens its terminal.
+enum TerminalOpenKind {
+    Create { attach: bool },
+    Attach,
+}
+
+/// Serves a stream dedicated to one daemon-owned terminal: spawns or attaches
+/// (per [`TerminalOpenKind`]), replies `TerminalOpened`, then pumps
+/// [`rho_ui_proto::term`] frames until either side closes. Closing only
+/// detaches; the terminal keeps running. A headless create replies and
+/// returns without attaching.
+#[expect(clippy::too_many_arguments)]
+async fn serve_terminal<R, W>(
+    agents: Arc<AgentRegistry>,
+    mut reader: R,
+    mut writer: W,
+    agent: String,
+    terminal_id: u64,
+    open: TerminalOpenKind,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let create = matches!(open, TerminalOpenKind::Create { .. });
+    let attached = terminal_attach(&agents, &agent, terminal_id, create, cols, rows).await;
+    let client = match attached {
+        Ok(attached) => attached,
+        Err(error) => {
+            let _ = write_frame(
+                &mut writer,
+                &ServerMessage::TerminalRefused {
+                    reason: format!("{error:#}"),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    write_frame(&mut writer, &ServerMessage::TerminalOpened { terminal_id }).await?;
+    if matches!(open, TerminalOpenKind::Create { attach: false }) {
+        // Headless create: the terminal keeps running with no clients.
+        return Ok(());
+    }
+
+    let terminal::TerminalClient { mut frames, input } = client;
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = frames.recv().await {
+            if write_frame(&mut writer, &frame).await.is_err() {
+                break;
+            }
+        }
+        // Half-close so a client blocked on reads notices the terminal is
+        // gone even if it never sends input.
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    });
+    let result = loop {
+        use rho_ui_proto::term::TermClientFrame;
+        let client_input = match read_frame::<_, TermClientFrame>(&mut reader).await {
+            Ok(TermClientFrame::Input(bytes)) => terminal::ClientInput::Bytes(bytes),
+            Ok(TermClientFrame::Resize { cols, rows }) => {
+                terminal::ClientInput::Resize { cols, rows }
+            }
+            Ok(TermClientFrame::Keystroke(keystroke)) => {
+                terminal::ClientInput::Keystroke(keystroke)
+            }
+            Ok(TermClientFrame::Paste(text)) => terminal::ClientInput::Paste(text),
+            Err(_) => break Ok(()),
+        };
+        let _ = input.send(client_input);
+    };
+    writer_task.abort();
+    result
+}
+
+/// Resolves the agent, then attaches to a running terminal — or, for
+/// `create`, builds the spawn spec for its default shell inside its view and
+/// spawns a fresh one.
+async fn terminal_attach(
+    agents: &Arc<AgentRegistry>,
+    agent: &str,
+    terminal_id: u64,
+    create: bool,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<terminal::TerminalClient> {
+    let agent_id = agents.resolve_display_agent_id(agent)?;
+    if !create {
+        return agents
+            .terminals
+            .attach(agent_id, terminal_id, cols, rows)
+            .await;
+    }
+    let record = agents.db.read().get_agent(agent_id);
+    anyhow::ensure!(
+        !record
+            .workdirs
+            .iter()
+            .any(|workdir| matches!(workdir, WorkspaceInfo::Sandbox { .. })),
+        "sandboxed agents have no terminals yet"
+    );
+    let view = agents
+        .pool
+        .materialize_view(&record.workdirs)
+        .await
+        .context("materialize agent view")?;
+    let shell = agents
+        .user_environment
+        .get("SHELL")
+        .and_then(|shell| shell.to_str())
+        .unwrap_or("bash")
+        .to_owned();
+    agents
+        .terminals
+        .create(
+            agent_id,
+            terminal_id,
+            cols,
+            rows,
+            terminal::TerminalSpawn { view, shell },
+        )
+        .await
+}
+
+/// Answers a [`ClientMessage::TerminalList`] one-shot stream.
+async fn serve_terminal_list<W>(
+    agents: Arc<AgentRegistry>,
+    mut writer: W,
+    agent: Option<String>,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let filter = match &agent {
+        Some(agent) => match agents.resolve_display_agent_id(agent) {
+            Ok(agent_id) => Some(agent_id),
+            Err(error) => {
+                let _ = write_frame(
+                    &mut writer,
+                    &ServerMessage::TerminalRefused {
+                        reason: format!("{error:#}"),
+                    },
+                )
+                .await;
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    let terminals = agents
+        .terminals
+        .list()
+        .await
+        .into_iter()
+        .filter(|entry| filter.is_none_or(|agent_id| entry.agent_id == agent_id))
+        .map(|entry| rho_ui_proto::term::TerminalInfo {
+            agent: entry.agent_id.encoded(),
+            terminal_id: entry.terminal_id,
+            title: entry.title.unwrap_or_default(),
+            cols: entry.cols,
+            rows: entry.rows,
+            clients: entry.clients as u32,
+        })
+        .collect();
+    write_frame(&mut writer, &ServerMessage::TerminalList { terminals }).await
 }
 
 /// Serves a stream dedicated to one zed channel: binds a headless project

@@ -15,6 +15,7 @@ mod render;
 mod rho_assets;
 mod store;
 mod style;
+mod terminal_view;
 #[cfg(test)]
 mod tests;
 mod topic_rail;
@@ -64,7 +65,8 @@ actions!(
         MinibufferCancel,
         MinibufferNext,
         MinibufferPrevious,
-        MinibufferComplete
+        MinibufferComplete,
+        TerminalPaste
     ]
 );
 
@@ -414,6 +416,10 @@ fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoGui > Editor && !showing_completions"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
+        // Terminal surface: every unbound key becomes terminal input, so its
+        // few chrome bindings use chords shells don't see anyway.
+        KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("RhoTerminal")),
+        KeyBinding::new("ctrl-shift-;", MinibufferCommand, Some("RhoTerminal")),
     ]);
     // Vim-leader pane vocabulary. Bound both for editors in normal mode
     // (vim or helix flavor — helix reports `vim_mode == helix_normal`) and

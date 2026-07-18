@@ -13,8 +13,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::remote::{AgentRemoteFrame, UiAgentState, UiBlock};
 use crate::{
     AgentRole, ClientMessage, IoCounters, MessageDelivery, ProtocolLogDirection, ServerMessage,
-    StartMode, UiAgentSummary, UiProject, UiTag, append_protocol_log_record,
-    protocol_frame_bytes, read_frame_counted, write_frame_counted,
+    StartMode, UiAgentSummary, UiProject, UiTag, append_protocol_log_record, protocol_frame_bytes,
+    read_frame_counted, write_frame_counted,
 };
 
 /// Raw async client for the rho UI Unix-socket protocol.
@@ -236,10 +236,13 @@ impl AgentClient {
                     | ServerMessage::IrohApproved { .. }
                     | ServerMessage::IrohRevoked { .. }
                     | ServerMessage::PrCommandResult { .. } => {}
-                    // Zed channel handshake replies only appear on dedicated
-                    // channel streams, never in a UI session.
+                    // Zed channel and terminal handshake replies only appear
+                    // on dedicated streams, never in a UI session.
                     ServerMessage::ChannelOpened { .. }
                     | ServerMessage::ChannelClosed { .. }
+                    | ServerMessage::TerminalOpened { .. }
+                    | ServerMessage::TerminalRefused { .. }
+                    | ServerMessage::TerminalList { .. }
                     | ServerMessage::AgentStreamOpened { .. } => {}
                 }
             }
@@ -349,7 +352,9 @@ impl AgentClient {
     }
 
     pub fn new_tag(&self, name: String, kind: TagKind, parent: Option<TagId>) {
-        let _ = self.commands.send(ClientMessage::NewTag { name, kind, parent });
+        let _ = self
+            .commands
+            .send(ClientMessage::NewTag { name, kind, parent });
     }
 
     pub fn set_project(&self, path: Utf8PathBuf, name: Option<String>, description: String) {
