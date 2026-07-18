@@ -158,6 +158,17 @@ impl FileView {
         &self.editor
     }
 
+    /// Whether any buffer in this view has unsaved edits.
+    pub fn is_dirty(&self, cx: &App) -> bool {
+        self.editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .all_buffers()
+            .iter()
+            .any(|buffer| buffer.read(cx).is_dirty())
+    }
+
     fn save(&mut self, _: &crate::FileSave, _window: &mut Window, cx: &mut Context<Self>) {
         let buffers = self.editor.read(cx).buffer().read(cx).all_buffers();
         let project = self.project.clone();

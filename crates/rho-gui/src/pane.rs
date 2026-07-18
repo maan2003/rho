@@ -7,6 +7,8 @@
 //! content. Each pane keeps a history of surfaces it displayed so "go
 //! back" is per-viewport, like emacs window history.
 
+use std::collections::HashSet;
+
 use camino::Utf8PathBuf;
 use rho_ui_proto::AgentId;
 
@@ -25,6 +27,43 @@ pub enum SurfaceKey {
         agent_id: AgentId,
         path: Utf8PathBuf,
     },
+}
+
+/// Per-kind layout and lifecycle policy, so the workspace asks the surface
+/// instead of matching on it in six places.
+pub struct SurfaceTraits {
+    /// Whether a pane showing this surface may be closed.
+    pub closable: bool,
+    /// Whether the surface stretches to fill its pane (the rail keeps its
+    /// intrinsic width instead).
+    pub grows: bool,
+    /// Whether the surface holds live resources (remote channels) that
+    /// should be dropped once no pane references it.
+    pub transient_resources: bool,
+}
+
+impl SurfaceKey {
+    pub fn traits(&self) -> SurfaceTraits {
+        match self {
+            SurfaceKey::Rail => SurfaceTraits {
+                closable: false,
+                grows: false,
+                transient_resources: false,
+            },
+            // Transcript and draft views double as materialization caches;
+            // they stay alive off-screen.
+            SurfaceKey::Draft | SurfaceKey::Transcript(_) => SurfaceTraits {
+                closable: true,
+                grows: true,
+                transient_resources: false,
+            },
+            SurfaceKey::File { .. } => SurfaceTraits {
+                closable: true,
+                grows: true,
+                transient_resources: true,
+            },
+        }
+    }
 }
 
 pub type PaneId = u64;
@@ -159,6 +198,17 @@ impl PaneTree {
             .iter()
             .find(|pane| pane.surface == *surface)
             .map(|pane| pane.id)
+    }
+
+    /// Every surface some pane shows or remembers in its history. Surfaces
+    /// outside this set are unreachable through the layout.
+    pub fn referenced_surfaces(&self) -> HashSet<SurfaceKey> {
+        let mut referenced = HashSet::new();
+        for pane in self.panes() {
+            referenced.insert(pane.surface.clone());
+            referenced.extend(pane.history.iter().cloned());
+        }
+        referenced
     }
 
     /// Splits the focused pane along `axis`; the new pane shows the same

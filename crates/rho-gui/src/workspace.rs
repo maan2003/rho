@@ -82,10 +82,14 @@ pub struct Workspace {
     /// The split-tree of viewports over surfaces; the rail is its leftmost
     /// pane.
     panes: PaneTree,
-    /// Open remote-file surfaces; each owns its own zed channel.
+    /// Open remote-file surfaces; each owns its own zed channel. Swept when
+    /// no pane references them (see [`Self::sweep_hidden_surfaces`]).
     file_views: HashMap<(AgentId, Utf8PathBuf), Entity<FileView>>,
     /// Keyboard focus for the rail surface (it has no editor).
     rail_focus: gpui::FocusHandle,
+    /// Focus-in observers per surface: gpui focus arriving inside a surface
+    /// (mouse click, vim navigation) moves pane focus with it.
+    focus_subscriptions: HashMap<SurfaceKey, gpui::Subscription>,
     _event_task: Task<()>,
 }
 
@@ -133,8 +137,11 @@ impl Workspace {
             },
             file_views: HashMap::new(),
             rail_focus: cx.focus_handle(),
+            focus_subscriptions: HashMap::new(),
             _event_task: event_task,
         };
+        let draft_focus = this.draft_view.read(cx).editor().focus_handle(cx);
+        this.track_surface_focus(SurfaceKey::Draft, draft_focus, window, cx);
         this.seed_draft(false, window, cx);
         this.focus_active_surface(window, cx);
         this
@@ -1196,7 +1203,7 @@ impl Workspace {
     /// is focused, then the first non-rail pane (created by splitting when
     /// the rail is all that's left).
     fn show_surface_in_main(&mut self, surface: SurfaceKey) {
-        if self.panes.focused().surface != SurfaceKey::Rail {
+        if self.panes.focused().surface.traits().grows {
             self.panes.focused_mut().show(surface);
             return;
         }
@@ -1204,7 +1211,7 @@ impl Workspace {
             .panes
             .panes()
             .iter()
-            .find(|pane| pane.surface != SurfaceKey::Rail)
+            .find(|pane| pane.surface.traits().grows)
             .map(|pane| pane.id);
         match main {
             Some(id) => {
@@ -1249,6 +1256,8 @@ impl Workspace {
                 Ok((project, buffer)) => {
                     let _ = this.update_in(cx, |this, window, cx| {
                         let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
+                        let editor_focus = view.read(cx).editor().focus_handle(cx);
+                        this.track_surface_focus(key.clone(), editor_focus, window, cx);
                         this.file_views.insert((agent_id, path), view);
                         this.show_surface_in_main(key);
                         this.focus_active_surface(window, cx);
@@ -1328,6 +1337,8 @@ impl Workspace {
             });
         }
         self.refresh_view_status(agent_id, &view, cx);
+        let editor_focus = view.read(cx).editor().focus_handle(cx);
+        self.track_surface_focus(SurfaceKey::Transcript(*agent_id), editor_focus, window, cx);
         self.views.insert(*agent_id, view.clone());
         view
     }
@@ -1412,6 +1423,61 @@ impl Workspace {
         }
     }
 
+    /// Follows gpui focus into a surface: registers a focus-in observer so
+    /// that clicking or navigating into a surface's editor moves pane focus
+    /// (and the agent context) with it.
+    fn track_surface_focus(
+        &mut self,
+        key: SurfaceKey,
+        handle: gpui::FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.focus_subscriptions.contains_key(&key) {
+            return;
+        }
+        let subscription = cx.on_focus_in(&handle, window, {
+            let key = key.clone();
+            move |this, _window, cx| {
+                if this.panes.focused().surface == key {
+                    return;
+                }
+                if let Some(id) = this.panes.pane_showing(&key) {
+                    this.panes.focus(id);
+                    this.sync_selection_to_focus(cx);
+                }
+            }
+        });
+        self.focus_subscriptions.insert(key, subscription);
+    }
+
+    /// Drops surfaces holding live resources (file views and their zed
+    /// channels) once no pane shows or remembers them. Dirty buffers are
+    /// kept alive: their edits only exist in the view.
+    fn sweep_hidden_surfaces(&mut self, cx: &mut Context<Self>) {
+        let referenced = self.panes.referenced_surfaces();
+        let file_views = std::mem::take(&mut self.file_views);
+        self.file_views = file_views
+            .into_iter()
+            .filter(|((agent_id, path), view)| {
+                let key = SurfaceKey::File {
+                    agent_id: *agent_id,
+                    path: path.clone(),
+                };
+                !key.traits().transient_resources
+                    || referenced.contains(&key)
+                    || view.read(cx).is_dirty(cx)
+            })
+            .collect();
+        let file_views = &self.file_views;
+        self.focus_subscriptions.retain(|key, _| match key {
+            SurfaceKey::File { agent_id, path } => {
+                file_views.contains_key(&(*agent_id, path.clone()))
+            }
+            _ => true,
+        });
+    }
+
     /// Keeps the registry's notion of "current agent" in step with the
     /// focused pane, so `:` commands resolve against what the user sees.
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
@@ -1425,7 +1491,7 @@ impl Workspace {
     }
 
     fn split_pane(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
-        if self.panes.focused().surface == SurfaceKey::Rail {
+        if !self.panes.focused().surface.traits().grows {
             // Splitting the rail would just clone it; open the main pane
             // instead.
             self.leave_rail(window, cx);
@@ -1436,10 +1502,11 @@ impl Workspace {
     }
 
     fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.panes.focused().surface == SurfaceKey::Rail {
+        if !self.panes.focused().surface.traits().closable {
             return;
         }
         self.panes.close_focused();
+        self.sweep_hidden_surfaces(cx);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
         cx.notify();
@@ -1454,6 +1521,7 @@ impl Workspace {
 
     fn pane_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.panes.focused_mut().back() {
+            self.sweep_hidden_surfaces(cx);
             self.sync_selection_to_focus(cx);
             self.focus_active_surface(window, cx);
             cx.notify();
@@ -1474,7 +1542,7 @@ impl Workspace {
             .panes
             .panes()
             .iter()
-            .find(|pane| pane.surface != SurfaceKey::Rail)
+            .find(|pane| pane.surface.traits().grows)
             .map(|pane| pane.id);
         if let Some(id) = main {
             self.panes.focus(id);
@@ -1495,12 +1563,12 @@ impl Workspace {
             let id = pane.id;
             let focused = id == focused_id;
             let content = self.render_surface(&pane.surface, text_style, cx);
-            let is_rail = pane.surface == SurfaceKey::Rail;
+            let grows = pane.surface.traits().grows;
             let mut element = div()
                 .h_full()
                 .overflow_hidden()
                 .border_1()
-                .border_color(if focused && !is_rail {
+                .border_color(if focused {
                     gpui::Hsla::from(focus_border)
                 } else {
                     gpui::transparent_black()
@@ -1516,10 +1584,10 @@ impl Workspace {
                     }),
                 )
                 .child(content);
-            element = if is_rail {
-                element.flex_none()
-            } else {
+            element = if grows {
                 element.flex_grow(1.0).min_w_0().min_h_0()
+            } else {
+                element.flex_none()
             };
             element.into_any_element()
         };
