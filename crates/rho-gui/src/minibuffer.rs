@@ -71,17 +71,24 @@ impl Echo {
     }
 }
 
-/// The shared chrome of the bottom line: same background, font, and size
-/// as the editors above it — it reads as the vim command line, not a
-/// panel.
+/// The shared chrome of the bottom line: same font and size as the
+/// editors above it — it reads as the vim command line, not a panel. The
+/// background is the editor's, nudged a few percent in lightness so the
+/// strip reads as its own region without a border.
 fn bottom_strip(text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> gpui::Div {
+    let mut background: gpui::Hsla = cx.theme().colors().editor_background.into();
+    if background.l < 0.5 {
+        background.l += 0.04;
+    } else {
+        background.l -= 0.04;
+    }
     div()
         .flex()
         .flex_col()
         .flex_none()
         .w_full()
         .py(px(2.))
-        .bg(cx.theme().colors().editor_background)
+        .bg(background)
         .text_color(text_style.color)
         .font_family(text_style.font_family.clone())
         .font_weight(text_style.font_weight)
