@@ -457,6 +457,38 @@ impl AgentRegistry {
         &self.workstreams
     }
 
+    /// Rail row order, the same machinery agent rows used before tasks:
+    /// each workstream is represented by its primary agent (its layout's
+    /// best-listed member), and rows sort by pinned workstream, pinned
+    /// primary, the primary's membership in the attention/recency top
+    /// bucket, then the retained engagement order — so rows with live
+    /// attention or fresh engagement surface without reshuffling the rest.
+    /// Creation order is the stable tiebreak; workstreams with nothing
+    /// listed trail.
+    pub fn ordered_workstreams(&self) -> Vec<&Workstream> {
+        let primary = |workstream: &Workstream| {
+            self.topic_rail_layouts
+                .get(&workstream.tag_id)
+                .and_then(|layout| layout.listed.first())
+                .and_then(|(agent_id, _)| self.agent_summary(*agent_id))
+        };
+        let bucket = self.top_bucket(self.workstreams.iter().filter_map(primary));
+        let mut rows = self.workstreams.iter().collect::<Vec<_>>();
+        rows.sort_by_key(|workstream| {
+            let primary = primary(workstream);
+            (
+                workstream.status != rho_ui_proto::Status::Pinned,
+                primary.is_none_or(|agent| agent.status != rho_ui_proto::Status::Pinned),
+                primary.is_none_or(|agent| !bucket.contains(&agent.agent_id)),
+                primary
+                    .and_then(|agent| self.rail_ranks.get(&agent.agent_id))
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+        });
+        rows
+    }
+
 
     pub fn mark_known(&mut self, agent_id: AgentId) {
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
@@ -523,12 +555,9 @@ impl AgentRegistry {
     /// one pinned agents first, then the active bucket, then the retained
     /// order. Agents known outside any workstream trail at the end.
     fn rail_order(&self) -> Vec<AgentId> {
-        let mut workstreams = self.workstreams.iter().collect::<Vec<_>>();
-        workstreams.sort_by_key(|workstream| workstream.status != rho_ui_proto::Status::Pinned);
-
         let mut candidates = Vec::new();
         let mut hidden = BTreeSet::new();
-        for workstream in workstreams {
+        for workstream in self.ordered_workstreams() {
             if workstream.hidden {
                 hidden.extend(workstream.agent_ids());
                 continue;
@@ -850,6 +879,45 @@ mod tests {
         registry.select_agent(agent_id(3));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
         assert_eq!(registry.next_live_agent(-1), Some(agent_id(2)));
+    }
+
+    #[test]
+    fn rows_sort_by_primary_engagement_and_attention_not_creation() {
+        use rho_ui_proto::UiAttention;
+
+        let mut registry = AgentRegistry::default();
+        // Three workstreams in creation order 1, 2, 3; agent 3 pinned,
+        // agent 1 engaged most recently (fixture recency grows with id,
+        // bumped explicitly here).
+        let mut fresh = agent(1, Status::Normal);
+        fresh.last_active = rho_core::UnixMs(crate::workspace::now_ms() + 100);
+        set_topics(&mut registry, vec![
+            topic(1, Status::Normal, vec![fresh]),
+            topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
+            topic(3, Status::Normal, vec![agent(3, Status::Pinned)]),
+        ]);
+
+        let order = |registry: &AgentRegistry| {
+            registry
+                .ordered_workstreams()
+                .into_iter()
+                .map(|workstream| workstream.tag_id.0)
+                .collect::<Vec<_>>()
+        };
+        // Pinned primary leads; then retained engagement order (1 above 2),
+        // not creation order.
+        assert_eq!(order(&registry), [3, 1, 2]);
+
+        // Attention admits a row to the top bucket but retained order holds
+        // within it; a workstream-level pin outranks everything.
+        registry.set_attention(agent_id(2), UiAttention::NeedsInput);
+        assert_eq!(order(&registry), [3, 1, 2]);
+        set_topics(&mut registry, vec![
+            topic(1, Status::Normal, vec![agent(1, Status::Normal)]),
+            topic(2, Status::Pinned, vec![agent(2, Status::Normal)]),
+            topic(3, Status::Normal, vec![agent(3, Status::Pinned)]),
+        ]);
+        assert_eq!(order(&registry), [2, 3, 1]);
     }
 
     #[test]

@@ -39,14 +39,10 @@ pub fn render_topic_rail(
     };
     let selected_agent = registry.selected_agent().cloned();
 
-    let mut visible_topics = registry
-        .workstreams()
-        .iter()
-        .filter(|topic| !topic.hidden)
-        .collect::<Vec<_>>();
-    visible_topics.sort_by_key(|topic| topic.status != Status::Pinned);
-    let rows = visible_topics
+    let rows = registry
+        .ordered_workstreams()
         .into_iter()
+        .filter(|topic| !topic.hidden)
         .map(|topic| {
             task_row(
                 topic,
