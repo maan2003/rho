@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -23,7 +24,7 @@ use rho_ui_proto::{
     McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
     UiTopic, WorkspaceInfo, read_frame_counted, write_frame, write_frame_counted,
 };
-use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc};
+use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, watch};
 
 pub mod debug;
 mod webui;
@@ -421,7 +422,7 @@ async fn load_or_create_iroh_secret(db: &RhoDb) -> anyhow::Result<iroh::SecretKe
 }
 
 /// Authenticates every iroh connection on its first bi-stream, then serves one
-/// session per later bi-stream: the full UI protocol on
+/// full UI control session plus any number of zed-channel bi-streams on
 /// [`rho_ui_proto::IROH_ALPN`], the web UI JSON protocol on
 /// [`rho_webui_messages::ALPN`]. Unapproved connections never reach either
 /// application handler.
@@ -465,14 +466,50 @@ async fn run_iroh_listener(
                 }
             }
             let webui = connection.alpn() == rho_webui_messages::ALPN;
+            let agent_streams = (!webui).then(|| IrohAgentStreams::new(connection.clone()));
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let agents = agents.clone();
+                let agent_streams = agent_streams.clone();
                 tokio::spawn(async move {
                     let result = if webui {
                         webui::serve_json_session(agents, recv, send).await
                     } else {
-                        let counters = rho_ui_proto::IoCounters::default();
-                        serve_connection_io(agents, recv, send, counters, None).await
+                        async {
+                            let counters = rho_ui_proto::IoCounters::default();
+                            let mut recv = recv;
+                            let first =
+                                read_frame_counted::<_, ClientMessage>(&mut recv, Some(&counters))
+                                    .await?;
+                            let control = if !matches!(&first, ClientMessage::ChannelOpen { .. }) {
+                                let streams = agent_streams
+                                    .clone()
+                                    .context("iroh agent streams missing")?;
+                                anyhow::ensure!(
+                                    streams.claim_control(),
+                                    "iroh connection already has a UI control session"
+                                );
+                                send.set_priority(1)
+                                    .context("set iroh control stream priority")?;
+                                Some(streams)
+                            } else {
+                                None
+                            };
+                            let result = serve_connection_io(
+                                agents,
+                                recv,
+                                send,
+                                counters,
+                                None,
+                                agent_streams,
+                                Some(first),
+                            )
+                            .await;
+                            if let Some(control) = control {
+                                control.close();
+                            }
+                            result
+                        }
+                        .await
                     };
                     if let Err(error) = result {
                         eprintln!("rho daemon iroh connection error: {error:#}");
@@ -481,6 +518,188 @@ async fn run_iroh_listener(
             }
         });
     }
+}
+
+const FOCUSED_AGENT_STREAM_WEIGHT: NonZeroU16 = NonZeroU16::new(64).unwrap();
+const MAX_IROH_AGENT_STREAMS: usize = 1024;
+
+/// Per-iroh-connection agent streams. Agent state is sent on daemon-opened
+/// unidirectional streams so QUIC can schedule agents independently while the
+/// bidirectional UI session remains a low-volume control channel.
+#[derive(Clone)]
+struct IrohAgentStreams {
+    connection: iroh::endpoint::Connection,
+    opened: Arc<Mutex<HashSet<AgentId>>>,
+    control_claimed: Arc<AtomicBool>,
+    focus: watch::Sender<Option<AgentId>>,
+    cancel: watch::Sender<bool>,
+}
+
+impl IrohAgentStreams {
+    fn new(connection: iroh::endpoint::Connection) -> Self {
+        let (focus, _) = watch::channel(None);
+        let (cancel, _) = watch::channel(false);
+        Self {
+            connection,
+            opened: Arc::new(Mutex::new(HashSet::new())),
+            control_claimed: Arc::new(AtomicBool::new(false)),
+            focus,
+            cancel,
+        }
+    }
+
+    fn set_focus(&self, agent_id: Option<AgentId>) {
+        self.focus.send_replace(agent_id);
+    }
+
+    fn claim_control(&self) -> bool {
+        self.control_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    fn close(&self) {
+        self.cancel.send_replace(true);
+        self.connection
+            .close(0u32.into(), b"UI control session closed");
+    }
+
+    async fn ensure(&self, agent_id: AgentId, agent: RunningAgent) -> anyhow::Result<()> {
+        {
+            let mut opened = self.opened.lock().await;
+            if opened.contains(&agent_id) {
+                return Ok(());
+            }
+            if opened.len() >= MAX_IROH_AGENT_STREAMS {
+                self.connection
+                    .close(2u32.into(), b"too many loaded agents");
+                anyhow::bail!(
+                    "iroh agent stream limit ({MAX_IROH_AGENT_STREAMS}) reached; \
+                     hide agents before reconnecting"
+                );
+            }
+            opened.insert(agent_id);
+        }
+        let connection = self.connection.clone();
+        let focus_sender = self.focus.clone();
+        let cancel_sender = self.cancel.clone();
+        let opened = self.opened.clone();
+        tokio::spawn(async move {
+            const RETRIES: usize = 3;
+            let mut exhausted = true;
+            for attempt in 0..RETRIES {
+                if *cancel_sender.borrow() {
+                    exhausted = false;
+                    break;
+                }
+                let focus = focus_sender.subscribe();
+                let cancel = cancel_sender.subscribe();
+                let result = async {
+                    let send = connection
+                        .open_uni()
+                        .await
+                        .context("open iroh agent stream")?;
+                    serve_iroh_agent_stream(agent_id, agent.clone(), send, focus, cancel).await
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        exhausted = false;
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("rho daemon iroh agent stream error: {error:#}");
+                        if attempt + 1 < RETRIES {
+                            let mut retry_cancel = cancel_sender.subscribe();
+                            tokio::select! {
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)) => {}
+                                _ = retry_cancel.changed() => {
+                                    exhausted = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            opened.lock().await.remove(&agent_id);
+            if exhausted {
+                connection.close(1u32.into(), b"agent state stream failed");
+            }
+        });
+        Ok(())
+    }
+}
+
+async fn serve_iroh_agent_stream(
+    agent_id: AgentId,
+    agent: RunningAgent,
+    mut send: iroh::endpoint::SendStream,
+    mut focus: watch::Receiver<Option<AgentId>>,
+    mut cancel: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    if *cancel.borrow() {
+        return Ok(());
+    }
+    let priority = send.priority_handle();
+    let weight = |focused| {
+        if focused {
+            FOCUSED_AGENT_STREAM_WEIGHT
+        } else {
+            NonZeroU16::MIN
+        }
+    };
+    priority
+        .set_weight(weight(*focus.borrow() == Some(agent_id)))
+        .context("set initial iroh agent stream weight")?;
+    let mut focus_cancel = cancel.clone();
+    let focus_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = focus.changed() => {
+                    changed.context("iroh agent focus channel closed")?;
+                    priority
+                        .set_weight(weight(*focus.borrow_and_update() == Some(agent_id)))
+                        .context("update iroh agent stream weight")?;
+                }
+                _ = focus_cancel.changed() => return Ok::<(), anyhow::Error>(()),
+            }
+        }
+    });
+
+    let result = async {
+        write_frame(&mut send, &ServerMessage::AgentStreamOpened { agent_id }).await?;
+        let changes = agent.subscribe();
+        let mut encoder = AgentRemoteEncoder::new();
+        write_frame(
+            &mut send,
+            &ServerMessage::Agent {
+                agent_id,
+                frame: encoder.encode(agent.state()),
+            },
+        )
+        .await?;
+        futures::pin_mut!(changes);
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => return Ok(()),
+                state = changes.next() => {
+                    let Some(state) = state else { return Ok(()) };
+                    write_frame(
+                        &mut send,
+                        &ServerMessage::Agent {
+                            agent_id,
+                            frame: encoder.encode(state),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+    .await;
+    focus_task.abort();
+    result
 }
 
 struct AgentRegistry {
@@ -696,6 +915,17 @@ impl AgentRegistry {
 
     async fn loaded(&self) -> Vec<(AgentId, RunningAgent)> {
         self.pool.loaded().await
+    }
+
+    async fn visible_loaded(&self) -> Vec<(AgentId, RunningAgent)> {
+        self.pool
+            .loaded()
+            .await
+            .into_iter()
+            .filter(|(agent_id, _)| {
+                self.db.read().get_agent(*agent_id).disposition != AgentDisposition::Hidden
+            })
+            .collect()
     }
 
     async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
@@ -1146,7 +1376,7 @@ async fn serve_connection(
     });
     let stream = connection.into_stream();
     let (reader, writer) = stream.into_split();
-    serve_connection_io(agents, reader, writer, counters, land_holder).await
+    serve_connection_io(agents, reader, writer, counters, land_holder, None, None).await
 }
 
 /// One UI protocol session over any framed byte stream (Unix socket or an
@@ -1157,6 +1387,8 @@ async fn serve_connection_io<R, W>(
     writer: W,
     counters: rho_ui_proto::IoCounters,
     land_holder: Option<LandLeaseHolder>,
+    agent_streams: Option<IrohAgentStreams>,
+    first: Option<ClientMessage>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -1167,7 +1399,10 @@ where
     // normal UI session (every UI client speaks first — Subscribe or a
     // command — so waiting here never deadlocks).
     let mut reader = reader;
-    let first = read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await?;
+    let first = match first {
+        Some(first) => first,
+        None => read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await?,
+    };
     if let ClientMessage::ChannelOpen { workspace } = first {
         return serve_zed_channel(agents, reader, writer, workspace).await;
     }
@@ -1191,8 +1426,18 @@ where
     // Subscribe to creations before snapshotting the loaded set so no agent
     // slips between the two.
     let mut created_rx = agents.pool.subscribe_created();
-    for (agent_id, agent) in agents.loaded().await {
-        subscribe_agent(agent_id, agent, outgoing_tx.clone());
+    if let Some(agent_streams) = &agent_streams {
+        for (agent_id, agent) in agents.visible_loaded().await {
+            if let Err(error) = agent_streams.ensure(agent_id, agent).await {
+                let _ = outgoing_tx.send(ServerMessage::Error {
+                    message: error.to_string(),
+                });
+            }
+        }
+    } else {
+        for (agent_id, agent) in agents.loaded().await {
+            subscribe_agent(agent_id, agent, outgoing_tx.clone());
+        }
     }
 
     // Announce every agent created in the pool — by clients or by other
@@ -1200,11 +1445,22 @@ where
     {
         let agents = Arc::clone(&agents);
         let outgoing_tx = outgoing_tx.clone();
+        let agent_streams = agent_streams.clone();
         tokio::spawn(async move {
             loop {
                 match created_rx.recv().await {
                     Ok(created) => {
-                        subscribe_agent(created.agent_id, created.agent, outgoing_tx.clone());
+                        if let Some(agent_streams) = &agent_streams {
+                            if let Err(error) =
+                                agent_streams.ensure(created.agent_id, created.agent).await
+                            {
+                                let _ = outgoing_tx.send(ServerMessage::Error {
+                                    message: error.to_string(),
+                                });
+                            }
+                        } else {
+                            subscribe_agent(created.agent_id, created.agent, outgoing_tx.clone());
+                        }
                         if outgoing_tx
                             .send(ServerMessage::AgentCreated {
                                 topic_id: created.topic_id,
@@ -1217,8 +1473,19 @@ where
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Missed creations still appear in the refreshed
-                        // agent list.
+                        // Rebuild both the stream set and the refreshed list;
+                        // otherwise a missed creation would never get an
+                        // agent-state stream on this connection.
+                        if let Some(agent_streams) = &agent_streams {
+                            for (agent_id, agent) in agents.visible_loaded().await {
+                                if let Err(error) = agent_streams.ensure(agent_id, agent).await {
+                                    let _ = outgoing_tx.send(ServerMessage::Error {
+                                        message: error.to_string(),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
                         if outgoing_tx.send(agents.ready_message().await).is_err() {
                             break;
                         }
@@ -1270,6 +1537,7 @@ where
             &outgoing_tx,
             &mut land_leases,
             land_holder.clone(),
+            agent_streams.as_ref(),
             message,
         )
         .await
@@ -1440,6 +1708,7 @@ async fn handle_message(
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
     land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
     land_holder: Option<LandLeaseHolder>,
+    agent_streams: Option<&IrohAgentStreams>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
     match message {
@@ -1670,9 +1939,24 @@ async fn handle_message(
                     agent_id,
                     agent.clone(),
                 );
-                subscribe_agent(agent_id, agent, outgoing_tx.clone());
+                if agent_streams.is_none() {
+                    subscribe_agent(agent_id, agent.clone(), outgoing_tx.clone());
+                }
+            }
+            if let Some(agent_streams) = agent_streams
+                && let Err(error) = agent_streams.ensure(agent_id, agent).await
+            {
+                let _ = outgoing_tx.send(ServerMessage::Error {
+                    message: error.to_string(),
+                });
             }
             let _ = outgoing_tx.send(ServerMessage::AgentLoaded { agent_id });
+            Ok(Refresh::None)
+        }
+        ClientMessage::AgentStreamFocus { agent_id } => {
+            if let Some(agent_streams) = agent_streams {
+                agent_streams.set_focus(agent_id);
+            }
             Ok(Refresh::None)
         }
         ClientMessage::SendUserMessage {
@@ -1740,6 +2024,15 @@ async fn handle_message(
             disposition,
         } => {
             agents.set_disposition(agent_id, disposition).await;
+            if disposition != AgentDisposition::Hidden
+                && let Some(agent_streams) = agent_streams
+                && let Some(agent) = agents.get(agent_id).await
+                && let Err(error) = agent_streams.ensure(agent_id, agent).await
+            {
+                let _ = outgoing_tx.send(ServerMessage::Error {
+                    message: error.to_string(),
+                });
+            }
             // Hidden changes what the rail folds, which clients read off
             // summaries; attention alone travels on its own broadcast.
             if disposition == AgentDisposition::Hidden {

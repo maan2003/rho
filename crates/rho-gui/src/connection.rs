@@ -20,6 +20,7 @@ use rho_ui_proto::{
     AgentId, ClientMessage, ServerMessage, UiProject, UiTopic, WorkspaceInfo, read_frame,
     write_frame,
 };
+use tokio::io::AsyncReadExt as _;
 
 use crate::workspace::AttachTarget;
 
@@ -75,6 +76,8 @@ pub enum ConnEvent {
     Frame {
         agent_id: AgentId,
         frame: AgentRemoteFrame,
+        /// Holds aggregate decode budget until the GUI consumes this frame.
+        allocation: Option<AgentFrameAllocation>,
     },
     TurnCancelled,
     AgentAttention {
@@ -164,6 +167,7 @@ async fn dial_channel(
 
 pub struct Connection {
     commands: futures_mpsc::UnboundedSender<ClientMessage>,
+    iroh: bool,
     /// `None` until the IO task connects; channels cannot open earlier.
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
     /// Dropping this aborts the IO task, tearing the connection down with the
@@ -174,6 +178,12 @@ pub struct Connection {
 impl Connection {
     pub fn send(&self, message: ClientMessage) {
         let _ = self.commands.unbounded_send(message);
+    }
+
+    pub fn focus_agent(&self, agent_id: Option<AgentId>) {
+        if self.iroh {
+            self.send(ClientMessage::AgentStreamFocus { agent_id });
+        }
     }
 
     /// Dials a dedicated stream for a zed channel onto `workspace` and runs
@@ -195,6 +205,7 @@ pub fn spawn(
     target: AttachTarget,
     cx: &App,
 ) -> (Connection, futures_mpsc::UnboundedReceiver<ConnEvent>) {
+    let iroh = matches!(&target, AttachTarget::Iroh { .. });
     let (event_tx, event_rx) = futures_mpsc::unbounded();
     let (command_tx, command_rx) = futures_mpsc::unbounded();
     let dialer = Arc::new(Mutex::new(None));
@@ -207,6 +218,7 @@ pub fn spawn(
     (
         Connection {
             commands: command_tx,
+            iroh,
             dialer,
             _io_task: io_task,
         },
@@ -220,13 +232,13 @@ async fn run(
     mut commands: futures_mpsc::UnboundedReceiver<ClientMessage>,
     dialer: &Mutex<Option<ChannelDialer>>,
 ) -> anyhow::Result<()> {
-    let mut stream = match target {
+    let (mut stream, agent_connection) = match target {
         AttachTarget::Unix(socket_path) => {
             let client = Client::connect(&socket_path)
                 .await
                 .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
             *dialer.lock().unwrap() = Some(ChannelDialer::Unix(socket_path));
-            Box::new(client.into_stream()) as Box<dyn AsyncStream>
+            (Box::new(client.into_stream()) as Box<dyn AsyncStream>, None)
         }
         AttachTarget::Iroh {
             endpoint_id,
@@ -235,8 +247,8 @@ async fn run(
         } => {
             let (stream, connection) =
                 connect_iroh(endpoint_id, &ssh_destination, &remote_rho).await?;
-            *dialer.lock().unwrap() = Some(ChannelDialer::Iroh(connection));
-            stream
+            *dialer.lock().unwrap() = Some(ChannelDialer::Iroh(connection.clone()));
+            (stream, Some(connection))
         }
     };
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
@@ -265,6 +277,11 @@ async fn run(
     {
         return Ok(());
     }
+
+    let agent_stream_task = agent_connection.map(|connection| {
+        let events = events.clone();
+        tokio::spawn(run_agent_streams(connection, events))
+    });
 
     let (mut reader, mut writer) = tokio::io::split(stream);
     let writer_task = tokio::spawn(async move {
@@ -302,7 +319,11 @@ async fn run(
             ServerMessage::TopicCreated { topic } => Some(ConnEvent::TopicCreated(topic)),
             ServerMessage::AgentCreated { agent_id, .. } => Some(ConnEvent::AgentCreated(agent_id)),
             ServerMessage::AgentLoaded { agent_id } => Some(ConnEvent::AgentLoaded(agent_id)),
-            ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame { agent_id, frame }),
+            ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame {
+                agent_id,
+                frame,
+                allocation: None,
+            }),
             ServerMessage::TurnCancelled { .. } => Some(ConnEvent::TurnCancelled),
             ServerMessage::AgentAttention {
                 agent_id,
@@ -323,7 +344,9 @@ async fn run(
             | ServerMessage::PrCommandResult { .. } => None,
             // Zed channel handshake replies belong to dedicated channel
             // streams, never the UI session.
-            ServerMessage::ChannelOpened { .. } | ServerMessage::ChannelClosed { .. } => None,
+            ServerMessage::ChannelOpened { .. }
+            | ServerMessage::ChannelClosed { .. }
+            | ServerMessage::AgentStreamOpened { .. } => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()
@@ -332,7 +355,155 @@ async fn run(
         }
     }
     writer_task.abort();
+    if let Some(task) = agent_stream_task {
+        task.abort();
+    }
     Ok(())
+}
+
+async fn run_agent_streams(
+    connection: iroh::endpoint::Connection,
+    events: futures_mpsc::UnboundedSender<ConnEvent>,
+) {
+    const AGENT_FRAME_ALLOCATION_BUDGET: usize = 128 * 1024 * 1024;
+    let mut streams = tokio::task::JoinSet::new();
+    let allocation_budget = Arc::new(AgentFrameAllocationBudget::new(
+        AGENT_FRAME_ALLOCATION_BUDGET,
+    ));
+    loop {
+        tokio::select! {
+            accepted = connection.accept_uni() => {
+                let Ok(mut recv) = accepted else { break };
+                let events = events.clone();
+                let allocation_budget = allocation_budget.clone();
+                streams.spawn(async move {
+                    let (header, header_allocation) =
+                        read_agent_stream_message(&mut recv, &allocation_budget).await?;
+                    let ServerMessage::AgentStreamOpened { agent_id } = header
+                    else {
+                        anyhow::bail!("invalid agent stream header");
+                    };
+                    drop(header_allocation);
+                    loop {
+                        let (message, allocation) =
+                            read_agent_stream_message(&mut recv, &allocation_budget).await?;
+                        let ServerMessage::Agent {
+                            agent_id: frame_agent_id,
+                            frame,
+                        } = message
+                        else {
+                            anyhow::bail!("invalid message on agent stream");
+                        };
+                        anyhow::ensure!(frame_agent_id == agent_id, "agent stream id changed");
+                        if events
+                            .unbounded_send(ConnEvent::Frame {
+                                agent_id,
+                                frame,
+                                allocation: Some(allocation),
+                            })
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+            joined = streams.join_next(), if !streams.is_empty() => {
+                match joined {
+                    Some(Ok(Err(error))) => {
+                        let _ = events.unbounded_send(ConnEvent::ServerError(
+                            format!("agent state stream failed; retrying: {error:#}"),
+                        ));
+                    }
+                    Some(Err(error)) => {
+                        let _ = events.unbounded_send(ConnEvent::ServerError(
+                            format!("agent state stream task failed: {error}"),
+                        ));
+                    }
+                    Some(Ok(Ok(()))) | None => {}
+                }
+            }
+        }
+    }
+}
+
+async fn read_agent_stream_message(
+    recv: &mut iroh::endpoint::RecvStream,
+    allocation_budget: &Arc<AgentFrameAllocationBudget>,
+) -> anyhow::Result<(ServerMessage, AgentFrameAllocation)> {
+    let len = recv
+        .read_u32_le()
+        .await
+        .context("read agent stream frame length")? as usize;
+    anyhow::ensure!(
+        len <= rho_ui_proto::MAX_FRAME_LEN,
+        "agent stream frame length {len} exceeds {}",
+        rho_ui_proto::MAX_FRAME_LEN,
+    );
+    let allocation = allocation_budget.reserve(len).await;
+    let mut payload = vec![0; len];
+    recv.read_exact(&mut payload)
+        .await
+        .context("read agent stream frame payload")?;
+    let mut payload = payload.as_slice();
+    let message = senax_encoder::unpack(&mut payload).context("unpack agent stream frame")?;
+    Ok((message, allocation))
+}
+
+struct AgentFrameAllocationBudget {
+    available: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl AgentFrameAllocationBudget {
+    fn new(bytes: usize) -> Self {
+        Self {
+            available: std::sync::atomic::AtomicUsize::new(bytes),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn reserve(self: &Arc<Self>, bytes: usize) -> AgentFrameAllocation {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut available = self.available.load(std::sync::atomic::Ordering::Acquire);
+            while available >= bytes {
+                match self.available.compare_exchange_weak(
+                    available,
+                    available - bytes,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        return AgentFrameAllocation {
+                            budget: self.clone(),
+                            bytes,
+                        };
+                    }
+                    Err(current) => available = current,
+                }
+            }
+            notified.as_mut().await;
+        }
+    }
+}
+
+pub(crate) struct AgentFrameAllocation {
+    budget: Arc<AgentFrameAllocationBudget>,
+    bytes: usize,
+}
+
+impl Drop for AgentFrameAllocation {
+    fn drop(&mut self) {
+        self.budget
+            .available
+            .fetch_add(self.bytes, std::sync::atomic::Ordering::Release);
+        self.budget.notify.notify_waiters();
+    }
 }
 
 async fn connect_iroh(
@@ -345,6 +516,11 @@ async fn connect_iroh(
     let secret = iroh::SecretKey::generate();
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret)
+        .transport_config(
+            iroh::endpoint::QuicTransportConfig::builder()
+                .max_concurrent_uni_streams(1024u32.into())
+                .build(),
+        )
         .bind()
         .await
         .context("bind iroh client endpoint")?;
@@ -372,6 +548,8 @@ async fn connect_iroh(
         "daemon did not approve SSH-trusted iroh client"
     );
     let (send, recv) = connection.open_bi().await.context("open iroh UI stream")?;
+    send.set_priority(1)
+        .context("set iroh UI control stream priority")?;
     let stream = Box::new(IrohStream {
         inner: tokio::io::join(recv, send),
         _endpoint: endpoint,
@@ -412,4 +590,34 @@ fn is_safe_remote_executable(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'+' | b'-')
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::AgentFrameAllocationBudget;
+
+    #[test]
+    fn small_frame_bypasses_waiting_large_allocation() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let budget = Arc::new(AgentFrameAllocationBudget::new(10));
+                let held = budget.reserve(6).await;
+                let large_budget = budget.clone();
+                let large = tokio::spawn(async move { large_budget.reserve(10).await });
+                tokio::task::yield_now().await;
+
+                let small =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), budget.reserve(4))
+                        .await
+                        .expect("small allocation should bypass the waiting large one");
+                drop(small);
+                drop(held);
+                drop(large.await.unwrap());
+            });
+    }
 }

@@ -33,7 +33,7 @@ members = [
   "crates/senax-encoder/derive",
 ]
 # The web UI is its own workspace: it targets wasm32 and is built with trunk.
-exclude = ["webui"]
+exclude = ["vendor/noq", "vendor/noq-proto", "webui"]
 resolver = "2"
 
 [workspace.package]
@@ -149,3 +149,10 @@ lto = "off"
 [profile.profiling]
 debug = "line-tables-only"
 inherits = "release"
+
+[patch.crates-io]
+# Local noq fork: adds per-send-stream weights to fair scheduling while
+# preserving noq's strict priority classes. Keep both crates patched because
+# `noq` exposes the API and `noq-proto` owns the packet scheduler.
+noq = { path = "vendor/noq" }
+noq-proto = { path = "vendor/noq-proto" }

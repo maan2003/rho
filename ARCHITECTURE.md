@@ -170,11 +170,18 @@ before calling `rho-pr-monitor`. The CLI process never owns a polling loop:
 subscribe/create return immediately, while the daemon later loads and wakes
 the persisted Engineer through `AgentPool`.
 
-The daemon's UI protocol (`rho-ui-proto`) is served over two transports, all
-through the same per-connection handler: the local Unix socket, and iroh
-bi-streams from clients enrolled through `rho-iroh-auth` (`rho daemon
---iroh`; approval via `rho iroh approve` stays on the Unix socket). The same
-iroh endpoint carries a second ALPN for the web UI: newline-delimited JSON
+The daemon's UI protocol (`rho-ui-proto`) is served over the local Unix socket
+and iroh connections from clients enrolled through `rho-iroh-auth` (`rho
+daemon --iroh`; approval via `rho iroh approve` stays on the Unix socket).
+Unix sessions multiplex control and agent state on one byte stream. Native
+iroh sessions keep commands and lifecycle events on a high-priority
+bidirectional control stream (exactly one per physical connection); the daemon
+opens one unidirectional stream per non-hidden loaded agent, up to 1024, so
+state remains warm in the GUI cache without cross-agent
+head-of-line blocking. The focused stream has weight 64 and background streams
+weight 1 within their lower-priority class. Focus changes travel over the
+control stream and update transport weights without reopening streams. The
+same iroh endpoint carries a second ALPN for the web UI: newline-delimited JSON
 (`rho-webui-messages`, shared with the browser as a wasm-safe crate) bridged
 through an in-process duplex pipe onto a normal UI protocol session, so the
 daemon's webui module only translates the JSON vocabulary and owns no agent
@@ -183,6 +190,14 @@ role, and isolated-versus-user-checkout start choice. The web UI page itself
 is a static Leptos/wasm app (`webui/` at the
 repo root, its own cargo workspace, hostable anywhere) that connects as an
 iroh client from the browser.
+
+Rho patches iroh's `noq` transport dependencies to vendored copies. The local
+extension preserves strict stream priorities and adds relative send-stream
+weights within each equal-priority fair-scheduling class. Weight 1 retains
+upstream behavior; higher weights receive proportionally more packet-writing
+turns without changing anything on the QUIC wire. Transport scheduling owns
+connection bandwidth allocation, while application-level stream selection and
+coalescing remain UI protocol policy.
 
 
 Dependencies should flow from higher-level assembly/policy crates toward lower

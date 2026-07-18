@@ -51,6 +51,7 @@ rho-daemon.workspace = true
 rho-iroh-auth.workspace = true
 rho-profiling.workspace = true
 rho-ui-proto.workspace = true
+senax-encoder.workspace = true
 # Same revision the zed fork pins, so a future switch to its `audio` crate
 # shares one rodio build.
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = [

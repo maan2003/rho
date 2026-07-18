@@ -26,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/1";
+pub const IROH_ALPN: &[u8] = b"rho/ui/2";
 const FRAME_LEN_BYTES: u64 = size_of::<u32>() as u64;
 const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP2";
 
@@ -204,6 +204,11 @@ pub enum ClientMessage {
     /// channel.
     ChannelOpen {
         workspace: WorkspaceInfo,
+    },
+    /// Selects the high-weight agent state stream on an iroh connection.
+    /// Ignored on transports that carry agent state in the control session.
+    AgentStreamFocus {
+        agent_id: Option<AgentId>,
     },
 }
 
@@ -431,6 +436,11 @@ pub enum ServerMessage {
     /// stream after sending it.
     ChannelClosed {
         reason: String,
+    },
+    /// First frame on a daemon-opened iroh unidirectional stream. Every later
+    /// frame on that stream is [`ServerMessage::Agent`] for this agent.
+    AgentStreamOpened {
+        agent_id: AgentId,
     },
 }
 
@@ -816,6 +826,28 @@ mod tests {
                 body: "addressed".into(),
             },
         };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn agent_stream_control_messages_round_trip() {
+        let agent_id = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
+        for message in [
+            ClientMessage::AgentStreamFocus {
+                agent_id: Some(agent_id),
+            },
+            ClientMessage::AgentStreamFocus { agent_id: None },
+        ] {
+            let bytes = senax_encoder::pack(&message).unwrap();
+            let mut slice: &[u8] = &bytes;
+            let decoded = senax_encoder::unpack(&mut slice).unwrap();
+            assert_eq!(message, decoded);
+        }
+
+        let message = ServerMessage::AgentStreamOpened { agent_id };
         let bytes = senax_encoder::pack(&message).unwrap();
         let mut slice: &[u8] = &bytes;
         let decoded = senax_encoder::unpack(&mut slice).unwrap();

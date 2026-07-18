@@ -72,7 +72,15 @@ fn feed_frame(
 ) {
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(ConnEvent::Frame { agent_id, frame }, window, cx);
+            workspace.handle_event(
+                ConnEvent::Frame {
+                    agent_id,
+                    frame,
+                    allocation: None,
+                },
+                window,
+                cx,
+            );
         })
         .expect("update workspace");
 }
@@ -84,7 +92,11 @@ fn feed_frames(
 ) {
     let events = frames
         .into_iter()
-        .map(|(agent_id, frame)| ConnEvent::Frame { agent_id, frame })
+        .map(|(agent_id, frame)| ConnEvent::Frame {
+            agent_id,
+            frame,
+            allocation: None,
+        })
         .collect();
     workspace
         .update(cx, |workspace, window, cx| {

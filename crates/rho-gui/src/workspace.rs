@@ -186,12 +186,21 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let mut frames = Vec::new();
+        let mut allocations = Vec::new();
         for event in events {
             match event {
-                ConnEvent::Frame { agent_id, frame } => frames.push((agent_id, frame)),
+                ConnEvent::Frame {
+                    agent_id,
+                    frame,
+                    allocation,
+                } => {
+                    frames.push((agent_id, frame));
+                    allocations.push(allocation);
+                }
                 event => {
                     if !frames.is_empty() {
                         self.handle_frame_batch(std::mem::take(&mut frames), window, cx);
+                        allocations.clear();
                     }
                     self.handle_event(event, window, cx);
                 }
@@ -200,6 +209,7 @@ impl Workspace {
         if !frames.is_empty() {
             self.handle_frame_batch(frames, window, cx);
         }
+        drop(allocations);
     }
 
     fn handle_frame_batch(
@@ -351,8 +361,13 @@ impl Workspace {
                 self.registry.mark_known(agent_id);
                 cx.notify();
             }
-            ConnEvent::Frame { agent_id, frame } => {
+            ConnEvent::Frame {
+                agent_id,
+                frame,
+                allocation,
+            } => {
                 self.handle_frame_batch(vec![(agent_id, frame)], window, cx);
+                drop(allocation);
             }
             ConnEvent::AgentAttention {
                 agent_id,
@@ -1228,6 +1243,7 @@ impl Workspace {
         let surface = self.make_surface(key, window, cx);
         self.show_surface_in_main(surface);
         self.focus_active_surface(window, cx);
+        self.connection.focus_agent(agent_id);
         self.ensure_duration_timer(cx);
         cx.notify();
     }

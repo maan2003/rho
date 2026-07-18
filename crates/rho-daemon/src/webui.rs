@@ -49,7 +49,16 @@ where
     tokio::spawn(async move {
         let counters = rho_ui_proto::IoCounters::default();
         // Ends when the browser side drops; disconnect errors are routine.
-        let _ = crate::serve_connection_io(agents, daemon_read, daemon_write, counters, None).await;
+        let _ = crate::serve_connection_io(
+            agents,
+            daemon_read,
+            daemon_write,
+            counters,
+            None,
+            None,
+            None,
+        )
+        .await;
     });
     let (session_read, mut session_write) = tokio::io::split(browser_side);
     write_frame(&mut session_write, &ClientMessage::Subscribe).await?;

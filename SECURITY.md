@@ -157,6 +157,21 @@ AI APIs.
   each connection permits at most 16 queued bidirectional streams, and both
   client and server bound the auth exchange to ten seconds. The daemon's iroh
   secret key lives in the local rho database.
+  After authentication, native GUI connections may accept up to 1024
+  daemon-initiated unidirectional agent-state streams. These streams carry only
+  framed UI state for agents already loaded by the daemon; authorization and
+  commands remain on the authenticated control session. Stream weights are
+  sender-local scheduling metadata and are never trusted from the network.
+  If more than 1024 non-hidden agents are loaded, the daemon closes the native
+  connection rather than silently serving incomplete state; the user must hide
+  agents before reconnecting. Hidden agents are omitted from the warm stream
+  set but get a stream if explicitly loaded/opened again.
+  Agent frames retain the 64 MiB per-frame bound, and the native GUI reserves
+  each declared payload against a connection-wide non-FIFO atomic byte budget before
+  allocation, bounding concurrent length-prefix-driven frame allocations to
+  128 MiB while allowing small frames to bypass a waiting large allocation.
+  The reservation remains attached to the decoded GUI event until consumption,
+  so slow UI handling cannot refill an unbounded queue of large agent frames.
   Enrollment approval is also accepted from already
   trusted remote clients (they are fully privileged anyway).
 - `rho-gui --endpoint <id>` generates its client key in process memory and
