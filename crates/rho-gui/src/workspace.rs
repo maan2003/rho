@@ -23,7 +23,7 @@ use theme::ActiveTheme as _;
 use crate::agent_view::AgentModel;
 use crate::chime::Chime;
 use crate::connection::{ConnEvent, Connection};
-use crate::draft_view::DraftView;
+use crate::draft_view::DraftModel;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer};
 use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
 use crate::registry::{ActivePane, AgentRegistry};
@@ -56,7 +56,11 @@ pub struct Surface {
 
 #[derive(Clone)]
 enum SurfaceView {
-    Draft(Entity<DraftView>),
+    Draft {
+        model: Entity<DraftModel>,
+        /// This pane's own editor over the model's multibuffer.
+        editor: Entity<editor::Editor>,
+    },
     Transcript {
         model: Entity<AgentModel>,
         /// This pane's own editor over the model's multibuffer.
@@ -103,7 +107,7 @@ pub struct Workspace {
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
-    draft_view: Entity<DraftView>,
+    draft_model: Entity<DraftModel>,
     /// Registered workdirs from the daemon; selection vocabulary for new
     /// agents.
     workdirs: Vec<rho_ui_proto::UiProject>,
@@ -145,7 +149,7 @@ impl Workspace {
     pub fn new(attach_target: AttachTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (connection, events) = crate::connection::spawn(attach_target, cx);
         let workspace = cx.entity().downgrade();
-        let draft_view = cx.new(|cx| DraftView::new(workspace, window, cx));
+        let draft_model = cx.new(|cx| DraftModel::new(workspace, cx));
         let event_task = cx.spawn(async move |this, cx| {
             let mut events: UnboundedReceiver<ConnEvent> = events;
             while let Some(event) = events.next().await {
@@ -168,7 +172,7 @@ impl Workspace {
             registry: AgentRegistry::default(),
             models: HashMap::new(),
             pending_syncs: HashMap::new(),
-            draft_view,
+            draft_model,
             workdirs: Vec::new(),
             draft_workstream: None,
             awaiting_draft_agent: false,
@@ -400,7 +404,7 @@ impl Workspace {
                         .draft_default_workdir()
                         .map(|path| self.workdir_label(&path))
                         .unwrap_or_default();
-                    self.draft_view.update(cx, |view, cx| {
+                    self.draft_model.update(cx, |view, cx| {
                         view.set_body_text("", cx);
                         view.set_workdir_text(&label, cx);
                         view.set_role_text(crate::draft_view::DEFAULT_ROLE, cx);
@@ -465,7 +469,7 @@ impl Workspace {
                         view.system_notice(&notice, StyleClass::Disconnect, cx);
                     });
                 }
-                self.draft_view.update(cx, |view, cx| {
+                self.draft_model.update(cx, |view, cx| {
                     view.system_notice(&notice, StyleClass::Disconnect, cx);
                 });
                 self.update_statuses(cx);
@@ -524,18 +528,20 @@ impl Workspace {
     /// inherited. The buffers are not cleared here — they survive until the
     /// daemon confirms creation.
     fn submit_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let body = self.draft_view.read(cx).body_text(cx).trim().to_owned();
+        let body = self.draft_model.read(cx).body_text(cx).trim().to_owned();
         if body.is_empty() {
             // Enter in the workdir field with nothing to send: jump to the
             // body instead of submitting.
-            self.draft_view
-                .update(cx, |view, cx| view.focus_body(window, cx));
+            if let Some(editor) = self.focused_draft_editor() {
+                self.draft_model
+                    .update(cx, |view, cx| view.focus_body(&editor, window, cx));
+            }
             return;
         }
         if let Some(parsed) = rho_commands::parse(&body) {
             // A command typed into the draft body: run it and clear just the
             // body, keeping the chosen workdir.
-            self.draft_view
+            self.draft_model
                 .update(cx, |view, cx| view.set_body_text("", cx));
             self.handle_command(None, parsed, window, cx);
             return;
@@ -549,12 +555,12 @@ impl Workspace {
             );
             return;
         }
-        let field = self.draft_view.read(cx).workdir_text(cx).trim().to_owned();
+        let field = self.draft_model.read(cx).workdir_text(cx).trim().to_owned();
         let working_directory = (!field.is_empty())
             .then(|| self.resolve_workdir_path(Utf8PathBuf::from(field)))
             .or_else(|| self.draft_default_workdir());
         let start = {
-            let draft = self.draft_view.read(cx);
+            let draft = self.draft_model.read(cx);
             let mode = draft.start_mode();
             let target = draft.start_text(cx).trim().to_owned();
             match self.parse_start(mode, &target, working_directory) {
@@ -565,7 +571,7 @@ impl Workspace {
                 }
             }
         };
-        let role = match parse_agent_role(self.draft_view.read(cx).role_text(cx).trim()) {
+        let role = match parse_agent_role(self.draft_model.read(cx).role_text(cx).trim()) {
             Ok(role) => role,
             Err(message) => {
                 self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -1003,8 +1009,9 @@ impl Workspace {
             Some(path) => {
                 let path = self.resolve_workdir_path(path);
                 let label = self.workdir_label(&path);
-                self.draft_view
-                    .update(cx, |view, cx| view.seed(&label, true, window, cx));
+                let editor = self.focused_draft_editor();
+                self.draft_model
+                    .update(cx, |view, cx| view.seed(&label, true, editor.as_ref(), window, cx));
             }
             None => self.seed_draft(false, window, cx),
         }
@@ -1170,9 +1177,11 @@ impl Workspace {
     /// Tab in the draft cycles the `Workdir:` field, the start field, and
     /// the body. On agent views it does nothing.
     fn cycle_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.registry.selected_agent().is_none() {
-            self.draft_view
-                .update(cx, |view, cx| view.toggle_field(window, cx));
+        if self.registry.selected_agent().is_none()
+            && let Some(editor) = self.focused_draft_editor()
+        {
+            self.draft_model
+                .update(cx, |view, cx| view.toggle_field(&editor, window, cx));
         }
     }
 
@@ -1180,15 +1189,17 @@ impl Workspace {
     /// mode (on top of ↔ join); anywhere else, cycle fields like Tab. On agent
     /// views it does nothing.
     fn cycle_draft_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.registry.selected_agent().is_none() {
-            self.draft_view.update(cx, |view, cx| {
-                if view.cursor_in_role_field(cx) {
+        if self.registry.selected_agent().is_none()
+            && let Some(editor) = self.focused_draft_editor()
+        {
+            self.draft_model.update(cx, |view, cx| {
+                if view.cursor_in_role_field(&editor, cx) {
                     let next = cycle_agent_role_text(&view.role_text(cx));
                     view.set_role_text(next, cx);
-                } else if view.cursor_in_start_field(cx) {
+                } else if view.cursor_in_start_field(&editor, cx) {
                     view.cycle_start_mode(cx);
                 } else {
-                    view.toggle_field(window, cx);
+                    view.toggle_field(&editor, window, cx);
                 }
             });
         }
@@ -1201,8 +1212,9 @@ impl Workspace {
             .draft_default_workdir()
             .map(|path| self.workdir_label(&path))
             .unwrap_or_default();
-        self.draft_view
-            .update(cx, |view, cx| view.seed(&label, force_header, window, cx));
+        let editor = self.focused_draft_editor();
+        self.draft_model
+            .update(cx, |view, cx| view.seed(&label, force_header, editor.as_ref(), window, cx));
     }
 
     /// Where a new agent works when the draft doesn't say: the inherited
@@ -1284,7 +1296,7 @@ impl Workspace {
         match view {
             Some(view) => view.update(cx, |view, cx| view.system_notice(text, class, cx)),
             None => self
-                .draft_view
+                .draft_model
                 .update(cx, |view, cx| view.system_notice(text, class, cx)),
         }
         self.echo(text, class, cx);
@@ -1578,17 +1590,41 @@ impl Workspace {
     /// draft's stands in for text-style queries.
     pub(crate) fn active_editor(&self, cx: &gpui::App) -> Entity<editor::Editor> {
         match &self.active_tree().focused().surface.view {
-            SurfaceView::Draft(view) => view.read(cx).editor().clone(),
+            SurfaceView::Draft { editor, .. } => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
-            SurfaceView::Terminal(_) => self.draft_view.read(cx).editor().clone(),
+            SurfaceView::Terminal(_) => self
+                .any_draft_editor()
+                .expect("the draft context always holds a draft surface"),
         }
+    }
+
+    /// The focused pane's draft editor, when the focused pane shows the
+    /// draft — cursor-dependent draft operations act on it.
+    fn focused_draft_editor(&self) -> Option<Entity<editor::Editor>> {
+        match &self.active_tree().focused().surface.view {
+            SurfaceView::Draft { editor, .. } => Some(editor.clone()),
+            _ => None,
+        }
+    }
+
+    /// Some draft editor, from the draft context's surface list (founded at
+    /// startup, never pruned). Used only where any editor serves, e.g. text
+    /// style for chrome while a terminal pane is focused.
+    fn any_draft_editor(&self) -> Option<Entity<editor::Editor>> {
+        self.surfaces
+            .get(&ContextId::Draft)?
+            .iter()
+            .find_map(|surface| match &surface.view {
+                SurfaceView::Draft { editor, .. } => Some(editor.clone()),
+                _ => None,
+            })
     }
 
     /// Moves gpui focus to the focused pane's surface.
     fn focus_active_surface(&self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.active_tree().focused().surface.view {
-            SurfaceView::Draft(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
+            SurfaceView::Draft { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
             SurfaceView::Transcript { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
             SurfaceView::File(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
             SurfaceView::Terminal(view) => window.focus(&view.read(cx).focus_handle(cx), cx),
@@ -1609,7 +1645,11 @@ impl Workspace {
             return existing.clone();
         }
         let view = match &key {
-            SurfaceKey::Draft => SurfaceView::Draft(self.draft_view.clone()),
+            SurfaceKey::Draft => {
+                let model = self.draft_model.clone();
+                let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
+                SurfaceView::Draft { model, editor }
+            }
             SurfaceKey::Transcript(agent_id) => {
                 let agent_id = *agent_id;
                 let model = self.materialize_model(&agent_id, cx);
@@ -1652,9 +1692,19 @@ impl Workspace {
                     cx,
                 )
             }
+            SurfaceView::Draft { model, .. } => {
+                let model = model.clone();
+                let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
+                Self::wrap_surface(
+                    surface.key.clone(),
+                    SurfaceView::Draft { model, editor },
+                    window,
+                    cx,
+                )
+            }
             // Terminals share their view between panes: splitting a pane
             // does not attach a second wire client.
-            SurfaceView::Draft(_) | SurfaceView::Terminal(_) => surface,
+            SurfaceView::Terminal(_) => surface,
         }
     }
 
@@ -1668,10 +1718,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Surface {
         let (handle, editor_id) = match &view {
-            SurfaceView::Draft(view) => {
-                let editor = view.read(cx).editor();
-                (editor.focus_handle(cx), editor.entity_id())
-            }
+            SurfaceView::Draft { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
             SurfaceView::Transcript { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
             SurfaceView::File(view) => {
                 let editor = view.read(cx).editor();
@@ -1872,7 +1919,7 @@ impl Workspace {
         let rail = self.render_rail(text_style, cx);
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
             let id = pane.id;
-            let content = self.render_surface(&pane.surface, cx);
+            let content = self.render_surface(&pane.surface);
             div()
                 .h_full()
                 .overflow_hidden()
@@ -1911,13 +1958,13 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_surface(&self, surface: &Surface, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_surface(&self, surface: &Surface) -> gpui::AnyElement {
         match &surface.view {
-            SurfaceView::Draft(view) => div()
+            SurfaceView::Draft { editor, .. } => div()
                 .id("rho-surface-draft")
                 .size_full()
                 .overflow_hidden()
-                .child(view.read(cx).editor().clone())
+                .child(editor.clone())
                 .into_any_element(),
             SurfaceView::Transcript { editor, .. } => div()
                 .id("rho-surface-transcript")
@@ -1991,7 +2038,7 @@ impl Workspace {
 
     fn refresh_draft_agent_targets(&mut self, cx: &mut Context<Self>) {
         let hints = self.agent_target_hints();
-        self.draft_view
+        self.draft_model
             .update(cx, |view, cx| view.set_start_target_hints(hints, cx));
     }
 

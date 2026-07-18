@@ -1,11 +1,17 @@
-//! The draft compose view: pick a workdir, write the first message, submit
+//! The draft compose model: pick a workdir, write the first message, submit
 //! to create the agent.
 //!
-//! Entirely separate from [`crate::agent_view::AgentView`] — there is no
+//! Entirely separate from [`crate::agent_view::AgentModel`] — there is no
 //! transcript here. The multibuffer composes three small buffers: read-only
 //! local notices, the workdir field, and the message body. The excerpt
 //! boundary separates field from body, so there is no scaffold text to
 //! parse: submission just reads the two writable buffers.
+//!
+//! The model is the buffer role; each pane showing the draft builds its own
+//! editor over the shared multibuffer via [`DraftModel::build_editor`].
+//! Cursor-dependent operations (field cycling, focusing the body) act on a
+//! specific pane's editor, passed by the caller — the cursor belongs to the
+//! window, not the buffer.
 
 use std::ops::Range;
 
@@ -57,9 +63,8 @@ impl StartFieldMode {
 
 pub struct DraftGutter;
 
-pub struct DraftView {
+pub struct DraftModel {
     workspace: WeakEntity<Workspace>,
-    editor: Entity<Editor>,
     multi_buffer: Entity<MultiBuffer>,
     system_buffer: Entity<Buffer>,
     system_styles: Vec<(StyleClass, Range<text::Anchor>)>,
@@ -71,15 +76,14 @@ pub struct DraftView {
     body_buffer: Entity<Buffer>,
     body_end: text::Anchor,
     suppress_draft_activation: bool,
+    /// Editors currently displaying the draft, weakly held: panes own
+    /// their editors; the model reconciles whoever is still alive.
+    editors: Vec<WeakEntity<Editor>>,
     _subscriptions: Vec<Subscription>,
 }
 
-impl DraftView {
-    pub fn new(
-        workspace: WeakEntity<Workspace>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+impl DraftModel {
+    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let system_buffer = cx.new(|cx| {
             let mut buffer = Buffer::local("", cx);
             buffer.set_capability(Capability::Read, cx);
@@ -109,36 +113,6 @@ impl DraftView {
             }
             multi_buffer
         });
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::new(
-                EditorMode::Full {
-                    scale_ui_elements_with_buffer_font_size: true,
-                    show_active_line_background: false,
-                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
-                },
-                multi_buffer.clone(),
-                None,
-                window,
-                cx,
-            );
-            crate::editor_config::configure(&mut editor, window, cx);
-            for buffer in [
-                &system_buffer,
-                &workdir_buffer,
-                &role_buffer,
-                &start_buffer,
-                &body_buffer,
-            ] {
-                editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
-            }
-            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
-                workspace.clone(),
-                Some(workdir_buffer.entity_id()),
-                Some(role_buffer.entity_id()),
-                Some(start_buffer.entity_id()),
-            )));
-            editor
-        });
 
         let subscriptions = vec![
             cx.subscribe(&body_buffer, |this, _, event, cx| {
@@ -165,9 +139,8 @@ impl DraftView {
             }),
         ];
 
-        let mut this = Self {
+        Self {
             workspace,
-            editor,
             multi_buffer,
             system_buffer,
             system_styles: Vec::new(),
@@ -179,22 +152,73 @@ impl DraftView {
             body_buffer,
             body_end,
             suppress_draft_activation: false,
+            editors: Vec::new(),
             _subscriptions: subscriptions,
-        };
-        crate::banner::insert(&this.editor, &this.multi_buffer, cx);
-        this.insert_workdir_label(cx);
-        this.insert_role_label(cx);
-        this.insert_start_label(cx);
-        this.update_start_target_hint(cx);
-        this.insert_body_gap(cx);
-        this.pin_autoscroll(cx);
-        this.update_body_chrome(cx);
-        this.focus_body(window, cx);
-        this
+        }
     }
 
-    pub fn editor(&self) -> &Entity<Editor> {
-        &self.editor
+    /// Builds a pane's editor over the shared multibuffer — own cursor and
+    /// scroll — fully caught up with the model, cursor at the body end.
+    pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
+        let workspace = self.workspace.clone();
+        let multi_buffer = self.multi_buffer.clone();
+        let buffers = [
+            &self.system_buffer,
+            &self.workdir_buffer,
+            &self.role_buffer,
+            &self.start_buffer,
+            &self.body_buffer,
+        ];
+        let buffer_ids = buffers.map(|buffer| buffer.read(cx).remote_id());
+        let workdir_id = self.workdir_buffer.entity_id();
+        let role_id = self.role_buffer.entity_id();
+        let start_id = self.start_buffer.entity_id();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                },
+                multi_buffer,
+                None,
+                window,
+                cx,
+            );
+            crate::editor_config::configure(&mut editor, window, cx);
+            for buffer_id in buffer_ids {
+                editor.disable_header_for_buffer(buffer_id, cx);
+            }
+            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
+                workspace,
+                Some(workdir_id),
+                Some(role_id),
+                Some(start_id),
+            )));
+            editor
+        });
+
+        crate::banner::insert(&editor, &self.multi_buffer, cx);
+        self.editors.push(editor.downgrade());
+        self.insert_workdir_label_to(&editor, cx);
+        self.insert_role_label_to(&editor, cx);
+        self.insert_start_label_to(&editor, cx);
+        self.apply_start_target_hint_to(&editor, cx);
+        self.insert_body_gap_to(&editor, cx);
+        self.pin_autoscroll_to(&editor, cx);
+        self.apply_body_chrome_to(&editor, cx);
+        self.apply_system_styles_to(&editor, cx);
+        self.focus_body(&editor, window, cx);
+        editor
+    }
+
+    /// The editors still alive, pruning dropped ones.
+    fn live_editors(&mut self) -> Vec<Entity<Editor>> {
+        self.editors.retain(|editor| editor.upgrade().is_some());
+        self.editors
+            .iter()
+            .filter_map(|editor| editor.upgrade())
+            .collect()
     }
 
     pub fn workdir_text(&self, cx: &gpui::App) -> String {
@@ -257,20 +281,22 @@ impl DraftView {
             StartFieldMode::Join => StartFieldMode::Sandbox,
             StartFieldMode::Sandbox => StartFieldMode::NewOn,
         };
-        self.insert_start_label(cx);
+        for editor in self.live_editors() {
+            self.insert_start_label_to(&editor, cx);
+        }
         self.update_start_target_hint(cx);
         cx.notify();
     }
 
-    pub fn cursor_in_start_field(&self, cx: &gpui::App) -> bool {
-        self.cursor_in(&self.start_buffer, cx)
+    pub fn cursor_in_start_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
+        self.cursor_in(&self.start_buffer, editor, cx)
     }
 
-    pub fn cursor_in_role_field(&self, cx: &gpui::App) -> bool {
-        self.cursor_in(&self.role_buffer, cx)
+    pub fn cursor_in_role_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
+        self.cursor_in(&self.role_buffer, editor, cx)
     }
 
-    fn cursor_in(&self, buffer: &Entity<Buffer>, cx: &gpui::App) -> bool {
+    fn cursor_in(&self, buffer: &Entity<Buffer>, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
         let field = buffer.read(cx);
         let range = field.anchor_before(0)..field.anchor_after(field.len());
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
@@ -280,8 +306,7 @@ impl DraftView {
         ) else {
             return false;
         };
-        let cursor = self
-            .editor
+        let cursor = editor
             .read(cx)
             .selections
             .newest_anchor()
@@ -315,12 +340,15 @@ impl DraftView {
         &mut self,
         workdir: &str,
         force: bool,
+        editor: Option<&Entity<Editor>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.body_text(cx).trim().is_empty() {
             self.set_workdir_text(workdir, cx);
-            self.focus_body(window, cx);
+            if let Some(editor) = editor {
+                self.focus_body(editor, window, cx);
+            }
         } else if force {
             self.set_workdir_text(workdir, cx);
         }
@@ -328,25 +356,35 @@ impl DraftView {
 
     /// Tab: cycles workdir field → role field → start field → message body
     /// (field values arrive selected, so typing replaces them).
-    pub fn toggle_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let target = if self.cursor_in(&self.workdir_buffer, cx) {
+    pub fn toggle_field(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = if self.cursor_in(&self.workdir_buffer, editor, cx) {
             &self.role_buffer
-        } else if self.cursor_in(&self.role_buffer, cx) {
+        } else if self.cursor_in(&self.role_buffer, editor, cx) {
             &self.start_buffer
-        } else if self.cursor_in(&self.start_buffer, cx) {
-            self.focus_body(window, cx);
+        } else if self.cursor_in(&self.start_buffer, editor, cx) {
+            self.focus_body(editor, window, cx);
             return;
         } else {
             &self.workdir_buffer
         };
         let field = target.read(cx);
         let range = field.anchor_before(0)..field.anchor_after(field.len());
-        self.select_range(range, window, cx);
+        self.select_range(editor, range, window, cx);
     }
 
-    /// Puts the cursor at the end of the message body.
-    pub fn focus_body(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.select_range(self.body_end..self.body_end, window, cx);
+    /// Puts the pane's cursor at the end of the message body.
+    pub fn focus_body(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_range(editor, self.body_end..self.body_end, window, cx);
     }
 
     /// Appends a local system notice (connection problems, rejected
@@ -362,6 +400,13 @@ impl DraftView {
             buffer.anchor_before(start)..buffer.anchor_before(start + line.len())
         });
         self.system_styles.push((class, range));
+        for editor in self.live_editors() {
+            self.apply_system_styles_to(&editor, cx);
+        }
+        cx.notify();
+    }
+
+    fn apply_system_styles_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let mut by_class: Vec<(StyleClass, Vec<Range<text::Anchor>>)> = Vec::new();
         for (class, range) in &self.system_styles {
             match by_class.iter_mut().find(|(existing, _)| existing == class) {
@@ -370,7 +415,7 @@ impl DraftView {
             }
         }
         apply_class_highlights(
-            &self.editor,
+            editor,
             &self.multi_buffer,
             Region::System,
             by_class
@@ -378,11 +423,11 @@ impl DraftView {
                 .map(|(class, ranges)| (*class, ranges.as_slice())),
             cx,
         );
-        cx.notify();
     }
 
     fn select_range(
         &self,
+        editor: &Entity<Editor>,
         range: Range<text::Anchor>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -394,21 +439,21 @@ impl DraftView {
         ) else {
             return;
         };
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
                 selections.select_anchor_ranges([start..end]);
             });
         });
     }
 
-    fn insert_workdir_label(&mut self, cx: &mut Context<Self>) {
+    fn insert_workdir_label_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(field_start) =
             snapshot.anchor_in_excerpt(self.workdir_buffer.read(cx).anchor_before(0))
         else {
             return;
         };
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.splice_inlays(
                 &[],
                 vec![Inlay::custom(
@@ -421,14 +466,14 @@ impl DraftView {
         });
     }
 
-    fn insert_role_label(&mut self, cx: &mut Context<Self>) {
+    fn insert_role_label_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(field_start) =
             snapshot.anchor_in_excerpt(self.role_buffer.read(cx).anchor_before(0))
         else {
             return;
         };
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.splice_inlays(
                 &[],
                 vec![Inlay::custom(MODE_LABEL_INLAY_ID, field_start, "Role: ")],
@@ -437,14 +482,14 @@ impl DraftView {
         });
     }
 
-    fn insert_start_label(&mut self, cx: &mut Context<Self>) {
+    fn insert_start_label_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(field_start) =
             snapshot.anchor_in_excerpt(self.start_buffer.read(cx).anchor_before(0))
         else {
             return;
         };
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.splice_inlays(
                 &[InlayId::Custom(START_LABEL_INLAY_ID)],
                 vec![Inlay::custom(
@@ -458,6 +503,12 @@ impl DraftView {
     }
 
     fn update_start_target_hint(&mut self, cx: &mut Context<Self>) {
+        for editor in self.live_editors() {
+            self.apply_start_target_hint_to(&editor, cx);
+        }
+    }
+
+    fn apply_start_target_hint_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let target = self.start_text(cx).trim().to_owned();
         let hint = self
             .start_target_hints
@@ -475,21 +526,21 @@ impl DraftView {
             .map(|hint| Inlay::custom(START_TARGET_HINT_INLAY_ID, field_end, format!("  {hint}")))
             .into_iter()
             .collect::<Vec<_>>();
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.splice_inlays(&[InlayId::Custom(START_TARGET_HINT_INLAY_ID)], inlays, cx);
         });
     }
 
     /// A blank line's worth of breathing room between the workdir field and
     /// the message body.
-    fn insert_body_gap(&mut self, cx: &mut Context<Self>) {
+    fn insert_body_gap_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(body_start) =
             snapshot.anchor_in_excerpt(self.body_buffer.read(cx).anchor_before(0))
         else {
             return;
         };
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.insert_blocks(
                 [editor::display_map::BlockProperties {
                     placement: editor::display_map::BlockPlacement::Above(body_start),
@@ -504,17 +555,24 @@ impl DraftView {
         });
     }
 
-    fn pin_autoscroll(&mut self, cx: &mut Context<Self>) {
+    fn pin_autoscroll_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(body_end) = snapshot.anchor_in_excerpt(self.body_end) else {
             return;
         };
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.set_autoscroll_pin(body_end, AutoscrollStrategy::Bottom, cx);
         });
     }
 
     fn update_body_chrome(&mut self, cx: &mut Context<Self>) {
+        for editor in self.live_editors() {
+            self.apply_body_chrome_to(&editor, cx);
+        }
+        cx.notify();
+    }
+
+    fn apply_body_chrome_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let body_empty = self.body_buffer.read(cx).is_empty();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(body_start) =
@@ -540,7 +598,7 @@ impl DraftView {
             vec![body_start..body_end]
         };
         let body_style = StyleClass::UserMessage.resolve(cx);
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.splice_inlays(&[InlayId::Custom(BODY_PLACEHOLDER_INLAY_ID)], inlays, cx);
             editor.highlight_text(
                 HighlightKey::SyntaxTreeView(PROMPT_DRAFT_HIGHLIGHT_KEY),
@@ -554,7 +612,6 @@ impl DraftView {
                 cx,
             );
         });
-        cx.notify();
     }
 
     fn note_draft_edit(&mut self, cx: &mut Context<Self>) {
