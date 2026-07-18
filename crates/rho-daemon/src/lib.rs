@@ -185,6 +185,9 @@ pub struct DaemonArgs {
     /// `rho iroh approve <code>` on this machine.
     #[arg(long = "iroh")]
     pub iroh: bool,
+    /// Use BBR3 instead of CUBIC for daemon-to-client iroh traffic.
+    #[arg(long = "iroh-bbr3", env = "RHO_IROH_BBR3")]
+    pub iroh_bbr3: bool,
     #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
@@ -283,14 +286,17 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     agents.resume_platform_integrations();
 
     if let Some((secret, iroh_auth)) = iroh {
+        let mut transport = iroh::endpoint::QuicTransportConfig::builder()
+            .max_concurrent_bidi_streams(16u8.into())
+            .qlog_from_env("rho-daemon");
+        if args.iroh_bbr3 {
+            transport = transport.congestion_controller_factory(Arc::new(
+                noq_proto::congestion::Bbr3Config::default(),
+            ));
+        }
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret)
-            .transport_config(
-                iroh::endpoint::QuicTransportConfig::builder()
-                    .max_concurrent_bidi_streams(16u8.into())
-                    .qlog_from_env("rho-daemon")
-                    .build(),
-            )
+            .transport_config(transport.build())
             .alpns(vec![
                 rho_ui_proto::IROH_ALPN.to_vec(),
                 rho_webui_messages::ALPN.to_vec(),

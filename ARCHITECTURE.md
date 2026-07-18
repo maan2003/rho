@@ -199,7 +199,10 @@ turns without changing anything on the QUIC wire. Transport scheduling owns
 connection bandwidth allocation, while application-level stream selection and
 coalescing remain UI protocol policy. Native GUI and daemon endpoints enable
 noq's qlog instrumentation when `QLOGDIR` is set, writing `rho-gui-*` and
-`rho-daemon-*` traces respectively for transport-level diagnosis.
+`rho-daemon-*` traces respectively for transport-level diagnosis. Iroh uses
+CUBIC congestion control by default; `rho daemon --iroh-bbr3` (or
+`RHO_IROH_BBR3=true`) selects BBR3 for daemon-to-client traffic without
+requiring the client to use the same controller.
 
 
 Dependencies should flow from higher-level assembly/policy crates toward lower

@@ -67,6 +67,7 @@ futures-util = "0.3"
 iroh = { version = "1.0.2", default-features = false }
 json-stream = { path = "crates/json-stream" }
 libc = "0.2"
+noq-proto = { version = "=1.0.1", default-features = false }
 octo-server = { path = "crates/octo-server" }
 octo-types = { path = "crates/octo-types" }
 pprof = { path = "crates/pprof", default-features = false }

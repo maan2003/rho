@@ -23,6 +23,7 @@ async fn zed_channel_ping_round_trip() -> anyhow::Result<()> {
         socket_path: Some(socket_path.clone()),
         die_on_detached: false,
         iroh: false,
+        iroh_bbr3: false,
         cpu_profile: None,
         extra_before_path: None,
         extra_after_path: None,

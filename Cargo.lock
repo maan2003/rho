@@ -12117,6 +12117,7 @@ dependencies = [
  "futures",
  "iroh",
  "json-stream",
+ "noq-proto",
  "octo-server",
  "octo-types",
  "prefix-id",
