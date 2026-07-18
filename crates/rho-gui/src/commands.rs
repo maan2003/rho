@@ -60,7 +60,7 @@ fn last_token(text: &str) -> &str {
     &text[token_start(text)..]
 }
 
-fn token_start(text_before_cursor: &str) -> usize {
+pub fn token_start(text_before_cursor: &str) -> usize {
     text_before_cursor
         .char_indices()
         .rev()

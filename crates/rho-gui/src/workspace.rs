@@ -24,15 +24,17 @@ use crate::agent_view::AgentView;
 use crate::chime::Chime;
 use crate::connection::{ConnEvent, Connection};
 use crate::draft_view::DraftView;
+use crate::minibuffer::Minibuffer;
 use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
 use crate::zed_remote::FileView;
 use crate::registry::{ActivePane, AgentRegistry};
 use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
 use crate::{
-    AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, PaneBack, PaneClose,
-    PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup,
-    SubmitPrompt, TaskBoard,
+    AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, MinibufferCancel,
+    MinibufferCommand, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
+    PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen,
+    RoleCycle, RoleCycleGroup, SubmitPrompt, TaskBoard,
 };
 
 /// What a pane shows: stable identity plus the live view. Panes own their
@@ -119,6 +121,8 @@ pub struct Workspace {
     panes: PaneTree<Surface>,
     /// Keyboard focus for the rail surface (it has no editor).
     rail_focus: gpui::FocusHandle,
+    /// The completing-read strip at the bottom of the window, when open.
+    minibuffer: Option<Minibuffer>,
     _event_task: Task<()>,
 }
 
@@ -164,6 +168,7 @@ impl Workspace {
                 _focus_follow: None,
             }),
             rail_focus: cx.focus_handle(),
+            minibuffer: None,
             _event_task: event_task,
         };
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
@@ -1546,6 +1551,84 @@ impl Workspace {
         }
     }
 
+    /// `space :`, the emacs `M-x`: run any `:` command from anywhere, with
+    /// the same completion grammar as the inline prompt.
+    fn open_command_minibuffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _cx: &gpui::App| {
+            let text = format!(":{input}");
+            crate::commands::completions_for(
+                &text,
+                &workspace.workdir_table(),
+                &workspace.live_agent_targets(),
+                &workspace.topic_names(),
+            )
+            .into_iter()
+            .map(|mut candidate| {
+                // The prompt already shows the `:`; keep the input bare.
+                if let Some(bare) = candidate.value.strip_prefix(':') {
+                    candidate.value = bare.to_owned();
+                }
+                candidate
+            })
+            .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let input = input.trim().to_owned();
+                if input.is_empty() {
+                    return;
+                }
+                let text = format!(":{input}");
+                match rho_commands::parse(&text) {
+                    Some(parsed) => {
+                        let agent_id = workspace.registry.selected_agent().copied();
+                        workspace.handle_command(agent_id, parsed, window, cx);
+                    }
+                    None => workspace.notice_on(
+                        None,
+                        &format!("not a command: {text}"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            },
+        );
+        let mut minibuffer = Minibuffer::open(":", complete, on_submit, window, cx);
+        minibuffer.refresh(self, cx);
+        self.minibuffer = Some(minibuffer);
+        cx.notify();
+    }
+
+    /// Recomputes candidates after an edit; subscribed by [`Minibuffer`].
+    pub(crate) fn refresh_minibuffer(&mut self, cx: &mut Context<Self>) {
+        let Some(mut minibuffer) = self.minibuffer.take() else {
+            return;
+        };
+        minibuffer.refresh(self, cx);
+        self.minibuffer = Some(minibuffer);
+        cx.notify();
+    }
+
+    fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(minibuffer) = self.minibuffer.take() else {
+            return;
+        };
+        let (input, on_submit) = minibuffer.into_submission(cx);
+        self.focus_active_surface(window, cx);
+        on_submit(self, input, window, cx);
+        cx.notify();
+    }
+
+    fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.minibuffer.take().is_some() {
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        }
+    }
+
     fn focus_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(rail) = self.panes.pane_showing(|s| s.key == SurfaceKey::Rail) {
             self.panes.focus(rail);
@@ -1941,7 +2024,39 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RailOpen, window, cx| {
                 this.leave_rail(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &MinibufferCommand, window, cx| {
+                this.open_command_minibuffer(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MinibufferConfirm, window, cx| {
+                this.minibuffer_confirm(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MinibufferCancel, window, cx| {
+                this.minibuffer_cancel(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MinibufferNext, _window, cx| {
+                if let Some(minibuffer) = &mut this.minibuffer {
+                    minibuffer.select_by_delta(1);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MinibufferPrevious, _window, cx| {
+                if let Some(minibuffer) = &mut this.minibuffer {
+                    minibuffer.select_by_delta(-1);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MinibufferComplete, window, cx| {
+                if let Some(mut minibuffer) = this.minibuffer.take() {
+                    minibuffer.complete_selected(window, cx);
+                    this.minibuffer = Some(minibuffer);
+                }
+            }))
             .child(self.render_panes(&text_style, cx))
+            .children(
+                self.minibuffer
+                    .as_ref()
+                    .map(|minibuffer| minibuffer.render(cx)),
+            )
     }
 }
 

@@ -8,6 +8,7 @@ mod connection;
 mod draft_view;
 mod editor_config;
 mod highlights;
+mod minibuffer;
 mod pane;
 mod registry;
 mod render;
@@ -57,7 +58,13 @@ actions!(
         PaneFocusNext,
         PaneBack,
         RailFocus,
-        RailOpen
+        RailOpen,
+        MinibufferCommand,
+        MinibufferConfirm,
+        MinibufferCancel,
+        MinibufferNext,
+        MinibufferPrevious,
+        MinibufferComplete
     ]
 );
 
@@ -416,8 +423,21 @@ fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("space w w", PaneFocusNext, Some(context)),
             KeyBinding::new("space b", PaneBack, Some(context)),
             KeyBinding::new("space r", RailFocus, Some(context)),
+            KeyBinding::new("space :", MinibufferCommand, Some(context)),
         ]);
     }
+    // Minibuffer keys. The input is a single-line editor (vim skips those),
+    // but enter/escape/tab still need to beat the editor's own bindings, so
+    // they are scoped under the minibuffer context and loaded last.
+    cx.bind_keys([
+        KeyBinding::new("enter", MinibufferConfirm, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("escape", MinibufferCancel, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("tab", MinibufferComplete, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("ctrl-n", MinibufferNext, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("ctrl-p", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
+        KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
+    ]);
     // Rail navigation: vim keys without a leader, since the rail is not a
     // text editor.
     cx.bind_keys([
