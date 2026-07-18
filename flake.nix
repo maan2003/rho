@@ -150,8 +150,8 @@
         zedSrc = pkgs.fetchFromGitHub {
           owner = "maan2003";
           repo = "zed";
-          rev = "8c93f816e224648577dcb1c1b58b9445a6633416";
-          hash = "sha256-Xw756jnCJPmTjLEPo8KYcplo/9Sk+ccjK9iHD8UhN4Y=";
+          rev = "f08a95d674b49474912b8c03ef51917cb042c606";
+          hash = "sha256-0rgm2Wh26AQo0iAPo+KJTuj66Jf8SbLEig5Cwnm4kH4=";
         };
 
         multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
@@ -181,6 +181,10 @@
               # provide the full-repo asset directory at the relative path the
               # crate expects.
               ln -s ${zedSrc}/assets $out/assets
+
+              # `extension_host` likewise reads the sibling extension API WIT
+              # definitions from its build script.
+              ln -s ${zedSrc}/crates/extension_api $out/extension_api
             '';
             craneLib = craneLibBase.overrideArgs {
               inherit cargoVendorDir;
