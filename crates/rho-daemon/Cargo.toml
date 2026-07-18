@@ -13,7 +13,7 @@ camino.workspace = true
 clap.workspace = true
 dirs.workspace = true
 futures.workspace = true
-iroh = { workspace = true, features = ["tls-aws-lc-rs"] }
+iroh = { workspace = true, features = ["qlog", "tls-aws-lc-rs"] }
 json-stream.workspace = true
 octo-server.workspace = true
 octo-types.workspace = true

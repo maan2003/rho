@@ -172,6 +172,13 @@ AI APIs.
   128 MiB while allowing small frames to bypass a waiting large allocation.
   The reservation remains attached to the decoded GUI event until consumption,
   so slow UI handling cannot refill an unbounded queue of large agent frames.
+  Setting `QLOGDIR` opts the process into writing a qlog file for every iroh
+  connection. Qlog records transport metadata such as endpoint addresses,
+  connection IDs, packet timing and sizes, stream IDs and offsets, loss, and
+  congestion state, but not UI frame payload bytes or cryptographic secrets.
+  Treat captures as sensitive diagnostics, use a private directory and bounded
+  capture window, and remove them after analysis; rho does not rotate or cap
+  their aggregate disk usage.
   Enrollment approval is also accepted from already
   trusted remote clients (they are fully privileged anyway).
 - `rho-gui --endpoint <id>` generates its client key in process memory and

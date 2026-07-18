@@ -197,7 +197,9 @@ weights within each equal-priority fair-scheduling class. Weight 1 retains
 upstream behavior; higher weights receive proportionally more packet-writing
 turns without changing anything on the QUIC wire. Transport scheduling owns
 connection bandwidth allocation, while application-level stream selection and
-coalescing remain UI protocol policy.
+coalescing remain UI protocol policy. Native GUI and daemon endpoints enable
+noq's qlog instrumentation when `QLOGDIR` is set, writing `rho-gui-*` and
+`rho-daemon-*` traces respectively for transport-level diagnosis.
 
 
 Dependencies should flow from higher-level assembly/policy crates toward lower

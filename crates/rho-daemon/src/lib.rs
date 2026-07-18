@@ -288,6 +288,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .transport_config(
                 iroh::endpoint::QuicTransportConfig::builder()
                     .max_concurrent_bidi_streams(16u8.into())
+                    .qlog_from_env("rho-daemon")
                     .build(),
             )
             .alpns(vec![

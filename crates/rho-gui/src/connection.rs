@@ -519,6 +519,7 @@ async fn connect_iroh(
         .transport_config(
             iroh::endpoint::QuicTransportConfig::builder()
                 .max_concurrent_uni_streams(1024u32.into())
+                .qlog_from_env("rho-gui")
                 .build(),
         )
         .bind()
