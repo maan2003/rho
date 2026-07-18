@@ -16,6 +16,7 @@ futures-util.workspace = true
 libc.workspace = true
 reqwest.workspace = true
 redb.workspace = true
+rustls.workspace = true
 rho-agent.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true

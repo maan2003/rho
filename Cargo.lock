@@ -94,7 +94,7 @@ dependencies = [
 [[package]]
 name = "acp_thread"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "action_log",
  "agent-client-protocol",
@@ -138,7 +138,7 @@ dependencies = [
 [[package]]
 name = "action_log"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "buffer_diff",
@@ -258,7 +258,7 @@ dependencies = [
 [[package]]
 name = "agent_settings"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -591,7 +591,7 @@ dependencies = [
 [[package]]
 name = "askpass"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "futures",
@@ -608,7 +608,7 @@ dependencies = [
 [[package]]
 name = "assets"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "gpui",
@@ -1394,7 +1394,7 @@ version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.20.11",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -1440,7 +1440,7 @@ dependencies = [
 [[package]]
 name = "breadcrumbs"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui",
  "ui",
@@ -1469,7 +1469,7 @@ dependencies = [
 [[package]]
 name = "buffer_diff"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "clock",
  "gpui",
@@ -1956,7 +1956,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "client"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -2015,7 +2015,7 @@ dependencies = [
 [[package]]
 name = "clock"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "serde",
  "smallvec",
@@ -2024,7 +2024,7 @@ dependencies = [
 [[package]]
 name = "cloud_api_client"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -2043,7 +2043,7 @@ dependencies = [
 [[package]]
 name = "cloud_api_types"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2058,7 +2058,7 @@ dependencies = [
 [[package]]
 name = "cloud_llm_client"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "serde",
@@ -2165,7 +2165,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui_util",
  "indexmap 2.14.0",
@@ -2207,7 +2207,7 @@ dependencies = [
 [[package]]
 name = "command_palette"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "client",
@@ -2234,7 +2234,7 @@ dependencies = [
 [[package]]
 name = "command_palette_hooks"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "collections",
  "derive_more",
@@ -2245,7 +2245,7 @@ dependencies = [
 [[package]]
 name = "component"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "collections",
  "gpui",
@@ -2335,7 +2335,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 [[package]]
 name = "context_server"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -2804,7 +2804,7 @@ dependencies = [
 [[package]]
 name = "crashes"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "async-process",
  "crash-handler",
@@ -2846,7 +2846,7 @@ dependencies = [
 [[package]]
 name = "credentials_provider"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3030,7 +3030,7 @@ dependencies = [
 [[package]]
 name = "dap"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3074,7 +3074,7 @@ dependencies = [
 [[package]]
 name = "dap_adapters"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3240,7 +3240,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "db"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3259,7 +3259,7 @@ dependencies = [
 [[package]]
 name = "debug_adapter_extension"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3559,7 +3559,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3874,7 +3874,7 @@ dependencies = [
 [[package]]
 name = "edit_prediction_types"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "client",
  "gpui",
@@ -3886,7 +3886,7 @@ dependencies = [
 [[package]]
 name = "editor"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4091,7 +4091,7 @@ dependencies = [
 [[package]]
 name = "env_var"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui_shared_string",
 ]
@@ -4222,7 +4222,7 @@ checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 [[package]]
 name = "extension"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4255,7 +4255,7 @@ dependencies = [
 [[package]]
 name = "extension_host"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -4371,7 +4371,7 @@ dependencies = [
 [[package]]
 name = "feature_flags"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "collections",
  "feature_flags_macros",
@@ -4386,7 +4386,7 @@ dependencies = [
 [[package]]
 name = "feature_flags_macros"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4402,7 +4402,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "file_icons"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui",
  "serde",
@@ -4625,7 +4625,7 @@ dependencies = [
 [[package]]
 name = "fs"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -4848,7 +4848,7 @@ dependencies = [
 [[package]]
 name = "fuzzy"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui",
  "log",
@@ -4858,7 +4858,7 @@ dependencies = [
 [[package]]
 name = "fuzzy_nucleo"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "fuzzy",
  "gpui",
@@ -4984,7 +4984,7 @@ dependencies = [
 [[package]]
 name = "git"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "askpass",
@@ -5022,12 +5022,13 @@ dependencies = [
  "anyhow",
  "octo-types",
  "reqwest 0.12.28",
+ "rustls",
 ]
 
 [[package]]
 name = "git_hosting_providers"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5244,7 +5245,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -5327,7 +5328,7 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -5373,7 +5374,7 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -5420,7 +5421,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -5431,7 +5432,7 @@ dependencies = [
 [[package]]
 name = "gpui_platform"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "console_error_panic_hook",
  "gpui",
@@ -5444,7 +5445,7 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -5454,7 +5455,7 @@ dependencies = [
 [[package]]
 name = "gpui_tokio"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "gpui",
@@ -5465,7 +5466,7 @@ dependencies = [
 [[package]]
 name = "gpui_util"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "log",
@@ -5475,7 +5476,7 @@ dependencies = [
 [[package]]
 name = "gpui_web"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -5499,7 +5500,7 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5528,7 +5529,7 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -5556,7 +5557,7 @@ dependencies = [
 [[package]]
 name = "grammars"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "language_core",
@@ -5905,7 +5906,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -5930,7 +5931,7 @@ dependencies = [
 [[package]]
 name = "http_client_tls"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "rustls",
  "rustls-platform-verifier 0.5.3",
@@ -5939,7 +5940,7 @@ dependencies = [
 [[package]]
 name = "http_proxy"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "base64",
@@ -6074,7 +6075,7 @@ dependencies = [
 [[package]]
 name = "icons"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "serde",
  "strum 0.27.2",
@@ -6877,7 +6878,7 @@ dependencies = [
 [[package]]
 name = "json_schema_store"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -7015,7 +7016,7 @@ dependencies = [
 [[package]]
 name = "language"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7065,7 +7066,7 @@ dependencies = [
 [[package]]
 name = "language_core"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -7085,7 +7086,7 @@ dependencies = [
 [[package]]
 name = "language_extension"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7108,7 +7109,7 @@ dependencies = [
 [[package]]
 name = "language_model"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "base64",
@@ -7132,7 +7133,7 @@ dependencies = [
 [[package]]
 name = "language_model_core"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -7152,7 +7153,7 @@ dependencies = [
 [[package]]
 name = "languages"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -7460,7 +7461,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "lsp"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -7594,7 +7595,7 @@ dependencies = [
 [[package]]
 name = "markdown"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "base64",
@@ -7698,7 +7699,7 @@ dependencies = [
 [[package]]
 name = "media"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "bindgen 0.71.1",
@@ -7746,7 +7747,7 @@ dependencies = [
 [[package]]
 name = "menu"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui",
 ]
@@ -7754,7 +7755,7 @@ dependencies = [
 [[package]]
 name = "mermaid_render"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "gpui",
@@ -7841,7 +7842,7 @@ dependencies = [
 [[package]]
 name = "migrator"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -8009,7 +8010,7 @@ dependencies = [
 [[package]]
 name = "multi_buffer"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "buffer_diff",
@@ -8225,7 +8226,7 @@ dependencies = [
 [[package]]
 name = "net"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-io",
@@ -8411,7 +8412,7 @@ dependencies = [
 [[package]]
 name = "node_runtime"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -8486,6 +8487,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa6c890013591e709a3e45dd53501351b7e27e7ff3c7e9fc3dce43e300e7e9d3"
 dependencies = [
  "aes-gcm",
+ "aws-lc-rs",
  "bytes",
  "derive_more",
  "enum-assoc",
@@ -8494,7 +8496,6 @@ dependencies = [
  "lru-slab",
  "rand 0.10.2",
  "rand_pcg",
- "ring",
  "rustc-hash 2.1.2",
  "rustls",
  "rustls-pki-types",
@@ -8766,7 +8767,7 @@ dependencies = [
 [[package]]
 name = "oauth_callback_server"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "futures",
@@ -9149,6 +9150,7 @@ dependencies = [
  "futures-util",
  "octo-types",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -9427,7 +9429,7 @@ dependencies = [
 [[package]]
 name = "paths"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "const_format",
  "dirs",
@@ -9478,7 +9480,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "collections",
  "serde",
@@ -10108,7 +10110,7 @@ dependencies = [
 [[package]]
 name = "picker"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "db",
@@ -10132,7 +10134,7 @@ dependencies = [
 [[package]]
 name = "picker_preview"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "editor",
  "gpui",
@@ -10504,7 +10506,7 @@ checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
 [[package]]
 name = "prettier"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -10614,7 +10616,7 @@ dependencies = [
 [[package]]
 name = "project"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -10775,7 +10777,7 @@ dependencies = [
 [[package]]
 name = "proto"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "prost",
@@ -10938,62 +10940,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "quinn"
-version = "0.11.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
-dependencies = [
- "bytes",
- "cfg_aliases 0.2.1",
- "pin-project-lite",
- "quinn-proto",
- "quinn-udp",
- "rustc-hash 2.1.2",
- "rustls",
- "socket2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "web-time",
-]
-
-[[package]]
-name = "quinn-proto"
-version = "0.11.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
-dependencies = [
- "bytes",
- "getrandom 0.4.3",
- "lru-slab",
- "rand 0.10.2",
- "rand_pcg",
- "ring",
- "rustc-hash 2.1.2",
- "rustls",
- "rustls-pki-types",
- "slab",
- "thiserror 2.0.18",
- "tinyvec",
- "tracing",
- "web-time",
-]
-
-[[package]]
-name = "quinn-udp"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
-dependencies = [
- "cfg_aliases 0.2.1",
- "libc",
- "once_cell",
- "socket2",
- "tracing",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11336,7 +11282,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "derive_refineable",
 ]
@@ -11388,7 +11334,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "release_channel"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui",
  "semver",
@@ -11397,7 +11343,7 @@ dependencies = [
 [[package]]
 name = "remote"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "askpass",
@@ -11430,7 +11376,7 @@ dependencies = [
 [[package]]
 name = "remote_server"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "acp_thread",
  "anyhow",
@@ -11528,7 +11474,6 @@ dependencies = [
  "log",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
@@ -11589,7 +11534,7 @@ dependencies = [
 [[package]]
 name = "reqwest_client"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "bytes",
@@ -11922,6 +11867,7 @@ dependencies = [
  "futures-util",
  "rand 0.8.6",
  "rho-core",
+ "rustls",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -11962,6 +11908,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rho-agent",
  "rho-db",
+ "rustls",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -11997,6 +11944,7 @@ dependencies = [
  "rho-agent",
  "rho-core",
  "rho-db",
+ "rustls",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -12058,6 +12006,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -12176,7 +12125,7 @@ dependencies = [
 [[package]]
 name = "rope"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "heapless",
  "log",
@@ -12221,7 +12170,7 @@ dependencies = [
 [[package]]
 name = "rpc"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-tungstenite",
@@ -12403,7 +12352,6 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -12570,7 +12518,7 @@ dependencies = [
 [[package]]
 name = "sandbox"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "futures",
@@ -12594,7 +12542,7 @@ dependencies = [
 [[package]]
 name = "scheduler"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "async-task",
  "backtrace",
@@ -12708,7 +12656,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 [[package]]
 name = "search"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "any_vec",
  "anyhow",
@@ -13081,7 +13029,7 @@ dependencies = [
 [[package]]
 name = "session"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "db",
  "gpui",
@@ -13093,7 +13041,7 @@ dependencies = [
 [[package]]
 name = "settings"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -13122,7 +13070,7 @@ dependencies = [
 [[package]]
 name = "settings_content"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -13143,7 +13091,7 @@ dependencies = [
 [[package]]
 name = "settings_json"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "serde",
@@ -13158,7 +13106,7 @@ dependencies = [
 [[package]]
 name = "settings_macros"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "quote",
  "syn 2.0.118",
@@ -13465,7 +13413,7 @@ dependencies = [
 [[package]]
 name = "snippet"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "smallvec",
@@ -13474,7 +13422,7 @@ dependencies = [
 [[package]]
 name = "snippet_provider"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -13587,7 +13535,7 @@ dependencies = [
 [[package]]
 name = "sqlez"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -13606,7 +13554,7 @@ dependencies = [
 [[package]]
 name = "sqlez_macros"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "sqlez",
  "sqlformat",
@@ -13787,7 +13735,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "heapless",
  "log",
@@ -14059,7 +14007,7 @@ dependencies = [
 [[package]]
 name = "syntax_theme"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui",
 ]
@@ -14172,7 +14120,7 @@ dependencies = [
 [[package]]
 name = "system_specs"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "gpui",
@@ -14235,7 +14183,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 [[package]]
 name = "task"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -14258,7 +14206,7 @@ dependencies = [
 [[package]]
 name = "telemetry"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "futures",
  "serde",
@@ -14269,7 +14217,7 @@ dependencies = [
 [[package]]
 name = "telemetry_events"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "semver",
  "serde",
@@ -14357,7 +14305,7 @@ dependencies = [
 [[package]]
 name = "terminal"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -14401,7 +14349,7 @@ dependencies = [
 [[package]]
 name = "text"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "clock",
@@ -14419,7 +14367,7 @@ dependencies = [
 [[package]]
 name = "theme"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -14440,7 +14388,7 @@ dependencies = [
 [[package]]
 name = "theme_settings"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -14748,6 +14696,7 @@ version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d52efb639344a7c6adb8e62c6f3d2c19c001ff1b79a5041ba1c6ed42e19c6aa5"
 dependencies = [
+ "aws-lc-rs",
  "base64",
  "bytes",
  "futures-core",
@@ -14756,7 +14705,6 @@ dependencies = [
  "http",
  "httparse",
  "rand 0.10.2",
- "ring",
  "rustls-pki-types",
  "sha1_smol",
  "simdutf8",
@@ -15153,7 +15101,7 @@ dependencies = [
 [[package]]
 name = "ui"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "chrono",
  "component",
@@ -15178,7 +15126,7 @@ dependencies = [
 [[package]]
 name = "ui_input"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "component",
  "gpui",
@@ -15188,7 +15136,7 @@ dependencies = [
 [[package]]
 name = "ui_macros"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "quote",
  "syn 2.0.118",
@@ -15427,7 +15375,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "util"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -15467,7 +15415,7 @@ dependencies = [
 [[package]]
 name = "util_macros"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "perf",
  "quote",
@@ -15609,7 +15557,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vim"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "collections",
@@ -15649,7 +15597,7 @@ dependencies = [
 [[package]]
 name = "vim_mode_setting"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui",
  "settings",
@@ -16234,7 +16182,7 @@ dependencies = [
 [[package]]
 name = "watch"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "parking_lot",
 ]
@@ -17418,7 +17366,7 @@ dependencies = [
 [[package]]
 name = "workspace"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "agent_settings",
  "any_vec",
@@ -17471,7 +17419,7 @@ dependencies = [
 [[package]]
 name = "worktree"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -17859,7 +17807,6 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -17907,7 +17854,7 @@ dependencies = [
 [[package]]
 name = "zed_actions"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "gpui",
  "schemars 1.2.1",
@@ -17918,7 +17865,7 @@ dependencies = [
 [[package]]
 name = "zed_credentials_provider"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "credentials_provider",
@@ -17933,7 +17880,7 @@ dependencies = [
 [[package]]
 name = "zed_env_vars"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "env_var",
 ]
@@ -18043,7 +17990,7 @@ dependencies = [
 [[package]]
 name = "zeta_prompt"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "imara-diff",
@@ -18072,7 +18019,7 @@ dependencies = [
 [[package]]
 name = "zlog"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "anyhow",
  "chrono",
@@ -18143,7 +18090,7 @@ dependencies = [
 [[package]]
 name = "ztracing"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -18154,7 +18101,7 @@ dependencies = [
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/zed?branch=rho#37fdaaa9638385b6091f06796084feedf7ac0345"
+source = "git+https://github.com/maan2003/zed?branch=rho#f08a95d674b49474912b8c03ef51917cb042c606"
 
 [[package]]
 name = "zune-core"

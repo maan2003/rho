@@ -14,6 +14,7 @@ bytes.workspace = true
 futures-util.workspace = true
 octo-types.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -17,6 +17,7 @@ futures.workspace = true
 futures-util.workspace = true
 rand.workspace = true
 rho-core.workspace = true
+rustls.workspace = true
 senax-encoder.workspace = true
 serde.workspace = true
 serde_json.workspace = true
