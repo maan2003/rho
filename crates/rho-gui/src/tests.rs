@@ -555,7 +555,7 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
 
     workspace
         .update(cx, |workspace, _, cx| {
-            let view = workspace.active_agent_view().expect("agent view");
+            let view = workspace.active_agent_model().expect("agent view");
             view.update(cx, |view, cx| {
                 assert!(view.has_timers());
                 view.tick_timers(started + 5_000, cx);
@@ -570,7 +570,7 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
 
     workspace
         .update(cx, |workspace, _, cx| {
-            let view = workspace.active_agent_view().expect("agent view");
+            let view = workspace.active_agent_model().expect("agent view");
             view.update(cx, |view, cx| view.tick_timers(started + 65_000, cx));
         })
         .expect("tick timers");
@@ -617,16 +617,13 @@ fn hidden_views_defer_rendering_until_selected(cx: &mut TestAppContext) {
     let hidden_view = workspace
         .update(cx, |workspace, _, _| {
             workspace
-                .agent_view(&agent(2))
+                .agent_model(&agent(2))
                 .expect("agent 2 view exists")
         })
         .expect("read workspace");
     let hidden_text = workspace
         .update(cx, |_, _, cx| {
-            hidden_view.update(cx, |view, cx| {
-                view.editor()
-                    .update(cx, |editor, cx| editor.display_text(cx))
-            })
+            hidden_view.update(cx, |view, cx| view.buffer_text(cx))
         })
         .expect("read hidden view");
     assert!(
@@ -899,7 +896,7 @@ fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
     let spans = workspace
         .update(cx, |workspace, _, cx| {
             workspace
-                .active_agent_view()
+                .active_agent_model()
                 .expect("agent view")
                 .read(cx)
                 .status_span_text()
@@ -924,7 +921,7 @@ fn context_chip_appears_when_frame_arrives_after_selection(cx: &mut TestAppConte
     let spans_before = workspace
         .update(cx, |workspace, _, cx| {
             workspace
-                .active_agent_view()
+                .active_agent_model()
                 .expect("agent view")
                 .read(cx)
                 .status_span_text()
@@ -948,7 +945,7 @@ fn context_chip_appears_when_frame_arrives_after_selection(cx: &mut TestAppConte
     let spans = workspace
         .update(cx, |workspace, _, cx| {
             workspace
-                .active_agent_view()
+                .active_agent_model()
                 .expect("agent view")
                 .read(cx)
                 .status_span_text()

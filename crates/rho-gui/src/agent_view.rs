@@ -1,8 +1,11 @@
-//! One live view per agent: editor, transcript projection, prompt draft, and
-//! local system notices.
+//! One agent model per agent: transcript projection, prompt draft, and
+//! local system notices — the buffer role. Editors are the window role:
+//! each pane showing the agent builds its own editor over the shared
+//! multibuffer via [`AgentModel::build_editor`], with its own cursor,
+//! scroll, and folds. The model reconciles every attached editor when
+//! content or chrome changes, so the model persists for the session while
+//! editors come and go with panes.
 //!
-//! Views persist for the lifetime of the session once created, so cursor,
-//! scroll position, open folds, and the prompt draft survive agent switches.
 //! The multibuffer composes three buffers: the read-only transcript, a lazy
 //! read-only system-notice region (local messages that must survive
 //! transcript re-renders), and the writable prompt draft.
@@ -31,8 +34,7 @@ const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
 
 pub struct PromptGutter;
 
-pub struct AgentView {
-    editor: Entity<Editor>,
+pub struct AgentModel {
     transcript: TranscriptModel,
     prompt_buffer: Entity<Buffer>,
     system_buffer: Entity<Buffer>,
@@ -41,15 +43,15 @@ pub struct AgentView {
     multi_buffer: Entity<MultiBuffer>,
     prompt_end: text::Anchor,
     status_spans: Vec<(String, gpui::HighlightStyle)>,
+    workspace: WeakEntity<Workspace>,
+    /// Editors currently displaying this agent, weakly held: panes own
+    /// their editors; the model only reconciles whoever is still alive.
+    editors: Vec<WeakEntity<Editor>>,
     _subscriptions: Vec<Subscription>,
 }
 
-impl AgentView {
-    pub fn new(
-        workspace: WeakEntity<Workspace>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+impl AgentModel {
+    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let transcript_buffer = cx.new(|cx| {
             let mut buffer = Buffer::local("", cx);
             buffer.set_capability(Capability::Read, cx);
@@ -80,27 +82,6 @@ impl AgentView {
             );
             multi_buffer
         });
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::new(
-                EditorMode::Full {
-                    scale_ui_elements_with_buffer_font_size: true,
-                    show_active_line_background: false,
-                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
-                },
-                multi_buffer.clone(),
-                None,
-                window,
-                cx,
-            );
-            crate::editor_config::configure(&mut editor, window, cx);
-            editor.disable_header_for_buffer(transcript_buffer.read(cx).remote_id(), cx);
-            editor.disable_header_for_buffer(system_buffer.read(cx).remote_id(), cx);
-            editor.disable_header_for_buffer(prompt_buffer.read(cx).remote_id(), cx);
-            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
-                workspace, None, None, None,
-            )));
-            editor
-        });
 
         let subscriptions = vec![cx.subscribe(&prompt_buffer, |this, _, event, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
@@ -108,10 +89,61 @@ impl AgentView {
             }
         })];
 
-        if let Some(draft_anchor) = multi_buffer
+        let transcript = TranscriptModel::new(transcript_buffer, multi_buffer.clone());
+        Self {
+            transcript,
+            prompt_buffer,
+            system_buffer,
+            system_excerpt_added: false,
+            system_styles: Vec::new(),
+            multi_buffer,
+            prompt_end,
+            status_spans: Vec::new(),
+            workspace,
+            editors: Vec::new(),
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// Builds a pane's editor over the shared multibuffer — own cursor,
+    /// scroll, and folds — fully caught up with the model.
+    pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
+        let transcript_id = self
+            .transcript
+            .buffer()
+            .read(cx)
+            .remote_id();
+        let workspace = self.workspace.clone();
+        let multi_buffer = self.multi_buffer.clone();
+        let system_id = self.system_buffer.read(cx).remote_id();
+        let prompt_id = self.prompt_buffer.read(cx).remote_id();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                },
+                multi_buffer,
+                None,
+                window,
+                cx,
+            );
+            crate::editor_config::configure(&mut editor, window, cx);
+            editor.disable_header_for_buffer(transcript_id, cx);
+            editor.disable_header_for_buffer(system_id, cx);
+            editor.disable_header_for_buffer(prompt_id, cx);
+            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
+                workspace, None, None, None,
+            )));
+            editor
+        });
+
+        if let Some(draft_anchor) = self
+            .multi_buffer
             .read(cx)
             .snapshot(cx)
-            .anchor_in_excerpt(prompt_end)
+            .anchor_in_excerpt(self.prompt_end)
         {
             editor.update(cx, |editor, cx| {
                 editor.set_autoscroll_pin(draft_anchor, AutoscrollStrategy::Bottom, cx);
@@ -121,27 +153,23 @@ impl AgentView {
             });
         }
 
-        let mut transcript = TranscriptModel::new(transcript_buffer, multi_buffer.clone());
-        transcript.attach(&editor, crate::workspace::now_ms(), cx);
-        let mut this = Self {
-            editor,
-            transcript,
-            prompt_buffer,
-            system_buffer,
-            system_excerpt_added: false,
-            system_styles: Vec::new(),
-            multi_buffer,
-            prompt_end,
-            status_spans: Vec::new(),
-            _subscriptions: subscriptions,
-        };
-        crate::banner::insert(&this.editor, &this.multi_buffer, cx);
-        this.update_prompt_chrome(cx);
-        this
+        crate::banner::insert(&editor, &self.multi_buffer, cx);
+        self.transcript
+            .attach(&editor, crate::workspace::now_ms(), cx);
+        self.editors.push(editor.downgrade());
+        self.apply_status_to(&editor, cx);
+        self.apply_system_styles_to(&editor, cx);
+        self.apply_prompt_chrome_to(&editor, cx);
+        editor
     }
 
-    pub fn editor(&self) -> &Entity<Editor> {
-        &self.editor
+    /// The editors still alive, pruning dropped ones.
+    fn live_editors(&mut self) -> Vec<Entity<Editor>> {
+        self.editors.retain(|editor| editor.upgrade().is_some());
+        self.editors
+            .iter()
+            .filter_map(|editor| editor.upgrade())
+            .collect()
     }
 
     pub fn sync(
@@ -207,11 +235,13 @@ impl AgentView {
                 );
             });
         }
-        self.apply_system_styles(cx);
+        for editor in self.live_editors() {
+            self.apply_system_styles_to(&editor, cx);
+        }
         cx.notify();
     }
 
-    fn apply_system_styles(&self, cx: &mut Context<Self>) {
+    fn apply_system_styles_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let mut by_class: Vec<(StyleClass, Vec<Range<text::Anchor>>)> = Vec::new();
         for (class, range) in &self.system_styles {
             match by_class.iter_mut().find(|(existing, _)| existing == class) {
@@ -220,7 +250,7 @@ impl AgentView {
             }
         }
         apply_class_highlights(
-            &self.editor,
+            editor,
             &self.multi_buffer,
             Region::System,
             by_class
@@ -271,7 +301,9 @@ impl AgentView {
             ));
         }
         self.status_spans = spans;
-        self.apply_status(cx);
+        for editor in self.live_editors() {
+            self.apply_status_to(&editor, cx);
+        }
     }
 
     #[cfg(test)]
@@ -282,7 +314,14 @@ impl AgentView {
             .collect()
     }
 
-    fn apply_status(&self, cx: &mut Context<Self>) {
+    /// The composed multibuffer text; lets tests observe what the model
+    /// would display without requiring an attached editor.
+    #[cfg(test)]
+    pub(crate) fn buffer_text(&self, cx: &Context<Self>) -> String {
+        self.multi_buffer.read(cx).snapshot(cx).text()
+    }
+
+    fn apply_status_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let Some(anchor) = self
             .multi_buffer
             .read(cx)
@@ -295,12 +334,19 @@ impl AgentView {
             anchor,
             spans: self.status_spans.clone(),
         });
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.set_right_prompt(right_prompt, cx);
         });
     }
 
     fn update_prompt_chrome(&mut self, cx: &mut Context<Self>) {
+        for editor in self.live_editors() {
+            self.apply_prompt_chrome_to(&editor, cx);
+        }
+        cx.notify();
+    }
+
+    fn apply_prompt_chrome_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let buffer = self.prompt_buffer.read(cx);
         let draft_empty = buffer.is_empty();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
@@ -327,7 +373,7 @@ impl AgentView {
             vec![prompt_start..prompt_end]
         };
         let draft_style = StyleClass::UserMessage.resolve(cx);
-        self.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.splice_inlays(&[InlayId::Custom(PROMPT_PLACEHOLDER_INLAY_ID)], inlays, cx);
             editor.highlight_text(
                 HighlightKey::SyntaxTreeView(PROMPT_DRAFT_HIGHLIGHT_KEY),
@@ -341,7 +387,6 @@ impl AgentView {
                 cx,
             );
         });
-        cx.notify();
     }
 }
 

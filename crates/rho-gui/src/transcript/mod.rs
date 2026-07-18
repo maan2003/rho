@@ -90,6 +90,10 @@ impl TranscriptModel {
         }
     }
 
+    pub fn buffer(&self) -> &Entity<Buffer> {
+        &self.buffer
+    }
+
     /// Attaches an editor over the transcript's multibuffer, bringing it
     /// fully up to date with the model. Dropped editors detach themselves:
     /// the model only holds weak handles and prunes on the next apply.

@@ -1,5 +1,5 @@
 //! Root entity: owns the daemon connection, the canonical agent states, the
-//! registry, and one persistent [`AgentView`] per opened agent.
+//! registry, and one persistent [`AgentModel`] per opened agent.
 //!
 //! All protocol events flow through [`Workspace`]; queued frame runs are
 //! merged per agent, and views receive summarized changes rather than the
@@ -20,7 +20,7 @@ use rho_ui_proto::{
 };
 use theme::ActiveTheme as _;
 
-use crate::agent_view::AgentView;
+use crate::agent_view::AgentModel;
 use crate::chime::Chime;
 use crate::connection::{ConnEvent, Connection};
 use crate::draft_view::DraftView;
@@ -57,7 +57,11 @@ pub struct Surface {
 #[derive(Clone)]
 enum SurfaceView {
     Draft(Entity<DraftView>),
-    Transcript(Entity<AgentView>),
+    Transcript {
+        model: Entity<AgentModel>,
+        /// This pane's own editor over the model's multibuffer.
+        editor: Entity<editor::Editor>,
+    },
     File(Entity<FileView>),
     Terminal(Entity<crate::terminal_view::TerminalView>),
 }
@@ -95,7 +99,7 @@ pub struct Workspace {
     connection: Connection,
     store: AgentStore,
     registry: AgentRegistry,
-    views: HashMap<AgentId, Entity<AgentView>>,
+    models: HashMap<AgentId, Entity<AgentModel>>,
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
@@ -162,7 +166,7 @@ impl Workspace {
             connection,
             store: AgentStore::default(),
             registry: AgentRegistry::default(),
-            views: HashMap::new(),
+            models: HashMap::new(),
             pending_syncs: HashMap::new(),
             draft_view,
             workdirs: Vec::new(),
@@ -299,7 +303,7 @@ impl Workspace {
                 .get(agent_id)
                 .and_then(|state| state.context_used);
             if old_context != new_context
-                && let Some(view) = self.views.get(agent_id).cloned()
+                && let Some(view) = self.models.get(agent_id).cloned()
             {
                 self.refresh_view_status(agent_id, &view, cx);
             }
@@ -318,7 +322,7 @@ impl Workspace {
                 continue;
             }
             if selected == Some(agent_id) {
-                if let Some(view) = self.views.get(&agent_id).cloned()
+                if let Some(view) = self.models.get(&agent_id).cloned()
                     && let Some(state) = self.store.get(&agent_id)
                 {
                     view.update(cx, |view, cx| {
@@ -331,7 +335,7 @@ impl Workspace {
                         )
                     });
                 }
-            } else if self.views.contains_key(&agent_id) {
+            } else if self.models.contains_key(&agent_id) {
                 self.pending_syncs
                     .entry(agent_id)
                     .and_modify(|pending| *pending = pending.merge(summary))
@@ -456,7 +460,7 @@ impl Workspace {
                 self.connected = false;
                 self.awaiting_draft_agent = false;
                 let notice = format!("[disconnected from rho daemon: {reason}]");
-                for view in self.views.values() {
+                for view in self.models.values() {
                     view.update(cx, |view, cx| {
                         view.system_notice(&notice, StyleClass::Disconnect, cx);
                     });
@@ -473,7 +477,7 @@ impl Workspace {
     fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
         match self.registry.selected_agent().copied() {
             Some(agent_id) => {
-                let Some(view) = self.views.get(&agent_id).cloned() else {
+                let Some(view) = self.models.get(&agent_id).cloned() else {
                     return;
                 };
                 let Some(text) = view.update(cx, |view, cx| view.take_prompt(cx)) else {
@@ -1275,7 +1279,7 @@ impl Workspace {
     ) {
         let view = agent_id
             .or_else(|| self.registry.selected_agent())
-            .and_then(|agent_id| self.views.get(agent_id))
+            .and_then(|agent_id| self.models.get(agent_id))
             .cloned();
         match view {
             Some(view) => view.update(cx, |view, cx| view.system_notice(text, class, cx)),
@@ -1307,7 +1311,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(agent_id) = &agent_id {
-            let view = self.materialize_view(agent_id, window, cx);
+            let view = self.materialize_model(agent_id, cx);
             view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         }
         let (context, key) = match agent_id {
@@ -1494,14 +1498,9 @@ impl Workspace {
         self.select_agent(Some(agent_id), window, cx);
     }
 
-    fn materialize_view(
-        &mut self,
-        agent_id: &AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<AgentView> {
+    fn materialize_model(&mut self, agent_id: &AgentId, cx: &mut Context<Self>) -> Entity<AgentModel> {
         let deferred = self.pending_syncs.remove(agent_id);
-        if let Some(view) = self.views.get(agent_id).cloned() {
+        if let Some(view) = self.models.get(agent_id).cloned() {
             if let (Some(summary), Some(state)) = (deferred, self.store.get(agent_id)) {
                 view.update(cx, |view, cx| {
                     view.sync(
@@ -1518,7 +1517,7 @@ impl Workspace {
         // A freshly created view renders the full state below, which
         // subsumes any deferred summary.
         let workspace = cx.entity().downgrade();
-        let view = cx.new(|cx| AgentView::new(workspace, window, cx));
+        let view = cx.new(|cx| AgentModel::new(workspace, cx));
         if let Some(state) = self.store.get(agent_id) {
             view.update(cx, |view, cx| {
                 view.sync(
@@ -1531,7 +1530,7 @@ impl Workspace {
             });
         }
         self.refresh_view_status(agent_id, &view, cx);
-        self.views.insert(*agent_id, view.clone());
+        self.models.insert(*agent_id, view.clone());
         view
     }
 
@@ -1539,7 +1538,7 @@ impl Workspace {
     fn refresh_view_status(
         &self,
         agent_id: &AgentId,
-        view: &Entity<AgentView>,
+        view: &Entity<AgentModel>,
         cx: &mut Context<Self>,
     ) {
         let directory_label = self.working_directory_label(agent_id);
@@ -1563,23 +1562,26 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn agent_view(&self, agent_id: &AgentId) -> Option<Entity<AgentView>> {
-        self.views.get(agent_id).cloned()
+    pub(crate) fn agent_model(&self, agent_id: &AgentId) -> Option<Entity<AgentModel>> {
+        self.models.get(agent_id).cloned()
     }
 
-    pub(crate) fn active_agent_view(&self) -> Option<Entity<AgentView>> {
+    pub(crate) fn active_agent_model(&self) -> Option<Entity<AgentModel>> {
         self.registry
             .selected_agent()
-            .and_then(|agent_id| self.views.get(agent_id))
+            .and_then(|agent_id| self.models.get(agent_id))
             .cloned()
     }
 
-    /// The editor the user is typing into: the selected agent's, or the
-    /// draft compose view's when nothing is selected.
+    /// The editor the user is typing into: the focused pane's own editor
+    /// (each transcript pane has one). Terminal panes have no editor; the
+    /// draft's stands in for text-style queries.
     pub(crate) fn active_editor(&self, cx: &gpui::App) -> Entity<editor::Editor> {
-        match self.active_agent_view() {
-            Some(view) => view.read(cx).editor().clone(),
-            None => self.draft_view.read(cx).editor().clone(),
+        match &self.active_tree().focused().surface.view {
+            SurfaceView::Draft(view) => view.read(cx).editor().clone(),
+            SurfaceView::Transcript { editor, .. } => editor.clone(),
+            SurfaceView::File(view) => view.read(cx).editor().clone(),
+            SurfaceView::Terminal(_) => self.draft_view.read(cx).editor().clone(),
         }
     }
 
@@ -1587,9 +1589,7 @@ impl Workspace {
     fn focus_active_surface(&self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.active_tree().focused().surface.view {
             SurfaceView::Draft(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
-            SurfaceView::Transcript(view) => {
-                window.focus(&view.read(cx).editor().focus_handle(cx), cx)
-            }
+            SurfaceView::Transcript { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
             SurfaceView::File(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
             SurfaceView::Terminal(view) => window.focus(&view.read(cx).focus_handle(cx), cx),
         }
@@ -1612,7 +1612,9 @@ impl Workspace {
             SurfaceKey::Draft => SurfaceView::Draft(self.draft_view.clone()),
             SurfaceKey::Transcript(agent_id) => {
                 let agent_id = *agent_id;
-                SurfaceView::Transcript(self.materialize_view(&agent_id, window, cx))
+                let model = self.materialize_model(&agent_id, cx);
+                let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
+                SurfaceView::Transcript { model, editor }
             }
             SurfaceKey::File { .. } => {
                 unreachable!("file surfaces are created by open_file_surface")
@@ -1624,10 +1626,10 @@ impl Workspace {
         Self::wrap_surface(key, view, window, cx)
     }
 
-    /// A surface for a new pane over the same content as `surface`. File
-    /// views get a fresh editor (own cursor and scroll) over the shared
-    /// buffer; transcript and draft views still share their editor until
-    /// their own model/view split lands.
+    /// A surface for a new pane over the same content as `surface`: file
+    /// and transcript panes get a fresh editor (own cursor, scroll, folds)
+    /// over the shared model; the draft still shares its editor until its
+    /// own model/view split lands.
     fn duplicate_surface(
         &mut self,
         surface: Surface,
@@ -1640,11 +1642,19 @@ impl Workspace {
                 let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
                 Self::wrap_surface(surface.key.clone(), SurfaceView::File(view), window, cx)
             }
+            SurfaceView::Transcript { model, .. } => {
+                let model = model.clone();
+                let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
+                Self::wrap_surface(
+                    surface.key.clone(),
+                    SurfaceView::Transcript { model, editor },
+                    window,
+                    cx,
+                )
+            }
             // Terminals share their view between panes: splitting a pane
             // does not attach a second wire client.
-            SurfaceView::Draft(_) | SurfaceView::Transcript(_) | SurfaceView::Terminal(_) => {
-                surface
-            }
+            SurfaceView::Draft(_) | SurfaceView::Terminal(_) => surface,
         }
     }
 
@@ -1662,10 +1672,7 @@ impl Workspace {
                 let editor = view.read(cx).editor();
                 (editor.focus_handle(cx), editor.entity_id())
             }
-            SurfaceView::Transcript(view) => {
-                let editor = view.read(cx).editor();
-                (editor.focus_handle(cx), editor.entity_id())
-            }
+            SurfaceView::Transcript { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
             SurfaceView::File(view) => {
                 let editor = view.read(cx).editor();
                 (editor.focus_handle(cx), editor.entity_id())
@@ -1912,11 +1919,11 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.read(cx).editor().clone())
                 .into_any_element(),
-            SurfaceView::Transcript(view) => div()
+            SurfaceView::Transcript { editor, .. } => div()
                 .id("rho-surface-transcript")
                 .size_full()
                 .overflow_hidden()
-                .child(view.read(cx).editor().clone())
+                .child(editor.clone())
                 .into_any_element(),
             SurfaceView::File(view) => div()
                 .id("rho-surface-file")
@@ -1934,7 +1941,7 @@ impl Workspace {
     }
 
     fn update_statuses(&self, cx: &mut Context<Self>) {
-        for (agent_id, view) in &self.views {
+        for (agent_id, view) in &self.models {
             self.refresh_view_status(agent_id, view, cx);
         }
     }
@@ -1993,7 +2000,7 @@ impl Workspace {
             return;
         }
         if !self
-            .active_agent_view()
+            .active_agent_model()
             .is_some_and(|view| view.read(cx).has_timers())
         {
             return;
@@ -2002,7 +2009,7 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let keep_going = this.update(cx, |this, cx| {
-                    let Some(view) = this.active_agent_view() else {
+                    let Some(view) = this.active_agent_model() else {
                         return false;
                     };
                     view.update(cx, |view, cx| {
