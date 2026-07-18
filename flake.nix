@@ -221,7 +221,16 @@
             };
           in
           rec {
-            workspaceDeps = craneLib.buildWorkspaceDepsOnly { };
+            workspaceDeps = craneLib.buildWorkspaceDepsOnly {
+              # Crane stubs every local package while caching workspace
+              # dependencies. The patched noq crates are dependencies of iroh,
+              # so they must retain their implementations in the dummy source.
+              extraDummyScript = ''
+                rm -rf $out/vendor/noq $out/vendor/noq-proto
+                cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/noq $out/vendor/noq
+                cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/noq-proto $out/vendor/noq-proto
+              '';
+            };
 
             workspace = craneLib.buildWorkspace {
               cargoArtifacts = workspaceDeps;
