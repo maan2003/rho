@@ -1,13 +1,12 @@
 //! The composition model: surfaces are the unit of content (emacs buffers),
 //! panes are viewports over them arranged in a split tree (emacs windows).
 //!
-//! The tree only stores [`SurfaceKey`]s — view entities live with the
-//! workspace, keyed by surface, independent of layout. A surface can be
-//! shown in several panes or in none; closing a pane never destroys
-//! content. Each pane keeps a history of surfaces it displayed so "go
-//! back" is per-viewport, like emacs window history.
-
-use std::collections::HashSet;
+//! The tree is generic over the surface type and owns what panes show:
+//! surface lifecycle is plain ownership. A surface shown in two panes is
+//! cloned into both (clones share view entities); once no pane shows or
+//! remembers a surface, dropping the last clone releases its resources.
+//! Each pane keeps a history of surfaces it displayed so "go back" is
+//! per-viewport, like emacs window history.
 
 use camino::Utf8PathBuf;
 use rho_ui_proto::AgentId;
@@ -37,9 +36,6 @@ pub struct SurfaceTraits {
     /// Whether the surface stretches to fill its pane (the rail keeps its
     /// intrinsic width instead).
     pub grows: bool,
-    /// Whether the surface holds live resources (remote channels) that
-    /// should be dropped once no pane references it.
-    pub transient_resources: bool,
 }
 
 impl SurfaceKey {
@@ -48,20 +44,13 @@ impl SurfaceKey {
             SurfaceKey::Rail => SurfaceTraits {
                 closable: false,
                 grows: false,
-                transient_resources: false,
             },
-            // Transcript and draft views double as materialization caches;
-            // they stay alive off-screen.
-            SurfaceKey::Draft | SurfaceKey::Transcript(_) => SurfaceTraits {
-                closable: true,
-                grows: true,
-                transient_resources: false,
-            },
-            SurfaceKey::File { .. } => SurfaceTraits {
-                closable: true,
-                grows: true,
-                transient_resources: true,
-            },
+            SurfaceKey::Draft | SurfaceKey::Transcript(_) | SurfaceKey::File { .. } => {
+                SurfaceTraits {
+                    closable: true,
+                    grows: true,
+                }
+            }
         }
     }
 }
@@ -76,20 +65,20 @@ pub enum SplitAxis {
     Column,
 }
 
-pub struct Pane {
+pub struct Pane<S> {
     pub id: PaneId,
-    pub surface: SurfaceKey,
+    pub surface: S,
     /// Previously shown surfaces, most recent last.
-    history: Vec<SurfaceKey>,
+    history: Vec<S>,
 }
 
-impl Pane {
-    pub fn show(&mut self, surface: SurfaceKey) {
+impl<S: Clone + PartialEq> Pane<S> {
+    pub fn show(&mut self, surface: S) {
         if surface == self.surface {
             return;
         }
         let previous = std::mem::replace(&mut self.surface, surface);
-        self.history.retain(|key| *key != previous);
+        self.history.retain(|s| *s != previous);
         self.history.push(previous);
     }
 
@@ -103,24 +92,23 @@ impl Pane {
             None => false,
         }
     }
-
 }
 
-enum Node {
-    Leaf(Pane),
-    Split { axis: SplitAxis, children: Vec<Node> },
+enum Node<S> {
+    Leaf(Pane<S>),
+    Split { axis: SplitAxis, children: Vec<Node<S>> },
 }
 
 /// A binary-ish split tree of panes plus a focus. The rail pane is a normal
 /// leaf created by the workspace; the tree itself has no special cases.
-pub struct PaneTree {
-    root: Node,
+pub struct PaneTree<S> {
+    root: Node<S>,
     focused: PaneId,
     next_id: PaneId,
 }
 
-impl PaneTree {
-    pub fn new(initial: SurfaceKey) -> Self {
+impl<S: Clone + PartialEq> PaneTree<S> {
+    pub fn new(initial: S) -> Self {
         Self {
             root: Node::Leaf(Pane {
                 id: 0,
@@ -136,11 +124,11 @@ impl PaneTree {
         self.focused
     }
 
-    pub fn focused(&self) -> &Pane {
+    pub fn focused(&self) -> &Pane<S> {
         self.pane(self.focused).expect("focused pane exists")
     }
 
-    pub fn focused_mut(&mut self) -> &mut Pane {
+    pub fn focused_mut(&mut self) -> &mut Pane<S> {
         let focused = self.focused;
         self.pane_mut(focused).expect("focused pane exists")
     }
@@ -151,20 +139,12 @@ impl PaneTree {
         }
     }
 
-    pub fn pane(&self, id: PaneId) -> Option<&Pane> {
-        fn find(node: &Node, id: PaneId) -> Option<&Pane> {
-            match node {
-                Node::Leaf(pane) => (pane.id == id).then_some(pane),
-                Node::Split { children, .. } => {
-                    children.iter().find_map(|child| find(child, id))
-                }
-            }
-        }
-        find(&self.root, id)
+    pub fn pane(&self, id: PaneId) -> Option<&Pane<S>> {
+        self.panes().into_iter().find(|pane| pane.id == id)
     }
 
-    pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
-        fn find(node: &mut Node, id: PaneId) -> Option<&mut Pane> {
+    pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane<S>> {
+        fn find<S>(node: &mut Node<S>, id: PaneId) -> Option<&mut Pane<S>> {
             match node {
                 Node::Leaf(pane) => (pane.id == id).then_some(pane),
                 Node::Split { children, .. } => {
@@ -176,8 +156,8 @@ impl PaneTree {
     }
 
     /// All panes in visual order (depth-first).
-    pub fn panes(&self) -> Vec<&Pane> {
-        fn walk<'a>(node: &'a Node, out: &mut Vec<&'a Pane>) {
+    pub fn panes(&self) -> Vec<&Pane<S>> {
+        fn walk<'a, S>(node: &'a Node<S>, out: &mut Vec<&'a Pane<S>>) {
             match node {
                 Node::Leaf(pane) => out.push(pane),
                 Node::Split { children, .. } => {
@@ -192,23 +172,28 @@ impl PaneTree {
         out
     }
 
-    /// The first pane showing `surface`, if any.
-    pub fn pane_showing(&self, surface: &SurfaceKey) -> Option<PaneId> {
+    /// The first pane whose current surface matches, if any.
+    pub fn pane_showing(&self, pred: impl Fn(&S) -> bool) -> Option<PaneId> {
         self.panes()
             .iter()
-            .find(|pane| pane.surface == *surface)
+            .find(|pane| pred(&pane.surface))
             .map(|pane| pane.id)
     }
 
-    /// Every surface some pane shows or remembers in its history. Surfaces
-    /// outside this set are unreachable through the layout.
-    pub fn referenced_surfaces(&self) -> HashSet<SurfaceKey> {
-        let mut referenced = HashSet::new();
-        for pane in self.panes() {
-            referenced.insert(pane.surface.clone());
-            referenced.extend(pane.history.iter().cloned());
-        }
-        referenced
+    /// The first surface (shown or in history) matching, if any. Lets the
+    /// workspace reuse a live surface instead of recreating it.
+    pub fn find_surface(&self, pred: impl Fn(&S) -> bool) -> Option<&S> {
+        let panes = self.panes();
+        panes
+            .iter()
+            .map(|pane| &pane.surface)
+            .find(|surface| pred(surface))
+            .or_else(|| {
+                panes
+                    .iter()
+                    .flat_map(|pane| pane.history.iter())
+                    .find(|surface| pred(surface))
+            })
     }
 
     /// Splits the focused pane along `axis`; the new pane shows the same
@@ -217,7 +202,12 @@ impl PaneTree {
         let id = self.next_id;
         self.next_id += 1;
         let focused = self.focused;
-        fn split_at(node: &mut Node, target: PaneId, axis: SplitAxis, id: PaneId) -> bool {
+        fn split_at<S: Clone>(
+            node: &mut Node<S>,
+            target: PaneId,
+            axis: SplitAxis,
+            id: PaneId,
+        ) -> bool {
             match node {
                 Node::Leaf(pane) if pane.id == target => {
                     let sibling = Pane {
@@ -268,10 +258,11 @@ impl PaneTree {
         id
     }
 
-    /// Closes the focused pane. The last pane never closes.
+    /// Closes the focused pane, dropping its surface and history. The last
+    /// pane never closes.
     pub fn close_focused(&mut self) {
         let target = self.focused;
-        fn remove(node: &mut Node, target: PaneId) -> bool {
+        fn remove<S>(node: &mut Node<S>, target: PaneId) -> bool {
             let Node::Split { children, .. } = node else {
                 return false;
             };
@@ -316,12 +307,12 @@ impl PaneTree {
     /// with the given container builders.
     pub fn layout<E>(
         &self,
-        leaf: &mut dyn FnMut(&Pane) -> E,
+        leaf: &mut dyn FnMut(&Pane<S>) -> E,
         container: &mut dyn FnMut(SplitAxis, Vec<E>) -> E,
     ) -> E {
-        fn walk<E>(
-            node: &Node,
-            leaf: &mut dyn FnMut(&Pane) -> E,
+        fn walk<S, E>(
+            node: &Node<S>,
+            leaf: &mut dyn FnMut(&Pane<S>) -> E,
             container: &mut dyn FnMut(SplitAxis, Vec<E>) -> E,
         ) -> E {
             match node {
@@ -376,5 +367,14 @@ mod tests {
         assert!(tree.focused_mut().back());
         assert_eq!(tree.focused().surface, SurfaceKey::Draft);
         assert!(!tree.focused_mut().back());
+    }
+
+    #[test]
+    fn find_surface_sees_history() {
+        let mut tree = PaneTree::new(SurfaceKey::Draft);
+        tree.focused_mut().show(transcript(1));
+        assert!(tree.find_surface(|s| *s == SurfaceKey::Draft).is_some());
+        assert!(tree.find_surface(|s| *s == transcript(1)).is_some());
+        assert!(tree.find_surface(|s| *s == transcript(2)).is_none());
     }
 }
