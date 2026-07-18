@@ -18,19 +18,17 @@ repository's validated landing command.
      stack above the configured base bookmark and moves the bookmark after
      checks pass.
 
-2. Run the repository land command from the checkout root. In this repo, the
-   reliable local invocation is:
-
-```sh
-cargo run -p rho-cli -- land
-```
-
-If the `rho` binary is already on `PATH`, this equivalent shorthand is also
-valid:
+2. Run the repository land command from the checkout root using the installed
+   `rho` binary:
 
 ```sh
 rho land
 ```
+
+   Do not substitute `cargo run -p rho-cli -- land`: that executes the working
+   copy's client, which may differ from the installed daemon/server version.
+   If `rho` is not on `PATH`, install the flake package first rather than
+   building an ad hoc landing client.
 
 3. If land fails, read `.rho/log/land-failure.txt` and fix the underlying
    issue. Do not report success unless the land command exits successfully.
