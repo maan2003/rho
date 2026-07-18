@@ -71,8 +71,13 @@ pub enum ConnEvent {
         workspace_counter: u64,
     },
     TagCreated(UiTag),
-    /// The daemon created an agent this connection asked for.
-    AgentCreated(AgentId),
+    /// The daemon created an agent this connection asked for. The tags ride
+    /// along so the agent's workstream context resolves before the next
+    /// `Ready` refresh lands.
+    AgentCreated {
+        agent_id: AgentId,
+        tags: Vec<rho_ui_proto::TagId>,
+    },
     AgentLoaded(AgentId),
     Frame {
         agent_id: AgentId,
@@ -318,7 +323,9 @@ async fn run(
                 workspace_counter,
             }),
             ServerMessage::TagCreated { tag } => Some(ConnEvent::TagCreated(tag)),
-            ServerMessage::AgentCreated { agent_id, .. } => Some(ConnEvent::AgentCreated(agent_id)),
+            ServerMessage::AgentCreated { agent_id, tags } => {
+                Some(ConnEvent::AgentCreated { agent_id, tags })
+            }
             ServerMessage::AgentLoaded { agent_id } => Some(ConnEvent::AgentLoaded(agent_id)),
             ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame {
                 agent_id,

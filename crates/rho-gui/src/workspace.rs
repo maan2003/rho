@@ -376,7 +376,8 @@ impl Workspace {
                 self.refresh_draft_agent_targets(cx);
                 cx.notify();
             }
-            ConnEvent::AgentCreated(agent_id) => {
+            ConnEvent::AgentCreated { agent_id, tags } => {
+                self.registry.note_agent_tags(agent_id, tags);
                 self.registry.mark_known(agent_id);
                 if self.awaiting_draft_agent {
                     self.awaiting_draft_agent = false;
@@ -1301,8 +1302,20 @@ impl Workspace {
             }
         };
         self.active_context = context;
-        let surface = self.make_surface(key, window, cx);
-        self.show_surface(surface);
+        // A pane already showing this surface keeps the arrangement intact:
+        // focus moves there instead of clobbering whatever the focused pane
+        // shows (a file view, another member's transcript).
+        match self
+            .contexts
+            .get(&self.active_context)
+            .and_then(|tree| tree.pane_showing(|s| s.key == key))
+        {
+            Some(pane) => self.active_tree_mut().focus(pane),
+            None => {
+                let surface = self.make_surface(key, window, cx);
+                self.show_surface(surface);
+            }
+        }
         self.focus_active_surface(window, cx);
         self.connection.focus_agent(agent_id);
         self.ensure_duration_timer(cx);

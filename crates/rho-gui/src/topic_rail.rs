@@ -5,10 +5,11 @@
 //! an attention rollup lamp, and small tags for member agents beyond the
 //! primary one (subagents, joiners). Clicking the row opens the workstream's
 //! primary agent (switching to its own pane arrangement); clicking a tag
-//! opens that member directly. A workstream's group shows as a dim
-//! annotation on the row — rows keep the plain pinned-first creation order.
-//! The `+` row opens the draft compose view and doubles as its selection
-//! indicator.
+//! opens that member directly. Workstreams sharing a workstream-group tag
+//! render together under the group's header, anchored where the group's
+//! best-sorted row would sit — so the rail's ordering still decides what
+//! surfaces, and grouping only gathers. The `+` row opens the draft compose
+//! view and doubles as its selection indicator.
 
 use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, TextStyle, div, px};
@@ -41,11 +42,22 @@ pub fn render_topic_rail(
 
     let (listed, folded) = registry.split_rows();
     let expanded = registry.rail_tail_expanded();
-    let mut rows = listed
-        .into_iter()
-        .map(|topic| {
+    // Expansion merges the folded tail back before grouping, so a group
+    // split across the fold reunites instead of repeating its header.
+    let display = if expanded {
+        listed.iter().chain(folded.iter()).copied().collect()
+    } else {
+        listed
+    };
+    // A group section anchors at its best-sorted member's position and
+    // gathers the rest of the group up to it; ungrouped rows stay put.
+    let mut rows: Vec<Div> = Vec::new();
+    let mut seen_groups = std::collections::BTreeSet::new();
+    for (index, topic) in display.iter().enumerate() {
+        let row = |topic, grouped: bool, cx: &mut Context<Workspace>| {
             task_row(
                 topic,
+                grouped,
                 selected_agent.as_ref(),
                 registry,
                 text_style,
@@ -54,25 +66,30 @@ pub fn render_topic_rail(
                 lamps,
                 cx,
             )
-        })
-        .collect::<Vec<_>>();
+        };
+        match topic.group {
+            None => rows.push(row(topic, false, cx)),
+            Some(group) => {
+                if !seen_groups.insert(group) {
+                    continue;
+                }
+                let name = registry
+                    .tag_name(group)
+                    .unwrap_or("group")
+                    .to_owned();
+                rows.push(group_header(&name, text_style));
+                for member in display[index..]
+                    .iter()
+                    .filter(|member| member.group == Some(group))
+                {
+                    rows.push(row(member, true, cx));
+                }
+            }
+        }
+    }
     // The quiet tail collapses behind a "n more" row; clicking expands the
     // folded rows in place (and again to fold them back).
     if !folded.is_empty() {
-        if expanded {
-            rows.extend(folded.iter().map(|topic| {
-                task_row(
-                    topic,
-                    selected_agent.as_ref(),
-                    registry,
-                    text_style,
-                    selected_color,
-                    tag_background,
-                    lamps,
-                    cx,
-                )
-            }));
-        }
         rows.push(fold_row(folded.len(), expanded, text_style, cx));
     }
 
@@ -112,6 +129,19 @@ pub fn render_topic_rail(
 
 /// How many member tags a task row shows before collapsing into `+n`.
 const VISIBLE_TAGS: usize = 4;
+
+/// A workstream-group's section header: a dim line with the group's name;
+/// its member rows indent beneath it.
+fn group_header(name: &str, text_style: &TextStyle) -> Div {
+    div()
+        .w_full()
+        .pl(px(4.))
+        .pt(px(4.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_color(text_style.color.opacity(0.5))
+        .child(name.to_owned())
+}
 
 /// The rail's collapsed tail: click to expand the folded rows in place
 /// (and again to fold them back).
@@ -423,6 +453,7 @@ impl LampColors {
 #[allow(clippy::too_many_arguments)]
 fn task_row(
     topic: &Workstream,
+    grouped: bool,
     selected_agent: Option<&AgentId>,
     registry: &AgentRegistry,
     text_style: &TextStyle,
@@ -465,12 +496,6 @@ fn task_row(
     } else {
         text_style.color.opacity(0.5)
     };
-    // The group reads as a dim annotation rather than a section, so rows
-    // keep their plain pinned-first creation order.
-    let group_name = topic
-        .group
-        .and_then(|group| registry.tag_name(group))
-        .map(str::to_owned);
     let members = agents.iter().skip(1).copied().collect::<Vec<_>>();
     let overflow = members.len().saturating_sub(VISIBLE_TAGS);
     let tags = members
@@ -501,7 +526,7 @@ fn task_row(
         .flex()
         .items_center()
         .gap_1()
-        .pl(px(4.))
+        .pl(px(if grouped { 14. } else { 4. }))
         .pt(px(2.))
         .overflow_hidden()
         .whitespace_nowrap()
@@ -535,12 +560,6 @@ fn task_row(
                 })
                 .child(title),
         )
-        .children(group_name.map(|name| {
-            div()
-                .flex_none()
-                .text_color(text_style.color.opacity(0.45))
-                .child(name)
-        }))
         .children(tags)
 }
 

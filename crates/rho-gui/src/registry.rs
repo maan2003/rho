@@ -105,6 +105,11 @@ pub struct AgentRegistry {
     /// The user clicked the rail's "n more" row: folded rows render in
     /// place until toggled back.
     rail_tail_expanded: bool,
+    /// Tags announced with `AgentCreated`, bridging the gap until the next
+    /// `Ready` refresh carries the agent's summary — so a fresh agent's
+    /// workstream context resolves immediately instead of falling back to
+    /// the draft context (and stranding pane splits there).
+    announced_tags: BTreeMap<AgentId, Vec<TagId>>,
     active: ActivePane,
     /// The daemon database's machine seed, from `Ready`; kept for consumers
     /// that resolve ids.
@@ -373,14 +378,23 @@ impl AgentRegistry {
             .map(|agent| agent.workspace.repo().to_owned())
     }
 
-    /// The workstream tag an agent currently carries.
+    /// The workstream tag an agent currently carries; falls back to the
+    /// tags announced at creation until the summary lands.
     pub fn workstream_of(&self, agent_id: AgentId) -> Option<TagId> {
-        let agent = self.agent_summary(agent_id)?;
-        agent.tags.iter().copied().find(|tag_id| {
+        let tags = match self.agent_summary(agent_id) {
+            Some(agent) => &agent.tags,
+            None => self.announced_tags.get(&agent_id)?,
+        };
+        tags.iter().copied().find(|tag_id| {
             self.tags
                 .iter()
                 .any(|tag| tag.tag_id == *tag_id && tag.kind == TagKind::Workstream)
         })
+    }
+
+    /// Records the tags announced with `AgentCreated`.
+    pub fn note_agent_tags(&mut self, agent_id: AgentId, tags: Vec<TagId>) {
+        self.announced_tags.insert(agent_id, tags);
     }
 
     /// The role-prefixed short display label, unique among generated IDs.
@@ -986,6 +1000,25 @@ mod tests {
             topic(3, Status::Normal, vec![agent(3, Status::Pinned)]),
         ]);
         assert_eq!(order(&registry), [2, 3, 1]);
+    }
+
+    #[test]
+    fn announced_tags_resolve_workstream_before_summary_lands() {
+        let mut registry = AgentRegistry::default();
+        set_topics(&mut registry, vec![topic(1, Status::Normal, vec![])]);
+
+        // AgentCreated announces the tags; the summary only arrives with
+        // the next Ready. The workstream must resolve in between, or the
+        // fresh agent's transcript lands in the draft context.
+        registry.note_agent_tags(agent_id(7), vec![TagId(1)]);
+        assert_eq!(registry.workstream_of(agent_id(7)), Some(TagId(1)));
+
+        // Once the summary lands it wins over the announcement.
+        set_topics(&mut registry, vec![
+            topic(1, Status::Normal, vec![]),
+            topic(2, Status::Normal, vec![agent(7, Status::Normal)]),
+        ]);
+        assert_eq!(registry.workstream_of(agent_id(7)), Some(TagId(2)));
     }
 
     #[test]
