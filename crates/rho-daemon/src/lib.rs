@@ -520,7 +520,7 @@ async fn run_iroh_listener(
     }
 }
 
-const FOCUSED_AGENT_STREAM_WEIGHT: NonZeroU16 = NonZeroU16::new(64).unwrap();
+const FOCUSED_AGENT_STREAM_WEIGHT: NonZeroU16 = NonZeroU16::new(200).unwrap();
 const MAX_IROH_AGENT_STREAMS: usize = 1024;
 
 /// Per-iroh-connection agent streams. Agent state is sent on daemon-opened

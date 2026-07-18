@@ -178,7 +178,7 @@ iroh sessions keep commands and lifecycle events on a high-priority
 bidirectional control stream (exactly one per physical connection); the daemon
 opens one unidirectional stream per non-hidden loaded agent, up to 1024, so
 state remains warm in the GUI cache without cross-agent
-head-of-line blocking. The focused stream has weight 64 and background streams
+head-of-line blocking. The focused stream has weight 200 and background streams
 weight 1 within their lower-priority class. Focus changes travel over the
 control stream and update transport weights without reopening streams. The
 same iroh endpoint carries a second ALPN for the web UI: newline-delimited JSON
