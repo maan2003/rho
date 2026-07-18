@@ -222,9 +222,9 @@ impl Minibuffer {
                 row
             })
             .collect::<Vec<_>>();
+        // Input first, candidates beneath it, like emacs completing-read.
         bottom_strip(text_style, cx)
             .key_context("RhoMinibuffer")
-            .children(rows)
             .child(
                 div()
                     .flex()
@@ -232,6 +232,7 @@ impl Minibuffer {
                     .child(div().child(self.prompt.clone()))
                     .child(div().flex_grow(1.0).child(self.editor.clone())),
             )
+            .children(rows)
             .into_any_element()
     }
 }
