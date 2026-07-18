@@ -140,6 +140,7 @@ pub fn open_file_buffer(
 pub struct FileView {
     editor: Entity<Editor>,
     project: Entity<Project>,
+    buffer: Entity<language::Buffer>,
 }
 
 impl FileView {
@@ -150,12 +151,22 @@ impl FileView {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor =
-            cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
-        Self { editor, project }
+            cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx));
+        Self {
+            editor,
+            project,
+            buffer,
+        }
     }
 
     pub fn editor(&self) -> &Entity<Editor> {
         &self.editor
+    }
+
+    /// The shared content behind this view; a split builds a sibling view
+    /// (its own editor, cursor, scroll) over the same pair.
+    pub fn shared_content(&self) -> (Entity<Project>, Entity<language::Buffer>) {
+        (self.project.clone(), self.buffer.clone())
     }
 
 

@@ -2,11 +2,12 @@
 //! panes are viewports over them arranged in a split tree (emacs windows).
 //!
 //! The tree is generic over the surface type and owns what panes show:
-//! surface lifecycle is plain ownership. A surface shown in two panes is
-//! cloned into both (clones share view entities); once no pane shows or
-//! remembers a surface, dropping the last clone releases its resources.
-//! Each pane keeps a history of surfaces it displayed so "go back" is
-//! per-viewport, like emacs window history.
+//! surface lifecycle is plain ownership — once no pane shows or remembers
+//! a surface, dropping it releases its resources. Splitting takes the new
+//! pane's surface by value: the caller builds a fresh view over the same
+//! content, so each pane owns its own cursor and scroll. Each pane keeps a
+//! history of surfaces it displayed so "go back" is per-viewport, like
+//! emacs window history.
 
 use camino::Utf8PathBuf;
 use rho_ui_proto::AgentId;
@@ -14,9 +15,6 @@ use rho_ui_proto::AgentId;
 /// Stable identity of a surface, independent of any view entity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SurfaceKey {
-    /// The agent/topic rail: navigation, but a first-class surface so it
-    /// can be focused and driven with the same key vocabulary.
-    Rail,
     /// The new-agent compose surface.
     Draft,
     /// An agent's conversation (transcript + prompt).
@@ -26,33 +24,6 @@ pub enum SurfaceKey {
         agent_id: AgentId,
         path: Utf8PathBuf,
     },
-}
-
-/// Per-kind layout and lifecycle policy, so the workspace asks the surface
-/// instead of matching on it in six places.
-pub struct SurfaceTraits {
-    /// Whether a pane showing this surface may be closed.
-    pub closable: bool,
-    /// Whether the surface stretches to fill its pane (the rail keeps its
-    /// intrinsic width instead).
-    pub grows: bool,
-}
-
-impl SurfaceKey {
-    pub fn traits(&self) -> SurfaceTraits {
-        match self {
-            SurfaceKey::Rail => SurfaceTraits {
-                closable: false,
-                grows: false,
-            },
-            SurfaceKey::Draft | SurfaceKey::Transcript(_) | SurfaceKey::File { .. } => {
-                SurfaceTraits {
-                    closable: true,
-                    grows: true,
-                }
-            }
-        }
-    }
 }
 
 pub type PaneId = u64;
@@ -72,7 +43,7 @@ pub struct Pane<S> {
     history: Vec<S>,
 }
 
-impl<S: Clone + PartialEq> Pane<S> {
+impl<S: PartialEq> Pane<S> {
     pub fn show(&mut self, surface: S) {
         if surface == self.surface {
             return;
@@ -99,15 +70,14 @@ enum Node<S> {
     Split { axis: SplitAxis, children: Vec<Node<S>> },
 }
 
-/// A binary-ish split tree of panes plus a focus. The rail pane is a normal
-/// leaf created by the workspace; the tree itself has no special cases.
+/// A binary-ish split tree of panes plus a focus.
 pub struct PaneTree<S> {
     root: Node<S>,
     focused: PaneId,
     next_id: PaneId,
 }
 
-impl<S: Clone + PartialEq> PaneTree<S> {
+impl<S: PartialEq> PaneTree<S> {
     pub fn new(initial: S) -> Self {
         Self {
             root: Node::Leaf(Pane {
@@ -196,25 +166,21 @@ impl<S: Clone + PartialEq> PaneTree<S> {
             })
     }
 
-    /// Splits the focused pane along `axis`; the new pane shows the same
-    /// surface and takes focus.
-    pub fn split(&mut self, axis: SplitAxis) -> PaneId {
+    /// Splits the focused pane along `axis`; the new pane shows `surface`
+    /// and takes focus. The caller builds the sibling surface (usually a
+    /// fresh view over the same content — each pane owns its own cursor).
+    pub fn split(&mut self, axis: SplitAxis, surface: S) -> PaneId {
         let id = self.next_id;
         self.next_id += 1;
         let focused = self.focused;
-        fn split_at<S: Clone>(
+        fn split_at<S>(
             node: &mut Node<S>,
             target: PaneId,
             axis: SplitAxis,
-            id: PaneId,
-        ) -> bool {
+            sibling: Pane<S>,
+        ) -> Result<(), Pane<S>> {
             match node {
                 Node::Leaf(pane) if pane.id == target => {
-                    let sibling = Pane {
-                        id,
-                        surface: pane.surface.clone(),
-                        history: Vec::new(),
-                    };
                     let old = std::mem::replace(
                         node,
                         Node::Split {
@@ -227,34 +193,39 @@ impl<S: Clone + PartialEq> PaneTree<S> {
                     };
                     children.push(old);
                     children.push(Node::Leaf(sibling));
-                    true
+                    Ok(())
                 }
-                Node::Leaf(_) => false,
+                Node::Leaf(_) => Err(sibling),
                 Node::Split { axis: node_axis, children } => {
                     // Splitting along the parent's own axis just inserts a
                     // sibling instead of nesting another level.
-                    for (index, child) in children.iter_mut().enumerate() {
-                        if let Node::Leaf(pane) = child
-                            && pane.id == target
-                            && *node_axis == axis
-                        {
-                            let sibling = Pane {
-                                id,
-                                surface: pane.surface.clone(),
-                                history: Vec::new(),
-                            };
-                            children.insert(index + 1, Node::Leaf(sibling));
-                            return true;
+                    if *node_axis == axis
+                        && let Some(index) = children.iter().position(
+                            |child| matches!(child, Node::Leaf(pane) if pane.id == target),
+                        )
+                    {
+                        children.insert(index + 1, Node::Leaf(sibling));
+                        return Ok(());
+                    }
+                    let mut sibling = sibling;
+                    for child in children.iter_mut() {
+                        match split_at(child, target, axis, sibling) {
+                            Ok(()) => return Ok(()),
+                            Err(returned) => sibling = returned,
                         }
                     }
-                    children
-                        .iter_mut()
-                        .any(|child| split_at(child, target, axis, id))
+                    Err(sibling)
                 }
             }
         }
-        split_at(&mut self.root, focused, axis, id);
-        self.focused = id;
+        let sibling = Pane {
+            id,
+            surface,
+            history: Vec::new(),
+        };
+        if split_at(&mut self.root, focused, axis, sibling).is_ok() {
+            self.focused = id;
+        }
         id
     }
 
@@ -342,12 +313,12 @@ mod tests {
     #[test]
     fn split_close_focus_cycle() {
         let mut tree = PaneTree::new(SurfaceKey::Draft);
-        let right = tree.split(SplitAxis::Row);
+        let right = tree.split(SplitAxis::Row, transcript(1));
         assert_eq!(tree.focused_id(), right);
         assert_eq!(tree.panes().len(), 2);
 
         // Sibling insertion instead of nesting on same-axis splits.
-        tree.split(SplitAxis::Row);
+        tree.split(SplitAxis::Row, transcript(2));
         assert_eq!(tree.panes().len(), 3);
 
         tree.focus_by_delta(1);
