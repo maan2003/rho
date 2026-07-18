@@ -1,13 +1,13 @@
 //! The composition model: surfaces are the unit of content (emacs buffers),
 //! panes are viewports over them arranged in a split tree (emacs windows).
 //!
-//! The tree is generic over the surface type and owns what panes show:
-//! surface lifecycle is plain ownership — once no pane shows or remembers
-//! a surface, dropping it releases its resources. Splitting takes the new
-//! pane's surface by value: the caller builds a fresh view over the same
-//! content, so each pane owns its own cursor and scroll. Each pane keeps a
-//! history of surfaces it displayed so "go back" is per-viewport, like
-//! emacs window history.
+//! The tree is generic over the surface type and only concerns display:
+//! surfaces themselves are retained by the workspace's per-context surface
+//! list, so panes can shuffle, cover, or close without losing content.
+//! Splitting takes the new pane's surface by value: the caller builds a
+//! fresh view over the same content, so each pane owns its own cursor and
+//! scroll. Each pane keeps a history of surfaces it displayed so "go back"
+//! is per-viewport, like emacs window history.
 
 use camino::Utf8PathBuf;
 use rho_ui_proto::AgentId;
@@ -26,6 +26,17 @@ pub enum SurfaceKey {
     },
     /// A daemon-owned terminal attached over a dedicated stream.
     Terminal { agent_id: AgentId, terminal_id: u64 },
+}
+
+impl SurfaceKey {
+    /// Conversation content (the draft composer, agent transcripts), as
+    /// opposed to artifacts the user opened deliberately (files,
+    /// terminals). Display policy routes conversations through panes
+    /// already showing conversation, so switching agents never covers an
+    /// artifact pane.
+    pub fn is_conversation(&self) -> bool {
+        matches!(self, SurfaceKey::Draft | SurfaceKey::Transcript(_))
+    }
 }
 
 pub type PaneId = u64;
@@ -153,22 +164,6 @@ impl<S: PartialEq> PaneTree<S> {
             .iter()
             .find(|pane| pred(&pane.surface))
             .map(|pane| pane.id)
-    }
-
-    /// The first surface (shown or in history) matching, if any. Lets the
-    /// workspace reuse a live surface instead of recreating it.
-    pub fn find_surface(&self, pred: impl Fn(&S) -> bool) -> Option<&S> {
-        let panes = self.panes();
-        panes
-            .iter()
-            .map(|pane| &pane.surface)
-            .find(|surface| pred(surface))
-            .or_else(|| {
-                panes
-                    .iter()
-                    .flat_map(|pane| pane.history.iter())
-                    .find(|surface| pred(surface))
-            })
     }
 
     /// Splits the focused pane along `axis`; the new pane shows `surface`
@@ -346,14 +341,5 @@ mod tests {
         assert!(tree.focused_mut().back());
         assert_eq!(tree.focused().surface, SurfaceKey::Draft);
         assert!(!tree.focused_mut().back());
-    }
-
-    #[test]
-    fn find_surface_sees_history() {
-        let mut tree = PaneTree::new(SurfaceKey::Draft);
-        tree.focused_mut().show(transcript(1));
-        assert!(tree.find_surface(|s| *s == SurfaceKey::Draft).is_some());
-        assert!(tree.find_surface(|s| *s == transcript(1)).is_some());
-        assert!(tree.find_surface(|s| *s == transcript(2)).is_none());
     }
 }

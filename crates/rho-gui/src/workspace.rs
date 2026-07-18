@@ -37,10 +37,10 @@ use crate::{
     RoleCycle, RoleCycleGroup, SubmitPrompt, TaskBoard,
 };
 
-/// What a pane shows: stable identity plus the live view. Panes own their
-/// surfaces, so view lifecycle is plain ownership — when the last pane
-/// showing or remembering a surface drops it, the view (and any remote
-/// channel behind it) is released with it.
+/// What a pane shows: stable identity plus the live view. Surfaces live
+/// in their context's surface list for the context's lifetime; panes hold
+/// clones of the same view handles, so display is cheap and the view (and
+/// any remote channel behind it) releases when the context closes.
 #[derive(Clone)]
 pub struct Surface {
     key: SurfaceKey,
@@ -115,11 +115,16 @@ pub struct Workspace {
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
-    /// Per-context split trees of viewports over surfaces. Each tree owns
-    /// the surfaces it shows (file views close their zed channel when the
-    /// last pane referencing them goes away). The rail is ambient chrome
-    /// beside the active tree, not a pane in it.
+    /// Per-context split trees of viewports over surfaces. The rail is
+    /// ambient chrome beside the active tree, not a pane in it.
     contexts: HashMap<ContextId, PaneTree<Surface>>,
+    /// Per-context surface list, the emacs buffer list: every surface
+    /// opened in a context lives here for the context's lifetime,
+    /// regardless of what its panes currently display. Panes are
+    /// viewports over this list — covering or closing one never loses a
+    /// file or terminal; the views (and any zed channel behind them)
+    /// release when the context itself closes.
+    surfaces: HashMap<ContextId, Vec<Surface>>,
     /// Always present in `contexts` (the draft context never closes).
     active_context: ContextId,
     /// Keyboard focus for the ambient rail (it has no editor).
@@ -167,6 +172,7 @@ impl Workspace {
             duration_timer: None,
             chime: Chime::default(),
             contexts: HashMap::new(),
+            surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             rail_focus: cx.focus_handle(),
             minibuffer: None,
@@ -174,7 +180,7 @@ impl Workspace {
             _event_task: event_task,
         };
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
-        this.contexts.insert(ContextId::Draft, PaneTree::new(draft));
+        this.display_surface(draft);
         this.seed_draft(false, window, cx);
         this.focus_active_surface(window, cx);
         this
@@ -210,10 +216,12 @@ impl Workspace {
             .iter()
             .map(|workstream| workstream.tag_id)
             .collect::<HashSet<_>>();
-        self.contexts.retain(|context, _| match context {
+        let keep = |context: &ContextId| match context {
             ContextId::Draft => true,
             ContextId::Task(tag_id) => live.contains(tag_id),
-        });
+        };
+        self.contexts.retain(|context, _| keep(context));
+        self.surfaces.retain(|context, _| keep(context));
         if !self.contexts.contains_key(&self.active_context) {
             self.active_context = ContextId::Draft;
         }
@@ -1316,47 +1324,55 @@ impl Workspace {
             }
         };
         self.active_context = context;
-        // A pane already showing this surface keeps the arrangement intact:
-        // focus moves there instead of clobbering whatever the focused pane
-        // shows (a file view, another member's transcript).
-        match self
-            .contexts
-            .get(&self.active_context)
-            .and_then(|tree| tree.pane_showing(|s| s.key == key))
-        {
-            Some(pane) => self.active_tree_mut().focus(pane),
-            None => {
-                // Opened files stay put: when the focused pane shows a file,
-                // the incoming transcript lands in a pane already hosting
-                // conversation surfaces (falling back to the focused pane
-                // only when every pane shows a file).
-                if let Some(tree) = self.contexts.get(&self.active_context)
-                    && matches!(tree.focused().surface.key, SurfaceKey::File { .. })
-                    && let Some(pane) =
-                        tree.pane_showing(|s| !matches!(s.key, SurfaceKey::File { .. }))
-                {
-                    self.active_tree_mut().focus(pane);
-                }
-                let surface = self.make_surface(key, window, cx);
-                self.show_surface(surface);
-            }
-        }
+        let surface = self.make_surface(key, window, cx);
+        self.display_surface(surface);
         self.focus_active_surface(window, cx);
         self.connection.focus_agent(agent_id);
         self.ensure_duration_timer(cx);
         cx.notify();
     }
 
-    /// Shows a surface in the active context's focused pane, founding the
-    /// context's tree when this is its first visit.
-    fn show_surface(&mut self, surface: Surface) {
+    /// The active context's surface with the given key, whether or not
+    /// any pane currently displays it.
+    fn find_surface(&self, pred: impl Fn(&Surface) -> bool) -> Option<&Surface> {
+        self.surfaces
+            .get(&self.active_context)?
+            .iter()
+            .find(|surface| pred(surface))
+    }
+
+    /// Emacs `display-buffer`: the one place pane choice happens. The
+    /// surface joins the context's surface list first, so it stays alive
+    /// however panes shuffle afterwards. Then, in order: a pane already
+    /// showing it wins (the arrangement stays intact); a conversation
+    /// surface arriving while an artifact pane (file, terminal) is
+    /// focused lands in a pane already showing conversation, so
+    /// switching agents never covers something opened deliberately;
+    /// otherwise the focused pane. Founds the context's tree on its
+    /// first visit.
+    fn display_surface(&mut self, surface: Surface) {
         use std::collections::hash_map::Entry;
-        match self.contexts.entry(self.active_context) {
-            Entry::Occupied(mut entry) => entry.get_mut().focused_mut().show(surface),
+        let list = self.surfaces.entry(self.active_context).or_default();
+        match list.iter_mut().find(|s| **s == surface) {
+            Some(existing) => *existing = surface.clone(),
+            None => list.push(surface.clone()),
+        }
+        let tree = match self.contexts.entry(self.active_context) {
             Entry::Vacant(entry) => {
                 entry.insert(PaneTree::new(surface));
+                return;
             }
+            Entry::Occupied(entry) => entry.into_mut(),
+        };
+        let target = tree.pane_showing(|s| s.key == surface.key).or_else(|| {
+            (surface.key.is_conversation() && !tree.focused().surface.key.is_conversation())
+                .then(|| tree.pane_showing(|s| s.key.is_conversation()))
+                .flatten()
+        });
+        if let Some(pane) = target {
+            tree.focus(pane);
         }
+        tree.focused_mut().show(surface);
     }
 
     /// `:open`: dials a zed channel for the agent's workspace (once per
@@ -1372,16 +1388,8 @@ impl Workspace {
             agent_id,
             path: path.clone(),
         };
-        if let Some(surface) = self
-            .contexts
-            .get(&self.active_context)
-            .and_then(|tree| tree.find_surface(|s| s.key == key))
-            .cloned()
-        {
-            self.show_surface(surface);
-            if let Some(pane) = self.active_tree().pane_showing(|s| s.key == key) {
-                self.active_tree_mut().focus(pane);
-            }
+        if let Some(surface) = self.find_surface(|s| s.key == key).cloned() {
+            self.display_surface(surface);
             cx.notify();
             return;
         }
@@ -1392,7 +1400,7 @@ impl Workspace {
                 let _ = this.update_in(cx, |this, window, cx| {
                     let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
                     let surface = Self::wrap_surface(key, SurfaceView::File(view), window, cx);
-                    this.show_surface(surface);
+                    this.display_surface(surface);
                     this.focus_active_surface(window, cx);
                     cx.notify();
                 });
@@ -1417,16 +1425,12 @@ impl Workspace {
     fn open_terminal_surface(&mut self, agent_id: AgentId, new: bool, cx: &mut Context<Self>) {
         if !new
             && let Some(surface) = self
-                .contexts
-                .get(&self.active_context)
-                .and_then(|tree| {
-                    tree.find_surface(|s| {
-                        matches!(s.key, SurfaceKey::Terminal { agent_id: id, .. } if id == agent_id)
-                    })
+                .find_surface(|s| {
+                    matches!(s.key, SurfaceKey::Terminal { agent_id: id, .. } if id == agent_id)
                 })
                 .cloned()
         {
-            self.show_surface(surface);
+            self.display_surface(surface);
             cx.notify();
             return;
         }
@@ -1449,7 +1453,7 @@ impl Workspace {
                             cx.new(|cx| crate::terminal_view::TerminalView::new(channel, cx));
                         let surface =
                             Self::wrap_surface(key, SurfaceView::Terminal(view), window, cx);
-                        this.show_surface(surface);
+                        this.display_surface(surface);
                         this.focus_active_surface(window, cx);
                         cx.notify();
                     });
@@ -1601,11 +1605,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Surface {
-        if let Some(existing) = self
-            .contexts
-            .get(&self.active_context)
-            .and_then(|tree| tree.find_surface(|s| s.key == key))
-        {
+        if let Some(existing) = self.find_surface(|s| s.key == key) {
             return existing.clone();
         }
         let view = match &key {
