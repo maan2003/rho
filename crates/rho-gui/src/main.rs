@@ -423,7 +423,9 @@ fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("space w w", PaneFocusNext, Some(context)),
             KeyBinding::new("space b", PaneBack, Some(context)),
             KeyBinding::new("space r", RailFocus, Some(context)),
-            KeyBinding::new("space :", MinibufferCommand, Some(context)),
+            // Vim's own command line: `:` drops into the minibuffer. Loads
+            // after the vim keymap, so it beats any bundled `:` binding.
+            KeyBinding::new(":", MinibufferCommand, Some(context)),
         ]);
     }
     // Minibuffer keys. The input is a single-line editor (vim skips those),
