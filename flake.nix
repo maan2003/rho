@@ -163,6 +163,9 @@
           path = "lib.rs"
         '';
         zedVendorLib = pkgs.writeText "zed-vendor-lib.rs" "";
+        zedVendorChecksum = pkgs.writeText "zed-vendor-checksum.json" ''
+          {"files":{},"package":null}
+        '';
 
         multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
           craneLib':
@@ -209,6 +212,7 @@
                 mkdir "$zedPackage"
                 ln -s ${zedVendorManifest} "$zedPackage/Cargo.toml"
                 ln -s ${zedVendorLib} "$zedPackage/lib.rs"
+                ln -s ${zedVendorChecksum} "$zedPackage/.cargo-checksum.json"
               done
             '';
             craneLib = craneLibBase.overrideArgs {
