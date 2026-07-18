@@ -186,8 +186,9 @@
               # definitions from its build script. Git dependencies live one
               # directory below their source hash in Crane's vendor tree.
               for extensionHost in $out/*/extension_host-*; do
-                ln -s ${zedSrc}/crates/extension_api \
-                  "$(dirname "$extensionHost")/extension_api"
+                extensionApi="$(dirname "$extensionHost")/extension_api"
+                mkdir "$extensionApi"
+                ln -s ${zedSrc}/crates/extension_api/wit "$extensionApi/wit"
               done
             '';
             craneLib = craneLibBase.overrideArgs {
