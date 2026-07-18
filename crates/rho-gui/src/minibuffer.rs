@@ -53,11 +53,12 @@ impl Echo {
         let mut rows = lines
             .into_iter()
             .take(ECHO_MAX_LINES)
-            .map(|line| div().child(line.to_owned()))
+            .map(|line| div().px_2().child(line.to_owned()))
             .collect::<Vec<_>>();
         if truncated {
             rows.push(
                 div()
+                    .px_2()
                     .text_color(colors.text_muted)
                     .child("… (full text in the transcript)"),
             );
@@ -79,11 +80,13 @@ fn bottom_strip(text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> gpui::
         .flex_col()
         .flex_none()
         .w_full()
-        .px_2()
         .py(px(2.))
         .bg(cx.theme().colors().editor_background)
+        .text_color(text_style.color)
         .font_family(text_style.font_family.clone())
+        .font_weight(text_style.font_weight)
         .text_size(text_style.font_size)
+        .line_height(text_style.line_height)
 }
 
 /// Recomputes candidates for the current input.
@@ -204,10 +207,14 @@ impl Minibuffer {
             .take(VISIBLE_CANDIDATES)
             .map(|(index, candidate)| {
                 let selected = index == self.selected;
+                // Padding lives on the row, not the strip, so the
+                // selection background spans the full width.
                 let mut row = div()
                     .flex()
                     .flex_row()
                     .gap_2()
+                    .w_full()
+                    .px_2()
                     .child(div().child(candidate.value.clone()));
                 if !candidate.description.is_empty() {
                     row = row.child(
@@ -229,6 +236,8 @@ impl Minibuffer {
                 div()
                     .flex()
                     .flex_row()
+                    .items_center()
+                    .px_2()
                     .child(div().child(self.prompt.clone()))
                     .child(div().flex_grow(1.0).child(self.editor.clone())),
             )
