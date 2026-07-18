@@ -17,7 +17,68 @@ use gpui::{
 use theme::ActiveTheme as _;
 
 use crate::commands::Candidate;
+use crate::style::StyleClass;
 use crate::workspace::Workspace;
+
+/// How long an echoed message stays visible.
+pub const ECHO_DURATION: std::time::Duration = std::time::Duration::from_secs(6);
+/// Long messages (`:help`) are capped in the echo area; the transcript
+/// keeps the full copy.
+const ECHO_MAX_LINES: usize = 12;
+
+/// The emacs echo area: the most recent system notice, flashed in the
+/// bottom strip. The durable copy lives in the transcript log; this is
+/// the at-a-glance one. Dropping it (replacement or timer) dismisses it.
+pub struct Echo {
+    text: String,
+    class: StyleClass,
+    /// Timer that clears the message; cancelled by drop on replacement.
+    pub _dismiss: gpui::Task<()>,
+}
+
+impl Echo {
+    pub fn new(text: &str, class: StyleClass, dismiss: gpui::Task<()>) -> Self {
+        Self {
+            text: text.to_owned(),
+            class,
+            _dismiss: dismiss,
+        }
+    }
+
+    pub fn render(&self, text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let style = self.class.resolve(cx);
+        let lines = self.text.lines().collect::<Vec<_>>();
+        let truncated = lines.len() > ECHO_MAX_LINES;
+        let mut rows = lines
+            .into_iter()
+            .take(ECHO_MAX_LINES)
+            .map(|line| div().child(line.to_owned()))
+            .collect::<Vec<_>>();
+        if truncated {
+            rows.push(
+                div()
+                    .text_color(colors.text_muted)
+                    .child("… (full text in the transcript)"),
+            );
+        }
+        let mut area = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .px_2()
+            .py(px(2.))
+            .border_t_1()
+            .border_color(colors.border_variant)
+            .bg(colors.elevated_surface_background)
+            .font_family(text_style.font_family.clone());
+        if let Some(color) = style.color {
+            area = area.text_color(color);
+        }
+        area.children(rows).into_any_element()
+    }
+}
 
 /// Recomputes candidates for the current input.
 pub type CandidateSource = Rc<dyn Fn(&Workspace, &str, &App) -> Vec<Candidate>>;

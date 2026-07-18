@@ -24,7 +24,7 @@ use crate::agent_view::AgentView;
 use crate::chime::Chime;
 use crate::connection::{ConnEvent, Connection};
 use crate::draft_view::DraftView;
-use crate::minibuffer::Minibuffer;
+use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer};
 use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
 use crate::zed_remote::FileView;
 use crate::registry::{ActivePane, AgentRegistry};
@@ -123,6 +123,9 @@ pub struct Workspace {
     rail_focus: gpui::FocusHandle,
     /// The completing-read strip at the bottom of the window, when open.
     minibuffer: Option<Minibuffer>,
+    /// The last system notice, flashed in the bottom strip (emacs echo
+    /// area). Cleared by its own timer or when the minibuffer opens.
+    echo: Option<Echo>,
     _event_task: Task<()>,
 }
 
@@ -169,6 +172,7 @@ impl Workspace {
             }),
             rail_focus: cx.focus_handle(),
             minibuffer: None,
+            echo: None,
             _event_task: event_task,
         };
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
@@ -1201,8 +1205,10 @@ impl Workspace {
             .unwrap_or(path)
     }
 
+    /// Emacs `message`: the notice lands in the transcript (the durable
+    /// log) and flashes in the echo area at the bottom of the window.
     fn notice_on(
-        &self,
+        &mut self,
         agent_id: Option<&AgentId>,
         text: &str,
         class: StyleClass,
@@ -1218,6 +1224,21 @@ impl Workspace {
                 .draft_view
                 .update(cx, |view, cx| view.system_notice(text, class, cx)),
         }
+        self.echo(text, class, cx);
+    }
+
+    /// Shows a message in the echo area; replacing a message cancels its
+    /// predecessor's dismiss timer.
+    fn echo(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
+        let dismiss = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ECHO_DURATION).await;
+            let _ = this.update(cx, |this, cx| {
+                this.echo = None;
+                cx.notify();
+            });
+        });
+        self.echo = Some(Echo::new(text, class, dismiss));
+        cx.notify();
     }
 
     pub fn select_agent(
@@ -1615,6 +1636,9 @@ impl Workspace {
         let mut minibuffer = Minibuffer::open(":", complete, on_submit, window, cx);
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
+        // The minibuffer takes over the bottom strip; a stale message
+        // reappearing after it closes would be confusing.
+        self.echo = None;
         cx.notify();
     }
 
@@ -2068,11 +2092,11 @@ impl Render for Workspace {
                 }
             }))
             .child(self.render_panes(&text_style, cx))
-            .children(
-                self.minibuffer
-                    .as_ref()
-                    .map(|minibuffer| minibuffer.render(cx)),
-            )
+            .children(match (&self.minibuffer, &self.echo) {
+                (Some(minibuffer), _) => Some(minibuffer.render(cx)),
+                (None, Some(echo)) => Some(echo.render(&text_style, cx)),
+                (None, None) => None,
+            })
     }
 }
 
