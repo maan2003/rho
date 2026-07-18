@@ -24,11 +24,14 @@ use crate::agent_view::AgentView;
 use crate::chime::Chime;
 use crate::connection::{ConnEvent, Connection};
 use crate::draft_view::DraftView;
+use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
+use crate::zed_remote::FileView;
 use crate::registry::{ActivePane, AgentRegistry};
 use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
 use crate::{
-    AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, RoleCycle, RoleCycleGroup,
+    AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, PaneBack, PaneClose,
+    PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup,
     SubmitPrompt, TaskBoard,
 };
 
@@ -76,6 +79,13 @@ pub struct Workspace {
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
+    /// The split-tree of viewports over surfaces; the rail is its leftmost
+    /// pane.
+    panes: PaneTree,
+    /// Open remote-file surfaces; each owns its own zed channel.
+    file_views: HashMap<(AgentId, Utf8PathBuf), Entity<FileView>>,
+    /// Keyboard focus for the rail surface (it has no editor).
+    rail_focus: gpui::FocusHandle,
     _event_task: Task<()>,
 }
 
@@ -115,10 +125,18 @@ impl Workspace {
             connected: false,
             duration_timer: None,
             chime: Chime::default(),
+            panes: {
+                let mut panes = PaneTree::new(SurfaceKey::Rail);
+                panes.split(SplitAxis::Row);
+                panes.focused_mut().show(SurfaceKey::Draft);
+                panes
+            },
+            file_views: HashMap::new(),
+            rail_focus: cx.focus_handle(),
             _event_task: event_task,
         };
         this.seed_draft(false, window, cx);
-        this.focus_active_editor(window, cx);
+        this.focus_active_surface(window, cx);
         this
     }
 
@@ -813,21 +831,7 @@ impl Workspace {
                     );
                     return;
                 };
-                let task =
-                    crate::zed_remote::open_file_window(&self.connection, workspace, path, cx);
-                cx.spawn(async move |this, cx| {
-                    if let Err(error) = task.await {
-                        let _ = this.update(cx, |this, cx| {
-                            this.notice_on(
-                                None,
-                                &format!(":open failed: {error:#}"),
-                                StyleClass::SystemInfo,
-                                cx,
-                            );
-                        });
-                    }
-                })
-                .detach();
+                self.open_file_surface(agent_id, workspace, path, cx);
             }
 
             Command::Quit => cx.quit(),
@@ -1172,13 +1176,98 @@ impl Workspace {
             let view = self.materialize_view(agent_id, window, cx);
             view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         }
-        match agent_id {
-            Some(agent_id) => self.registry.select_agent(agent_id),
-            None => self.registry.enter_draft(),
-        }
-        self.focus_active_editor(window, cx);
+        let surface = match agent_id {
+            Some(agent_id) => {
+                self.registry.select_agent(agent_id);
+                SurfaceKey::Transcript(agent_id)
+            }
+            None => {
+                self.registry.enter_draft();
+                SurfaceKey::Draft
+            }
+        };
+        self.show_surface_in_main(surface);
+        self.focus_active_surface(window, cx);
         self.ensure_duration_timer(cx);
         cx.notify();
+    }
+
+    /// Shows a surface in the "main" pane: the focused one unless the rail
+    /// is focused, then the first non-rail pane (created by splitting when
+    /// the rail is all that's left).
+    fn show_surface_in_main(&mut self, surface: SurfaceKey) {
+        if self.panes.focused().surface != SurfaceKey::Rail {
+            self.panes.focused_mut().show(surface);
+            return;
+        }
+        let main = self
+            .panes
+            .panes()
+            .iter()
+            .find(|pane| pane.surface != SurfaceKey::Rail)
+            .map(|pane| pane.id);
+        match main {
+            Some(id) => {
+                let rail = self.panes.focused_id();
+                self.panes.focus(id);
+                self.panes.focused_mut().show(surface);
+                // Selection from the rail keeps the rail focused.
+                self.panes.focus(rail);
+            }
+            None => {
+                self.panes.split(SplitAxis::Row);
+                self.panes.focused_mut().show(surface);
+            }
+        }
+    }
+
+    /// `:open`: dials a zed channel for the agent's workspace (once per
+    /// file) and shows the file surface in the main pane.
+    fn open_file_surface(
+        &mut self,
+        agent_id: AgentId,
+        workspace: rho_ui_proto::WorkspaceInfo,
+        path: Utf8PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let key = SurfaceKey::File {
+            agent_id,
+            path: path.clone(),
+        };
+        if self.file_views.contains_key(&(agent_id, path.clone())) {
+            self.show_surface_in_main(key.clone());
+            if let Some(pane) = self.panes.pane_showing(&key) {
+                self.panes.focus(pane);
+            }
+            cx.notify();
+            return;
+        }
+        let task =
+            crate::zed_remote::open_file_buffer(&self.connection, workspace, path.clone(), cx);
+        cx.spawn(async move |this, cx| {
+            match task.await {
+                Ok((project, buffer)) => {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
+                        this.file_views.insert((agent_id, path), view);
+                        this.show_surface_in_main(key);
+                        this.focus_active_surface(window, cx);
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.notice_on(
+                            None,
+                            &format!(":open failed: {error:#}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn switch_agent_by_delta(
@@ -1291,9 +1380,221 @@ impl Workspace {
         }
     }
 
-    fn focus_active_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let editor = self.active_editor(cx);
-        window.focus(&editor.focus_handle(cx), cx);
+    /// Moves gpui focus to the focused pane's surface.
+    fn focus_active_surface(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.panes.focused().surface {
+            SurfaceKey::Rail => window.focus(&self.rail_focus, cx),
+            surface => {
+                if let Some(editor) = self.surface_editor(surface, cx) {
+                    window.focus(&editor.focus_handle(cx), cx);
+                }
+            }
+        }
+    }
+
+    /// The editor inside a surface, when it has one.
+    fn surface_editor(
+        &self,
+        surface: &SurfaceKey,
+        cx: &gpui::App,
+    ) -> Option<Entity<editor::Editor>> {
+        match surface {
+            SurfaceKey::Rail => None,
+            SurfaceKey::Draft => Some(self.draft_view.read(cx).editor().clone()),
+            SurfaceKey::Transcript(agent_id) => self
+                .views
+                .get(agent_id)
+                .map(|view| view.read(cx).editor().clone()),
+            SurfaceKey::File { agent_id, path } => self
+                .file_views
+                .get(&(*agent_id, path.clone()))
+                .map(|view| view.read(cx).editor().clone()),
+        }
+    }
+
+    /// Keeps the registry's notion of "current agent" in step with the
+    /// focused pane, so `:` commands resolve against what the user sees.
+    fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
+        match self.panes.focused().surface.clone() {
+            SurfaceKey::Transcript(agent_id) => self.registry.select_agent(agent_id),
+            SurfaceKey::Draft => self.registry.enter_draft(),
+            // The rail and files keep whatever agent context was current.
+            SurfaceKey::Rail | SurfaceKey::File { .. } => {}
+        }
+        cx.notify();
+    }
+
+    fn split_pane(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panes.focused().surface == SurfaceKey::Rail {
+            // Splitting the rail would just clone it; open the main pane
+            // instead.
+            self.leave_rail(window, cx);
+        }
+        self.panes.split(axis);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panes.focused().surface == SurfaceKey::Rail {
+            return;
+        }
+        self.panes.close_focused();
+        self.sync_selection_to_focus(cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    fn focus_pane_by_delta(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        self.panes.focus_by_delta(delta);
+        self.sync_selection_to_focus(cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    fn pane_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panes.focused_mut().back() {
+            self.sync_selection_to_focus(cx);
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn focus_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(rail) = self.panes.pane_showing(&SurfaceKey::Rail) {
+            self.panes.focus(rail);
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Enter from the rail: move focus into the first content pane.
+    fn leave_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let main = self
+            .panes
+            .panes()
+            .iter()
+            .find(|pane| pane.surface != SurfaceKey::Rail)
+            .map(|pane| pane.id);
+        if let Some(id) = main {
+            self.panes.focus(id);
+            self.sync_selection_to_focus(cx);
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn render_panes(
+        &self,
+        text_style: &gpui::TextStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let focused_id = self.panes.focused_id();
+        let focus_border = cx.theme().colors().border_focused;
+        let mut leaf = |pane: &crate::pane::Pane| -> gpui::AnyElement {
+            let id = pane.id;
+            let focused = id == focused_id;
+            let content = self.render_surface(&pane.surface, text_style, cx);
+            let is_rail = pane.surface == SurfaceKey::Rail;
+            let mut element = div()
+                .h_full()
+                .overflow_hidden()
+                .border_1()
+                .border_color(if focused && !is_rail {
+                    gpui::Hsla::from(focus_border)
+                } else {
+                    gpui::transparent_black()
+                })
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        if this.panes.focused_id() != id {
+                            this.panes.focus(id);
+                            this.sync_selection_to_focus(cx);
+                            this.focus_active_surface(window, cx);
+                        }
+                    }),
+                )
+                .child(content);
+            element = if is_rail {
+                element.flex_none()
+            } else {
+                element.flex_grow(1.0).min_w_0().min_h_0()
+            };
+            element.into_any_element()
+        };
+        let mut container = |axis: SplitAxis, children: Vec<gpui::AnyElement>| {
+            let element = div().flex().size_full().flex_grow(1.0).min_h_0().min_w_0();
+            let element = match axis {
+                SplitAxis::Row => element.flex_row(),
+                SplitAxis::Column => element.flex_col(),
+            };
+            element.children(children).into_any_element()
+        };
+        div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .flex_grow(1.0)
+            .min_h_0()
+            .child(self.panes.layout(&mut leaf, &mut container))
+            .into_any_element()
+    }
+
+    fn render_surface(
+        &self,
+        surface: &SurfaceKey,
+        text_style: &gpui::TextStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match surface {
+            SurfaceKey::Rail => div()
+                .h_full()
+                .track_focus(&self.rail_focus)
+                .key_context("RhoRail")
+                .child(crate::topic_rail::render_topic_rail(
+                    &self.registry,
+                    &self.expanded_folds,
+                    text_style,
+                    cx,
+                ))
+                .into_any_element(),
+            SurfaceKey::Draft => div()
+                .id("rho-surface-draft")
+                .size_full()
+                .overflow_hidden()
+                .child(self.draft_view.read(cx).editor().clone())
+                .into_any_element(),
+            SurfaceKey::Transcript(agent_id) => match self.views.get(agent_id) {
+                Some(view) => div()
+                    .id("rho-surface-transcript")
+                    .size_full()
+                    .overflow_hidden()
+                    .child(view.read(cx).editor().clone())
+                    .into_any_element(),
+                None => div()
+                    .size_full()
+                    .child(format!(
+                        "loading agent {}…",
+                        self.registry.agent_display_label(*agent_id)
+                    ))
+                    .into_any_element(),
+            },
+            SurfaceKey::File { agent_id, path } => {
+                match self.file_views.get(&(*agent_id, path.clone())) {
+                    Some(view) => div()
+                        .id("rho-surface-file")
+                        .size_full()
+                        .overflow_hidden()
+                        .child(view.clone())
+                        .into_any_element(),
+                    None => div()
+                        .size_full()
+                        .child(format!("opening {path}…"))
+                        .into_any_element(),
+                }
+            }
+        }
     }
 
     fn update_statuses(&self, cx: &mut Context<Self>) {
@@ -1498,12 +1799,6 @@ impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
-        let rail = crate::topic_rail::render_topic_rail(
-            &self.registry,
-            &self.expanded_folds,
-            &text_style,
-            cx,
-        );
         div()
             .id("rho-gui")
             .size_full()
@@ -1556,24 +1851,28 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RoleCycleGroup, window, cx| {
                 this.cycle_draft_group(window, cx);
             }))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .w_full()
-                    .flex_grow(1.0)
-                    .min_h_0()
-                    .child(rail)
-                    .child(
-                        div()
-                            .id("rho-gui-editor")
-                            .h_full()
-                            .flex_grow(1.0)
-                            .min_w_0()
-                            .overflow_hidden()
-                            .child(editor),
-                    ),
-            )
+            .on_action(cx.listener(|this, _: &PaneSplitRight, window, cx| {
+                this.split_pane(SplitAxis::Row, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PaneSplitDown, window, cx| {
+                this.split_pane(SplitAxis::Column, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PaneClose, window, cx| {
+                this.close_pane(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PaneFocusNext, window, cx| {
+                this.focus_pane_by_delta(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PaneBack, window, cx| {
+                this.pane_back(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RailFocus, window, cx| {
+                this.focus_rail(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RailOpen, window, cx| {
+                this.leave_rail(window, cx);
+            }))
+            .child(self.render_panes(&text_style, cx))
     }
 }
 

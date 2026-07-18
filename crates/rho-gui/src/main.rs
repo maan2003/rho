@@ -8,6 +8,7 @@ mod connection;
 mod draft_view;
 mod editor_config;
 mod highlights;
+mod pane;
 mod registry;
 mod render;
 mod rho_assets;
@@ -49,7 +50,14 @@ actions!(
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
-        FileSave
+        FileSave,
+        PaneSplitRight,
+        PaneSplitDown,
+        PaneClose,
+        PaneFocusNext,
+        PaneBack,
+        RailFocus,
+        RailOpen
     ]
 );
 
@@ -405,6 +413,26 @@ fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoGui > Editor && !showing_completions"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
+    ]);
+    // Vim-leader pane vocabulary. Bound both for editors in normal mode and
+    // for the rail (which has no editor, so plain keys are safe there).
+    // These load after the vim keymap, so they win ties at equal depth.
+    for context in ["RhoRail", "RhoGui > Editor && vim_mode == normal"] {
+        cx.bind_keys([
+            KeyBinding::new("space w v", PaneSplitRight, Some(context)),
+            KeyBinding::new("space w s", PaneSplitDown, Some(context)),
+            KeyBinding::new("space w q", PaneClose, Some(context)),
+            KeyBinding::new("space w w", PaneFocusNext, Some(context)),
+            KeyBinding::new("space b", PaneBack, Some(context)),
+            KeyBinding::new("space r", RailFocus, Some(context)),
+        ]);
+    }
+    // Rail navigation: vim keys without a leader, since the rail is not a
+    // text editor.
+    cx.bind_keys([
+        KeyBinding::new("j", AgentNext, Some("RhoRail")),
+        KeyBinding::new("k", AgentPrevious, Some("RhoRail")),
+        KeyBinding::new("enter", RailOpen, Some("RhoRail")),
     ]);
 }
 

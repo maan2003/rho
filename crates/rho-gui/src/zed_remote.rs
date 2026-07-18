@@ -92,14 +92,15 @@ pub fn open_remote_project(
     })
 }
 
-/// Opens `path` (relative to the workspace root, or absolute) from the
-/// remote project in a new window with a plain editor.
-pub fn open_file_window(
+/// Opens `path` (relative to the workspace root, or absolute) as a buffer
+/// in a remote project over `workspace`'s channel. The caller builds the
+/// [`FileView`] with its own window.
+pub fn open_file_buffer(
     connection: &Connection,
     workspace: WorkspaceInfo,
     path: Utf8PathBuf,
     cx: &mut App,
-) -> Task<Result<()>> {
+) -> Task<Result<(Entity<Project>, Entity<language::Buffer>)>> {
     let project_task = open_remote_project(connection, workspace, cx);
     cx.spawn(async move |cx| {
         let (project, root) = project_task.await?;
@@ -129,25 +130,20 @@ pub fn open_file_window(
                 })
             })
             .await?;
-        cx.update(|cx| {
-            cx.open_window(gpui::WindowOptions::default(), |window, cx| {
-                cx.new(|cx| FileView::new(project, buffer, window, cx))
-            })
-        })?;
-        Ok(())
+        Ok((project, buffer))
     })
 }
 
-/// A single remote buffer in its own window: the phase-1 editing surface.
-/// The window owns the whole remote stack — closing it drops the editor,
-/// project, remote client, and daemon channel in one chain.
+/// A single remote buffer, shown as a surface in the pane tree. The view
+/// owns the whole remote stack — dropping it drops the editor, project,
+/// remote client, and daemon channel in one chain.
 pub struct FileView {
     editor: Entity<Editor>,
     project: Entity<Project>,
 }
 
 impl FileView {
-    fn new(
+    pub fn new(
         project: Entity<Project>,
         buffer: Entity<language::Buffer>,
         window: &mut Window,
@@ -156,6 +152,10 @@ impl FileView {
         let editor =
             cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
         Self { editor, project }
+    }
+
+    pub fn editor(&self) -> &Entity<Editor> {
+        &self.editor
     }
 
     fn save(&mut self, _: &crate::FileSave, _window: &mut Window, cx: &mut Context<Self>) {
