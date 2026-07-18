@@ -62,22 +62,28 @@ impl Echo {
                     .child("… (full text in the transcript)"),
             );
         }
-        let mut area = div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w_full()
-            .px_2()
-            .py(px(2.))
-            .border_t_1()
-            .border_color(colors.border_variant)
-            .bg(colors.elevated_surface_background)
-            .font_family(text_style.font_family.clone());
+        let mut area = bottom_strip(text_style, cx);
         if let Some(color) = style.color {
             area = area.text_color(color);
         }
         area.children(rows).into_any_element()
     }
+}
+
+/// The shared chrome of the bottom line: same background, font, and size
+/// as the editors above it — it reads as the vim command line, not a
+/// panel.
+fn bottom_strip(text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .px_2()
+        .py(px(2.))
+        .bg(cx.theme().colors().editor_background)
+        .font_family(text_style.font_family.clone())
+        .text_size(text_style.font_size)
 }
 
 /// Recomputes candidates for the current input.
@@ -103,12 +109,25 @@ const VISIBLE_CANDIDATES: usize = 8;
 impl Minibuffer {
     pub fn open(
         prompt: impl Into<SharedString>,
+        text_style: &gpui::TextStyle,
         complete: CandidateSource,
         on_submit: SubmitHandler,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Self {
-        let editor = cx.new(|cx| Editor::single_line(window, cx));
+        let font = text_style.font();
+        let font_size = text_style.font_size;
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            // The input line reads as part of the editor above it, not as
+            // a UI widget: same buffer font and size.
+            editor.set_text_style_refinement(gpui::TextStyleRefinement {
+                font_family: Some(font.family),
+                font_size: Some(font_size),
+                ..Default::default()
+            });
+            editor
+        });
         let edits = cx.subscribe(&editor, |this: &mut Workspace, _, event, cx| {
             if matches!(event, editor::EditorEvent::BufferEdited) {
                 this.refresh_minibuffer(cx);
@@ -171,7 +190,7 @@ impl Minibuffer {
         (input, self.on_submit)
     }
 
-    pub fn render(&self, cx: &Context<Workspace>) -> AnyElement {
+    pub fn render(&self, text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> AnyElement {
         let colors = cx.theme().colors();
         // Keep the selection visible: scroll the window, not the list.
         let window_start = self
@@ -189,10 +208,7 @@ impl Minibuffer {
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .px_2()
-                    .child(div().child(candidate.value.clone()).when(selected, |el| {
-                        el.text_color(colors.text_accent)
-                    }));
+                    .child(div().child(candidate.value.clone()));
                 if !candidate.description.is_empty() {
                     row = row.child(
                         div()
@@ -206,24 +222,14 @@ impl Minibuffer {
                 row
             })
             .collect::<Vec<_>>();
-        div()
+        bottom_strip(text_style, cx)
             .key_context("RhoMinibuffer")
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w_full()
-            .border_t_1()
-            .border_color(colors.border_variant)
-            .bg(colors.elevated_surface_background)
             .children(rows)
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap_1()
-                    .px_2()
-                    .py(px(2.))
-                    .child(div().text_color(colors.text_accent).child(self.prompt.clone()))
+                    .child(div().child(self.prompt.clone()))
                     .child(div().flex_grow(1.0).child(self.editor.clone())),
             )
             .into_any_element()

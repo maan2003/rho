@@ -1633,7 +1633,10 @@ impl Workspace {
                 }
             },
         );
-        let mut minibuffer = Minibuffer::open(":", complete, on_submit, window, cx);
+        let text_style = self
+            .active_editor(cx)
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        let mut minibuffer = Minibuffer::open(":", &text_style, complete, on_submit, window, cx);
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
         // The minibuffer takes over the bottom strip; a stale message
@@ -2084,7 +2087,7 @@ impl Render for Workspace {
             }))
             .child(self.render_panes(&text_style, cx))
             .children(match (&self.minibuffer, &self.echo) {
-                (Some(minibuffer), _) => Some(minibuffer.render(cx)),
+                (Some(minibuffer), _) => Some(minibuffer.render(&text_style, cx)),
                 (None, Some(echo)) => Some(echo.render(&text_style, cx)),
                 (None, None) => None,
             })
