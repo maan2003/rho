@@ -39,10 +39,10 @@ pub fn render_topic_rail(
     };
     let selected_agent = registry.selected_agent().cloned();
 
-    let rows = registry
-        .ordered_workstreams()
+    let (listed, folded) = registry.split_rows();
+    let expanded = registry.rail_tail_expanded();
+    let mut rows = listed
         .into_iter()
-        .filter(|topic| !topic.hidden)
         .map(|topic| {
             task_row(
                 topic,
@@ -56,6 +56,25 @@ pub fn render_topic_rail(
             )
         })
         .collect::<Vec<_>>();
+    // The quiet tail collapses behind a "n more" row; clicking expands the
+    // folded rows in place (and again to fold them back).
+    if !folded.is_empty() {
+        if expanded {
+            rows.extend(folded.iter().map(|topic| {
+                task_row(
+                    topic,
+                    selected_agent.as_ref(),
+                    registry,
+                    text_style,
+                    selected_color,
+                    tag_background,
+                    lamps,
+                    cx,
+                )
+            }));
+        }
+        rows.push(fold_row(folded.len(), expanded, text_style, cx));
+    }
 
     div()
         .id("rho-gui-topic-rail")
@@ -93,6 +112,44 @@ pub fn render_topic_rail(
 
 /// How many member tags a task row shows before collapsing into `+n`.
 const VISIBLE_TAGS: usize = 4;
+
+/// The rail's collapsed tail: click to expand the folded rows in place
+/// (and again to fold them back).
+fn fold_row(
+    folded_count: usize,
+    expanded: bool,
+    text_style: &TextStyle,
+    cx: &mut Context<Workspace>,
+) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_1()
+        .pl(px(4.))
+        .pt(px(2.))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _window, cx| {
+                this.toggle_rail_tail(cx);
+            }),
+        )
+        .child(
+            Icon::new(IconName::Archive)
+                .size(IconSize::XSmall)
+                .color(Color::Custom(text_style.color.opacity(0.5).into())),
+        )
+        .child(
+            div()
+                .text_color(text_style.color.opacity(0.65))
+                .child(if expanded {
+                    "fold".to_owned()
+                } else {
+                    format!("{folded_count} more")
+                }),
+        )
+}
 
 #[cfg(test)]
 mod tests {

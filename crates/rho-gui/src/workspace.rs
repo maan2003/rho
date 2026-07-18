@@ -1041,6 +1041,11 @@ impl Workspace {
         Some(agent_id)
     }
 
+    pub fn toggle_rail_tail(&mut self, cx: &mut Context<Self>) {
+        self.registry.toggle_rail_tail();
+        cx.notify();
+    }
+
     /// Jumps to the rail's most urgent agent (excluding the current one), so
     /// working through a backlog is one keystroke per agent.
     pub fn jump_to_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
