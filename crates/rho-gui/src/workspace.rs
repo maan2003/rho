@@ -1698,22 +1698,13 @@ impl Workspace {
         text_style: &gpui::TextStyle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let focused_id = self.panes.focused_id();
-        let focus_border = cx.theme().colors().border_focused;
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
             let id = pane.id;
-            let focused = id == focused_id;
             let content = self.render_surface(&pane.surface, text_style, cx);
             let grows = pane.surface.traits().grows;
             let mut element = div()
                 .h_full()
                 .overflow_hidden()
-                .border_1()
-                .border_color(if focused {
-                    gpui::Hsla::from(focus_border)
-                } else {
-                    gpui::transparent_black()
-                })
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {

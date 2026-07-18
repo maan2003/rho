@@ -75,6 +75,7 @@ tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-ma
 ui = { git = "https://github.com/maan2003/zed", branch = "rho" }
 util = { git = "https://github.com/maan2003/zed", branch = "rho" }
 vim = { git = "https://github.com/maan2003/zed", branch = "rho" }
+vim_mode_setting = { git = "https://github.com/maan2003/zed", branch = "rho" }
 
 [dev-dependencies]
 gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
