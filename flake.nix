@@ -360,6 +360,11 @@
           NIX_LD_LIBRARY_PATH = guiLibraryPath;
           shellHook = ''
             ${public-skills.packages.${system}.install}/bin/install-maan2003-skills
+            # Flakebox sets target-specific RUSTFLAGS (wild linker), which
+            # shadow build.rustflags from .cargo/config.toml; re-add the
+            # tokio_unstable cfg that dial9-tokio-telemetry needs.
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable"
           '';
         };
       }
