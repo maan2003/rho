@@ -415,10 +415,15 @@ fn bind_rho_key_overrides(cx: &mut App) {
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
     ]);
-    // Vim-leader pane vocabulary. Bound both for editors in normal mode and
+    // Vim-leader pane vocabulary. Bound both for editors in normal mode
+    // (vim or helix flavor — helix reports `vim_mode == helix_normal`) and
     // for the rail (which has no editor, so plain keys are safe there).
     // These load after the vim keymap, so they win ties at equal depth.
-    for context in ["RhoRail", "RhoGui > Editor && vim_mode == normal"] {
+    for context in [
+        "RhoRail",
+        "RhoGui > Editor && vim_mode == normal",
+        "RhoGui > Editor && vim_mode == helix_normal",
+    ] {
         cx.bind_keys([
             KeyBinding::new("space w v", PaneSplitRight, Some(context)),
             KeyBinding::new("space w s", PaneSplitDown, Some(context)),
