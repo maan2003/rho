@@ -332,7 +332,6 @@ impl ChatApp {
                     .compact_agent(agent_id, MessageDelivery::NextTurn);
             }
             rho_commands::Command::AgentNew { working_directory } => {
-                let topic_id = self.agent.default_topic_id();
                 let Some(working_directory) =
                     resolve_working_directory(working_directory, &workdir_table(&self.agent))
                 else {
@@ -342,7 +341,7 @@ impl ChatApp {
                 };
                 self.term
                     .print_system(&format!("new agent in {working_directory}"));
-                self.agent.new_agent_in_topic(topic_id, working_directory);
+                self.agent.new_agent(Vec::new(), working_directory);
             }
             rho_commands::Command::AgentRename { name } => {
                 let Some(agent_id) = primary_agent_id(&self.agent) else {
@@ -385,37 +384,45 @@ impl ChatApp {
                     .print_system(&format!("rewinding {turns} turn(s)"));
                 self.agent.rewind(agent_id, turns);
             }
-            rho_commands::Command::TopicNew { name } => {
-                self.term.print_system(&format!("creating topic `{name}`"));
-                self.agent.new_topic(name);
-            }
-            rho_commands::Command::TopicRename { name } => {
-                let topic_id = primary_agent_id(&self.agent)
-                    .and_then(|agent_id| topic_of(&self.agent, agent_id))
-                    .unwrap_or_else(|| self.agent.default_topic_id());
-                self.term
-                    .print_system(&format!("renamed topic to `{name}`"));
-                self.agent.rename_topic(topic_id, name);
-            }
-            rho_commands::Command::TopicPin { name } => {
-                self.toggle_topic_status(name, rho_ui_proto::Status::Pinned);
-            }
-            rho_commands::Command::TopicHide { name } => {
-                self.toggle_topic_hidden(name);
-            }
-            rho_commands::Command::TopicMove { name } => {
-                let Some(agent_id) = primary_agent_id(&self.agent) else {
-                    self.term.print_system(":topic move: no agent yet");
+            rho_commands::Command::TagRename { name } => {
+                let Some(tag_id) = primary_agent_id(&self.agent)
+                    .and_then(|agent_id| workstream_of(&self.agent, agent_id))
+                else {
+                    self.term.print_system(":tag rename: no workstream yet");
                     return Ok(true);
                 };
-                let topics = topic_labels(&self.agent);
-                let target = match rho_commands::resolve_topic(&name, &topics) {
-                    Some(topic_id) => rho_ui_proto::TopicTarget::Existing(topic_id),
-                    None => rho_ui_proto::TopicTarget::Named(name.clone()),
-                };
                 self.term
-                    .print_system(&format!("moving {agent_id:?} to topic `{name}`"));
-                self.agent.move_agent(agent_id, target);
+                    .print_system(&format!("renamed workstream to `{name}`"));
+                self.agent.rename_tag(tag_id, name);
+            }
+            rho_commands::Command::TagPin { name } => {
+                self.toggle_tag_status(name, rho_ui_proto::Status::Pinned);
+            }
+            rho_commands::Command::TagHide { name } => {
+                self.toggle_tag_hidden(name);
+            }
+            rho_commands::Command::TagMove { name } => {
+                self.tag_by_name(name, rho_ui_proto::TagKind::Workstream, "moving to workstream");
+            }
+            rho_commands::Command::TagGroup { name } => {
+                self.tag_by_name(name, rho_ui_proto::TagKind::WorkstreamGroup, "grouping under");
+            }
+            rho_commands::Command::TagLabel { name } => {
+                self.tag_by_name(name, rho_ui_proto::TagKind::Label, "labelling");
+            }
+            rho_commands::Command::TagUnlabel { name } => {
+                let Some(agent_id) = primary_agent_id(&self.agent) else {
+                    self.term.print_system(":tag unlabel: no agent yet");
+                    return Ok(true);
+                };
+                let labels = tag_labels(&self.agent, rho_ui_proto::TagKind::Label);
+                match rho_commands::resolve_tag(&name, &labels) {
+                    Some(tag_id) => {
+                        self.term.print_system(&format!("removed label `{name}`"));
+                        self.agent.untag_agent(agent_id, tag_id);
+                    }
+                    None => self.term.print_system(&format!("no label named `{name}`")),
+                }
             }
             rho_commands::Command::ProjectAdd {
                 path,
@@ -469,9 +476,8 @@ impl ChatApp {
         };
         let current = self
             .agent
-            .topics()
+            .agents()
             .iter()
-            .flat_map(|topic| &topic.agents)
             .find(|summary| summary.agent_id == agent_id)
             .map(|summary| summary.status)
             .unwrap_or(rho_ui_proto::Status::Normal);
@@ -481,69 +487,77 @@ impl ChatApp {
         self.agent.set_agent_status(agent_id, status);
     }
 
-    /// Pin toggles for a topic named by argument, defaulting to the
-    /// chat agent's own topic.
-    fn toggle_topic_status(&mut self, name: Option<String>, target: rho_ui_proto::Status) {
-        let topics = self.agent.topics();
-        let topic_id = match &name {
-            Some(name) => {
-                let Some(topic_id) = rho_commands::resolve_topic(name, &topic_labels(&self.agent))
-                else {
-                    self.term.print_system(&format!("no topic named `{name}`"));
-                    return;
-                };
-                topic_id
-            }
-            None => primary_agent_id(&self.agent)
-                .and_then(|agent_id| {
-                    topics
-                        .iter()
-                        .find(|topic| topic.agents.iter().any(|a| a.agent_id == agent_id))
-                        .map(|topic| topic.topic_id)
-                })
-                .unwrap_or_else(|| self.agent.default_topic_id()),
+    /// Kind-aware tagging by name; the daemon creates unknown tags.
+    fn tag_by_name(&mut self, name: String, kind: rho_ui_proto::TagKind, verb: &str) {
+        let Some(agent_id) = primary_agent_id(&self.agent) else {
+            self.term.print_system(":tag: no agent yet");
+            return;
         };
-        let current = topics
+        self.term
+            .print_system(&format!("{verb} `{name}` for {agent_id:?}"));
+        self.agent.tag_agent(
+            agent_id,
+            rho_ui_proto::TagTarget::Named { name, kind },
+        );
+    }
+
+    /// Pin toggles for a workstream named by argument, defaulting to the
+    /// chat agent's own workstream.
+    fn toggle_tag_status(&mut self, name: Option<String>, target: rho_ui_proto::Status) {
+        let Some(tag_id) = self.named_or_current_workstream(name) else {
+            return;
+        };
+        let current = self
+            .agent
+            .tags()
             .iter()
-            .find(|topic| topic.topic_id == topic_id)
-            .map(|topic| topic.status)
+            .find(|tag| tag.tag_id == tag_id)
+            .map(|tag| tag.status)
             .unwrap_or(rho_ui_proto::Status::Normal);
         let status = rho_commands::toggle_status(current, target);
         self.term
-            .print_system(&format!("{topic_id:?} is now {status:?}"));
-        self.agent.set_topic_status(topic_id, status);
+            .print_system(&format!("workstream is now {status:?}"));
+        self.agent.set_tag_status(tag_id, status);
     }
 
-    fn toggle_topic_hidden(&mut self, name: Option<String>) {
-        let topics = self.agent.topics();
-        let topic_id = match &name {
-            Some(name) => {
-                let Some(topic_id) = rho_commands::resolve_topic(name, &topic_labels(&self.agent))
-                else {
-                    self.term.print_system(&format!("no topic named `{name}`"));
-                    return;
-                };
-                topic_id
-            }
-            None => primary_agent_id(&self.agent)
-                .and_then(|agent_id| {
-                    topics
-                        .iter()
-                        .find(|topic| topic.agents.iter().any(|a| a.agent_id == agent_id))
-                        .map(|topic| topic.topic_id)
-                })
-                .unwrap_or_else(|| self.agent.default_topic_id()),
+    fn toggle_tag_hidden(&mut self, name: Option<String>) {
+        let Some(tag_id) = self.named_or_current_workstream(name) else {
+            return;
         };
-        let hidden = !topics
+        let hidden = !self
+            .agent
+            .tags()
             .iter()
-            .find(|topic| topic.topic_id == topic_id)
-            .is_some_and(|topic| topic.hidden);
+            .find(|tag| tag.tag_id == tag_id)
+            .is_some_and(|tag| tag.hidden);
         self.term.print_system(if hidden {
-            "topic hidden"
+            "workstream hidden"
         } else {
-            "topic shown"
+            "workstream shown"
         });
-        self.agent.set_topic_hidden(topic_id, hidden);
+        self.agent.set_tag_hidden(tag_id, hidden);
+    }
+
+    fn named_or_current_workstream(&mut self, name: Option<String>) -> Option<rho_ui_proto::TagId> {
+        match &name {
+            Some(name) => {
+                let workstreams = tag_labels(&self.agent, rho_ui_proto::TagKind::Workstream);
+                let resolved = rho_commands::resolve_tag(name, &workstreams);
+                if resolved.is_none() {
+                    self.term
+                        .print_system(&format!("no workstream named `{name}`"));
+                }
+                resolved
+            }
+            None => {
+                let current = primary_agent_id(&self.agent)
+                    .and_then(|agent_id| workstream_of(&self.agent, agent_id));
+                if current.is_none() {
+                    self.term.print_system("no workstream yet");
+                }
+                current
+            }
+        }
     }
 
     async fn reap_finished_turn(&mut self) {
@@ -595,17 +609,18 @@ fn primary_agent_id(agent: &AgentClient) -> Option<AgentId> {
     agent.known_agent_ids().into_iter().next()
 }
 
-fn topic_of(agent: &AgentClient, agent_id: AgentId) -> Option<rho_ui_proto::TopicId> {
-    agent
-        .topics()
+/// The agent's workstream tag, if it carries one.
+fn workstream_of(agent: &AgentClient, agent_id: AgentId) -> Option<rho_ui_proto::TagId> {
+    let member = agent
+        .agents()
         .into_iter()
-        .find(|topic| {
-            topic
-                .agents
-                .iter()
-                .any(|summary| summary.agent_id == agent_id)
+        .find(|summary| summary.agent_id == agent_id)?;
+    let tags = agent.tags();
+    member.tags.into_iter().find(|tag_id| {
+        tags.iter().any(|tag| {
+            tag.tag_id == *tag_id && tag.kind == rho_ui_proto::TagKind::Workstream
         })
-        .map(|topic| topic.topic_id)
+    })
 }
 
 fn short_agent_label(agent_id: AgentId) -> String {
@@ -631,11 +646,7 @@ fn send_prompt(agent: &AgentClient, text: String) {
         else {
             return;
         };
-        agent.new_agent_with_user_message_in_topic(
-            agent.default_topic_id(),
-            working_directory,
-            text,
-        );
+        agent.new_agent_with_user_message(Vec::new(), working_directory, text);
     }
 }
 
@@ -649,12 +660,14 @@ fn workdir_table(agent: &AgentClient) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Topics as the `(name, id)` pairs shared completion and resolution expect.
-fn topic_labels(agent: &AgentClient) -> Vec<(String, rho_ui_proto::TopicId)> {
+/// Tags of one kind as the `(name, id)` pairs shared completion and
+/// resolution expect.
+fn tag_labels(agent: &AgentClient, kind: rho_ui_proto::TagKind) -> Vec<(String, rho_ui_proto::TagId)> {
     agent
-        .topics()
+        .tags()
         .into_iter()
-        .map(|topic| (topic.name, topic.topic_id))
+        .filter(|tag| tag.kind == kind)
+        .map(|tag| (tag.name, tag.tag_id))
         .collect()
 }
 
@@ -753,7 +766,7 @@ impl ChatTerm {
     fn new() -> io::Result<Self> {
         let (mut term, handle) = Term::new(prompt_text(), CursorShape::Bar)?;
         term.set_completion_source(Some(Box::new(|buffer: &str, cursor: usize| {
-            completion::completion_candidates(buffer, cursor, &[], &[])
+            completion::completion_candidates(buffer, cursor, &[], &Default::default())
         })));
         handle.set_input_placeholder(dim_text("send a message"));
         handle.set_right_prompt(dim_text(":quit"));
@@ -777,11 +790,18 @@ impl ChatTerm {
         self.term
             .set_completion_source(Some(Box::new(move |buffer: &str, cursor: usize| {
                 let workdirs = workdir_table(&agent);
-                let topics = topic_labels(&agent)
-                    .into_iter()
-                    .map(|(label, _)| label)
-                    .collect::<Vec<_>>();
-                completion::completion_candidates(buffer, cursor, &workdirs, &topics)
+                let names = |kind| {
+                    tag_labels(&agent, kind)
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>()
+                };
+                let tags = completion::TagNames {
+                    workstreams: names(rho_ui_proto::TagKind::Workstream),
+                    groups: names(rho_ui_proto::TagKind::WorkstreamGroup),
+                    labels: names(rho_ui_proto::TagKind::Label),
+                };
+                completion::completion_candidates(buffer, cursor, &workdirs, &tags)
             })));
     }
 

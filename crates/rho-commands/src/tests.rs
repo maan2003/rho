@@ -64,61 +64,64 @@ fn parses_agent_commands() {
 }
 
 #[test]
-fn parses_topic_new_with_multi_word_name() {
+fn parses_tag_move_with_multi_word_name() {
     assert_eq!(
-        parse(":topic new fix auth bug"),
-        Some(Parsed::Command(Command::TopicNew {
-            name: "fix auth bug".to_owned()
-        }))
-    );
-    // Unnamed topics don't exist; the name is required.
-    assert_eq!(
-        parse(":topic new"),
-        Some(Parsed::Invalid(":topic new <name>".to_owned()))
-    );
-}
-
-#[test]
-fn parses_topic_move() {
-    assert_eq!(
-        parse(":topic move fix auth bug"),
-        Some(Parsed::Command(Command::TopicMove {
+        parse(":tag move fix auth bug"),
+        Some(Parsed::Command(Command::TagMove {
             name: "fix auth bug".to_owned()
         }))
     );
     assert_eq!(
-        parse(":topic move"),
-        Some(Parsed::Invalid(":topic move <name>".to_owned()))
+        parse(":tag move"),
+        Some(Parsed::Invalid(":tag move <workstream>".to_owned()))
     );
 }
 
 #[test]
-fn parses_topic_rename() {
+fn parses_tag_group_and_labels() {
     assert_eq!(
-        parse(":topic rename fix auth bug"),
-        Some(Parsed::Command(Command::TopicRename {
+        parse(":tag group infra work"),
+        Some(Parsed::Command(Command::TagGroup {
+            name: "infra work".to_owned()
+        }))
+    );
+    assert_eq!(
+        parse(":tag label urgent"),
+        Some(Parsed::Command(Command::TagLabel {
+            name: "urgent".to_owned()
+        }))
+    );
+    assert_eq!(
+        parse(":tag unlabel urgent"),
+        Some(Parsed::Command(Command::TagUnlabel {
+            name: "urgent".to_owned()
+        }))
+    );
+}
+
+#[test]
+fn parses_tag_rename() {
+    assert_eq!(
+        parse(":tag rename fix auth bug"),
+        Some(Parsed::Command(Command::TagRename {
             name: "fix auth bug".to_owned()
         }))
     );
     assert_eq!(
-        parse(":topic rename"),
-        Some(Parsed::Invalid(":topic rename <name>".to_owned()))
+        parse(":tag rename"),
+        Some(Parsed::Invalid(":tag rename <name>".to_owned()))
     );
 }
 
 #[test]
-fn resolves_topics_by_label() {
-    let domain = rho_ui_proto::TopicIdDomain(0);
-    let topics = vec![
-        (
-            "infra".to_owned(),
-            TopicId::from_counter(2, &domain).unwrap(),
-        ),
-        ("1".to_owned(), TopicId::from_counter(1, &domain).unwrap()),
+fn resolves_tags_by_name() {
+    let tags = vec![
+        ("infra".to_owned(), TagId(2)),
+        ("1".to_owned(), TagId(1)),
     ];
-    assert_eq!(resolve_topic("infra", &topics), Some(topics[0].1));
-    assert_eq!(resolve_topic("1", &topics), Some(topics[1].1));
-    assert_eq!(resolve_topic("new-topic", &topics), None);
+    assert_eq!(resolve_tag("infra", &tags), Some(TagId(2)));
+    assert_eq!(resolve_tag("1", &tags), Some(TagId(1)));
+    assert_eq!(resolve_tag("new-tag", &tags), None);
 }
 
 #[test]
@@ -128,12 +131,12 @@ fn parses_status_commands() {
         Some(Parsed::Command(Command::AgentPin))
     );
     assert_eq!(
-        parse(":topic pin"),
-        Some(Parsed::Command(Command::TopicPin { name: None }))
+        parse(":tag pin"),
+        Some(Parsed::Command(Command::TagPin { name: None }))
     );
     assert_eq!(
-        parse(":topic hide archived work"),
-        Some(Parsed::Command(Command::TopicHide {
+        parse(":tag hide archived work"),
+        Some(Parsed::Command(Command::TagHide {
             name: Some("archived work".to_owned())
         }))
     );
@@ -213,16 +216,28 @@ fn completes_command_words_stepwise() {
 #[test]
 fn completes_arguments_from_context() {
     let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
-    let topics = vec!["infra".to_owned(), "1".to_owned()];
+    let workstreams = vec!["infra".to_owned(), "1".to_owned()];
+    let groups = vec!["backend".to_owned()];
+    let labels = vec!["urgent".to_owned()];
     let ctx = CompletionCtx {
         workdirs: &workdirs,
-        topics: &topics,
+        workstreams: &workstreams,
+        groups: &groups,
+        labels: &labels,
     };
 
     assert_eq!(values(&completion_candidates(":agent new ", &ctx)), ["rho"]);
     assert_eq!(
-        values(&completion_candidates(":topic move in", &ctx)),
+        values(&completion_candidates(":tag move in", &ctx)),
         ["infra"]
+    );
+    assert_eq!(
+        values(&completion_candidates(":tag group ba", &ctx)),
+        ["backend"]
+    );
+    assert_eq!(
+        values(&completion_candidates(":tag unlabel ", &ctx)),
+        ["urgent"]
     );
     assert_eq!(
         values(&completion_candidates(":projects rm rh", &ctx)),

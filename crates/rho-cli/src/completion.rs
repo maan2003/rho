@@ -2,11 +2,19 @@ use std::path::{Path, PathBuf};
 
 use rho_cli_term_raw::{Candidate, Color, CompletionView, Span, Style, StyledBlock, StyledText};
 
+/// Tag names by kind, feeding `:tag` argument completion.
+#[derive(Default)]
+pub(crate) struct TagNames {
+    pub workstreams: Vec<String>,
+    pub groups: Vec<String>,
+    pub labels: Vec<String>,
+}
+
 pub(crate) fn completion_candidates(
     buffer: &str,
     cursor: usize,
     workdirs: &[(String, String)],
-    topics: &[String],
+    tags: &TagNames,
 ) -> Vec<Candidate> {
     let Some(token) = word_token(buffer, cursor) else {
         return Vec::new();
@@ -18,7 +26,12 @@ pub(crate) fn completion_candidates(
         };
         let command = rho_commands::completion_candidates(
             before_cursor,
-            &rho_commands::CompletionCtx { workdirs, topics },
+            &rho_commands::CompletionCtx {
+                workdirs,
+                workstreams: &tags.workstreams,
+                groups: &tags.groups,
+                labels: &tags.labels,
+            },
         )
         .into_iter()
         .map(|candidate| {

@@ -5,7 +5,9 @@
 use rho_ui_proto::remote::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
-use rho_ui_proto::{AgentRole, EngineerIntelligence, UiAttention, UiProject, UiTopic};
+use rho_ui_proto::{
+    AgentRole, EngineerIntelligence, TagKind, UiAgentSummary, UiAttention, UiProject, UiTag,
+};
 use rho_webui_messages::{AgentState, AgentSummary, Block, Project, ToBrowser, Topic};
 
 /// Longest tool output/error forwarded to the browser, in bytes.
@@ -14,18 +16,20 @@ const TOOL_TEXT_LIMIT: usize = 16 * 1024;
 /// Longest one-line tool label, in bytes.
 const TOOL_LABEL_LIMIT: usize = 256;
 
-pub fn hello(topics: &[UiTopic], projects: &[UiProject]) -> ToBrowser {
+/// The browser keeps its topic-shaped view: each workstream tag is one
+/// "topic" (id `tp-{n}`), listing the agents tagged with it.
+pub fn hello(tags: &[UiTag], agents: &[UiAgentSummary], projects: &[UiProject]) -> ToBrowser {
     ToBrowser::Hello {
-        topics: topics
+        topics: tags
             .iter()
-            .filter(|topic| !topic.hidden)
-            .map(|topic| Topic {
-                id: topic.topic_id.encoded(),
-                name: topic.name.clone(),
-                pinned: topic.status == rho_ui_proto::Status::Pinned,
-                agents: topic
-                    .agents
+            .filter(|tag| tag.kind == TagKind::Workstream && !tag.hidden)
+            .map(|tag| Topic {
+                id: format!("tp-{}", tag.tag_id.0),
+                name: tag.name.clone(),
+                pinned: tag.status == rho_ui_proto::Status::Pinned,
+                agents: agents
                     .iter()
+                    .filter(|agent| agent.tags.contains(&tag.tag_id))
                     .map(|agent| {
                         let id = agent.agent_id.encoded();
                         AgentSummary {

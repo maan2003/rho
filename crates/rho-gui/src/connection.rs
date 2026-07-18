@@ -17,7 +17,8 @@ use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
-    AgentId, ClientMessage, ServerMessage, UiProject, UiTopic, WorkspaceInfo, read_frame,
+    AgentId, ClientMessage, ServerMessage, UiAgentSummary, UiProject, UiTag, WorkspaceInfo,
+    read_frame,
     write_frame,
 };
 use tokio::io::AsyncReadExt as _;
@@ -62,14 +63,14 @@ impl tokio::io::AsyncWrite for IrohStream {
 
 pub enum ConnEvent {
     Ready {
-        topics: Vec<UiTopic>,
+        tags: Vec<UiTag>,
+        agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
-        default_topic_id: rho_ui_proto::TopicId,
         machine_seed: u64,
         agent_counter: u64,
         workspace_counter: u64,
     },
-    TopicCreated(UiTopic),
+    TagCreated(UiTag),
     /// The daemon created an agent this connection asked for.
     AgentCreated(AgentId),
     AgentLoaded(AgentId),
@@ -254,9 +255,9 @@ async fn run(
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
     let ServerMessage::Ready {
-        topics,
+        tags,
+        agents,
         projects,
-        default_topic_id,
         machine_seed,
         agent_counter,
         workspace_counter,
@@ -266,9 +267,9 @@ async fn run(
     };
     if events
         .unbounded_send(ConnEvent::Ready {
-            topics,
+            tags,
+            agents,
             projects,
-            default_topic_id,
             machine_seed,
             agent_counter,
             workspace_counter,
@@ -302,21 +303,21 @@ async fn run(
         };
         let event = match message {
             ServerMessage::Ready {
-                topics,
+                tags,
+                agents,
                 projects,
-                default_topic_id,
                 machine_seed,
                 agent_counter,
                 workspace_counter,
             } => Some(ConnEvent::Ready {
-                topics,
+                tags,
+                agents,
                 projects,
-                default_topic_id,
                 machine_seed,
                 agent_counter,
                 workspace_counter,
             }),
-            ServerMessage::TopicCreated { topic } => Some(ConnEvent::TopicCreated(topic)),
+            ServerMessage::TagCreated { tag } => Some(ConnEvent::TagCreated(tag)),
             ServerMessage::AgentCreated { agent_id, .. } => Some(ConnEvent::AgentCreated(agent_id)),
             ServerMessage::AgentLoaded { agent_id } => Some(ConnEvent::AgentLoaded(agent_id)),
             ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame {

@@ -20,7 +20,7 @@ use crate::claude::ClaudeAgent;
 use crate::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWorkflow,
     AgentWriteTxnExt as _, EngineerIntelligence, InferenceModel, InferenceProfile, SessionBinding,
-    TopicId,
+    TagId,
 };
 use crate::lazy::Lazy;
 use crate::{
@@ -59,7 +59,7 @@ pub trait AgentToolExtensionProvider: Send + Sync + 'static {
 /// Broadcast when any agent is created in the pool.
 #[derive(Clone)]
 pub struct AgentCreated {
-    pub topic_id: TopicId,
+    pub tags: Vec<TagId>,
     pub agent_id: AgentId,
     pub agent: RunningAgent,
 }
@@ -204,25 +204,25 @@ impl AgentPool {
 
     pub async fn create(
         self: &Arc<Self>,
-        topic_id: TopicId,
+        tags: Vec<TagId>,
         config: AgentRole,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        self.create_with_parent(topic_id, config, display_name, start, None, None)
+        self.create_with_parent(tags, config, display_name, start, None, None)
             .await
     }
 
     pub async fn create_with_tool_extension(
         self: &Arc<Self>,
-        topic_id: TopicId,
+        tags: Vec<TagId>,
         config: AgentRole,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         tool_extension: AgentToolExtensionFactory,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         self.create_with_parent(
-            topic_id,
+            tags,
             config,
             display_name,
             start,
@@ -234,7 +234,7 @@ impl AgentPool {
 
     async fn create_with_parent(
         self: &Arc<Self>,
-        topic_id: TopicId,
+        tags: Vec<TagId>,
         config: AgentRole,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
@@ -255,7 +255,7 @@ impl AgentPool {
                     self.auth.clone(),
                     mode,
                     config,
-                    topic_id,
+                    tags.clone(),
                     display_name,
                     start,
                     parent,
@@ -270,7 +270,7 @@ impl AgentPool {
             | SessionBinding::ClaudeAdvisor { .. } => {
                 let (agent_id, agent) = ClaudeAgent::create(
                     self.db.clone(),
-                    topic_id,
+                    tags.clone(),
                     display_name,
                     start,
                     mode,
@@ -284,16 +284,16 @@ impl AgentPool {
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
         let _ = self.created.send(AgentCreated {
-            topic_id,
+            tags,
             agent_id,
             agent: agent.clone(),
         });
         Ok((agent_id, agent))
     }
 
-    /// Create a child agent for `parent` in the parent's topic and mode, and
-    /// mail it its task. Returns once the child is running. An empty
-    /// `workdirs` forks the parent's whole working set.
+    /// Create a child agent for `parent` in the parent's mode, inheriting
+    /// the parent's tags, and mail it its task. Returns once the child is
+    /// running. An empty `workdirs` forks the parent's whole working set.
     pub async fn spawn_child(
         self: &Arc<Self>,
         parent: AgentId,
@@ -302,14 +302,11 @@ impl AgentPool {
         workdirs: Vec<SpawnWorkdir>,
         config: AgentRole,
     ) -> anyhow::Result<AgentId> {
-        let (topic_id, parent_workdirs, parent_role) = {
+        let (tags, parent_workdirs, parent_role) = {
             let read = self.db.read();
-            let topic_id = read
-                .agent_topic(parent)
-                .ok_or_else(|| anyhow::anyhow!("spawning agent belongs to no topic"))?;
             let record = read.get_agent(parent);
             self.enforce_spawn_limits(&read, parent)?;
-            (topic_id, record.workdirs, record.role)
+            (record.tags, record.workdirs, record.role)
         };
         let workdirs = if workdirs.is_empty() {
             parent_workdirs
@@ -374,7 +371,7 @@ impl AgentPool {
         }
         let config = child_role(parent_role, config);
         let (child_id, child) = self
-            .create_with_parent(topic_id, config, Some(task_name), start, Some(parent), None)
+            .create_with_parent(tags, config, Some(task_name), start, Some(parent), None)
             .await?;
         let parent_label = self.agent_handle(parent);
         child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);
@@ -448,7 +445,10 @@ impl AgentPool {
     }
 
     pub fn agent_exists(&self, agent_id: AgentId) -> bool {
-        self.db.read().agent_topic(agent_id).is_some()
+        let read = self.db.read();
+        read.list_agents()
+            .iter()
+            .any(|(existing, _)| *existing == agent_id)
     }
 
     /// Short raw prefix for an agent id.

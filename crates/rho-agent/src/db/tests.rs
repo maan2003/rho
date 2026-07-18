@@ -143,16 +143,37 @@ fn test_agent_runtime() -> AgentRuntime {
 }
 
 #[tokio::test]
-async fn topic_hidden_state_is_persisted() {
+async fn tag_hidden_state_is_persisted() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.init_agent_tables();
-    let topic = write.create_topic(UnixMs(1), "team".to_owned(), Status::Normal);
-    write.set_topic_hidden(UnixMs(2), topic, true);
+    let tag = write.create_tag(UnixMs(1), "team".to_owned(), TagKind::WorkstreamGroup, None);
+    write.set_tag_hidden(UnixMs(2), tag, true);
     write.commit();
 
-    assert!(db.read().get_topic(topic).hidden);
+    assert!(db.read().get_tag(tag).hidden);
+}
+
+#[tokio::test]
+async fn tag_names_are_uniquified_by_suffix() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let first = write.create_tag(UnixMs(1), "team".to_owned(), TagKind::Workstream, None);
+    let second = write.create_tag(UnixMs(2), "team".to_owned(), TagKind::Workstream, None);
+    let third = write.create_tag(UnixMs(3), "team".to_owned(), TagKind::Label, None);
+    // Renaming onto a taken name suffixes too; renaming to your own name
+    // does not.
+    write.set_tag_name(UnixMs(4), third, "team".to_owned());
+    write.set_tag_name(UnixMs(5), first, "team".to_owned());
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.get_tag(first).name, "team");
+    assert_eq!(read.get_tag(second).name, "team-2");
+    assert_eq!(read.get_tag(third).name, "team-3");
 }
 
 #[tokio::test]
@@ -161,12 +182,12 @@ async fn agent_spawned_by_is_stored_at_creation() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.init_agent_tables();
-    let topic = write.create_topic(UnixMs(1), "team".to_owned(), Status::Normal);
+    let tag = write.create_tag(UnixMs(1), "team".to_owned(), TagKind::Workstream, None);
     let pm = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         pm,
-        topic,
+        vec![tag],
         None,
         vec![test_workspace()],
         AgentRole::pm().session_profile().unwrap(),
@@ -177,7 +198,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
     write.create_agent(
         UnixMs(2),
         engineer,
-        topic,
+        vec![tag],
         None,
         vec![test_workspace()],
         AgentRole::default().session_profile().unwrap(),
@@ -298,12 +319,12 @@ async fn create_agent_and_append_events_with_cursor() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
+    let tag_id = write.create_tag(UnixMs(1), "default".to_owned(), TagKind::Workstream, None);
     let agent_id = write.alloc_agent_id();
     let next = write.create_agent(
         UnixMs(1),
         agent_id,
-        topic_id,
+        vec![tag_id],
         Some("main".to_owned()),
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -317,7 +338,8 @@ async fn create_agent_and_append_events_with_cursor() {
     let read = db.read();
     let agent = read.get_agent(agent_id);
     assert_eq!(agent.display_name.as_deref(), Some("main"));
-    assert_eq!(read.list_topic_agents(topic_id), [agent_id]);
+    assert_eq!(agent.tags, [tag_id]);
+    assert_eq!(read.agent_workstream(agent_id), Some(tag_id));
 
     let (next, events) = read.agent_events(agent_id);
     assert_eq!(next.seq, 2);
@@ -332,12 +354,11 @@ async fn agent_events_read_lineage_parents() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
     let agent_id = write.alloc_agent_id();
     let next = write.create_agent(
         UnixMs(1),
         agent_id,
-        topic_id,
+        Vec::new(),
         Some("main".to_owned()),
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -380,12 +401,11 @@ async fn fork_agent_lineage_repoints_current_branch() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
     let agent_id = write.alloc_agent_id();
     let next = write.create_agent(
         UnixMs(1),
         agent_id,
-        topic_id,
+        Vec::new(),
         Some("main".to_owned()),
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -408,69 +428,63 @@ async fn fork_agent_lineage_repoints_current_branch() {
 }
 
 #[tokio::test]
-async fn move_agent_to_topic_repoints_membership() {
+async fn set_agent_tags_replaces_the_set() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let default_topic = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
-    let named_topic = write.create_topic(UnixMs(1), "infra".to_owned(), Status::Normal);
+    let first = write.create_tag(UnixMs(1), "default".to_owned(), TagKind::Workstream, None);
+    let second = write.create_tag(UnixMs(1), "infra".to_owned(), TagKind::Workstream, None);
     let agent_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         agent_id,
-        default_topic,
+        vec![first],
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
-    write.move_agent_to_topic(agent_id, named_topic);
+    write.set_agent_tags(UnixMs(2), agent_id, vec![second]);
     write.commit();
 
     let read = db.read();
-    assert_eq!(read.list_topic_agents(default_topic), []);
-    assert_eq!(read.list_topic_agents(named_topic), [agent_id]);
-
-    // Moving to the topic it is already in is a no-op, not a duplicate.
-    let mut write = db.write().await;
-    write.move_agent_to_topic(agent_id, named_topic);
-    write.commit();
-    assert_eq!(db.read().list_topic_agents(named_topic), [agent_id]);
+    assert_eq!(read.get_agent(agent_id).tags, [second]);
+    assert_eq!(read.agent_workstream(agent_id), Some(second));
 }
 
 #[tokio::test]
-async fn topic_and_agent_statuses_are_settable() {
+async fn tag_and_agent_statuses_are_settable() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let topic_id = write.create_topic(UnixMs(1), "infra".to_owned(), Status::Normal);
+    let tag_id = write.create_tag(UnixMs(1), "infra".to_owned(), TagKind::Workstream, None);
     let agent_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         agent_id,
-        topic_id,
+        vec![tag_id],
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
-    write.set_topic_status(UnixMs(2), topic_id, Status::Pinned);
-    write.set_topic_name(UnixMs(3), topic_id, "platform".to_owned());
+    write.set_tag_status(UnixMs(2), tag_id, Status::Pinned);
+    write.set_tag_name(UnixMs(3), tag_id, "platform".to_owned());
     write.set_agent_status(UnixMs(2), agent_id, Status::Pinned);
     write.set_agent_display_name(UnixMs(4), agent_id, "builder".to_owned());
     write.commit();
 
     let read = db.read();
-    let topic = read.get_topic(topic_id);
-    assert_eq!(topic.name, "platform");
-    assert_eq!(topic.status, Status::Pinned);
-    assert_eq!(topic.updated_at, UnixMs(3));
+    let tag = read.get_tag(tag_id);
+    assert_eq!(tag.name, "platform");
+    assert_eq!(tag.status, Status::Pinned);
+    assert_eq!(tag.updated_at, UnixMs(3));
     let agent = read.get_agent(agent_id);
     assert_eq!(agent.status, Status::Pinned);
     assert_eq!(agent.display_name.as_deref(), Some("builder"));
@@ -533,11 +547,10 @@ async fn agent_ids_allocate_before_records_exist() {
     let leaked_id = write.alloc_agent_id();
     let agent_id = write.alloc_agent_id();
     assert_ne!(leaked_id, agent_id);
-    let topic_id = write.create_topic(UnixMs(1), "default".to_owned(), Status::Normal);
     write.create_agent(
         UnixMs(2),
         agent_id,
-        topic_id,
+        Vec::new(),
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),

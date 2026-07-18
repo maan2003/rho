@@ -10,7 +10,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use rho_agent::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _, Status,
-    TopicId,
+    TagId, TagKind,
 };
 use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
@@ -22,7 +22,7 @@ use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
     McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
-    UiTopic, WorkspaceInfo, read_frame_counted, write_frame, write_frame_counted,
+    UiTag, WorkspaceInfo, read_frame_counted, write_frame, write_frame_counted,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, watch};
 
@@ -713,9 +713,6 @@ struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
     auth: InferenceAuth,
-    /// The daemon-created topic agents are born into; announced in `Ready`
-    /// so clients never guess it from topic ordering.
-    default_topic_id: TopicId,
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
@@ -755,33 +752,12 @@ impl AgentRegistry {
     ) -> anyhow::Result<Self> {
         let pool = AgentPool::new(db.clone(), auth.clone(), path_overrides, user_environment).await;
         let machine_seed = db.read().machine_seed();
-        // Topics are ad-hoc tab groups; every agent starts in the default
-        // one (the oldest topic) until it is moved somewhere more specific.
-        let oldest_topic = db
-            .read()
-            .list_topics()
-            .into_iter()
-            .min_by_key(|(_, topic)| topic.created_at);
-        let default_topic_id = match oldest_topic {
-            Some((topic_id, _)) => topic_id,
-            None => {
-                let mut write = db.write().await;
-                let topic_id = write.create_topic(
-                    rho_core::UnixMs::now(),
-                    "default".to_owned(),
-                    Status::Normal,
-                );
-                write.commit();
-                topic_id
-            }
-        };
         let slack = rho_slack::SlackManager::new(pool.clone(), db.clone()).await;
         let pr_monitor = rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone()).await?;
         let registry = Self {
             pool,
             db,
             auth,
-            default_topic_id,
             machine_seed,
             title_tasks: Mutex::new(HashSet::new()),
             land_locks: Mutex::new(HashMap::new()),
@@ -852,43 +828,40 @@ impl AgentRegistry {
         self.zed_host.get_or_init(rho_zed_host::ZedHost::spawn)
     }
 
-    fn topics(&self, kinds: &HashMap<AgentId, AgentStateKind>) -> Vec<UiTopic> {
-        let read = self.db.read();
-        // Key order over ids is meaningless (scrambled characters); creation
-        // order comes from the timestamps.
-        let mut records = read.list_topics();
-        records.sort_by_key(|(_, topic)| topic.created_at);
+    fn ui_tags(&self) -> Vec<UiTag> {
+        let mut records = self.db.read().list_tags();
+        records.sort_by_key(|(_, tag)| tag.created_at);
         records
             .into_iter()
-            .map(|(topic_id, topic)| {
-                let mut agents = read
-                    .list_topic_agents(topic_id)
-                    .into_iter()
-                    .map(|agent_id| (agent_id, read.get_agent(agent_id)))
-                    .collect::<Vec<_>>();
-                agents.sort_by_key(|(_, agent)| agent.created_at);
-                UiTopic {
-                    topic_id,
-                    name: topic.name,
-                    status: topic.status,
-                    hidden: topic.hidden,
-                    agents: agents
-                        .into_iter()
-                        .map(|(agent_id, agent)| UiAgentSummary {
-                            agent_id,
-                            parent_agent: agent.parent_agent,
-                            role: agent.config(),
-                            created_at: agent.created_at,
-                            updated_at: agent.updated_at,
-                            workspace: agent.primary_workdir().clone(),
-                            display_name: agent.display_name,
-                            status: agent.status,
-                            attention: attention_level(kinds.get(&agent_id), agent.disposition),
-                            last_active: agent.last_user_message.max(agent.created_at),
-                            hidden: agent.disposition == AgentDisposition::Hidden,
-                        })
-                        .collect(),
-                }
+            .map(|(tag_id, tag)| UiTag {
+                tag_id,
+                name: tag.name,
+                kind: tag.kind,
+                parent: tag.parent,
+                status: tag.status,
+                hidden: tag.hidden,
+            })
+            .collect()
+    }
+
+    fn ui_agents(&self, kinds: &HashMap<AgentId, AgentStateKind>) -> Vec<UiAgentSummary> {
+        let mut records = self.db.read().list_agents();
+        records.sort_by_key(|(_, agent)| agent.created_at);
+        records
+            .into_iter()
+            .map(|(agent_id, agent)| UiAgentSummary {
+                agent_id,
+                parent_agent: agent.parent_agent,
+                role: agent.config(),
+                created_at: agent.created_at,
+                updated_at: agent.updated_at,
+                workspace: agent.primary_workdir().clone(),
+                display_name: agent.display_name,
+                status: agent.status,
+                attention: attention_level(kinds.get(&agent_id), agent.disposition),
+                last_active: agent.last_user_message.max(agent.created_at),
+                hidden: agent.disposition == AgentDisposition::Hidden,
+                tags: agent.tags,
             })
             .collect()
     }
@@ -911,9 +884,9 @@ impl AgentRegistry {
 
     async fn ready_message(&self) -> ServerMessage {
         ServerMessage::Ready {
-            topics: self.topics(&self.agent_state_kinds().await),
+            tags: self.ui_tags(),
+            agents: self.ui_agents(&self.agent_state_kinds().await),
             projects: self.projects(),
-            default_topic_id: self.default_topic_id,
             machine_seed: self.machine_seed,
             agent_counter: self.db.read().last_agent_counter(),
             workspace_counter: self.db.read().last_workspace_counter(),
@@ -972,25 +945,28 @@ impl AgentRegistry {
             .insert(repo, (agent_id, status));
     }
 
-    async fn create_topic(&self, name: String) -> UiTopic {
+    async fn create_tag(&self, name: String, kind: TagKind, parent: Option<TagId>) -> UiTag {
         let mut write = self.db.write().await;
-        let topic_id = write.create_topic(rho_core::UnixMs::now(), name, Status::Normal);
+        let tag_id = write.create_tag(rho_core::UnixMs::now(), name, kind, parent);
         write.commit();
-        UiTopic {
-            topic_id,
-            name: self.db.read().get_topic(topic_id).name,
-            status: Status::Normal,
-            hidden: false,
-            agents: Vec::new(),
+        // Re-read: creation may have uniquified the name.
+        let tag = self.db.read().get_tag(tag_id);
+        UiTag {
+            tag_id,
+            name: tag.name,
+            kind: tag.kind,
+            parent: tag.parent,
+            status: tag.status,
+            hidden: tag.hidden,
         }
     }
 
     async fn create(
         &self,
-        topic_id: TopicId,
+        tags: Vec<TagId>,
         role: AgentRole,
         start: StartMode,
-    ) -> anyhow::Result<(TopicId, AgentId, RunningAgent)> {
+    ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let start = match start {
             StartMode::NewOn { repo, revset } => {
                 let repo = validate_repo_root(repo)?;
@@ -1018,8 +994,8 @@ impl AgentRegistry {
                 )]
             }
         };
-        let (agent_id, agent) = self.pool.create(topic_id, role, None, start).await?;
-        Ok((topic_id, agent_id, agent))
+        let (agent_id, agent) = self.pool.create(tags, role, None, start).await?;
+        Ok((agent_id, agent))
     }
 
     async fn mcp_agent_tool(
@@ -1230,26 +1206,95 @@ impl AgentRegistry {
         self.pool.agent_handle(agent_id)
     }
 
-    async fn move_agent(
+    /// Kind-aware tagging: a workstream tag replaces the agent's current
+    /// workstream (a move); a workstream-group re-parents the agent's
+    /// workstream tag; a label joins the set.
+    async fn tag_agent(
         &self,
         agent_id: AgentId,
-        target: rho_ui_proto::TopicTarget,
+        target: rho_ui_proto::TagTarget,
     ) -> anyhow::Result<()> {
+        let now = rho_core::UnixMs::now();
         let mut write = self.db.write().await;
-        let topic_id = match target {
-            rho_ui_proto::TopicTarget::Existing(topic_id) => topic_id,
-            rho_ui_proto::TopicTarget::Named(name) => self
-                .db
-                .read()
-                .list_topics()
-                .into_iter()
-                .find(|(_, topic)| topic.name == name)
-                .map(|(topic_id, _)| topic_id)
-                .unwrap_or_else(|| {
-                    write.create_topic(rho_core::UnixMs::now(), name, Status::Normal)
-                }),
+        let read = self.db.read();
+        let tags = read
+            .list_tags()
+            .into_iter()
+            .collect::<HashMap<TagId, _>>();
+        let (tag_id, kind) = match target {
+            rho_ui_proto::TagTarget::Existing(tag_id) => {
+                let tag = tags
+                    .get(&tag_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown tag id: {}", tag_id.0))?;
+                (tag_id, tag.kind)
+            }
+            rho_ui_proto::TagTarget::Named { name, kind } => tags
+                .iter()
+                .find(|(_, tag)| tag.kind == kind && tag.name == name)
+                .map(|(tag_id, _)| (*tag_id, kind))
+                .unwrap_or_else(|| (write.create_tag(now, name, kind, None), kind)),
         };
-        write.move_agent_to_topic(agent_id, topic_id);
+        let record = read.get_agent(agent_id);
+        let tag_kind = |tag_id: &TagId| tags.get(tag_id).map(|tag| tag.kind);
+        match kind {
+            TagKind::Workstream => {
+                let mut new_tags = record
+                    .tags
+                    .into_iter()
+                    .filter(|existing| tag_kind(existing) != Some(TagKind::Workstream))
+                    .collect::<Vec<_>>();
+                new_tags.insert(0, tag_id);
+                write.set_agent_tags(now, agent_id, new_tags);
+            }
+            TagKind::WorkstreamGroup => {
+                let workstream = record
+                    .tags
+                    .iter()
+                    .copied()
+                    .find(|existing| tag_kind(existing) == Some(TagKind::Workstream))
+                    .ok_or_else(|| anyhow::anyhow!("agent has no workstream tag to group"))?;
+                write.set_tag_parent(now, workstream, Some(tag_id));
+            }
+            TagKind::Label => {
+                if !record.tags.contains(&tag_id) {
+                    let mut new_tags = record.tags;
+                    new_tags.push(tag_id);
+                    write.set_agent_tags(now, agent_id, new_tags);
+                }
+            }
+        }
+        write.commit();
+        Ok(())
+    }
+
+    async fn untag_agent(&self, agent_id: AgentId, tag_id: TagId) -> anyhow::Result<()> {
+        let now = rho_core::UnixMs::now();
+        let mut write = self.db.write().await;
+        let read = self.db.read();
+        let tag = read.get_tag(tag_id);
+        let record = read.get_agent(agent_id);
+        match tag.kind {
+            TagKind::Workstream => {
+                anyhow::bail!("workstreams are moved (tag another), not removed")
+            }
+            TagKind::WorkstreamGroup => {
+                // Ungrouping: clear the agent's workstream's parent if it
+                // points at this group.
+                let workstream = record.tags.iter().copied().find(|existing| {
+                    let tag = read.get_tag(*existing);
+                    tag.kind == TagKind::Workstream && tag.parent == Some(tag_id)
+                });
+                match workstream {
+                    Some(workstream) => write.set_tag_parent(now, workstream, None),
+                    None => anyhow::bail!("agent's workstream is not in that group"),
+                }
+            }
+            TagKind::Label => {
+                let mut new_tags = record.tags;
+                new_tags.retain(|existing| *existing != tag_id);
+                write.set_agent_tags(now, agent_id, new_tags);
+            }
+        }
         write.commit();
         Ok(())
     }
@@ -1265,14 +1310,15 @@ impl AgentRegistry {
     /// background. Policy: only fills an empty `display_name` — a manual
     /// rename, before or during generation, always wins — and at most one
     /// generation runs per agent at a time. The requesting connection gets a
-    /// `Ready` refresh when the title lands. A topic the agent founded
-    /// (`retitle_topic`: its id plus the provisional name it was created
-    /// under) takes the same title, unless someone renamed it meanwhile.
+    /// `Ready` refresh when the title lands. A workstream tag the agent
+    /// founded (`retitle_tag`: its id plus the provisional name it was
+    /// created under) takes the same title, unless someone renamed it
+    /// meanwhile.
     async fn maybe_generate_title(
         self: &Arc<Self>,
         agent_id: AgentId,
         text: String,
-        retitle_topic: Option<(TopicId, String)>,
+        retitle_tag: Option<(TagId, String)>,
         outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
     ) {
         if text.trim().is_empty() || self.db.read().get_agent(agent_id).display_name.is_some() {
@@ -1298,10 +1344,10 @@ impl AgentRegistry {
                     {
                         let now = rho_core::UnixMs::now();
                         write.set_agent_display_name(now, agent_id, title.clone());
-                        if let Some((topic_id, provisional)) = retitle_topic
-                            && registry.db.read().get_topic(topic_id).name == provisional
+                        if let Some((tag_id, provisional)) = retitle_tag
+                            && registry.db.read().get_tag(tag_id).name == provisional
                         {
-                            write.set_topic_name(now, topic_id, title);
+                            write.set_tag_name(now, tag_id, title);
                         }
                         write.commit();
                         let _ = outgoing_tx.send(registry.ready_message().await);
@@ -1324,26 +1370,26 @@ impl AgentRegistry {
         Ok(())
     }
 
-    async fn rename_topic(&self, topic_id: TopicId, name: String) -> anyhow::Result<()> {
+    async fn rename_tag(&self, tag_id: TagId, name: String) -> anyhow::Result<()> {
         if name.trim().is_empty() {
-            anyhow::bail!("topic name cannot be empty");
+            anyhow::bail!("tag name cannot be empty");
         }
         let mut write = self.db.write().await;
-        write.set_topic_name(rho_core::UnixMs::now(), topic_id, name);
+        write.set_tag_name(rho_core::UnixMs::now(), tag_id, name);
         write.commit();
         Ok(())
     }
 
-    async fn set_topic_status(&self, topic_id: TopicId, status: Status) -> anyhow::Result<()> {
+    async fn set_tag_status(&self, tag_id: TagId, status: Status) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
-        write.set_topic_status(rho_core::UnixMs::now(), topic_id, status);
+        write.set_tag_status(rho_core::UnixMs::now(), tag_id, status);
         write.commit();
         Ok(())
     }
 
-    async fn set_topic_hidden(&self, topic_id: TopicId, hidden: bool) -> anyhow::Result<()> {
+    async fn set_tag_hidden(&self, tag_id: TagId, hidden: bool) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
-        write.set_topic_hidden(rho_core::UnixMs::now(), topic_id, hidden);
+        write.set_tag_hidden(rho_core::UnixMs::now(), tag_id, hidden);
         write.commit();
         Ok(())
     }
@@ -1479,8 +1525,8 @@ where
                         }
                         if outgoing_tx
                             .send(ServerMessage::AgentCreated {
-                                topic_id: created.topic_id,
                                 agent_id: created.agent_id,
+                                tags: created.tags.clone(),
                             })
                             .is_err()
                             || outgoing_tx.send(agents.ready_message().await).is_err()
@@ -1711,7 +1757,7 @@ fn spawn_snooze_timer(
 }
 
 /// Whether a handled message changed registry state that clients see through
-/// `Ready` (topics, agents, workdirs).
+/// `Ready` (tags, agents, workdirs).
 enum Refresh {
     Ready,
     None,
@@ -1861,32 +1907,51 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::Subscribe => Ok(Refresh::None),
-        ClientMessage::NewTopic { name } => {
-            let topic = agents.create_topic(name).await;
-            let _ = outgoing_tx.send(ServerMessage::TopicCreated { topic });
+        ClientMessage::NewTag { name, kind, parent } => {
+            let tag = agents.create_tag(name, kind, parent).await;
+            let _ = outgoing_tx.send(ServerMessage::TagCreated { tag });
             Ok(Refresh::Ready)
         }
         ClientMessage::NewAgent {
-            topic_id,
+            tags,
             role,
             start,
             content,
         } => {
-            // No topic given: the agent founds its own task, provisionally
-            // named after its first message until the generated title lands.
-            let founded = match topic_id {
+            // Partition the seed tags: an existing workstream to join, a
+            // group for a founded workstream to sit under, labels carried
+            // verbatim. Without a workstream, the agent founds its own,
+            // provisionally named after its first message until the
+            // generated title lands.
+            let known = agents.db.read().list_tags().into_iter().collect::<HashMap<TagId, _>>();
+            let mut workstream = None;
+            let mut group = None;
+            let mut labels = Vec::new();
+            for tag_id in tags {
+                match known.get(&tag_id).map(|tag| tag.kind) {
+                    Some(TagKind::Workstream) => workstream = workstream.or(Some(tag_id)),
+                    Some(TagKind::WorkstreamGroup) => group = group.or(Some(tag_id)),
+                    Some(TagKind::Label) => labels.push(tag_id),
+                    None => {}
+                }
+            }
+            let founded = match workstream {
                 Some(_) => None,
                 None => {
-                    let name = provisional_topic_name(content.as_deref());
-                    let topic = agents.create_topic(name.clone()).await;
-                    let _ = outgoing_tx.send(ServerMessage::TopicCreated { topic: topic.clone() });
-                    Some((topic.topic_id, name))
+                    let name = provisional_workstream_name(content.as_deref());
+                    let tag = agents
+                        .create_tag(name.clone(), TagKind::Workstream, group)
+                        .await;
+                    let _ = outgoing_tx.send(ServerMessage::TagCreated { tag: tag.clone() });
+                    workstream = Some(tag.tag_id);
+                    Some((tag.tag_id, tag.name))
                 }
             };
-            let topic_id = topic_id.unwrap_or_else(|| founded.as_ref().unwrap().0);
+            let mut agent_tags = vec![workstream.expect("workstream joined or founded")];
+            agent_tags.extend(labels);
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
-            let (_topic_id, agent_id, agent) = agents.create(topic_id, role, start).await?;
+            let (agent_id, agent) = agents.create(agent_tags, role, start).await?;
             if let Some(content) = content {
                 let text = text_content(&content);
                 // The agent is fresh, so the lanes are equivalent here.
@@ -2023,8 +2088,8 @@ async fn handle_message(
             agent.compact(delivery)?;
             Ok(Refresh::None)
         }
-        ClientMessage::MoveAgent { agent_id, topic } => {
-            agents.move_agent(agent_id, topic).await?;
+        ClientMessage::TagAgent { agent_id, target } => {
+            agents.tag_agent(agent_id, target).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::SetAgentStatus { agent_id, status } => {
@@ -2043,8 +2108,12 @@ async fn handle_message(
             agent.change_prompt_cache_key()?;
             Ok(Refresh::None)
         }
-        ClientMessage::RenameTopic { topic_id, name } => {
-            agents.rename_topic(topic_id, name).await?;
+        ClientMessage::UntagAgent { agent_id, tag_id } => {
+            agents.untag_agent(agent_id, tag_id).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::RenameTag { tag_id, name } => {
+            agents.rename_tag(tag_id, name).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::SetAgentDisposition {
@@ -2069,12 +2138,12 @@ async fn handle_message(
                 Ok(Refresh::None)
             }
         }
-        ClientMessage::SetTopicStatus { topic_id, status } => {
-            agents.set_topic_status(topic_id, status).await?;
+        ClientMessage::SetTagStatus { tag_id, status } => {
+            agents.set_tag_status(tag_id, status).await?;
             Ok(Refresh::Ready)
         }
-        ClientMessage::SetTopicHidden { topic_id, hidden } => {
-            agents.set_topic_hidden(topic_id, hidden).await?;
+        ClientMessage::SetTagHidden { tag_id, hidden } => {
+            agents.set_tag_hidden(tag_id, hidden).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::CancelTurn { agent_id } => {
@@ -2272,10 +2341,10 @@ fn subscribe_agent(
 /// workdir registration and agent creation take repos. A leading `~` expands
 /// to the daemon's home: clients may run on another machine, so path
 /// interpretation belongs here.
-/// The name a self-founded topic starts under: the first line of the
+/// The name a self-founded workstream starts under: the first line of the
 /// agent's first message, truncated. The generated title replaces it
 /// (matching by this exact string) once it lands.
-fn provisional_topic_name(content: Option<&[ContentPart]>) -> String {
+fn provisional_workstream_name(content: Option<&[ContentPart]>) -> String {
     let text = content.map(text_content).unwrap_or_default();
     let line = text.lines().next().unwrap_or("").trim();
     if line.is_empty() {

@@ -1,20 +1,21 @@
-//! The left rail listing tasks: one row per topic.
+//! The left rail listing tasks: one row per workstream.
 //!
-//! A task is the unit of work — every top-level agent founds its own —
-//! so the rail lists tasks, not agents. The row carries the task title,
+//! A workstream is the unit of work — every top-level agent founds its own —
+//! so the rail lists workstreams, not agents. The row carries the title,
 //! an attention rollup lamp, and small tags for member agents beyond the
-//! primary one (subagents, joiners). Clicking the row opens the task's
-//! primary agent (switching to the task's own pane arrangement); clicking
-//! a tag opens that member directly. Pinned tasks sort first; the `+` row
-//! opens the draft compose view and doubles as its selection indicator.
+//! primary one (subagents, joiners). Clicking the row opens the workstream's
+//! primary agent (switching to its own pane arrangement); clicking a tag
+//! opens that member directly. Workstreams sharing a workstream-group render
+//! under a section header; pinned ones sort first. The `+` row opens the
+//! draft compose view and doubles as its selection indicator.
 
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, MouseButton, TextStyle, div, px};
-use rho_ui_proto::{AgentId, Status, UiAgentSummary, UiAttention, UiTopic};
+use gpui::{AnyElement, Context, Div, FontWeight, MouseButton, TextStyle, div, px};
+use rho_ui_proto::{AgentId, Status, UiAgentSummary, UiAttention};
 use theme::ActiveTheme as _;
 use ui::{Color, Icon, IconName, IconSize};
 
-use crate::registry::AgentRegistry;
+use crate::registry::{AgentRegistry, Workstream};
 use crate::workspace::Workspace;
 
 pub fn render_topic_rail(
@@ -38,26 +39,45 @@ pub fn render_topic_rail(
     let selected_agent = registry.selected_agent().cloned();
 
     let mut visible_topics = registry
-        .topics()
+        .workstreams()
         .iter()
         .filter(|topic| !topic.hidden)
         .collect::<Vec<_>>();
     visible_topics.sort_by_key(|topic| topic.status != Status::Pinned);
-    let rows = visible_topics
-        .into_iter()
-        .map(|topic| {
-            task_row(
-                topic,
-                selected_agent.as_ref(),
-                registry,
-                text_style,
-                selected_color,
-                tag_background,
-                lamps,
-                cx,
-            )
-        })
-        .collect::<Vec<_>>();
+    // Grouped workstreams render under their group's section header;
+    // ungrouped ones lead the rail.
+    let mut rows: Vec<AnyElement> = Vec::new();
+    let row = |topic: &Workstream, cx: &mut Context<Workspace>| {
+        task_row(
+            topic,
+            selected_agent.as_ref(),
+            registry,
+            text_style,
+            selected_color,
+            tag_background,
+            lamps,
+            cx,
+        )
+        .into_any_element()
+    };
+    for topic in &visible_topics {
+        if topic.group.is_none() {
+            rows.push(row(topic, cx));
+        }
+    }
+    for group in registry.group_tags() {
+        let members = visible_topics
+            .iter()
+            .filter(|topic| topic.group == Some(group.tag_id))
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            continue;
+        }
+        rows.push(group_header(&group.name, text_style));
+        for topic in members {
+            rows.push(row(topic, cx));
+        }
+    }
 
     div()
         .id("rho-gui-topic-rail")
@@ -96,10 +116,24 @@ pub fn render_topic_rail(
 /// How many member tags a task row shows before collapsing into `+n`.
 const VISIBLE_TAGS: usize = 4;
 
+/// A workstream-group's section header: a dim separator line with the
+/// group's name.
+fn group_header(name: &str, text_style: &TextStyle) -> AnyElement {
+    div()
+        .w_full()
+        .pl(px(4.))
+        .pt(px(6.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_color(text_style.color.opacity(0.55))
+        .child(name.to_owned())
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use rho_core::UnixMs;
-    use rho_ui_proto::{AgentIdDomain, AgentRole, TopicId, TopicIdDomain, WorkspaceInfo};
+    use rho_ui_proto::{AgentIdDomain, AgentRole, TagId, TagKind, UiTag, WorkspaceInfo};
 
     use super::*;
 
@@ -120,17 +154,33 @@ mod tests {
             attention: UiAttention::Quiet,
             last_active: UnixMs(crate::workspace::now_ms() + id),
             hidden: false,
+            tags: vec![TagId(1)],
         }
     }
 
-    fn topic(status: Status, agents: Vec<UiAgentSummary>) -> UiTopic {
-        UiTopic {
-            topic_id: TopicId::from_counter(1, &TopicIdDomain(0)).unwrap(),
+    fn topic(status: Status, agents: Vec<UiAgentSummary>) -> Workstream {
+        Workstream {
+            tag_id: TagId(1),
             name: "topic".to_owned(),
             status,
             hidden: false,
+            group: None,
             agents,
         }
+    }
+
+    fn install(registry: &mut AgentRegistry, topic: &Workstream) {
+        registry.set_data(
+            vec![UiTag {
+                tag_id: topic.tag_id,
+                name: topic.name.clone(),
+                kind: TagKind::Workstream,
+                parent: topic.group,
+                status: topic.status,
+                hidden: topic.hidden,
+            }],
+            topic.agents.clone(),
+        );
     }
 
     #[test]
@@ -143,7 +193,7 @@ mod tests {
         summaries.extend((4..=13).map(|id| agent(id, Status::Normal, 10)));
         let topic = topic(Status::Normal, summaries);
         let mut registry = AgentRegistry::default();
-        registry.set_topics(vec![topic.clone()]);
+        install(&mut registry, &topic);
 
         let (active, folded) = split_agents(&topic, &registry);
         let active = active
@@ -186,7 +236,7 @@ mod tests {
         let topic = topic(Status::Normal, summaries);
 
         let mut registry = AgentRegistry::default();
-        registry.set_topics(vec![topic.clone()]);
+        install(&mut registry, &topic);
         let (_, folded) = split_agents(&topic, &registry);
         let folded = folded
             .into_iter()
@@ -203,7 +253,7 @@ mod tests {
         let topic = topic(Status::Normal, vec![quiet_pinned, urgent.clone()]);
 
         let mut registry = AgentRegistry::default();
-        registry.set_topics(vec![topic.clone()]);
+        install(&mut registry, &topic);
         registry.set_attention(urgent.agent_id, UiAttention::NeedsInput);
 
         let visible = split_agents(&topic, &registry)
@@ -230,7 +280,7 @@ mod tests {
         let topic = topic(Status::Normal, vec![idle, pinned, recent]);
 
         let mut registry = AgentRegistry::default();
-        registry.set_topics(vec![topic.clone()]);
+        install(&mut registry, &topic);
         let visible = split_agents(&topic, &registry)
             .0
             .into_iter()
@@ -259,7 +309,7 @@ mod tests {
         let topic = topic(Status::Normal, vec![parent, root, grandchild, child]);
 
         let mut registry = AgentRegistry::default();
-        registry.set_topics(vec![topic.clone()]);
+        install(&mut registry, &topic);
         let collapsed = split_agents(&topic, &registry)
             .0
             .into_iter()
@@ -318,14 +368,14 @@ fn new_agent_row(
         .child(div().text_color(text_color).child("new agent"))
 }
 
-/// Splits a topic's agents into the listed ones (rail sort: pins, active
-/// bucket, retained order) and the folded tail (filed away or inactive; most
-/// recently touched first).
+/// Splits a workstream's agents into the listed ones (rail sort: pins,
+/// active bucket, retained order) and the folded tail (filed away or
+/// inactive; most recently touched first).
 fn split_agents<'a>(
-    topic: &'a UiTopic,
+    topic: &'a Workstream,
     registry: &AgentRegistry,
 ) -> (Vec<&'a UiAgentSummary>, Vec<&'a UiAgentSummary>) {
-    registry.split_topic_agents(topic)
+    registry.split_workstream_agents(topic)
 }
 
 /// Lamp palette for attention levels; Quiet has no lamp.
@@ -352,7 +402,7 @@ impl LampColors {
 /// remaining members render as small clickable tags.
 #[allow(clippy::too_many_arguments)]
 fn task_row(
-    topic: &UiTopic,
+    topic: &Workstream,
     selected_agent: Option<&AgentId>,
     registry: &AgentRegistry,
     text_style: &TextStyle,

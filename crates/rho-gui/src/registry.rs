@@ -1,7 +1,7 @@
 //! Agent lifecycle and selection.
 //!
 //! One explicit state machine instead of parallel sets: an agent is *known*
-//! (appears in topics or was announced), and optionally *live* (this
+//! (appears in summaries or was announced), and optionally *live* (this
 //! connection has received frames for it). Selection and next/previous
 //! cycling operate over live agents only.
 
@@ -9,7 +9,45 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
-use rho_ui_proto::{AgentId, UiTopic};
+use rho_ui_proto::{AgentId, TagId, TagKind, UiAgentSummary, UiTag};
+
+/// A workstream tag with its member agents resolved: the unit the rail rows
+/// and per-task pane contexts are built around.
+#[derive(Clone)]
+pub struct Workstream {
+    pub tag_id: TagId,
+    pub name: String,
+    pub status: rho_ui_proto::Status,
+    pub hidden: bool,
+    /// The workstream-group tag this stream sits under, from the tag's
+    /// parent chain.
+    pub group: Option<TagId>,
+    pub agents: Vec<UiAgentSummary>,
+}
+
+impl Workstream {
+    pub fn agent_ids(&self) -> impl Iterator<Item = AgentId> + '_ {
+        self.agents.iter().map(|agent| agent.agent_id)
+    }
+}
+
+fn derive_workstreams(tags: &[UiTag], agents: &[UiAgentSummary]) -> Vec<Workstream> {
+    tags.iter()
+        .filter(|tag| tag.kind == TagKind::Workstream)
+        .map(|tag| Workstream {
+            tag_id: tag.tag_id,
+            name: tag.name.clone(),
+            status: tag.status,
+            hidden: tag.hidden,
+            group: tag.parent,
+            agents: agents
+                .iter()
+                .filter(|agent| agent.tags.contains(&tag.tag_id))
+                .cloned()
+                .collect(),
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentLife {
@@ -31,25 +69,31 @@ pub enum ActivePane {
 #[derive(Default)]
 pub struct AgentRegistry {
     agents: BTreeMap<AgentId, AgentLife>,
-    /// Live attention overlay: broadcasts land here between topic refreshes,
-    /// which re-seed it from the summaries' snapshot.
+    /// Live attention overlay: broadcasts land here between `Ready`
+    /// refreshes, which re-seed it from the summaries' snapshot.
     attention: BTreeMap<AgentId, rho_ui_proto::UiAttention>,
     /// Retained top-to-bottom rail order. Bucket changes are applied with a
     /// stable sort, so agents only move when their coarse rail bucket changes
     /// or when they are first seen.
     rail_order: Vec<AgentId>,
     /// Cached positions in `rail_order`, avoiding a linear scan for every row
-    /// while constructing the topic rail.
+    /// while constructing the rail.
     rail_ranks: BTreeMap<AgentId, usize>,
     /// Derived row membership and ordering, rebuilt only when rail-relevant
     /// state changes rather than on every window draw.
-    topic_rail_layouts: BTreeMap<rho_ui_proto::TopicId, TopicRailLayout>,
+    topic_rail_layouts: BTreeMap<TagId, TopicRailLayout>,
     /// When the user last engaged each agent: seeded from summaries, bumped
     /// locally on send. Selects quiet agents for the active rail bucket.
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
-    topics: Vec<UiTopic>,
-    /// Positions in the latest topic snapshot, used by all summary lookups.
-    agent_locations: BTreeMap<AgentId, (usize, usize)>,
+    /// The latest tag snapshot from `Ready`, all kinds.
+    tags: Vec<UiTag>,
+    /// The latest agent summaries from `Ready`.
+    summaries: Vec<UiAgentSummary>,
+    /// Workstream tags joined with their member agents, derived from the two
+    /// snapshots above.
+    workstreams: Vec<Workstream>,
+    /// Positions in `summaries`, used by all summary lookups.
+    agent_locations: BTreeMap<AgentId, usize>,
     active: ActivePane,
     /// The daemon database's machine seed, from `Ready`; kept for consumers
     /// that resolve ids.
@@ -69,7 +113,7 @@ struct TopicRailLayout {
 }
 
 struct TopicRailState<'a> {
-    by_id: BTreeMap<AgentId, &'a rho_ui_proto::UiAgentSummary>,
+    by_id: BTreeMap<AgentId, &'a UiAgentSummary>,
     root_by_id: BTreeMap<AgentId, AgentId>,
     selected_root: Option<AgentId>,
     top_roots: BTreeSet<AgentId>,
@@ -77,7 +121,7 @@ struct TopicRailState<'a> {
 }
 
 impl<'a> TopicRailState<'a> {
-    fn new(registry: &AgentRegistry, topic: &'a UiTopic) -> Self {
+    fn new(registry: &AgentRegistry, topic: &'a Workstream) -> Self {
         let by_id = topic
             .agents
             .iter()
@@ -199,25 +243,23 @@ impl AgentRegistry {
         self.workspace_counter = workspace_counter;
     }
 
-    pub fn set_topics(&mut self, topics: Vec<UiTopic>) {
+    pub fn set_data(&mut self, tags: Vec<UiTag>, agents: Vec<UiAgentSummary>) {
         self.attention.clear();
         let mut unseen = Vec::new();
-        for topic in &topics {
-            for agent in &topic.agents {
-                self.agents
-                    .entry(agent.agent_id)
-                    .or_insert(AgentLife::Known);
-                self.attention.insert(agent.agent_id, agent.attention);
-                // Keep the freshest engagement signal: a local send can be
-                // newer than the summary's persisted timestamp.
-                let last_active = self
-                    .last_active
-                    .entry(agent.agent_id)
-                    .or_insert(rho_core::UnixMs(0));
-                *last_active = (*last_active).max(agent.last_active);
-                if !self.rail_ranks.contains_key(&agent.agent_id) {
-                    unseen.push((agent.last_active, agent.agent_id));
-                }
+        for agent in &agents {
+            self.agents
+                .entry(agent.agent_id)
+                .or_insert(AgentLife::Known);
+            self.attention.insert(agent.agent_id, agent.attention);
+            // Keep the freshest engagement signal: a local send can be
+            // newer than the summary's persisted timestamp.
+            let last_active = self
+                .last_active
+                .entry(agent.agent_id)
+                .or_insert(rho_core::UnixMs(0));
+            *last_active = (*last_active).max(agent.last_active);
+            if !self.rail_ranks.contains_key(&agent.agent_id) {
+                unseen.push((agent.last_active, agent.agent_id));
             }
         }
         // First-seen agents enter above the retained order, seeded by
@@ -233,18 +275,14 @@ impl AgentRegistry {
             .enumerate()
             .map(|(rank, agent_id)| (agent_id, rank))
             .collect();
-        self.agent_locations = topics
+        self.agent_locations = agents
             .iter()
             .enumerate()
-            .flat_map(|(topic_index, topic)| {
-                topic
-                    .agents
-                    .iter()
-                    .enumerate()
-                    .map(move |(agent_index, agent)| (agent.agent_id, (topic_index, agent_index)))
-            })
+            .map(|(index, agent)| (agent.agent_id, index))
             .collect();
-        self.topics = topics;
+        self.workstreams = derive_workstreams(&tags, &agents);
+        self.tags = tags;
+        self.summaries = agents;
         self.rebuild_topic_rail_layouts();
     }
 
@@ -265,20 +303,20 @@ impl AgentRegistry {
         self.rebuild_topic_rail_layouts();
     }
 
-    /// Folded under the topic's collapsed tail instead of listed. Explicitly
-    /// hidden agents always fold; otherwise the rail shows pinned agents, the
-    /// active bucket, five more agents from the quiet tail, and the current
-    /// selection.
+    /// Folded under the workstream's collapsed tail instead of listed.
+    /// Explicitly hidden agents always fold; otherwise the rail shows pinned
+    /// agents, the active bucket, five more agents from the quiet tail, and
+    /// the current selection.
     pub fn agent_folded(&self, agent_id: AgentId) -> bool {
-        let Some(topic) = self
-            .topics
+        let Some(workstream) = self
+            .workstreams
             .iter()
-            .find(|topic| topic.agent_ids().any(|id| id == agent_id))
+            .find(|workstream| workstream.agent_ids().any(|id| id == agent_id))
         else {
             return false;
         };
         self.topic_rail_layouts
-            .get(&topic.topic_id)
+            .get(&workstream.tag_id)
             .is_some_and(|layout| layout.listed.iter().all(|(id, _)| *id != agent_id))
     }
 
@@ -297,21 +335,25 @@ impl AgentRegistry {
             .map(|(agent_id, _)| agent_id)
     }
 
-    /// Where a new agent should work: the newest agent in the topic sets the
-    /// precedent, since sibling agents usually share a project.
-    pub fn last_working_directory(&self, topic_id: rho_ui_proto::TopicId) -> Option<Utf8PathBuf> {
-        self.topics
+    /// Where a new agent should work: the newest agent in the workstream sets
+    /// the precedent, since sibling agents usually share a project.
+    pub fn last_working_directory(&self, tag_id: TagId) -> Option<Utf8PathBuf> {
+        self.workstreams
             .iter()
-            .find(|topic| topic.topic_id == topic_id)?
+            .find(|workstream| workstream.tag_id == tag_id)?
             .agents
             .last()
             .map(|agent| agent.workspace.repo().to_owned())
     }
 
-    /// The topic an agent currently belongs to, from topic summaries.
-    pub fn topic_of(&self, agent_id: AgentId) -> Option<rho_ui_proto::TopicId> {
-        let (topic_index, _) = self.agent_locations.get(&agent_id)?;
-        Some(self.topics[*topic_index].topic_id)
+    /// The workstream tag an agent currently carries.
+    pub fn workstream_of(&self, agent_id: AgentId) -> Option<TagId> {
+        let agent = self.agent_summary(agent_id)?;
+        agent.tags.iter().copied().find(|tag_id| {
+            self.tags
+                .iter()
+                .any(|tag| tag.tag_id == *tag_id && tag.kind == TagKind::Workstream)
+        })
     }
 
     /// The role-prefixed short display label, unique among generated IDs.
@@ -346,16 +388,16 @@ impl AgentRegistry {
         self.agent_summary(agent_id).map(|agent| agent.role)
     }
 
-    /// The pin status of an agent, from topic summaries.
+    /// The pin status of an agent, from summaries.
     pub fn agent_status(&self, agent_id: AgentId) -> rho_ui_proto::Status {
         self.agent_summary(agent_id)
             .map(|agent| agent.status)
             .unwrap_or(rho_ui_proto::Status::Normal)
     }
 
-    fn agent_summary(&self, agent_id: AgentId) -> Option<&rho_ui_proto::UiAgentSummary> {
-        let (topic_index, agent_index) = self.agent_locations.get(&agent_id)?;
-        self.topics.get(*topic_index)?.agents.get(*agent_index)
+    fn agent_summary(&self, agent_id: AgentId) -> Option<&UiAgentSummary> {
+        let index = self.agent_locations.get(&agent_id)?;
+        self.summaries.get(*index)
     }
 
     pub fn agent_display_name(&self, agent_id: AgentId) -> Option<&str> {
@@ -371,17 +413,29 @@ impl AgentRegistry {
         }
     }
 
-    pub fn add_topic(&mut self, topic: UiTopic) {
-        // Topics stay in the daemon's creation order; a new topic is the
-        // newest, so it belongs at the end.
-        let mut topics = std::mem::take(&mut self.topics);
-        topics.retain(|existing| existing.topic_id != topic.topic_id);
-        topics.push(topic);
-        self.set_topics(topics);
+    pub fn add_tag(&mut self, tag: UiTag) {
+        // Tags stay in the daemon's creation order; a new tag is the newest,
+        // so it belongs at the end.
+        let mut tags = std::mem::take(&mut self.tags);
+        tags.retain(|existing| existing.tag_id != tag.tag_id);
+        tags.push(tag);
+        let agents = std::mem::take(&mut self.summaries);
+        self.set_data(tags, agents);
     }
 
-    pub fn topics(&self) -> &[UiTopic] {
-        &self.topics
+    pub fn tags(&self) -> &[UiTag] {
+        &self.tags
+    }
+
+    pub fn workstreams(&self) -> &[Workstream] {
+        &self.workstreams
+    }
+
+    /// Workstream-group tags, in daemon creation order.
+    pub fn group_tags(&self) -> impl Iterator<Item = &UiTag> {
+        self.tags
+            .iter()
+            .filter(|tag| tag.kind == TagKind::WorkstreamGroup)
     }
 
     pub fn mark_known(&mut self, agent_id: AgentId) {
@@ -423,8 +477,8 @@ impl AgentRegistry {
     }
 
     /// Cycles through live, rail-visible agents by `delta`, starting from
-    /// the current selection. Cycling follows rail order (topics, then
-    /// agents within each topic); agent id order is meaningless.
+    /// the current selection. Cycling follows rail order (workstreams, then
+    /// agents within each); agent id order is meaningless.
     pub fn next_live_agent(&self, delta: isize) -> Option<AgentId> {
         let live = self
             .rail_order()
@@ -445,21 +499,21 @@ impl AgentRegistry {
         live.get(index).copied()
     }
 
-    /// All agents in rail display order: pinned topics first, and within a
-    /// topic pinned agents first, then the active bucket, then the retained
-    /// order. Agents known outside any topic summary trail at the end.
+    /// All agents in rail display order: pinned workstreams first, and within
+    /// one pinned agents first, then the active bucket, then the retained
+    /// order. Agents known outside any workstream trail at the end.
     fn rail_order(&self) -> Vec<AgentId> {
-        let mut topics = self.topics.iter().collect::<Vec<_>>();
-        topics.sort_by_key(|topic| topic.status != rho_ui_proto::Status::Pinned);
+        let mut workstreams = self.workstreams.iter().collect::<Vec<_>>();
+        workstreams.sort_by_key(|workstream| workstream.status != rho_ui_proto::Status::Pinned);
 
         let mut candidates = Vec::new();
         let mut hidden = BTreeSet::new();
-        for topic in topics {
-            if topic.hidden {
-                hidden.extend(topic.agent_ids());
+        for workstream in workstreams {
+            if workstream.hidden {
+                hidden.extend(workstream.agent_ids());
                 continue;
             }
-            if let Some(layout) = self.topic_rail_layouts.get(&topic.topic_id) {
+            if let Some(layout) = self.topic_rail_layouts.get(&workstream.tag_id) {
                 candidates.extend(layout.listed.iter().map(|(agent_id, _)| *agent_id));
             }
         }
@@ -474,8 +528,8 @@ impl AgentRegistry {
     fn order_topic_agents_with_state<'a>(
         &self,
         state: &TopicRailState<'_>,
-        mut agents: Vec<&'a rho_ui_proto::UiAgentSummary>,
-    ) -> Vec<&'a rho_ui_proto::UiAgentSummary> {
+        mut agents: Vec<&'a UiAgentSummary>,
+    ) -> Vec<&'a UiAgentSummary> {
         agents.sort_by_key(|agent| {
             (
                 agent.status != rho_ui_proto::Status::Pinned,
@@ -501,9 +555,9 @@ impl AgentRegistry {
 
         fn append<'a>(
             parent: Option<AgentId>,
-            children: &BTreeMap<Option<AgentId>, Vec<&'a rho_ui_proto::UiAgentSummary>>,
+            children: &BTreeMap<Option<AgentId>, Vec<&'a UiAgentSummary>>,
             seen: &mut BTreeSet<AgentId>,
-            ordered: &mut Vec<&'a rho_ui_proto::UiAgentSummary>,
+            ordered: &mut Vec<&'a UiAgentSummary>,
         ) {
             for agent in children.get(&parent).into_iter().flatten() {
                 if seen.insert(agent.agent_id) {
@@ -530,7 +584,7 @@ impl AgentRegistry {
 
     fn rebuild_topic_rail_layouts(&mut self) {
         let layouts = self
-            .topics
+            .workstreams
             .iter()
             .map(|topic| {
                 let state = TopicRailState::new(self, topic);
@@ -547,14 +601,14 @@ impl AgentRegistry {
                     .enumerate()
                     .map(|(index, agent)| (agent.agent_id, index))
                     .collect::<BTreeMap<_, _>>();
-                let cache = |agents: Vec<&rho_ui_proto::UiAgentSummary>| {
+                let cache = |agents: Vec<&UiAgentSummary>| {
                     agents
                         .into_iter()
                         .map(|agent| (agent.agent_id, indexes[&agent.agent_id]))
                         .collect()
                 };
                 (
-                    topic.topic_id,
+                    topic.tag_id,
                     TopicRailLayout {
                         listed: cache(listed),
                         folded: cache(folded),
@@ -566,9 +620,9 @@ impl AgentRegistry {
     }
 
     fn resolve_cached_agents<'a>(
-        topic: &'a UiTopic,
+        topic: &'a Workstream,
         cached: &[(AgentId, usize)],
-    ) -> Vec<&'a rho_ui_proto::UiAgentSummary> {
+    ) -> Vec<&'a UiAgentSummary> {
         cached
             .iter()
             .filter_map(|(agent_id, index)| {
@@ -586,14 +640,14 @@ impl AgentRegistry {
             .collect()
     }
 
-    pub(crate) fn split_topic_agents<'a>(
+    pub(crate) fn split_workstream_agents<'a>(
         &self,
-        topic: &'a UiTopic,
+        topic: &'a Workstream,
     ) -> (
-        Vec<&'a rho_ui_proto::UiAgentSummary>,
-        Vec<&'a rho_ui_proto::UiAgentSummary>,
+        Vec<&'a UiAgentSummary>,
+        Vec<&'a UiAgentSummary>,
     ) {
-        let Some(layout) = self.topic_rail_layouts.get(&topic.topic_id) else {
+        let Some(layout) = self.topic_rail_layouts.get(&topic.tag_id) else {
             return (Vec::new(), Vec::new());
         };
         (
@@ -604,7 +658,7 @@ impl AgentRegistry {
 
     pub fn top_bucket<'a>(
         &self,
-        agents: impl IntoIterator<Item = &'a rho_ui_proto::UiAgentSummary>,
+        agents: impl IntoIterator<Item = &'a UiAgentSummary>,
     ) -> BTreeSet<AgentId> {
         let mut normal = agents
             .into_iter()
@@ -667,9 +721,7 @@ const LABEL_HEADROOM: u64 = 200;
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::{
-        AgentIdDomain, Status, TopicIdDomain, UiAgentSummary, WorkspaceId, WorkspaceIdDomain,
-    };
+    use rho_ui_proto::{AgentIdDomain, Status, UiAgentSummary, WorkspaceId, WorkspaceIdDomain};
 
     use super::*;
 
@@ -698,6 +750,7 @@ mod tests {
                     .saturating_add(id),
             ),
             hidden: false,
+            tags: Vec::new(),
         }
     }
 
@@ -724,17 +777,36 @@ mod tests {
             attention: rho_ui_proto::UiAttention::Quiet,
             last_active: rho_core::UnixMs(0),
             hidden: false,
+            tags: Vec::new(),
         }
     }
 
-    fn topic(id: u64, status: Status, agents: Vec<UiAgentSummary>) -> UiTopic {
-        UiTopic {
-            topic_id: rho_ui_proto::TopicId::from_counter(id, &TopicIdDomain(0)).unwrap(),
-            name: id.to_string(),
-            status,
-            hidden: false,
-            agents,
+    /// A workstream tag with its members' `tags` set to match.
+    fn topic(id: u64, status: Status, mut agents: Vec<UiAgentSummary>) -> (UiTag, Vec<UiAgentSummary>) {
+        for agent in &mut agents {
+            agent.tags = vec![TagId(id)];
         }
+        (
+            UiTag {
+                tag_id: TagId(id),
+                name: id.to_string(),
+                kind: TagKind::Workstream,
+                parent: None,
+                status,
+                hidden: false,
+            },
+            agents,
+        )
+    }
+
+    fn set_topics(registry: &mut AgentRegistry, topics: Vec<(UiTag, Vec<UiAgentSummary>)>) {
+        let mut tags = Vec::new();
+        let mut agents = Vec::new();
+        for (tag, members) in topics {
+            tags.push(tag);
+            agents.extend(members);
+        }
+        registry.set_data(tags, agents);
     }
 
     #[test]
@@ -742,7 +814,7 @@ mod tests {
         let mut registry = AgentRegistry::default();
         let mut recent = agent(3, Status::Normal);
         recent.last_active = rho_core::UnixMs(crate::workspace::now_ms() + 100);
-        registry.set_topics(vec![topic(
+        set_topics(&mut registry, vec![topic(
             1,
             Status::Normal,
             vec![agent(1, Status::Normal), agent(2, Status::Pinned), recent],
@@ -765,8 +837,8 @@ mod tests {
     fn hidden_topics_are_excluded_from_rail_navigation() {
         let mut registry = AgentRegistry::default();
         let mut hidden = topic(1, Status::Normal, vec![agent(1, Status::Normal)]);
-        hidden.hidden = true;
-        registry.set_topics(vec![
+        hidden.0.hidden = true;
+        set_topics(&mut registry, vec![
             hidden,
             topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
         ]);
@@ -784,7 +856,7 @@ mod tests {
         let agents = (1..=3)
             .map(|id| agent(id, Status::Normal))
             .collect::<Vec<_>>();
-        registry.set_topics(vec![topic(1, Status::Normal, agents)]);
+        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
         for id in 1..=3 {
             registry.mark_live(agent_id(id));
         }
@@ -816,7 +888,7 @@ mod tests {
         let agents = (1..=7)
             .map(|id| agent(id, Status::Normal))
             .collect::<Vec<_>>();
-        registry.set_topics(vec![topic(1, Status::Normal, agents)]);
+        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
         for id in 1..=7 {
             registry.mark_live(agent_id(id));
         }
@@ -849,7 +921,7 @@ mod tests {
             .map(|id| agent(id, Status::Normal))
             .collect::<Vec<_>>();
         agents[1] = filed;
-        registry.set_topics(vec![topic(1, Status::Normal, agents)]);
+        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
         for id in 1..=13 {
             registry.mark_live(agent_id(id));
         }
@@ -873,7 +945,7 @@ mod tests {
         use rho_ui_proto::UiAttention;
 
         let mut registry = AgentRegistry::default();
-        registry.set_topics(vec![topic(
+        set_topics(&mut registry, vec![topic(
             1,
             Status::Normal,
             vec![
@@ -902,7 +974,7 @@ mod tests {
         use rho_ui_proto::UiAttention;
 
         let mut registry = AgentRegistry::default();
-        registry.set_topics(vec![topic(
+        set_topics(&mut registry, vec![topic(
             1,
             Status::Normal,
             vec![agent(1, Status::Normal), agent(2, Status::Pinned)],
@@ -928,7 +1000,7 @@ mod tests {
         idle_pinned.last_active = rho_core::UnixMs(0);
         let mut agents = vec![idle, idle_pinned];
         agents.extend((3..=13).map(|id| agent(id, Status::Normal)));
-        registry.set_topics(vec![topic(1, Status::Normal, agents)]);
+        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
 
         // The quiet tail beyond the active bucket plus five more folds away;
         // pins and active bucket agents stay. Fresh engagement revives it.
@@ -948,7 +1020,7 @@ mod tests {
         let mut registry = AgentRegistry::default();
         registry.set_machine_seed(0);
         registry.set_workspace_counter(36 * 36);
-        registry.set_topics(vec![topic(
+        set_topics(&mut registry, vec![topic(
             1,
             Status::Normal,
             vec![
@@ -984,7 +1056,7 @@ mod tests {
     #[test]
     fn agent_lookup_accepts_display_name() {
         let mut registry = AgentRegistry::default();
-        registry.set_topics(vec![topic(
+        set_topics(&mut registry, vec![topic(
             1,
             Status::Normal,
             vec![named_agent(1, "Fix Tests")],

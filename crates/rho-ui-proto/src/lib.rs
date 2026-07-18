@@ -12,7 +12,7 @@ use camino::Utf8PathBuf;
 pub use rho_agent::MessageDelivery;
 pub use rho_agent::db::{
     AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
-    Status, TopicId, TopicIdDomain,
+    Status, TagId, TagKind,
 };
 use rho_core::ContentPart;
 pub use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
@@ -70,14 +70,18 @@ pub struct IoStats {
 pub enum ClientMessage {
     Ping,
     Subscribe,
-    NewTopic {
+    NewTag {
         name: String,
+        kind: TagKind,
+        parent: Option<TagId>,
     },
     NewAgent {
-        /// The task this agent joins. `None` founds a topic of the agent's
-        /// own — every top-level agent starts its own task — named
-        /// provisionally until the agent's generated title lands.
-        topic_id: Option<TopicId>,
+        /// Seed tags for the new agent. A workstream tag joins that
+        /// workstream; otherwise the daemon founds a fresh workstream
+        /// (named provisionally until the agent's generated title lands),
+        /// parented to the first workstream-group tag given. Labels carry
+        /// over verbatim.
+        tags: Vec<TagId>,
         role: AgentRole,
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).
@@ -100,8 +104,8 @@ pub enum ClientMessage {
         agent_id: AgentId,
         name: String,
     },
-    RenameTopic {
-        topic_id: TopicId,
+    RenameTag {
+        tag_id: TagId,
         name: String,
     },
     CancelTurn {
@@ -114,24 +118,31 @@ pub enum ClientMessage {
     ContinueTurn {
         agent_id: AgentId,
     },
-    /// Re-points the agent's topic membership. Topics are ad-hoc tab groups:
-    /// agents start in the default topic and move into a topic once they
-    /// prove worth organizing.
-    MoveAgent {
+    /// Applies a tag to an agent, with kind-aware semantics: a workstream
+    /// tag replaces the agent's current workstream (a move); a
+    /// workstream-group re-parents the agent's workstream tag; a label is
+    /// added to the set.
+    TagAgent {
         agent_id: AgentId,
-        topic: TopicTarget,
+        target: TagTarget,
+    },
+    /// Removes a label from the agent (workstream membership is moved, not
+    /// removed).
+    UntagAgent {
+        agent_id: AgentId,
+        tag_id: TagId,
     },
     /// Pin an agent, or return it to normal.
     SetAgentStatus {
         agent_id: AgentId,
         status: Status,
     },
-    SetTopicStatus {
-        topic_id: TopicId,
+    SetTagStatus {
+        tag_id: TagId,
         status: Status,
     },
-    SetTopicHidden {
-        topic_id: TopicId,
+    SetTagHidden {
+        tag_id: TagId,
         hidden: bool,
     },
     /// The user's verdict on an agent's last finished turn. Attention is
@@ -322,13 +333,14 @@ pub enum JoinTarget {
     User { repo: Utf8PathBuf },
 }
 
-/// Destination of [`ClientMessage::MoveAgent`]. `Named` is resolved by the
-/// daemon against topic display names and creates the topic when no match
-/// exists, so "spin off a topic around this agent" is one message.
+/// Destination of [`ClientMessage::TagAgent`]. `Named` is resolved by the
+/// daemon against tag display names (of the given kind) and creates the
+/// tag when no match exists, so "spin off a group around this agent" is
+/// one message.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum TopicTarget {
-    Existing(TopicId),
-    Named(String),
+pub enum TagTarget {
+    Existing(TagId),
+    Named { name: String, kind: TagKind },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -353,12 +365,9 @@ pub struct LandLeaseHolder {
 pub enum ServerMessage {
     Pong,
     Ready {
-        topics: Vec<UiTopic>,
+        tags: Vec<UiTag>,
+        agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
-        /// Where new agents land when the client doesn't say otherwise (the
-        /// daemon-created "default" topic). Identified explicitly so clients
-        /// never have to guess from topic ordering.
-        default_topic_id: TopicId,
         /// The daemon database's machine seed; clients need it to encode
         /// agent IDs (see [`AgentIdDomain`]).
         machine_seed: u64,
@@ -381,11 +390,11 @@ pub enum ServerMessage {
         frame: remote::AgentRemoteFrame,
     },
     AgentCreated {
-        topic_id: TopicId,
         agent_id: AgentId,
+        tags: Vec<TagId>,
     },
-    TopicCreated {
-        topic: UiTopic,
+    TagCreated {
+        tag: UiTag,
     },
     AgentLoaded {
         agent_id: AgentId,
@@ -448,27 +457,23 @@ pub enum ServerMessage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiTopic {
-    pub topic_id: TopicId,
+pub struct UiTag {
+    pub tag_id: TagId,
     pub name: String,
+    pub kind: TagKind,
+    /// Structure between tags (workstream → workstream-group); membership
+    /// in ancestors is implied, never stored on agents.
+    pub parent: Option<TagId>,
     pub status: Status,
-    #[senax(default)]
     pub hidden: bool,
-    pub agents: Vec<UiAgentSummary>,
-}
-
-impl UiTopic {
-    pub fn agent_ids(&self) -> impl Iterator<Item = AgentId> + '_ {
-        self.agents.iter().map(|agent| agent.agent_id)
-    }
 }
 
 /// Enough about an agent to list and label it without loading it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiAgentSummary {
     pub agent_id: AgentId,
-    /// The agent that spawned this one. The GUI uses same-topic parent edges
-    /// to present delegated work inline beneath its parent.
+    /// The agent that spawned this one. The GUI uses parent edges to
+    /// present delegated work inline beneath its parent.
     pub parent_agent: Option<AgentId>,
     pub display_name: Option<String>,
     pub created_at: rho_core::UnixMs,
@@ -491,6 +496,10 @@ pub struct UiAgentSummary {
     /// The user filed this agent away (`AgentDisposition::Hidden`): fold it
     /// immediately instead of waiting out the rail's idle window.
     pub hidden: bool,
+    /// The agent's tags: at most one workstream plus any labels. Copied
+    /// from the parent on spawn.
+    #[senax(default)]
+    pub tags: Vec<TagId>,
 }
 
 /// How urgently an agent wants the user, in ascending order — the rail's

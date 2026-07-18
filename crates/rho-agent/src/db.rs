@@ -25,8 +25,11 @@ const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentEventPos> =
 const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
     TableDefinition::new("agent_events");
 const AGENTS: TableDefinition<AgentId, Sen<AgentRecord>> = TableDefinition::new("agents");
-const TOPICS: TableDefinition<TopicId, Sen<TopicRecord>> = TableDefinition::new("topics");
-const TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> = TableDefinition::new("topic_agents");
+const TAGS: TableDefinition<TagId, Sen<TagRecord>> = TableDefinition::new("tags");
+/// Superseded by tags (kind = workstream-group); read once by migration.
+const LEGACY_TOPICS: TableDefinition<TopicId, Sen<TopicRecord>> = TableDefinition::new("topics");
+const LEGACY_TOPIC_AGENTS: TableDefinition<TopicAgentKey, ()> =
+    TableDefinition::new("topic_agents");
 /// Keyed by the workdir's absolute path (UTF-8; paths are strings on disk
 /// and on the wire), making paths unique by construction.
 const LEGACY_WORKDIRS: TableDefinition<String, Sen<WorkdirRecord>> =
@@ -35,7 +38,7 @@ const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::n
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "b6e40c7a";
+const CURRENT_AGENT_DB_FORMAT: &str = "5d19e3f2";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -72,6 +75,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         to: "b6e40c7a",
         migrate: migrate_projects,
     },
+    AgentDbMigration {
+        from: "b6e40c7a",
+        to: "5d19e3f2",
+        migrate: migrate_topics_to_tags,
+    },
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -80,17 +88,55 @@ struct CounterKey(u8);
 impl CounterKey {
     pub const LAST_AGENT_ID: Self = Self(1);
     pub const LAST_LINEAGE_ID: Self = Self(2);
-    pub const LAST_TOPIC_ID: Self = Self(3);
+    /// Formerly the topic id counter; tags continue its sequence.
+    pub const LAST_TAG_ID: Self = Self(3);
     pub const LAST_WORKSPACE_ID: Self = Self(4);
 }
 
 pub use rho_core::{AgentId, AgentIdDomain};
 
-pub type TopicId = PrefixId<TopicIdDomain>;
+/// Plain sequential tag id; no prefix-id scrambling — tags are addressed
+/// by their unique name in user-facing contexts, and clients that need a
+/// string render `tp-{n}`.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue, Encode, Decode, Pack,
+    Unpack,
+)]
+pub struct TagId(pub u64);
 
-/// Keys topic-id encoding with this database's persisted machine seed.
+/// What a tag means structurally; clients render each kind differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
+pub enum TagKind {
+    /// The unit of work: one per top-level agent tree, founded with the
+    /// agent. An agent carries at most one workstream tag; adding another
+    /// is a move.
+    Workstream,
+    /// Groups workstreams (via the workstream tag's `parent`); what topics
+    /// used to be. User-created only.
+    WorkstreamGroup,
+    /// Flat cross-cutting marker; agents accumulate these freely.
+    Label,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct TagRecord {
+    pub name: String,
+    pub kind: TagKind,
+    /// Structure between tags (workstream → workstream-group). Membership
+    /// in ancestors is implied by the chain, never stored on agents.
+    pub parent: Option<TagId>,
+    pub created_at: UnixMillis,
+    pub updated_at: UnixMillis,
+    pub status: Status,
+    pub hidden: bool,
+}
+
+type TopicId = PrefixId<TopicIdDomain>;
+
+/// Legacy topic-id domain; decodes existing `topics` table keys during
+/// migration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TopicIdDomain(pub u64);
+struct TopicIdDomain(u64);
 
 impl PrefixIdDomain for TopicIdDomain {
     const KIND: &'static str = "topic-id";
@@ -117,7 +163,7 @@ pub struct ProjectRecord {
     pub created_at: UnixMillis,
 }
 
-/// Pin state, shared by topics and agents. Pinned items sort first in
+/// Pin state, shared by tags and agents. Pinned items sort first in
 /// client rails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Status {
@@ -146,8 +192,9 @@ pub enum AgentDisposition {
     Hidden,
 }
 
+/// Legacy topic shape, read once by [`migrate_topics_to_tags`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct TopicRecord {
+struct TopicRecord {
     pub name: String,
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
@@ -157,15 +204,9 @@ pub struct TopicRecord {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue)]
-pub struct TopicAgentKey {
+struct TopicAgentKey {
     topic_id: TopicId,
     agent_id: AgentId,
-}
-
-impl TopicAgentKey {
-    pub fn new(topic_id: TopicId, agent_id: AgentId) -> Self {
-        Self { topic_id, agent_id }
-    }
 }
 
 #[derive(
@@ -267,6 +308,11 @@ pub struct AgentRecord {
     pub last_user_message: UnixMillis,
     #[senax(default)]
     pub disposition: AgentDisposition,
+    /// The agent's tags: at most one workstream, any number of labels.
+    /// Copied from the parent on spawn. Ancestor workstream-groups are
+    /// implied by the workstream tag's parent chain, never stored here.
+    #[senax(default)]
+    pub tags: Vec<TagId>,
 }
 
 impl AgentRecord {
@@ -305,6 +351,8 @@ impl senax_encoder::Decoder for AgentRecord {
             last_user_message: UnixMillis,
             #[senax(default)]
             disposition: AgentDisposition,
+            #[senax(default)]
+            tags: Vec<TagId>,
         }
 
         let encoded = EncodedAgentRecord::decode(reader)?;
@@ -330,6 +378,7 @@ impl senax_encoder::Decoder for AgentRecord {
             runtime: encoded.runtime,
             last_user_message: encoded.last_user_message,
             disposition: encoded.disposition,
+            tags: encoded.tags,
         })
     }
 }
@@ -688,11 +737,10 @@ pub trait AgentReadTxnExt {
     fn machine_seed(&self) -> u64;
     fn last_agent_counter(&self) -> u64;
     fn last_workspace_counter(&self) -> u64;
-    fn get_topic(&self, topic_id: TopicId) -> TopicRecord;
-    fn list_topics(&self) -> Vec<(TopicId, TopicRecord)>;
-    fn list_topic_agents(&self, topic_id: TopicId) -> Vec<AgentId>;
-    /// The topic an agent currently belongs to.
-    fn agent_topic(&self, agent_id: AgentId) -> Option<TopicId>;
+    fn get_tag(&self, tag_id: TagId) -> TagRecord;
+    fn list_tags(&self) -> Vec<(TagId, TagRecord)>;
+    /// The agent's workstream tag, if it carries one.
+    fn agent_workstream(&self, agent_id: AgentId) -> Option<TagId>;
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
     fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
     fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)>;
@@ -707,13 +755,21 @@ pub trait AgentReadTxnExt {
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
 
-    fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId;
+    fn create_tag(
+        &mut self,
+        now: UnixMillis,
+        name: String,
+        kind: TagKind,
+        parent: Option<TagId>,
+    ) -> TagId;
 
-    fn set_topic_name(&mut self, now: UnixMillis, topic_id: TopicId, name: String);
+    fn set_tag_name(&mut self, now: UnixMillis, tag_id: TagId, name: String);
 
-    fn set_topic_status(&mut self, now: UnixMillis, topic_id: TopicId, status: Status);
+    fn set_tag_status(&mut self, now: UnixMillis, tag_id: TagId, status: Status);
 
-    fn set_topic_hidden(&mut self, now: UnixMillis, topic_id: TopicId, hidden: bool);
+    fn set_tag_hidden(&mut self, now: UnixMillis, tag_id: TagId, hidden: bool);
+
+    fn set_tag_parent(&mut self, now: UnixMillis, tag_id: TagId, parent: Option<TagId>);
 
     fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status);
 
@@ -727,9 +783,9 @@ pub trait AgentWriteTxnExt {
     /// workspaces can't collide with forgotten names in the repo view.
     fn alloc_workspace_id(&mut self) -> WorkspaceId;
 
-    /// Re-points the agent's topic membership. Topics are ad-hoc groupings
-    /// agents move into after the fact; nothing else about the agent changes.
-    fn move_agent_to_topic(&mut self, agent_id: AgentId, topic_id: TopicId);
+    /// Replaces the agent's tag set wholesale; callers enforce the at-most-
+    /// one-workstream rule.
+    fn set_agent_tags(&mut self, now: UnixMillis, agent_id: AgentId, tags: Vec<TagId>);
 
     fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String);
 
@@ -761,7 +817,7 @@ pub(crate) trait AgentProfileWriteTxnExt {
         &mut self,
         now: UnixMillis,
         agent_id: AgentId,
-        topic_id: TopicId,
+        tags: Vec<TagId>,
         display_name: Option<String>,
         workdirs: Vec<WorkspaceInfo>,
         mode: SessionBinding,
@@ -775,7 +831,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         &mut self,
         now: UnixMillis,
         agent_id: AgentId,
-        topic_id: TopicId,
+        tags: Vec<TagId>,
         display_name: Option<String>,
         workdirs: Vec<WorkspaceInfo>,
         mode: SessionBinding,
@@ -815,11 +871,10 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             runtime,
             last_user_message: now,
             disposition: AgentDisposition::Done,
+            tags,
         };
         self.open_table(AGENTS)
             .insert(&agent_id, SenValue::borrowed(&agent));
-        self.open_table(TOPIC_AGENTS)
-            .insert(&TopicAgentKey::new(topic_id, agent_id), &());
         AgentEventPos::root(lineage_id)
     }
 }
@@ -846,37 +901,27 @@ impl AgentReadTxnExt for ReadTxn {
             .unwrap_or(0)
     }
 
-    fn get_topic(&self, topic_id: TopicId) -> TopicRecord {
-        self.open_table(TOPICS)
-            .get(&topic_id)
-            .expect("topic id missing")
+    fn get_tag(&self, tag_id: TagId) -> TagRecord {
+        self.open_table(TAGS)
+            .get(&tag_id)
+            .expect("tag id missing")
             .value()
             .into_owned()
     }
 
-    fn list_topics(&self) -> Vec<(TopicId, TopicRecord)> {
-        self.open_table(TOPICS)
+    fn list_tags(&self) -> Vec<(TagId, TagRecord)> {
+        self.open_table(TAGS)
             .iter()
             .map(|(key, value)| (key.value(), value.value().into_owned()))
             .collect()
     }
 
-    fn list_topic_agents(&self, topic_id: TopicId) -> Vec<AgentId> {
-        self.open_table(TOPIC_AGENTS)
-            .range(
-                TopicAgentKey::new(topic_id, AgentId::MIN)
-                    ..=TopicAgentKey::new(topic_id, AgentId::MAX),
-            )
-            .map(|(key, _)| key.value().agent_id)
-            .collect()
-    }
-
-    fn agent_topic(&self, agent_id: AgentId) -> Option<TopicId> {
-        self.open_table(TOPIC_AGENTS)
-            .iter()
-            .map(|(key, _)| key.value())
-            .find(|key| key.agent_id == agent_id)
-            .map(|key| key.topic_id)
+    fn agent_workstream(&self, agent_id: AgentId) -> Option<TagId> {
+        let tags = self.open_table(TAGS);
+        self.get_agent(agent_id).tags.into_iter().find(|tag_id| {
+            tags.get(tag_id)
+                .is_some_and(|tag| tag.value().into_owned().kind == TagKind::Workstream)
+        })
     }
 
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord {
@@ -962,8 +1007,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(LINEAGE_PARENTS);
         self.open_table(AGENT_EVENTS);
         self.open_table(AGENTS);
-        self.open_table(TOPICS);
-        self.open_table(TOPIC_AGENTS);
+        self.open_table(TAGS);
         self.open_table(PROJECTS);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
@@ -971,57 +1015,43 @@ impl AgentWriteTxnExt for WriteTxn {
         }
     }
 
-    fn create_topic(&mut self, now: UnixMillis, name: String, status: Status) -> TopicId {
-        let domain = TopicIdDomain(machine_seed(self));
-        let topic_id =
-            TopicId::from_counter(next_counter(self, CounterKey::LAST_TOPIC_ID), &domain)
-                .expect("topic id counter exceeds prefix-id capacity");
-        let topic = TopicRecord {
-            name,
+    fn create_tag(
+        &mut self,
+        now: UnixMillis,
+        name: String,
+        kind: TagKind,
+        parent: Option<TagId>,
+    ) -> TagId {
+        let tag_id = TagId(next_counter(self, CounterKey::LAST_TAG_ID));
+        let tag = TagRecord {
+            name: unique_tag_name(self, name, None),
+            kind,
+            parent,
             created_at: now,
             updated_at: now,
-            status,
+            status: Status::Normal,
             hidden: false,
         };
-        self.open_table(TOPICS)
-            .insert(&topic_id, SenValue::borrowed(&topic));
-        topic_id
+        self.open_table(TAGS)
+            .insert(&tag_id, SenValue::borrowed(&tag));
+        tag_id
     }
 
-    fn set_topic_name(&mut self, now: UnixMillis, topic_id: TopicId, name: String) {
-        let mut topics = self.open_table(TOPICS);
-        let mut topic = topics
-            .get(&topic_id)
-            .expect("topic id missing")
-            .value()
-            .into_owned();
-        topic.name = name;
-        topic.updated_at = now;
-        topics.insert(&topic_id, SenValue::borrowed(&topic));
+    fn set_tag_name(&mut self, now: UnixMillis, tag_id: TagId, name: String) {
+        let name = unique_tag_name(self, name, Some(tag_id));
+        update_tag(self, now, tag_id, |tag| tag.name = name);
     }
 
-    fn set_topic_status(&mut self, now: UnixMillis, topic_id: TopicId, status: Status) {
-        let mut topics = self.open_table(TOPICS);
-        let mut topic = topics
-            .get(&topic_id)
-            .expect("topic id missing")
-            .value()
-            .into_owned();
-        topic.status = status;
-        topic.updated_at = now;
-        topics.insert(&topic_id, SenValue::borrowed(&topic));
+    fn set_tag_status(&mut self, now: UnixMillis, tag_id: TagId, status: Status) {
+        update_tag(self, now, tag_id, |tag| tag.status = status);
     }
 
-    fn set_topic_hidden(&mut self, now: UnixMillis, topic_id: TopicId, hidden: bool) {
-        let mut topics = self.open_table(TOPICS);
-        let mut topic = topics
-            .get(&topic_id)
-            .expect("topic id missing")
-            .value()
-            .into_owned();
-        topic.hidden = hidden;
-        topic.updated_at = now;
-        topics.insert(&topic_id, SenValue::borrowed(&topic));
+    fn set_tag_hidden(&mut self, now: UnixMillis, tag_id: TagId, hidden: bool) {
+        update_tag(self, now, tag_id, |tag| tag.hidden = hidden);
+    }
+
+    fn set_tag_parent(&mut self, now: UnixMillis, tag_id: TagId, parent: Option<TagId>) {
+        update_tag(self, now, tag_id, |tag| tag.parent = parent);
     }
 
     fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status) {
@@ -1084,17 +1114,16 @@ impl AgentWriteTxnExt for WriteTxn {
             .expect("workspace id counter exceeds prefix-id capacity")
     }
 
-    fn move_agent_to_topic(&mut self, agent_id: AgentId, topic_id: TopicId) {
-        let mut topic_agents = self.open_table(TOPIC_AGENTS);
-        let previous = topic_agents
-            .iter()
-            .map(|(key, _)| key.value())
-            .filter(|key| key.agent_id == agent_id)
-            .collect::<Vec<_>>();
-        for key in previous {
-            topic_agents.remove(&key);
-        }
-        topic_agents.insert(&TopicAgentKey::new(topic_id, agent_id), &());
+    fn set_agent_tags(&mut self, now: UnixMillis, agent_id: AgentId, tags: Vec<TagId>) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.tags = tags;
+        agent.updated_at = now;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
     fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String) {
@@ -1284,6 +1313,117 @@ fn migrate_projects(write: &mut WriteTxn) {
             }),
         );
     }
+}
+
+/// Tag names are unique (so a name identifies a tag); a colliding name
+/// gets a numeric suffix rather than failing, since workstream names are
+/// auto-generated from agent titles.
+fn unique_tag_name(write: &mut WriteTxn, base: String, exclude: Option<TagId>) -> String {
+    let taken = write
+        .open_table(TAGS)
+        .iter()
+        .filter(|(tag_id, _)| Some(tag_id.value()) != exclude)
+        .map(|(_, tag)| tag.value().into_owned().name)
+        .collect::<std::collections::HashSet<_>>();
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2u64..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken.contains(candidate))
+        .expect("unbounded suffix search terminates")
+}
+
+fn update_tag(write: &mut WriteTxn, now: UnixMillis, tag_id: TagId, edit: impl FnOnce(&mut TagRecord)) {
+    let mut tags = write.open_table(TAGS);
+    let mut tag = tags
+        .get(&tag_id)
+        .expect("tag id missing")
+        .value()
+        .into_owned();
+    edit(&mut tag);
+    tag.updated_at = now;
+    tags.insert(&tag_id, SenValue::borrowed(&tag));
+}
+
+/// Topics become workstream-group tags; every top-level agent founds a
+/// workstream tag (named from its title, parented to its topic's group)
+/// that it and its whole spawn tree carry.
+fn migrate_topics_to_tags(write: &mut WriteTxn) {
+    let topics = write
+        .open_table(LEGACY_TOPICS)
+        .iter()
+        .map(|(key, value)| (key.value(), value.value().into_owned()))
+        .collect::<Vec<_>>();
+    let memberships = write
+        .open_table(LEGACY_TOPIC_AGENTS)
+        .iter()
+        .map(|(key, _)| {
+            let key = key.value();
+            (key.agent_id, key.topic_id)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut groups = std::collections::HashMap::new();
+    for (topic_id, topic) in topics {
+        let group_id = write.create_tag(topic.created_at, topic.name, TagKind::WorkstreamGroup, None);
+        update_tag(write, topic.updated_at, group_id, |tag| {
+            tag.status = topic.status;
+            tag.hidden = topic.hidden;
+        });
+        groups.insert(topic_id, group_id);
+    }
+
+    let mut agents = {
+        let table = write.open_table(AGENTS);
+        table
+            .iter()
+            .map(|(key, value)| (key.value(), value.value().into_owned()))
+            .collect::<Vec<_>>()
+    };
+    let parents = agents
+        .iter()
+        .map(|(agent_id, record)| (*agent_id, record.parent_agent))
+        .collect::<std::collections::HashMap<_, _>>();
+    let root_of = |mut agent_id: AgentId| {
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(agent_id)
+            && let Some(Some(parent)) = parents.get(&agent_id)
+        {
+            agent_id = *parent;
+        }
+        agent_id
+    };
+
+    let mut workstreams = std::collections::HashMap::new();
+    for (agent_id, record) in &agents {
+        if record.parent_agent.is_some() {
+            continue;
+        }
+        let name = record
+            .display_name
+            .clone()
+            .unwrap_or_else(|| "untitled".to_owned());
+        let parent = memberships
+            .get(agent_id)
+            .and_then(|topic_id| groups.get(topic_id))
+            .copied();
+        let workstream = write.create_tag(record.created_at, name, TagKind::Workstream, parent);
+        workstreams.insert(*agent_id, workstream);
+    }
+
+    for (agent_id, record) in &mut agents {
+        // Orphaned subtrees (root missing) stay untagged rather than failing.
+        record.tags = workstreams.get(&root_of(*agent_id)).copied().into_iter().collect();
+    }
+    {
+        let mut table = write.open_table(AGENTS);
+        for (agent_id, record) in &agents {
+            table.insert(agent_id, SenValue::borrowed(record));
+        }
+    }
+    write.delete_table("topics");
+    write.delete_table("topic_agents");
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

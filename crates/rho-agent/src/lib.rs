@@ -564,7 +564,7 @@ impl Agent {
         auth: InferenceAuth,
         mode: SessionBinding,
         role: db::AgentRole,
-        topic_id: db::TopicId,
+        tags: Vec<db::TagId>,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         parent: Option<AgentId>,
@@ -591,7 +591,7 @@ impl Agent {
         let next_event = write.create_agent(
             now,
             agent_id,
-            topic_id,
+            tags,
             display_name,
             entries
                 .iter()

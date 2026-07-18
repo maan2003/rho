@@ -16,8 +16,8 @@ use camino::Utf8PathBuf;
 use rho_core::ContentPart;
 use rho_ui_proto::remote::UiAgentState;
 use rho_ui_proto::{
-    AgentId, AgentRole, ClientMessage, MessageDelivery, ServerMessage, StartMode, UiProject,
-    UiTopic, read_frame, write_frame,
+    AgentId, AgentRole, ClientMessage, MessageDelivery, ServerMessage, StartMode, TagKind,
+    UiAgentSummary, UiProject, UiTag, read_frame, write_frame,
 };
 use rho_webui_messages::{FromBrowser, MAX_LINE_LEN, ToBrowser};
 use tokio::io::{
@@ -86,7 +86,8 @@ where
         }
     });
 
-    let mut topics: Vec<UiTopic> = Vec::new();
+    let mut tags: Vec<UiTag> = Vec::new();
+    let mut agents_list: Vec<UiAgentSummary> = Vec::new();
     let mut projects: Vec<UiProject> = Vec::new();
     let mut agent_ids: HashMap<String, AgentId> = HashMap::new();
     let mut states: HashMap<AgentId, UiAgentState> = HashMap::new();
@@ -102,26 +103,24 @@ where
                     anyhow::bail!("daemon session closed");
                 };
                 match message {
-                    ServerMessage::Ready { topics: new_topics, projects: new_projects, .. } => {
-                        topics = new_topics;
+                    ServerMessage::Ready { tags: new_tags, agents: new_agents, projects: new_projects, .. } => {
+                        tags = new_tags;
+                        agents_list = new_agents;
                         projects = new_projects;
-                        index_agent_ids(&topics, &mut agent_ids);
-                        send_json(&mut writer, &json::hello(&topics, &projects)).await?;
+                        index_agent_ids(&agents_list, &mut agent_ids);
+                        send_json(&mut writer, &json::hello(&tags, &agents_list, &projects)).await?;
                     }
-                    ServerMessage::TopicCreated { topic } => {
-                        topics.push(topic);
-                        index_agent_ids(&topics, &mut agent_ids);
-                        send_json(&mut writer, &json::hello(&topics, &projects)).await?;
+                    ServerMessage::TagCreated { tag } => {
+                        tags.push(tag);
+                        send_json(&mut writer, &json::hello(&tags, &agents_list, &projects)).await?;
                     }
                     ServerMessage::AgentAttention { agent_id, attention } => {
-                        for topic in &mut topics {
-                            for agent in &mut topic.agents {
-                                if agent.agent_id == agent_id {
-                                    agent.attention = attention;
-                                }
+                        for agent in &mut agents_list {
+                            if agent.agent_id == agent_id {
+                                agent.attention = attention;
                             }
                         }
-                        send_json(&mut writer, &json::hello(&topics, &projects)).await?;
+                        send_json(&mut writer, &json::hello(&tags, &agents_list, &projects)).await?;
                     }
                     ServerMessage::Agent { agent_id, frame } => {
                         let state = states.entry(agent_id).or_insert_with(empty_state);
@@ -178,10 +177,12 @@ where
                         }).await?;
                     }
                     FromBrowser::NewAgent { topic_id, repo, role, join, sandbox, revset, text } => {
-                        // An unknown topic founds a new task for the agent.
-                        let topic_id = topics.iter()
-                            .find(|topic| topic.topic_id.encoded() == topic_id)
-                            .map(|topic| topic.topic_id);
+                        // An unknown workstream founds a new one for the agent.
+                        let seed_tags = tags.iter()
+                            .find(|tag| tag.kind == TagKind::Workstream
+                                && format!("tp-{}", tag.tag_id.0) == topic_id)
+                            .map(|tag| vec![tag.tag_id])
+                            .unwrap_or_default();
                         let role = match parse_role(&role) {
                             Some(role) => role,
                             None => {
@@ -198,7 +199,7 @@ where
                             StartMode::NewOn { repo, revset }
                         };
                         write_frame(&mut session_write, &ClientMessage::NewAgent {
-                            topic_id,
+                            tags: seed_tags,
                             role,
                             start,
                             content: Some(vec![ContentPart::Text { text }]),
@@ -271,11 +272,9 @@ where
     Ok(Some(text))
 }
 
-fn index_agent_ids(topics: &[UiTopic], agent_ids: &mut HashMap<String, AgentId>) {
-    for topic in topics {
-        for agent in &topic.agents {
-            agent_ids.insert(agent.agent_id.encoded(), agent.agent_id);
-        }
+fn index_agent_ids(agents: &[UiAgentSummary], agent_ids: &mut HashMap<String, AgentId>) {
+    for agent in agents {
+        agent_ids.insert(agent.agent_id.encoded(), agent.agent_id);
     }
 }
 

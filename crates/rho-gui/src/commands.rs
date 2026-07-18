@@ -16,6 +16,14 @@ pub struct Candidate {
     pub description: String,
 }
 
+/// Tag names by kind, feeding `:tag` argument completion.
+#[derive(Default)]
+pub struct TagNames {
+    pub workstreams: Vec<String>,
+    pub groups: Vec<String>,
+    pub labels: Vec<String>,
+}
+
 /// Completion candidates for the text before the cursor. Values replace the
 /// current whitespace-delimited token (the `:` of the leading command token
 /// is preserved).
@@ -23,7 +31,7 @@ pub fn completions_for(
     text_before_cursor: &str,
     workdirs: &[(String, String)],
     live_agents: &[Candidate],
-    topics: &[String],
+    tags: &TagNames,
 ) -> Vec<Candidate> {
     if let Some(mention) = mention_prefix(text_before_cursor) {
         return live_agents
@@ -43,7 +51,15 @@ pub fn completions_for(
     } else {
         ""
     };
-    rho_commands::completion_candidates(trimmed, &rho_commands::CompletionCtx { workdirs, topics })
+    rho_commands::completion_candidates(
+        trimmed,
+        &rho_commands::CompletionCtx {
+            workdirs,
+            workstreams: &tags.workstreams,
+            groups: &tags.groups,
+            labels: &tags.labels,
+        },
+    )
         .into_iter()
         .map(|candidate| Candidate {
             value: format!("{colon}{}", candidate.value),
@@ -175,7 +191,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         _window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<anyhow::Result<Vec<CompletionResponse>>> {
-        let (workdirs, live_agents, topics) = self
+        let (workdirs, live_agents, tags) = self
             .workspace
             .upgrade()
             .map(|workspace| {
@@ -183,7 +199,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
                 (
                     workspace.workdir_table(),
                     workspace.live_agent_targets(),
-                    workspace.topic_names(),
+                    workspace.tag_names(),
                 )
             })
             .unwrap_or_default();
@@ -204,7 +220,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         } else if in_start_field {
             start_field_candidates(&text_before_cursor, &live_agents)
         } else {
-            completions_for(&text_before_cursor, &workdirs, &live_agents, &topics)
+            completions_for(&text_before_cursor, &workdirs, &live_agents, &tags)
         };
         let completions = candidates
             .into_iter()
@@ -275,10 +291,10 @@ mod tests {
 
     #[test]
     fn root_commands_complete_by_prefix() {
-        let candidates = completions_for(":", &[], &[], &[]);
+        let candidates = completions_for(":", &[], &[], &Default::default());
         assert!(candidates.iter().any(|c| c.value == ":agent"));
         assert!(candidates.iter().any(|c| c.value == ":projects"));
-        let candidates = completions_for(":agent re", &[], &[], &[]);
+        let candidates = completions_for(":agent re", &[], &[], &Default::default());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "rename");
     }
@@ -286,7 +302,7 @@ mod tests {
     #[test]
     fn agent_new_completes_workdirs() {
         let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
-        let candidates = completions_for(":agent new ", &workdirs, &[], &[]);
+        let candidates = completions_for(":agent new ", &workdirs, &[], &Default::default());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "rho");
         assert_eq!(candidates[0].description, "/home/u/src/rho");
@@ -294,8 +310,11 @@ mod tests {
 
     #[test]
     fn topic_move_completes_topics() {
-        let topics = vec!["infra".to_owned(), "1".to_owned()];
-        let candidates = completions_for(":topic move in", &[], &[], &topics);
+        let tags = TagNames {
+            workstreams: vec!["infra".to_owned(), "1".to_owned()],
+            ..Default::default()
+        };
+        let candidates = completions_for(":tag move in", &[], &[], &tags);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "infra");
     }
@@ -312,7 +331,7 @@ mod tests {
                 description: "agent".to_owned(),
             },
         ];
-        let candidates = completions_for("ask @w", &[], &live, &[]);
+        let candidates = completions_for("ask @w", &[], &live, &Default::default());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "worker");
     }

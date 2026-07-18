@@ -67,13 +67,13 @@ impl PartialEq for Surface {
     }
 }
 
-/// Which task's window arrangement fills the window. Every task (topic)
+/// Which task's window arrangement fills the window. Every workstream
 /// keeps its own split tree, like emacs perspectives; the draft composer
 /// is its own context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ContextId {
     Draft,
-    Task(rho_ui_proto::TopicId),
+    Task(rho_ui_proto::TagId),
 }
 
 /// How to reach the daemon. Deliberately holds no client-local paths: the
@@ -102,13 +102,10 @@ pub struct Workspace {
     /// Registered workdirs from the daemon; selection vocabulary for new
     /// agents.
     workdirs: Vec<rho_ui_proto::UiProject>,
-    /// Topic the draft inherits: whichever topic was focused when the draft
-    /// was entered. Topics are ad-hoc tab groups — a new agent lands in the
-    /// default topic unless created from inside one.
-    draft_topic_id: Option<rho_ui_proto::TopicId>,
-    /// Announced by the daemon in `Ready`; where draft submissions land when
-    /// no topic was inherited.
-    default_topic_id: Option<rho_ui_proto::TopicId>,
+    /// Workstream the draft inherits context from: whichever was focused
+    /// when the draft was entered. Only used to derive the default workdir —
+    /// a submitted draft always founds its own workstream.
+    draft_workstream: Option<rho_ui_proto::TagId>,
     /// A NewAgent request from the draft is in flight; the draft buffer is
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
@@ -163,8 +160,7 @@ impl Workspace {
             pending_syncs: HashMap::new(),
             draft_view,
             workdirs: Vec::new(),
-            draft_topic_id: None,
-            default_topic_id: None,
+            draft_workstream: None,
             awaiting_draft_agent: false,
             connected: false,
             duration_timer: None,
@@ -195,11 +191,11 @@ impl Workspace {
             .expect("active context has a tree")
     }
 
-    /// The context an agent's transcript lives in: its task (topic). An
+    /// The context an agent's transcript lives in: its workstream. An
     /// agent the registry can't place yet shows in the draft context.
     fn context_for_agent(&self, agent_id: AgentId) -> ContextId {
         self.registry
-            .topic_of(agent_id)
+            .workstream_of(agent_id)
             .map(ContextId::Task)
             .unwrap_or(ContextId::Draft)
     }
@@ -209,13 +205,13 @@ impl Workspace {
     fn prune_contexts(&mut self) {
         let live = self
             .registry
-            .topics()
+            .workstreams()
             .iter()
-            .map(|topic| topic.topic_id)
+            .map(|workstream| workstream.tag_id)
             .collect::<HashSet<_>>();
         self.contexts.retain(|context, _| match context {
             ContextId::Draft => true,
-            ContextId::Task(topic_id) => live.contains(topic_id),
+            ContextId::Task(tag_id) => live.contains(tag_id),
         });
         if !self.contexts.contains_key(&self.active_context) {
             self.active_context = ContextId::Draft;
@@ -351,9 +347,9 @@ impl Workspace {
     ) {
         match event {
             ConnEvent::Ready {
-                topics,
+                tags,
+                agents,
                 projects: workdirs,
-                default_topic_id,
                 machine_seed,
                 agent_counter,
                 workspace_counter,
@@ -362,10 +358,9 @@ impl Workspace {
                 self.registry.set_machine_seed(machine_seed);
                 self.registry.set_agent_counter(agent_counter);
                 self.registry.set_workspace_counter(workspace_counter);
-                self.registry.set_topics(topics);
+                self.registry.set_data(tags, agents);
                 self.prune_contexts();
                 self.workdirs = workdirs;
-                self.default_topic_id = Some(default_topic_id);
                 self.connected = true;
                 self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.registry.active_pane(), ActivePane::Startup) {
@@ -376,8 +371,8 @@ impl Workspace {
                 self.update_statuses(cx);
                 cx.notify();
             }
-            ConnEvent::TopicCreated(topic) => {
-                self.registry.add_topic(topic);
+            ConnEvent::TagCreated(tag) => {
+                self.registry.add_tag(tag);
                 self.refresh_draft_agent_targets(cx);
                 cx.notify();
             }
@@ -564,10 +559,10 @@ impl Workspace {
             }
         };
         self.awaiting_draft_agent = true;
-        // Every top-level agent founds its own task; the daemon names the
-        // topic from the agent's generated title.
+        // Every top-level agent founds its own workstream; the daemon names
+        // it from the agent's generated title.
         self.connection.send(ClientMessage::NewAgent {
-            topic_id: None,
+            tags: Vec::new(),
             role,
             start,
             content: Some(vec![ContentPart::Text { text: body }]),
@@ -812,16 +807,13 @@ impl Workspace {
                     ),
                 }
             }
-            Command::TopicNew { name } => {
-                self.connection.send(ClientMessage::NewTopic { name });
-            }
-            Command::TopicRename { name } => {
-                let Some(topic_id) = self.focused_topic_id(source_agent) else {
-                    self.notice_on(None, "no topic in focus", StyleClass::SystemInfo, cx);
+            Command::TagRename { name } => {
+                let Some(tag_id) = self.focused_workstream(source_agent) else {
+                    self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
                     return;
                 };
                 self.connection
-                    .send(ClientMessage::RenameTopic { topic_id, name });
+                    .send(ClientMessage::RenameTag { tag_id, name });
             }
             Command::AgentDone { hide } => {
                 let disposition = if hide {
@@ -849,29 +841,45 @@ impl Workspace {
             Command::AgentPin => {
                 self.toggle_agent_status(source_agent, rho_ui_proto::Status::Pinned, cx);
             }
-            Command::TopicPin { name } => {
-                self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
+            Command::TagPin { name } => {
+                self.toggle_workstream_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
             }
-            Command::TopicHide { name } => {
-                self.toggle_topic_hidden(source_agent, name, cx);
+            Command::TagHide { name } => {
+                self.toggle_workstream_hidden(source_agent, name, cx);
             }
-            Command::TopicMove { name } => {
+            Command::TagMove { name } => {
+                self.tag_by_name(source_agent, name, rho_ui_proto::TagKind::Workstream, cx);
+            }
+            Command::TagGroup { name } => {
+                self.tag_by_name(source_agent, name, rho_ui_proto::TagKind::WorkstreamGroup, cx);
+            }
+            Command::TagLabel { name } => {
+                self.tag_by_name(source_agent, name, rho_ui_proto::TagKind::Label, cx);
+            }
+            Command::TagUnlabel { name } => {
                 let target = source_agent.or_else(|| self.registry.selected_agent().copied());
                 let Some(agent_id) = target else {
                     self.notice_on(
                         None,
-                        ":topic move: no agent selected",
+                        ":tag unlabel: no agent selected",
                         StyleClass::SystemInfo,
                         cx,
                     );
                     return;
                 };
-                let topic = match rho_commands::resolve_topic(&name, &self.topic_labels()) {
-                    Some(topic_id) => rho_ui_proto::TopicTarget::Existing(topic_id),
-                    None => rho_ui_proto::TopicTarget::Named(name),
-                };
-                self.connection
-                    .send(ClientMessage::MoveAgent { agent_id, topic });
+                match rho_commands::resolve_tag(
+                    &name,
+                    &self.tag_labels(rho_ui_proto::TagKind::Label),
+                ) {
+                    Some(tag_id) => {
+                        self.connection
+                            .send(ClientMessage::UntagAgent { agent_id, tag_id });
+                    }
+                    None => {
+                        let message = format!("no label named `{name}`");
+                        self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
+                    }
+                }
             }
             Command::ProjectAdd {
                 path,
@@ -963,9 +971,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(selected) = self.registry.selected_agent().copied()
-            && let Some(topic_id) = self.registry.topic_of(selected)
+            && let Some(tag_id) = self.registry.workstream_of(selected)
         {
-            self.draft_topic_id = Some(topic_id);
+            self.draft_workstream = Some(tag_id);
         }
         match working_directory {
             Some(path) => {
@@ -1051,85 +1059,104 @@ impl Workspace {
         self.open_agent(agent_id, window, cx);
     }
 
-    /// Pin toggle for a topic named by argument, defaulting to the focused
-    /// agent's topic (else the default topic).
-    fn toggle_topic_status(
+    /// Kind-aware tagging by name for the addressed (else selected) agent;
+    /// the daemon creates unknown tags.
+    fn tag_by_name(
+        &mut self,
+        source_agent: Option<AgentId>,
+        name: String,
+        kind: rho_ui_proto::TagKind,
+        cx: &mut Context<Self>,
+    ) {
+        let target = source_agent.or_else(|| self.registry.selected_agent().copied());
+        let Some(agent_id) = target else {
+            self.notice_on(None, ":tag: no agent selected", StyleClass::SystemInfo, cx);
+            return;
+        };
+        self.connection.send(ClientMessage::TagAgent {
+            agent_id,
+            target: rho_ui_proto::TagTarget::Named { name, kind },
+        });
+    }
+
+    /// Pin toggle for a workstream named by argument, defaulting to the
+    /// focused agent's workstream.
+    fn toggle_workstream_status(
         &mut self,
         source_agent: Option<AgentId>,
         name: Option<String>,
         target: rho_ui_proto::Status,
         cx: &mut Context<Self>,
     ) {
-        let topic_id = match &name {
-            Some(name) => {
-                let Some(topic_id) = rho_commands::resolve_topic(name, &self.topic_labels()) else {
-                    let message = format!("no topic named `{name}`");
-                    self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
-                    return;
-                };
-                topic_id
-            }
-            None => match self.focused_topic_id(source_agent) {
-                Some(topic_id) => topic_id,
-                None => {
-                    self.notice_on(None, "no topic in focus", StyleClass::SystemInfo, cx);
-                    return;
-                }
-            },
+        let Some(tag_id) = self.named_or_focused_workstream(source_agent, name, cx) else {
+            return;
         };
         let current = self
             .registry
-            .topics()
+            .workstreams()
             .iter()
-            .find(|topic| topic.topic_id == topic_id)
-            .map(|topic| topic.status)
+            .find(|workstream| workstream.tag_id == tag_id)
+            .map(|workstream| workstream.status)
             .unwrap_or(rho_ui_proto::Status::Normal);
         let status = rho_commands::toggle_status(current, target);
         self.connection
-            .send(ClientMessage::SetTopicStatus { topic_id, status });
+            .send(ClientMessage::SetTagStatus { tag_id, status });
     }
 
-    /// Hide toggle for a topic named by argument, defaulting to the focused
-    /// agent's topic (else the default topic).
-    fn toggle_topic_hidden(
+    /// Hide toggle for a workstream named by argument, defaulting to the
+    /// focused agent's workstream.
+    fn toggle_workstream_hidden(
         &mut self,
         source_agent: Option<AgentId>,
         name: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let topic_id = match &name {
-            Some(name) => {
-                let Some(topic_id) = rho_commands::resolve_topic(name, &self.topic_labels()) else {
-                    let message = format!("no topic named `{name}`");
-                    self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
-                    return;
-                };
-                topic_id
-            }
-            None => match self.focused_topic_id(source_agent) {
-                Some(topic_id) => topic_id,
-                None => {
-                    self.notice_on(None, "no topic in focus", StyleClass::SystemInfo, cx);
-                    return;
-                }
-            },
+        let Some(tag_id) = self.named_or_focused_workstream(source_agent, name, cx) else {
+            return;
         };
         let hidden = !self
             .registry
-            .topics()
+            .workstreams()
             .iter()
-            .find(|topic| topic.topic_id == topic_id)
-            .is_some_and(|topic| topic.hidden);
+            .find(|workstream| workstream.tag_id == tag_id)
+            .is_some_and(|workstream| workstream.hidden);
         self.connection
-            .send(ClientMessage::SetTopicHidden { topic_id, hidden });
+            .send(ClientMessage::SetTagHidden { tag_id, hidden });
     }
 
-    fn focused_topic_id(&self, source_agent: Option<AgentId>) -> Option<rho_ui_proto::TopicId> {
+    fn named_or_focused_workstream(
+        &mut self,
+        source_agent: Option<AgentId>,
+        name: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<rho_ui_proto::TagId> {
+        match &name {
+            Some(name) => {
+                let resolved = rho_commands::resolve_tag(
+                    name,
+                    &self.tag_labels(rho_ui_proto::TagKind::Workstream),
+                );
+                if resolved.is_none() {
+                    let message = format!("no workstream named `{name}`");
+                    self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
+                }
+                resolved
+            }
+            None => {
+                let focused = self.focused_workstream(source_agent);
+                if focused.is_none() {
+                    self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
+                }
+                focused
+            }
+        }
+    }
+
+    fn focused_workstream(&self, source_agent: Option<AgentId>) -> Option<rho_ui_proto::TagId> {
         source_agent
             .or_else(|| self.registry.selected_agent().copied())
-            .and_then(|agent_id| self.registry.topic_of(agent_id))
-            .or(self.draft_topic_id)
-            .or(self.default_topic_id)
+            .and_then(|agent_id| self.registry.workstream_of(agent_id))
+            .or(self.draft_workstream)
     }
 
     /// Tab in the draft cycles the `Workdir:` field, the start field, and
@@ -1170,19 +1197,13 @@ impl Workspace {
             .update(cx, |view, cx| view.seed(&label, force_header, window, cx));
     }
 
-    /// The topic a draft submission lands in: the inherited topic, else the
-    /// default topic.
-    fn draft_target_topic(&self) -> Option<rho_ui_proto::TopicId> {
-        self.draft_topic_id.or(self.default_topic_id)
-    }
-
-    /// Where a new agent works when the draft doesn't say: the target
-    /// topic's newest agent sets the precedent, else the first registered
-    /// workdir. All daemon-side data — the GUI may run on another machine,
-    /// so its own cwd is meaningless here.
+    /// Where a new agent works when the draft doesn't say: the inherited
+    /// workstream's newest agent sets the precedent, else the first
+    /// registered workdir. All daemon-side data — the GUI may run on another
+    /// machine, so its own cwd is meaningless here.
     fn draft_default_workdir(&self) -> Option<Utf8PathBuf> {
-        self.draft_target_topic()
-            .and_then(|topic_id| self.registry.last_working_directory(topic_id))
+        self.draft_workstream
+            .and_then(|tag_id| self.registry.last_working_directory(tag_id))
             .or_else(|| self.workdirs.first().map(|workdir| workdir.path.clone()))
     }
 
@@ -1196,20 +1217,28 @@ impl Workspace {
             .unwrap_or_else(|| path.to_string())
     }
 
-    /// Topics as the `(name, id)` pairs shared resolution expects.
-    fn topic_labels(&self) -> Vec<(String, rho_ui_proto::TopicId)> {
+    /// Tags of one kind as the `(name, id)` pairs shared resolution expects.
+    fn tag_labels(&self, kind: rho_ui_proto::TagKind) -> Vec<(String, rho_ui_proto::TagId)> {
         self.registry
-            .topics()
+            .tags()
             .iter()
-            .map(|topic| (topic.name.clone(), topic.topic_id))
+            .filter(|tag| tag.kind == kind)
+            .map(|tag| (tag.name.clone(), tag.tag_id))
             .collect()
     }
 
-    pub fn topic_names(&self) -> Vec<String> {
-        self.topic_labels()
-            .into_iter()
-            .map(|(label, _)| label)
-            .collect()
+    pub fn tag_names(&self) -> crate::commands::TagNames {
+        let names = |kind| {
+            self.tag_labels(kind)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        };
+        crate::commands::TagNames {
+            workstreams: names(rho_ui_proto::TagKind::Workstream),
+            groups: names(rho_ui_proto::TagKind::WorkstreamGroup),
+            labels: names(rho_ui_proto::TagKind::Label),
+        }
     }
 
     /// Registered workdirs as the `(name, path)` table the shared command
@@ -1630,7 +1659,7 @@ impl Workspace {
                 &text,
                 &workspace.workdir_table(),
                 &workspace.live_agent_targets(),
-                &workspace.topic_names(),
+                &workspace.tag_names(),
             )
             .into_iter()
             .map(|mut candidate| {

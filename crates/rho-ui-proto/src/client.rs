@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
 use futures::Stream;
-use rho_agent::db::{AgentId, TopicId};
+use rho_agent::db::{AgentId, TagId, TagKind};
 use rho_core::ContentPart;
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -13,8 +13,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::remote::{AgentRemoteFrame, UiAgentState, UiBlock};
 use crate::{
     AgentRole, ClientMessage, IoCounters, MessageDelivery, ProtocolLogDirection, ServerMessage,
-    StartMode, UiProject, UiTopic, append_protocol_log_record, protocol_frame_bytes,
-    read_frame_counted, write_frame_counted,
+    StartMode, UiAgentSummary, UiProject, UiTag, append_protocol_log_record,
+    protocol_frame_bytes, read_frame_counted, write_frame_counted,
 };
 
 /// Raw async client for the rho UI Unix-socket protocol.
@@ -73,9 +73,9 @@ impl Client {
 pub struct AgentClient {
     commands: mpsc::UnboundedSender<ClientMessage>,
     state: watch::Receiver<HashMap<AgentId, UiAgentState>>,
-    topics: watch::Receiver<Vec<UiTopic>>,
+    tags: watch::Receiver<Vec<UiTag>>,
+    agents: watch::Receiver<Vec<UiAgentSummary>>,
     projects: watch::Receiver<Vec<UiProject>>,
-    default_topic_id: watch::Receiver<TopicId>,
     known_agent_ids: watch::Receiver<Vec<AgentId>>,
     frames: broadcast::Sender<(AgentId, AgentRemoteFrame)>,
     counters: IoCounters,
@@ -105,9 +105,9 @@ impl AgentClient {
             );
         }
         let ServerMessage::Ready {
-            topics,
+            tags,
+            agents,
             projects,
-            default_topic_id,
             machine_seed,
             agent_counter,
             workspace_counter,
@@ -115,14 +115,14 @@ impl AgentClient {
         else {
             anyhow::bail!("rho daemon did not send ready message");
         };
-        let agent_ids = topic_agent_ids(&topics);
+        let agent_ids = summary_agent_ids(&agents);
         if let Some(logger) = &logger {
             logger.log(
                 ProtocolLogDirection::ServerToClient,
                 &ServerMessage::Ready {
-                    topics: topics.clone(),
+                    tags: tags.clone(),
+                    agents: agents.clone(),
                     projects: projects.clone(),
-                    default_topic_id,
                     machine_seed,
                     agent_counter,
                     workspace_counter,
@@ -132,9 +132,9 @@ impl AgentClient {
 
         let (reader, writer) = stream.into_split();
         let (state_tx, state_rx) = watch::channel(HashMap::new());
-        let (topics_tx, topics_rx) = watch::channel(topics.clone());
+        let (tags_tx, tags_rx) = watch::channel(tags.clone());
+        let (agents_tx, agents_rx) = watch::channel(agents);
         let (projects_tx, projects_rx) = watch::channel(projects);
-        let (default_topic_tx, default_topic_rx) = watch::channel(default_topic_id);
         let (known_agent_ids_tx, known_agent_ids_rx) = watch::channel(agent_ids);
         let (frame_tx, _) = broadcast::channel::<(AgentId, AgentRemoteFrame)>(256);
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<ClientMessage>();
@@ -169,37 +169,33 @@ impl AgentClient {
                         }
                     }
                     ServerMessage::Ready {
-                        topics,
+                        tags,
+                        agents,
                         projects,
-                        default_topic_id,
                         machine_seed: _,
                         agent_counter: _,
                         workspace_counter: _,
                     } => {
-                        known_agent_ids = topic_agent_ids(&topics);
-                        if topics_tx.send(topics).is_err() {
+                        known_agent_ids = summary_agent_ids(&agents);
+                        if tags_tx.send(tags).is_err() {
+                            break;
+                        }
+                        if agents_tx.send(agents).is_err() {
                             break;
                         }
                         if projects_tx.send(projects).is_err() {
-                            break;
-                        }
-                        if default_topic_tx.send(default_topic_id).is_err() {
                             break;
                         }
                         if known_agent_ids_tx.send(known_agent_ids.clone()).is_err() {
                             break;
                         }
                     }
-                    ServerMessage::TopicCreated { topic } => {
-                        let mut topics = topics_tx.borrow().clone();
-                        // Topics stay in the daemon's creation order; a new
-                        // topic is the newest, so it belongs at the end.
-                        topics.push(topic);
-                        known_agent_ids = topic_agent_ids(&topics);
-                        if topics_tx.send(topics).is_err() {
-                            break;
-                        }
-                        if known_agent_ids_tx.send(known_agent_ids.clone()).is_err() {
+                    ServerMessage::TagCreated { tag } => {
+                        let mut tags = tags_tx.borrow().clone();
+                        // Tags stay in the daemon's creation order; a new
+                        // tag is the newest, so it belongs at the end.
+                        tags.push(tag);
+                        if tags_tx.send(tags).is_err() {
                             break;
                         }
                     }
@@ -220,15 +216,13 @@ impl AgentClient {
                         agent_id,
                         attention,
                     } => {
-                        let mut topics = topics_tx.borrow().clone();
-                        for topic in &mut topics {
-                            for agent in &mut topic.agents {
-                                if agent.agent_id == agent_id {
-                                    agent.attention = attention;
-                                }
+                        let mut agents = agents_tx.borrow().clone();
+                        for agent in &mut agents {
+                            if agent.agent_id == agent_id {
+                                agent.attention = attention;
                             }
                         }
-                        if topics_tx.send(topics).is_err() {
+                        if agents_tx.send(agents).is_err() {
                             break;
                         }
                     }
@@ -271,9 +265,9 @@ impl AgentClient {
         Ok(Self {
             commands: command_tx,
             state: state_rx,
-            topics: topics_rx,
+            tags: tags_rx,
+            agents: agents_rx,
             projects: projects_rx,
-            default_topic_id: default_topic_rx,
             known_agent_ids: known_agent_ids_rx,
             frames: frame_tx,
             counters: client_counters,
@@ -324,44 +318,38 @@ impl AgentClient {
         self.known_agent_ids.borrow().clone()
     }
 
-    pub fn topics(&self) -> Vec<UiTopic> {
-        self.topics.borrow().clone()
+    pub fn tags(&self) -> Vec<UiTag> {
+        self.tags.borrow().clone()
+    }
+
+    pub fn agents(&self) -> Vec<UiAgentSummary> {
+        self.agents.borrow().clone()
     }
 
     pub fn projects(&self) -> Vec<UiProject> {
         self.projects.borrow().clone()
     }
 
-    /// Where new agents land when no topic is chosen.
-    pub fn default_topic_id(&self) -> TopicId {
-        *self.default_topic_id.borrow()
-    }
-
-    pub fn new_agent_with_user_message_in_topic(
-        &self,
-        topic_id: TopicId,
-        repo: Utf8PathBuf,
-        text: String,
-    ) {
+    pub fn new_agent_with_user_message(&self, tags: Vec<TagId>, repo: Utf8PathBuf, text: String) {
         let _ = self.commands.send(ClientMessage::NewAgent {
-            topic_id: Some(topic_id),
+            tags,
             role: AgentRole::default(),
             start: default_start(repo),
             content: Some(vec![ContentPart::Text { text }]),
         });
     }
 
-    pub fn new_agent_in_topic(&self, topic_id: TopicId, repo: Utf8PathBuf) {
+    pub fn new_agent(&self, tags: Vec<TagId>, repo: Utf8PathBuf) {
         let _ = self.commands.send(ClientMessage::NewAgent {
-            topic_id: Some(topic_id),
+            tags,
             role: AgentRole::default(),
             start: default_start(repo),
             content: None,
         });
     }
 
-    pub fn new_topic(&self, name: String) {
-        let _ = self.commands.send(ClientMessage::NewTopic { name });
+    pub fn new_tag(&self, name: String, kind: TagKind, parent: Option<TagId>) {
+        let _ = self.commands.send(ClientMessage::NewTag { name, kind, parent });
     }
 
     pub fn set_project(&self, path: Utf8PathBuf, name: Option<String>, description: String) {
@@ -376,10 +364,16 @@ impl AgentClient {
         let _ = self.commands.send(ClientMessage::ProjectRemove { path });
     }
 
-    pub fn move_agent(&self, agent_id: AgentId, topic: crate::TopicTarget) {
+    pub fn tag_agent(&self, agent_id: AgentId, target: crate::TagTarget) {
         let _ = self
             .commands
-            .send(ClientMessage::MoveAgent { agent_id, topic });
+            .send(ClientMessage::TagAgent { agent_id, target });
+    }
+
+    pub fn untag_agent(&self, agent_id: AgentId, tag_id: TagId) {
+        let _ = self
+            .commands
+            .send(ClientMessage::UntagAgent { agent_id, tag_id });
     }
 
     pub fn set_agent_status(&self, agent_id: AgentId, status: crate::Status) {
@@ -400,22 +394,22 @@ impl AgentClient {
             .send(ClientMessage::ChangePromptCacheKey { agent_id });
     }
 
-    pub fn rename_topic(&self, topic_id: TopicId, name: String) {
+    pub fn rename_tag(&self, tag_id: TagId, name: String) {
         let _ = self
             .commands
-            .send(ClientMessage::RenameTopic { topic_id, name });
+            .send(ClientMessage::RenameTag { tag_id, name });
     }
 
-    pub fn set_topic_status(&self, topic_id: TopicId, status: crate::Status) {
+    pub fn set_tag_status(&self, tag_id: TagId, status: crate::Status) {
         let _ = self
             .commands
-            .send(ClientMessage::SetTopicStatus { topic_id, status });
+            .send(ClientMessage::SetTagStatus { tag_id, status });
     }
 
-    pub fn set_topic_hidden(&self, topic_id: TopicId, hidden: bool) {
+    pub fn set_tag_hidden(&self, tag_id: TagId, hidden: bool) {
         let _ = self
             .commands
-            .send(ClientMessage::SetTopicHidden { topic_id, hidden });
+            .send(ClientMessage::SetTagHidden { tag_id, hidden });
     }
 
     pub fn load_agent(&self, agent_id: AgentId) {
@@ -482,10 +476,10 @@ fn empty_agent_state() -> UiAgentState {
     }
 }
 
-fn topic_agent_ids(topics: &[UiTopic]) -> Vec<AgentId> {
-    let mut agent_ids = topics
+fn summary_agent_ids(agents: &[UiAgentSummary]) -> Vec<AgentId> {
+    let mut agent_ids = agents
         .iter()
-        .flat_map(UiTopic::agent_ids)
+        .map(|agent| agent.agent_id)
         .collect::<Vec<_>>();
     agent_ids.sort();
     agent_ids.dedup();

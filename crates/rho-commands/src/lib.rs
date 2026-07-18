@@ -7,7 +7,7 @@
 //! *are*.
 
 use camino::Utf8PathBuf;
-use rho_ui_proto::{Status, TopicId};
+use rho_ui_proto::{Status, TagId};
 
 pub struct CommandSpec {
     /// Full command name after the `:`, e.g. `agent new`.
@@ -43,29 +43,39 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Pin/unpin the current agent",
     },
     CommandSpec {
-        name: "topic new",
-        usage: ":topic new <name>",
-        description: "Create a new topic",
+        name: "tag move",
+        usage: ":tag move <workstream>",
+        description: "Move the current agent into a workstream (created when unknown)",
     },
     CommandSpec {
-        name: "topic move",
-        usage: ":topic move <name>",
-        description: "Move the current agent into a topic (created when unknown)",
+        name: "tag group",
+        usage: ":tag group <group>",
+        description: "Put the current workstream under a group (created when unknown)",
     },
     CommandSpec {
-        name: "topic rename",
-        usage: ":topic rename <name>",
-        description: "Rename the focused topic",
+        name: "tag label",
+        usage: ":tag label <name>",
+        description: "Add a label to the current agent (created when unknown)",
     },
     CommandSpec {
-        name: "topic pin",
-        usage: ":topic pin [name]",
-        description: "Pin/unpin a topic (default: the current one)",
+        name: "tag unlabel",
+        usage: ":tag unlabel <name>",
+        description: "Remove a label from the current agent",
     },
     CommandSpec {
-        name: "topic hide",
-        usage: ":topic hide [name]",
-        description: "Hide/unhide a topic (default: the current one)",
+        name: "tag rename",
+        usage: ":tag rename <name>",
+        description: "Rename the current workstream",
+    },
+    CommandSpec {
+        name: "tag pin",
+        usage: ":tag pin [workstream]",
+        description: "Pin/unpin a workstream (default: the current one)",
+    },
+    CommandSpec {
+        name: "tag hide",
+        usage: ":tag hide [workstream]",
+        description: "Hide/unhide a workstream (default: the current one)",
     },
     CommandSpec {
         name: "projects add",
@@ -145,19 +155,25 @@ pub enum Command {
     AgentCancel,
     AgentChangePromptCacheKey,
     AgentPin,
-    TopicNew {
+    TagMove {
         name: String,
     },
-    TopicMove {
+    TagGroup {
         name: String,
     },
-    TopicRename {
+    TagLabel {
         name: String,
     },
-    TopicPin {
+    TagUnlabel {
+        name: String,
+    },
+    TagRename {
+        name: String,
+    },
+    TagPin {
         name: Option<String>,
     },
-    TopicHide {
+    TagHide {
         name: Option<String>,
     },
     ProjectAdd {
@@ -217,26 +233,34 @@ pub fn parse(line: &str) -> Option<Parsed> {
             Some("pin") => Parsed::Command(Command::AgentPin),
             _ => Parsed::Invalid(":agent new|rename|cancel|change-prompt-cache-key|pin".to_owned()),
         },
-        "topic" => match tokens.next() {
-            Some("new") => match joined_name(rest) {
-                Some(name) => Parsed::Command(Command::TopicNew { name }),
-                None => Parsed::Invalid(":topic new <name>".to_owned()),
-            },
+        "tag" => match tokens.next() {
             Some("move") => match joined_name(rest) {
-                Some(name) => Parsed::Command(Command::TopicMove { name }),
-                None => Parsed::Invalid(":topic move <name>".to_owned()),
+                Some(name) => Parsed::Command(Command::TagMove { name }),
+                None => Parsed::Invalid(":tag move <workstream>".to_owned()),
+            },
+            Some("group") => match joined_name(rest) {
+                Some(name) => Parsed::Command(Command::TagGroup { name }),
+                None => Parsed::Invalid(":tag group <group>".to_owned()),
+            },
+            Some("label") => match joined_name(rest) {
+                Some(name) => Parsed::Command(Command::TagLabel { name }),
+                None => Parsed::Invalid(":tag label <name>".to_owned()),
+            },
+            Some("unlabel") => match joined_name(rest) {
+                Some(name) => Parsed::Command(Command::TagUnlabel { name }),
+                None => Parsed::Invalid(":tag unlabel <name>".to_owned()),
             },
             Some("rename") => match joined_name(rest) {
-                Some(name) => Parsed::Command(Command::TopicRename { name }),
-                None => Parsed::Invalid(":topic rename <name>".to_owned()),
+                Some(name) => Parsed::Command(Command::TagRename { name }),
+                None => Parsed::Invalid(":tag rename <name>".to_owned()),
             },
-            Some("pin") => Parsed::Command(Command::TopicPin {
+            Some("pin") => Parsed::Command(Command::TagPin {
                 name: joined_name(rest),
             }),
-            Some("hide") => Parsed::Command(Command::TopicHide {
+            Some("hide") => Parsed::Command(Command::TagHide {
                 name: joined_name(rest),
             }),
-            _ => Parsed::Invalid(":topic new|move|rename|pin|hide".to_owned()),
+            _ => Parsed::Invalid(":tag move|group|label|unlabel|rename|pin|hide".to_owned()),
         },
         "projects" => match tokens.next() {
             Some("add") => {
@@ -308,7 +332,7 @@ pub fn parse_duration_ms(text: &str) -> Option<u64> {
     minutes.checked_mul(60 * 1000)
 }
 
-/// The words after `:topic <sub>` as one name, `None` when absent.
+/// The words after `:tag <sub>` as one name, `None` when absent.
 fn joined_name(rest: &str) -> Option<String> {
     let name = rest
         .split_whitespace()
@@ -333,7 +357,10 @@ pub fn toggle_status(current: Status, target: Status) -> Status {
 pub struct CompletionCtx<'a> {
     /// Registered workdirs as `(name, path)`.
     pub workdirs: &'a [(String, String)],
-    pub topics: &'a [String],
+    /// Tag names by kind for `:tag` argument completion.
+    pub workstreams: &'a [String],
+    pub groups: &'a [String],
+    pub labels: &'a [String],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,15 +446,11 @@ fn command_word_candidates(prefix_words: &[&str], partial: &str) -> Vec<Candidat
 
 fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> Vec<Candidate> {
     match command {
-        ["topic", "move"] | ["topic", "pin"] => ctx
-            .topics
-            .iter()
-            .filter(|topic| fuzzy_contains(topic, partial))
-            .map(|topic| Candidate {
-                value: topic.clone(),
-                description: "topic".to_owned(),
-            })
-            .collect(),
+        ["tag", "move"] | ["tag", "pin"] | ["tag", "hide"] => {
+            tag_candidates(ctx.workstreams, "workstream", partial)
+        }
+        ["tag", "group"] => tag_candidates(ctx.groups, "group", partial),
+        ["tag", "label"] | ["tag", "unlabel"] => tag_candidates(ctx.labels, "label", partial),
         ["agent", "new"] | ["projects", "rm"] => ctx
             .workdirs
             .iter()
@@ -441,14 +464,23 @@ fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> 
     }
 }
 
-/// Resolves a topic argument against `(label, id)` pairs, where the label is
-/// the display name or the id string for unnamed topics. `None` means no
-/// such topic exists yet.
-pub fn resolve_topic(argument: &str, topics: &[(String, TopicId)]) -> Option<TopicId> {
-    topics
+fn tag_candidates(names: &[String], description: &str, partial: &str) -> Vec<Candidate> {
+    names
         .iter()
-        .find(|(label, _)| label == argument)
-        .map(|(_, topic_id)| *topic_id)
+        .filter(|name| fuzzy_contains(name, partial))
+        .map(|name| Candidate {
+            value: name.clone(),
+            description: description.to_owned(),
+        })
+        .collect()
+}
+
+/// Resolves a tag argument against `(name, id)` pairs; tag names are unique,
+/// so the name is the identity. `None` means no such tag exists yet.
+pub fn resolve_tag(argument: &str, tags: &[(String, TagId)]) -> Option<TagId> {
+    tags.iter()
+        .find(|(name, _)| name == argument)
+        .map(|(_, tag_id)| *tag_id)
 }
 
 /// Resolves a workdir argument (registered name or path) to its path.

@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::db::{
     AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRuntime, AgentWriteTxnExt,
-    SessionBinding, TopicId, UnixMillis,
+    SessionBinding, TagId, UnixMillis,
 };
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
@@ -52,7 +52,7 @@ impl ClaudeAgent {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create(
         db: RhoDb,
-        topic_id: TopicId,
+        tags: Vec<TagId>,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         mode: SessionBinding,
@@ -74,7 +74,7 @@ impl ClaudeAgent {
         write.create_agent(
             UnixMillis::now(),
             agent_id,
-            topic_id,
+            tags,
             display_name,
             entries
                 .iter()
