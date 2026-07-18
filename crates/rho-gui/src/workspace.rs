@@ -544,15 +544,6 @@ impl Workspace {
             );
             return;
         }
-        let Some(topic_id) = self.draft_target_topic() else {
-            self.notice_on(
-                None,
-                "no rho topic is available",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        };
         let field = self.draft_view.read(cx).workdir_text(cx).trim().to_owned();
         let working_directory = (!field.is_empty())
             .then(|| self.resolve_workdir_path(Utf8PathBuf::from(field)))
@@ -577,8 +568,10 @@ impl Workspace {
             }
         };
         self.awaiting_draft_agent = true;
+        // Every top-level agent founds its own task; the daemon names the
+        // topic from the agent's generated title.
         self.connection.send(ClientMessage::NewAgent {
-            topic_id,
+            topic_id: None,
             role,
             start,
             content: Some(vec![ContentPart::Text { text: body }]),

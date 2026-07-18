@@ -14,7 +14,7 @@ use rho_agent::db::{
 };
 use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
-use rho_core::{ContextBlock, text_content};
+use rho_core::{ContentPart, ContextBlock, text_content};
 use rho_db::RhoDb;
 use rho_inference::InferenceAuth;
 use rho_ui_proto::remote::AgentRemoteEncoder;
@@ -1265,11 +1265,14 @@ impl AgentRegistry {
     /// background. Policy: only fills an empty `display_name` — a manual
     /// rename, before or during generation, always wins — and at most one
     /// generation runs per agent at a time. The requesting connection gets a
-    /// `Ready` refresh when the title lands.
+    /// `Ready` refresh when the title lands. A topic the agent founded
+    /// (`retitle_topic`: its id plus the provisional name it was created
+    /// under) takes the same title, unless someone renamed it meanwhile.
     async fn maybe_generate_title(
         self: &Arc<Self>,
         agent_id: AgentId,
         text: String,
+        retitle_topic: Option<(TopicId, String)>,
         outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
     ) {
         if text.trim().is_empty() || self.db.read().get_agent(agent_id).display_name.is_some() {
@@ -1293,7 +1296,13 @@ impl AgentRegistry {
                         .display_name
                         .is_none()
                     {
-                        write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, title);
+                        let now = rho_core::UnixMs::now();
+                        write.set_agent_display_name(now, agent_id, title.clone());
+                        if let Some((topic_id, provisional)) = retitle_topic
+                            && registry.db.read().get_topic(topic_id).name == provisional
+                        {
+                            write.set_topic_name(now, topic_id, title);
+                        }
                         write.commit();
                         let _ = outgoing_tx.send(registry.ready_message().await);
                     }
@@ -1863,6 +1872,18 @@ async fn handle_message(
             start,
             content,
         } => {
+            // No topic given: the agent founds its own task, provisionally
+            // named after its first message until the generated title lands.
+            let founded = match topic_id {
+                Some(_) => None,
+                None => {
+                    let name = provisional_topic_name(content.as_deref());
+                    let topic = agents.create_topic(name.clone()).await;
+                    let _ = outgoing_tx.send(ServerMessage::TopicCreated { topic: topic.clone() });
+                    Some((topic.topic_id, name))
+                }
+            };
+            let topic_id = topic_id.unwrap_or_else(|| founded.as_ref().unwrap().0);
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
             let (_topic_id, agent_id, agent) = agents.create(topic_id, role, start).await?;
@@ -1871,7 +1892,7 @@ async fn handle_message(
                 // The agent is fresh, so the lanes are equivalent here.
                 agent.send_user_message(text.clone(), MessageDelivery::NextRequest);
                 agents
-                    .maybe_generate_title(agent_id, text, outgoing_tx.clone())
+                    .maybe_generate_title(agent_id, text, founded, outgoing_tx.clone())
                     .await;
             }
             Ok(Refresh::Ready)
@@ -1990,7 +2011,7 @@ async fn handle_message(
                 attention: attention_level(Some(&agent.state().kind), AgentDisposition::Done),
             });
             agents
-                .maybe_generate_title(agent_id, text, outgoing_tx.clone())
+                .maybe_generate_title(agent_id, text, None, outgoing_tx.clone())
                 .await;
             Ok(Refresh::None)
         }
@@ -2251,6 +2272,21 @@ fn subscribe_agent(
 /// workdir registration and agent creation take repos. A leading `~` expands
 /// to the daemon's home: clients may run on another machine, so path
 /// interpretation belongs here.
+/// The name a self-founded topic starts under: the first line of the
+/// agent's first message, truncated. The generated title replaces it
+/// (matching by this exact string) once it lands.
+fn provisional_topic_name(content: Option<&[ContentPart]>) -> String {
+    let text = content.map(text_content).unwrap_or_default();
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return "new task".to_owned();
+    }
+    match line.char_indices().nth(48) {
+        Some((index, _)) => format!("{}…", &line[..index]),
+        None => line.to_owned(),
+    }
+}
+
 fn validate_repo_root(path: Utf8PathBuf) -> anyhow::Result<Utf8PathBuf> {
     let path = expand_home(&path).unwrap_or(path);
     rho_workspaces::resolve_repo_root(path.as_std_path())

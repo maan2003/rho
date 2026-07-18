@@ -74,7 +74,10 @@ pub enum ClientMessage {
         name: String,
     },
     NewAgent {
-        topic_id: TopicId,
+        /// The task this agent joins. `None` founds a topic of the agent's
+        /// own — every top-level agent starts its own task — named
+        /// provisionally until the agent's generated title lands.
+        topic_id: Option<TopicId>,
         role: AgentRole,
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).

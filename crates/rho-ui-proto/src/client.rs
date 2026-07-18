@@ -344,7 +344,7 @@ impl AgentClient {
         text: String,
     ) {
         let _ = self.commands.send(ClientMessage::NewAgent {
-            topic_id,
+            topic_id: Some(topic_id),
             role: AgentRole::default(),
             start: default_start(repo),
             content: Some(vec![ContentPart::Text { text }]),
@@ -353,7 +353,7 @@ impl AgentClient {
 
     pub fn new_agent_in_topic(&self, topic_id: TopicId, repo: Utf8PathBuf) {
         let _ = self.commands.send(ClientMessage::NewAgent {
-            topic_id,
+            topic_id: Some(topic_id),
             role: AgentRole::default(),
             start: default_start(repo),
             content: None,

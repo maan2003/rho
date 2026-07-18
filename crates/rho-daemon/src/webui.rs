@@ -88,7 +88,6 @@ where
 
     let mut topics: Vec<UiTopic> = Vec::new();
     let mut projects: Vec<UiProject> = Vec::new();
-    let mut default_topic = None;
     let mut agent_ids: HashMap<String, AgentId> = HashMap::new();
     let mut states: HashMap<AgentId, UiAgentState> = HashMap::new();
     let mut selected: Option<AgentId> = None;
@@ -103,10 +102,9 @@ where
                     anyhow::bail!("daemon session closed");
                 };
                 match message {
-                    ServerMessage::Ready { topics: new_topics, projects: new_projects, default_topic_id, .. } => {
+                    ServerMessage::Ready { topics: new_topics, projects: new_projects, .. } => {
                         topics = new_topics;
                         projects = new_projects;
-                        default_topic = Some(default_topic_id);
                         index_agent_ids(&topics, &mut agent_ids);
                         send_json(&mut writer, &json::hello(&topics, &projects)).await?;
                     }
@@ -180,11 +178,10 @@ where
                         }).await?;
                     }
                     FromBrowser::NewAgent { topic_id, repo, role, join, sandbox, revset, text } => {
+                        // An unknown topic founds a new task for the agent.
                         let topic_id = topics.iter()
                             .find(|topic| topic.topic_id.encoded() == topic_id)
-                            .map(|topic| topic.topic_id)
-                            .or(default_topic);
-                        let Some(topic_id) = topic_id else { continue };
+                            .map(|topic| topic.topic_id);
                         let role = match parse_role(&role) {
                             Some(role) => role,
                             None => {
