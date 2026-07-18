@@ -183,8 +183,12 @@
               ln -s ${zedSrc}/assets $out/assets
 
               # `extension_host` likewise reads the sibling extension API WIT
-              # definitions from its build script.
-              ln -s ${zedSrc}/crates/extension_api $out/extension_api
+              # definitions from its build script. Git dependencies live one
+              # directory below their source hash in Crane's vendor tree.
+              for extensionHost in $out/*/extension_host-*; do
+                ln -s ${zedSrc}/crates/extension_api \
+                  "$(dirname "$extensionHost")/extension_api"
+              done
             '';
             craneLib = craneLibBase.overrideArgs {
               inherit cargoVendorDir;
