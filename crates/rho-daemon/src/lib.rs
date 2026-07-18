@@ -623,6 +623,7 @@ impl AgentRegistry {
                     topic_id,
                     name: topic.name,
                     status: topic.status,
+                    hidden: topic.hidden,
                     agents: agents
                         .into_iter()
                         .map(|(agent_id, agent)| UiAgentSummary {
@@ -720,6 +721,7 @@ impl AgentRegistry {
             topic_id,
             name: self.db.read().get_topic(topic_id).name,
             status: Status::Normal,
+            hidden: false,
             agents: Vec::new(),
         }
     }
@@ -1067,6 +1069,13 @@ impl AgentRegistry {
     async fn set_topic_status(&self, topic_id: TopicId, status: Status) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
         write.set_topic_status(rho_core::UnixMs::now(), topic_id, status);
+        write.commit();
+        Ok(())
+    }
+
+    async fn set_topic_hidden(&self, topic_id: TopicId, hidden: bool) -> anyhow::Result<()> {
+        let mut write = self.db.write().await;
+        write.set_topic_hidden(rho_core::UnixMs::now(), topic_id, hidden);
         write.commit();
         Ok(())
     }
@@ -1718,6 +1727,10 @@ async fn handle_message(
         }
         ClientMessage::SetTopicStatus { topic_id, status } => {
             agents.set_topic_status(topic_id, status).await?;
+            Ok(Refresh::Ready)
+        }
+        ClientMessage::SetTopicHidden { topic_id, hidden } => {
+            agents.set_topic_hidden(topic_id, hidden).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::CancelTurn { agent_id } => {

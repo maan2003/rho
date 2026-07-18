@@ -822,6 +822,9 @@ impl Workspace {
             Command::TopicPin { name } => {
                 self.toggle_topic_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
             }
+            Command::TopicHide { name } => {
+                self.toggle_topic_hidden(source_agent, name, cx);
+            }
             Command::TopicMove { name } => {
                 let target = source_agent.or_else(|| self.registry.selected_agent().copied());
                 let Some(agent_id) = target else {
@@ -1044,6 +1047,41 @@ impl Workspace {
         let status = rho_commands::toggle_status(current, target);
         self.connection
             .send(ClientMessage::SetTopicStatus { topic_id, status });
+    }
+
+    /// Hide toggle for a topic named by argument, defaulting to the focused
+    /// agent's topic (else the default topic).
+    fn toggle_topic_hidden(
+        &mut self,
+        source_agent: Option<AgentId>,
+        name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let topic_id = match &name {
+            Some(name) => {
+                let Some(topic_id) = rho_commands::resolve_topic(name, &self.topic_labels()) else {
+                    let message = format!("no topic named `{name}`");
+                    self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
+                    return;
+                };
+                topic_id
+            }
+            None => match self.focused_topic_id(source_agent) {
+                Some(topic_id) => topic_id,
+                None => {
+                    self.notice_on(None, "no topic in focus", StyleClass::SystemInfo, cx);
+                    return;
+                }
+            },
+        };
+        let hidden = !self
+            .registry
+            .topics()
+            .iter()
+            .find(|topic| topic.topic_id == topic_id)
+            .is_some_and(|topic| topic.hidden);
+        self.connection
+            .send(ClientMessage::SetTopicHidden { topic_id, hidden });
     }
 
     fn focused_topic_id(&self, source_agent: Option<AgentId>) -> Option<rho_ui_proto::TopicId> {

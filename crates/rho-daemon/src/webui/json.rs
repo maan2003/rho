@@ -18,6 +18,7 @@ pub fn hello(topics: &[UiTopic], projects: &[UiProject]) -> ToBrowser {
     ToBrowser::Hello {
         topics: topics
             .iter()
+            .filter(|topic| !topic.hidden)
             .map(|topic| Topic {
                 id: topic.topic_id.encoded(),
                 name: topic.name.clone(),

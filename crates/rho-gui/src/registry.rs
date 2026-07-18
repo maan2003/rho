@@ -454,13 +454,18 @@ impl AgentRegistry {
         topics.sort_by_key(|topic| topic.status != rho_ui_proto::Status::Pinned);
 
         let mut candidates = Vec::new();
+        let mut hidden = BTreeSet::new();
         for topic in topics {
+            if topic.hidden {
+                hidden.extend(topic.agent_ids());
+                continue;
+            }
             if let Some(layout) = self.topic_rail_layouts.get(&topic.topic_id) {
                 candidates.extend(layout.listed.iter().map(|(agent_id, _)| *agent_id));
             }
         }
         for agent_id in self.agents.keys() {
-            if !candidates.contains(agent_id) {
+            if !hidden.contains(agent_id) && !candidates.contains(agent_id) {
                 candidates.push(*agent_id);
             }
         }
@@ -767,6 +772,7 @@ mod tests {
             topic_id: rho_ui_proto::TopicId::from_counter(id, &TopicIdDomain(0)).unwrap(),
             name: id.to_string(),
             status,
+            hidden: false,
             agents,
         }
     }
@@ -793,6 +799,21 @@ mod tests {
         registry.select_agent(agent_id(3));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
         assert_eq!(registry.next_live_agent(-1), Some(agent_id(2)));
+    }
+
+    #[test]
+    fn hidden_topics_are_excluded_from_rail_navigation() {
+        let mut registry = AgentRegistry::default();
+        let mut hidden = topic(1, Status::Normal, vec![agent(1, Status::Normal)]);
+        hidden.hidden = true;
+        registry.set_topics(vec![
+            hidden,
+            topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
+        ]);
+        registry.agents.insert(agent_id(1), AgentLife::Live);
+        registry.agents.insert(agent_id(2), AgentLife::Live);
+
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
     }
 
     #[test]

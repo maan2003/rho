@@ -143,6 +143,19 @@ fn test_agent_runtime() -> AgentRuntime {
 }
 
 #[tokio::test]
+async fn topic_hidden_state_is_persisted() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let topic = write.create_topic(UnixMs(1), "team".to_owned(), Status::Normal);
+    write.set_topic_hidden(UnixMs(2), topic, true);
+    write.commit();
+
+    assert!(db.read().get_topic(topic).hidden);
+}
+
+#[tokio::test]
 async fn agent_spawned_by_is_stored_at_creation() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));

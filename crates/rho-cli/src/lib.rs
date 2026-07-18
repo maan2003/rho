@@ -399,6 +399,9 @@ impl ChatApp {
             rho_commands::Command::TopicPin { name } => {
                 self.toggle_topic_status(name, rho_ui_proto::Status::Pinned);
             }
+            rho_commands::Command::TopicHide { name } => {
+                self.toggle_topic_hidden(name);
+            }
             rho_commands::Command::TopicMove { name } => {
                 let Some(agent_id) = primary_agent_id(&self.agent) else {
                     self.term.print_system(":topic move: no agent yet");
@@ -508,6 +511,38 @@ impl ChatApp {
         self.term
             .print_system(&format!("{topic_id:?} is now {status:?}"));
         self.agent.set_topic_status(topic_id, status);
+    }
+
+    fn toggle_topic_hidden(&mut self, name: Option<String>) {
+        let topics = self.agent.topics();
+        let topic_id = match &name {
+            Some(name) => {
+                let Some(topic_id) = rho_commands::resolve_topic(name, &topic_labels(&self.agent))
+                else {
+                    self.term.print_system(&format!("no topic named `{name}`"));
+                    return;
+                };
+                topic_id
+            }
+            None => primary_agent_id(&self.agent)
+                .and_then(|agent_id| {
+                    topics
+                        .iter()
+                        .find(|topic| topic.agents.iter().any(|a| a.agent_id == agent_id))
+                        .map(|topic| topic.topic_id)
+                })
+                .unwrap_or_else(|| self.agent.default_topic_id()),
+        };
+        let hidden = !topics
+            .iter()
+            .find(|topic| topic.topic_id == topic_id)
+            .is_some_and(|topic| topic.hidden);
+        self.term.print_system(if hidden {
+            "topic hidden"
+        } else {
+            "topic shown"
+        });
+        self.agent.set_topic_hidden(topic_id, hidden);
     }
 
     async fn reap_finished_turn(&mut self) {

@@ -40,7 +40,11 @@ pub fn render_topic_rail(
     };
     let selected_agent = registry.selected_agent().cloned();
 
-    let mut visible_topics = registry.topics().iter().collect::<Vec<_>>();
+    let mut visible_topics = registry
+        .topics()
+        .iter()
+        .filter(|topic| !topic.hidden)
+        .collect::<Vec<_>>();
     visible_topics.sort_by_key(|topic| topic.status != Status::Pinned);
     let rows = visible_topics
         .into_iter()
@@ -165,6 +169,7 @@ mod tests {
             topic_id: TopicId::from_counter(1, &TopicIdDomain(0)).unwrap(),
             name: "topic".to_owned(),
             status,
+            hidden: false,
             agents,
         }
     }

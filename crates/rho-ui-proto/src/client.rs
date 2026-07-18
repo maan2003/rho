@@ -415,6 +415,12 @@ impl AgentClient {
             .send(ClientMessage::SetTopicStatus { topic_id, status });
     }
 
+    pub fn set_topic_hidden(&self, topic_id: TopicId, hidden: bool) {
+        let _ = self
+            .commands
+            .send(ClientMessage::SetTopicHidden { topic_id, hidden });
+    }
+
     pub fn load_agent(&self, agent_id: AgentId) {
         let _ = self.commands.send(ClientMessage::LoadAgent { agent_id });
     }

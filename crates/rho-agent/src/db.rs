@@ -152,6 +152,8 @@ pub struct TopicRecord {
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
     pub status: Status,
+    #[senax(default)]
+    pub hidden: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue)]
@@ -711,6 +713,8 @@ pub trait AgentWriteTxnExt {
 
     fn set_topic_status(&mut self, now: UnixMillis, topic_id: TopicId, status: Status);
 
+    fn set_topic_hidden(&mut self, now: UnixMillis, topic_id: TopicId, hidden: bool);
+
     fn set_agent_status(&mut self, now: UnixMillis, agent_id: AgentId, status: Status);
 
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
@@ -977,6 +981,7 @@ impl AgentWriteTxnExt for WriteTxn {
             created_at: now,
             updated_at: now,
             status,
+            hidden: false,
         };
         self.open_table(TOPICS)
             .insert(&topic_id, SenValue::borrowed(&topic));
@@ -1003,6 +1008,18 @@ impl AgentWriteTxnExt for WriteTxn {
             .value()
             .into_owned();
         topic.status = status;
+        topic.updated_at = now;
+        topics.insert(&topic_id, SenValue::borrowed(&topic));
+    }
+
+    fn set_topic_hidden(&mut self, now: UnixMillis, topic_id: TopicId, hidden: bool) {
+        let mut topics = self.open_table(TOPICS);
+        let mut topic = topics
+            .get(&topic_id)
+            .expect("topic id missing")
+            .value()
+            .into_owned();
+        topic.hidden = hidden;
         topic.updated_at = now;
         topics.insert(&topic_id, SenValue::borrowed(&topic));
     }

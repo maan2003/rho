@@ -127,6 +127,10 @@ pub enum ClientMessage {
         topic_id: TopicId,
         status: Status,
     },
+    SetTopicHidden {
+        topic_id: TopicId,
+        hidden: bool,
+    },
     /// The user's verdict on an agent's last finished turn. Attention is
     /// action-cleared: viewing an agent never clears it; `Done`, snoozing,
     /// replying, landing, or hiding do.
@@ -469,6 +473,8 @@ pub struct UiTopic {
     pub topic_id: TopicId,
     pub name: String,
     pub status: Status,
+    #[senax(default)]
+    pub hidden: bool,
     pub agents: Vec<UiAgentSummary>,
 }
 

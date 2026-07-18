@@ -63,6 +63,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Pin/unpin a topic (default: the current one)",
     },
     CommandSpec {
+        name: "topic hide",
+        usage: ":topic hide [name]",
+        description: "Hide/unhide a topic (default: the current one)",
+    },
+    CommandSpec {
         name: "projects add",
         usage: ":projects add [path] [name]",
         description: "Register a working directory (defaults to the current one)",
@@ -152,6 +157,9 @@ pub enum Command {
     TopicPin {
         name: Option<String>,
     },
+    TopicHide {
+        name: Option<String>,
+    },
     ProjectAdd {
         path: Option<Utf8PathBuf>,
         name: Option<String>,
@@ -223,7 +231,10 @@ pub fn parse(line: &str) -> Option<Parsed> {
             Some("pin") => Parsed::Command(Command::TopicPin {
                 name: joined_name(rest),
             }),
-            _ => Parsed::Invalid(":topic new|move|rename|pin".to_owned()),
+            Some("hide") => Parsed::Command(Command::TopicHide {
+                name: joined_name(rest),
+            }),
+            _ => Parsed::Invalid(":topic new|move|rename|pin|hide".to_owned()),
         },
         "projects" => match tokens.next() {
             Some("add") => {
