@@ -18,6 +18,8 @@ pub struct Workstream {
     pub tag_id: TagId,
     pub name: String,
     pub status: rho_ui_proto::Status,
+    /// Derived, not stored: a workstream with no visible members (empty, or
+    /// every agent hidden) folds out of the rail automatically.
     pub hidden: bool,
     /// The workstream-group tag this stream sits under, from the tag's
     /// parent chain.
@@ -31,20 +33,26 @@ impl Workstream {
     }
 }
 
+/// The well-known label that hides whatever carries it.
+pub const HIDE_LABEL: &str = "hide";
+
 fn derive_workstreams(tags: &[UiTag], agents: &[UiAgentSummary]) -> Vec<Workstream> {
     tags.iter()
         .filter(|tag| tag.kind == TagKind::Workstream)
-        .map(|tag| Workstream {
-            tag_id: tag.tag_id,
-            name: tag.name.clone(),
-            status: tag.status,
-            hidden: tag.hidden,
-            group: tag.parent,
-            agents: agents
+        .map(|tag| {
+            let members = agents
                 .iter()
                 .filter(|agent| agent.tags.contains(&tag.tag_id))
                 .cloned()
-                .collect(),
+                .collect::<Vec<_>>();
+            Workstream {
+                tag_id: tag.tag_id,
+                name: tag.name.clone(),
+                status: tag.status,
+                hidden: members.iter().all(|agent| agent.hidden),
+                group: tag.parent,
+                agents: members,
+            }
         })
         .collect()
 }
@@ -243,7 +251,18 @@ impl AgentRegistry {
         self.workspace_counter = workspace_counter;
     }
 
-    pub fn set_data(&mut self, tags: Vec<UiTag>, agents: Vec<UiAgentSummary>) {
+    pub fn set_data(&mut self, tags: Vec<UiTag>, mut agents: Vec<UiAgentSummary>) {
+        // The "hide" label folds its carriers exactly like the filed-away
+        // disposition; merging here keeps every downstream check uniform.
+        if let Some(hide_label) = tags
+            .iter()
+            .find(|tag| tag.kind == TagKind::Label && tag.name == HIDE_LABEL)
+            .map(|tag| tag.tag_id)
+        {
+            for agent in &mut agents {
+                agent.hidden |= agent.tags.contains(&hide_label);
+            }
+        }
         self.attention.clear();
         let mut unseen = Vec::new();
         for agent in &agents {
@@ -427,16 +446,17 @@ impl AgentRegistry {
         &self.tags
     }
 
+    pub fn tag_name(&self, tag_id: TagId) -> Option<&str> {
+        self.tags
+            .iter()
+            .find(|tag| tag.tag_id == tag_id)
+            .map(|tag| tag.name.as_str())
+    }
+
     pub fn workstreams(&self) -> &[Workstream] {
         &self.workstreams
     }
 
-    /// Workstream-group tags, in daemon creation order.
-    pub fn group_tags(&self) -> impl Iterator<Item = &UiTag> {
-        self.tags
-            .iter()
-            .filter(|tag| tag.kind == TagKind::WorkstreamGroup)
-    }
 
     pub fn mark_known(&mut self, agent_id: AgentId) {
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
@@ -793,7 +813,6 @@ mod tests {
                 kind: TagKind::Workstream,
                 parent: None,
                 status,
-                hidden: false,
             },
             agents,
         )
@@ -835,11 +854,12 @@ mod tests {
 
     #[test]
     fn hidden_topics_are_excluded_from_rail_navigation() {
+        // A workstream whose every member is hidden auto-hides.
         let mut registry = AgentRegistry::default();
-        let mut hidden = topic(1, Status::Normal, vec![agent(1, Status::Normal)]);
-        hidden.0.hidden = true;
+        let mut filed = agent(1, Status::Normal);
+        filed.hidden = true;
         set_topics(&mut registry, vec![
-            hidden,
+            topic(1, Status::Normal, vec![filed]),
             topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
         ]);
         registry.agents.insert(agent_id(1), AgentLife::Live);

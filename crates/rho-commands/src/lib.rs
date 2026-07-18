@@ -73,11 +73,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Pin/unpin a workstream (default: the current one)",
     },
     CommandSpec {
-        name: "tag hide",
-        usage: ":tag hide [workstream]",
-        description: "Hide/unhide a workstream (default: the current one)",
-    },
-    CommandSpec {
         name: "projects add",
         usage: ":projects add [path] [name]",
         description: "Register a working directory (defaults to the current one)",
@@ -173,9 +168,6 @@ pub enum Command {
     TagPin {
         name: Option<String>,
     },
-    TagHide {
-        name: Option<String>,
-    },
     ProjectAdd {
         path: Option<Utf8PathBuf>,
         name: Option<String>,
@@ -257,10 +249,7 @@ pub fn parse(line: &str) -> Option<Parsed> {
             Some("pin") => Parsed::Command(Command::TagPin {
                 name: joined_name(rest),
             }),
-            Some("hide") => Parsed::Command(Command::TagHide {
-                name: joined_name(rest),
-            }),
-            _ => Parsed::Invalid(":tag move|group|label|unlabel|rename|pin|hide".to_owned()),
+            _ => Parsed::Invalid(":tag move|group|label|unlabel|rename|pin".to_owned()),
         },
         "projects" => match tokens.next() {
             Some("add") => {
@@ -446,7 +435,7 @@ fn command_word_candidates(prefix_words: &[&str], partial: &str) -> Vec<Candidat
 
 fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> Vec<Candidate> {
     match command {
-        ["tag", "move"] | ["tag", "pin"] | ["tag", "hide"] => {
+        ["tag", "move"] | ["tag", "pin"] => {
             tag_candidates(ctx.workstreams, "workstream", partial)
         }
         ["tag", "group"] => tag_candidates(ctx.groups, "group", partial),

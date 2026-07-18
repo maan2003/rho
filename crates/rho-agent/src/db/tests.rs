@@ -143,19 +143,6 @@ fn test_agent_runtime() -> AgentRuntime {
 }
 
 #[tokio::test]
-async fn tag_hidden_state_is_persisted() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let tag = write.create_tag(UnixMs(1), "team".to_owned(), TagKind::WorkstreamGroup, None);
-    write.set_tag_hidden(UnixMs(2), tag, true);
-    write.commit();
-
-    assert!(db.read().get_tag(tag).hidden);
-}
-
-#[tokio::test]
 async fn tag_names_are_uniquified_by_suffix() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));

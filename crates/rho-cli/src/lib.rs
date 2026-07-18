@@ -398,9 +398,6 @@ impl ChatApp {
             rho_commands::Command::TagPin { name } => {
                 self.toggle_tag_status(name, rho_ui_proto::Status::Pinned);
             }
-            rho_commands::Command::TagHide { name } => {
-                self.toggle_tag_hidden(name);
-            }
             rho_commands::Command::TagMove { name } => {
                 self.tag_by_name(name, rho_ui_proto::TagKind::Workstream, "moving to workstream");
             }
@@ -518,24 +515,6 @@ impl ChatApp {
         self.term
             .print_system(&format!("workstream is now {status:?}"));
         self.agent.set_tag_status(tag_id, status);
-    }
-
-    fn toggle_tag_hidden(&mut self, name: Option<String>) {
-        let Some(tag_id) = self.named_or_current_workstream(name) else {
-            return;
-        };
-        let hidden = !self
-            .agent
-            .tags()
-            .iter()
-            .find(|tag| tag.tag_id == tag_id)
-            .is_some_and(|tag| tag.hidden);
-        self.term.print_system(if hidden {
-            "workstream hidden"
-        } else {
-            "workstream shown"
-        });
-        self.agent.set_tag_hidden(tag_id, hidden);
     }
 
     fn named_or_current_workstream(&mut self, name: Option<String>) -> Option<rho_ui_proto::TagId> {

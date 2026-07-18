@@ -135,12 +135,6 @@ fn parses_status_commands() {
         Some(Parsed::Command(Command::TagPin { name: None }))
     );
     assert_eq!(
-        parse(":tag hide archived work"),
-        Some(Parsed::Command(Command::TagHide {
-            name: Some("archived work".to_owned())
-        }))
-    );
-    assert_eq!(
         parse(":done"),
         Some(Parsed::Command(Command::AgentDone { hide: false }))
     );

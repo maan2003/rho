@@ -406,12 +406,6 @@ impl AgentClient {
             .send(ClientMessage::SetTagStatus { tag_id, status });
     }
 
-    pub fn set_tag_hidden(&self, tag_id: TagId, hidden: bool) {
-        let _ = self
-            .commands
-            .send(ClientMessage::SetTagHidden { tag_id, hidden });
-    }
-
     pub fn load_agent(&self, agent_id: AgentId) {
         let _ = self.commands.send(ClientMessage::LoadAgent { agent_id });
     }

@@ -38,7 +38,7 @@ const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::n
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "5d19e3f2";
+const CURRENT_AGENT_DB_FORMAT: &str = "f3b8d24a";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -77,8 +77,15 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
     },
     AgentDbMigration {
         from: "b6e40c7a",
-        to: "5d19e3f2",
+        to: "f3b8d24a",
         migrate: migrate_topics_to_tags,
+    },
+    // Briefly-current format whose TagRecord carried a `hidden` flag;
+    // hiding is a "hide" label now, and workstreams auto-hide when empty.
+    AgentDbMigration {
+        from: "5d19e3f2",
+        to: "f3b8d24a",
+        migrate: migrate_tag_hidden_removal,
     },
 ];
 
@@ -128,8 +135,23 @@ pub struct TagRecord {
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
     pub status: Status,
-    pub hidden: bool,
 }
+
+/// Tag record of the short-lived "5d19e3f2" format, which stored an explicit
+/// `hidden` flag; kept only to migrate it away.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct LegacyTagRecordV1 {
+    name: String,
+    kind: TagKind,
+    parent: Option<TagId>,
+    created_at: UnixMillis,
+    updated_at: UnixMillis,
+    status: Status,
+    hidden: bool,
+}
+
+const LEGACY_TAGS_V1: TableDefinition<TagId, Sen<LegacyTagRecordV1>> =
+    TableDefinition::new("tags");
 
 type TopicId = PrefixId<TopicIdDomain>;
 
@@ -767,7 +789,6 @@ pub trait AgentWriteTxnExt {
 
     fn set_tag_status(&mut self, now: UnixMillis, tag_id: TagId, status: Status);
 
-    fn set_tag_hidden(&mut self, now: UnixMillis, tag_id: TagId, hidden: bool);
 
     fn set_tag_parent(&mut self, now: UnixMillis, tag_id: TagId, parent: Option<TagId>);
 
@@ -1030,7 +1051,6 @@ impl AgentWriteTxnExt for WriteTxn {
             created_at: now,
             updated_at: now,
             status: Status::Normal,
-            hidden: false,
         };
         self.open_table(TAGS)
             .insert(&tag_id, SenValue::borrowed(&tag));
@@ -1044,10 +1064,6 @@ impl AgentWriteTxnExt for WriteTxn {
 
     fn set_tag_status(&mut self, now: UnixMillis, tag_id: TagId, status: Status) {
         update_tag(self, now, tag_id, |tag| tag.status = status);
-    }
-
-    fn set_tag_hidden(&mut self, now: UnixMillis, tag_id: TagId, hidden: bool) {
-        update_tag(self, now, tag_id, |tag| tag.hidden = hidden);
     }
 
     fn set_tag_parent(&mut self, now: UnixMillis, tag_id: TagId, parent: Option<TagId>) {
@@ -1346,6 +1362,32 @@ fn update_tag(write: &mut WriteTxn, now: UnixMillis, tag_id: TagId, edit: impl F
     tags.insert(&tag_id, SenValue::borrowed(&tag));
 }
 
+/// Drops the explicit `hidden` flag from tag records: hiding is a "hide"
+/// label on agents now, and clients auto-hide workstreams with no visible
+/// members.
+fn migrate_tag_hidden_removal(write: &mut WriteTxn) {
+    let tags = write
+        .open_table(LEGACY_TAGS_V1)
+        .iter()
+        .map(|(key, value)| (key.value(), value.value().into_owned()))
+        .collect::<Vec<_>>();
+    write.delete_table("tags");
+    let mut table = write.open_table(TAGS);
+    for (tag_id, legacy) in tags {
+        table.insert(
+            &tag_id,
+            SenValue::borrowed(&TagRecord {
+                name: legacy.name,
+                kind: legacy.kind,
+                parent: legacy.parent,
+                created_at: legacy.created_at,
+                updated_at: legacy.updated_at,
+                status: legacy.status,
+            }),
+        );
+    }
+}
+
 /// Topics become workstream-group tags; every top-level agent founds a
 /// workstream tag (named from its title, parented to its topic's group)
 /// that it and its whole spawn tree carry.
@@ -1369,7 +1411,6 @@ fn migrate_topics_to_tags(write: &mut WriteTxn) {
         let group_id = write.create_tag(topic.created_at, topic.name, TagKind::WorkstreamGroup, None);
         update_tag(write, topic.updated_at, group_id, |tag| {
             tag.status = topic.status;
-            tag.hidden = topic.hidden;
         });
         groups.insert(topic_id, group_id);
     }

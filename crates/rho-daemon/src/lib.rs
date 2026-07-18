@@ -839,7 +839,6 @@ impl AgentRegistry {
                 kind: tag.kind,
                 parent: tag.parent,
                 status: tag.status,
-                hidden: tag.hidden,
             })
             .collect()
     }
@@ -957,7 +956,6 @@ impl AgentRegistry {
             kind: tag.kind,
             parent: tag.parent,
             status: tag.status,
-            hidden: tag.hidden,
         }
     }
 
@@ -1383,13 +1381,6 @@ impl AgentRegistry {
     async fn set_tag_status(&self, tag_id: TagId, status: Status) -> anyhow::Result<()> {
         let mut write = self.db.write().await;
         write.set_tag_status(rho_core::UnixMs::now(), tag_id, status);
-        write.commit();
-        Ok(())
-    }
-
-    async fn set_tag_hidden(&self, tag_id: TagId, hidden: bool) -> anyhow::Result<()> {
-        let mut write = self.db.write().await;
-        write.set_tag_hidden(rho_core::UnixMs::now(), tag_id, hidden);
         write.commit();
         Ok(())
     }
@@ -2140,10 +2131,6 @@ async fn handle_message(
         }
         ClientMessage::SetTagStatus { tag_id, status } => {
             agents.set_tag_status(tag_id, status).await?;
-            Ok(Refresh::Ready)
-        }
-        ClientMessage::SetTagHidden { tag_id, hidden } => {
-            agents.set_tag_hidden(tag_id, hidden).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::CancelTurn { agent_id } => {

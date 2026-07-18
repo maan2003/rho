@@ -141,10 +141,6 @@ pub enum ClientMessage {
         tag_id: TagId,
         status: Status,
     },
-    SetTagHidden {
-        tag_id: TagId,
-        hidden: bool,
-    },
     /// The user's verdict on an agent's last finished turn. Attention is
     /// action-cleared: viewing an agent never clears it; `Done`, snoozing,
     /// replying, landing, or hiding do.
@@ -465,7 +461,6 @@ pub struct UiTag {
     /// in ancestors is implied, never stored on agents.
     pub parent: Option<TagId>,
     pub status: Status,
-    pub hidden: bool,
 }
 
 /// Enough about an agent to list and label it without loading it.

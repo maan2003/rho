@@ -5,12 +5,13 @@
 //! an attention rollup lamp, and small tags for member agents beyond the
 //! primary one (subagents, joiners). Clicking the row opens the workstream's
 //! primary agent (switching to its own pane arrangement); clicking a tag
-//! opens that member directly. Workstreams sharing a workstream-group render
-//! under a section header; pinned ones sort first. The `+` row opens the
-//! draft compose view and doubles as its selection indicator.
+//! opens that member directly. A workstream's group shows as a dim
+//! annotation on the row — rows keep the plain pinned-first creation order.
+//! The `+` row opens the draft compose view and doubles as its selection
+//! indicator.
 
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Div, FontWeight, MouseButton, TextStyle, div, px};
+use gpui::{Context, Div, FontWeight, MouseButton, TextStyle, div, px};
 use rho_ui_proto::{AgentId, Status, UiAgentSummary, UiAttention};
 use theme::ActiveTheme as _;
 use ui::{Color, Icon, IconName, IconSize};
@@ -44,40 +45,21 @@ pub fn render_topic_rail(
         .filter(|topic| !topic.hidden)
         .collect::<Vec<_>>();
     visible_topics.sort_by_key(|topic| topic.status != Status::Pinned);
-    // Grouped workstreams render under their group's section header;
-    // ungrouped ones lead the rail.
-    let mut rows: Vec<AnyElement> = Vec::new();
-    let row = |topic: &Workstream, cx: &mut Context<Workspace>| {
-        task_row(
-            topic,
-            selected_agent.as_ref(),
-            registry,
-            text_style,
-            selected_color,
-            tag_background,
-            lamps,
-            cx,
-        )
-        .into_any_element()
-    };
-    for topic in &visible_topics {
-        if topic.group.is_none() {
-            rows.push(row(topic, cx));
-        }
-    }
-    for group in registry.group_tags() {
-        let members = visible_topics
-            .iter()
-            .filter(|topic| topic.group == Some(group.tag_id))
-            .collect::<Vec<_>>();
-        if members.is_empty() {
-            continue;
-        }
-        rows.push(group_header(&group.name, text_style));
-        for topic in members {
-            rows.push(row(topic, cx));
-        }
-    }
+    let rows = visible_topics
+        .into_iter()
+        .map(|topic| {
+            task_row(
+                topic,
+                selected_agent.as_ref(),
+                registry,
+                text_style,
+                selected_color,
+                tag_background,
+                lamps,
+                cx,
+            )
+        })
+        .collect::<Vec<_>>();
 
     div()
         .id("rho-gui-topic-rail")
@@ -115,20 +97,6 @@ pub fn render_topic_rail(
 
 /// How many member tags a task row shows before collapsing into `+n`.
 const VISIBLE_TAGS: usize = 4;
-
-/// A workstream-group's section header: a dim separator line with the
-/// group's name.
-fn group_header(name: &str, text_style: &TextStyle) -> AnyElement {
-    div()
-        .w_full()
-        .pl(px(4.))
-        .pt(px(6.))
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .text_color(text_style.color.opacity(0.55))
-        .child(name.to_owned())
-        .into_any_element()
-}
 
 #[cfg(test)]
 mod tests {
@@ -177,7 +145,6 @@ mod tests {
                 kind: TagKind::Workstream,
                 parent: topic.group,
                 status: topic.status,
-                hidden: topic.hidden,
             }],
             topic.agents.clone(),
         );
@@ -445,6 +412,12 @@ fn task_row(
     } else {
         text_style.color.opacity(0.5)
     };
+    // The group reads as a dim annotation rather than a section, so rows
+    // keep their plain pinned-first creation order.
+    let group_name = topic
+        .group
+        .and_then(|group| registry.tag_name(group))
+        .map(str::to_owned);
     let members = agents.iter().skip(1).copied().collect::<Vec<_>>();
     let overflow = members.len().saturating_sub(VISIBLE_TAGS);
     let tags = members
@@ -509,6 +482,12 @@ fn task_row(
                 })
                 .child(title),
         )
+        .children(group_name.map(|name| {
+            div()
+                .flex_none()
+                .text_color(text_style.color.opacity(0.45))
+                .child(name)
+        }))
         .children(tags)
 }
 

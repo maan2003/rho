@@ -17,17 +17,23 @@ const TOOL_TEXT_LIMIT: usize = 16 * 1024;
 const TOOL_LABEL_LIMIT: usize = 256;
 
 /// The browser keeps its topic-shaped view: each workstream tag is one
-/// "topic" (id `tp-{n}`), listing the agents tagged with it.
+/// "topic" (id `tp-{n}`), listing the agents tagged with it. There is no
+/// explicit hidden bit on tags: agents carrying the "hide" label count as
+/// hidden, and a workstream with no visible members is dropped entirely.
 pub fn hello(tags: &[UiTag], agents: &[UiAgentSummary], projects: &[UiProject]) -> ToBrowser {
+    let hide_label = tags
+        .iter()
+        .find(|tag| tag.kind == TagKind::Label && tag.name == "hide")
+        .map(|tag| tag.tag_id);
+    let agent_hidden = |agent: &UiAgentSummary| {
+        agent.hidden || hide_label.is_some_and(|label| agent.tags.contains(&label))
+    };
     ToBrowser::Hello {
         topics: tags
             .iter()
-            .filter(|tag| tag.kind == TagKind::Workstream && !tag.hidden)
-            .map(|tag| Topic {
-                id: format!("tp-{}", tag.tag_id.0),
-                name: tag.name.clone(),
-                pinned: tag.status == rho_ui_proto::Status::Pinned,
-                agents: agents
+            .filter(|tag| tag.kind == TagKind::Workstream)
+            .filter_map(|tag| {
+                let members = agents
                     .iter()
                     .filter(|agent| agent.tags.contains(&tag.tag_id))
                     .map(|agent| {
@@ -39,10 +45,19 @@ pub fn hello(tags: &[UiTag], agents: &[UiAgentSummary], projects: &[UiProject]) 
                             pinned: agent.status == rho_ui_proto::Status::Pinned,
                             updated_at: agent.updated_at.0,
                             attention: attention_label(agent.attention).to_owned(),
-                            hidden: agent.hidden,
+                            hidden: agent_hidden(agent),
                         }
                     })
-                    .collect(),
+                    .collect::<Vec<_>>();
+                if members.iter().all(|member| member.hidden) {
+                    return None;
+                }
+                Some(Topic {
+                    id: format!("tp-{}", tag.tag_id.0),
+                    name: tag.name.clone(),
+                    pinned: tag.status == rho_ui_proto::Status::Pinned,
+                    agents: members,
+                })
             })
             .collect(),
         projects: projects

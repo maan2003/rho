@@ -844,9 +844,6 @@ impl Workspace {
             Command::TagPin { name } => {
                 self.toggle_workstream_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
             }
-            Command::TagHide { name } => {
-                self.toggle_workstream_hidden(source_agent, name, cx);
-            }
             Command::TagMove { name } => {
                 self.tag_by_name(source_agent, name, rho_ui_proto::TagKind::Workstream, cx);
             }
@@ -1101,27 +1098,6 @@ impl Workspace {
         let status = rho_commands::toggle_status(current, target);
         self.connection
             .send(ClientMessage::SetTagStatus { tag_id, status });
-    }
-
-    /// Hide toggle for a workstream named by argument, defaulting to the
-    /// focused agent's workstream.
-    fn toggle_workstream_hidden(
-        &mut self,
-        source_agent: Option<AgentId>,
-        name: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(tag_id) = self.named_or_focused_workstream(source_agent, name, cx) else {
-            return;
-        };
-        let hidden = !self
-            .registry
-            .workstreams()
-            .iter()
-            .find(|workstream| workstream.tag_id == tag_id)
-            .is_some_and(|workstream| workstream.hidden);
-        self.connection
-            .send(ClientMessage::SetTagHidden { tag_id, hidden });
     }
 
     fn named_or_focused_workstream(
