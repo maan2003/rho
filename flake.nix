@@ -153,6 +153,16 @@
           rev = "f08a95d674b49474912b8c03ef51917cb042c606";
           hash = "sha256-0rgm2Wh26AQo0iAPo+KJTuj66Jf8SbLEig5Cwnm4kH4=";
         };
+        zedVendorManifest = pkgs.writeText "zed-vendor-Cargo.toml" ''
+          [package]
+          name = "zed"
+          version = "1.11.0"
+          edition = "2024"
+
+          [lib]
+          path = "lib.rs"
+        '';
+        zedVendorLib = pkgs.writeText "zed-vendor-lib.rs" "";
 
         multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
           craneLib':
@@ -189,6 +199,16 @@
                 extensionApi="$(dirname "$extensionHost")/extension_api"
                 mkdir "$extensionApi"
                 ln -s ${zedSrc}/crates/extension_api/wit "$extensionApi/wit"
+              done
+
+              # `remote_server` embeds the Zed package version from the sibling
+              # `zed` manifest. Supply a standalone manifest so Cargo can also
+              # scan the reconstructed vendor source without workspace context.
+              for remoteServer in $out/*/remote_server-*; do
+                zedPackage="$(dirname "$remoteServer")/zed"
+                mkdir "$zedPackage"
+                ln -s ${zedVendorManifest} "$zedPackage/Cargo.toml"
+                ln -s ${zedVendorLib} "$zedPackage/lib.rs"
               done
             '';
             craneLib = craneLibBase.overrideArgs {
