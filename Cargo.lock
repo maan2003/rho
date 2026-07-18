@@ -11775,6 +11775,7 @@ dependencies = [
  "rho-workspaces",
  "rho-zed-host",
  "rpc",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

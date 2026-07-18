@@ -195,7 +195,17 @@ pub struct DaemonArgs {
     pub cpu_profile: Option<PathBuf>,
 }
 
+pub fn install_crypto_provider() -> anyhow::Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .map_err(|_| anyhow::anyhow!("failed to install the AWS-LC rustls crypto provider"))?;
+    }
+    Ok(())
+}
+
 pub async fn run(mut args: DaemonArgs) -> anyhow::Result<()> {
+    install_crypto_provider()?;
     let profiler = args
         .cpu_profile
         .take()

@@ -149,6 +149,7 @@ fn init_tracing() {
 }
 
 fn run() -> Result<()> {
+    rho_daemon::install_crypto_provider()?;
     let args = Args::parse();
     let profiler = args
         .cpu_profile

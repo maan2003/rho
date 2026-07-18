@@ -53,6 +53,11 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .map_err(|_| anyhow::anyhow!("failed to install the AWS-LC rustls crypto provider"))?;
+    }
     let started = Instant::now();
     let args = Args::parse();
     let mut config = VoiceConfig::grok_cli()

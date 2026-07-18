@@ -32,6 +32,7 @@ rho-voice.workspace = true
 rho-webui-messages.workspace = true
 rho-workspaces.workspace = true
 redb.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rho-zed-host.workspace = true
