@@ -5,8 +5,37 @@ use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
 use rho_workspaces::WorkspaceInfo;
+use senax_encoder::Decoder as _;
 
 use super::*;
+
+#[test]
+fn tag_record_decodes_legacy_hidden_field() {
+    let legacy = TagRecordDecode {
+        name: "legacy".to_owned(),
+        kind: TagKind::Workstream,
+        parent: Some(TagId(7)),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(2),
+        status: Status::Pinned,
+        hidden: true,
+    };
+    let mut bytes = senax_encoder::encode(&legacy).unwrap();
+
+    let decoded = TagRecord::decode(&mut bytes).unwrap();
+
+    assert_eq!(
+        decoded,
+        TagRecord {
+            name: "legacy".to_owned(),
+            kind: TagKind::Workstream,
+            parent: Some(TagId(7)),
+            created_at: UnixMs(1),
+            updated_at: UnixMs(2),
+            status: Status::Pinned,
+        }
+    );
+}
 
 #[test]
 fn agent_role_resolves_opinionated_bindings() {

@@ -125,7 +125,7 @@ pub enum TagKind {
     Label,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode)]
 pub struct TagRecord {
     pub name: String,
     pub kind: TagKind,
@@ -137,21 +137,34 @@ pub struct TagRecord {
     pub status: Status,
 }
 
-/// Tag record of the short-lived "5d19e3f2" format, which stored an explicit
-/// `hidden` flag; kept only to migrate it away.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-struct LegacyTagRecordV1 {
+/// Temporary decode shape for both the current tag record and the short-lived
+/// "5d19e3f2" format, which also stored an explicit `hidden` field.
+#[derive(Encode, Decode)]
+struct TagRecordDecode {
     name: String,
     kind: TagKind,
     parent: Option<TagId>,
     created_at: UnixMillis,
     updated_at: UnixMillis,
     status: Status,
+    #[senax(default)]
     hidden: bool,
 }
 
-const LEGACY_TAGS_V1: TableDefinition<TagId, Sen<LegacyTagRecordV1>> =
-    TableDefinition::new("tags");
+impl senax_encoder::Decoder for TagRecord {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        let decoded = TagRecordDecode::decode(reader)?;
+        let _ = decoded.hidden;
+        Ok(Self {
+            name: decoded.name,
+            kind: decoded.kind,
+            parent: decoded.parent,
+            created_at: decoded.created_at,
+            updated_at: decoded.updated_at,
+            status: decoded.status,
+        })
+    }
+}
 
 type TopicId = PrefixId<TopicIdDomain>;
 
@@ -1366,25 +1379,19 @@ fn update_tag(write: &mut WriteTxn, now: UnixMillis, tag_id: TagId, edit: impl F
 /// label on agents now, and clients auto-hide workstreams with no visible
 /// members.
 fn migrate_tag_hidden_removal(write: &mut WriteTxn) {
+    // redb identifies the value type by its Rust name, which remains
+    // `TagRecord` across this format hop. The temporary custom decoder accepts
+    // the legacy `hidden` field; reinserting normalizes records to the current
+    // shape. Do not delete and recreate the table: redb cannot change a table's
+    // type within the transaction that deletes it.
     let tags = write
-        .open_table(LEGACY_TAGS_V1)
+        .open_table(TAGS)
         .iter()
         .map(|(key, value)| (key.value(), value.value().into_owned()))
         .collect::<Vec<_>>();
-    write.delete_table("tags");
     let mut table = write.open_table(TAGS);
-    for (tag_id, legacy) in tags {
-        table.insert(
-            &tag_id,
-            SenValue::borrowed(&TagRecord {
-                name: legacy.name,
-                kind: legacy.kind,
-                parent: legacy.parent,
-                created_at: legacy.created_at,
-                updated_at: legacy.updated_at,
-                status: legacy.status,
-            }),
-        );
+    for (tag_id, tag) in tags {
+        table.insert(&tag_id, SenValue::borrowed(&tag));
     }
 }
 
