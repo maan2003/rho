@@ -52,10 +52,9 @@ rho-iroh-auth.workspace = true
 rho-profiling.workspace = true
 rho-ui-proto.workspace = true
 # Same revision the zed fork pins, so a future switch to its `audio` crate
-# (for the echo canceller) shares one rodio build.
+# shares one rodio build.
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = [
   "playback",
-  "recording",
   "wav",
 ] }
 rpc = { git = "https://github.com/maan2003/zed", branch = "rho" }

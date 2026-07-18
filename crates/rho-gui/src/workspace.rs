@@ -17,7 +17,6 @@ use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
 use rho_ui_proto::{
     AdvisorIntelligence, AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery,
-    VoiceRole, VoiceState, VoiceUiAction,
 };
 use theme::ActiveTheme as _;
 
@@ -28,13 +27,10 @@ use crate::draft_view::DraftView;
 use crate::registry::{ActivePane, AgentRegistry};
 use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
-use crate::voice_audio::VoiceAudio;
 use crate::{
     AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, RoleCycle, RoleCycleGroup,
     SubmitPrompt, TaskBoard,
 };
-
-const MAX_VOICE_TRANSCRIPT_LINES: usize = 12;
 
 /// How to reach the daemon. Deliberately holds no client-local paths: the
 /// socket may be forwarded from another machine, so the GUI's own cwd and
@@ -78,21 +74,9 @@ pub struct Workspace {
     expanded_folds: HashSet<rho_ui_proto::TopicId>,
     connected: bool,
     duration_timer: Option<Task<()>>,
-    /// Live audio devices while a voice session runs; `None` otherwise.
-    voice: Option<VoiceAudio>,
-    voice_state: Option<VoiceState>,
-    /// Tail of the assistant's current spoken utterance, for the voice bar.
-    voice_line: String,
-    /// Recent spoken transcript lines for the current/last voice session.
-    voice_transcript: Vec<VoiceTranscriptLine>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
     _event_task: Task<()>,
-}
-
-struct VoiceTranscriptLine {
-    role: VoiceRole,
-    text: String,
 }
 
 impl Workspace {
@@ -130,10 +114,6 @@ impl Workspace {
             expanded_folds: HashSet::new(),
             connected: false,
             duration_timer: None,
-            voice: None,
-            voice_state: None,
-            voice_line: String::new(),
-            voice_transcript: Vec::new(),
             chime: Chime::default(),
             _event_task: event_task,
         };
@@ -351,68 +331,9 @@ impl Workspace {
                     cx,
                 );
             }
-            ConnEvent::VoiceAudio(pcm) => {
-                if let Some(voice) = &self.voice {
-                    voice.play(&pcm);
-                }
-            }
-            ConnEvent::VoiceFlushPlayback => {
-                if let Some(voice) = &self.voice {
-                    voice.flush_playback();
-                }
-                self.voice_line.clear();
-                cx.notify();
-            }
-            ConnEvent::VoiceState(state) => match state {
-                VoiceState::Stopped { reason } => {
-                    self.voice = None;
-                    self.voice_state = None;
-                    self.voice_line.clear();
-                    self.notice_on(
-                        None,
-                        &format!("[voice stopped: {reason}]"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    cx.notify();
-                }
-                state => {
-                    self.voice_state = Some(state);
-                    cx.notify();
-                }
-            },
-            ConnEvent::VoiceTranscript { role, text } => {
-                match role {
-                    // A user-speech marker starts a fresh assistant line.
-                    VoiceRole::User => {
-                        self.voice_line.clear();
-                        self.start_voice_transcript_line(VoiceRole::User);
-                        self.append_voice_transcript(VoiceRole::User, &text);
-                    }
-                    VoiceRole::Assistant => {
-                        self.voice_line.push_str(&text);
-                        self.append_voice_transcript(VoiceRole::Assistant, &text);
-                        // The bar shows one line; keep the tail.
-                        let overflow = self.voice_line.len().saturating_sub(160);
-                        if overflow > 0 {
-                            let mut cut = overflow;
-                            while !self.voice_line.is_char_boundary(cut) {
-                                cut += 1;
-                            }
-                            self.voice_line.drain(..cut);
-                        }
-                    }
-                }
-                cx.notify();
-            }
-            ConnEvent::VoiceUiAction(action) => self.handle_voice_ui_action(action, window, cx),
             ConnEvent::Disconnected(reason) => {
                 self.connected = false;
                 self.awaiting_draft_agent = false;
-                self.voice = None;
-                self.voice_state = None;
-                self.voice_line.clear();
-                self.voice_transcript.clear();
                 let notice = format!("[disconnected from rho daemon: {reason}]");
                 for view in self.views.values() {
                     view.update(cx, |view, cx| {
@@ -877,7 +798,6 @@ impl Workspace {
                     }
                 }
             }
-            Command::VoiceToggle => self.toggle_voice(cx),
             Command::Open { path } => {
                 let target = source_agent.or_else(|| self.registry.selected_agent().copied());
                 let Some(agent_id) = target else {
@@ -1223,50 +1143,6 @@ impl Workspace {
             .unwrap_or(path)
     }
 
-    fn start_voice_transcript_line(&mut self, role: VoiceRole) {
-        let needs_line = self
-            .voice_transcript
-            .last()
-            .is_none_or(|line| line.role != role || !line.text.is_empty());
-        if needs_line {
-            self.voice_transcript.push(VoiceTranscriptLine {
-                role,
-                text: String::new(),
-            });
-            self.trim_voice_transcript();
-        }
-    }
-
-    fn append_voice_transcript(&mut self, role: VoiceRole, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        if self
-            .voice_transcript
-            .last()
-            .is_none_or(|line| line.role != role)
-        {
-            self.voice_transcript.push(VoiceTranscriptLine {
-                role,
-                text: String::new(),
-            });
-        }
-        if let Some(line) = self.voice_transcript.last_mut() {
-            line.text.push_str(text);
-        }
-        self.trim_voice_transcript();
-    }
-
-    fn trim_voice_transcript(&mut self) {
-        let overflow = self
-            .voice_transcript
-            .len()
-            .saturating_sub(MAX_VOICE_TRANSCRIPT_LINES);
-        if overflow > 0 {
-            self.voice_transcript.drain(..overflow);
-        }
-    }
-
     fn notice_on(
         &self,
         agent_id: Option<&AgentId>,
@@ -1300,63 +1176,9 @@ impl Workspace {
             Some(agent_id) => self.registry.select_agent(agent_id),
             None => self.registry.enter_draft(),
         }
-        // Voice tools resolve "the current agent" against what the user is
-        // looking at.
-        if self.voice.is_some() {
-            self.connection.send(ClientMessage::VoiceFocus { agent_id });
-        }
         self.focus_active_editor(window, cx);
         self.ensure_duration_timer(cx);
         cx.notify();
-    }
-
-    /// `:voice`: starts or stops the realtime voice session. Starting is an
-    /// explicit action — microphone audio leaves the machine and sessions
-    /// are billed per minute.
-    fn toggle_voice(&mut self, cx: &mut Context<Self>) {
-        if self.voice.is_some() {
-            self.connection.send(ClientMessage::VoiceStop);
-            self.voice = None;
-            self.voice_state = None;
-            self.voice_line.clear();
-            cx.notify();
-            return;
-        }
-        match VoiceAudio::start(self.connection.sender()) {
-            Ok(voice) => {
-                self.voice = Some(voice);
-                self.voice_state = Some(VoiceState::Starting);
-                self.voice_line.clear();
-                self.voice_transcript.clear();
-                self.connection.send(ClientMessage::VoiceStart);
-                self.connection.send(ClientMessage::VoiceFocus {
-                    agent_id: self.registry.selected_agent().copied(),
-                });
-                cx.notify();
-            }
-            Err(error) => self.notice_on(
-                None,
-                &format!("voice: {error:#}"),
-                StyleClass::SystemImportant,
-                cx,
-            ),
-        }
-    }
-
-    fn handle_voice_ui_action(
-        &mut self,
-        action: VoiceUiAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match action {
-            VoiceUiAction::FocusAgent { agent_id } => self.open_agent(agent_id, window, cx),
-            VoiceUiAction::ShowAgents => {
-                self.expanded_folds.clear();
-                self.enter_draft(None, window, cx);
-            }
-            VoiceUiAction::EnterNewAgentScreen => self.enter_draft(None, window, cx),
-        }
     }
 
     pub fn switch_agent_by_delta(
@@ -1682,48 +1504,6 @@ impl Render for Workspace {
             &text_style,
             cx,
         );
-        let voice_bar = self.voice_state.as_ref().map(|state| {
-            let label = match state {
-                VoiceState::Starting => "voice: starting…".to_owned(),
-                VoiceState::Active if self.voice_line.is_empty() => "voice: listening".to_owned(),
-                VoiceState::Active => format!("voice: {}", self.voice_line),
-                VoiceState::Stopped { reason } => format!("voice: stopped — {reason}"),
-            };
-            div()
-                .w_full()
-                .px(px(8.))
-                .py(px(2.))
-                .text_color(cx.theme().colors().text_muted)
-                .child(label)
-        });
-        let visible_voice_lines = self
-            .voice_transcript
-            .iter()
-            .filter(|line| !line.text.trim().is_empty())
-            .rev()
-            .take(4)
-            .collect::<Vec<_>>();
-        let voice_transcript = (!visible_voice_lines.is_empty()).then(|| {
-            let rows = visible_voice_lines
-                .iter()
-                .rev()
-                .map(|line| {
-                    let role = match line.role {
-                        VoiceRole::User => "you",
-                        VoiceRole::Assistant => "voice",
-                    };
-                    div().child(format!("{role}: {}", line.text.trim_end()))
-                })
-                .collect::<Vec<_>>();
-            div()
-                .w_full()
-                .border_t_1()
-                .border_color(cx.theme().colors().border_variant.opacity(0.5))
-                .px(px(8.))
-                .py(px(4.))
-                .text_color(cx.theme().colors().text_muted)
-                .children(rows)
-        });
         div()
             .id("rho-gui")
             .size_full()
@@ -1794,8 +1574,6 @@ impl Render for Workspace {
                             .child(editor),
                     ),
             )
-            .children(voice_transcript)
-            .children(voice_bar)
     }
 }
 

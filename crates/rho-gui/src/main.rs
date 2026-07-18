@@ -17,7 +17,6 @@ mod style;
 mod tests;
 mod topic_rail;
 mod transcript;
-mod voice_audio;
 mod workspace;
 mod zed_remote;
 

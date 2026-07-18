@@ -78,11 +78,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Unregister a working directory",
     },
     CommandSpec {
-        name: "voice",
-        usage: ":voice",
-        description: "Toggle the realtime voice session (billed per minute)",
-    },
-    CommandSpec {
         name: "cancel",
         usage: ":cancel",
         description: "Alias for :agent cancel",
@@ -173,7 +168,6 @@ pub enum Command {
     ProjectRemove {
         path: String,
     },
-    VoiceToggle,
     Rewind {
         turns: u32,
     },
@@ -262,7 +256,6 @@ pub fn parse(line: &str) -> Option<Parsed> {
             },
             _ => Parsed::Invalid(":projects add|rm".to_owned()),
         },
-        "voice" => Parsed::Command(Command::VoiceToggle),
         "cancel" => Parsed::Command(Command::AgentCancel),
         "rewind" => parse_rewind(&mut tokens),
         "continue" => Parsed::Command(Command::Continue),

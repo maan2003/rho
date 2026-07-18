@@ -11677,7 +11677,6 @@ dependencies = [
  "rho-inference",
  "rho-tool-shell",
  "rho-ui-proto",
- "rho-voice",
  "rho-workspaces",
  "serde",
  "serde_json",
@@ -11771,7 +11770,6 @@ dependencies = [
  "rho-profiling",
  "rho-slack",
  "rho-ui-proto",
- "rho-voice",
  "rho-webui-messages",
  "rho-workspaces",
  "rho-zed-host",
@@ -12000,25 +11998,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-voice"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "dirs",
- "futures-util",
- "reqwest 0.12.28",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
- "url",
-]
-
-[[package]]
 name = "rho-webui-messages"
 version = "0.1.0"
 dependencies = [
@@ -12119,7 +12098,6 @@ dependencies = [
  "cpal",
  "dasp_sample",
  "num-rational",
- "rtrb",
  "symphonia",
  "thiserror 2.0.18",
 ]
@@ -12212,12 +12190,6 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
-
-[[package]]
-name = "rtrb"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ade083ccbb4bf536df69d1f6432cc23deb7acccff86b183f3923a6fd56a1153"
 
 [[package]]
 name = "rust-embed"

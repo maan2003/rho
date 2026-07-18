@@ -24,7 +24,6 @@ rho-db.workspace = true
 rho-inference.workspace = true
 rho-tool-shell.workspace = true
 rho-ui-proto.workspace = true
-rho-voice.workspace = true
 rho-workspaces.workspace = true
 serde.workspace = true
 serde_json.workspace = true

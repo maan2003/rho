@@ -26,7 +26,6 @@ use rho_ui_proto::{
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc};
 
 pub mod debug;
-mod voice;
 mod webui;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
@@ -493,8 +492,6 @@ struct AgentRegistry {
     land_locks: Mutex<HashMap<Utf8PathBuf, Arc<TokioMutex<()>>>>,
     land_holders: Mutex<HashMap<Utf8PathBuf, LandLeaseHolder>>,
     land_statuses: Mutex<HashMap<Utf8PathBuf, (Option<AgentId>, LandStatus)>>,
-    /// At most one realtime voice session per daemon (see [`voice`]).
-    voice_active: Arc<std::sync::atomic::AtomicBool>,
     /// In-process Slack connection and its thread sessions
     /// (see [`rho_slack::SlackManager`]).
     slack: Arc<rho_slack::SlackManager>,
@@ -557,7 +554,6 @@ impl AgentRegistry {
             land_locks: Mutex::new(HashMap::new()),
             land_holders: Mutex::new(HashMap::new()),
             land_statuses: Mutex::new(HashMap::new()),
-            voice_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             slack,
             pr_monitor,
             platform_secrets,
@@ -1246,9 +1242,6 @@ where
     });
 
     let mut land_leases: Vec<(Utf8PathBuf, OwnedMutexGuard<()>)> = Vec::new();
-    // The voice session (at most one) is owned by this connection: dropping
-    // the handle on disconnect ends the session task.
-    let mut voice: Option<voice::VoiceHandle> = None;
     let mut first = Some(first);
     let result = loop {
         let message = match first.take() {
@@ -1265,16 +1258,6 @@ where
                 }
             },
         };
-        match voice::handle_client_message(&agents, &outgoing_tx, &mut voice, &message) {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(error) => {
-                let _ = outgoing_tx.send(ServerMessage::Error {
-                    message: error.to_string(),
-                });
-                continue;
-            }
-        }
         match handle_message(
             &agents,
             &outgoing_tx,
@@ -1808,7 +1791,6 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::McpAgentToolResult(response));
             Ok(Refresh::None)
         }
-        // Intercepted by `voice::handle_client_message` before this dispatch.
         ClientMessage::IrohApprove { code } => {
             let auth = agents
                 .iroh_auth
@@ -1857,10 +1839,6 @@ async fn handle_message(
             });
             Ok(Refresh::None)
         }
-        ClientMessage::VoiceStart
-        | ClientMessage::VoiceStop
-        | ClientMessage::VoiceAudio { .. }
-        | ClientMessage::VoiceFocus { .. } => Ok(Refresh::None),
         // Only valid as a stream's first frame (see `serve_connection_io`);
         // inside a UI session it is a protocol error.
         ClientMessage::ChannelOpen { .. } => {

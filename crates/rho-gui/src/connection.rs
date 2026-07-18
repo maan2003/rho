@@ -17,9 +17,8 @@ use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
-    WorkspaceInfo,
-    AgentId, ClientMessage, ServerMessage, UiProject, UiTopic, VoiceRole, VoiceState,
-    VoiceUiAction, read_frame, write_frame,
+    AgentId, ClientMessage, ServerMessage, UiProject, UiTopic, WorkspaceInfo, read_frame,
+    write_frame,
 };
 
 use crate::workspace::AttachTarget;
@@ -84,16 +83,6 @@ pub enum ConnEvent {
     },
     ServerError(String),
     Disconnected(String),
-    /// Assistant audio (wire-format PCM16) for immediate playback.
-    VoiceAudio(Vec<u8>),
-    /// The user barged in; drop buffered playback now.
-    VoiceFlushPlayback,
-    VoiceState(VoiceState),
-    VoiceTranscript {
-        role: VoiceRole,
-        text: String,
-    },
-    VoiceUiAction(VoiceUiAction),
 }
 
 /// One open zed channel: a dedicated stream to the daemon carrying raw
@@ -185,10 +174,6 @@ pub struct Connection {
 impl Connection {
     pub fn send(&self, message: ClientMessage) {
         let _ = self.commands.unbounded_send(message);
-    }
-
-    pub fn sender(&self) -> futures_mpsc::UnboundedSender<ClientMessage> {
-        self.commands.clone()
     }
 
     /// Dials a dedicated stream for a zed channel onto `workspace` and runs
@@ -327,13 +312,6 @@ async fn run(
                 attention,
             }),
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
-            ServerMessage::VoiceAudio { pcm } => Some(ConnEvent::VoiceAudio(pcm)),
-            ServerMessage::VoiceFlushPlayback => Some(ConnEvent::VoiceFlushPlayback),
-            ServerMessage::VoiceState { state } => Some(ConnEvent::VoiceState(state)),
-            ServerMessage::VoiceTranscript { role, text } => {
-                Some(ConnEvent::VoiceTranscript { role, text })
-            }
-            ServerMessage::VoiceUiAction(action) => Some(ConnEvent::VoiceUiAction(action)),
             ServerMessage::Pong
             | ServerMessage::LandLeaseQueued { .. }
             | ServerMessage::LandLeaseGranted { .. }

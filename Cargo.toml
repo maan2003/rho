@@ -26,7 +26,6 @@ members = [
   "crates/rho-term-screen",
   "crates/rho-tool-shell",
   "crates/rho-ui-proto",
-  "crates/rho-voice",
   "crates/rho-webui-messages",
   "crates/rho-workspaces",
   "crates/rho-zed-host",
@@ -102,7 +101,6 @@ rho-slack = { path = "crates/rho-slack" }
 rho-term-screen = { path = "crates/rho-term-screen" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
-rho-voice = { path = "crates/rho-voice" }
 rho-webui-messages = { path = "crates/rho-webui-messages" }
 rho-workspaces = { path = "crates/rho-workspaces" }
 senax-encoder = { path = "crates/senax-encoder" }

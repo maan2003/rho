@@ -28,7 +28,6 @@ rho-pr-monitor.workspace = true
 rho-profiling.workspace = true
 rho-slack.workspace = true
 rho-ui-proto.workspace = true
-rho-voice.workspace = true
 rho-webui-messages.workspace = true
 rho-workspaces.workspace = true
 redb.workspace = true

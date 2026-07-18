@@ -216,9 +216,6 @@ impl AgentClient {
                             }
                         }
                     }
-                    // Voice frames are only meaningful to the client that
-                    // started the session (the GUI); this CLI client has no
-                    // audio path.
                     ServerMessage::AgentAttention {
                         agent_id,
                         attention,
@@ -240,11 +237,6 @@ impl AgentClient {
                     | ServerMessage::LandLeaseQueued { .. }
                     | ServerMessage::LandLeaseGranted { .. }
                     | ServerMessage::LandStatus { .. }
-                    | ServerMessage::VoiceAudio { .. }
-                    | ServerMessage::VoiceFlushPlayback
-                    | ServerMessage::VoiceState { .. }
-                    | ServerMessage::VoiceTranscript { .. }
-                    | ServerMessage::VoiceUiAction(_)
                     | ServerMessage::McpAgentToolResult(_)
                     | ServerMessage::PlatformStatus { .. }
                     | ServerMessage::IrohApproved { .. }

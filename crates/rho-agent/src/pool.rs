@@ -2,7 +2,7 @@
 //!
 //! The pool owns the id → running-agent map and the shared repo handles that
 //! make live-workspace sharing possible. Higher layers (the daemon) own
-//! product policy around it: topics, titles, land leases, voice.
+//! product policy around it: topics, titles, land leases.
 
 use std::collections::HashMap;
 use std::sync::Arc;
