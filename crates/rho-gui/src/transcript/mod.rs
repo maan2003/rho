@@ -5,6 +5,14 @@
 //! `first_changed_block` are never touched (their anchors, highlights,
 //! gutters and folds survive untouched); everything after is re-rendered.
 //!
+//! The model is editor-agnostic (emacs: decoration is buffer state, not
+//! window state): records, styles, inlay content, and elision plans are
+//! all anchor-based data. Any number of editors attach; after each sync
+//! the model reconciles every attachment — highlights and gutters are
+//! reapplied for changed classes, inlays and display elisions diffed
+//! against the desired state — so every pane over the transcript stays
+//! correct without owning any of it.
+//!
 //! Highlights are bucketed per [`StyleClass`] into two editor highlight keys
 //! each, split at the start of the live turn (after the last user message) —
 //! history ranges change at most once per turn; live-turn ranges are small,
@@ -19,12 +27,11 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use editor::Editor;
-use elisions::ElisionSync;
-use gpui::{Context, Entity};
-use inlays::InlayRecord;
+use elisions::{ElisionState, ElisionSync};
+use gpui::{Context, Entity, WeakEntity};
+use inlays::{InlayRecord, PlacedInlay};
 use language::Buffer;
 use multi_buffer::MultiBuffer;
-use project::InlayId;
 use rho_ui_proto::remote::UiAgentState;
 use text::{Anchor, ToOffset as _};
 
@@ -37,16 +44,25 @@ use crate::style::{Region, StyleClass};
 pub struct TranscriptModel {
     buffer: Entity<Buffer>,
     multi_buffer: Entity<MultiBuffer>,
-    editor: Entity<Editor>,
     records: Vec<BlockRecord>,
     /// First record of the live turn as of the last sync. Records before it
     /// carry their highlights in the history region, records from it onward
     /// in the live-turn region.
     turn_boundary: usize,
     elisions: ElisionSync,
-    // Custom inlay ids share the editor's id space with the prompt
-    // placeholder (id 0), so they start at 1.
+    // Custom inlay ids share each editor's id space with the prompt
+    // placeholder (id 0), so they start at 1. One counter serves every
+    // attachment: ids only need uniqueness within an editor.
     next_inlay_id: usize,
+    attachments: Vec<Attachment>,
+}
+
+/// One editor displaying this transcript, plus the per-editor state that
+/// lives in that editor's id spaces (inlay ids, display elision ids).
+struct Attachment {
+    editor: WeakEntity<Editor>,
+    elisions: ElisionState,
+    inlays: Vec<PlacedInlay>,
 }
 
 struct BlockRecord {
@@ -62,21 +78,35 @@ struct BlockRecord {
 struct UserMessageGutter;
 
 impl TranscriptModel {
-    pub fn new<V>(
-        buffer: Entity<Buffer>,
-        multi_buffer: Entity<MultiBuffer>,
-        editor: Entity<Editor>,
-        _cx: &Context<V>,
-    ) -> Self {
+    pub fn new(buffer: Entity<Buffer>, multi_buffer: Entity<MultiBuffer>) -> Self {
         Self {
             buffer,
             multi_buffer,
-            editor,
             records: Vec::new(),
             turn_boundary: 0,
             elisions: ElisionSync::default(),
             next_inlay_id: 1,
+            attachments: Vec::new(),
         }
+    }
+
+    /// Attaches an editor over the transcript's multibuffer, bringing it
+    /// fully up to date with the model. Dropped editors detach themselves:
+    /// the model only holds weak handles and prunes on the next apply.
+    pub fn attach<V: 'static>(
+        &mut self,
+        editor: &Entity<Editor>,
+        now_ms: u64,
+        cx: &mut Context<V>,
+    ) {
+        self.attachments.push(Attachment {
+            editor: editor.downgrade(),
+            elisions: ElisionState::default(),
+            inlays: Vec::new(),
+        });
+        let history = classes_in(&self.records[..self.turn_boundary]);
+        let live = classes_in(&self.records[self.turn_boundary..]);
+        self.apply_to_attachments(now_ms, &history, &live, true, cx);
     }
 
     /// Applies a state change bounded by `summary`.
@@ -121,7 +151,6 @@ impl TranscriptModel {
         let old_boundary = self.turn_boundary;
         let mut changed_history = HashSet::new();
         let mut changed_live = HashSet::new();
-        let mut stale_inlays = Vec::new();
         let mut gutters_changed = false;
         self.buffer.clone().update(cx, |buffer, cx| {
             let removed = self.records.split_off(start);
@@ -134,7 +163,6 @@ impl TranscriptModel {
                 for (class, _) in &record.styles {
                     changed.insert(*class);
                 }
-                stale_inlays.extend(record.inlay.as_ref().and_then(InlayRecord::inlay_id));
                 gutters_changed |= record.gutter.is_some();
             }
             let start_offset = removed
@@ -176,13 +204,8 @@ impl TranscriptModel {
         }
         self.turn_boundary = new_boundary;
 
-        self.apply_region_styles(Region::History, &changed_history, cx);
-        self.apply_region_styles(Region::LiveTurn, &changed_live, cx);
-        self.refresh_inlays(now_ms, stale_inlays, cx);
-        if gutters_changed {
-            self.refresh_gutters(cx);
-        }
-        self.refresh_elisions(state, start, cx);
+        self.refresh_elision_plans(state, start);
+        self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
         cx.notify();
     }
 
@@ -221,20 +244,8 @@ impl TranscriptModel {
             return false;
         };
 
-        let old_boundary = self.turn_boundary;
-        let region = if index < old_boundary {
-            Region::History
-        } else {
-            Region::LiveTurn
-        };
+        let live_region = index >= self.turn_boundary;
         let mut changed = HashSet::new();
-        let stale_inlays = old_record
-            .inlay
-            .as_ref()
-            .and_then(InlayRecord::inlay_id)
-            .into_iter()
-            .collect::<Vec<_>>();
-
         let mut gutters_changed = false;
         self.buffer.clone().update(cx, |buffer, cx| {
             let block_start = self.records[index].range.start.to_offset(buffer);
@@ -271,12 +282,14 @@ impl TranscriptModel {
             };
         });
 
-        self.apply_region_styles(region, &changed, cx);
-        self.refresh_inlays(now_ms, stale_inlays, cx);
-        if gutters_changed {
-            self.refresh_gutters(cx);
-        }
-        self.refresh_elisions(state, index, cx);
+        let empty = HashSet::new();
+        let (changed_history, changed_live) = if live_region {
+            (&empty, &changed)
+        } else {
+            (&changed, &empty)
+        };
+        self.refresh_elision_plans(state, index);
+        self.apply_to_attachments(now_ms, changed_history, changed_live, gutters_changed, cx);
         cx.notify();
         true
     }
@@ -286,34 +299,9 @@ impl TranscriptModel {
         if !self.has_timers() {
             return;
         }
-        self.refresh_inlays(now_ms, Vec::new(), cx);
+        let empty = HashSet::new();
+        self.apply_to_attachments(now_ms, &empty, &empty, false, cx);
         cx.notify();
-    }
-
-    fn refresh_inlays<V: 'static>(
-        &mut self,
-        now_ms: u64,
-        stale: Vec<InlayId>,
-        cx: &mut Context<V>,
-    ) {
-        let Self {
-            records,
-            multi_buffer,
-            editor,
-            next_inlay_id,
-            ..
-        } = self;
-        inlays::refresh_inlays(
-            records
-                .iter_mut()
-                .filter_map(|record| record.inlay.as_mut()),
-            now_ms,
-            stale,
-            next_inlay_id,
-            multi_buffer,
-            editor,
-            cx,
-        );
     }
 
     pub fn has_timers(&self) -> bool {
@@ -322,75 +310,14 @@ impl TranscriptModel {
             .any(|record| record.inlay.as_ref().is_some_and(InlayRecord::ticks))
     }
 
-    fn apply_region_styles<V: 'static>(
-        &self,
-        region: Region,
-        changed: &HashSet<StyleClass>,
-        cx: &mut Context<V>,
-    ) {
-        if changed.is_empty() {
-            return;
-        }
-        let records = match region {
-            Region::LiveTurn => &self.records[self.turn_boundary..],
-            _ => &self.records[..self.turn_boundary],
-        };
-        let mut by_class = changed
-            .iter()
-            .map(|class| (*class, Vec::new()))
-            .collect::<HashMap<_, _>>();
-        for record in records {
-            for (class, range) in &record.styles {
-                if let Some(ranges) = by_class.get_mut(class) {
-                    ranges.push(range.clone());
-                }
-            }
-        }
-        apply_class_highlights(
-            &self.editor,
-            &self.multi_buffer,
-            region,
-            by_class
-                .iter()
-                .map(|(class, ranges)| (*class, ranges.as_slice())),
-            cx,
-        );
-    }
-
-    fn refresh_gutters<V: 'static>(&self, cx: &mut Context<V>) {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let ranges = self
-            .records
-            .iter()
-            .filter_map(|record| record.gutter.as_ref())
-            .filter_map(|range| excerpt_range(&snapshot, range))
-            .collect::<Vec<_>>();
-        self.editor.update(cx, |editor, cx| {
-            editor.highlight_gutter::<UserMessageGutter>(
-                ranges,
-                crate::style::user_prompt_gutter_color,
-                cx,
-            );
-        });
-    }
-
-    fn refresh_elisions<V: 'static>(
-        &mut self,
-        state: &UiAgentState,
-        first_changed_block: usize,
-        cx: &mut Context<V>,
-    ) {
+    fn refresh_elision_plans(&mut self, state: &UiAgentState, first_changed_block: usize) {
         let visible = self
             .records
             .iter()
             .map(|record| record.visible)
             .collect::<Vec<_>>();
         let Self {
-            records,
-            elisions,
-            multi_buffer,
-            editor,
-            ..
+            records, elisions, ..
         } = self;
         elisions.refresh(
             &state.blocks,
@@ -398,11 +325,119 @@ impl TranscriptModel {
             &visible,
             crate::store::turn_open(state.status),
             |plan| plan_anchor_range(records, plan),
-            multi_buffer,
-            editor,
-            cx,
         );
     }
+
+    /// Brings every attached editor up to date with the model: changed
+    /// highlight classes reapplied per region, gutters when they moved,
+    /// inlays and display elisions reconciled. Dead attachments prune here.
+    fn apply_to_attachments<V: 'static>(
+        &mut self,
+        now_ms: u64,
+        changed_history: &HashSet<StyleClass>,
+        changed_live: &HashSet<StyleClass>,
+        gutters_changed: bool,
+        cx: &mut Context<V>,
+    ) {
+        if self.attachments.is_empty() {
+            return;
+        }
+        let history_styles = region_styles(&self.records[..self.turn_boundary], changed_history);
+        let live_styles = region_styles(&self.records[self.turn_boundary..], changed_live);
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let gutter_ranges = gutters_changed.then(|| {
+            self.records
+                .iter()
+                .filter_map(|record| record.gutter.as_ref())
+                .filter_map(|range| excerpt_range(&snapshot, range))
+                .collect::<Vec<_>>()
+        });
+        let desired_inlays = self
+            .records
+            .iter()
+            .filter_map(|record| record.inlay.as_ref())
+            .filter_map(|inlay| inlay.desired(now_ms))
+            .collect::<Vec<_>>();
+
+        let Self {
+            multi_buffer,
+            next_inlay_id,
+            attachments,
+            elisions,
+            ..
+        } = self;
+        attachments.retain_mut(|attachment| {
+            let Some(editor) = attachment.editor.upgrade() else {
+                return false;
+            };
+            apply_class_highlights(
+                &editor,
+                multi_buffer,
+                Region::History,
+                history_styles
+                    .iter()
+                    .map(|(class, ranges)| (*class, ranges.as_slice())),
+                cx,
+            );
+            apply_class_highlights(
+                &editor,
+                multi_buffer,
+                Region::LiveTurn,
+                live_styles
+                    .iter()
+                    .map(|(class, ranges)| (*class, ranges.as_slice())),
+                cx,
+            );
+            if let Some(ranges) = &gutter_ranges {
+                editor.update(cx, |editor, cx| {
+                    editor.highlight_gutter::<UserMessageGutter>(
+                        ranges.clone(),
+                        crate::style::user_prompt_gutter_color,
+                        cx,
+                    );
+                });
+            }
+            inlays::reconcile_inlays(
+                &desired_inlays,
+                &mut attachment.inlays,
+                next_inlay_id,
+                multi_buffer,
+                &editor,
+                cx,
+            );
+            elisions.apply(&mut attachment.elisions, multi_buffer, &editor, cx);
+            true
+        });
+    }
+}
+
+/// Every style class appearing in `records` — the "all changed" set for a
+/// full application to a freshly attached editor.
+fn classes_in(records: &[BlockRecord]) -> HashSet<StyleClass> {
+    records
+        .iter()
+        .flat_map(|record| record.styles.iter().map(|(class, _)| *class))
+        .collect()
+}
+
+/// Collects each changed class's full range list for a region; an empty
+/// list clears the class.
+fn region_styles(
+    records: &[BlockRecord],
+    changed: &HashSet<StyleClass>,
+) -> Vec<(StyleClass, Vec<Range<Anchor>>)> {
+    let mut by_class = changed
+        .iter()
+        .map(|class| (*class, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    for record in records {
+        for (class, range) in &record.styles {
+            if let Some(ranges) = by_class.get_mut(class) {
+                ranges.push(range.clone());
+            }
+        }
+    }
+    by_class.into_iter().collect()
 }
 
 /// First record of the live turn: everything after the last user message.

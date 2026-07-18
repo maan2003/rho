@@ -121,8 +121,8 @@ impl AgentView {
             });
         }
 
-        let transcript =
-            TranscriptModel::new(transcript_buffer, multi_buffer.clone(), editor.clone(), cx);
+        let mut transcript = TranscriptModel::new(transcript_buffer, multi_buffer.clone());
+        transcript.attach(&editor, crate::workspace::now_ms(), cx);
         let mut this = Self {
             editor,
             transcript,

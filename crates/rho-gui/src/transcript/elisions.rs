@@ -1,8 +1,11 @@
-//! Applies elision plans to the editor as display elisions.
+//! Applies elision plans to editors as display elisions.
 //!
-//! Plans are cached per turn: a refresh recomputes only from the changed
-//! turn onward, then diffs the resulting specs positionally against the
-//! editor's live display elisions.
+//! Plans and their anchor-resolved specs are model state, cached per turn:
+//! a refresh recomputes only from the changed turn onward. Which display
+//! elisions an editor actually carries is per-attachment [`ElisionState`],
+//! diffed positionally against the model's specs — elision ids live in the
+//! editor's id space, and fold open/closed state stays per-editor (vim's
+//! per-window folds, not emacs' buffer-level invisibility).
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -32,30 +35,31 @@ struct ActiveElision {
     spec: ElisionSpec,
 }
 
+/// One editor's live display elisions, reconciled against the model's specs.
 #[derive(Default)]
-pub struct ElisionSync {
-    plans: Vec<ElisionPlan>,
+pub struct ElisionState {
     active: Vec<ActiveElision>,
 }
 
+#[derive(Default)]
+pub struct ElisionSync {
+    plans: Vec<ElisionPlan>,
+    specs: Vec<ElisionSpec>,
+}
+
 impl ElisionSync {
-    /// Recomputes plans from the changed turn onward and reconciles the
-    /// editor's display elisions with them. `plan_range` resolves a plan to
-    /// its buffer anchor range.
-    #[allow(clippy::too_many_arguments)]
-    pub fn refresh<V: 'static>(
+    /// Recomputes plans and their anchor-resolved specs from the changed
+    /// turn onward. `plan_range` resolves a plan to its buffer anchor range.
+    pub fn refresh(
         &mut self,
         blocks: &[UiBlock],
         first_changed_block: usize,
         visible: &[bool],
         turn_in_progress: bool,
         plan_range: impl Fn(&ElisionPlan) -> Option<Range<Anchor>>,
-        multi_buffer: &Entity<MultiBuffer>,
-        editor: &Entity<Editor>,
-        cx: &mut Context<V>,
     ) {
         self.rebuild_plans(blocks, first_changed_block, visible, turn_in_progress);
-        let specs = self
+        self.specs = self
             .plans
             .iter()
             .filter_map(|plan| {
@@ -65,8 +69,7 @@ impl ElisionSync {
                     tail_rows: plan.tail_rows,
                 })
             })
-            .collect::<Vec<_>>();
-        self.apply(specs, multi_buffer, editor, cx);
+            .collect();
     }
 
     /// Plans depend only on their own turn's blocks, so plans for turns
@@ -117,15 +120,17 @@ impl ElisionSync {
         ));
     }
 
-    fn apply<V: 'static>(
-        &mut self,
-        specs: Vec<ElisionSpec>,
+    /// Reconciles one editor's display elisions with the model's specs.
+    pub fn apply<V: 'static>(
+        &self,
+        state: &mut ElisionState,
         multi_buffer: &Entity<MultiBuffer>,
         editor: &Entity<Editor>,
         cx: &mut Context<V>,
     ) {
+        let specs = self.specs.clone();
         let snapshot = multi_buffer.read(cx).snapshot(cx);
-        let mut removed_ids = self.active[specs.len().min(self.active.len())..]
+        let mut removed_ids = state.active[specs.len().min(state.active.len())..]
             .iter()
             .map(|elision| elision.id)
             .collect::<rustc_hash::FxHashSet<_>>();
@@ -135,7 +140,7 @@ impl ElisionSync {
         let mut next_active = Vec::new();
 
         for (index, spec) in specs.into_iter().enumerate() {
-            let existing = self.active.get(index);
+            let existing = state.active.get(index);
             if let Some(existing) = existing
                 && existing.spec == spec
             {
@@ -167,7 +172,7 @@ impl ElisionSync {
         }
 
         if removed_ids.is_empty() && updates.is_empty() && inserted_properties.is_empty() {
-            self.active = next_active;
+            state.active = next_active;
             return;
         }
 
@@ -186,7 +191,7 @@ impl ElisionSync {
                 .zip(inserted_specs)
                 .map(|(id, spec)| ActiveElision { id, spec }),
         );
-        self.active = next_active;
+        state.active = next_active;
     }
 }
 
