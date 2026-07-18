@@ -113,9 +113,6 @@ pub struct Workspace {
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
     awaiting_draft_agent: bool,
-    /// Topics whose folded tail (filed / stale agents) is expanded in the
-    /// rail.
-    expanded_folds: HashSet<rho_ui_proto::TopicId>,
     connected: bool,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
@@ -169,7 +166,6 @@ impl Workspace {
             draft_topic_id: None,
             default_topic_id: None,
             awaiting_draft_agent: false,
-            expanded_folds: HashSet::new(),
             connected: false,
             duration_timer: None,
             chime: Chime::default(),
@@ -990,13 +986,6 @@ impl Workspace {
         }
     }
 
-    pub fn toggle_topic_fold(&mut self, topic_id: rho_ui_proto::TopicId, cx: &mut Context<Self>) {
-        if !self.expanded_folds.remove(&topic_id) {
-            self.expanded_folds.insert(topic_id);
-        }
-        cx.notify();
-    }
-
     /// Selects an agent, asking the daemon to load it first when this
     /// connection has never seen frames for it.
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
@@ -1741,7 +1730,6 @@ impl Workspace {
             .key_context("RhoRail")
             .child(crate::topic_rail::render_topic_rail(
                 &self.registry,
-                &self.expanded_folds,
                 text_style,
                 cx,
             ))

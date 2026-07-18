@@ -1,19 +1,16 @@
-//! The left rail listing agents grouped by topic.
+//! The left rail listing tasks: one row per topic.
 //!
-//! Topics are ad-hoc tab groups; every topic — including the daemon-created
-//! "default" one that agents are born into — renders uniformly with its
-//! name as the header, which advertises that grouping exists. Pinned topics
-//! and agents sort first; folded agents (filed via `:done hide` or outside
-//! the active bucket) collapse into a per-topic tail row that expands in
-//! place. Clicking an agent opens it (loading folded agents on demand); the
-//! `+` row opens the draft compose view and doubles as its selection
-//! indicator.
-
-use std::collections::HashSet;
+//! A task is the unit of work — every top-level agent founds its own —
+//! so the rail lists tasks, not agents. The row carries the task title,
+//! an attention rollup lamp, and small tags for member agents beyond the
+//! primary one (subagents, joiners). Clicking the row opens the task's
+//! primary agent (switching to the task's own pane arrangement); clicking
+//! a tag opens that member directly. Pinned tasks sort first; the `+` row
+//! opens the draft compose view and doubles as its selection indicator.
 
 use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, TextStyle, div, px};
-use rho_ui_proto::{AgentId, Status, TopicId, UiAgentSummary, UiAttention, UiTopic};
+use rho_ui_proto::{AgentId, Status, UiAgentSummary, UiAttention, UiTopic};
 use theme::ActiveTheme as _;
 use ui::{Color, Icon, IconName, IconSize};
 
@@ -22,15 +19,15 @@ use crate::workspace::Workspace;
 
 pub fn render_topic_rail(
     registry: &AgentRegistry,
-    expanded_folds: &HashSet<TopicId>,
     text_style: &TextStyle,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
-    let (selected_color, border_color, lamps) = {
+    let (selected_color, border_color, tag_background, lamps) = {
         let colors = cx.theme().colors();
         (
             colors.terminal_ansi_magenta.into(),
             colors.border_variant.opacity(0.6),
+            colors.element_background.into(),
             LampColors {
                 needs_input: colors.terminal_ansi_red.into(),
                 pending: colors.terminal_ansi_yellow.into(),
@@ -49,16 +46,13 @@ pub fn render_topic_rail(
     let rows = visible_topics
         .into_iter()
         .map(|topic| {
-            let (agents, folded) = split_agents(topic, registry);
-            render_topic_rows(
+            task_row(
                 topic,
-                agents,
-                folded,
-                expanded_folds.contains(&topic.topic_id),
                 selected_agent.as_ref(),
                 registry,
                 text_style,
                 selected_color,
+                tag_background,
                 lamps,
                 cx,
             )
@@ -99,43 +93,8 @@ pub fn render_topic_rail(
         ))
 }
 
-/// The collapsed tail of a topic: click to expand the folded agents in
-/// place (and again to fold them back).
-fn fold_row(
-    topic_id: TopicId,
-    folded_count: usize,
-    expanded: bool,
-    text_style: &TextStyle,
-    cx: &mut Context<Workspace>,
-) -> Div {
-    div()
-        .w_full()
-        .flex()
-        .items_center()
-        .gap_1()
-        .pl(px(12.))
-        .cursor_pointer()
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _window, cx| {
-                this.toggle_topic_fold(topic_id, cx);
-            }),
-        )
-        .child(
-            Icon::new(IconName::Archive)
-                .size(IconSize::XSmall)
-                .color(Color::Custom(text_style.color.opacity(0.5).into())),
-        )
-        .child(
-            div()
-                .text_color(text_style.color.opacity(0.65))
-                .child(if expanded {
-                    "fold".to_owned()
-                } else {
-                    format!("{folded_count} more")
-                }),
-        )
-}
+/// How many member tags a task row shows before collapsing into `+n`.
+const VISIBLE_TAGS: usize = 4;
 
 #[cfg(test)]
 mod tests {
@@ -322,7 +281,6 @@ mod tests {
             visible,
             [1, 2, 3, 4].map(|id| AgentId::from_counter(id, &AgentIdDomain(0)).unwrap())
         );
-        assert_eq!(registry.topic_agent_depth(&topic, visible[2]), 2);
     }
 }
 
@@ -389,130 +347,157 @@ impl LampColors {
     }
 }
 
+/// One task: title, attention rollup, and member tags. The primary agent
+/// (rail sort: pins, attention, engagement) answers a row click; the
+/// remaining members render as small clickable tags.
 #[allow(clippy::too_many_arguments)]
-fn render_topic_rows<'a>(
-    topic: &'a UiTopic,
-    mut agents: Vec<&'a UiAgentSummary>,
-    folded: Vec<&'a UiAgentSummary>,
-    expanded: bool,
+fn task_row(
+    topic: &UiTopic,
     selected_agent: Option<&AgentId>,
     registry: &AgentRegistry,
     text_style: &TextStyle,
     selected_color: gpui::Hsla,
+    tag_background: gpui::Hsla,
     lamps: LampColors,
     cx: &mut Context<Workspace>,
 ) -> Div {
-    let name = topic.name.clone();
-    let folded_count = folded.len();
-    if expanded {
-        agents = registry.expanded_topic_agents(topic);
-    }
-    let fold = (folded_count > 0)
-        .then(|| fold_row(topic.topic_id, folded_count, expanded, text_style, cx));
-    // Roll the topic's most urgent agent up into the header, so a collapsed
-    // or scrolled-away topic still shows that something inside wants the
-    // user. Working alone doesn't qualify: the header lamp means "act here".
-    let rollup = agents
+    let (agents, _folded) = split_agents(topic, registry);
+    let primary = agents.first().map(|summary| summary.agent_id);
+    let selected = selected_agent
+        .is_some_and(|selected| topic.agent_ids().any(|agent_id| agent_id == *selected));
+    let pinned = topic.status == Status::Pinned;
+    // The row lamp is the most urgent member: acting on the task means
+    // acting on whoever inside it wants the user.
+    let attention = agents
         .iter()
         .map(|summary| registry.attention(summary.agent_id))
         .max()
-        .filter(|attention| *attention >= UiAttention::Pending)
-        .and_then(|attention| lamps.color(attention));
+        .unwrap_or(UiAttention::Quiet);
+    let lamp = lamps.color(attention);
+    let title = if topic.name.trim().is_empty() {
+        primary
+            .map(|agent_id| registry.agent_display_label(agent_id))
+            .unwrap_or_else(|| "task".to_owned())
+    } else {
+        topic.name.clone()
+    };
+    let text_color = if selected {
+        selected_color
+    } else {
+        text_style.color
+    };
+    let icon_color = if selected {
+        selected_color
+    } else if let Some(lamp) = lamp {
+        lamp
+    } else if pinned {
+        text_style.color.opacity(0.9)
+    } else {
+        text_style.color.opacity(0.5)
+    };
+    let members = agents.iter().skip(1).copied().collect::<Vec<_>>();
+    let overflow = members.len().saturating_sub(VISIBLE_TAGS);
+    let tags = members
+        .into_iter()
+        .take(VISIBLE_TAGS)
+        .map(|summary| {
+            member_tag(
+                summary,
+                selected_agent,
+                registry,
+                text_style,
+                selected_color,
+                tag_background,
+                lamps,
+                cx,
+            )
+            .into_any_element()
+        })
+        .chain((overflow > 0).then(|| {
+            div()
+                .text_color(text_style.color.opacity(0.5))
+                .child(format!("+{overflow}"))
+                .into_any_element()
+        }))
+        .collect::<Vec<_>>();
     div()
         .w_full()
         .flex()
-        .flex_col()
-        .gap_0p5()
+        .items_center()
+        .gap_1()
+        .pl(px(4.))
+        .pt(px(2.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                if let Some(agent_id) = primary {
+                    this.open_agent(agent_id, window, cx);
+                }
+            }),
+        )
+        .child(
+            Icon::new(if pinned {
+                IconName::Pin
+            } else {
+                IconName::Circle
+            })
+            .size(IconSize::XSmall)
+            .color(Color::Custom(icon_color.into())),
+        )
         .child(
             div()
-                .w_full()
-                .flex()
-                .items_center()
-                .gap_1()
-                .pt(px(5.))
-                .pl(px(4.))
-                .text_color(text_style.color.opacity(0.65))
-                .child(name)
-                .when(topic.status == Status::Pinned, |this| {
-                    this.child(
-                        Icon::new(IconName::Pin)
-                            .size(IconSize::XSmall)
-                            .color(Color::Custom(text_style.color.opacity(0.65).into())),
-                    )
-                })
-                .when_some(rollup, |this, lamp| {
-                    this.child(
-                        Icon::new(IconName::Circle)
-                            .size(IconSize::XSmall)
-                            .color(Color::Custom(lamp.into())),
-                    )
-                }),
-        )
-        .children(agents.into_iter().map(|summary| {
-            let agent_id = &summary.agent_id;
-            let label = summary
-                .display_name
-                .clone()
-                .unwrap_or_else(|| registry.agent_id_label(summary.agent_id));
-            let selected = selected_agent == Some(agent_id);
-            let depth = registry.topic_agent_depth(topic, summary.agent_id);
-            let pinned = summary.status == Status::Pinned;
-            let attention = registry.attention(summary.agent_id);
-            let lamp = lamps.color(attention);
-            let text_color = if selected {
-                selected_color
-            } else {
-                text_style.color
-            };
-            let icon_color = if selected {
-                selected_color
-            } else if let Some(lamp) = lamp {
-                lamp
-            } else if pinned {
-                text_style.color.opacity(0.9)
-            } else {
-                text_style.color.opacity(0.5)
-            };
-            div()
-                .relative()
-                .w_full()
-                .flex()
-                .items_center()
-                .gap_1()
-                .pl(px(12. + depth as f32 * 14.))
+                .flex_grow(1.0)
+                .min_w_0()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener({
-                        let agent_id = *agent_id;
-                        move |this, _, window, cx| {
-                            this.open_agent(agent_id, window, cx);
-                        }
-                    }),
-                )
-                .child(
-                    Icon::new(if pinned {
-                        IconName::Pin
-                    } else {
-                        IconName::Circle
-                    })
-                    .size(IconSize::XSmall)
-                    .color(Color::Custom(icon_color.into())),
-                )
-                .child(
-                    div()
-                        .flex_grow(1.0)
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_color(text_color)
-                        .when(attention >= UiAttention::Pending, |this| {
-                            this.font_weight(FontWeight::BOLD)
-                        })
-                        .child(label),
-                )
-        }))
-        .children(fold)
+                .text_color(text_color)
+                .when(attention >= UiAttention::Pending, |this| {
+                    this.font_weight(FontWeight::BOLD)
+                })
+                .child(title),
+        )
+        .children(tags)
+}
+
+/// A member agent beyond the primary (subagent, joiner): a small chip on
+/// the task row, lamp-colored when it wants the user. Clicking opens that
+/// member instead of the primary.
+#[allow(clippy::too_many_arguments)]
+fn member_tag(
+    summary: &UiAgentSummary,
+    selected_agent: Option<&AgentId>,
+    registry: &AgentRegistry,
+    text_style: &TextStyle,
+    selected_color: gpui::Hsla,
+    tag_background: gpui::Hsla,
+    lamps: LampColors,
+    cx: &mut Context<Workspace>,
+) -> Div {
+    let agent_id = summary.agent_id;
+    let attention = registry.attention(agent_id);
+    let selected = selected_agent == Some(&agent_id);
+    let color = if selected {
+        selected_color
+    } else if let Some(lamp) = lamps.color(attention) {
+        lamp
+    } else {
+        text_style.color.opacity(0.65)
+    };
+    div()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .bg(tag_background)
+        .text_color(color)
+        .child(registry.agent_id_label(agent_id))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.open_agent(agent_id, window, cx);
+            }),
+        )
 }

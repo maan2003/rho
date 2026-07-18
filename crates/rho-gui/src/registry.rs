@@ -66,7 +66,6 @@ pub struct AgentRegistry {
 struct TopicRailLayout {
     listed: Vec<(AgentId, usize)>,
     folded: Vec<(AgentId, usize)>,
-    expanded: Vec<(AgentId, usize)>,
 }
 
 struct TopicRailState<'a> {
@@ -541,14 +540,6 @@ impl AgentRegistry {
                     .filter(|agent| !state.auto_collapsed(agent.agent_id))
                     .partition(|agent| !state.folded(agent.agent_id));
                 let listed = self.order_topic_agents_with_state(&state, listed);
-                let expanded = self.order_topic_agents_with_state(
-                    &state,
-                    listed
-                        .iter()
-                        .copied()
-                        .chain(folded.iter().copied())
-                        .collect(),
-                );
                 folded.sort_by_key(|agent| Reverse(agent.updated_at));
                 let indexes = topic
                     .agents
@@ -567,7 +558,6 @@ impl AgentRegistry {
                     TopicRailLayout {
                         listed: cache(listed),
                         folded: cache(folded),
-                        expanded: cache(expanded),
                     },
                 )
             })
@@ -610,36 +600,6 @@ impl AgentRegistry {
             Self::resolve_cached_agents(topic, &layout.listed),
             Self::resolve_cached_agents(topic, &layout.folded),
         )
-    }
-
-    pub(crate) fn expanded_topic_agents<'a>(
-        &self,
-        topic: &'a UiTopic,
-    ) -> Vec<&'a rho_ui_proto::UiAgentSummary> {
-        self.topic_rail_layouts
-            .get(&topic.topic_id)
-            .map(|layout| Self::resolve_cached_agents(topic, &layout.expanded))
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn topic_agent_depth(&self, topic: &UiTopic, agent_id: AgentId) -> usize {
-        let mut depth = 0;
-        let mut cursor = agent_id;
-        let mut seen = BTreeSet::new();
-        while seen.insert(cursor) {
-            let Some(parent) = topic
-                .agents
-                .iter()
-                .find(|agent| agent.agent_id == cursor)
-                .and_then(|agent| agent.parent_agent)
-                .filter(|parent| topic.agent_ids().any(|id| id == *parent))
-            else {
-                break;
-            };
-            depth += 1;
-            cursor = parent;
-        }
-        depth
     }
 
     pub fn top_bucket<'a>(
