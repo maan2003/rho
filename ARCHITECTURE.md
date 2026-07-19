@@ -149,39 +149,41 @@ PR client is `rho pr` over the normal daemon socket. The daemon owns platform
 secret installation and fd-store resume, so Octo receives the GitHub token
 only through a RAM-only callback into the sealed platform secret store.
 
-`git-remote-octo` selects transport before executing an operation. Standard
-GitHub remotes use the private Nix-patched `git-remote-http` while a GitHub
-token is configured: fetches and pushes wholly below `refs/heads/rho/*` go
-through Octo's Unix-socket smart-HTTP proxy, which independently enforces that
-ref restriction. A push batch containing any other destination is instead
-performed by `git send-pack` over a raw Git-protocol stream. Without a token,
-or for a non-GitHub SSH host, the helper advertises Git's raw `connect`
-capability from the outset. It never retries an HTTP push after a rejection.
+`git-remote-octo` routes each operation by token availability and destination
+ref. With a GitHub token, standard GitHub fetches and pushes wholly below
+`refs/heads/rho/*` use the private Nix-patched `git-remote-http` through Octo's
+Unix-socket smart-HTTP proxy. A push batch containing any other destination is
+performed by `git send-pack` over a raw Git-protocol stream instead; no HTTP
+push is attempted first. Without a token, or for another SSH host, fetches use
+Git's raw `connect` capability while receive-pack connection attempts fall back
+to the helper's `push` capability. The helper reports local remote-tracking
+refs for `list for-push`, learns the requested destination refs, and sends every
+push through GUI-backed SSH. The inner `git send-pack` performs the authoritative
+remote negotiation.
 
 Every connected native GUI registers as a client-held SSH Git transport
 provider. For each operation the daemon snapshots the live providers and fans
-out the same request. Fetches prompt first; for pushes, the first provider to
-claim the request opens a dedicated GUI stream so it can independently parse
-the actual receive-pack commands before prompting. Every other recipient
+out the same request. Fetch prompts contain the typed destination; push prompts
+also contain the helper's planned destination refs. The first user approval
+claims the request and opens a dedicated GUI stream. Every other recipient
 receives an outcome-neutral `Done` message carrying only the request id. With
 no registered GUI the helper fails immediately, and with no provider claim it
 fails after 60 seconds. There is no mid-operation failover.
 
 The winning GUI launches the user's local OpenSSH for a typed host, user, port,
-repository, and upload-pack/receive-pack service. Fetches are approved before
-OpenSSH starts. Pushes start receive-pack negotiation first, but the GUI does
-not forward any update command until it has independently parsed the bounded
-command list and the user approves the repository and exact ref updates. Thus
-each push has one approval containing its branches, tags, and full old/new
-object ids. Rho injects process-local Git `insteadOf` entries into every agent,
+repository, and upload-pack/receive-pack service. Every operation is approved
+before OpenSSH starts. For pushes, the GUI independently parses the bounded
+receive-pack command list and forwards it only when its destination-ref set
+exactly matches the approved plan; any missing, additional, duplicated, or
+changed destination denies the operation without another prompt. Rho injects
+process-local Git `insteadOf` entries into every agent,
 terminal, and internal workspace-management subprocess. Standard
 `git@github.com:OWNER/REPOSITORY.git` and
 `ssh://git@github.com/OWNER/REPOSITORY.git` remotes then select
 `git-remote-octo` without changing repository or user Git configuration. The
 explicit `octo://[USER@]HOST[:PORT]/REPOSITORY` form remains supported for
-other destinations. A push is not failed over after one GUI claims it,
-including when that GUI later denies because another local prompt is active;
-retrying starts a fresh provider race.
+other destinations. There is no failover after an approved GUI claims an
+operation; retrying starts a fresh provider race.
 
 `rho-pr-monitor` owns long-lived pull-request policy while Octo remains only
 the authenticated GitHub API boundary. Engineers create or adopt PRs through

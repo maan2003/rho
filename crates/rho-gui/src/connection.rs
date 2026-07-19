@@ -3,7 +3,7 @@
 //! [`ConnEvent`]s on a futures channel the workspace awaits (no polling);
 //! outbound commands are fire-and-forget.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -621,28 +621,33 @@ async fn run_git_transport_provider(
     request: GitTransportRequest,
     events: futures_mpsc::UnboundedSender<ConnEvent>,
 ) -> anyhow::Result<()> {
-    validate_git_transport_request(&request)?;
-    if request.service == GitService::UploadPack {
-        let decision = request_git_approval(
-            &events,
-            request_id,
-            format!(
-                "Fetch via SSH from {}@{}:{}/{}? [shift-Y/N]",
-                display_field(&request.user),
-                display_field(&request.host),
-                request.port,
-                display_field(&request.repository),
-            ),
-        )
-        .await?;
-        match decision {
-            GitApprovalDecision::Allow => {}
-            GitApprovalDecision::Deny => {
-                report_git_transport_decision(dialer, request_id, provider_id, false).await?;
-                return Ok(());
-            }
-            GitApprovalDecision::Done => return Ok(()),
+    if let Err(error) = validate_git_transport_request(&request) {
+        report_git_transport_decision(dialer, request_id, provider_id, false).await?;
+        return Err(error);
+    }
+    let prompt = match request.service {
+        GitService::UploadPack => format!(
+            "Fetch via SSH from {}@{}:{}/{}? [shift-Y/N]",
+            display_field(&request.user),
+            display_field(&request.host),
+            request.port,
+            display_field(&request.repository),
+        ),
+        GitService::ReceivePack => git_push_prompt(
+            &request,
+            request
+                .planned_refs
+                .as_deref()
+                .context("SSH Git push is missing its destination ref plan")?,
+        ),
+    };
+    match request_git_approval(&events, request_id, prompt).await? {
+        GitApprovalDecision::Allow => {}
+        GitApprovalDecision::Deny => {
+            report_git_transport_decision(dialer, request_id, provider_id, false).await?;
+            return Ok(());
         }
+        GitApprovalDecision::Done => return Ok(()),
     }
 
     let Some(mut stream) = open_git_transport_provider(dialer, request_id, provider_id).await?
@@ -682,9 +687,14 @@ async fn run_git_transport_provider(
 
     let input = async {
         if request.service == GitService::ReceivePack {
-            copy_approved_receive_pack(&mut transport_read, &mut ssh_stdin, |commands| {
-                request_git_approval(&events, request_id, git_push_prompt(&request, commands))
-            })
+            copy_planned_receive_pack(
+                &mut transport_read,
+                &mut ssh_stdin,
+                request
+                    .planned_refs
+                    .as_deref()
+                    .context("SSH Git push is missing its destination ref plan")?,
+            )
             .await?;
         } else {
             tokio::io::copy(&mut transport_read, &mut ssh_stdin).await?;
@@ -720,21 +730,19 @@ async fn run_git_transport_provider(
     Ok(())
 }
 
-async fn copy_approved_receive_pack<R, W, A, F>(
+async fn copy_planned_receive_pack<R, W>(
     reader: &mut R,
     writer: &mut W,
-    approve: A,
+    planned_refs: &[String],
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
-    A: FnOnce(&octo_types::ReceivePackCommands) -> F,
-    F: std::future::Future<Output = anyhow::Result<GitApprovalDecision>>,
 {
     let (prefix, commands) = read_receive_pack_prefix(reader).await?;
     anyhow::ensure!(
-        approve(&commands).await? == GitApprovalDecision::Allow,
-        "Git ref update denied by the GUI user"
+        receive_pack_refs_match(planned_refs, &commands),
+        "Git receive-pack destination refs differ from the approved plan"
     );
     writer.write_all(&prefix).await?;
     tokio::io::copy(reader, writer).await?;
@@ -742,10 +750,26 @@ where
     Ok(())
 }
 
-fn git_push_prompt(
-    request: &GitTransportRequest,
+fn receive_pack_refs_match(
+    planned_refs: &[String],
     commands: &octo_types::ReceivePackCommands,
-) -> String {
+) -> bool {
+    if planned_refs.len() != commands.updates.len() {
+        return false;
+    }
+    let planned = planned_refs
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let actual = commands
+        .updates
+        .iter()
+        .map(|update| update.reference.as_str())
+        .collect::<BTreeSet<_>>();
+    planned.len() == planned_refs.len() && planned == actual
+}
+
+fn git_push_prompt(request: &GitTransportRequest, planned_refs: &[String]) -> String {
     let destination = format!(
         "ssh://{}@{}:{}/{}",
         display_field(&request.user),
@@ -754,33 +778,18 @@ fn git_push_prompt(
         display_field(&request.repository)
     );
     let mut prompt = format!("Push via SSH to {destination}:");
-    for update in &commands.updates {
+    for reference in planned_refs {
         use std::fmt::Write as _;
-        let old_zero = update.old.bytes().all(|byte| byte == b'0');
-        let new_zero = update.new.bytes().all(|byte| byte == b'0');
-        let action = if old_zero {
-            "create"
-        } else if new_zero {
-            "delete"
-        } else {
-            "update"
-        };
-        let reference = update
-            .reference
+        let reference = reference
             .strip_prefix("refs/heads/")
             .map(|name| format!("branch {name}"))
             .or_else(|| {
-                update
-                    .reference
+                reference
                     .strip_prefix("refs/tags/")
                     .map(|name| format!("tag {name}"))
             })
-            .unwrap_or_else(|| update.reference.clone());
-        let _ = write!(
-            prompt,
-            "\n  {action} {reference}\n    {} -> {}",
-            update.old, update.new
-        );
+            .unwrap_or_else(|| reference.clone());
+        let _ = write!(prompt, "\n  {reference}");
     }
     prompt.push_str("\nApprove? [shift-Y/N]");
     prompt
@@ -886,6 +895,28 @@ fn validate_git_transport_request(request: &GitTransportRequest) -> anyhow::Resu
             }),
         "invalid SSH Git repository path"
     );
+    match (&request.service, &request.planned_refs) {
+        (GitService::UploadPack, None) => {}
+        (GitService::ReceivePack, Some(planned_refs)) => {
+            anyhow::ensure!(
+                !planned_refs.is_empty(),
+                "SSH Git push has an empty ref plan"
+            );
+            anyhow::ensure!(
+                planned_refs.iter().map(String::len).sum::<usize>()
+                    <= octo_types::MAX_RECEIVE_PACK_COMMAND_BYTES,
+                "SSH Git push ref plan is too large"
+            );
+            let mut unique = HashSet::new();
+            anyhow::ensure!(
+                planned_refs.iter().all(|reference| {
+                    octo_types::valid_git_ref(reference) && unique.insert(reference)
+                }),
+                "SSH Git push ref plan is invalid"
+            );
+        }
+        _ => anyhow::bail!("SSH Git transport has an invalid ref plan"),
+    }
     Ok(())
 }
 
@@ -1152,8 +1183,8 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
-        AgentFrameAllocationBudget, GitApprovalDecision, copy_approved_receive_pack, display_field,
-        git_push_prompt, validate_git_transport_request,
+        AgentFrameAllocationBudget, copy_planned_receive_pack, display_field, git_push_prompt,
+        receive_pack_refs_match, validate_git_transport_request,
     };
 
     fn receive_pack_input(reference: &str, old: &str, new: &str, tail: &[u8]) -> Vec<u8> {
@@ -1172,6 +1203,7 @@ mod tests {
             user: "git".to_owned(),
             repository: "team/repo.git".to_owned(),
             service: GitService::ReceivePack,
+            planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
         assert!(validate_git_transport_request(&valid).is_ok());
         for repository in ["../repo", "-oProxyCommand=bad", "team//repo"] {
@@ -1179,6 +1211,24 @@ mod tests {
             request.repository = repository.to_owned();
             assert!(validate_git_transport_request(&request).is_err());
         }
+        for planned_refs in [
+            None,
+            Some(Vec::new()),
+            Some(vec![
+                "refs/heads/main".to_owned(),
+                "refs/heads/main".to_owned(),
+            ]),
+            Some(vec!["refs/heads/../main".to_owned()]),
+        ] {
+            let mut request = valid.clone();
+            request.planned_refs = planned_refs;
+            assert!(validate_git_transport_request(&request).is_err());
+        }
+        let mut fetch = valid;
+        fetch.service = GitService::UploadPack;
+        assert!(validate_git_transport_request(&fetch).is_err());
+        fetch.planned_refs = None;
+        assert!(validate_git_transport_request(&fetch).is_ok());
     }
 
     #[test]
@@ -1187,60 +1237,60 @@ mod tests {
     }
 
     #[test]
-    fn push_prompt_names_ref_kinds_and_keeps_full_destination_and_ids() {
+    fn push_prompt_names_destination_refs() {
         let request = GitTransportRequest {
             host: "github.com".to_owned(),
             port: 2222,
             user: "git".to_owned(),
             repository: "acme/repo.git".to_owned(),
             service: GitService::ReceivePack,
+            planned_refs: Some(vec![
+                "refs/heads/main".to_owned(),
+                "refs/tags/v1".to_owned(),
+                "refs/heads/rho/test".to_owned(),
+                "refs/notes/review".to_owned(),
+            ]),
         };
-        let old = "1".repeat(40);
-        let new = "2".repeat(40);
-        let old_sha256 = "3".repeat(64);
-        let new_sha256 = "4".repeat(64);
-        let commands = ReceivePackCommands {
-            end: 0,
-            updates: vec![
-                RefUpdate {
-                    old: old.clone(),
-                    new: new.clone(),
-                    reference: "refs/heads/main".to_owned(),
-                },
-                RefUpdate {
-                    old: "0".repeat(40),
-                    new: new.clone(),
-                    reference: "refs/tags/v1".to_owned(),
-                },
-                RefUpdate {
-                    old: old_sha256.clone(),
-                    new: "0".repeat(64),
-                    reference: "refs/heads/rho/test".to_owned(),
-                },
-                RefUpdate {
-                    old: old_sha256.clone(),
-                    new: new_sha256.clone(),
-                    reference: "refs/notes/review".to_owned(),
-                },
-            ],
-        };
-        let prompt = git_push_prompt(&request, &commands);
+        let prompt = git_push_prompt(&request, request.planned_refs.as_deref().unwrap());
         assert!(prompt.contains("ssh://git@github.com:2222/acme/repo.git"));
-        assert!(prompt.contains("update branch main"));
-        assert!(prompt.contains("create tag v1"));
-        assert!(prompt.contains("delete branch rho/test"));
-        assert!(prompt.contains("update refs/notes/review"));
-        assert!(prompt.contains(&old));
-        assert!(prompt.contains(&new));
-        assert!(prompt.contains(&old_sha256));
-        assert!(prompt.contains(&new_sha256));
+        assert!(prompt.contains("branch main"));
+        assert!(prompt.contains("tag v1"));
+        assert!(prompt.contains("branch rho/test"));
+        assert!(prompt.contains("refs/notes/review"));
         assert!(prompt.ends_with("Approve? [shift-Y/N]"));
     }
 
     #[test]
-    fn receive_pack_writes_nothing_before_approval() {
+    fn receive_pack_plan_comparison_ignores_order_and_object_ids() {
+        let commands = ReceivePackCommands {
+            end: 0,
+            updates: vec![
+                RefUpdate {
+                    old: "1".repeat(40),
+                    new: "2".repeat(40),
+                    reference: "refs/tags/v1".to_owned(),
+                },
+                RefUpdate {
+                    old: "3".repeat(40),
+                    new: "4".repeat(40),
+                    reference: "refs/heads/main".to_owned(),
+                },
+            ],
+        };
+        assert!(receive_pack_refs_match(
+            &["refs/heads/main".to_owned(), "refs/tags/v1".to_owned()],
+            &commands
+        ));
+        assert!(!receive_pack_refs_match(
+            &["refs/heads/main".to_owned()],
+            &commands
+        ));
+    }
+
+    #[test]
+    fn matching_receive_pack_plan_forwards_exact_bytes() {
         tokio::runtime::Builder::new_current_thread()
-            .enable_time()
+            .enable_all()
             .build()
             .unwrap()
             .block_on(async {
@@ -1251,24 +1301,14 @@ mod tests {
                 let (mut ssh, mut remote) = tokio::io::duplex(4096);
                 client.write_all(&input).await.unwrap();
                 client.shutdown().await.unwrap();
-                let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
                 let copy = tokio::spawn(async move {
-                    copy_approved_receive_pack(&mut transport, &mut ssh, |_| async move {
-                        Ok(decision_rx.await.unwrap())
-                    })
-                    .await
-                });
-
-                let mut byte = [0];
-                assert!(
-                    tokio::time::timeout(
-                        std::time::Duration::from_millis(20),
-                        remote.read_exact(&mut byte)
+                    copy_planned_receive_pack(
+                        &mut transport,
+                        &mut ssh,
+                        &["refs/heads/main".to_owned()],
                     )
                     .await
-                    .is_err()
-                );
-                decision_tx.send(GitApprovalDecision::Allow).unwrap();
+                });
                 let mut received = Vec::new();
                 remote.read_to_end(&mut received).await.unwrap();
                 copy.await.unwrap().unwrap();
@@ -1277,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn denied_receive_pack_writes_nothing() {
+    fn mismatched_receive_pack_plan_writes_nothing() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1293,9 +1333,11 @@ mod tests {
                 let (mut ssh, mut remote) = tokio::io::duplex(4096);
                 client.write_all(&input).await.unwrap();
                 client.shutdown().await.unwrap();
-                let result = copy_approved_receive_pack(&mut transport, &mut ssh, |_| async {
-                    Ok(GitApprovalDecision::Deny)
-                })
+                let result = copy_planned_receive_pack(
+                    &mut transport,
+                    &mut ssh,
+                    &["refs/heads/main".to_owned()],
+                )
                 .await;
                 assert!(result.is_err());
                 drop(ssh);
@@ -1316,9 +1358,11 @@ mod tests {
                 let (mut ssh, mut remote) = tokio::io::duplex(64);
                 client.write_all(b"0003").await.unwrap();
                 client.shutdown().await.unwrap();
-                let result = copy_approved_receive_pack(&mut transport, &mut ssh, |_| async {
-                    Ok(GitApprovalDecision::Allow)
-                })
+                let result = copy_planned_receive_pack(
+                    &mut transport,
+                    &mut ssh,
+                    &["refs/heads/main".to_owned()],
+                )
                 .await;
                 assert!(result.is_err());
                 drop(ssh);

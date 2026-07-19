@@ -99,32 +99,31 @@ AI APIs.
   HTTP token source. It has no token argv/env/file/admin import path in Rho.
   Token-backed fetches are limited to standard GitHub remotes; receive-pack
   independently rejects every update outside `refs/heads/rho/*`. The helper
-  pre-routes any push batch containing another destination to client SSH and
-  never retries an HTTP rejection. When switching after an authenticated ref
-  listing, forced updates and deletions carry exact `--force-with-lease`
-  expectations so the second advertisement cannot widen the requested update.
+  routes any push batch containing another destination to client SSH and never
+  retries an HTTP rejection. Without a token, its push listing is synthesized
+  from at most 4,096 local remote-tracking refs and every push uses client SSH;
+  destination plans are capped at 64 KiB. Remote-helper `cas` options and
+  forced updates carry exact `--force-with-lease` expectations into the inner
+  `git send-pack`, including expect-absent leases; when no observed old ref is
+  available the routed path does not turn the update into an unconditional
+  force.
   The token's actual fine-grained GitHub
   permissions still determine its authority and must be audited when setup
   guidance changes.
 - SSH Git credentials stay on native GUI machines. Every native GUI
   automatically registers its connection as a provider. Requests expose the
-  typed destination and repository to all registered GUIs. Fetches use the
-  first approval; pushes use the first provider claim so the selected GUI can
-  independently parse the receive-pack command list before asking for one
-  approval. Every other recipient receives only an opaque `Done` for that
+  typed destination and repository to all registered GUIs; push requests also
+  expose a bounded, validated destination-ref plan. The first user approval
+  claims the credential-provider role. Every other recipient receives only an opaque `Done` for that
   request id, revealing neither winner nor outcome. With no provider the daemon
   rejects immediately; after 60 seconds without a claim it rejects the
   request. A winning GUI validates bounded typed
-  host/user/port/repository/service fields. It asks before starting OpenSSH for
-  fetches. For pushes it starts OpenSSH and receives the ref advertisement
-  before approval, but forwards no receive-pack update command until the user
-  approves the full typed destination and parsed branch, tag, or other ref
-  updates with full old/new object ids. No client-to-OpenSSH bytes are sent
-  before that approval; only the server's advertisement is relayed to the Git
-  client. Starting SSH, invoking configured SSH helpers such as `ProxyCommand`,
-  authenticating, and exposing the remote ref advertisement before approval
-  are necessary to learn the exact command list. Both provider claim and the
-  final user approval have 60-second deadlines. Ref names,
+  host/user/port/repository/service fields and destination refs. It asks before
+  starting OpenSSH. For pushes it independently parses the actual bounded
+  receive-pack command list and requires its destination-ref set to exactly
+  match the approved plan. Any missing, additional, duplicated, or changed ref
+  fails closed without a second prompt or any client-to-OpenSSH bytes. The
+  approval and provider claim are one operation with a 60-second deadline. Ref names,
   repository fields, and prompts use a conservative character set and prompt
   text replaces control and bidirectional formatting characters. Push options,
   signed pushes, unknown framing, and unsupported object-id sizes fail closed.
@@ -135,8 +134,7 @@ AI APIs.
   fetch and `rho/*` push remain
   available without a GUI. At most eight requests wait in the daemon
   and each GUI runs one SSH transport at a time. A push is not failed over
-  after a GUI claims it, even if that GUI later
-  denies because another local prompt is active; retrying starts a new race.
+  after an approved GUI claims it; retrying starts a new race.
   Streams are backpressured, SSH diagnostics are capped at 64 KiB, and
   cancellation or disconnect drops
   the stream and kills the GUI-owned OpenSSH child. OpenSSH config and host-key

@@ -98,11 +98,11 @@ pub fn parse_receive_pack_commands(input: &[u8]) -> Result<Option<ReceivePackCom
     }
 }
 
-fn valid_object_id(value: &str) -> bool {
+pub fn valid_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn valid_git_ref(reference: &str) -> bool {
+pub fn valid_git_ref(reference: &str) -> bool {
     let Some(suffix) = reference.strip_prefix("refs/") else {
         return false;
     };

@@ -273,8 +273,8 @@ pub enum ClientMessage {
     GitTransportProvide {
         request_id: u64,
         provider_id: u64,
-        /// Whether this GUI claims the transport. This selects the credential
-        /// provider; push authorization happens later in the selected GUI.
+        /// Whether this GUI claims the transport after approving the operation.
+        /// The first claim selects the credential provider.
         claim: bool,
     },
     /// One-shot query on a fresh local stream used by the remote helper to
@@ -297,6 +297,9 @@ pub struct GitTransportRequest {
     pub user: String,
     pub repository: String,
     pub service: GitService,
+    /// Destination refs authorized by the first GUI approval for a push.
+    /// Fetches carry `None`.
+    pub planned_refs: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -988,6 +991,7 @@ mod tests {
             user: "deploy".to_owned(),
             repository: "team/repo.git".to_owned(),
             service: GitService::ReceivePack,
+            planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
         for message in [
             ClientMessage::GitTransportRegister,

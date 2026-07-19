@@ -2973,6 +2973,7 @@ mod tests {
             user: "git".to_owned(),
             repository: "team/repo.git".to_owned(),
             service: rho_ui_proto::GitService::ReceivePack,
+            planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
         let waiting = {
             let broker = broker.clone();
@@ -3032,6 +3033,7 @@ mod tests {
                 user: "git".to_owned(),
                 repository: "team/repo.git".to_owned(),
                 service: rho_ui_proto::GitService::UploadPack,
+                planned_refs: None,
             })
             .await;
         let error = match result {
@@ -3057,6 +3059,7 @@ mod tests {
                             user: "git".to_owned(),
                             repository: "team/repo.git".to_owned(),
                             service: rho_ui_proto::GitService::UploadPack,
+                            planned_refs: None,
                         },
                         std::time::Duration::from_millis(10),
                     )

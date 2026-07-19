@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::io::{BufRead as _, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -24,7 +24,7 @@ fn main() -> Result<()> {
     if pat_available {
         run_http_helper(&remote_name, &remote)
     } else {
-        run_raw_remote_helper(remote.request)
+        run_raw_remote_helper(&remote_name, remote)
     }
 }
 
@@ -75,10 +75,21 @@ async fn query_pat_available(host: &str) -> Result<bool> {
     }
 }
 
-fn run_raw_remote_helper(mut request: GitTransportRequest) -> Result<()> {
+fn run_raw_remote_helper(remote_name: &str, mut remote: Remote) -> Result<()> {
     let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
     let mut stdout = std::io::stdout();
+    run_raw_remote_helper_io(remote_name, &mut remote, stdin.lock(), &mut stdout)
+}
+
+fn run_raw_remote_helper_io(
+    remote_name: &str,
+    remote: &mut Remote,
+    input: impl BufRead,
+    output: &mut impl Write,
+) -> Result<()> {
+    let mut lines = input.lines();
+    let mut remote_refs = HashMap::new();
+    let mut options = PushOptions::default();
     loop {
         let command = lines
             .next()
@@ -86,27 +97,69 @@ fn run_raw_remote_helper(mut request: GitTransportRequest) -> Result<()> {
             .context("Git closed the remote-helper control channel")?;
         match command.as_str() {
             "capabilities" => {
-                writeln!(stdout, "connect")?;
-                writeln!(stdout)?;
-                stdout.flush()?;
+                writeln!(output, "connect")?;
+                writeln!(output, "push")?;
+                writeln!(output, "option")?;
+                writeln!(output)?;
+                output.flush()?;
             }
             "connect git-upload-pack" => {
-                request.service = GitService::UploadPack;
-                break;
+                remote.request.service = GitService::UploadPack;
+                drop(lines);
+                return runtime()?.block_on(run_transport(remote.request.clone(), true));
             }
             "connect git-receive-pack" => {
-                request.service = GitService::ReceivePack;
-                break;
+                writeln!(output, "fallback")?;
+                output.flush()?;
+            }
+            "list for-push" => {
+                remote_refs = local_remote_refs(remote_name)?;
+                let mut refs = remote_refs.iter().collect::<Vec<_>>();
+                refs.sort_by_key(|(reference, _)| *reference);
+                for (reference, object_id) in refs {
+                    writeln!(output, "{object_id} {reference}")?;
+                }
+                writeln!(output)?;
+                output.flush()?;
+            }
+            command if command.starts_with("option ") => {
+                let accepted = raw_push_option_supported(command);
+                options.record(command, accepted)?;
+                writeln!(output, "{}", if accepted { "ok" } else { "unsupported" })?;
+                output.flush()?;
+            }
+            command if command.starts_with("push ") => {
+                let batch = collect_batch(command.to_owned(), &mut lines)?;
+                let (pushes, has_protocol_options) = parse_push_batch(&batch)?;
+                return run_ssh_send_pack(
+                    remote,
+                    &pushes,
+                    &options,
+                    has_protocol_options,
+                    &remote_refs,
+                    output,
+                );
             }
             "" => return Ok(()),
             _ => anyhow::bail!("unsupported Git remote-helper command: {command}"),
         }
     }
-    drop(lines);
-    runtime()?.block_on(run_transport(request, true))
+}
+
+fn raw_push_option_supported(command: &str) -> bool {
+    let Some(option) = command.strip_prefix("option ") else {
+        return false;
+    };
+    let (name, value) = option.split_once(' ').unwrap_or((option, ""));
+    matches!(
+        name,
+        "dry-run" | "force" | "atomic" | "progress" | "verbosity" | "cas"
+    ) || (name == "pushcert" && value == "false")
 }
 
 fn run_bridge() -> Result<()> {
+    let planned_refs = std::env::var("RHO_GIT_REFS").context("RHO_GIT_REFS is missing")?;
+    let planned_refs = parse_planned_refs(&planned_refs)?;
     let request = GitTransportRequest {
         host: std::env::var("RHO_GIT_HOST").context("RHO_GIT_HOST is missing")?,
         port: std::env::var("RHO_GIT_PORT")
@@ -116,8 +169,29 @@ fn run_bridge() -> Result<()> {
         user: std::env::var("RHO_GIT_USER").context("RHO_GIT_USER is missing")?,
         repository: std::env::var("RHO_GIT_REPOSITORY").context("RHO_GIT_REPOSITORY is missing")?,
         service: GitService::ReceivePack,
+        planned_refs: Some(planned_refs),
     };
     runtime()?.block_on(run_transport(request, false))
+}
+
+fn parse_planned_refs(value: &str) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        value.len() <= octo_types::MAX_RECEIVE_PACK_COMMAND_BYTES,
+        "planned Git ref list is too large"
+    );
+    let planned_refs = value.lines().map(str::to_owned).collect::<Vec<_>>();
+    anyhow::ensure!(!planned_refs.is_empty(), "planned Git ref list is empty");
+    anyhow::ensure!(
+        planned_refs
+            .iter()
+            .all(|reference| octo_types::valid_git_ref(reference)),
+        "planned Git ref list is invalid"
+    );
+    anyhow::ensure!(
+        planned_refs.iter().collect::<HashSet<_>>().len() == planned_refs.len(),
+        "planned Git ref list contains duplicates"
+    );
+    Ok(planned_refs)
 }
 
 async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> Result<()> {
@@ -301,15 +375,16 @@ struct PushOptions {
     pushcert: Option<String>,
     push_options: Vec<String>,
     service_path: Option<String>,
+    force_with_lease: HashMap<String, String>,
 }
 
 impl PushOptions {
-    fn record(&mut self, command: &str, accepted: bool) {
+    fn record(&mut self, command: &str, accepted: bool) -> Result<()> {
         if !accepted {
-            return;
+            return Ok(());
         }
         let Some(rest) = command.strip_prefix("option ") else {
-            return;
+            return Ok(());
         };
         let (name, value) = rest.split_once(' ').unwrap_or((rest, ""));
         match name {
@@ -321,8 +396,25 @@ impl PushOptions {
             "pushcert" => self.pushcert = Some(value.to_owned()),
             "push-option" => self.push_options.push(value.to_owned()),
             "servpath" => self.service_path = Some(value.to_owned()),
+            "cas" => {
+                let (reference, expected) = value
+                    .split_once(':')
+                    .context("invalid force-with-lease option")?;
+                anyhow::ensure!(
+                    octo_types::valid_git_ref(reference)
+                        && (expected.is_empty() || octo_types::valid_object_id(expected)),
+                    "invalid force-with-lease option"
+                );
+                anyhow::ensure!(
+                    self.force_with_lease
+                        .insert(reference.to_owned(), expected.to_owned())
+                        .is_none(),
+                    "duplicate force-with-lease option"
+                );
+            }
             _ => {}
         }
+        Ok(())
     }
 }
 
@@ -362,7 +454,7 @@ fn run_http_helper(remote_name: &str, remote: &Remote) -> Result<()> {
         if command.starts_with("option ") {
             helper.send_line(&command)?;
             let response = helper.read_line()?;
-            options.record(&command, response == "ok");
+            options.record(&command, response == "ok")?;
             writeln!(stdout, "{response}")?;
             stdout.flush()?;
             continue;
@@ -436,6 +528,53 @@ struct PushCommand {
     destination: String,
 }
 
+fn local_remote_refs(remote_name: &str) -> Result<HashMap<String, String>> {
+    const MAX_LOCAL_REMOTE_REFS: usize = 4096;
+    let prefix = format!("refs/remotes/{remote_name}/");
+    if !octo_types::valid_git_ref(&format!("{prefix}probe")) {
+        return Ok(HashMap::new());
+    }
+    let output = Command::new("git")
+        .args([
+            "for-each-ref",
+            &format!("--count={}", MAX_LOCAL_REMOTE_REFS + 1),
+            "--format=%(objectname) %(refname)",
+            &prefix,
+        ])
+        .output()
+        .context("read local remote-tracking refs")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "read local remote-tracking refs: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let output =
+        std::str::from_utf8(&output.stdout).context("local remote-tracking refs are not UTF-8")?;
+    anyhow::ensure!(
+        output.lines().count() <= MAX_LOCAL_REMOTE_REFS,
+        "too many local remote-tracking refs"
+    );
+    let mut refs = HashMap::new();
+    for line in output.lines() {
+        let (object_id, reference) = line
+            .split_once(' ')
+            .context("invalid local remote-tracking ref")?;
+        let suffix = reference
+            .strip_prefix(&prefix)
+            .context("local remote-tracking ref escaped its namespace")?;
+        if suffix == "HEAD" {
+            continue;
+        }
+        let destination = format!("refs/heads/{suffix}");
+        anyhow::ensure!(
+            octo_types::valid_object_id(object_id) && octo_types::valid_git_ref(&destination),
+            "invalid local remote-tracking ref"
+        );
+        refs.insert(destination, object_id.to_owned());
+    }
+    Ok(refs)
+}
+
 fn pushes_use_http(pushes: &[PushCommand]) -> bool {
     !pushes.is_empty()
         && pushes
@@ -445,23 +584,39 @@ fn pushes_use_http(pushes: &[PushCommand]) -> bool {
 
 fn force_leases(
     pushes: &[PushCommand],
-    force_all: bool,
+    options: &PushOptions,
     remote_refs: &HashMap<String, String>,
-) -> Vec<String> {
-    pushes
+) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        options
+            .force_with_lease
+            .keys()
+            .all(|reference| pushes.iter().any(|push| &push.destination == reference)),
+        "force-with-lease names a ref outside the push batch"
+    );
+    Ok(pushes
         .iter()
         .filter_map(|push| {
+            if let Some(expected) = options.force_with_lease.get(&push.destination) {
+                return Some(format!(
+                    "--force-with-lease={}:{}",
+                    push.destination, expected
+                ));
+            }
             let refspec = push.refspec.strip_prefix('+').unwrap_or(&push.refspec);
             let source = refspec
                 .split_once(':')
                 .map(|(source, _)| source)
                 .unwrap_or("");
-            (force_all || push.refspec.starts_with('+') || source.is_empty())
-                .then(|| remote_refs.get(&push.destination))
-                .flatten()
-                .map(|old| format!("--force-with-lease={}:{}", push.destination, old))
+            (options.force || push.refspec.starts_with('+') || source.is_empty()).then(|| {
+                let expected = remote_refs
+                    .get(&push.destination)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                format!("--force-with-lease={}:{}", push.destination, expected)
+            })
         })
-        .collect()
+        .collect())
 }
 
 fn send_pack_refspecs(pushes: &[PushCommand], force_all: bool) -> Vec<&str> {
@@ -479,6 +634,7 @@ fn send_pack_refspecs(pushes: &[PushCommand], force_all: bool) -> Vec<&str> {
 
 fn parse_push_batch(batch: &[String]) -> Result<(Vec<PushCommand>, bool)> {
     let mut pushes = Vec::new();
+    let mut destinations = HashSet::new();
     let mut has_protocol_options = false;
     for command in batch {
         let Some(refspec) = command.strip_prefix("push ") else {
@@ -490,8 +646,12 @@ fn parse_push_batch(batch: &[String]) -> Result<(Vec<PushCommand>, bool)> {
             .split_once(':')
             .context("invalid remote-helper push refspec")?;
         anyhow::ensure!(
-            destination.starts_with("refs/"),
-            "push destination is not a fully qualified ref"
+            octo_types::valid_git_ref(destination),
+            "invalid push destination ref"
+        );
+        anyhow::ensure!(
+            destinations.insert(destination.to_owned()),
+            "duplicate push destination ref"
         );
         pushes.push(PushCommand {
             refspec: refspec.to_owned(),
@@ -499,6 +659,13 @@ fn parse_push_batch(batch: &[String]) -> Result<(Vec<PushCommand>, bool)> {
         });
     }
     anyhow::ensure!(!pushes.is_empty(), "empty remote-helper push batch");
+    let plan_len = pushes.iter().try_fold(0_usize, |length, push| {
+        length.checked_add(push.destination.len() + 1)
+    });
+    anyhow::ensure!(
+        plan_len.is_some_and(|length| length <= octo_types::MAX_RECEIVE_PACK_COMMAND_BYTES),
+        "planned Git ref list is too large"
+    );
     Ok((pushes, has_protocol_options))
 }
 
@@ -553,7 +720,7 @@ fn run_ssh_send_pack(
     for _ in 1..options.verbosity {
         command.arg("--verbose");
     }
-    command.args(force_leases(pushes, options.force, remote_refs));
+    command.args(force_leases(pushes, options, remote_refs)?);
     command
         .arg(".")
         .args(send_pack_refspecs(pushes, options.force))
@@ -561,6 +728,14 @@ fn run_ssh_send_pack(
         .env("RHO_GIT_PORT", remote.request.port.to_string())
         .env("RHO_GIT_USER", &remote.request.user)
         .env("RHO_GIT_REPOSITORY", &remote.request.repository)
+        .env(
+            "RHO_GIT_REFS",
+            pushes
+                .iter()
+                .map(|push| push.destination.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
@@ -625,6 +800,7 @@ fn parse_remote(value: &str) -> Result<Remote> {
             user: user.to_owned(),
             repository: repository.to_owned(),
             service: GitService::UploadPack,
+            planned_refs: None,
         },
     })
 }
@@ -715,6 +891,68 @@ mod tests {
         .unwrap();
         assert!(options);
         assert!(!pushes_use_http(&mixed));
+
+        for invalid in [
+            vec![
+                "push HEAD:refs/heads/main".to_owned(),
+                "push HEAD:refs/heads/main".to_owned(),
+            ],
+            vec!["push HEAD:refs/heads/../main".to_owned()],
+        ] {
+            assert!(parse_push_batch(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_only_send_pack_options_the_routed_path_preserves() {
+        for command in [
+            "option dry-run true",
+            "option force true",
+            "option atomic true",
+            "option progress false",
+            "option verbosity 2",
+            "option pushcert false",
+            "option cas refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "option cas refs/heads/new:",
+        ] {
+            assert!(raw_push_option_supported(command), "rejected {command}");
+        }
+        for command in [
+            "option pushcert true",
+            "option push-option ci.skip",
+            "option servpath git-receive-pack",
+        ] {
+            assert!(!raw_push_option_supported(command), "accepted {command}");
+        }
+    }
+
+    #[test]
+    fn no_pat_receive_pack_falls_back_to_plannable_push_protocol() {
+        let mut remote = parse_remote("octo://github.com/acme/library.git").unwrap();
+        let input = b"capabilities\nconnect git-receive-pack\nlist for-push\n\n";
+        let mut output = Vec::new();
+        run_raw_remote_helper_io(
+            "octo://github.com/acme/library.git",
+            &mut remote,
+            &input[..],
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "connect\npush\noption\n\nfallback\n\n"
+        );
+    }
+
+    #[test]
+    fn validates_destination_plan_crossing_the_send_pack_bridge() {
+        assert_eq!(
+            parse_planned_refs("refs/heads/main\nrefs/tags/v1").unwrap(),
+            ["refs/heads/main", "refs/tags/v1"]
+        );
+        for invalid in ["", "refs/heads/main\nrefs/heads/main", "refs/heads/../main"] {
+            assert!(parse_planned_refs(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]
@@ -723,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_updates_and_deletions_preserve_observed_old_ids() {
+    fn forced_updates_and_deletions_preserve_exact_expectations() {
         let (pushes, _) = parse_push_batch(&[
             "push +HEAD:refs/heads/main".to_owned(),
             "push :refs/heads/old".to_owned(),
@@ -733,14 +971,13 @@ mod tests {
         let old = "a".repeat(40);
         let refs = HashMap::from([
             ("refs/heads/main".to_owned(), old.clone()),
-            ("refs/heads/old".to_owned(), old.clone()),
             ("refs/heads/new".to_owned(), old.clone()),
         ]);
         assert_eq!(
-            force_leases(&pushes, false, &refs),
+            force_leases(&pushes, &PushOptions::default(), &refs).unwrap(),
             vec![
                 format!("--force-with-lease=refs/heads/main:{old}"),
-                format!("--force-with-lease=refs/heads/old:{old}"),
+                "--force-with-lease=refs/heads/old:".to_owned(),
             ]
         );
         assert_eq!(
@@ -749,6 +986,28 @@ mod tests {
                 "HEAD:refs/heads/main",
                 ":refs/heads/old",
                 "HEAD:refs/heads/new"
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_force_with_lease_options_survive_transport_selection() {
+        let (pushes, _) = parse_push_batch(&[
+            "push HEAD:refs/heads/main".to_owned(),
+            "push HEAD:refs/heads/new".to_owned(),
+        ])
+        .unwrap();
+        let expected = "a".repeat(40);
+        let mut options = PushOptions::default();
+        options
+            .record(&format!("option cas refs/heads/main:{expected}"), true)
+            .unwrap();
+        options.record("option cas refs/heads/new:", true).unwrap();
+        assert_eq!(
+            force_leases(&pushes, &options, &HashMap::new()).unwrap(),
+            [
+                format!("--force-with-lease=refs/heads/main:{expected}"),
+                "--force-with-lease=refs/heads/new:".to_owned(),
             ]
         );
     }
