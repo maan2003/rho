@@ -9,21 +9,20 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
-use rho_ui_proto::{AgentId, TagId, TagKind, UiAgentSummary, UiTag};
+use rho_ui_proto::{AgentId, UiAgentSummary, UiWorkstream, WorkstreamId};
 
-/// A workstream tag with its member agents resolved: the unit the rail rows
+/// A workstream with its member agents resolved: the unit the rail rows
 /// and per-task pane contexts are built around.
 #[derive(Clone)]
 pub struct Workstream {
-    pub tag_id: TagId,
+    pub workstream_id: WorkstreamId,
     pub name: String,
-    pub status: rho_ui_proto::Status,
+    pub pinned: bool,
     /// Derived, not stored: a workstream with no visible members (empty, or
     /// every agent hidden) folds out of the rail automatically.
     pub hidden: bool,
-    /// The workstream-group tag this stream sits under, from the tag's
-    /// parent chain.
-    pub group: Option<TagId>,
+    /// The group this stream shelves under, from its `group:<name>` label.
+    pub group: Option<String>,
     pub agents: Vec<UiAgentSummary>,
 }
 
@@ -36,21 +35,35 @@ impl Workstream {
 /// The well-known label that hides whatever carries it.
 pub const HIDE_LABEL: &str = "hide";
 
-fn derive_workstreams(tags: &[UiTag], agents: &[UiAgentSummary]) -> Vec<Workstream> {
-    tags.iter()
-        .filter(|tag| tag.kind == TagKind::Workstream)
-        .map(|tag| {
+/// The well-known label that pins whatever carries it.
+pub const PIN_LABEL: &str = "pin";
+
+/// The label prefix that shelves a workstream under a named group.
+pub const GROUP_LABEL_PREFIX: &str = "group:";
+
+pub fn agent_pinned(agent: &UiAgentSummary) -> bool {
+    agent.labels.iter().any(|label| label == PIN_LABEL)
+}
+
+fn derive_workstreams(workstreams: &[UiWorkstream], agents: &[UiAgentSummary]) -> Vec<Workstream> {
+    workstreams
+        .iter()
+        .map(|workstream| {
             let members = agents
                 .iter()
-                .filter(|agent| agent.tags.contains(&tag.tag_id))
+                .filter(|agent| agent.workstream == workstream.workstream_id)
                 .cloned()
                 .collect::<Vec<_>>();
             Workstream {
-                tag_id: tag.tag_id,
-                name: tag.name.clone(),
-                status: tag.status,
+                workstream_id: workstream.workstream_id,
+                name: workstream.name.clone(),
+                pinned: workstream.labels.iter().any(|label| label == PIN_LABEL),
                 hidden: members.iter().all(|agent| agent.hidden),
-                group: tag.parent,
+                group: workstream.labels.iter().find_map(|label| {
+                    label
+                        .strip_prefix(GROUP_LABEL_PREFIX)
+                        .map(|name| name.to_owned())
+                }),
                 agents: members,
             }
         })
@@ -89,15 +102,15 @@ pub struct AgentRegistry {
     rail_ranks: BTreeMap<AgentId, usize>,
     /// Derived row membership and ordering, rebuilt only when rail-relevant
     /// state changes rather than on every window draw.
-    topic_rail_layouts: BTreeMap<TagId, TopicRailLayout>,
+    topic_rail_layouts: BTreeMap<WorkstreamId, TopicRailLayout>,
     /// When the user last engaged each agent: seeded from summaries, bumped
     /// locally on send. Selects quiet agents for the active rail bucket.
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
-    /// The latest tag snapshot from `Ready`, all kinds.
-    tags: Vec<UiTag>,
+    /// The latest workstream snapshot from `Ready`.
+    raw_workstreams: Vec<UiWorkstream>,
     /// The latest agent summaries from `Ready`.
     summaries: Vec<UiAgentSummary>,
-    /// Workstream tags joined with their member agents, derived from the two
+    /// Workstreams joined with their member agents, derived from the two
     /// snapshots above.
     workstreams: Vec<Workstream>,
     /// Positions in `summaries`, used by all summary lookups.
@@ -105,11 +118,11 @@ pub struct AgentRegistry {
     /// The user clicked the rail's "n more" row: folded rows render in
     /// place until toggled back.
     rail_tail_expanded: bool,
-    /// Tags announced with `AgentCreated`, bridging the gap until the next
-    /// `Ready` refresh carries the agent's summary — so a fresh agent's
+    /// Workstreams announced with `AgentCreated`, bridging the gap until the
+    /// next `Ready` refresh carries the agent's summary — so a fresh agent's
     /// workstream context resolves immediately instead of falling back to
     /// the draft context (and stranding pane splits there).
-    announced_tags: BTreeMap<AgentId, Vec<TagId>>,
+    announced_workstreams: BTreeMap<AgentId, WorkstreamId>,
     active: ActivePane,
     /// The daemon database's machine seed, from `Ready`; kept for consumers
     /// that resolve ids.
@@ -178,9 +191,7 @@ impl<'a> TopicRailState<'a> {
         let mut extra = roots
             .into_iter()
             .filter(|agent| {
-                agent.status != rho_ui_proto::Status::Pinned
-                    && !agent.hidden
-                    && !top_roots.contains(&agent.agent_id)
+                !agent_pinned(agent) && !agent.hidden && !top_roots.contains(&agent.agent_id)
             })
             .collect::<Vec<_>>();
         extra.sort_by_key(|agent| {
@@ -239,7 +250,7 @@ impl<'a> TopicRailState<'a> {
         }
 
         let root = self.by_id[&root_id];
-        if root.status == rho_ui_proto::Status::Pinned || self.selected_root == Some(root_id) {
+        if agent_pinned(root) || self.selected_root == Some(root_id) {
             return false;
         }
         !self.top_roots.contains(&root_id) && !self.extra_roots.contains(&root_id)
@@ -259,17 +270,11 @@ impl AgentRegistry {
         self.workspace_counter = workspace_counter;
     }
 
-    pub fn set_data(&mut self, tags: Vec<UiTag>, mut agents: Vec<UiAgentSummary>) {
+    pub fn set_data(&mut self, workstreams: Vec<UiWorkstream>, mut agents: Vec<UiAgentSummary>) {
         // The "hide" label folds its carriers exactly like the filed-away
         // disposition; merging here keeps every downstream check uniform.
-        if let Some(hide_label) = tags
-            .iter()
-            .find(|tag| tag.kind == TagKind::Label && tag.name == HIDE_LABEL)
-            .map(|tag| tag.tag_id)
-        {
-            for agent in &mut agents {
-                agent.hidden |= agent.tags.contains(&hide_label);
-            }
+        for agent in &mut agents {
+            agent.hidden |= agent.labels.iter().any(|label| label == HIDE_LABEL);
         }
         self.attention.clear();
         let mut unseen = Vec::new();
@@ -307,8 +312,8 @@ impl AgentRegistry {
             .enumerate()
             .map(|(index, agent)| (agent.agent_id, index))
             .collect();
-        self.workstreams = derive_workstreams(&tags, &agents);
-        self.tags = tags;
+        self.workstreams = derive_workstreams(&workstreams, &agents);
+        self.raw_workstreams = workstreams;
         self.summaries = agents;
         self.rebuild_topic_rail_layouts();
     }
@@ -346,12 +351,12 @@ impl AgentRegistry {
         let (_, folded_rows) = self.split_rows();
         if folded_rows
             .iter()
-            .any(|row| row.tag_id == workstream.tag_id)
+            .any(|row| row.workstream_id == workstream.workstream_id)
         {
             return true;
         }
         self.topic_rail_layouts
-            .get(&workstream.tag_id)
+            .get(&workstream.workstream_id)
             .is_some_and(|layout| layout.listed.iter().all(|(id, _)| *id != agent_id))
     }
 
@@ -372,32 +377,27 @@ impl AgentRegistry {
 
     /// Where a new agent should work: the newest agent in the workstream sets
     /// the precedent, since sibling agents usually share a project.
-    pub fn last_working_directory(&self, tag_id: TagId) -> Option<Utf8PathBuf> {
+    pub fn last_working_directory(&self, workstream_id: WorkstreamId) -> Option<Utf8PathBuf> {
         self.workstreams
             .iter()
-            .find(|workstream| workstream.tag_id == tag_id)?
+            .find(|workstream| workstream.workstream_id == workstream_id)?
             .agents
             .last()
             .map(|agent| agent.workspace.repo().to_owned())
     }
 
-    /// The workstream tag an agent currently carries; falls back to the
-    /// tags announced at creation until the summary lands.
-    pub fn workstream_of(&self, agent_id: AgentId) -> Option<TagId> {
-        let tags = match self.agent_summary(agent_id) {
-            Some(agent) => &agent.tags,
-            None => self.announced_tags.get(&agent_id)?,
-        };
-        tags.iter().copied().find(|tag_id| {
-            self.tags
-                .iter()
-                .any(|tag| tag.tag_id == *tag_id && tag.kind == TagKind::Workstream)
-        })
+    /// The workstream an agent currently belongs to; falls back to the one
+    /// announced at creation until the summary lands.
+    pub fn workstream_of(&self, agent_id: AgentId) -> Option<WorkstreamId> {
+        match self.agent_summary(agent_id) {
+            Some(agent) => Some(agent.workstream),
+            None => self.announced_workstreams.get(&agent_id).copied(),
+        }
     }
 
-    /// Records the tags announced with `AgentCreated`.
-    pub fn note_agent_tags(&mut self, agent_id: AgentId, tags: Vec<TagId>) {
-        self.announced_tags.insert(agent_id, tags);
+    /// Records the workstream announced with `AgentCreated`.
+    pub fn note_agent_workstream(&mut self, agent_id: AgentId, workstream: WorkstreamId) {
+        self.announced_workstreams.insert(agent_id, workstream);
     }
 
     /// The role-prefixed short display label, unique among generated IDs.
@@ -432,11 +432,28 @@ impl AgentRegistry {
         self.agent_summary(agent_id).map(|agent| agent.role)
     }
 
-    /// The pin status of an agent, from summaries.
-    pub fn agent_status(&self, agent_id: AgentId) -> rho_ui_proto::Status {
+    /// Whether an agent carries the "pin" label, from summaries.
+    pub fn agent_pinned(&self, agent_id: AgentId) -> bool {
+        self.agent_summary(agent_id).is_some_and(agent_pinned)
+    }
+
+    /// An agent's labels, from summaries.
+    pub fn agent_labels(&self, agent_id: AgentId) -> &[String] {
         self.agent_summary(agent_id)
-            .map(|agent| agent.status)
-            .unwrap_or(rho_ui_proto::Status::Normal)
+            .map(|agent| agent.labels.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Every distinct label carried by any agent; label-prompt completion.
+    pub fn agent_label_names(&self) -> Vec<String> {
+        let mut labels = self
+            .summaries
+            .iter()
+            .flat_map(|agent| agent.labels.iter().cloned())
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels.dedup();
+        labels
     }
 
     fn agent_summary(&self, agent_id: AgentId) -> Option<&UiAgentSummary> {
@@ -457,25 +474,14 @@ impl AgentRegistry {
         }
     }
 
-    pub fn add_tag(&mut self, tag: UiTag) {
-        // Tags stay in the daemon's creation order; a new tag is the newest,
-        // so it belongs at the end.
-        let mut tags = std::mem::take(&mut self.tags);
-        tags.retain(|existing| existing.tag_id != tag.tag_id);
-        tags.push(tag);
+    pub fn add_workstream(&mut self, workstream: UiWorkstream) {
+        // Workstreams stay in the daemon's creation order; a new one is the
+        // newest, so it belongs at the end.
+        let mut workstreams = std::mem::take(&mut self.raw_workstreams);
+        workstreams.retain(|existing| existing.workstream_id != workstream.workstream_id);
+        workstreams.push(workstream);
         let agents = std::mem::take(&mut self.summaries);
-        self.set_data(tags, agents);
-    }
-
-    pub fn tags(&self) -> &[UiTag] {
-        &self.tags
-    }
-
-    pub fn tag_name(&self, tag_id: TagId) -> Option<&str> {
-        self.tags
-            .iter()
-            .find(|tag| tag.tag_id == tag_id)
-            .map(|tag| tag.name.as_str())
+        self.set_data(workstreams, agents);
     }
 
     pub fn workstreams(&self) -> &[Workstream] {
@@ -496,8 +502,8 @@ impl AgentRegistry {
         rows.sort_by_key(|workstream| {
             let primary = self.row_primary(workstream);
             (
-                workstream.status != rho_ui_proto::Status::Pinned,
-                primary.is_none_or(|agent| agent.status != rho_ui_proto::Status::Pinned),
+                !workstream.pinned,
+                primary.is_none_or(|agent| !agent_pinned(agent)),
                 primary.is_none_or(|agent| !bucket.contains(&agent.agent_id)),
                 primary
                     .and_then(|agent| self.rail_ranks.get(&agent.agent_id))
@@ -511,7 +517,7 @@ impl AgentRegistry {
     /// The workstream's face in the rail: its layout's best-listed member.
     fn row_primary(&self, workstream: &Workstream) -> Option<&UiAgentSummary> {
         self.topic_rail_layouts
-            .get(&workstream.tag_id)
+            .get(&workstream.workstream_id)
             .and_then(|layout| layout.listed.first())
             .and_then(|(agent_id, _)| self.agent_summary(*agent_id))
     }
@@ -544,11 +550,10 @@ impl AgentRegistry {
                 continue;
             }
             let primary = self.row_primary(workstream);
-            let keep = workstream.status == rho_ui_proto::Status::Pinned
-                || selected_row == Some(workstream.tag_id)
-                || primary.is_some_and(|agent| {
-                    agent.status == rho_ui_proto::Status::Pinned || bucket.contains(&agent.agent_id)
-                });
+            let keep = workstream.pinned
+                || selected_row == Some(workstream.workstream_id)
+                || primary
+                    .is_some_and(|agent| agent_pinned(agent) || bucket.contains(&agent.agent_id));
             if keep {
                 listed.push(workstream);
             } else if extra < EXTRA_ROWS {
@@ -641,7 +646,7 @@ impl AgentRegistry {
                 hidden.extend(workstream.agent_ids());
                 continue;
             }
-            if let Some(layout) = self.topic_rail_layouts.get(&workstream.tag_id) {
+            if let Some(layout) = self.topic_rail_layouts.get(&workstream.workstream_id) {
                 candidates.extend(layout.listed.iter().map(|(agent_id, _)| *agent_id));
             }
         }
@@ -660,7 +665,7 @@ impl AgentRegistry {
     ) -> Vec<&'a UiAgentSummary> {
         agents.sort_by_key(|agent| {
             (
-                agent.status != rho_ui_proto::Status::Pinned,
+                !agent_pinned(agent),
                 !state.top_roots.contains(&agent.agent_id),
                 self.rail_ranks
                     .get(&agent.agent_id)
@@ -736,7 +741,7 @@ impl AgentRegistry {
                         .collect()
                 };
                 (
-                    topic.tag_id,
+                    topic.workstream_id,
                     TopicRailLayout {
                         listed: cache(listed),
                         folded: cache(folded),
@@ -772,7 +777,7 @@ impl AgentRegistry {
         &self,
         topic: &'a Workstream,
     ) -> (Vec<&'a UiAgentSummary>, Vec<&'a UiAgentSummary>) {
-        let Some(layout) = self.topic_rail_layouts.get(&topic.tag_id) else {
+        let Some(layout) = self.topic_rail_layouts.get(&topic.workstream_id) else {
             return (Vec::new(), Vec::new());
         };
         (
@@ -787,7 +792,7 @@ impl AgentRegistry {
     ) -> BTreeSet<AgentId> {
         let mut normal = agents
             .into_iter()
-            .filter(|agent| agent.status != rho_ui_proto::Status::Pinned && !agent.hidden)
+            .filter(|agent| !agent_pinned(agent) && !agent.hidden)
             .collect::<Vec<_>>();
         let colored_count = normal
             .iter()
@@ -850,9 +855,23 @@ const EXTRA_ROWS: usize = 5;
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::{AgentIdDomain, Status, UiAgentSummary, WorkspaceId, WorkspaceIdDomain};
+    use rho_ui_proto::{AgentIdDomain, UiAgentSummary, WorkspaceId, WorkspaceIdDomain};
 
     use super::*;
+
+    /// Pin state fixture shorthand, in the shape the old tag `Status` had.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Status {
+        Normal,
+        Pinned,
+    }
+
+    fn status_labels(status: Status) -> Vec<String> {
+        match status {
+            Status::Normal => Vec::new(),
+            Status::Pinned => vec![PIN_LABEL.to_owned()],
+        }
+    }
 
     fn agent_id(id: u64) -> AgentId {
         AgentId::from_counter(id, &AgentIdDomain(0)).unwrap()
@@ -871,7 +890,6 @@ mod tests {
             workspace: rho_ui_proto::WorkspaceInfo::UserCheckout {
                 repo: "/tmp".into(),
             },
-            status,
             attention: rho_ui_proto::UiAttention::Quiet,
             last_active: rho_core::UnixMs(
                 crate::workspace::now_ms()
@@ -879,7 +897,8 @@ mod tests {
                     .saturating_add(id),
             ),
             hidden: false,
-            tags: Vec::new(),
+            workstream: WorkstreamId(0),
+            labels: status_labels(status),
         }
     }
 
@@ -892,53 +911,42 @@ mod tests {
 
     fn workspace_agent(id: u64, workspace_id: WorkspaceId) -> UiAgentSummary {
         UiAgentSummary {
-            agent_id: agent_id(id),
-            parent_agent: None,
-            display_name: None,
-            created_at: rho_core::UnixMs(id),
-            updated_at: rho_core::UnixMs(id),
-            role: rho_ui_proto::AgentRole::default(),
             workspace: rho_ui_proto::WorkspaceInfo::Workspace {
                 repo: "/tmp".into(),
                 id: workspace_id,
             },
-            status: Status::Normal,
-            attention: rho_ui_proto::UiAttention::Quiet,
             last_active: rho_core::UnixMs(0),
-            hidden: false,
-            tags: Vec::new(),
+            ..agent(id, Status::Normal)
         }
     }
 
-    /// A workstream tag with its members' `tags` set to match.
+    /// A workstream with its members' `workstream` set to match.
     fn topic(
         id: u64,
         status: Status,
         mut agents: Vec<UiAgentSummary>,
-    ) -> (UiTag, Vec<UiAgentSummary>) {
+    ) -> (UiWorkstream, Vec<UiAgentSummary>) {
         for agent in &mut agents {
-            agent.tags = vec![TagId(id)];
+            agent.workstream = WorkstreamId(id);
         }
         (
-            UiTag {
-                tag_id: TagId(id),
+            UiWorkstream {
+                workstream_id: WorkstreamId(id),
                 name: id.to_string(),
-                kind: TagKind::Workstream,
-                parent: None,
-                status,
+                labels: status_labels(status),
             },
             agents,
         )
     }
 
-    fn set_topics(registry: &mut AgentRegistry, topics: Vec<(UiTag, Vec<UiAgentSummary>)>) {
-        let mut tags = Vec::new();
+    fn set_topics(registry: &mut AgentRegistry, topics: Vec<(UiWorkstream, Vec<UiAgentSummary>)>) {
+        let mut workstreams = Vec::new();
         let mut agents = Vec::new();
-        for (tag, members) in topics {
-            tags.push(tag);
+        for (workstream, members) in topics {
+            workstreams.push(workstream);
             agents.extend(members);
         }
-        registry.set_data(tags, agents);
+        registry.set_data(workstreams, agents);
     }
 
     #[test]
@@ -991,7 +999,7 @@ mod tests {
             registry
                 .ordered_workstreams()
                 .into_iter()
-                .map(|workstream| workstream.tag_id.0)
+                .map(|workstream| workstream.workstream_id.0)
                 .collect::<Vec<_>>()
         };
         // Pinned primary leads; then retained engagement order (1 above 2),
@@ -1018,11 +1026,11 @@ mod tests {
         let mut registry = AgentRegistry::default();
         set_topics(&mut registry, vec![topic(1, Status::Normal, vec![])]);
 
-        // AgentCreated announces the tags; the summary only arrives with
-        // the next Ready. The workstream must resolve in between, or the
-        // fresh agent's transcript lands in the draft context.
-        registry.note_agent_tags(agent_id(7), vec![TagId(1)]);
-        assert_eq!(registry.workstream_of(agent_id(7)), Some(TagId(1)));
+        // AgentCreated announces the workstream; the summary only arrives
+        // with the next Ready. The workstream must resolve in between, or
+        // the fresh agent's transcript lands in the draft context.
+        registry.note_agent_workstream(agent_id(7), WorkstreamId(1));
+        assert_eq!(registry.workstream_of(agent_id(7)), Some(WorkstreamId(1)));
 
         // Once the summary lands it wins over the announcement.
         set_topics(
@@ -1032,7 +1040,7 @@ mod tests {
                 topic(2, Status::Normal, vec![agent(7, Status::Normal)]),
             ],
         );
-        assert_eq!(registry.workstream_of(agent_id(7)), Some(TagId(2)));
+        assert_eq!(registry.workstream_of(agent_id(7)), Some(WorkstreamId(2)));
     }
 
     #[test]
@@ -1053,7 +1061,10 @@ mod tests {
         let (listed, folded) = registry.split_rows();
         assert_eq!(listed.len(), 10);
         assert_eq!(
-            folded.iter().map(|row| row.tag_id.0).collect::<Vec<_>>(),
+            folded
+                .iter()
+                .map(|row| row.workstream_id.0)
+                .collect::<Vec<_>>(),
             [3, 2, 1]
         );
         // Members of folded rows fold with them (skipped by cycling).
@@ -1064,13 +1075,13 @@ mod tests {
         // the row; selection keeps the open row visible regardless.
         registry.set_attention(agent_id(1), UiAttention::Pending);
         let (_, folded) = registry.split_rows();
-        assert!(folded.iter().all(|row| row.tag_id.0 != 1));
+        assert!(folded.iter().all(|row| row.workstream_id.0 != 1));
         assert!(!registry.agent_folded(agent_id(1)));
 
         registry.set_attention(agent_id(1), UiAttention::Quiet);
         registry.select_agent(agent_id(2));
         let (_, folded) = registry.split_rows();
-        assert!(folded.iter().all(|row| row.tag_id.0 != 2));
+        assert!(folded.iter().all(|row| row.workstream_id.0 != 2));
     }
 
     #[test]

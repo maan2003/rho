@@ -20,7 +20,7 @@ use crate::claude::ClaudeAgent;
 use crate::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWorkflow,
     AgentWriteTxnExt as _, EngineerIntelligence, InferenceModel, InferenceProfile, SessionBinding,
-    TagId,
+    WorkstreamId,
 };
 use crate::lazy::Lazy;
 use crate::{
@@ -59,7 +59,7 @@ pub trait AgentToolExtensionProvider: Send + Sync + 'static {
 /// Broadcast when any agent is created in the pool.
 #[derive(Clone)]
 pub struct AgentCreated {
-    pub tags: Vec<TagId>,
+    pub workstream: WorkstreamId,
     pub agent_id: AgentId,
     pub agent: RunningAgent,
 }
@@ -204,25 +204,25 @@ impl AgentPool {
 
     pub async fn create(
         self: &Arc<Self>,
-        tags: Vec<TagId>,
+        workstream: WorkstreamId,
         config: AgentRole,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        self.create_with_parent(tags, config, display_name, start, None, None)
+        self.create_with_parent(workstream, config, display_name, start, None, None)
             .await
     }
 
     pub async fn create_with_tool_extension(
         self: &Arc<Self>,
-        tags: Vec<TagId>,
+        workstream: WorkstreamId,
         config: AgentRole,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         tool_extension: AgentToolExtensionFactory,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         self.create_with_parent(
-            tags,
+            workstream,
             config,
             display_name,
             start,
@@ -234,7 +234,7 @@ impl AgentPool {
 
     async fn create_with_parent(
         self: &Arc<Self>,
-        tags: Vec<TagId>,
+        workstream: WorkstreamId,
         config: AgentRole,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
@@ -255,7 +255,7 @@ impl AgentPool {
                     self.auth.clone(),
                     mode,
                     config,
-                    tags.clone(),
+                    workstream,
                     display_name,
                     start,
                     parent,
@@ -270,7 +270,7 @@ impl AgentPool {
             | SessionBinding::ClaudeAdvisor { .. } => {
                 let (agent_id, agent) = ClaudeAgent::create(
                     self.db.clone(),
-                    tags.clone(),
+                    workstream,
                     display_name,
                     start,
                     mode,
@@ -284,15 +284,15 @@ impl AgentPool {
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
         let _ = self.created.send(AgentCreated {
-            tags,
+            workstream,
             agent_id,
             agent: agent.clone(),
         });
         Ok((agent_id, agent))
     }
 
-    /// Create a child agent for `parent` in the parent's mode, inheriting
-    /// the parent's tags, and mail it its task. Returns once the child is
+    /// Create a child agent for `parent` in the parent's mode, joining the
+    /// parent's workstream, and mail it its task. Returns once the child is
     /// running. An empty `workdirs` forks the parent's whole working set.
     pub async fn spawn_child(
         self: &Arc<Self>,
@@ -302,11 +302,11 @@ impl AgentPool {
         workdirs: Vec<SpawnWorkdir>,
         config: AgentRole,
     ) -> anyhow::Result<AgentId> {
-        let (tags, parent_workdirs, parent_role) = {
+        let (workstream, parent_workdirs, parent_role) = {
             let read = self.db.read();
             let record = read.get_agent(parent);
             self.enforce_spawn_limits(&read, parent)?;
-            (record.tags, record.workdirs, record.role)
+            (record.workstream, record.workdirs, record.role)
         };
         let workdirs = if workdirs.is_empty() {
             parent_workdirs
@@ -371,7 +371,7 @@ impl AgentPool {
         }
         let config = child_role(parent_role, config);
         let (child_id, child) = self
-            .create_with_parent(tags, config, Some(task_name), start, Some(parent), None)
+            .create_with_parent(workstream, config, Some(task_name), start, Some(parent), None)
             .await?;
         let parent_label = self.agent_handle(parent);
         child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);

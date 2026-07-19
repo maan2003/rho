@@ -6,7 +6,7 @@ use rho_ui_proto::remote::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
 use rho_ui_proto::{
-    AgentRole, EngineerIntelligence, TagKind, UiAgentSummary, UiAttention, UiProject, UiTag,
+    AgentRole, EngineerIntelligence, UiAgentSummary, UiAttention, UiProject, UiWorkstream,
 };
 use rho_webui_messages::{AgentState, AgentSummary, Block, Project, ToBrowser, Topic};
 
@@ -16,33 +16,32 @@ const TOOL_TEXT_LIMIT: usize = 16 * 1024;
 /// Longest one-line tool label, in bytes.
 const TOOL_LABEL_LIMIT: usize = 256;
 
-/// The browser keeps its topic-shaped view: each workstream tag is one
-/// "topic" (id `tp-{n}`), listing the agents tagged with it. There is no
-/// explicit hidden bit on tags: agents carrying the "hide" label count as
-/// hidden, and a workstream with no visible members is dropped entirely.
-pub fn hello(tags: &[UiTag], agents: &[UiAgentSummary], projects: &[UiProject]) -> ToBrowser {
-    let hide_label = tags
-        .iter()
-        .find(|tag| tag.kind == TagKind::Label && tag.name == "hide")
-        .map(|tag| tag.tag_id);
+/// The browser keeps its topic-shaped view: each workstream is one "topic"
+/// (id `tp-{n}`), listing its member agents. Agents carrying the "hide"
+/// label count as hidden, and a workstream with no visible members is
+/// dropped entirely.
+pub fn hello(
+    workstreams: &[UiWorkstream],
+    agents: &[UiAgentSummary],
+    projects: &[UiProject],
+) -> ToBrowser {
     let agent_hidden = |agent: &UiAgentSummary| {
-        agent.hidden || hide_label.is_some_and(|label| agent.tags.contains(&label))
+        agent.hidden || agent.labels.iter().any(|label| label == "hide")
     };
     ToBrowser::Hello {
-        topics: tags
+        topics: workstreams
             .iter()
-            .filter(|tag| tag.kind == TagKind::Workstream)
-            .filter_map(|tag| {
+            .filter_map(|workstream| {
                 let members = agents
                     .iter()
-                    .filter(|agent| agent.tags.contains(&tag.tag_id))
+                    .filter(|agent| agent.workstream == workstream.workstream_id)
                     .map(|agent| {
                         let id = agent.agent_id.encoded();
                         AgentSummary {
                             name: agent.display_name.clone().unwrap_or_else(|| id.clone()),
                             id,
                             role: role_label(agent.role).to_owned(),
-                            pinned: agent.status == rho_ui_proto::Status::Pinned,
+                            pinned: agent.labels.iter().any(|label| label == "pin"),
                             updated_at: agent.updated_at.0,
                             attention: attention_label(agent.attention).to_owned(),
                             hidden: agent_hidden(agent),
@@ -53,9 +52,9 @@ pub fn hello(tags: &[UiTag], agents: &[UiAgentSummary], projects: &[UiProject]) 
                     return None;
                 }
                 Some(Topic {
-                    id: format!("tp-{}", tag.tag_id.0),
-                    name: tag.name.clone(),
-                    pinned: tag.status == rho_ui_proto::Status::Pinned,
+                    id: format!("tp-{}", workstream.workstream_id.0),
+                    name: workstream.name.clone(),
+                    pinned: workstream.labels.iter().any(|label| label == "pin"),
                     agents: members,
                 })
             })

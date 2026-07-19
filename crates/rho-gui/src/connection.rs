@@ -17,7 +17,7 @@ use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
-    AgentId, ClientMessage, ServerMessage, UiAgentSummary, UiProject, UiTag, WorkspaceInfo,
+    AgentId, ClientMessage, ServerMessage, UiAgentSummary, UiProject, UiWorkstream, WorkspaceInfo,
     read_frame, write_frame,
 };
 use tokio::io::AsyncReadExt as _;
@@ -62,20 +62,20 @@ impl tokio::io::AsyncWrite for IrohStream {
 
 pub enum ConnEvent {
     Ready {
-        tags: Vec<UiTag>,
+        workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
         machine_seed: u64,
         agent_counter: u64,
         workspace_counter: u64,
     },
-    TagCreated(UiTag),
-    /// The daemon created an agent this connection asked for. The tags ride
-    /// along so the agent's workstream context resolves before the next
-    /// `Ready` refresh lands.
+    WorkstreamCreated(UiWorkstream),
+    /// The daemon created an agent this connection asked for. The workstream
+    /// rides along so the agent's workstream context resolves before the
+    /// next `Ready` refresh lands.
     AgentCreated {
         agent_id: AgentId,
-        tags: Vec<rho_ui_proto::TagId>,
+        workstream: rho_ui_proto::WorkstreamId,
     },
     AgentLoaded(AgentId),
     Frame {
@@ -403,9 +403,10 @@ async fn run(
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
     let ServerMessage::Ready {
-        tags,
+        workstreams,
         agents,
         projects,
+        view_config: _,
         machine_seed,
         agent_counter,
         workspace_counter,
@@ -415,7 +416,7 @@ async fn run(
     };
     if events
         .unbounded_send(ConnEvent::Ready {
-            tags,
+            workstreams,
             agents,
             projects,
             machine_seed,
@@ -451,24 +452,31 @@ async fn run(
         };
         let event = match message {
             ServerMessage::Ready {
-                tags,
+                workstreams,
                 agents,
                 projects,
+                view_config: _,
                 machine_seed,
                 agent_counter,
                 workspace_counter,
             } => Some(ConnEvent::Ready {
-                tags,
+                workstreams,
                 agents,
                 projects,
                 machine_seed,
                 agent_counter,
                 workspace_counter,
             }),
-            ServerMessage::TagCreated { tag } => Some(ConnEvent::TagCreated(tag)),
-            ServerMessage::AgentCreated { agent_id, tags } => {
-                Some(ConnEvent::AgentCreated { agent_id, tags })
+            ServerMessage::WorkstreamCreated { workstream } => {
+                Some(ConnEvent::WorkstreamCreated(workstream))
             }
+            ServerMessage::AgentCreated {
+                agent_id,
+                workstream,
+            } => Some(ConnEvent::AgentCreated {
+                agent_id,
+                workstream,
+            }),
             ServerMessage::AgentLoaded { agent_id } => Some(ConnEvent::AgentLoaded(agent_id)),
             ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame {
                 agent_id,

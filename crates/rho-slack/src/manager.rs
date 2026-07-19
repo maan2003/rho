@@ -16,9 +16,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use futures_util::future::{BoxFuture, FutureExt as _};
-use rho_agent::db::{
-    AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _, TagId, TagKind,
-};
+use rho_agent::db::{AgentId, AgentRole, AgentWriteTxnExt as _};
 use rho_agent::pool::{AgentPool, AgentToolExtensionProvider};
 use rho_agent::{AgentToolExtension, InputSourceId, MessageDelivery, MessageSender};
 use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
@@ -39,9 +37,6 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 pub struct SlackManager {
     pool: Arc<AgentPool>,
     db: RhoDb,
-    /// The "slack" workstream-group; each Slack-born agent founds a
-    /// workstream parented under it.
-    group_tag: TagId,
     /// user id → display name, so mention tags and author lines read as
     /// names instead of `U03AB12CD` (filled via `users.info`).
     user_names: tokio::sync::Mutex<HashMap<String, String>>,
@@ -56,35 +51,13 @@ pub struct SlackManager {
 }
 
 impl SlackManager {
-    /// Finds (or creates) the "slack" workstream-group up front.
     pub async fn new(pool: Arc<AgentPool>, db: RhoDb) -> Arc<Self> {
         let mut write = db.write().await;
         write.init_slack_tables();
         write.commit();
-        let existing = db
-            .read()
-            .list_tags()
-            .into_iter()
-            .find(|(_, tag)| tag.kind == TagKind::WorkstreamGroup && tag.name == "slack")
-            .map(|(tag_id, _)| tag_id);
-        let group_tag = match existing {
-            Some(tag_id) => tag_id,
-            None => {
-                let mut write = db.write().await;
-                let tag_id = write.create_tag(
-                    rho_core::UnixMs::now(),
-                    "slack".to_owned(),
-                    TagKind::WorkstreamGroup,
-                    None,
-                );
-                write.commit();
-                tag_id
-            }
-        };
         let manager = Arc::new(Self {
             pool,
             db,
-            group_tag,
             user_names: tokio::sync::Mutex::new(HashMap::new()),
             in_progress: tokio::sync::Mutex::new(HashMap::new()),
             source_id: InputSourceId::fresh(),
@@ -448,23 +421,21 @@ impl SlackManager {
                     repo: self.pool.repo(&config.coordinator_repo).await?,
                     parent_revset: "@-".to_owned(),
                 }];
-                // Each Slack session gets its own workstream under the
-                // "slack" group; the generated title renames it later.
+                // Each Slack session gets its own workstream, marked with
+                // the "group:slack" label so clients can shelve them
+                // together; the generated title renames it later.
                 let workstream = {
+                    let now = rho_core::UnixMs::now();
                     let mut write = self.db.write().await;
-                    let tag_id = write.create_tag(
-                        rho_core::UnixMs::now(),
-                        "slack session".to_owned(),
-                        TagKind::Workstream,
-                        Some(self.group_tag),
-                    );
+                    let workstream_id = write.create_workstream(now, "slack session".to_owned());
+                    write.workstream_label(now, workstream_id, "group:slack", true);
                     write.commit();
-                    tag_id
+                    workstream_id
                 };
                 let (agent_id, agent) = self
                     .pool
                     .create_with_tool_extension(
-                        vec![workstream],
+                        workstream,
                         AgentRole::WorkflowPM {
                             workflow: rho_agent::db::AgentWorkflow::PrFriendly,
                         },

@@ -82,7 +82,7 @@ impl PartialEq for Surface {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ContextId {
     Draft,
-    Task(rho_ui_proto::TagId),
+    Task(rho_ui_proto::WorkstreamId),
 }
 
 /// How to reach the daemon. Deliberately holds no client-local paths: the
@@ -114,7 +114,7 @@ pub struct Workspace {
     /// Workstream the draft inherits context from: whichever was focused
     /// when the draft was entered. Only used to derive the default workdir —
     /// a submitted draft always founds its own workstream.
-    draft_workstream: Option<rho_ui_proto::TagId>,
+    draft_workstream: Option<rho_ui_proto::WorkstreamId>,
     /// A NewAgent request from the draft is in flight; the draft buffer is
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
@@ -258,11 +258,11 @@ impl Workspace {
             .registry
             .workstreams()
             .iter()
-            .map(|workstream| workstream.tag_id)
+            .map(|workstream| workstream.workstream_id)
             .collect::<HashSet<_>>();
         let keep = |context: &ContextId| match context {
             ContextId::Draft => true,
-            ContextId::Task(tag_id) => live.contains(tag_id),
+            ContextId::Task(workstream_id) => live.contains(workstream_id),
         };
         self.contexts.retain(|context, _| keep(context));
         self.surfaces.retain(|context, _| keep(context));
@@ -400,7 +400,7 @@ impl Workspace {
     ) {
         match event {
             ConnEvent::Ready {
-                tags,
+                workstreams,
                 agents,
                 projects: workdirs,
                 machine_seed,
@@ -411,7 +411,7 @@ impl Workspace {
                 self.registry.set_machine_seed(machine_seed);
                 self.registry.set_agent_counter(agent_counter);
                 self.registry.set_workspace_counter(workspace_counter);
-                self.registry.set_data(tags, agents);
+                self.registry.set_data(workstreams, agents);
                 self.prune_contexts();
                 self.workdirs = workdirs;
                 self.connected = true;
@@ -424,13 +424,16 @@ impl Workspace {
                 self.update_statuses(cx);
                 cx.notify();
             }
-            ConnEvent::TagCreated(tag) => {
-                self.registry.add_tag(tag);
+            ConnEvent::WorkstreamCreated(workstream) => {
+                self.registry.add_workstream(workstream);
                 self.refresh_draft_agent_targets(cx);
                 cx.notify();
             }
-            ConnEvent::AgentCreated { agent_id, tags } => {
-                self.registry.note_agent_tags(agent_id, tags);
+            ConnEvent::AgentCreated {
+                agent_id,
+                workstream,
+            } => {
+                self.registry.note_agent_workstream(agent_id, workstream);
                 self.registry.mark_known(agent_id);
                 if self.awaiting_draft_agent {
                     self.awaiting_draft_agent = false;
@@ -600,7 +603,7 @@ impl Workspace {
         // Every top-level agent founds its own workstream; the daemon names
         // it from the agent's generated title.
         self.connection.send(ClientMessage::NewAgent {
-            tags: Vec::new(),
+            workstream: None,
             role,
             start,
             content: Some(vec![ContentPart::Text { text: body }]),
@@ -817,12 +820,14 @@ impl Workspace {
             return;
         }
         let selected = self.registry.selected_agent().copied();
-        let Some(tag_id) = self.focused_workstream(selected) else {
+        let Some(workstream_id) = self.focused_workstream(selected) else {
             self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
             return;
         };
-        self.connection
-            .send(ClientMessage::RenameTag { tag_id, name });
+        self.connection.send(ClientMessage::WorkstreamRename {
+            workstream_id,
+            name,
+        });
     }
 
     pub(crate) fn cmd_agent_done(
@@ -866,8 +871,15 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
-        let selected = self.registry.selected_agent().copied();
-        self.toggle_agent_status(selected, rho_ui_proto::Status::Pinned, cx);
+        let Some(agent_id) = self.selected_or_notice("pin", cx) else {
+            return;
+        };
+        let add = !self.registry.agent_pinned(agent_id);
+        self.connection.send(ClientMessage::AgentLabel {
+            agent_id,
+            label: crate::registry::PIN_LABEL.to_owned(),
+            add,
+        });
     }
 
     pub(crate) fn cmd_tag_pin(&mut self, cx: &mut Context<Self>) {
@@ -875,15 +887,40 @@ impl Workspace {
             return;
         }
         let selected = self.registry.selected_agent().copied();
-        self.toggle_workstream_status(selected, None, rho_ui_proto::Status::Pinned, cx);
+        let Some(workstream) = self
+            .focused_workstream(selected)
+            .and_then(|workstream_id| {
+                self.registry
+                    .workstreams()
+                    .iter()
+                    .find(|workstream| workstream.workstream_id == workstream_id)
+            })
+            .map(|workstream| (workstream.workstream_id, workstream.pinned))
+        else {
+            self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let (workstream_id, pinned) = workstream;
+        self.connection.send(ClientMessage::WorkstreamLabel {
+            workstream_id,
+            label: crate::registry::PIN_LABEL.to_owned(),
+            add: !pinned,
+        });
     }
 
     pub(crate) fn cmd_tag_move(&mut self, name: String, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
-        let selected = self.registry.selected_agent().copied();
-        self.tag_by_name(selected, name, rho_ui_proto::TagKind::Workstream, cx);
+        let Some(agent_id) = self.selected_or_notice("move", cx) else {
+            return;
+        };
+        // Named targets create the workstream when no name matches, so
+        // "spin off a workstream around this agent" is the same gesture.
+        self.connection.send(ClientMessage::AgentMove {
+            agent_id,
+            target: rho_ui_proto::WorkstreamTarget::Named(name),
+        });
     }
 
     pub(crate) fn cmd_tag_group(&mut self, name: String, cx: &mut Context<Self>) {
@@ -891,15 +928,29 @@ impl Workspace {
             return;
         }
         let selected = self.registry.selected_agent().copied();
-        self.tag_by_name(selected, name, rho_ui_proto::TagKind::WorkstreamGroup, cx);
+        let Some(workstream_id) = self.focused_workstream(selected) else {
+            self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
+            return;
+        };
+        self.connection.send(ClientMessage::WorkstreamLabel {
+            workstream_id,
+            label: format!("{}{name}", crate::registry::GROUP_LABEL_PREFIX),
+            add: true,
+        });
     }
 
     pub(crate) fn cmd_tag_label(&mut self, name: String, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
-        let selected = self.registry.selected_agent().copied();
-        self.tag_by_name(selected, name, rho_ui_proto::TagKind::Label, cx);
+        let Some(agent_id) = self.selected_or_notice("label", cx) else {
+            return;
+        };
+        self.connection.send(ClientMessage::AgentLabel {
+            agent_id,
+            label: name,
+            add: true,
+        });
     }
 
     pub(crate) fn cmd_tag_unlabel(&mut self, name: String, cx: &mut Context<Self>) {
@@ -909,16 +960,16 @@ impl Workspace {
         let Some(agent_id) = self.selected_or_notice("unlabel", cx) else {
             return;
         };
-        match resolve_tag(&name, &self.tag_labels(rho_ui_proto::TagKind::Label)) {
-            Some(tag_id) => {
-                self.connection
-                    .send(ClientMessage::UntagAgent { agent_id, tag_id });
-            }
-            None => {
-                let message = format!("no label named `{name}`");
-                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-            }
+        if !self.registry.agent_labels(agent_id).contains(&name) {
+            let message = format!("no label named `{name}` on this agent");
+            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+            return;
         }
+        self.connection.send(ClientMessage::AgentLabel {
+            agent_id,
+            label: name,
+            add: false,
+        });
     }
 
     pub(crate) fn cmd_project_add(
@@ -996,9 +1047,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(selected) = self.registry.selected_agent().copied()
-            && let Some(tag_id) = self.registry.workstream_of(selected)
+            && let Some(workstream_id) = self.registry.workstream_of(selected)
         {
-            self.draft_workstream = Some(tag_id);
+            self.draft_workstream = Some(workstream_id);
         }
         match working_directory {
             Some(path) => {
@@ -1028,23 +1079,6 @@ impl Workspace {
             self.connection.send(ClientMessage::LoadAgent { agent_id });
         }
         self.select_agent(Some(agent_id), window, cx);
-    }
-
-    /// Pin toggle for the addressed (else selected) agent.
-    fn toggle_agent_status(
-        &mut self,
-        source_agent: Option<AgentId>,
-        target: rho_ui_proto::Status,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
-        else {
-            self.notice_on(None, "no agent selected", StyleClass::SystemInfo, cx);
-            return;
-        };
-        let status = toggle_status(self.registry.agent_status(agent_id), target);
-        self.connection
-            .send(ClientMessage::SetAgentStatus { agent_id, status });
     }
 
     /// Clears (or snoozes, or files away) an agent's claim on the user's
@@ -1091,77 +1125,7 @@ impl Workspace {
         self.open_agent(agent_id, window, cx);
     }
 
-    /// Kind-aware tagging by name for the addressed (else selected) agent;
-    /// the daemon creates unknown tags.
-    fn tag_by_name(
-        &mut self,
-        source_agent: Option<AgentId>,
-        name: String,
-        kind: rho_ui_proto::TagKind,
-        cx: &mut Context<Self>,
-    ) {
-        let target = source_agent.or_else(|| self.registry.selected_agent().copied());
-        let Some(agent_id) = target else {
-            self.notice_on(None, ":tag: no agent selected", StyleClass::SystemInfo, cx);
-            return;
-        };
-        self.connection.send(ClientMessage::TagAgent {
-            agent_id,
-            target: rho_ui_proto::TagTarget::Named { name, kind },
-        });
-    }
-
-    /// Pin toggle for a workstream named by argument, defaulting to the
-    /// focused agent's workstream.
-    fn toggle_workstream_status(
-        &mut self,
-        source_agent: Option<AgentId>,
-        name: Option<String>,
-        target: rho_ui_proto::Status,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(tag_id) = self.named_or_focused_workstream(source_agent, name, cx) else {
-            return;
-        };
-        let current = self
-            .registry
-            .workstreams()
-            .iter()
-            .find(|workstream| workstream.tag_id == tag_id)
-            .map(|workstream| workstream.status)
-            .unwrap_or(rho_ui_proto::Status::Normal);
-        let status = toggle_status(current, target);
-        self.connection
-            .send(ClientMessage::SetTagStatus { tag_id, status });
-    }
-
-    fn named_or_focused_workstream(
-        &mut self,
-        source_agent: Option<AgentId>,
-        name: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> Option<rho_ui_proto::TagId> {
-        match &name {
-            Some(name) => {
-                let resolved =
-                    resolve_tag(name, &self.tag_labels(rho_ui_proto::TagKind::Workstream));
-                if resolved.is_none() {
-                    let message = format!("no workstream named `{name}`");
-                    self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
-                }
-                resolved
-            }
-            None => {
-                let focused = self.focused_workstream(source_agent);
-                if focused.is_none() {
-                    self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
-                }
-                focused
-            }
-        }
-    }
-
-    fn focused_workstream(&self, source_agent: Option<AgentId>) -> Option<rho_ui_proto::TagId> {
+    fn focused_workstream(&self, source_agent: Option<AgentId>) -> Option<rho_ui_proto::WorkstreamId> {
         source_agent
             .or_else(|| self.registry.selected_agent().copied())
             .and_then(|agent_id| self.registry.workstream_of(agent_id))
@@ -1218,7 +1182,7 @@ impl Workspace {
     /// machine, so its own cwd is meaningless here.
     fn draft_default_workdir(&self) -> Option<Utf8PathBuf> {
         self.draft_workstream
-            .and_then(|tag_id| self.registry.last_working_directory(tag_id))
+            .and_then(|workstream_id| self.registry.last_working_directory(workstream_id))
             .or_else(|| self.workdirs.first().map(|workdir| workdir.path.clone()))
     }
 
@@ -1232,27 +1196,21 @@ impl Workspace {
             .unwrap_or_else(|| path.to_string())
     }
 
-    /// Tags of one kind as the `(name, id)` pairs shared resolution expects.
-    fn tag_labels(&self, kind: rho_ui_proto::TagKind) -> Vec<(String, rho_ui_proto::TagId)> {
-        self.registry
-            .tags()
-            .iter()
-            .filter(|tag| tag.kind == kind)
-            .map(|tag| (tag.name.clone(), tag.tag_id))
-            .collect()
-    }
-
     pub fn tag_names(&self) -> crate::commands::TagNames {
-        let names = |kind| {
-            self.tag_labels(kind)
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect()
-        };
+        let workstreams = self.registry.workstreams();
+        let mut groups = workstreams
+            .iter()
+            .filter_map(|workstream| workstream.group.clone())
+            .collect::<Vec<_>>();
+        groups.sort();
+        groups.dedup();
         crate::commands::TagNames {
-            workstreams: names(rho_ui_proto::TagKind::Workstream),
-            groups: names(rho_ui_proto::TagKind::WorkstreamGroup),
-            labels: names(rho_ui_proto::TagKind::Label),
+            workstreams: workstreams
+                .iter()
+                .map(|workstream| workstream.name.clone())
+                .collect(),
+            groups,
+            labels: self.registry.agent_label_names(),
         }
     }
 
@@ -2785,30 +2743,6 @@ fn parse_duration_ms(text: &str) -> Option<u64> {
         _ => return None,
     };
     minutes.checked_mul(60 * 1000)
-}
-
-/// Toggle semantics for pin commands: applying the state an item is
-/// already in returns it to normal.
-fn toggle_status(
-    current: rho_ui_proto::Status,
-    target: rho_ui_proto::Status,
-) -> rho_ui_proto::Status {
-    if current == target {
-        rho_ui_proto::Status::Normal
-    } else {
-        target
-    }
-}
-
-/// Resolves a tag argument against `(name, id)` pairs; tag names are unique,
-/// so the name is the identity. `None` means no such tag exists yet.
-fn resolve_tag(
-    argument: &str,
-    tags: &[(String, rho_ui_proto::TagId)],
-) -> Option<rho_ui_proto::TagId> {
-    tags.iter()
-        .find(|(name, _)| name == argument)
-        .map(|(_, tag_id)| *tag_id)
 }
 
 /// Resolves a workdir argument (registered name or path) to its path.

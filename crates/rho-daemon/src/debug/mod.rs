@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use rho_agent::db::{
     AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWriteTxnExt as _,
-    EngineerIntelligence, Status,
+    EngineerIntelligence,
 };
 use rho_db::RhoDb;
 use rho_workspaces::WorkspaceInfo;
@@ -163,7 +163,10 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
         if let Some(name) = &agent.display_name {
             writeln!(output, "  name: {name}")?;
         }
-        writeln!(output, "  status: {}", status_name(agent.status))?;
+        writeln!(output, "  workstream: {:?}", agent.workstream)?;
+        if !agent.labels.is_empty() {
+            writeln!(output, "  labels: {}", agent.labels.join(", "))?;
+        }
         writeln!(
             output,
             "  disposition: {}",
@@ -342,13 +345,6 @@ fn disposition_name(disposition: rho_agent::db::AgentDisposition) -> String {
         AgentDisposition::Done => "done".to_owned(),
         AgentDisposition::Snoozed { until } => format!("snoozed until {}", until.0),
         AgentDisposition::Hidden => "hidden".to_owned(),
-    }
-}
-
-fn status_name(status: Status) -> &'static str {
-    match status {
-        Status::Normal => "normal",
-        Status::Pinned => "pinned",
     }
 }
 

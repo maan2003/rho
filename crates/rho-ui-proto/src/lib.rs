@@ -12,7 +12,7 @@ use camino::Utf8PathBuf;
 pub use rho_agent::MessageDelivery;
 pub use rho_agent::db::{
     AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
-    Status, TagId, TagKind,
+    WorkstreamId,
 };
 use rho_core::ContentPart;
 pub use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
@@ -71,18 +71,10 @@ pub struct IoStats {
 pub enum ClientMessage {
     Ping,
     Subscribe,
-    NewTag {
-        name: String,
-        kind: TagKind,
-        parent: Option<TagId>,
-    },
     NewAgent {
-        /// Seed tags for the new agent. A workstream tag joins that
-        /// workstream; otherwise the daemon founds a fresh workstream
-        /// (named provisionally until the agent's generated title lands),
-        /// parented to the first workstream-group tag given. Labels carry
-        /// over verbatim.
-        tags: Vec<TagId>,
+        /// The workstream to join; `None` founds a fresh one, named
+        /// provisionally until the agent's generated title lands.
+        workstream: Option<WorkstreamId>,
         role: AgentRole,
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).
@@ -105,8 +97,9 @@ pub enum ClientMessage {
         agent_id: AgentId,
         name: String,
     },
-    RenameTag {
-        tag_id: TagId,
+    /// Renames a workstream; a colliding name gets a numeric suffix.
+    WorkstreamRename {
+        workstream_id: WorkstreamId,
         name: String,
     },
     CancelTurn {
@@ -119,28 +112,29 @@ pub enum ClientMessage {
     ContinueTurn {
         agent_id: AgentId,
     },
-    /// Applies a tag to an agent, with kind-aware semantics: a workstream
-    /// tag replaces the agent's current workstream (a move); a
-    /// workstream-group re-parents the agent's workstream tag; a label is
-    /// added to the set.
-    TagAgent {
-        agent_id: AgentId,
-        target: TagTarget,
+    /// Adds or removes one free-form label on a workstream; semantics
+    /// ("pin", "group:slack", …) live in the client's view layer.
+    WorkstreamLabel {
+        workstream_id: WorkstreamId,
+        label: String,
+        add: bool,
     },
-    /// Removes a label from the agent (workstream membership is moved, not
-    /// removed).
-    UntagAgent {
+    /// Adds or removes one free-form label on an agent.
+    AgentLabel {
         agent_id: AgentId,
-        tag_id: TagId,
+        label: String,
+        add: bool,
     },
-    /// Pin an agent, or return it to normal.
-    SetAgentStatus {
+    /// Moves an agent to another workstream; its spawn subtree moves with
+    /// it (an agent's workstream is always its root's).
+    AgentMove {
         agent_id: AgentId,
-        status: Status,
+        target: WorkstreamTarget,
     },
-    SetTagStatus {
-        tag_id: TagId,
-        status: Status,
+    /// Replaces the stored client view configuration; the daemon keeps the
+    /// bytes opaque and hands them back on [`ServerMessage::Ready`].
+    ViewConfigSet {
+        data: Vec<u8>,
     },
     /// The user's verdict on an agent's last finished turn. Attention is
     /// action-cleared: viewing an agent never clears it; `Done`, snoozing,
@@ -368,14 +362,13 @@ pub enum JoinTarget {
     User { repo: Utf8PathBuf },
 }
 
-/// Destination of [`ClientMessage::TagAgent`]. `Named` is resolved by the
-/// daemon against tag display names (of the given kind) and creates the
-/// tag when no match exists, so "spin off a group around this agent" is
-/// one message.
+/// Destination of [`ClientMessage::AgentMove`]. `Named` is resolved by the
+/// daemon against workstream names and creates the workstream when no match
+/// exists, so "spin off a workstream around this agent" is one message.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum TagTarget {
-    Existing(TagId),
-    Named { name: String, kind: TagKind },
+pub enum WorkstreamTarget {
+    Existing(WorkstreamId),
+    Named(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -400,9 +393,12 @@ pub struct LandLeaseHolder {
 pub enum ServerMessage {
     Pong,
     Ready {
-        tags: Vec<UiTag>,
+        workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
+        /// The client-owned view configuration blob, verbatim from the last
+        /// [`ClientMessage::ViewConfigSet`] (empty if never set).
+        view_config: Vec<u8>,
         /// The daemon database's machine seed; clients need it to encode
         /// agent IDs (see [`AgentIdDomain`]).
         machine_seed: u64,
@@ -426,10 +422,10 @@ pub enum ServerMessage {
     },
     AgentCreated {
         agent_id: AgentId,
-        tags: Vec<TagId>,
+        workstream: WorkstreamId,
     },
-    TagCreated {
-        tag: UiTag,
+    WorkstreamCreated {
+        workstream: UiWorkstream,
     },
     AgentLoaded {
         agent_id: AgentId,
@@ -510,14 +506,12 @@ pub enum ServerMessage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiTag {
-    pub tag_id: TagId,
+pub struct UiWorkstream {
+    pub workstream_id: WorkstreamId,
     pub name: String,
-    pub kind: TagKind,
-    /// Structure between tags (workstream → workstream-group); membership
-    /// in ancestors is implied, never stored on agents.
-    pub parent: Option<TagId>,
-    pub status: Status,
+    /// Free-form markers ("pin", "group:slack", …); semantics live in the
+    /// client's view layer.
+    pub labels: Vec<String>,
 }
 
 /// Enough about an agent to list and label it without loading it.
@@ -537,7 +531,6 @@ pub struct UiAgentSummary {
     /// themselves: "on top of agent" is the revset `<workspace name>@`, and
     /// joining sends the info back verbatim.
     pub workspace: WorkspaceInfo,
-    pub status: Status,
     /// Attention level at summary time; kept current afterwards by
     /// [`ServerMessage::AgentAttention`].
     pub attention: UiAttention,
@@ -548,10 +541,11 @@ pub struct UiAgentSummary {
     /// The user filed this agent away (`AgentDisposition::Hidden`): fold it
     /// immediately instead of waiting out the rail's idle window.
     pub hidden: bool,
-    /// The agent's tags: at most one workstream plus any labels. Copied
-    /// from the parent on spawn.
-    #[senax(default)]
-    pub tags: Vec<TagId>,
+    /// The workstream this agent belongs to (exactly one).
+    pub workstream: WorkstreamId,
+    /// Free-form markers ("pin", …); semantics live in the client's view
+    /// layer.
+    pub labels: Vec<String>,
 }
 
 /// How urgently an agent wants the user, in ascending order — the rail's

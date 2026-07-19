@@ -5,37 +5,8 @@ use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
 use rho_workspaces::WorkspaceInfo;
-use senax_encoder::Decoder as _;
 
 use super::*;
-
-#[test]
-fn tag_record_decodes_legacy_hidden_field() {
-    let legacy = TagRecordDecode {
-        name: "legacy".to_owned(),
-        kind: TagKind::Workstream,
-        parent: Some(TagId(7)),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(2),
-        status: Status::Pinned,
-        hidden: true,
-    };
-    let mut bytes = senax_encoder::encode(&legacy).unwrap();
-
-    let decoded = TagRecord::decode(&mut bytes).unwrap();
-
-    assert_eq!(
-        decoded,
-        TagRecord {
-            name: "legacy".to_owned(),
-            kind: TagKind::Workstream,
-            parent: Some(TagId(7)),
-            created_at: UnixMs(1),
-            updated_at: UnixMs(2),
-            status: Status::Pinned,
-        }
-    );
-}
 
 #[test]
 fn agent_role_resolves_opinionated_bindings() {
@@ -172,24 +143,59 @@ fn test_agent_runtime() -> AgentRuntime {
 }
 
 #[tokio::test]
-async fn tag_names_are_uniquified_by_suffix() {
+async fn workstream_names_are_uniquified_by_suffix() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.init_agent_tables();
-    let first = write.create_tag(UnixMs(1), "team".to_owned(), TagKind::Workstream, None);
-    let second = write.create_tag(UnixMs(2), "team".to_owned(), TagKind::Workstream, None);
-    let third = write.create_tag(UnixMs(3), "team".to_owned(), TagKind::Label, None);
+    let first = write.create_workstream(UnixMs(1), "team".to_owned());
+    let second = write.create_workstream(UnixMs(2), "team".to_owned());
+    let third = write.create_workstream(UnixMs(3), "crew".to_owned());
     // Renaming onto a taken name suffixes too; renaming to your own name
     // does not.
-    write.set_tag_name(UnixMs(4), third, "team".to_owned());
-    write.set_tag_name(UnixMs(5), first, "team".to_owned());
+    write.set_workstream_name(UnixMs(4), third, "team".to_owned());
+    write.set_workstream_name(UnixMs(5), first, "team".to_owned());
     write.commit();
 
     let read = db.read();
-    assert_eq!(read.get_tag(first).name, "team");
-    assert_eq!(read.get_tag(second).name, "team-2");
-    assert_eq!(read.get_tag(third).name, "team-3");
+    assert_eq!(read.get_workstream(first).name, "team");
+    assert_eq!(read.get_workstream(second).name, "team-2");
+    assert_eq!(read.get_workstream(third).name, "team-3");
+}
+
+#[tokio::test]
+async fn labels_toggle_without_duplicates() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let workstream = write.create_workstream(UnixMs(1), "team".to_owned());
+    let agent_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        agent_id,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        None,
+    );
+    write.workstream_label(UnixMs(2), workstream, "pin", true);
+    write.workstream_label(UnixMs(3), workstream, "pin", true);
+    write.workstream_label(UnixMs(4), workstream, "group:slack", true);
+    write.agent_label(UnixMs(5), agent_id, "urgent", true);
+    write.agent_label(UnixMs(6), agent_id, "urgent", true);
+    write.agent_label(UnixMs(7), agent_id, "review", true);
+    write.agent_label(UnixMs(8), agent_id, "urgent", false);
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(
+        read.get_workstream(workstream).labels,
+        ["pin", "group:slack"]
+    );
+    assert_eq!(read.get_agent(agent_id).labels, ["review"]);
 }
 
 #[tokio::test]
@@ -198,12 +204,12 @@ async fn agent_spawned_by_is_stored_at_creation() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.init_agent_tables();
-    let tag = write.create_tag(UnixMs(1), "team".to_owned(), TagKind::Workstream, None);
+    let workstream = write.create_workstream(UnixMs(1), "team".to_owned());
     let pm = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         pm,
-        vec![tag],
+        workstream,
         None,
         vec![test_workspace()],
         AgentRole::pm().session_profile().unwrap(),
@@ -214,7 +220,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
     write.create_agent(
         UnixMs(2),
         engineer,
-        vec![tag],
+        workstream,
         None,
         vec![test_workspace()],
         AgentRole::default().session_profile().unwrap(),
@@ -256,6 +262,157 @@ fn agent_db_migrations_eventually_reach_current_format() {
             format = next.to;
         }
     }
+}
+
+/// The pre-workstream on-disk shape of [`AgentRecord`]; senax field ids
+/// hash field names, so a same-named-fields struct produces bytes the
+/// current decoder must accept.
+#[derive(Encode)]
+struct PreWorkstreamAgentRecord {
+    display_name: Option<String>,
+    workdirs: Vec<WorkspaceInfo>,
+    status: Status,
+    created_at: UnixMillis,
+    updated_at: UnixMillis,
+    current_lineage: AgentLineageId,
+    parent_agent: Option<AgentId>,
+    spawned_by: AgentSpawnedBy,
+    role: AgentRole,
+    binding: SessionBinding,
+    runtime: AgentRuntime,
+    last_user_message: UnixMillis,
+    disposition: AgentDisposition,
+    tags: Vec<TagId>,
+}
+
+fn pre_workstream_agent(
+    display_name: Option<&str>,
+    parent_agent: Option<AgentId>,
+    status: Status,
+    tags: Vec<TagId>,
+) -> PreWorkstreamAgentRecord {
+    PreWorkstreamAgentRecord {
+        display_name: display_name.map(str::to_owned),
+        workdirs: vec![test_workspace()],
+        status,
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        current_lineage: AgentLineageId(1),
+        parent_agent,
+        spawned_by: AgentSpawnedBy::Direct,
+        role: AgentRole::default(),
+        binding: SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        runtime: test_agent_runtime(),
+        last_user_message: UnixMs(1),
+        disposition: AgentDisposition::Pending,
+        tags,
+    }
+}
+
+#[tokio::test]
+async fn migration_turns_tags_into_workstreams_and_labels() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let agent_id = |counter| AgentId::from_counter(counter, &AgentIdDomain(0)).unwrap();
+    let (tagged, child, orphan) = (agent_id(1), agent_id(2), agent_id(3));
+
+    // A pre-migration database: a pinned workstream tag inside a group, a
+    // label tag, and three agents — one tagged, one child inheriting via
+    // its parent, one with no workstream tag at all.
+    let mut write = db.write().await;
+    write.open_table(FORMAT).insert(&(), &"f3b8d24a".to_owned());
+    write
+        .open_table(COUNTERS)
+        .insert(&CounterKey::LAST_WORKSTREAM_ID, &3u64);
+    {
+        let mut tags = write.open_table(LEGACY_TAGS);
+        let tag = |name: &str, kind, parent, status| TagRecord {
+            name: name.to_owned(),
+            kind,
+            parent,
+            created_at: UnixMs(1),
+            updated_at: UnixMs(2),
+            status,
+        };
+        tags.insert(
+            &TagId(1),
+            SenValue::borrowed(&tag(
+                "team",
+                TagKind::Workstream,
+                Some(TagId(3)),
+                Status::Pinned,
+            )),
+        );
+        tags.insert(
+            &TagId(2),
+            SenValue::borrowed(&tag("urgent", TagKind::Label, None, Status::Normal)),
+        );
+        tags.insert(
+            &TagId(3),
+            SenValue::borrowed(&tag(
+                "slack",
+                TagKind::WorkstreamGroup,
+                None,
+                Status::Normal,
+            )),
+        );
+    }
+    {
+        let mut agents = write.open_table(AGENTS);
+        agents.insert(
+            &tagged,
+            SenValue::borrowed(&pre_workstream_agent(
+                None,
+                None,
+                Status::Pinned,
+                vec![TagId(1), TagId(2)],
+            )),
+        );
+        agents.insert(
+            &child,
+            SenValue::borrowed(&pre_workstream_agent(
+                None,
+                Some(tagged),
+                Status::Normal,
+                Vec::new(),
+            )),
+        );
+        agents.insert(
+            &orphan,
+            SenValue::borrowed(&pre_workstream_agent(
+                Some("solo"),
+                None,
+                Status::Normal,
+                Vec::new(),
+            )),
+        );
+    }
+    write.commit();
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    let read = db.read();
+    let team = read.get_workstream(WorkstreamId(1));
+    assert_eq!(team.name, "team");
+    assert_eq!(team.labels, ["group:slack", "pin"]);
+
+    let tagged = read.get_agent(tagged);
+    assert_eq!(tagged.workstream, WorkstreamId(1));
+    assert_eq!(tagged.labels, ["urgent", "pin"]);
+    assert_eq!(tagged.legacy, LegacyAgentFields::default());
+    assert_eq!(tagged.disposition, AgentDisposition::Pending);
+    assert_eq!(read.get_agent(child).workstream, WorkstreamId(1));
+
+    // The orphan founds its own workstream past the persisted counter.
+    let orphan = read.get_agent(orphan);
+    assert_eq!(orphan.workstream, WorkstreamId(4));
+    assert_eq!(read.get_workstream(WorkstreamId(4)).name, "solo");
+
+    assert!(!read.has_table("tags"));
+    let format = read.open_table(FORMAT).get(&()).unwrap().value();
+    assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
 }
 
 #[test]
@@ -335,12 +492,12 @@ async fn create_agent_and_append_events_with_cursor() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let tag_id = write.create_tag(UnixMs(1), "default".to_owned(), TagKind::Workstream, None);
+    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     let agent_id = write.alloc_agent_id();
     let next = write.create_agent(
         UnixMs(1),
         agent_id,
-        vec![tag_id],
+        workstream,
         Some("main".to_owned()),
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -354,8 +511,7 @@ async fn create_agent_and_append_events_with_cursor() {
     let read = db.read();
     let agent = read.get_agent(agent_id);
     assert_eq!(agent.display_name.as_deref(), Some("main"));
-    assert_eq!(agent.tags, [tag_id]);
-    assert_eq!(read.agent_workstream(agent_id), Some(tag_id));
+    assert_eq!(agent.workstream, workstream);
 
     let (next, events) = read.agent_events(agent_id);
     assert_eq!(next.seq, 2);
@@ -370,11 +526,12 @@ async fn agent_events_read_lineage_parents() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
+    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     let agent_id = write.alloc_agent_id();
     let next = write.create_agent(
         UnixMs(1),
         agent_id,
-        Vec::new(),
+        workstream,
         Some("main".to_owned()),
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -417,11 +574,12 @@ async fn fork_agent_lineage_repoints_current_branch() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
+    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     let agent_id = write.alloc_agent_id();
     let next = write.create_agent(
         UnixMs(1),
         agent_id,
-        Vec::new(),
+        workstream,
         Some("main".to_owned()),
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -444,67 +602,79 @@ async fn fork_agent_lineage_repoints_current_branch() {
 }
 
 #[tokio::test]
-async fn set_agent_tags_replaces_the_set() {
+async fn set_agent_workstream_moves_the_agent() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let first = write.create_tag(UnixMs(1), "default".to_owned(), TagKind::Workstream, None);
-    let second = write.create_tag(UnixMs(1), "infra".to_owned(), TagKind::Workstream, None);
+    let first = write.create_workstream(UnixMs(1), "default".to_owned());
+    let second = write.create_workstream(UnixMs(1), "infra".to_owned());
     let agent_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         agent_id,
-        vec![first],
+        first,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
-    write.set_agent_tags(UnixMs(2), agent_id, vec![second]);
+    write.set_agent_workstream(UnixMs(2), agent_id, second);
     write.commit();
 
-    let read = db.read();
-    assert_eq!(read.get_agent(agent_id).tags, [second]);
-    assert_eq!(read.agent_workstream(agent_id), Some(second));
+    assert_eq!(db.read().get_agent(agent_id).workstream, second);
 }
 
 #[tokio::test]
-async fn tag_and_agent_statuses_are_settable() {
+async fn turn_end_and_user_message_set_dispositions() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let tag_id = write.create_tag(UnixMs(1), "infra".to_owned(), TagKind::Workstream, None);
+    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     let agent_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         agent_id,
-        vec![tag_id],
+        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
-    write.set_tag_status(UnixMs(2), tag_id, Status::Pinned);
-    write.set_tag_name(UnixMs(3), tag_id, "platform".to_owned());
-    write.set_agent_status(UnixMs(2), agent_id, Status::Pinned);
-    write.set_agent_display_name(UnixMs(4), agent_id, "builder".to_owned());
+    write.record_agent_turn_end(agent_id);
     write.commit();
+    assert_eq!(
+        db.read().get_agent(agent_id).disposition,
+        AgentDisposition::Pending
+    );
 
-    let read = db.read();
-    let tag = read.get_tag(tag_id);
-    assert_eq!(tag.name, "platform");
-    assert_eq!(tag.status, Status::Pinned);
-    assert_eq!(tag.updated_at, UnixMs(3));
-    let agent = read.get_agent(agent_id);
-    assert_eq!(agent.status, Status::Pinned);
-    assert_eq!(agent.display_name.as_deref(), Some("builder"));
-    assert_eq!(agent.updated_at, UnixMs(4));
+    let mut write = db.write().await;
+    write.record_agent_user_message(UnixMs(5), agent_id);
+    write.commit();
+    let agent = db.read().get_agent(agent_id);
+    assert_eq!(agent.disposition, AgentDisposition::Done);
+    assert_eq!(agent.last_user_message, UnixMs(5));
+}
+
+#[tokio::test]
+async fn view_config_round_trips_and_defaults_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+    assert_eq!(db.read().view_config(), Vec::<u8>::new());
+
+    let mut write = db.write().await;
+    write.set_view_config(vec![1, 2, 3]);
+    write.commit();
+    assert_eq!(db.read().view_config(), [1, 2, 3]);
 }
 
 #[tokio::test]
@@ -558,6 +728,7 @@ async fn agent_ids_allocate_before_records_exist() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
+    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     // Only the second allocation gets a record, as when the first jj
     // checkout fails.
     let leaked_id = write.alloc_agent_id();
@@ -566,7 +737,7 @@ async fn agent_ids_allocate_before_records_exist() {
     write.create_agent(
         UnixMs(2),
         agent_id,
-        Vec::new(),
+        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),

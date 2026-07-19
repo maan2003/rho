@@ -13,7 +13,7 @@
 
 use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, TextStyle, div, px};
-use rho_ui_proto::{AgentId, Status, UiAgentSummary, UiAttention};
+use rho_ui_proto::{AgentId, UiAgentSummary, UiAttention};
 use theme::ActiveTheme as _;
 use ui::{Color, Icon, IconName, IconSize};
 
@@ -67,17 +67,16 @@ pub fn render_topic_rail(
                 cx,
             )
         };
-        match topic.group {
+        match &topic.group {
             None => rows.push(row(topic, false, cx)),
             Some(group) => {
-                if !seen_groups.insert(group) {
+                if !seen_groups.insert(group.clone()) {
                     continue;
                 }
-                let name = registry.tag_name(group).unwrap_or("group").to_owned();
-                rows.push(group_header(&name, text_style));
+                rows.push(group_header(group, text_style));
                 for member in display[index..]
                     .iter()
-                    .filter(|member| member.group == Some(group))
+                    .filter(|member| member.group.as_ref() == Some(group))
                 {
                     rows.push(row(member, true, cx));
                 }
@@ -181,9 +180,16 @@ fn fold_row(
 #[cfg(test)]
 mod tests {
     use rho_core::UnixMs;
-    use rho_ui_proto::{AgentIdDomain, AgentRole, TagId, TagKind, UiTag, WorkspaceInfo};
+    use rho_ui_proto::{AgentIdDomain, AgentRole, UiWorkstream, WorkspaceInfo, WorkstreamId};
 
     use super::*;
+
+    /// Pin state fixture shorthand, in the shape the old tag `Status` had.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Status {
+        Normal,
+        Pinned,
+    }
 
     /// Freshly-engaged fixture (`last_active` at now + `id`) for deterministic
     /// active-bucket ordering.
@@ -198,19 +204,22 @@ mod tests {
             workspace: WorkspaceInfo::UserCheckout {
                 repo: "/tmp".into(),
             },
-            status,
             attention: UiAttention::Quiet,
             last_active: UnixMs(crate::workspace::now_ms() + id),
             hidden: false,
-            tags: vec![TagId(1)],
+            workstream: WorkstreamId(1),
+            labels: match status {
+                Status::Normal => Vec::new(),
+                Status::Pinned => vec![crate::registry::PIN_LABEL.to_owned()],
+            },
         }
     }
 
     fn topic(status: Status, agents: Vec<UiAgentSummary>) -> Workstream {
         Workstream {
-            tag_id: TagId(1),
+            workstream_id: WorkstreamId(1),
             name: "topic".to_owned(),
-            status,
+            pinned: status == Status::Pinned,
             hidden: false,
             group: None,
             agents,
@@ -218,13 +227,15 @@ mod tests {
     }
 
     fn install(registry: &mut AgentRegistry, topic: &Workstream) {
+        let mut labels = Vec::new();
+        if topic.pinned {
+            labels.push(crate::registry::PIN_LABEL.to_owned());
+        }
         registry.set_data(
-            vec![UiTag {
-                tag_id: topic.tag_id,
+            vec![UiWorkstream {
+                workstream_id: topic.workstream_id,
                 name: topic.name.clone(),
-                kind: TagKind::Workstream,
-                parent: topic.group,
-                status: topic.status,
+                labels,
             }],
             topic.agents.clone(),
         );
@@ -463,7 +474,7 @@ fn task_row(
     let primary = agents.first().map(|summary| summary.agent_id);
     let selected = selected_agent
         .is_some_and(|selected| topic.agent_ids().any(|agent_id| agent_id == *selected));
-    let pinned = topic.status == Status::Pinned;
+    let pinned = topic.pinned;
     // The row lamp is the most urgent member: acting on the task means
     // acting on whoever inside it wants the user.
     let attention = agents

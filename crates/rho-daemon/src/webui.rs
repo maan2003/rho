@@ -16,8 +16,8 @@ use camino::Utf8PathBuf;
 use rho_core::ContentPart;
 use rho_ui_proto::remote::UiAgentState;
 use rho_ui_proto::{
-    AgentId, AgentRole, ClientMessage, MessageDelivery, ServerMessage, StartMode, TagKind,
-    UiAgentSummary, UiProject, UiTag, read_frame, write_frame,
+    AgentId, AgentRole, ClientMessage, MessageDelivery, ServerMessage, StartMode, UiAgentSummary,
+    UiProject, UiWorkstream, read_frame, write_frame,
 };
 use rho_webui_messages::{FromBrowser, MAX_LINE_LEN, ToBrowser};
 use tokio::io::{
@@ -86,7 +86,7 @@ where
         }
     });
 
-    let mut tags: Vec<UiTag> = Vec::new();
+    let mut workstreams: Vec<UiWorkstream> = Vec::new();
     let mut agents_list: Vec<UiAgentSummary> = Vec::new();
     let mut projects: Vec<UiProject> = Vec::new();
     let mut agent_ids: HashMap<String, AgentId> = HashMap::new();
@@ -103,16 +103,16 @@ where
                     anyhow::bail!("daemon session closed");
                 };
                 match message {
-                    ServerMessage::Ready { tags: new_tags, agents: new_agents, projects: new_projects, .. } => {
-                        tags = new_tags;
+                    ServerMessage::Ready { workstreams: new_workstreams, agents: new_agents, projects: new_projects, .. } => {
+                        workstreams = new_workstreams;
                         agents_list = new_agents;
                         projects = new_projects;
                         index_agent_ids(&agents_list, &mut agent_ids);
-                        send_json(&mut writer, &json::hello(&tags, &agents_list, &projects)).await?;
+                        send_json(&mut writer, &json::hello(&workstreams, &agents_list, &projects)).await?;
                     }
-                    ServerMessage::TagCreated { tag } => {
-                        tags.push(tag);
-                        send_json(&mut writer, &json::hello(&tags, &agents_list, &projects)).await?;
+                    ServerMessage::WorkstreamCreated { workstream } => {
+                        workstreams.push(workstream);
+                        send_json(&mut writer, &json::hello(&workstreams, &agents_list, &projects)).await?;
                     }
                     ServerMessage::AgentAttention { agent_id, attention } => {
                         for agent in &mut agents_list {
@@ -120,7 +120,7 @@ where
                                 agent.attention = attention;
                             }
                         }
-                        send_json(&mut writer, &json::hello(&tags, &agents_list, &projects)).await?;
+                        send_json(&mut writer, &json::hello(&workstreams, &agents_list, &projects)).await?;
                     }
                     ServerMessage::Agent { agent_id, frame } => {
                         let state = states.entry(agent_id).or_insert_with(empty_state);
@@ -178,11 +178,9 @@ where
                     }
                     FromBrowser::NewAgent { topic_id, repo, role, join, sandbox, revset, text } => {
                         // An unknown workstream founds a new one for the agent.
-                        let seed_tags = tags.iter()
-                            .find(|tag| tag.kind == TagKind::Workstream
-                                && format!("tp-{}", tag.tag_id.0) == topic_id)
-                            .map(|tag| vec![tag.tag_id])
-                            .unwrap_or_default();
+                        let workstream = workstreams.iter()
+                            .find(|workstream| format!("tp-{}", workstream.workstream_id.0) == topic_id)
+                            .map(|workstream| workstream.workstream_id);
                         let role = match parse_role(&role) {
                             Some(role) => role,
                             None => {
@@ -199,7 +197,7 @@ where
                             StartMode::NewOn { repo, revset }
                         };
                         write_frame(&mut session_write, &ClientMessage::NewAgent {
-                            tags: seed_tags,
+                            workstream,
                             role,
                             start,
                             content: Some(vec![ContentPart::Text { text }]),
