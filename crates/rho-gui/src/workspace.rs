@@ -148,6 +148,10 @@ pub struct Workspace {
     /// quit-one) before a final escape closes the strip.
     transient_stack: Vec<crate::transient::Transient>,
     transient_focus: gpui::FocusHandle,
+    /// Where focus lived when the leader chord began — the dashboard or a
+    /// pane. Transient actions run against (and closing returns to) that
+    /// origin, so `space a d` from home mode stays in home mode.
+    transient_origin: Option<gpui::FocusHandle>,
     /// Menus stay invisible for a beat so fast fingers never see them;
     /// pausing reveals the full menu. Submenus opened from a visible menu
     /// show immediately.
@@ -240,6 +244,7 @@ impl Workspace {
             transient: None,
             transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
+            transient_origin: None,
             transient_visible: false,
             transient_reveal: None,
             echo: None,
@@ -2131,8 +2136,25 @@ impl Workspace {
         });
         self.minibuffer = None;
         self.echo = None;
+        // Capture the chain's origin on first open; submenu reopens see
+        // focus already restored to that origin and re-capture the same.
+        if !self.transient_focus.is_focused(window) {
+            self.transient_origin = window.focused(cx);
+        }
         window.focus(&self.transient_focus, cx);
         cx.notify();
+    }
+
+    /// Returns focus to where it was when the leader chord began, falling
+    /// back to the active surface.
+    fn restore_transient_origin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.transient_origin.clone() {
+            Some(handle) => {
+                window.focus(&handle, cx);
+                cx.notify();
+            }
+            None => self.focus_active_surface(window, cx),
+        }
     }
 
     /// Clears the menu and its reveal state without touching focus.
@@ -2146,7 +2168,8 @@ impl Workspace {
     fn close_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.transient.is_some() {
             self.drop_transient();
-            self.focus_active_surface(window, cx);
+            self.restore_transient_origin(window, cx);
+            self.transient_origin = None;
             cx.notify();
         }
     }
@@ -2202,9 +2225,10 @@ impl Workspace {
                 // invisible too: remember visibility across the action.
                 let was_visible = self.transient_visible;
                 let parent = self.transient.take();
-                // Restore focus first so the action sees normal focus;
+                // Restore focus to the chord's origin first so the action
+                // sees normal focus (and a dashboard chord stays home);
                 // submenus and prompts re-take the strip themselves.
-                self.focus_active_surface(window, cx);
+                self.restore_transient_origin(window, cx);
                 run(self, window, cx);
                 if self.transient.is_some() {
                     // The action opened a submenu: its parent waits under
@@ -2215,6 +2239,7 @@ impl Workspace {
                     self.transient_stack.clear();
                     self.transient_visible = false;
                     self.transient_reveal = None;
+                    self.transient_origin = None;
                 }
                 cx.notify();
             }
