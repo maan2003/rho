@@ -2529,7 +2529,7 @@ impl Workspace {
                 } else {
                     gpui::relative(1.0)
                 })
-                .pl(px(40.))
+                .pl(px(24.))
                 .pr(px(24.))
                 .child(self.render_dashboard_header(text_style, cx))
         } else {
@@ -2722,7 +2722,7 @@ impl Workspace {
             // focused: who this is, where it runs, how full its context is.
             if home {
                 element
-                    .mt(gpui::relative(0.05))
+                    .mt(gpui::relative(0.02))
                     .border_1()
                     .border_color(separator_color)
                     .rounded_t_md()
