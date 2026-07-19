@@ -122,6 +122,9 @@ fn display_key(spec: &str) -> String {
 /// agent, plus a door into the agent menu.
 pub fn root_menu() -> Transient {
     Transient::new("rho")
+        .item("w", "workstream…", |workspace, window, cx| {
+            workspace.open_transient(workstream_menu(), window, cx);
+        })
         .item("a", "agent…", |workspace, window, cx| {
             workspace.open_transient(agent_menu(), window, cx);
         })
@@ -198,9 +201,6 @@ pub fn agent_menu() -> Transient {
         .item("n", "new agent", |workspace, window, cx| {
             workspace.cmd_agent_new(window, cx);
         })
-        .item("shift-t", "workstream…", |workspace, window, cx| {
-            workspace.open_transient(workstream_menu(), window, cx);
-        })
 }
 
 fn snooze_menu() -> Transient {
@@ -220,7 +220,8 @@ fn snooze_menu() -> Transient {
         })
 }
 
-/// `space a T`: workstream operations, rare enough to live one level down.
+/// `space w`: operations on the focused workstream (and moving agents
+/// into it).
 fn workstream_menu() -> Transient {
     Transient::new("workstream")
         .item("m", "move agent here…", |workspace, window, cx| {
