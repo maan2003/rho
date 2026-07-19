@@ -2666,6 +2666,7 @@ impl Workspace {
                 .flex_none()
                 .flex()
                 .flex_row()
+                .justify_end()
                 .items_baseline()
                 .gap(px(12.))
                 .px(px(12.))
