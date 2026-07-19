@@ -33,8 +33,8 @@ use crate::zed_remote::FileView;
 use crate::{
     AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, MinibufferCancel,
     MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose,
-    DashboardReply, PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle,
-    RoleCycleGroup,
+    DashboardNewAgent, DashboardReply, PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus,
+    RailOpen, RoleCycle, RoleCycleGroup,
     SubmitPrompt, TaskBoard,
 };
 
@@ -2407,16 +2407,50 @@ impl Workspace {
             Some(RowTarget::FoldToggle) => self.toggle_rail_tail(cx),
             Some(RowTarget::NewAgent) => self.enter_draft(None, window, cx),
             // Enter sends the inline reply draft (and closes it); an empty
-            // draft just closes.
+            // draft just closes. Disconnected, the draft stays parked
+            // rather than being consumed into the void.
             Some(RowTarget::Reply(agent_id)) => {
+                if !self.require_connected(cx) {
+                    return;
+                }
                 if let Some(text) = self.dashboard.take_reply(agent_id, cx) {
                     self.handle_submit(agent_id, text, cx);
+                }
+            }
+            Some(RowTarget::NewDraft) => {
+                if !self.require_connected(cx) {
+                    return;
+                }
+                if let Some(body) = self.dashboard.take_new_draft(cx) {
+                    self.create_inline_agent(body, cx);
                 }
             }
             Some(RowTarget::Stream { primary: None, .. })
             | Some(RowTarget::None)
             | None => {}
         }
+    }
+
+    /// Creates an agent from the dashboard's inline draft with the same
+    /// defaults the compose view seeds: a new change on `@-` in the
+    /// default working directory, default role. The compose surface
+    /// remains the place to pick anything else.
+    fn create_inline_agent(&mut self, body: String, cx: &mut Context<Self>) {
+        let workdir = self.draft_default_workdir();
+        let start = match self.parse_start(crate::draft_view::StartFieldMode::NewOn, "@-", workdir)
+        {
+            Ok(start) => start,
+            Err(message) => {
+                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                return;
+            }
+        };
+        self.connection.send(ClientMessage::NewAgent {
+            workstream: None,
+            role: rho_ui_proto::AgentRole::default(),
+            start,
+            content: Some(vec![ContentPart::Text { text: body }]),
+        });
     }
 
     /// `r` in the dashboard: splice an inline reply draft under the row —
@@ -2789,6 +2823,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardReply, _window, cx| {
                 this.dashboard_reply(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardNewAgent, _window, cx| {
+                this.dashboard.open_new_draft(cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(

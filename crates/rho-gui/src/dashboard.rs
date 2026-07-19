@@ -46,6 +46,8 @@ enum LineKey {
     FoldToggle,
     NewAgent,
     Reply(AgentId),
+    /// The inline new-agent draft, at the top of the listing.
+    NewDraft,
 }
 
 /// What the line under the cursor refers to; the object of every
@@ -62,6 +64,8 @@ pub enum RowTarget {
     NewAgent,
     /// An inline reply draft addressed to this agent.
     Reply(AgentId),
+    /// The inline new-agent draft.
+    NewDraft,
 }
 
 pub struct Dashboard {
@@ -79,6 +83,9 @@ pub struct Dashboard {
     /// Keeps the workspace re-rendering on draft edits, so placeholder
     /// and gutter chrome track the text.
     reply_subscriptions: HashMap<AgentId, gpui::Subscription>,
+    /// The inline new-agent draft, when open: its buffer plus the edit
+    /// subscription that keeps chrome fresh.
+    new_draft: Option<(Entity<Buffer>, gpui::Subscription)>,
     /// Move the cursor into this key's buffer on the next sync — how a
     /// freshly opened reply draft receives the cursor.
     pending_cursor: Option<LineKey>,
@@ -121,6 +128,7 @@ impl Dashboard {
             targets: HashMap::new(),
             replies: Vec::new(),
             reply_subscriptions: HashMap::new(),
+            new_draft: None,
             pending_cursor: None,
             lamp_ids: Vec::new(),
             placeholder_ids: Vec::new(),
@@ -158,6 +166,33 @@ impl Dashboard {
         }
         self.pending_cursor = Some(key);
         cx.notify();
+    }
+
+    /// Opens (or returns to) the inline new-agent draft at the top of the
+    /// listing. Like a reply draft it parks when left and survives
+    /// refreshes.
+    pub fn open_new_draft(&mut self, cx: &mut Context<Workspace>) {
+        if self.new_draft.is_none() {
+            let buffer = cx.new(|cx| Buffer::local("", cx));
+            let subscription = cx.subscribe(&buffer, |_, _, event, cx| {
+                if matches!(event, language::BufferEvent::Edited { .. }) {
+                    cx.notify();
+                }
+            });
+            self.buffers.insert(LineKey::NewDraft, buffer.clone());
+            self.new_draft = Some((buffer, subscription));
+        }
+        self.pending_cursor = Some(LineKey::NewDraft);
+        cx.notify();
+    }
+
+    /// Takes the new-agent draft's text and closes it. `None` when empty.
+    pub fn take_new_draft(&mut self, cx: &mut Context<Workspace>) -> Option<String> {
+        let (buffer, _) = self.new_draft.take()?;
+        let text = buffer.read(cx).text().trim().to_owned();
+        self.buffers.remove(&LineKey::NewDraft);
+        cx.notify();
+        (!text.is_empty()).then_some(text)
     }
 
     /// Takes a reply draft's text and closes it. `None` when the draft is
@@ -207,11 +242,24 @@ impl Dashboard {
             self.buffers.remove(&LineKey::Reply(agent_id));
             self.reply_subscriptions.remove(&agent_id);
         }
+        if self
+            .new_draft
+            .as_ref()
+            .is_some_and(|(buffer, _)| buffer.read(cx).is_empty())
+            && cursor_key != Some(LineKey::NewDraft)
+            && pending != Some(LineKey::NewDraft)
+        {
+            self.new_draft = None;
+            self.buffers.remove(&LineKey::NewDraft);
+        }
 
         // Interleave: each reply draft directly under its agent's row;
         // drafts whose row is folded away sit above the new-agent line so
         // they are never lost off-screen.
         let mut order = Vec::new();
+        if self.new_draft.is_some() {
+            order.push(LineKey::NewDraft);
+        }
         let mut orphans = self.replies.clone();
         for line in &lines {
             if line.key == LineKey::NewAgent {
@@ -277,9 +325,10 @@ impl Dashboard {
             });
         }
         // Prune buffers for lines that fell out of the listing (their
-        // excerpts are gone); open reply drafts always stay.
-        self.buffers
-            .retain(|key, _| order.contains(key) || matches!(key, LineKey::Reply(_)));
+        // excerpts are gone); open drafts always stay.
+        self.buffers.retain(|key, _| {
+            order.contains(key) || matches!(key, LineKey::Reply(_) | LineKey::NewDraft)
+        });
 
         self.targets = lines
             .iter()
@@ -288,6 +337,9 @@ impl Dashboard {
         for agent_id in &self.replies {
             self.targets
                 .insert(LineKey::Reply(*agent_id), RowTarget::Reply(*agent_id));
+        }
+        if self.new_draft.is_some() {
+            self.targets.insert(LineKey::NewDraft, RowTarget::NewDraft);
         }
 
         // The cursor follows its buffer: reposition only when the buffer
@@ -453,8 +505,25 @@ impl Dashboard {
         let to_remove = std::mem::take(&mut self.placeholder_ids);
         let mut inlays = Vec::new();
         let mut gutter_ranges = Vec::new();
-        for (index, agent_id) in self.replies.iter().enumerate() {
-            let Some(buffer) = self.buffers.get(&LineKey::Reply(*agent_id)) else {
+        let drafts = self
+            .replies
+            .iter()
+            .map(|agent_id| {
+                (
+                    LineKey::Reply(*agent_id),
+                    format!(
+                        "reply to {}… (enter sends)",
+                        registry.agent_id_label(*agent_id)
+                    ),
+                )
+            })
+            .chain(
+                self.new_draft
+                    .is_some()
+                    .then(|| (LineKey::NewDraft, "new agent… (enter creates)".to_owned())),
+            );
+        for (index, (key, placeholder)) in drafts.enumerate() {
+            let Some(buffer) = self.buffers.get(&key) else {
                 continue;
             };
             let buffer = buffer.read(cx);
@@ -469,11 +538,7 @@ impl Dashboard {
             };
             gutter_ranges.push(start..end);
             if buffer.is_empty() {
-                let label = format!(
-                    "reply to {}… (enter sends)",
-                    registry.agent_id_label(*agent_id)
-                );
-                let inlay = Inlay::custom(PLACEHOLDER_ID_BASE + index, end, label);
+                let inlay = Inlay::custom(PLACEHOLDER_ID_BASE + index, end, placeholder);
                 self.placeholder_ids.push(inlay.id);
                 inlays.push(inlay);
             }

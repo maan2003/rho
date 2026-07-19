@@ -50,6 +50,7 @@ actions!(
         AgentNew,
         AgentJumpAttention,
         AgentDone,
+        DashboardNewAgent,
         DashboardReply,
         RoleCycle,
         RoleCycleGroup,
@@ -499,6 +500,7 @@ fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("r", DashboardReply, Some(context)),
             KeyBinding::new("d", AgentDone, Some(context)),
+            KeyBinding::new("n", DashboardNewAgent, Some(context)),
         ]);
     }
 }
