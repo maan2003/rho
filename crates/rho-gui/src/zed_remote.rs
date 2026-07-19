@@ -169,7 +169,6 @@ impl FileView {
         (self.project.clone(), self.buffer.clone())
     }
 
-
     fn save(&mut self, _: &crate::FileSave, _window: &mut Window, cx: &mut Context<Self>) {
         let buffers = self.editor.read(cx).buffer().read(cx).all_buffers();
         let project = self.project.clone();

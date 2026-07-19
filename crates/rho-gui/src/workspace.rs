@@ -962,6 +962,11 @@ impl Workspace {
                 };
                 self.open_terminal_surface(agent_id, new, cx);
             }
+            Command::Buffer { name } => match name {
+                Some(name) => self.switch_buffer(&name, window, cx),
+                None => self.open_buffer_picker(window, cx),
+            },
+            Command::Close { name } => self.close_surface(name.as_deref(), window, cx),
 
             Command::Quit => cx.quit(),
             Command::Help => {
@@ -1010,8 +1015,9 @@ impl Workspace {
                 let path = self.resolve_workdir_path(path);
                 let label = self.workdir_label(&path);
                 let editor = self.focused_draft_editor();
-                self.draft_model
-                    .update(cx, |view, cx| view.seed(&label, true, editor.as_ref(), window, cx));
+                self.draft_model.update(cx, |view, cx| {
+                    view.seed(&label, true, editor.as_ref(), window, cx)
+                });
             }
             None => self.seed_draft(false, window, cx),
         }
@@ -1213,8 +1219,9 @@ impl Workspace {
             .map(|path| self.workdir_label(&path))
             .unwrap_or_default();
         let editor = self.focused_draft_editor();
-        self.draft_model
-            .update(cx, |view, cx| view.seed(&label, force_header, editor.as_ref(), window, cx));
+        self.draft_model.update(cx, |view, cx| {
+            view.seed(&label, force_header, editor.as_ref(), window, cx)
+        });
     }
 
     /// Where a new agent works when the draft doesn't say: the inherited
@@ -1357,15 +1364,211 @@ impl Workspace {
             .find(|surface| pred(surface))
     }
 
+    /// Human name of a surface, as `:buffer`/`:close` address it.
+    fn surface_name(&self, key: &SurfaceKey) -> String {
+        match key {
+            SurfaceKey::Draft => "draft".to_owned(),
+            SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
+            SurfaceKey::File { path, .. } => path.to_string(),
+            SurfaceKey::Terminal {
+                agent_id,
+                terminal_id,
+            } => format!(
+                "term {}/{terminal_id}",
+                self.registry.agent_id_label(*agent_id)
+            ),
+        }
+    }
+
+    fn surface_kind(key: &SurfaceKey) -> &'static str {
+        match key {
+            SurfaceKey::Draft => "compose",
+            SurfaceKey::Transcript(_) => "transcript",
+            SurfaceKey::File { .. } => "file",
+            SurfaceKey::Terminal { .. } => "terminal",
+        }
+    }
+
+    /// The active context's surfaces as `(name, kind)` for completion.
+    pub fn buffer_table(&self) -> Vec<(String, String)> {
+        self.surfaces
+            .get(&self.active_context)
+            .map(|list| {
+                list.iter()
+                    .map(|surface| {
+                        (
+                            self.surface_name(&surface.key),
+                            Self::surface_kind(&surface.key).to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Resolves a `:buffer`/`:close` argument: exact name first, then a
+    /// unique case-insensitive substring match.
+    fn surface_named(&self, name: &str) -> Option<&Surface> {
+        let list = self.surfaces.get(&self.active_context)?;
+        if let Some(surface) = list
+            .iter()
+            .find(|surface| self.surface_name(&surface.key) == name)
+        {
+            return Some(surface);
+        }
+        let needle = name.to_lowercase();
+        let mut matches = list.iter().filter(|surface| {
+            self.surface_name(&surface.key)
+                .to_lowercase()
+                .contains(&needle)
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    /// `:buffer <name>`: shows the named surface in the focused pane (or
+    /// focuses a pane already showing it).
+    fn switch_buffer(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(surface) = self.surface_named(name).cloned() else {
+            self.notice_on(
+                None,
+                &format!("no surface matching `{name}`"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        self.display_surface(surface);
+        self.sync_selection_to_focus(cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    /// Bare `:buffer`: a completing-read picker over the context's
+    /// surface list, emacs `C-x b`.
+    fn open_buffer_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _cx: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            workspace
+                .buffer_table()
+                .into_iter()
+                .filter(|(name, _)| name.to_lowercase().contains(&needle))
+                .map(|(name, kind)| crate::commands::Candidate {
+                    value: name,
+                    description: kind,
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let input = input.trim();
+                if !input.is_empty() {
+                    workspace.switch_buffer(input, window, cx);
+                }
+            },
+        );
+        let text_style = self
+            .active_editor(cx)
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        let mut minibuffer =
+            Minibuffer::open("buffer:", &text_style, complete, on_submit, window, cx);
+        minibuffer.refresh(self, cx);
+        self.minibuffer = Some(minibuffer);
+        self.echo = None;
+        cx.notify();
+    }
+
+    /// `:close [name]`: removes a surface from the context. Panes showing
+    /// it fall back to their own history, then to the list's most recent
+    /// conversation surface. Dropping a terminal's last view detaches its
+    /// wire client (the daemon keeps the pty; `:term` reattaches).
+    fn close_surface(&mut self, name: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let key = match name {
+            Some(name) => match self.surface_named(name) {
+                Some(surface) => surface.key.clone(),
+                None => {
+                    self.notice_on(
+                        None,
+                        &format!("no surface matching `{name}`"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                }
+            },
+            None => self.active_tree().focused().surface.key.clone(),
+        };
+        let Some(list) = self.surfaces.get_mut(&self.active_context) else {
+            return;
+        };
+        if list.iter().filter(|s| s.key != key).count() == 0 {
+            self.notice_on(
+                None,
+                ":close: nothing else to show",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        list.retain(|surface| surface.key != key);
+        let fallback = list
+            .iter()
+            .rev()
+            .find(|surface| surface.key.is_conversation())
+            .or_else(|| list.last())
+            .cloned()
+            .expect("list retains at least one surface");
+
+        // Replace the closed surface everywhere it is shown, preferring
+        // each pane's own history; only the first history-less pane may
+        // take the list's surface directly (a view renders in one pane).
+        let mut orphaned = Vec::new();
+        self.active_tree_mut().for_each_pane_mut(&mut |pane| {
+            pane.purge_history(|surface| surface.key == key);
+            if pane.surface.key == key {
+                orphaned.push(pane.id);
+            }
+        });
+        // A view renders in one pane: the list's surface may go to one
+        // orphan (and only when no pane shows it already), the rest get
+        // fresh views.
+        let mut fallback_used = self
+            .active_tree()
+            .pane_showing(|s| s.key == fallback.key)
+            .is_some();
+        for pane_id in orphaned {
+            let went_back = self
+                .active_tree_mut()
+                .pane_mut(pane_id)
+                .is_some_and(|pane| pane.back());
+            if went_back {
+                continue;
+            }
+            let replacement = if fallback_used {
+                self.duplicate_surface(fallback.clone(), window, cx)
+            } else {
+                fallback_used = true;
+                fallback.clone()
+            };
+            if let Some(pane) = self.active_tree_mut().pane_mut(pane_id) {
+                pane.surface = replacement;
+            }
+        }
+        self.sync_selection_to_focus(cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
     /// Emacs `display-buffer`: the one place pane choice happens. The
     /// surface joins the context's surface list first, so it stays alive
-    /// however panes shuffle afterwards. Then, in order: a pane already
-    /// showing it wins (the arrangement stays intact); a conversation
-    /// surface arriving while an artifact pane (file, terminal) is
-    /// focused lands in a pane already showing conversation, so
-    /// switching agents never covers something opened deliberately;
-    /// otherwise the focused pane. Founds the context's tree on its
-    /// first visit.
+    /// however panes shuffle afterwards. A pane already showing it wins
+    /// (the arrangement stays intact and no view is shown twice);
+    /// otherwise the focused pane shows it — never any other split, so
+    /// switching agents only ever changes the pane you're in. Founds the
+    /// context's tree on its first visit.
     fn display_surface(&mut self, surface: Surface) {
         use std::collections::hash_map::Entry;
         let list = self.surfaces.entry(self.active_context).or_default();
@@ -1380,12 +1583,7 @@ impl Workspace {
             }
             Entry::Occupied(entry) => entry.into_mut(),
         };
-        let target = tree.pane_showing(|s| s.key == surface.key).or_else(|| {
-            (surface.key.is_conversation() && !tree.focused().surface.key.is_conversation())
-                .then(|| tree.pane_showing(|s| s.key.is_conversation()))
-                .flatten()
-        });
-        if let Some(pane) = target {
+        if let Some(pane) = tree.pane_showing(|s| s.key == surface.key) {
             tree.focus(pane);
         }
         tree.focused_mut().show(surface);
@@ -1439,12 +1637,11 @@ impl Workspace {
     /// its first running terminal, spawning the default one when none run,
     /// or a fresh one with `new`) and shows the terminal surface.
     fn open_terminal_surface(&mut self, agent_id: AgentId, new: bool, cx: &mut Context<Self>) {
-        if !new
-            && let Some(surface) = self
-                .find_surface(|s| {
-                    matches!(s.key, SurfaceKey::Terminal { agent_id: id, .. } if id == agent_id)
-                })
-                .cloned()
+        if !new && let Some(surface) = self
+            .find_surface(
+                |s| matches!(s.key, SurfaceKey::Terminal { agent_id: id, .. } if id == agent_id),
+            )
+            .cloned()
         {
             self.display_surface(surface);
             cx.notify();
@@ -1511,7 +1708,11 @@ impl Workspace {
         self.select_agent(Some(agent_id), window, cx);
     }
 
-    fn materialize_model(&mut self, agent_id: &AgentId, cx: &mut Context<Self>) -> Entity<AgentModel> {
+    fn materialize_model(
+        &mut self,
+        agent_id: &AgentId,
+        cx: &mut Context<Self>,
+    ) -> Entity<AgentModel> {
         let deferred = self.pending_syncs.remove(agent_id);
         if let Some(view) = self.models.get(agent_id).cloned() {
             if let (Some(summary), Some(state)) = (deferred, self.store.get(agent_id)) {
@@ -1807,6 +2008,7 @@ impl Workspace {
                 &workspace.workdir_table(),
                 &workspace.live_agent_targets(),
                 &workspace.tag_names(),
+                &workspace.buffer_table(),
             )
             .into_iter()
             .map(|mut candidate| {

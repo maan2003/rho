@@ -32,6 +32,7 @@ pub fn completions_for(
     workdirs: &[(String, String)],
     live_agents: &[Candidate],
     tags: &TagNames,
+    buffers: &[(String, String)],
 ) -> Vec<Candidate> {
     if let Some(mention) = mention_prefix(text_before_cursor) {
         return live_agents
@@ -58,14 +59,15 @@ pub fn completions_for(
             workstreams: &tags.workstreams,
             groups: &tags.groups,
             labels: &tags.labels,
+            buffers,
         },
     )
-        .into_iter()
-        .map(|candidate| Candidate {
-            value: format!("{colon}{}", candidate.value),
-            description: candidate.description,
-        })
-        .collect()
+    .into_iter()
+    .map(|candidate| Candidate {
+        value: format!("{colon}{}", candidate.value),
+        description: candidate.description,
+    })
+    .collect()
 }
 
 fn fuzzy_contains(value: &str, needle: &str) -> bool {
@@ -191,7 +193,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         _window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<anyhow::Result<Vec<CompletionResponse>>> {
-        let (workdirs, live_agents, tags) = self
+        let (workdirs, live_agents, tags, buffers) = self
             .workspace
             .upgrade()
             .map(|workspace| {
@@ -200,6 +202,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
                     workspace.workdir_table(),
                     workspace.live_agent_targets(),
                     workspace.tag_names(),
+                    workspace.buffer_table(),
                 )
             })
             .unwrap_or_default();
@@ -220,7 +223,13 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         } else if in_start_field {
             start_field_candidates(&text_before_cursor, &live_agents)
         } else {
-            completions_for(&text_before_cursor, &workdirs, &live_agents, &tags)
+            completions_for(
+                &text_before_cursor,
+                &workdirs,
+                &live_agents,
+                &tags,
+                &buffers,
+            )
         };
         let completions = candidates
             .into_iter()
@@ -291,10 +300,10 @@ mod tests {
 
     #[test]
     fn root_commands_complete_by_prefix() {
-        let candidates = completions_for(":", &[], &[], &Default::default());
+        let candidates = completions_for(":", &[], &[], &Default::default(), &[]);
         assert!(candidates.iter().any(|c| c.value == ":agent"));
         assert!(candidates.iter().any(|c| c.value == ":projects"));
-        let candidates = completions_for(":agent re", &[], &[], &Default::default());
+        let candidates = completions_for(":agent re", &[], &[], &Default::default(), &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "rename");
     }
@@ -302,7 +311,7 @@ mod tests {
     #[test]
     fn agent_new_completes_workdirs() {
         let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
-        let candidates = completions_for(":agent new ", &workdirs, &[], &Default::default());
+        let candidates = completions_for(":agent new ", &workdirs, &[], &Default::default(), &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "rho");
         assert_eq!(candidates[0].description, "/home/u/src/rho");
@@ -314,7 +323,7 @@ mod tests {
             workstreams: vec!["infra".to_owned(), "1".to_owned()],
             ..Default::default()
         };
-        let candidates = completions_for(":tag move in", &[], &[], &tags);
+        let candidates = completions_for(":tag move in", &[], &[], &tags, &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "infra");
     }
@@ -331,7 +340,7 @@ mod tests {
                 description: "agent".to_owned(),
             },
         ];
-        let candidates = completions_for("ask @w", &[], &live, &Default::default());
+        let candidates = completions_for("ask @w", &[], &live, &Default::default(), &[]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "worker");
     }

@@ -307,6 +307,9 @@ impl ChatApp {
                 self.term
                     .print_system(":term is GUI-only; use `rho term <agent>`");
             }
+            rho_commands::Command::Buffer { .. } | rho_commands::Command::Close { .. } => {
+                self.term.print_system(":buffer and :close are GUI-only");
+            }
             rho_commands::Command::AgentCancel => {
                 self.cancel_running_turn().await;
             }

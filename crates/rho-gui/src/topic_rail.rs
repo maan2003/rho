@@ -73,10 +73,7 @@ pub fn render_topic_rail(
                 if !seen_groups.insert(group) {
                     continue;
                 }
-                let name = registry
-                    .tag_name(group)
-                    .unwrap_or("group")
-                    .to_owned();
+                let name = registry.tag_name(group).unwrap_or("group").to_owned();
                 rows.push(group_header(&name, text_style));
                 for member in display[index..]
                     .iter()

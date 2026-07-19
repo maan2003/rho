@@ -61,7 +61,7 @@ fn colon_completion_lists_matching_commands() {
             .iter()
             .map(|candidate| candidate.label.as_str())
             .collect::<Vec<_>>(),
-        ["cancel", "continue", "compact", "clear"]
+        ["cancel", "continue", "compact", "clear", "close"]
     );
 }
 
@@ -85,7 +85,8 @@ fn command_completion_preserves_suffix() {
 fn argument_completion_uses_live_workdirs() {
     let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
     let buffer = ":agent new rh";
-    let candidates = completion::completion_candidates(buffer, buffer.len(), &workdirs, &Default::default());
+    let candidates =
+        completion::completion_candidates(buffer, buffer.len(), &workdirs, &Default::default());
     assert!(candidates.iter().any(|candidate| {
         candidate.label == "rho" && candidate.replacement == ":agent new rho"
     }));

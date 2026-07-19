@@ -66,6 +66,12 @@ impl<S: PartialEq> Pane<S> {
         self.history.push(previous);
     }
 
+    /// Forgets matching surfaces from this pane's history (the shown
+    /// surface is the caller's problem — it may need a replacement).
+    pub fn purge_history(&mut self, matches: impl Fn(&S) -> bool) {
+        self.history.retain(|surface| !matches(surface));
+    }
+
     /// Returns to the previously shown surface, if any.
     pub fn back(&mut self) -> bool {
         match self.history.pop() {
@@ -156,6 +162,21 @@ impl<S: PartialEq> PaneTree<S> {
         let mut out = Vec::new();
         walk(&self.root, &mut out);
         out
+    }
+
+    /// Visits every pane mutably (depth-first, visual order).
+    pub fn for_each_pane_mut(&mut self, f: &mut dyn FnMut(&mut Pane<S>)) {
+        fn walk<S>(node: &mut Node<S>, f: &mut dyn FnMut(&mut Pane<S>)) {
+            match node {
+                Node::Leaf(pane) => f(pane),
+                Node::Split { children, .. } => {
+                    for child in children {
+                        walk(child, f);
+                    }
+                }
+            }
+        }
+        walk(&mut self.root, f);
     }
 
     /// The first pane whose current surface matches, if any.

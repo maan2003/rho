@@ -108,11 +108,7 @@ impl AgentModel {
     /// Builds a pane's editor over the shared multibuffer — own cursor,
     /// scroll, and folds — fully caught up with the model.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
-        let transcript_id = self
-            .transcript
-            .buffer()
-            .read(cx)
-            .remote_id();
+        let transcript_id = self.transcript.buffer().read(cx).remote_id();
         let workspace = self.workspace.clone();
         let multi_buffer = self.multi_buffer.clone();
         let system_id = self.system_buffer.read(cx).remote_id();

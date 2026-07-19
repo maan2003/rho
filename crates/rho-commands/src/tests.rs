@@ -115,10 +115,7 @@ fn parses_tag_rename() {
 
 #[test]
 fn resolves_tags_by_name() {
-    let tags = vec![
-        ("infra".to_owned(), TagId(2)),
-        ("1".to_owned(), TagId(1)),
-    ];
+    let tags = vec![("infra".to_owned(), TagId(2)), ("1".to_owned(), TagId(1))];
     assert_eq!(resolve_tag("infra", &tags), Some(TagId(2)));
     assert_eq!(resolve_tag("1", &tags), Some(TagId(1)));
     assert_eq!(resolve_tag("new-tag", &tags), None);
@@ -213,11 +210,16 @@ fn completes_arguments_from_context() {
     let workstreams = vec!["infra".to_owned(), "1".to_owned()];
     let groups = vec!["backend".to_owned()];
     let labels = vec!["urgent".to_owned()];
+    let buffers = vec![
+        ("draft".to_owned(), "compose".to_owned()),
+        ("src/main.rs".to_owned(), "file".to_owned()),
+    ];
     let ctx = CompletionCtx {
         workdirs: &workdirs,
         workstreams: &workstreams,
         groups: &groups,
         labels: &labels,
+        buffers: &buffers,
     };
 
     assert_eq!(values(&completion_candidates(":agent new ", &ctx)), ["rho"]);
@@ -239,6 +241,19 @@ fn completes_arguments_from_context() {
     );
     // Paths for `workdirs add` come from the client's filesystem completion.
     assert_eq!(completion_candidates(":projects add ", &ctx), Vec::new());
+    assert_eq!(
+        values(&completion_candidates(":buffer ma", &ctx)),
+        ["src/main.rs"]
+    );
+    // Parse-only aliases complete their arguments too.
+    assert_eq!(
+        values(&completion_candidates(":b ma", &ctx)),
+        ["src/main.rs"]
+    );
+    assert_eq!(
+        values(&completion_candidates(":bd ", &ctx)),
+        ["draft", "src/main.rs"]
+    );
 }
 
 #[test]
@@ -265,4 +280,28 @@ fn resolves_workdirs_by_name_or_path() {
         Some("/home/u/src/rho")
     );
     assert_eq!(resolve_workdir("zed", &workdirs), None);
+}
+
+#[test]
+fn buffer_and_close_parse_with_aliases() {
+    assert_eq!(
+        parse(":buffer"),
+        Some(Parsed::Command(Command::Buffer { name: None }))
+    );
+    assert_eq!(
+        parse(":b src/main.rs"),
+        Some(Parsed::Command(Command::Buffer {
+            name: Some("src/main.rs".to_owned())
+        }))
+    );
+    assert_eq!(
+        parse(":close term eng-1/2"),
+        Some(Parsed::Command(Command::Close {
+            name: Some("term eng-1/2".to_owned())
+        }))
+    );
+    assert_eq!(
+        parse(":bd"),
+        Some(Parsed::Command(Command::Close { name: None }))
+    );
 }

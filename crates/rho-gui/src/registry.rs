@@ -344,7 +344,10 @@ impl AgentRegistry {
         };
         // A folded row folds all its members with it.
         let (_, folded_rows) = self.split_rows();
-        if folded_rows.iter().any(|row| row.tag_id == workstream.tag_id) {
+        if folded_rows
+            .iter()
+            .any(|row| row.tag_id == workstream.tag_id)
+        {
             return true;
         }
         self.topic_rail_layouts
@@ -544,8 +547,7 @@ impl AgentRegistry {
             let keep = workstream.status == rho_ui_proto::Status::Pinned
                 || selected_row == Some(workstream.tag_id)
                 || primary.is_some_and(|agent| {
-                    agent.status == rho_ui_proto::Status::Pinned
-                        || bucket.contains(&agent.agent_id)
+                    agent.status == rho_ui_proto::Status::Pinned || bucket.contains(&agent.agent_id)
                 });
             if keep {
                 listed.push(workstream);
@@ -566,7 +568,6 @@ impl AgentRegistry {
     pub fn toggle_rail_tail(&mut self) {
         self.rail_tail_expanded = !self.rail_tail_expanded;
     }
-
 
     pub fn mark_known(&mut self, agent_id: AgentId) {
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
@@ -770,10 +771,7 @@ impl AgentRegistry {
     pub(crate) fn split_workstream_agents<'a>(
         &self,
         topic: &'a Workstream,
-    ) -> (
-        Vec<&'a UiAgentSummary>,
-        Vec<&'a UiAgentSummary>,
-    ) {
+    ) -> (Vec<&'a UiAgentSummary>, Vec<&'a UiAgentSummary>) {
         let Some(layout) = self.topic_rail_layouts.get(&topic.tag_id) else {
             return (Vec::new(), Vec::new());
         };
@@ -913,7 +911,11 @@ mod tests {
     }
 
     /// A workstream tag with its members' `tags` set to match.
-    fn topic(id: u64, status: Status, mut agents: Vec<UiAgentSummary>) -> (UiTag, Vec<UiAgentSummary>) {
+    fn topic(
+        id: u64,
+        status: Status,
+        mut agents: Vec<UiAgentSummary>,
+    ) -> (UiTag, Vec<UiAgentSummary>) {
         for agent in &mut agents {
             agent.tags = vec![TagId(id)];
         }
@@ -944,11 +946,14 @@ mod tests {
         let mut registry = AgentRegistry::default();
         let mut recent = agent(3, Status::Normal);
         recent.last_active = rho_core::UnixMs(crate::workspace::now_ms() + 100);
-        set_topics(&mut registry, vec![topic(
-            1,
-            Status::Normal,
-            vec![agent(1, Status::Normal), agent(2, Status::Pinned), recent],
-        )]);
+        set_topics(
+            &mut registry,
+            vec![topic(
+                1,
+                Status::Normal,
+                vec![agent(1, Status::Normal), agent(2, Status::Pinned), recent],
+            )],
+        );
         for id in 1..=3 {
             registry.mark_live(agent_id(id));
         }
@@ -973,11 +978,14 @@ mod tests {
         // bumped explicitly here).
         let mut fresh = agent(1, Status::Normal);
         fresh.last_active = rho_core::UnixMs(crate::workspace::now_ms() + 100);
-        set_topics(&mut registry, vec![
-            topic(1, Status::Normal, vec![fresh]),
-            topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
-            topic(3, Status::Normal, vec![agent(3, Status::Pinned)]),
-        ]);
+        set_topics(
+            &mut registry,
+            vec![
+                topic(1, Status::Normal, vec![fresh]),
+                topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
+                topic(3, Status::Normal, vec![agent(3, Status::Pinned)]),
+            ],
+        );
 
         let order = |registry: &AgentRegistry| {
             registry
@@ -994,11 +1002,14 @@ mod tests {
         // within it; a workstream-level pin outranks everything.
         registry.set_attention(agent_id(2), UiAttention::NeedsInput);
         assert_eq!(order(&registry), [3, 1, 2]);
-        set_topics(&mut registry, vec![
-            topic(1, Status::Normal, vec![agent(1, Status::Normal)]),
-            topic(2, Status::Pinned, vec![agent(2, Status::Normal)]),
-            topic(3, Status::Normal, vec![agent(3, Status::Pinned)]),
-        ]);
+        set_topics(
+            &mut registry,
+            vec![
+                topic(1, Status::Normal, vec![agent(1, Status::Normal)]),
+                topic(2, Status::Pinned, vec![agent(2, Status::Normal)]),
+                topic(3, Status::Normal, vec![agent(3, Status::Pinned)]),
+            ],
+        );
         assert_eq!(order(&registry), [2, 3, 1]);
     }
 
@@ -1014,10 +1025,13 @@ mod tests {
         assert_eq!(registry.workstream_of(agent_id(7)), Some(TagId(1)));
 
         // Once the summary lands it wins over the announcement.
-        set_topics(&mut registry, vec![
-            topic(1, Status::Normal, vec![]),
-            topic(2, Status::Normal, vec![agent(7, Status::Normal)]),
-        ]);
+        set_topics(
+            &mut registry,
+            vec![
+                topic(1, Status::Normal, vec![]),
+                topic(2, Status::Normal, vec![agent(7, Status::Normal)]),
+            ],
+        );
         assert_eq!(registry.workstream_of(agent_id(7)), Some(TagId(2)));
     }
 
@@ -1065,10 +1079,13 @@ mod tests {
         let mut registry = AgentRegistry::default();
         let mut filed = agent(1, Status::Normal);
         filed.hidden = true;
-        set_topics(&mut registry, vec![
-            topic(1, Status::Normal, vec![filed]),
-            topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
-        ]);
+        set_topics(
+            &mut registry,
+            vec![
+                topic(1, Status::Normal, vec![filed]),
+                topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
+            ],
+        );
         registry.agents.insert(agent_id(1), AgentLife::Live);
         registry.agents.insert(agent_id(2), AgentLife::Live);
 
@@ -1172,15 +1189,18 @@ mod tests {
         use rho_ui_proto::UiAttention;
 
         let mut registry = AgentRegistry::default();
-        set_topics(&mut registry, vec![topic(
-            1,
-            Status::Normal,
-            vec![
-                agent(1, Status::Normal),
-                agent(2, Status::Normal),
-                agent(3, Status::Normal),
-            ],
-        )]);
+        set_topics(
+            &mut registry,
+            vec![topic(
+                1,
+                Status::Normal,
+                vec![
+                    agent(1, Status::Normal),
+                    agent(2, Status::Normal),
+                    agent(3, Status::Normal),
+                ],
+            )],
+        );
         assert_eq!(registry.next_attention_agent(), None);
 
         registry.set_attention(agent_id(1), UiAttention::Pending);
@@ -1201,11 +1221,14 @@ mod tests {
         use rho_ui_proto::UiAttention;
 
         let mut registry = AgentRegistry::default();
-        set_topics(&mut registry, vec![topic(
-            1,
-            Status::Normal,
-            vec![agent(1, Status::Normal), agent(2, Status::Pinned)],
-        )]);
+        set_topics(
+            &mut registry,
+            vec![topic(
+                1,
+                Status::Normal,
+                vec![agent(1, Status::Normal), agent(2, Status::Pinned)],
+            )],
+        );
         for id in 1..=2 {
             registry.mark_live(agent_id(id));
         }
@@ -1247,15 +1270,18 @@ mod tests {
         let mut registry = AgentRegistry::default();
         registry.set_machine_seed(0);
         registry.set_workspace_counter(36 * 36);
-        set_topics(&mut registry, vec![topic(
-            1,
-            Status::Normal,
-            vec![
-                workspace_agent(1, short_workspace),
-                workspace_agent(2, long_workspace),
-                agent(3, Status::Normal),
-            ],
-        )]);
+        set_topics(
+            &mut registry,
+            vec![topic(
+                1,
+                Status::Normal,
+                vec![
+                    workspace_agent(1, short_workspace),
+                    workspace_agent(2, long_workspace),
+                    agent(3, Status::Normal),
+                ],
+            )],
+        );
 
         assert_eq!(
             registry.workspace_id_label(agent_id(1)),
@@ -1283,11 +1309,10 @@ mod tests {
     #[test]
     fn agent_lookup_accepts_display_name() {
         let mut registry = AgentRegistry::default();
-        set_topics(&mut registry, vec![topic(
-            1,
-            Status::Normal,
-            vec![named_agent(1, "Fix Tests")],
-        )]);
+        set_topics(
+            &mut registry,
+            vec![topic(1, Status::Normal, vec![named_agent(1, "Fix Tests")])],
+        );
 
         assert_eq!(registry.agent_by_label("fix tests"), Some(agent_id(1)));
         assert_eq!(

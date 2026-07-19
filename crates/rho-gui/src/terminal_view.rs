@@ -387,18 +387,24 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::enter_normal_mode))
             .on_action(cx.listener(Self::enter_raw_mode))
-            .on_action(cx.listener(|this, _: &crate::TerminalScrollLineDown, _, cx| {
-                this.scroll_lines(-1, cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::TerminalScrollLineDown, _, cx| {
+                    this.scroll_lines(-1, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &crate::TerminalScrollLineUp, _, cx| {
                 this.scroll_lines(1, cx);
             }))
-            .on_action(cx.listener(|this, _: &crate::TerminalScrollHalfPageDown, _, cx| {
-                this.scroll_lines(-this.half_page(cx), cx);
-            }))
-            .on_action(cx.listener(|this, _: &crate::TerminalScrollHalfPageUp, _, cx| {
-                this.scroll_lines(this.half_page(cx), cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::TerminalScrollHalfPageDown, _, cx| {
+                    this.scroll_lines(-this.half_page(cx), cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::TerminalScrollHalfPageUp, _, cx| {
+                    this.scroll_lines(this.half_page(cx), cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &crate::TerminalScrollTop, _, cx| {
                 this.scroll_lines(isize::MAX / 2, cx);
             }))

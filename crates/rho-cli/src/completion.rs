@@ -31,6 +31,8 @@ pub(crate) fn completion_candidates(
                 workstreams: &tags.workstreams,
                 groups: &tags.groups,
                 labels: &tags.labels,
+                // Surfaces are a GUI notion; the CLI has none.
+                buffers: &[],
             },
         )
         .into_iter()

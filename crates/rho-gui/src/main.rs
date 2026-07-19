@@ -441,8 +441,16 @@ fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("k", TerminalScrollLineUp, Some("RhoTerminalNormal")),
         KeyBinding::new("down", TerminalScrollLineDown, Some("RhoTerminalNormal")),
         KeyBinding::new("up", TerminalScrollLineUp, Some("RhoTerminalNormal")),
-        KeyBinding::new("ctrl-d", TerminalScrollHalfPageDown, Some("RhoTerminalNormal")),
-        KeyBinding::new("ctrl-u", TerminalScrollHalfPageUp, Some("RhoTerminalNormal")),
+        KeyBinding::new(
+            "ctrl-d",
+            TerminalScrollHalfPageDown,
+            Some("RhoTerminalNormal"),
+        ),
+        KeyBinding::new(
+            "ctrl-u",
+            TerminalScrollHalfPageUp,
+            Some("RhoTerminalNormal"),
+        ),
         KeyBinding::new("g g", TerminalScrollTop, Some("RhoTerminalNormal")),
         KeyBinding::new("shift-g", TerminalScrollBottom, Some("RhoTerminalNormal")),
     ]);

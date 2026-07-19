@@ -142,6 +142,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: ":term [new]",
         description: "Attach the agent's terminal (`new` starts another)",
     },
+    CommandSpec {
+        name: "buffer",
+        usage: ":buffer [name]",
+        description: "Show a surface from this workstream (`:b`); bare opens a picker",
+    },
+    CommandSpec {
+        name: "close",
+        usage: ":close [name]",
+        description: "Close a surface (`:bd`; default: the focused one)",
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,6 +209,14 @@ pub enum Command {
     },
     Term {
         new: bool,
+    },
+    Buffer {
+        /// Surface to show; `None` opens the client's picker.
+        name: Option<String>,
+    },
+    Close {
+        /// Surface to close; `None` means the focused one.
+        name: Option<String>,
     },
     Quit,
     Clear,
@@ -294,6 +312,12 @@ pub fn parse(line: &str) -> Option<Parsed> {
             Some("new") => Parsed::Command(Command::Term { new: true }),
             Some(_) => Parsed::Invalid(":term [new]".to_owned()),
         },
+        "buffer" | "b" => Parsed::Command(Command::Buffer {
+            name: joined_args(rest, 1),
+        }),
+        "close" | "bd" => Parsed::Command(Command::Close {
+            name: joined_args(rest, 1),
+        }),
         "quit" | "exit" => Parsed::Command(Command::Quit),
         "clear" => Parsed::Command(Command::Clear),
         "help" => Parsed::Command(Command::Help),
@@ -336,9 +360,15 @@ pub fn parse_duration_ms(text: &str) -> Option<u64> {
 
 /// The words after `:tag <sub>` as one name, `None` when absent.
 fn joined_name(rest: &str) -> Option<String> {
+    joined_args(rest, 2)
+}
+
+/// The words after the first `skip` tokens as one name, `None` when absent
+/// — surface and tag names may contain spaces.
+fn joined_args(rest: &str, skip: usize) -> Option<String> {
     let name = rest
         .split_whitespace()
-        .skip(2)
+        .skip(skip)
         .collect::<Vec<_>>()
         .join(" ");
     (!name.is_empty()).then_some(name)
@@ -363,6 +393,8 @@ pub struct CompletionCtx<'a> {
     pub workstreams: &'a [String],
     pub groups: &'a [String],
     pub labels: &'a [String],
+    /// Open surfaces as `(name, kind)` for `:buffer`/`:close` completion.
+    pub buffers: &'a [(String, String)],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -385,6 +417,14 @@ pub fn completion_candidates(text_before_cursor: &str, ctx: &CompletionCtx) -> V
     } else {
         tokens.pop().unwrap_or("")
     };
+    // Parse-only aliases still complete their arguments.
+    if let Some(first) = tokens.first_mut() {
+        *first = match *first {
+            "b" => "buffer",
+            "bd" => "close",
+            _ => first,
+        };
+    }
 
     match tokens.as_slice() {
         // Completing (part of) the command name itself, word by word.
@@ -448,11 +488,18 @@ fn command_word_candidates(prefix_words: &[&str], partial: &str) -> Vec<Candidat
 
 fn argument_candidates(command: &[&str], partial: &str, ctx: &CompletionCtx) -> Vec<Candidate> {
     match command {
-        ["tag", "move"] | ["tag", "pin"] => {
-            tag_candidates(ctx.workstreams, "workstream", partial)
-        }
+        ["tag", "move"] | ["tag", "pin"] => tag_candidates(ctx.workstreams, "workstream", partial),
         ["tag", "group"] => tag_candidates(ctx.groups, "group", partial),
         ["tag", "label"] | ["tag", "unlabel"] => tag_candidates(ctx.labels, "label", partial),
+        ["buffer"] | ["close"] => ctx
+            .buffers
+            .iter()
+            .filter(|(name, _)| fuzzy_contains(name, partial))
+            .map(|(name, kind)| Candidate {
+                value: name.clone(),
+                description: kind.clone(),
+            })
+            .collect(),
         ["agent", "new"] | ["projects", "rm"] => ctx
             .workdirs
             .iter()
