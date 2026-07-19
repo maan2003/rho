@@ -1465,8 +1465,9 @@ impl Workspace {
                             agent_id,
                             terminal_id: channel.terminal_id,
                         };
-                        let view =
-                            cx.new(|cx| crate::terminal_view::TerminalView::new(channel, cx));
+                        let model =
+                            cx.new(|cx| crate::terminal_view::TerminalModel::new(channel, cx));
+                        let view = cx.new(|cx| crate::terminal_view::TerminalView::new(model, cx));
                         let surface =
                             Self::wrap_surface(key, SurfaceView::Terminal(view), window, cx);
                         this.display_surface(surface);
@@ -1666,10 +1667,9 @@ impl Workspace {
         Self::wrap_surface(key, view, window, cx)
     }
 
-    /// A surface for a new pane over the same content as `surface`: file
-    /// and transcript panes get a fresh editor (own cursor, scroll, folds)
-    /// over the shared model; the draft still shares its editor until its
-    /// own model/view split lands.
+    /// A surface for a new pane over the same content as `surface`: every
+    /// pane gets its own view (own cursor, scroll, folds — or for
+    /// terminals, own focus and mode) over the shared model.
     fn duplicate_surface(
         &mut self,
         surface: Surface,
@@ -1702,9 +1702,14 @@ impl Workspace {
                     cx,
                 )
             }
-            // Terminals share their view between panes: splitting a pane
-            // does not attach a second wire client.
-            SurfaceView::Terminal(_) => surface,
+            // Terminals share one model (one wire client) but each pane
+            // gets its own view: own focus, scroll offset, and mode. Only
+            // the focused view sizes the pty, so splits don't fight.
+            SurfaceView::Terminal(view) => {
+                let model = view.read(cx).model().clone();
+                let view = cx.new(|cx| crate::terminal_view::TerminalView::new(model, cx));
+                Self::wrap_surface(surface.key.clone(), SurfaceView::Terminal(view), window, cx)
+            }
         }
     }
 

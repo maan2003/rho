@@ -956,3 +956,12 @@ fn context_chip_appears_when_frame_arrives_after_selection(cx: &mut TestAppConte
         "context chip missing after late frame: {spans:?}"
     );
 }
+
+/// `KeyBinding::new` panics at startup on unparseable keystrokes; the
+/// terminal escape chord is the only binding with a non-alphanumeric key.
+#[test]
+fn terminal_escape_chord_parses() {
+    for stroke in "ctrl-\\ ctrl-n".split(' ') {
+        gpui::Keystroke::parse(stroke).expect("terminal escape chord must parse");
+    }
+}

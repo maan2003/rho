@@ -1,12 +1,24 @@
-//! A daemon-owned terminal shown as a surface: renders the wire display
-//! state ([`WireScreen`]) and forwards input.
+//! A daemon-owned terminal shown as a surface.
 //!
-//! The view is deliberately mode-free — keystrokes go to the daemon as
-//! structured [`TermKeystroke`]s and are encoded against the terminal's live
-//! modes there, so this side never tracks application cursor keys, bracketed
-//! paste, or anything else stateful. Scrollback lives client-side in the
-//! [`WireScreen`] ring; the wheel scrolls over it, any keystroke snaps back
-//! to the live screen.
+//! [`TerminalModel`] is the buffer role: it owns the wire display state
+//! ([`WireScreen`]), the input stream, and the read task — shared by every
+//! pane showing the terminal. [`TerminalView`] is the window role: one per
+//! pane, with its own focus, scrollback offset, and mode.
+//!
+//! Input is deliberately mode-free on the wire — keystrokes go to the
+//! daemon as structured [`TermKeystroke`]s and are encoded against the
+//! terminal's live modes there, so this side never tracks application
+//! cursor keys, bracketed paste, or anything else stateful.
+//!
+//! Views have two modes, vim-style: **raw** (the default) forwards every
+//! keystroke to the pty; **normal** (`ctrl-\ ctrl-n`, or `ctrl-shift-n`)
+//! releases the keyboard back to rho — `:` opens the command line, the
+//! space leader works, and j/k/ctrl-d/ctrl-u/gg/G browse scrollback.
+//! `i`/`a`/`enter` return to raw.
+//!
+//! Only the focused view's size is sent to the pty (tmux `window-size
+//! latest`): a terminal shown in differently-sized splits follows whichever
+//! pane you're typing in instead of thrashing the pty with competing sizes.
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -15,9 +27,9 @@ use std::rc::Rc;
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use gpui::{
-    AnyElement, Context, FocusHandle, Focusable, HighlightStyle, Hsla, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, Render, ScrollDelta, ScrollWheelEvent,
-    Styled as _, StyledText, TextStyle, Window, canvas, div, px,
+    AnyElement, Context, Entity, FocusHandle, Focusable, HighlightStyle, Hsla,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, ScrollDelta,
+    ScrollWheelEvent, Styled as _, StyledText, Subscription, TextStyle, Window, canvas, div, px,
 };
 use rho_ui_proto::term::{
     FrameApplied, ScrollbackItem, TermCell, TermCellFlags, TermClientFrame, TermColor,
@@ -32,23 +44,23 @@ use crate::connection::TerminalChannel;
 /// Client-side scrollback retention; the daemon replays up to its own cap.
 const SCROLLBACK_LIMIT: usize = 8192;
 
-pub struct TerminalView {
+/// The shared terminal state: wire screen, input stream, and read task.
+/// Panes hold views over it; the model outlives any of them.
+pub struct TerminalModel {
     screen: WireScreen,
     input: futures_mpsc::UnboundedSender<TermClientFrame>,
-    focus_handle: FocusHandle,
-    /// Whole lines scrolled up into history; 0 pins to the live screen.
-    scroll_offset: usize,
-    /// (cols, rows) last sent to the daemon; shared with the paint-time
-    /// measurement so resizes go straight to the stream without an update.
+    /// Monotonic count of lines appended to scrollback, so views can keep
+    /// their place while history arrives (the ring length saturates).
+    history_appended: u64,
+    /// (cols, rows) last sent to the daemon; shared with the focused
+    /// view's paint-time measurement so resizes go straight to the stream.
     sent_size: Rc<Cell<(u16, u16)>>,
-    /// One terminal line in pixels, for wheel-delta conversion.
-    line_height_px: Rc<Cell<f32>>,
     /// The stream ended without an `Exited` status (daemon or dial gone).
     disconnected: bool,
     _read_task: gpui::Task<()>,
 }
 
-impl TerminalView {
+impl TerminalModel {
     pub fn new(channel: TerminalChannel, cx: &mut Context<Self>) -> Self {
         let TerminalChannel {
             terminal_id: _,
@@ -59,25 +71,23 @@ impl TerminalView {
             while let Some(frame) = frames.next().await {
                 let exited = matches!(frame, TermServerFrame::Exited { .. });
                 if this
-                    .update(cx, |view: &mut TerminalView, cx| view.apply(frame, cx))
+                    .update(cx, |model: &mut TerminalModel, cx| model.apply(frame, cx))
                     .is_err()
                     || exited
                 {
                     return;
                 }
             }
-            let _ = this.update(cx, |view, cx| {
-                view.disconnected = true;
+            let _ = this.update(cx, |model, cx| {
+                model.disconnected = true;
                 cx.notify();
             });
         });
         Self {
             screen: WireScreen::new(SCROLLBACK_LIMIT),
             input,
-            focus_handle: cx.focus_handle(),
-            scroll_offset: 0,
+            history_appended: 0,
             sent_size: Rc::new(Cell::new((0, 0))),
-            line_height_px: Rc::new(Cell::new(16.0)),
             disconnected: false,
             _read_task: read_task,
         }
@@ -86,14 +96,68 @@ impl TerminalView {
     fn apply(&mut self, frame: TermServerFrame, cx: &mut Context<Self>) {
         let before = self.screen.scrollback.len();
         let applied = self.screen.apply(frame);
-        if matches!(applied, FrameApplied::History) && self.scroll_offset > 0 {
-            // Keep the viewed lines fixed while new history arrives below.
-            self.scroll_offset += self.screen.scrollback.len() - before;
+        if matches!(applied, FrameApplied::History) {
+            self.history_appended += (self.screen.scrollback.len() - before) as u64;
         }
         cx.notify();
     }
 
+    fn send(&self, frame: TermClientFrame) {
+        let _ = self.input.unbounded_send(frame);
+    }
+}
+
+/// One pane's view of a terminal: own focus, scroll offset, and mode.
+pub struct TerminalView {
+    model: Entity<TerminalModel>,
+    focus_handle: FocusHandle,
+    /// Raw mode forwards keystrokes to the pty; normal mode releases the
+    /// keyboard to rho bindings.
+    raw: bool,
+    /// Whole lines scrolled up into history; 0 pins to the live screen.
+    scroll_offset: usize,
+    /// `history_appended` as of the last observe, for offset preservation.
+    seen_history: u64,
+    /// One terminal line in pixels, for wheel-delta conversion.
+    line_height_px: Rc<Cell<f32>>,
+    _model_changed: Subscription,
+}
+
+impl TerminalView {
+    pub fn new(model: Entity<TerminalModel>, cx: &mut Context<Self>) -> Self {
+        let seen_history = model.read(cx).history_appended;
+        let model_changed = cx.observe(&model, |view, model, cx| {
+            let (appended, limit) = {
+                let model = model.read(cx);
+                (model.history_appended, model.screen.scrollback.len())
+            };
+            let delta = (appended - view.seen_history) as usize;
+            view.seen_history = appended;
+            if view.scroll_offset > 0 {
+                // Keep the viewed lines fixed while new history arrives below.
+                view.scroll_offset = (view.scroll_offset + delta).min(limit);
+            }
+            cx.notify();
+        });
+        Self {
+            model,
+            focus_handle: cx.focus_handle(),
+            raw: true,
+            scroll_offset: 0,
+            seen_history,
+            line_height_px: Rc::new(Cell::new(16.0)),
+            _model_changed: model_changed,
+        }
+    }
+
+    pub fn model(&self) -> &Entity<TerminalModel> {
+        &self.model
+    }
+
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.raw {
+            return;
+        }
         let ks = &event.keystroke;
         if ks.modifiers.platform {
             return;
@@ -108,11 +172,11 @@ impl TerminalView {
         let handled = probably_produces_bytes(&keystroke);
         if self.scroll_offset != 0 {
             self.scroll_offset = 0;
-            cx.notify();
         }
-        let _ = self
-            .input
-            .unbounded_send(TermClientFrame::Keystroke(keystroke));
+        self.model
+            .read(cx)
+            .send(TermClientFrame::Keystroke(keystroke));
+        cx.notify();
         if handled {
             cx.stop_propagation();
         }
@@ -121,9 +185,43 @@ impl TerminalView {
     fn paste(&mut self, _: &crate::TerminalPaste, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.scroll_offset = 0;
-            let _ = self.input.unbounded_send(TermClientFrame::Paste(text));
+            self.model.read(cx).send(TermClientFrame::Paste(text));
             cx.notify();
         }
+    }
+
+    fn enter_normal_mode(
+        &mut self,
+        _: &crate::TerminalNormalMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.raw = false;
+        cx.notify();
+    }
+
+    fn enter_raw_mode(
+        &mut self,
+        _: &crate::TerminalRawMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.raw = true;
+        self.scroll_offset = 0;
+        cx.notify();
+    }
+
+    fn scroll_lines(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let limit = self.model.read(cx).screen.scrollback.len() as isize;
+        let offset = (self.scroll_offset as isize + delta).clamp(0, limit) as usize;
+        if offset != self.scroll_offset {
+            self.scroll_offset = offset;
+            cx.notify();
+        }
+    }
+
+    fn half_page(&self, cx: &Context<Self>) -> isize {
+        (self.model.read(cx).screen.rows.len() as isize / 2).max(1)
     }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -131,26 +229,19 @@ impl TerminalView {
             ScrollDelta::Lines(delta) => delta.y,
             ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.line_height_px.get().max(1.0),
         };
-        let offset = self.scroll_offset as f32 + lines * 3.0;
-        let clamped = offset
-            .round()
-            .clamp(0.0, self.screen.scrollback.len() as f32) as usize;
-        if clamped != self.scroll_offset {
-            self.scroll_offset = clamped;
-            cx.notify();
-        }
+        self.scroll_lines((lines * 3.0).round() as isize, cx);
     }
 
     /// The window of lines the viewport shows: the live screen, shifted up
     /// into scrollback by `scroll_offset`.
-    fn visible_lines(&self) -> Vec<VisibleLine<'_>> {
-        let height = self.screen.rows.len().max(1);
-        let scrollback = &self.screen.scrollback;
-        let total = scrollback.len() + self.screen.rows.len();
+    fn visible_lines<'a>(&self, screen: &'a WireScreen) -> Vec<VisibleLine<'a>> {
+        let height = screen.rows.len().max(1);
+        let scrollback = &screen.scrollback;
+        let total = scrollback.len() + screen.rows.len();
         let offset = self.scroll_offset.min(scrollback.len());
         let end = total - offset;
         let start = end.saturating_sub(height);
-        let cursor = &self.screen.cursor;
+        let cursor = &screen.cursor;
         (start..end)
             .map(|index| {
                 if index < scrollback.len() {
@@ -163,7 +254,7 @@ impl TerminalView {
                     let at_cursor =
                         offset == 0 && cursor.visible && usize::from(cursor.row) == row_index;
                     VisibleLine::Row {
-                        row: &self.screen.rows[row_index],
+                        row: &screen.rows[row_index],
                         cursor: at_cursor.then_some(cursor.col),
                     }
                 }
@@ -215,12 +306,20 @@ impl Render for TerminalView {
             )
             .unwrap_or(px(8.0));
 
-        // Size measurement happens at paint time: compare the pane bounds to
-        // the cell metrics and tell the daemon when the grid size changed.
-        let sent_size = self.sent_size.clone();
-        let input = self.input.clone();
+        let focused = self.focus_handle.is_focused(window);
+
+        // Size measurement happens at paint time: compare the pane bounds
+        // to the cell metrics and tell the daemon when the grid changed.
+        // Only the focused view drives the pty size (tmux `window-size
+        // latest`) — competing sizes from other splits would thrash it.
+        let model = self.model.read(cx);
+        let sent_size = model.sent_size.clone();
+        let input = model.input.clone();
         let measure = canvas(
             move |bounds, _window, _cx| {
+                if !focused {
+                    return;
+                }
                 let cols = (f32::from(bounds.size.width) / f32::from(cell_width)).floor();
                 let rows = (f32::from(bounds.size.height) / f32::from(line_height)).floor();
                 let size = (cols.max(2.0) as u16, rows.max(2.0) as u16);
@@ -236,18 +335,17 @@ impl Render for TerminalView {
         )
         .size_full();
 
-        let focused = self.focus_handle.is_focused(window);
         let palette = Palette {
             foreground,
             background,
             colors: &colors,
         };
         let mut rows: Vec<AnyElement> = Vec::new();
-        for line in self.visible_lines() {
+        for line in self.visible_lines(&model.screen) {
             rows.push(match line {
                 VisibleLine::Row { row, cursor } => {
                     let cursor = if focused { cursor } else { None };
-                    row_element(row, cursor, &text_style, &palette)
+                    row_element(row, cursor, self.raw, &text_style, &palette)
                 }
                 VisibleLine::Gap(lost) => div()
                     .h(line_height)
@@ -257,22 +355,56 @@ impl Render for TerminalView {
             });
         }
 
-        let status = if let Some(status) = self.screen.exited {
+        let status = if let Some(status) = model.screen.exited {
             Some(match status {
                 Some(code) => format!("terminal exited ({code})"),
                 None => "terminal exited".to_owned(),
             })
-        } else if self.disconnected {
+        } else if model.disconnected {
             Some("terminal disconnected".to_owned())
         } else {
             None
         };
+        let normal_badge = (!self.raw).then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .right_2()
+                .px_1()
+                .bg(colors.element_background)
+                .text_color(foreground.opacity(0.7))
+                .child("NORMAL")
+        });
 
         div()
             .id("rho-terminal")
             .track_focus(&self.focus_handle)
-            .key_context("RhoTerminal")
+            .key_context(if self.raw {
+                "RhoTerminal"
+            } else {
+                "RhoTerminalNormal"
+            })
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::enter_normal_mode))
+            .on_action(cx.listener(Self::enter_raw_mode))
+            .on_action(cx.listener(|this, _: &crate::TerminalScrollLineDown, _, cx| {
+                this.scroll_lines(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TerminalScrollLineUp, _, cx| {
+                this.scroll_lines(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TerminalScrollHalfPageDown, _, cx| {
+                this.scroll_lines(-this.half_page(cx), cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TerminalScrollHalfPageUp, _, cx| {
+                this.scroll_lines(this.half_page(cx), cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TerminalScrollTop, _, cx| {
+                this.scroll_lines(isize::MAX / 2, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TerminalScrollBottom, _, cx| {
+                this.scroll_lines(isize::MIN / 2, cx);
+            }))
             .on_key_down(cx.listener(Self::key_down))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .size_full()
@@ -284,6 +416,7 @@ impl Render for TerminalView {
             .line_height(line_height)
             .child(div().absolute().size_full().child(measure))
             .child(div().flex().flex_col().children(rows))
+            .children(normal_badge)
             .children(status.map(|status| {
                 div()
                     .absolute()
@@ -414,9 +547,16 @@ fn cell_highlight(cell: &TermCell, palette: &Palette<'_>) -> HighlightStyle {
 fn row_element(
     row: &TermRow,
     cursor_col: Option<u16>,
+    raw: bool,
     text_style: &TextStyle,
     palette: &Palette<'_>,
 ) -> AnyElement {
+    // Normal mode dims the cursor: the keyboard is rho's, not the pty's.
+    let cursor_bg = if raw {
+        palette.foreground
+    } else {
+        palette.foreground.opacity(0.5)
+    };
     let mut text = String::new();
     let mut runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
     let mut push_run = |range: Range<usize>, style: HighlightStyle| match runs.last_mut() {
@@ -439,7 +579,7 @@ fn row_element(
         });
         if under_cursor {
             style.color = Some(palette.background);
-            style.background_color = Some(palette.foreground);
+            style.background_color = Some(cursor_bg);
         }
         push_run(start..text.len(), style);
     }
@@ -456,7 +596,7 @@ fn row_element(
                 start..text.len(),
                 HighlightStyle {
                     color: Some(palette.background),
-                    background_color: Some(palette.foreground),
+                    background_color: Some(cursor_bg),
                     ..Default::default()
                 },
             );

@@ -66,7 +66,15 @@ actions!(
         MinibufferNext,
         MinibufferPrevious,
         MinibufferComplete,
-        TerminalPaste
+        TerminalPaste,
+        TerminalNormalMode,
+        TerminalRawMode,
+        TerminalScrollLineUp,
+        TerminalScrollLineDown,
+        TerminalScrollHalfPageUp,
+        TerminalScrollHalfPageDown,
+        TerminalScrollTop,
+        TerminalScrollBottom
     ]
 );
 
@@ -416,10 +424,27 @@ fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoGui > Editor && !showing_completions"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
-        // Terminal surface: every unbound key becomes terminal input, so its
-        // few chrome bindings use chords shells don't see anyway.
+        // Terminal surface, raw mode: every unbound key becomes terminal
+        // input, so its few chrome bindings use chords shells don't see
+        // anyway. `ctrl-\ ctrl-n` is vim's terminal escape; `ctrl-shift-n`
+        // is the discoverable chord for the same thing.
         KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("RhoTerminal")),
         KeyBinding::new("ctrl-shift-;", MinibufferCommand, Some("RhoTerminal")),
+        KeyBinding::new("ctrl-\\ ctrl-n", TerminalNormalMode, Some("RhoTerminal")),
+        KeyBinding::new("ctrl-shift-n", TerminalNormalMode, Some("RhoTerminal")),
+        // Terminal normal mode: the keyboard belongs to rho again. Insert
+        // returns to raw; plain vim keys browse scrollback.
+        KeyBinding::new("i", TerminalRawMode, Some("RhoTerminalNormal")),
+        KeyBinding::new("a", TerminalRawMode, Some("RhoTerminalNormal")),
+        KeyBinding::new("enter", TerminalRawMode, Some("RhoTerminalNormal")),
+        KeyBinding::new("j", TerminalScrollLineDown, Some("RhoTerminalNormal")),
+        KeyBinding::new("k", TerminalScrollLineUp, Some("RhoTerminalNormal")),
+        KeyBinding::new("down", TerminalScrollLineDown, Some("RhoTerminalNormal")),
+        KeyBinding::new("up", TerminalScrollLineUp, Some("RhoTerminalNormal")),
+        KeyBinding::new("ctrl-d", TerminalScrollHalfPageDown, Some("RhoTerminalNormal")),
+        KeyBinding::new("ctrl-u", TerminalScrollHalfPageUp, Some("RhoTerminalNormal")),
+        KeyBinding::new("g g", TerminalScrollTop, Some("RhoTerminalNormal")),
+        KeyBinding::new("shift-g", TerminalScrollBottom, Some("RhoTerminalNormal")),
     ]);
     // Vim-leader pane vocabulary. Bound both for editors in normal mode
     // (vim or helix flavor — helix reports `vim_mode == helix_normal`) and
@@ -427,6 +452,7 @@ fn bind_rho_key_overrides(cx: &mut App) {
     // These load after the vim keymap, so they win ties at equal depth.
     for context in [
         "RhoRail",
+        "RhoTerminalNormal",
         "RhoGui > Editor && vim_mode == normal",
         "RhoGui > Editor && vim_mode == helix_normal",
     ] {
