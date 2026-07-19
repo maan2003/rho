@@ -163,10 +163,12 @@ impl AgentModel {
                 editor::EditorEvent::Focused => {
                     this.focused_editors.insert(editor.entity_id());
                     this.apply_prompt_chrome_to(&editor, cx);
+                    this.apply_status_to(&editor, cx);
                 }
                 editor::EditorEvent::Blurred => {
                     this.focused_editors.remove(&editor.entity_id());
                     this.apply_prompt_chrome_to(&editor, cx);
+                    this.apply_status_to(&editor, cx);
                 }
                 _ => {}
             }));
@@ -344,7 +346,11 @@ impl AgentModel {
         else {
             return;
         };
-        let right_prompt = (!self.status_spans.is_empty()).then(|| EditorRightPrompt {
+        // The status chips ride the prompt line, so they only exist where
+        // the prompt does: on a focused editor. A preview is a document,
+        // not an input.
+        let focused = self.focused_editors.contains(&editor.entity_id());
+        let right_prompt = (focused && !self.status_spans.is_empty()).then(|| EditorRightPrompt {
             anchor,
             spans: self.status_spans.clone(),
         });
@@ -373,8 +379,12 @@ impl AgentModel {
             return;
         };
 
+        // A previewed (unfocused) transcript shows no input affordances at
+        // all: no invite, no gutter stripe — the prompt row is just a
+        // blank line.
+        let focused = self.focused_editors.contains(&editor.entity_id());
         let mut inlays = Vec::new();
-        if draft_empty && self.focused_editors.contains(&editor.entity_id()) {
+        if draft_empty && focused {
             inlays.push(Inlay::custom(
                 PROMPT_PLACEHOLDER_INLAY_ID,
                 prompt_end,
@@ -386,6 +396,11 @@ impl AgentModel {
         } else {
             vec![prompt_start..prompt_end]
         };
+        let gutter_ranges = if focused {
+            vec![prompt_start..prompt_end]
+        } else {
+            Vec::new()
+        };
         let draft_style = StyleClass::UserMessage.resolve(cx);
         editor.update(cx, |editor, cx| {
             editor.splice_inlays(&[InlayId::Custom(PROMPT_PLACEHOLDER_INLAY_ID)], inlays, cx);
@@ -396,7 +411,7 @@ impl AgentModel {
                 cx,
             );
             editor.highlight_gutter::<PromptGutter>(
-                vec![prompt_start..prompt_end],
+                gutter_ranges,
                 style::user_prompt_gutter_color,
                 cx,
             );

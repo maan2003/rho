@@ -36,6 +36,11 @@ const DASHBOARD_KEY_BASE: usize = usize::MAX - 200;
 /// Inlay id space for reply-draft placeholders, clear of the lamp ids.
 const PLACEHOLDER_ID_BASE: usize = 1_000_000;
 
+/// Highlight key for draft text (the user-message accent), past the
+/// class and lamp key ranges.
+const DRAFT_TEXT_KEY: HighlightKey =
+    HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + 2 * DashClass::ALL.len());
+
 /// Identity of one dashboard line; each key owns one buffer in the
 /// multibuffer. Cursor position and reply drafts survive re-sorts by
 /// following their key, not their line number.
@@ -531,22 +536,20 @@ impl Dashboard {
         let to_remove = std::mem::take(&mut self.placeholder_ids);
         let mut inlays = Vec::new();
         let mut gutter_ranges = Vec::new();
+        let mut draft_text_ranges = Vec::new();
         let drafts = self
             .replies
             .iter()
             .map(|agent_id| {
                 (
                     LineKey::Reply(*agent_id),
-                    format!(
-                        "reply to {}… (enter sends)",
-                        registry.agent_id_label(*agent_id)
-                    ),
+                    format!("reply to {}…", registry.agent_id_label(*agent_id)),
                 )
             })
             .chain(
                 self.new_draft
                     .is_some()
-                    .then(|| (LineKey::NewDraft, "new agent… (enter creates)".to_owned())),
+                    .then(|| (LineKey::NewDraft, "new agent…".to_owned())),
             );
         for (index, (key, placeholder)) in drafts.enumerate() {
             let Some(buffer) = self.buffers.get(&key) else {
@@ -563,6 +566,9 @@ impl Dashboard {
                 continue;
             };
             gutter_ranges.push(start..end);
+            // Draft text wears the user-message accent, same as typed
+            // prompts everywhere else in rho.
+            draft_text_ranges.push(start..end);
             if buffer.is_empty() {
                 // Right-biased like the transcript's prompt placeholder, so
                 // the cursor renders before the hint, not after it.
@@ -576,6 +582,7 @@ impl Dashboard {
                 inlays.push(inlay);
             }
         }
+        let draft_style = crate::style::StyleClass::UserMessage.resolve(cx);
         self.editor.update(cx, |editor, cx| {
             editor.splice_inlays(&to_remove, inlays, cx);
             editor.highlight_gutter::<ReplyGutter>(
@@ -583,6 +590,7 @@ impl Dashboard {
                 crate::style::user_prompt_gutter_color,
                 cx,
             );
+            editor.highlight_text(DRAFT_TEXT_KEY, draft_text_ranges, draft_style, cx);
         });
     }
 }
@@ -590,11 +598,11 @@ impl Dashboard {
 /// Gutter highlight marker type for reply drafts.
 pub struct ReplyGutter;
 
-/// Dashboard text classes: lamps, selection, and muted chrome.
+/// Dashboard text classes: lamps and muted chrome. The cursor itself is
+/// the selection indicator — rows carry no selected styling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashClass {
     Muted,
-    Selected,
     Working,
     Pending,
     NeedsInput,
@@ -603,9 +611,8 @@ enum DashClass {
 }
 
 impl DashClass {
-    const ALL: [DashClass; 6] = [
+    const ALL: [DashClass; 5] = [
         DashClass::Muted,
-        DashClass::Selected,
         DashClass::Working,
         DashClass::Pending,
         DashClass::NeedsInput,
@@ -615,11 +622,10 @@ impl DashClass {
     fn key(self) -> HighlightKey {
         let slot = match self {
             DashClass::Muted => 0,
-            DashClass::Selected => 1,
-            DashClass::Working => 2,
-            DashClass::Pending => 3,
-            DashClass::NeedsInput => 4,
-            DashClass::Urgent => 5,
+            DashClass::Working => 1,
+            DashClass::Pending => 2,
+            DashClass::NeedsInput => 3,
+            DashClass::Urgent => 4,
         };
         HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + slot)
     }
@@ -636,7 +642,6 @@ impl DashClass {
         let colors = cx.theme().colors();
         let color = match self {
             DashClass::Muted => colors.text_muted,
-            DashClass::Selected => colors.terminal_ansi_magenta,
             DashClass::Working => colors.terminal_ansi_cyan,
             DashClass::Pending => colors.terminal_ansi_yellow,
             DashClass::NeedsInput => colors.terminal_ansi_red,
@@ -777,6 +782,7 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
             } => {
                 let mut line = Line::new(LineKey::FoldToggle, RowTarget::FoldToggle);
                 line.span(Some(DashClass::Muted), |text| {
+                    text.push_str("  ");
                     if expanded {
                         text.push_str("fold");
                     } else {
@@ -787,16 +793,10 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
             }
         }
     }
-    let draft_selected = registry.selected_agent().is_none();
     let mut line = Line::new(LineKey::NewAgent, RowTarget::NewAgent);
-    line.span(
-        Some(if draft_selected {
-            DashClass::Selected
-        } else {
-            DashClass::Muted
-        }),
-        |text| text.push_str("+ new agent"),
-    );
+    line.span(Some(DashClass::Muted), |text| {
+        text.push_str("  + new agent")
+    });
     lines.push(line);
     lines
 }
@@ -808,9 +808,6 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
 fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Line {
     let (agents, _folded) = registry.split_workstream_agents(topic);
     let primary = agents.first().map(|summary| summary.agent_id);
-    let selected_agent = registry.selected_agent().copied();
-    let selected = selected_agent
-        .is_some_and(|selected| topic.agent_ids().any(|agent_id| agent_id == selected));
     let attention = agents
         .iter()
         .map(|summary| registry.attention(summary.agent_id))
@@ -831,29 +828,24 @@ fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Lin
             primary,
         },
     );
-    if grouped {
-        line.span(None, |text| text.push_str("  "));
-    }
+    // Rows sit at an indent (deeper when grouped) so the listing reads as
+    // a document with structure, not a flush-left sidebar — and reply
+    // drafts, at the margin, hang visibly to their left. The cursor is
+    // the selection indicator; rows carry no selected styling.
+    line.span(None, |text| {
+        text.push_str(if grouped { "    " } else { "  " })
+    });
     if topic.pinned {
         line.span(None, |text| text.push_str("◆ "));
     }
-    let title_class = if selected {
-        Some(DashClass::Selected)
-    } else if attention >= UiAttention::Pending {
-        Some(DashClass::Urgent)
-    } else {
-        None
-    };
+    let title_class = (attention >= UiAttention::Pending).then_some(DashClass::Urgent);
     line.span(title_class, |text| text.push_str(&title));
 
     let members = agents.iter().skip(1).collect::<Vec<_>>();
     let overflow = members.len().saturating_sub(VISIBLE_TAGS);
     for member in members.into_iter().take(VISIBLE_TAGS) {
-        let class = if selected_agent == Some(member.agent_id) {
-            DashClass::Selected
-        } else {
-            DashClass::lamp(registry.attention(member.agent_id)).unwrap_or(DashClass::Muted)
-        };
+        let class =
+            DashClass::lamp(registry.attention(member.agent_id)).unwrap_or(DashClass::Muted);
         line.span(None, |text| text.push_str("  "));
         line.span(Some(class), |text| {
             text.push_str(&registry.agent_id_label(member.agent_id))

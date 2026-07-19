@@ -1382,14 +1382,15 @@ impl Workspace {
             return;
         }
         match self.dashboard.cursor_target(cx) {
-            Some(RowTarget::Stream {
-                primary: Some(agent_id),
-                ..
-            }) if self.registry.selected_agent() != Some(&agent_id) => {
+            // A reply draft previews its addressee, same as the row above it.
+            Some(
+                RowTarget::Stream {
+                    primary: Some(agent_id),
+                    ..
+                }
+                | RowTarget::Reply(agent_id),
+            ) if self.registry.selected_agent() != Some(&agent_id) => {
                 self.preview_agent(Some(agent_id), window, cx);
-            }
-            Some(RowTarget::NewAgent) if self.registry.selected_agent().is_some() => {
-                self.preview_agent(None, window, cx);
             }
             _ => {}
         }
@@ -2407,7 +2408,11 @@ impl Workspace {
                 ..
             }) => self.open_agent(agent_id, window, cx),
             Some(RowTarget::FoldToggle) => self.toggle_rail_tail(cx),
-            Some(RowTarget::NewAgent) => self.enter_draft(None, window, cx),
+            // New agents draft inline, in the dashboard itself.
+            Some(RowTarget::NewAgent) => {
+                self.dashboard.open_new_draft(cx);
+                self.dashboard_enter_insert(window, cx);
+            }
             // Enter sends the inline reply draft (and closes it); an empty
             // draft just closes. Disconnected, the draft stays parked
             // rather than being consumed into the void.
@@ -2492,6 +2497,7 @@ impl Workspace {
     fn render_rail(
         &mut self,
         home: bool,
+        show_panes: bool,
         text_style: &gpui::TextStyle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -2500,8 +2506,6 @@ impl Workspace {
             .h_full()
             .flex_none()
             .overflow_hidden()
-            .border_r_1()
-            .border_color(border_color)
             .py(px(2.))
             .flex()
             .flex_col()
@@ -2512,11 +2516,22 @@ impl Workspace {
             .key_context("RhoDashboard");
         let container = if home {
             container
-                .w(gpui::relative(0.5))
+                .w(if show_panes {
+                    gpui::relative(0.5)
+                } else {
+                    gpui::relative(1.0)
+                })
                 .px(px(24.))
                 .child(self.render_dashboard_header(text_style, cx))
         } else {
             container.w(px(275.)).pl(px(6.))
+        };
+        // In home mode the boxed preview provides its own separation; the
+        // hairline is only needed against full-bleed work-mode panes.
+        let container = if show_panes && !home {
+            container.border_r_1().border_color(border_color)
+        } else {
+            container
         };
         container
             .child(
@@ -2584,9 +2599,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         // Home mode: the dashboard owns the keyboard, so it owns the frame;
-        // the panes are its preview, visibly subordinate.
+        // the panes are its preview. With nothing selected there is
+        // nothing to preview — the dashboard takes the whole frame.
         let home = self.dashboard.focus_handle(cx).is_focused(window);
-        let rail = self.render_rail(home, text_style, cx);
+        let show_panes = !home || self.registry.selected_agent().is_some();
+        let rail = self.render_rail(home, show_panes, text_style, cx);
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
@@ -2633,15 +2650,23 @@ impl Workspace {
             }
             element.children(separated).into_any_element()
         };
-        let panes = div()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .h_full()
-            // Subordinate while the dashboard is home: the preview reads
-            // as "what the cursor points at", not "the workspace".
-            .when(home, |this| this.opacity(0.75))
-            .child(self.active_tree().layout(&mut leaf, &mut container));
+        let panes = show_panes.then(|| {
+            let element = div().flex_1().min_w_0().min_h_0();
+            // Home mode boxes the preview — inset with borders, visibly a
+            // card showing what the cursor points at, not an equal half.
+            let element = if home {
+                element
+                    .my(gpui::relative(0.05))
+                    .mr(px(16.))
+                    .border_1()
+                    .border_color(separator_color)
+                    .rounded_md()
+                    .overflow_hidden()
+            } else {
+                element.h_full()
+            };
+            element.child(self.active_tree().layout(&mut leaf, &mut container))
+        });
         div()
             .flex()
             .flex_row()
@@ -2649,7 +2674,7 @@ impl Workspace {
             .flex_grow(1.0)
             .min_h_0()
             .child(rail)
-            .child(panes)
+            .children(panes)
             .into_any_element()
     }
 
