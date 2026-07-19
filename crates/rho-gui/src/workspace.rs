@@ -2423,6 +2423,12 @@ impl Workspace {
                 if let Some(text) = self.dashboard.take_reply(agent_id, cx) {
                     self.handle_submit(agent_id, text, cx);
                 }
+                // Removing the draft's excerpt would drop the cursor onto
+                // whatever text slid into the gap; park it back on the row
+                // the reply belonged to.
+                if let Some(workstream_id) = self.registry.workstream_of(agent_id) {
+                    self.dashboard.cursor_to_stream(workstream_id, cx);
+                }
             }
             Some(RowTarget::NewDraft) => {
                 if !self.require_connected(cx) {
@@ -2523,7 +2529,8 @@ impl Workspace {
                 } else {
                     gpui::relative(1.0)
                 })
-                .px(px(24.))
+                .pl(px(40.))
+                .pr(px(24.))
                 .child(self.render_dashboard_header(text_style, cx))
         } else {
             container.w(px(275.)).pl(px(6.))
@@ -2654,15 +2661,15 @@ impl Workspace {
         };
         let panes = show_panes.then(|| {
             let element = div().flex_1().min_w_0().min_h_0();
-            // Home mode boxes the preview — inset with borders, visibly a
-            // card showing what the cursor points at, not an equal half.
+            // Home mode boxes the preview — a sheet hanging from a top
+            // inset, flush with the bottom and right window edges, visibly
+            // a card showing what the cursor points at, not an equal half.
             let element = if home {
                 element
-                    .my(gpui::relative(0.05))
-                    .mr(px(16.))
+                    .mt(gpui::relative(0.05))
                     .border_1()
                     .border_color(separator_color)
-                    .rounded_md()
+                    .rounded_t_md()
                     .overflow_hidden()
             } else {
                 element.h_full()

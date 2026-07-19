@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
 use editor::hover_links::InlayHighlight;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
@@ -98,6 +99,8 @@ pub struct Dashboard {
     lamp_ids: Vec<InlayId>,
     /// Reply placeholder inlays currently spliced in.
     placeholder_ids: Vec<InlayId>,
+    /// Spacer blocks breathing air between items, for replacement on sync.
+    gap_ids: Vec<CustomBlockId>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the per-line excerpts seamless.
@@ -138,6 +141,7 @@ impl Dashboard {
             pending_cursor: None,
             lamp_ids: Vec::new(),
             placeholder_ids: Vec::new(),
+            gap_ids: Vec::new(),
             headers_disabled: std::collections::HashSet::new(),
         }
     }
@@ -220,6 +224,13 @@ impl Dashboard {
         self.buffers.remove(&LineKey::NewDraft);
         cx.notify();
         (!text.is_empty()).then_some(text)
+    }
+
+    /// Parks the cursor on a workstream's row at the next sync — for when
+    /// a consumed draft's excerpt vanishes under the cursor.
+    pub fn cursor_to_stream(&mut self, workstream_id: WorkstreamId, cx: &mut Context<Workspace>) {
+        self.pending_cursor = Some(LineKey::Stream(workstream_id));
+        cx.notify();
     }
 
     /// Takes a reply draft's text and closes it. `None` when the draft is
@@ -393,9 +404,54 @@ impl Dashboard {
             self.move_cursor_to(&key, window, cx);
         }
 
+        if order_changed || !edited.is_empty() {
+            self.apply_gaps(cx);
+        }
         self.apply_highlights(&lines, cx);
         self.apply_lamps(&lines, cx);
         self.apply_reply_chrome(registry, cx);
+    }
+
+    /// Replaces the spacer blocks that put a blank line above each row
+    /// starting a new item, so the listing breathes instead of packing
+    /// tight. A row stays attached to what it belongs to: a stream to the
+    /// group header above it, a reply draft to its row. Blocks are
+    /// non-text rows, so the cursor never lands on the air.
+    fn apply_gaps(&mut self, cx: &mut Context<Workspace>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let mut blocks = Vec::new();
+        for (index, key) in self.order.iter().enumerate() {
+            let starts_item = match key {
+                LineKey::Group(_) | LineKey::FoldToggle | LineKey::NewAgent => true,
+                LineKey::Stream(_) => {
+                    !matches!(self.order[index.saturating_sub(1)], LineKey::Group(_))
+                }
+                LineKey::Reply(_) | LineKey::NewDraft => false,
+            };
+            if index == 0 || !starts_item {
+                continue;
+            }
+            let Some(buffer) = self.buffers.get(key) else {
+                continue;
+            };
+            let Some(position) = snapshot.anchor_in_excerpt(buffer.read(cx).anchor_before(0))
+            else {
+                continue;
+            };
+            blocks.push(BlockProperties {
+                placement: BlockPlacement::Above(position),
+                height: Some(1),
+                style: BlockStyle::Spacer,
+                render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
+                priority: 0,
+            });
+        }
+        let to_remove = std::mem::take(&mut self.gap_ids).into_iter().collect();
+        let editor = self.editor.clone();
+        self.gap_ids = editor.update(cx, |editor, cx| {
+            editor.remove_blocks(to_remove, None, cx);
+            editor.insert_blocks(blocks, None, cx)
+        });
     }
 
     /// Places the cursor at the start of a key's buffer.
@@ -782,7 +838,6 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
             } => {
                 let mut line = Line::new(LineKey::FoldToggle, RowTarget::FoldToggle);
                 line.span(Some(DashClass::Muted), |text| {
-                    text.push_str("  ");
                     if expanded {
                         text.push_str("fold");
                     } else {
@@ -794,9 +849,7 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
         }
     }
     let mut line = Line::new(LineKey::NewAgent, RowTarget::NewAgent);
-    line.span(Some(DashClass::Muted), |text| {
-        text.push_str("  + new agent")
-    });
+    line.span(Some(DashClass::Muted), |text| text.push_str("+ new agent"));
     lines.push(line);
     lines
 }
@@ -828,13 +881,12 @@ fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Lin
             primary,
         },
     );
-    // Rows sit at an indent (deeper when grouped) so the listing reads as
-    // a document with structure, not a flush-left sidebar — and reply
-    // drafts, at the margin, hang visibly to their left. The cursor is
-    // the selection indicator; rows carry no selected styling.
-    line.span(None, |text| {
-        text.push_str(if grouped { "    " } else { "  " })
-    });
+    // Rows, headers, and reply drafts all sit flush at one level — the
+    // container's margin does the breathing, not per-row indents. The
+    // cursor is the selection indicator; rows carry no selected styling.
+    if grouped {
+        line.span(None, |text| text.push_str("  "));
+    }
     if topic.pinned {
         line.span(None, |text| text.push_str("◆ "));
     }
