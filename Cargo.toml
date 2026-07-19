@@ -6,11 +6,9 @@ members = [
   "crates/octo-types",
   "crates/prefix-id",
   "crates/rho-agent",
-  "crates/rho-blocking-notify-channel",
   "crates/rho-ci",
   "crates/rho-claude",
   "crates/rho-cli",
-  "crates/rho-cli-term-raw",
   "crates/rho-code-mode",
   "crates/rho-context-config",
   "crates/rho-core",
@@ -22,7 +20,6 @@ members = [
   "crates/rho-pr-monitor",
   "crates/rho-profiling",
   "crates/rho-slack",
-  "crates/rho-term-screen",
   "crates/rho-tool-shell",
   "crates/rho-ui-proto",
   "crates/rho-webui-messages",
@@ -49,15 +46,10 @@ anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
-bon = { version = "3", default-features = false }
 bytes = "1"
 camino = "1"
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
-crossterm = { version = "0.28", default-features = false, features = [
-  "bracketed-paste",
-  "events",
-] }
 deno_core = "0.407"
 deno_error = "0.7"
 dirs = { version = "6", default-features = false }
@@ -82,11 +74,9 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-native-roots-no-provider",
 ] }
 rho-agent = { path = "crates/rho-agent" }
-rho-blocking-notify-channel = { path = "crates/rho-blocking-notify-channel" }
 rho-ci = { path = "crates/rho-ci" }
 rho-claude = { path = "crates/rho-claude" }
 rho-cli = { path = "crates/rho-cli" }
-rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
 rho-code-mode = { path = "crates/rho-code-mode" }
 rho-context-config = { path = "crates/rho-context-config" }
 rho-core = { path = "crates/rho-core" }
@@ -97,7 +87,6 @@ rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-slack = { path = "crates/rho-slack" }
-rho-term-screen = { path = "crates/rho-term-screen" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
 rho-webui-messages = { path = "crates/rho-webui-messages" }
@@ -136,11 +125,8 @@ tracing = { version = "0.1", default-features = false, features = [
   "attributes",
   "std",
 ] }
-unicode-segmentation = { version = "1", default-features = false }
-unicode-width = { version = "0.2", default-features = false }
 url = { version = "2", default-features = false }
 uuid = { version = "1", features = ["serde", "v4"] }
-vt100 = { version = "0.16", default-features = false }
 zip = { version = "2", default-features = false, features = [
   "deflate",
   "time",
