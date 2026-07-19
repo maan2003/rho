@@ -2124,6 +2124,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let rail = self.render_rail(text_style, cx);
+        // Same hairline the rail uses against the panes.
+        let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
             let id = pane.id;
             let content = self.render_surface(&pane.surface);
@@ -2155,7 +2157,23 @@ impl Workspace {
                 SplitAxis::Row => element.flex_row(),
                 SplitAxis::Column => element.flex_col(),
             };
-            element.children(children).into_any_element()
+            let mut separated = Vec::with_capacity(children.len() * 2);
+            for (index, child) in children.into_iter().enumerate() {
+                if index > 0 {
+                    let separator = match axis {
+                        SplitAxis::Row => div().w(px(1.)).h_full(),
+                        SplitAxis::Column => div().h(px(1.)).w_full(),
+                    };
+                    separated.push(
+                        separator
+                            .flex_none()
+                            .bg(separator_color)
+                            .into_any_element(),
+                    );
+                }
+                separated.push(child);
+            }
+            element.children(separated).into_any_element()
         };
         div()
             .flex()
