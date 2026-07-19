@@ -237,8 +237,7 @@ fn project_deps(
         let languages = Arc::new(language::LanguageRegistry::new(
             cx.background_executor().clone(),
         ));
-        let fs: Arc<dyn fs::Fs> =
-            Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
+        let fs: Arc<dyn fs::Fs> = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
         languages::init(
             languages.clone(),
             fs.clone(),

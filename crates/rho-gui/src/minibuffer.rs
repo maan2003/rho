@@ -75,7 +75,7 @@ impl Echo {
 /// editors above it — it reads as the vim command line, not a panel. The
 /// background is the editor's, nudged a few percent in lightness so the
 /// strip reads as its own region without a border.
-fn bottom_strip(text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> gpui::Div {
+pub(crate) fn bottom_strip(text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> gpui::Div {
     let mut background: gpui::Hsla = cx.theme().colors().editor_background.into();
     if background.l < 0.5 {
         background.l += 0.04;

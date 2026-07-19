@@ -20,6 +20,7 @@ mod terminal_view;
 mod tests;
 mod topic_rail;
 mod transcript;
+mod transient;
 mod workspace;
 mod zed_remote;
 
@@ -61,6 +62,7 @@ actions!(
         RailFocus,
         RailOpen,
         MinibufferCommand,
+        AgentTransient,
         MinibufferConfirm,
         MinibufferCancel,
         MinibufferNext,
@@ -471,6 +473,9 @@ fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("space w w", PaneFocusNext, Some(context)),
             KeyBinding::new("space b", PaneBack, Some(context)),
             KeyBinding::new("space r", RailFocus, Some(context)),
+            // The agent transient: `space a d` marks done, `space a` alone
+            // shows the menu.
+            KeyBinding::new("space a", AgentTransient, Some(context)),
             // Vim's own command line: `:` drops into the minibuffer. Loads
             // after the vim keymap, so it beats any bundled `:` binding.
             KeyBinding::new(":", MinibufferCommand, Some(context)),

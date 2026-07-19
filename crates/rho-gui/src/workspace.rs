@@ -139,10 +139,36 @@ pub struct Workspace {
     rail_focus: gpui::FocusHandle,
     /// The completing-read strip at the bottom of the window, when open.
     minibuffer: Option<Minibuffer>,
+    /// An open transient menu in the bottom strip; captures the keyboard
+    /// via `transient_focus` while shown.
+    transient: Option<crate::transient::Transient>,
+    transient_focus: gpui::FocusHandle,
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
     _event_task: Task<()>,
+}
+
+/// Which tag operation a transient prompt collects a name for.
+#[derive(Clone, Copy)]
+pub enum TagPrompt {
+    Move,
+    Group,
+    Label,
+    Unlabel,
+    Rename,
+}
+
+impl TagPrompt {
+    fn prompt(self) -> &'static str {
+        match self {
+            TagPrompt::Move => "workstream:",
+            TagPrompt::Group => "group:",
+            TagPrompt::Label => "label:",
+            TagPrompt::Unlabel => "unlabel:",
+            TagPrompt::Rename => "rename workstream:",
+        }
+    }
 }
 
 impl Workspace {
@@ -184,6 +210,8 @@ impl Workspace {
             active_context: ContextId::Draft,
             rail_focus: cx.focus_handle(),
             minibuffer: None,
+            transient: None,
+            transient_focus: cx.focus_handle(),
             echo: None,
             _event_task: event_task,
         };
@@ -1470,15 +1498,7 @@ impl Workspace {
                 }
             },
         );
-        let text_style = self
-            .active_editor(cx)
-            .update(cx, |editor, cx| editor.style(cx).text.clone());
-        let mut minibuffer =
-            Minibuffer::open("buffer:", &text_style, complete, on_submit, window, cx);
-        minibuffer.refresh(self, cx);
-        self.minibuffer = Some(minibuffer);
-        self.echo = None;
-        cx.notify();
+        self.open_prompt("buffer:", complete, on_submit, window, cx);
     }
 
     /// `:close [name]`: removes a surface from the context. Panes showing
@@ -2044,16 +2064,7 @@ impl Workspace {
                 }
             },
         );
-        let text_style = self
-            .active_editor(cx)
-            .update(cx, |editor, cx| editor.style(cx).text.clone());
-        let mut minibuffer = Minibuffer::open(":", &text_style, complete, on_submit, window, cx);
-        minibuffer.refresh(self, cx);
-        self.minibuffer = Some(minibuffer);
-        // The minibuffer takes over the bottom strip; a stale message
-        // reappearing after it closes would be confusing.
-        self.echo = None;
-        cx.notify();
+        self.open_prompt(":", complete, on_submit, window, cx);
     }
 
     /// Recomputes candidates after an edit; subscribed by [`Minibuffer`].
@@ -2082,6 +2093,197 @@ impl Workspace {
             self.focus_active_surface(window, cx);
             cx.notify();
         }
+    }
+
+    /// Opens a completing-read prompt in the bottom strip: the primitive
+    /// transient items drop into for values.
+    pub(crate) fn open_prompt(
+        &mut self,
+        prompt: impl Into<gpui::SharedString>,
+        complete: crate::minibuffer::CandidateSource,
+        on_submit: crate::minibuffer::SubmitHandler,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text_style = self
+            .active_editor(cx)
+            .update(cx, |editor, cx| editor.style(cx).text.clone());
+        let mut minibuffer = Minibuffer::open(prompt, &text_style, complete, on_submit, window, cx);
+        minibuffer.refresh(self, cx);
+        self.minibuffer = Some(minibuffer);
+        self.transient = None;
+        // The strip is single-occupancy; a stale message reappearing after
+        // the prompt closes would be confusing.
+        self.echo = None;
+        cx.notify();
+    }
+
+    /// Runs a command as if fully typed: the single dispatch point shared
+    /// by transient items and the (legacy) `:` command line.
+    pub(crate) fn dispatch_command(
+        &mut self,
+        command: rho_commands::Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let agent_id = self.registry.selected_agent().copied();
+        self.handle_command(agent_id, rho_commands::Parsed::Command(command), window, cx);
+    }
+
+    pub(crate) fn open_transient(
+        &mut self,
+        transient: crate::transient::Transient,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.transient = Some(transient);
+        self.minibuffer = None;
+        self.echo = None;
+        window.focus(&self.transient_focus, cx);
+        cx.notify();
+    }
+
+    fn close_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.transient.take().is_some() {
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Keyboard dispatch while a transient is open: escape closes, a bound
+    /// key runs its action, anything else dismisses (magit's quiet exit).
+    fn transient_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        // Bare modifiers arrive as key events too; holding shift for an
+        // uppercase key must not dismiss the menu.
+        if matches!(
+            keystroke.key.as_str(),
+            "shift" | "control" | "alt" | "platform" | "function"
+        ) {
+            return;
+        }
+        let Some(transient) = &self.transient else {
+            return;
+        };
+        if keystroke.key == "escape" {
+            self.close_transient(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        match transient.action_for(keystroke) {
+            Some(run) => {
+                self.transient = None;
+                // Restore focus first so the action sees normal focus;
+                // submenus and prompts re-take the strip themselves.
+                self.focus_active_surface(window, cx);
+                run(self, window, cx);
+                cx.notify();
+            }
+            None => self.close_transient(window, cx),
+        }
+        cx.stop_propagation();
+    }
+
+    pub(crate) fn prompt_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let name = input.trim().to_owned();
+                if !name.is_empty() {
+                    workspace.dispatch_command(
+                        rho_commands::Command::AgentRename { name },
+                        window,
+                        cx,
+                    );
+                }
+            },
+        );
+        self.open_prompt("rename:", complete, on_submit, window, cx);
+    }
+
+    pub(crate) fn prompt_snooze(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let input = input.trim();
+                if input.is_empty() {
+                    return;
+                }
+                match rho_commands::parse_duration_ms(input) {
+                    Some(duration_ms) => workspace.dispatch_command(
+                        rho_commands::Command::AgentSnooze { duration_ms },
+                        window,
+                        cx,
+                    ),
+                    None => workspace.notice_on(
+                        None,
+                        &format!("snooze: bad duration `{input}` (30m, 2h, 1d)"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            },
+        );
+        self.open_prompt("snooze (30m/2h/1d):", complete, on_submit, window, cx);
+    }
+
+    pub(crate) fn prompt_tag(
+        &mut self,
+        kind: TagPrompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let names = {
+            let tags = self.tag_names();
+            match kind {
+                TagPrompt::Move => tags.workstreams,
+                TagPrompt::Group => tags.groups,
+                TagPrompt::Label | TagPrompt::Unlabel => tags.labels,
+                TagPrompt::Rename => Vec::new(),
+            }
+        };
+        let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            names
+                .iter()
+                .filter(|name| name.to_lowercase().contains(&needle))
+                .map(|name| crate::commands::Candidate {
+                    value: name.clone(),
+                    description: String::new(),
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let name = input.trim().to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                let command = match kind {
+                    TagPrompt::Move => rho_commands::Command::TagMove { name },
+                    TagPrompt::Group => rho_commands::Command::TagGroup { name },
+                    TagPrompt::Label => rho_commands::Command::TagLabel { name },
+                    TagPrompt::Unlabel => rho_commands::Command::TagUnlabel { name },
+                    TagPrompt::Rename => rho_commands::Command::TagRename { name },
+                };
+                workspace.dispatch_command(command, window, cx);
+            },
+        );
+        self.open_prompt(kind.prompt(), complete, on_submit, window, cx);
     }
 
     /// `space r`: the rail is ambient chrome, not a pane — focus jumps to
@@ -2165,12 +2367,7 @@ impl Workspace {
                         SplitAxis::Row => div().w(px(1.)).h_full(),
                         SplitAxis::Column => div().h(px(1.)).w_full(),
                     };
-                    separated.push(
-                        separator
-                            .flex_none()
-                            .bg(separator_color)
-                            .into_any_element(),
-                    );
+                    separated.push(separator.flex_none().bg(separator_color).into_any_element());
                 }
                 separated.push(child);
             }
@@ -2494,6 +2691,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &MinibufferCommand, window, cx| {
                 this.open_command_minibuffer(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &crate::AgentTransient, window, cx| {
+                this.open_transient(crate::transient::agent_menu(), window, cx);
+            }))
             .on_action(cx.listener(|this, _: &MinibufferConfirm, window, cx| {
                 this.minibuffer_confirm(window, cx);
             }))
@@ -2519,10 +2719,17 @@ impl Render for Workspace {
                 }
             }))
             .child(self.render_panes(&text_style, cx))
-            .children(match (&self.minibuffer, &self.echo) {
-                (Some(minibuffer), _) => Some(minibuffer.render(&text_style, cx)),
-                (None, Some(echo)) => Some(echo.render(&text_style, cx)),
-                (None, None) => None,
+            .children(match (&self.minibuffer, &self.transient, &self.echo) {
+                (Some(minibuffer), _, _) => Some(minibuffer.render(&text_style, cx)),
+                (None, Some(transient), _) => Some(
+                    div()
+                        .track_focus(&self.transient_focus)
+                        .on_key_down(cx.listener(Self::transient_key))
+                        .child(transient.render(&text_style, cx))
+                        .into_any_element(),
+                ),
+                (None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
+                (None, None, None) => None,
             })
     }
 }
