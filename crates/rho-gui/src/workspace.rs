@@ -2587,7 +2587,7 @@ impl Workspace {
             .flex_col()
             .items_center()
             .pt(px(10.))
-            .pb(px(14.))
+            .pb(px(26.))
             .child(
                 div()
                     .font_weight(gpui::FontWeight::BOLD)
