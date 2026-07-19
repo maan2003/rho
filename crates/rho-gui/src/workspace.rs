@@ -2691,9 +2691,20 @@ impl Workspace {
         )
     }
 
+    /// The selected agent's document preview editor, built on first use.
+    fn selected_preview_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<editor::Editor>> {
+        let agent_id = self.registry.selected_agent().copied()?;
+        let model = self.models.get(&agent_id)?.clone();
+        Some(model.update(cx, |model, cx| model.preview_editor(window, cx)))
+    }
+
     fn render_panes(
         &mut self,
-        window: &Window,
+        window: &mut Window,
         text_style: &gpui::TextStyle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -2706,6 +2717,10 @@ impl Workspace {
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         let preview_bar = home.then(|| self.render_preview_bar(text_style, cx)).flatten();
+        let preview = home
+            .then(|| self.selected_preview_editor(window, cx))
+            .flatten()
+            .map(|editor| div().size_full().overflow_hidden().child(editor));
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
             let id = pane.id;
             let content = self.render_surface(&pane.surface);
@@ -2751,13 +2766,14 @@ impl Workspace {
             element.children(separated).into_any_element()
         };
         let panes = show_panes.then(|| {
-            let content = self.active_tree().layout(&mut leaf, &mut container);
             let element = div().flex_1().min_w_0().min_h_0();
             // Home mode boxes the preview — a sheet hanging from a top
             // inset, flush with the bottom and right window edges, visibly
             // a card showing what the cursor points at, not an equal half.
-            // Its bottom bar carries the context the prompt row shows when
-            // focused: who this is, where it runs, how full its context is.
+            // The sheet shows the agent's *document* editor: the same
+            // transcript buffers composed without the prompt, ending where
+            // the words end. Its bottom bar carries the context the prompt
+            // row shows in work mode.
             if home {
                 element
                     .mt(gpui::relative(0.02))
@@ -2767,10 +2783,19 @@ impl Workspace {
                     .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .child(div().flex_1().min_w_0().min_h_0().child(content))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .children(preview),
+                    )
                     .children(preview_bar)
             } else {
-                element.h_full().child(content)
+                element
+                    .h_full()
+                    .child(self.active_tree().layout(&mut leaf, &mut container))
             }
         });
         div()

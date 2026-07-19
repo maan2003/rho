@@ -41,21 +41,21 @@ pub struct AgentModel {
     system_excerpt_added: bool,
     system_styles: Vec<(StyleClass, Range<text::Anchor>)>,
     multi_buffer: Entity<MultiBuffer>,
+    /// The document multibuffer: transcript (cropped flush when the turn
+    /// is closed) plus system notices, without the prompt. The dashboard
+    /// preview reads this — a pure document that ends where the words do.
+    document_multi_buffer: Entity<MultiBuffer>,
+    /// The read-only editor over the document multibuffer, built lazily
+    /// for the dashboard preview and kept for the model's lifetime.
+    preview_editor: Option<Entity<Editor>>,
     prompt_end: text::Anchor,
     status_spans: Vec<(String, gpui::HighlightStyle)>,
-    /// Editors whose keyboard focus is on this view right now. The prompt's
-    /// "Write a message…" invite only shows on a focused editor — a
-    /// transcript being previewed from the dashboard shouldn't ask for
-    /// input.
-    focused_editors: std::collections::HashSet<gpui::EntityId>,
     workspace: WeakEntity<Workspace>,
-    /// Editors currently displaying this agent, weakly held: panes own
-    /// their editors; the model only reconciles whoever is still alive.
+    /// Full-multibuffer editors currently displaying this agent, weakly
+    /// held: panes own their editors; the model only reconciles whoever
+    /// is still alive. The preview editor lives apart — prompt chrome
+    /// must never reach it.
     editors: Vec<WeakEntity<Editor>>,
-    /// Per-editor display elision hiding the trailing blank row and the
-    /// empty prompt row on unfocused (preview) editors — those rows are
-    /// the prompt's breathing room, and a preview has no prompt.
-    prompt_tail_elisions: std::collections::HashMap<gpui::EntityId, editor::DisplayElisionId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -98,7 +98,10 @@ impl AgentModel {
             }
         })];
 
-        let transcript = TranscriptModel::new(transcript_buffer, multi_buffer.clone());
+        let document_multi_buffer =
+            cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
+        let transcript =
+            TranscriptModel::new(transcript_buffer, document_multi_buffer.clone());
         Self {
             transcript,
             prompt_buffer,
@@ -106,14 +109,53 @@ impl AgentModel {
             system_excerpt_added: false,
             system_styles: Vec::new(),
             multi_buffer,
+            document_multi_buffer,
+            preview_editor: None,
             prompt_end,
             status_spans: Vec::new(),
-            focused_editors: std::collections::HashSet::new(),
             workspace,
             editors: Vec::new(),
-            prompt_tail_elisions: std::collections::HashMap::new(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// The read-only preview editor over the document multibuffer, built
+    /// on first use: no prompt, no banner, pinned to the latest content.
+    pub fn preview_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        if let Some(editor) = &self.preview_editor {
+            return editor.clone();
+        }
+        let multi_buffer = self.document_multi_buffer.clone();
+        let transcript_id = self.transcript.buffer().read(cx).remote_id();
+        let system_id = self.system_buffer.read(cx).remote_id();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                },
+                multi_buffer,
+                None,
+                window,
+                cx,
+            );
+            crate::editor_config::configure(&mut editor, window, cx);
+            editor.disable_header_for_buffer(transcript_id, cx);
+            editor.disable_header_for_buffer(system_id, cx);
+            editor.set_read_only(true);
+            editor.set_autoscroll_pin(multi_buffer::Anchor::Max, AutoscrollStrategy::Bottom, cx);
+            editor
+        });
+        self.transcript
+            .attach(&editor, crate::workspace::now_ms(), cx);
+        self.apply_system_styles_to(&editor, cx);
+        self.preview_editor = Some(editor.clone());
+        editor
     }
 
     /// Builds a pane's editor over the shared multibuffer — own cursor,
@@ -163,43 +205,6 @@ impl AgentModel {
         crate::banner::insert(&editor, &self.multi_buffer, cx);
         self.transcript
             .attach(&editor, crate::workspace::now_ms(), cx);
-        self._subscriptions
-            .push(
-                cx.subscribe_in(&editor, window, |this, editor, event, window, cx| match event {
-                    editor::EditorEvent::Focused => {
-                        this.focused_editors.insert(editor.entity_id());
-                        let unhidden = this.apply_prompt_chrome_to(editor, cx);
-                        // The elision clamped the selection out of the
-                        // hidden prompt; with the prompt back, focus means
-                        // the user came here to type.
-                        if unhidden
-                            && let Some(anchor) = this
-                                .multi_buffer
-                                .read(cx)
-                                .snapshot(cx)
-                                .anchor_in_excerpt(this.prompt_end)
-                        {
-                            editor.update(cx, |editor, cx| {
-                                editor.change_selections(
-                                    SelectionEffects::default(),
-                                    window,
-                                    cx,
-                                    |selections| {
-                                        selections.select_anchor_ranges([anchor..anchor]);
-                                    },
-                                );
-                            });
-                        }
-                        this.apply_status_to(editor, cx);
-                    }
-                    editor::EditorEvent::Blurred => {
-                        this.focused_editors.remove(&editor.entity_id());
-                        this.apply_prompt_chrome_to(editor, cx);
-                        this.apply_status_to(editor, cx);
-                    }
-                    _ => {}
-                }),
-            );
         self.editors.push(editor.downgrade());
         self.apply_status_to(&editor, cx);
         self.apply_system_styles_to(&editor, cx);
@@ -226,22 +231,6 @@ impl AgentModel {
     ) {
         self.transcript
             .sync(state, summary, now_ms, agent_label, cx);
-        // Content growth moves the tail; re-anchor the tail elisions.
-        self.refresh_tail_elisions(cx);
-    }
-
-    /// Drops every tail elision and lets prompt chrome re-place them
-    /// against the current end of content.
-    fn refresh_tail_elisions(&mut self, cx: &mut Context<Self>) {
-        let stale = std::mem::take(&mut self.prompt_tail_elisions);
-        for editor in self.live_editors() {
-            if let Some(id) = stale.get(&editor.entity_id()) {
-                editor.update(cx, |editor, cx| {
-                    editor.remove_display_elisions([*id].into_iter().collect(), None, cx);
-                });
-            }
-            self.apply_prompt_chrome_to(&editor, cx);
-        }
     }
 
     pub fn tick_timers(&mut self, now_ms: u64, cx: &mut Context<Self>) {
@@ -282,9 +271,9 @@ impl AgentModel {
             buffer.anchor_before(start)..buffer.anchor_before(start + line.len())
         });
         self.system_styles.push((class, range));
+        let system_buffer = self.system_buffer.clone();
         if !self.system_excerpt_added {
             self.system_excerpt_added = true;
-            let system_buffer = self.system_buffer.clone();
             self.multi_buffer.update(cx, |multi_buffer, cx| {
                 multi_buffer.set_excerpts_for_path(
                     PathKey::sorted(1),
@@ -294,11 +283,26 @@ impl AgentModel {
                     cx,
                 );
             });
-            // Tail elisions anchored at the transcript's end would swallow
-            // the new excerpt; rebuild them against the system buffer.
-            self.refresh_tail_elisions(cx);
         }
+        // The document's system excerpt is cropped flush (no trailing
+        // blank row) and re-set as notices accumulate.
+        let end = {
+            let buffer = system_buffer.read(cx);
+            buffer.offset_to_point(buffer.len().saturating_sub(1))
+        };
+        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(1),
+                system_buffer.clone(),
+                [Point::zero()..end],
+                0,
+                cx,
+            );
+        });
         for editor in self.live_editors() {
+            self.apply_system_styles_to(&editor, cx);
+        }
+        if let Some(editor) = self.preview_editor.clone() {
             self.apply_system_styles_to(&editor, cx);
         }
         cx.notify();
@@ -312,9 +316,12 @@ impl AgentModel {
                 None => by_class.push((*class, vec![range.clone()])),
             }
         }
+        // Resolve against the editor's own multibuffer: full editors and
+        // the document preview compose the system buffer differently.
+        let multi_buffer = editor.read(cx).buffer().clone();
         apply_class_highlights(
             editor,
-            &self.multi_buffer,
+            &multi_buffer,
             Region::System,
             by_class
                 .iter()
@@ -399,11 +406,7 @@ impl AgentModel {
         else {
             return;
         };
-        // The status chips ride the prompt line, so they only exist where
-        // the prompt does: on a focused editor. A preview is a document,
-        // not an input.
-        let focused = self.focused_editors.contains(&editor.entity_id());
-        let right_prompt = (focused && !self.status_spans.is_empty()).then(|| EditorRightPrompt {
+        let right_prompt = (!self.status_spans.is_empty()).then(|| EditorRightPrompt {
             anchor,
             spans: self.status_spans.clone(),
         });
@@ -419,27 +422,21 @@ impl AgentModel {
         cx.notify();
     }
 
-    /// Returns whether a tail elision was removed (the prompt row just
-    /// became visible again).
-    fn apply_prompt_chrome_to(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> bool {
+    fn apply_prompt_chrome_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let buffer = self.prompt_buffer.read(cx);
         let draft_empty = buffer.is_empty();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(prompt_start) =
             snapshot.anchor_in_excerpt(self.prompt_buffer.read(cx).anchor_before(0))
         else {
-            return false;
+            return;
         };
         let Some(prompt_end) = snapshot.anchor_in_excerpt(self.prompt_end) else {
-            return false;
+            return;
         };
 
-        // A previewed (unfocused) transcript shows no input affordances at
-        // all: no invite, no gutter stripe — the prompt row is just a
-        // blank line.
-        let focused = self.focused_editors.contains(&editor.entity_id());
         let mut inlays = Vec::new();
-        if draft_empty && focused {
+        if draft_empty {
             inlays.push(Inlay::custom(
                 PROMPT_PLACEHOLDER_INLAY_ID,
                 prompt_end,
@@ -451,77 +448,6 @@ impl AgentModel {
         } else {
             vec![prompt_start..prompt_end]
         };
-        let gutter_ranges = if focused {
-            vec![prompt_start..prompt_end]
-        } else {
-            Vec::new()
-        };
-        // Unfocused with nothing typed, the tail — the blank spacing row
-        // plus the empty prompt row — is dead space; a per-editor display
-        // elision collapses it to a single blank row. (Zero-height would
-        // leave buffer positions with no display row and panic selection
-        // layout.) A parked draft stays visible. The start anchor is
-        // right-biased at the transcript's end, so it rides appends and
-        // keeps covering only the tail.
-        let hide_tail = !focused && draft_empty;
-        let elision = self.prompt_tail_elisions.get(&editor.entity_id()).copied();
-        let mut unhidden = false;
-        match (hide_tail, elision) {
-            (true, None) => {
-                // The tail begins after the last content excerpt — the
-                // system-notice buffer when present, else the transcript.
-                let tail_buffer = if self.system_excerpt_added {
-                    &self.system_buffer
-                } else {
-                    self.transcript.buffer()
-                };
-                let tail_buffer = tail_buffer.read(cx);
-                let len = tail_buffer.len();
-                // Step back over trailing newlines (keeping the content's
-                // own terminator) so the blank separator rows fold away
-                // with the prompt row, not just the final one. Content
-                // appended after this anchor lands inside the hidden range
-                // until the next sync re-anchors — which it always does.
-                let trailing = tail_buffer
-                    .as_rope()
-                    .reversed_chars_at(len)
-                    .take_while(|c| *c == '\n')
-                    .count();
-                let start_offset = len - trailing.saturating_sub(1);
-                let tail_start =
-                    snapshot.anchor_in_excerpt(tail_buffer.anchor_after(start_offset));
-                if let Some(start) = tail_start {
-                    let ids = editor.update(cx, |editor, cx| {
-                        editor.insert_display_elisions(
-                            [editor::DisplayElisionProperties {
-                                range: start..prompt_end,
-                                tail_rows: 0,
-                                height: Some(1),
-                                style: editor::display_map::BlockStyle::Fixed,
-                                render: std::sync::Arc::new(|_| {
-                                    gpui::Empty.into_any_element()
-                                }),
-                                priority: 0,
-                                type_tag: None,
-                            }],
-                            None,
-                            cx,
-                        )
-                    });
-                    if let Some(id) = ids.first() {
-                        self.prompt_tail_elisions.insert(editor.entity_id(), *id);
-                    }
-                }
-            }
-            (false, Some(id)) => {
-                editor.update(cx, |editor, cx| {
-                    editor.remove_display_elisions([id].into_iter().collect(), None, cx);
-                });
-                self.prompt_tail_elisions.remove(&editor.entity_id());
-                unhidden = true;
-            }
-            _ => {}
-        }
         let draft_style = StyleClass::UserMessage.resolve(cx);
         editor.update(cx, |editor, cx| {
             editor.splice_inlays(&[InlayId::Custom(PROMPT_PLACEHOLDER_INLAY_ID)], inlays, cx);
@@ -532,12 +458,11 @@ impl AgentModel {
                 cx,
             );
             editor.highlight_gutter::<PromptGutter>(
-                gutter_ranges,
+                vec![prompt_start..prompt_end],
                 style::user_prompt_gutter_color,
                 cx,
             );
         });
-        unhidden
     }
 }
 

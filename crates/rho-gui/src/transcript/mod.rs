@@ -30,8 +30,8 @@ use editor::Editor;
 use elisions::{ElisionState, ElisionSync};
 use gpui::{Context, Entity, WeakEntity};
 use inlays::{InlayRecord, PlacedInlay};
-use language::Buffer;
-use multi_buffer::MultiBuffer;
+use language::{Buffer, Point};
+use multi_buffer::{MultiBuffer, PathKey};
 use rho_ui_proto::remote::UiAgentState;
 use text::{Anchor, ToOffset as _};
 
@@ -43,7 +43,16 @@ use crate::style::{Region, StyleClass};
 
 pub struct TranscriptModel {
     buffer: Entity<Buffer>,
-    multi_buffer: Entity<MultiBuffer>,
+    /// The document multibuffer: the transcript excerpt, cropped when the
+    /// turn is closed to end where the words end (no trailing turn
+    /// separator). Preview editors read this; the full prompt-bearing
+    /// multibuffer is composed by the agent model and reaches this model
+    /// only through attachments.
+    document_multi_buffer: Entity<MultiBuffer>,
+    document_tail: Option<DocumentTail>,
+    /// Whether the last-synced state had an open turn; decides the
+    /// document tail policy between syncs (e.g. at attach time).
+    turn_open: bool,
     records: Vec<BlockRecord>,
     /// First record of the live turn as of the last sync. Records before it
     /// carry their highlights in the history region, records from it onward
@@ -59,8 +68,12 @@ pub struct TranscriptModel {
 
 /// One editor displaying this transcript, plus the per-editor state that
 /// lives in that editor's id spaces (inlay ids, display elision ids).
+/// Attachments carry their own multibuffer: full-prompt editors and
+/// document previews compose the shared buffer differently, so anchor
+/// resolution is per-attachment.
 struct Attachment {
     editor: WeakEntity<Editor>,
+    multi_buffer: Entity<MultiBuffer>,
     elisions: ElisionState,
     inlays: Vec<PlacedInlay>,
 }
@@ -77,11 +90,25 @@ struct BlockRecord {
 
 struct UserMessageGutter;
 
+/// The document excerpt's tail policy. Replacing an excerpt gives it a
+/// new id (invalidating every anchor into it), so the tail changes shape
+/// only at turn boundaries: streaming rides a growing excerpt; a closed
+/// turn crops flush at the last content line.
+#[derive(Clone, Copy, PartialEq)]
+enum DocumentTail {
+    /// The excerpt runs to the buffer's end and grows with appends.
+    Growing,
+    /// The excerpt is cropped flush at this point.
+    Cropped(Point),
+}
+
 impl TranscriptModel {
-    pub fn new(buffer: Entity<Buffer>, multi_buffer: Entity<MultiBuffer>) -> Self {
+    pub fn new(buffer: Entity<Buffer>, document_multi_buffer: Entity<MultiBuffer>) -> Self {
         Self {
             buffer,
-            multi_buffer,
+            document_multi_buffer,
+            document_tail: None,
+            turn_open: false,
             records: Vec::new(),
             turn_boundary: 0,
             elisions: ElisionSync::default(),
@@ -94,9 +121,10 @@ impl TranscriptModel {
         &self.buffer
     }
 
-    /// Attaches an editor over the transcript's multibuffer, bringing it
-    /// fully up to date with the model. Dropped editors detach themselves:
-    /// the model only holds weak handles and prunes on the next apply.
+    /// Attaches an editor showing this transcript (over whatever
+    /// multibuffer the editor was built on), bringing it fully up to date
+    /// with the model. Dropped editors detach themselves: the model only
+    /// holds weak handles and prunes on the next apply.
     pub fn attach<V: 'static>(
         &mut self,
         editor: &Entity<Editor>,
@@ -105,6 +133,7 @@ impl TranscriptModel {
     ) {
         self.attachments.push(Attachment {
             editor: editor.downgrade(),
+            multi_buffer: editor.read(cx).buffer().clone(),
             elisions: ElisionState::default(),
             inlays: Vec::new(),
         });
@@ -122,7 +151,12 @@ impl TranscriptModel {
         agent_label: &impl Fn(rho_ui_proto::AgentId) -> String,
         cx: &mut Context<V>,
     ) {
+        self.turn_open = crate::store::turn_open(state.status);
         let Some(first_changed) = summary.first_changed_block else {
+            // Status alone can close the turn; the document tail follows,
+            // and a replaced excerpt triggers the full re-apply inside.
+            let empty = HashSet::new();
+            self.apply_to_attachments(now_ms, &empty, &empty, false, cx);
             return;
         };
 
@@ -332,9 +366,49 @@ impl TranscriptModel {
         );
     }
 
+    /// Aligns the document excerpt with the tail policy. Returns whether
+    /// the excerpt was replaced (its id changed): every anchor a document
+    /// attachment holds is stale then, and it needs a full re-apply.
+    fn update_document_excerpt<V: 'static>(&mut self, cx: &mut Context<V>) -> bool {
+        let buffer = self.buffer.read(cx);
+        let desired = if self.turn_open {
+            DocumentTail::Growing
+        } else {
+            let len = buffer.len();
+            let trailing = buffer
+                .as_rope()
+                .reversed_chars_at(len)
+                .take_while(|c| *c == '\n')
+                .count();
+            DocumentTail::Cropped(buffer.offset_to_point(len - trailing))
+        };
+        if self.document_tail == Some(desired) {
+            return false;
+        }
+        self.document_tail = Some(desired);
+        let end = match desired {
+            DocumentTail::Growing => buffer.max_point(),
+            DocumentTail::Cropped(end) => end,
+        };
+        let buffer = self.buffer.clone();
+        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(0),
+                buffer,
+                [Point::zero()..end],
+                0,
+                cx,
+            );
+        });
+        true
+    }
+
     /// Brings every attached editor up to date with the model: changed
     /// highlight classes reapplied per region, gutters when they moved,
-    /// inlays and display elisions reconciled. Dead attachments prune here.
+    /// inlays and display elisions reconciled. Dead attachments prune
+    /// here. When the document excerpt was replaced, attachments over the
+    /// document multibuffer re-apply everything from scratch — their old
+    /// anchors all died with the excerpt.
     fn apply_to_attachments<V: 'static>(
         &mut self,
         now_ms: u64,
@@ -343,17 +417,26 @@ impl TranscriptModel {
         gutters_changed: bool,
         cx: &mut Context<V>,
     ) {
+        let document_replaced = self.update_document_excerpt(cx);
         if self.attachments.is_empty() {
             return;
         }
         let history_styles = region_styles(&self.records[..self.turn_boundary], changed_history);
         let live_styles = region_styles(&self.records[self.turn_boundary..], changed_live);
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let gutter_ranges = gutters_changed.then(|| {
+        let (full_history_styles, full_live_styles) = if document_replaced {
+            let history = classes_in(&self.records[..self.turn_boundary]);
+            let live = classes_in(&self.records[self.turn_boundary..]);
+            (
+                region_styles(&self.records[..self.turn_boundary], &history),
+                region_styles(&self.records[self.turn_boundary..], &live),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let gutter_anchor_ranges = (gutters_changed || document_replaced).then(|| {
             self.records
                 .iter()
-                .filter_map(|record| record.gutter.as_ref())
-                .filter_map(|range| excerpt_range(&snapshot, range))
+                .filter_map(|record| record.gutter.clone())
                 .collect::<Vec<_>>()
         });
         let desired_inlays = self
@@ -364,7 +447,7 @@ impl TranscriptModel {
             .collect::<Vec<_>>();
 
         let Self {
-            multi_buffer,
+            document_multi_buffer,
             next_inlay_id,
             attachments,
             elisions,
@@ -374,6 +457,20 @@ impl TranscriptModel {
             let Some(editor) = attachment.editor.upgrade() else {
                 return false;
             };
+            let refresh = document_replaced && attachment.multi_buffer == *document_multi_buffer;
+            if refresh {
+                // The replaced excerpt took the placed inlays and display
+                // elisions with it; forget them so reconciliation places
+                // them anew with live anchors.
+                attachment.inlays.clear();
+                attachment.elisions = ElisionState::default();
+            }
+            let (history_styles, live_styles) = if refresh {
+                (&full_history_styles, &full_live_styles)
+            } else {
+                (&history_styles, &live_styles)
+            };
+            let multi_buffer = &attachment.multi_buffer;
             apply_class_highlights(
                 &editor,
                 multi_buffer,
@@ -392,10 +489,17 @@ impl TranscriptModel {
                     .map(|(class, ranges)| (*class, ranges.as_slice())),
                 cx,
             );
-            if let Some(ranges) = &gutter_ranges {
+            if let Some(ranges) = &gutter_anchor_ranges
+                && (gutters_changed || refresh)
+            {
+                let snapshot = multi_buffer.read(cx).snapshot(cx);
+                let ranges = ranges
+                    .iter()
+                    .filter_map(|range| excerpt_range(&snapshot, range))
+                    .collect::<Vec<_>>();
                 editor.update(cx, |editor, cx| {
                     editor.highlight_gutter::<UserMessageGutter>(
-                        ranges.clone(),
+                        ranges,
                         crate::style::user_prompt_gutter_color,
                         cx,
                     );

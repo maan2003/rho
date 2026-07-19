@@ -202,10 +202,8 @@ fn user_messages_render_with_turn_gaps_and_gutters(cx: &mut TestAppContext) {
     );
 
     let text = display_text(&workspace, cx);
-    // (No trailing gap after the final message: an unfocused editor folds
-    // the tail away.)
     assert!(
-        text.contains("first\n\nanswer\n\nsecond\n"),
+        text.contains("first\n\nanswer\n\nsecond\n\n"),
         "subsequent user messages should start a new turn with a blank line: {text:?}"
     );
     // Leading newlines are the banner block's display rows; the transcript
@@ -321,17 +319,6 @@ fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
     );
 
     let editor = active_editor(&workspace, cx);
-    // Typing happens on a focused editor; unfocused ones elide the prompt
-    // row entirely (they are previews).
-    workspace
-        .update(cx, |_, window, cx| {
-            window.activate_window();
-            let handle = editor.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
-        })
-        .expect("focus transcript editor");
-    // Focus dispatches on draw; a keystroke draws the window.
-    cx.simulate_keystrokes(*workspace, "escape");
     workspace
         .update(cx, |_, window, cx| {
             editor.update(cx, |editor, cx| editor.insert("draft", window, cx));
