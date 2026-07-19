@@ -1,5 +1,5 @@
 ---
-name: workstreams
+name: rho-workstreams
 description: Use when organizing rho agents into workstreams — listing, renaming, labeling, grouping, pinning, hiding, or moving agents between workstreams with the rho workstream CLI.
 ---
 
