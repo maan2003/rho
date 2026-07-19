@@ -135,8 +135,9 @@ pub struct Workspace {
     surfaces: HashMap<ContextId, Vec<Surface>>,
     /// Always present in `contexts` (the draft context never closes).
     active_context: ContextId,
-    /// Keyboard focus for the ambient rail (it has no editor).
-    rail_focus: gpui::FocusHandle,
+    /// The dashboard: the rail as a real editor buffer, ambient chrome
+    /// beside the active tree.
+    dashboard: crate::dashboard::Dashboard,
     /// The completing-read strip at the bottom of the window, when open.
     minibuffer: Option<Minibuffer>,
     /// An open transient menu in the bottom strip; captures the keyboard
@@ -217,7 +218,7 @@ impl Workspace {
             contexts: HashMap::new(),
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
-            rail_focus: cx.focus_handle(),
+            dashboard: crate::dashboard::Dashboard::new(window, cx),
             minibuffer: None,
             transient: None,
             transient_stack: Vec::new(),
@@ -2317,47 +2318,49 @@ impl Workspace {
         self.open_prompt("remove project:", complete, on_submit, window, cx);
     }
 
-    /// `space r`: the rail is ambient chrome, not a pane — focus jumps to
-    /// it directly and never lands on it through the pane cycle.
+    /// `space r`: the dashboard is ambient chrome, not a pane — focus jumps
+    /// to it directly and never lands on it through the pane cycle.
     pub(crate) fn focus_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.rail_focus, cx);
+        let handle = self.dashboard.focus_handle(cx);
+        window.focus(&handle, cx);
         cx.notify();
     }
 
-    /// Enter from the rail: return focus to the active context's tree.
-    fn leave_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_selection_to_focus(cx);
-        self.focus_active_surface(window, cx);
-        cx.notify();
+    /// `enter` in the dashboard: act on the row under the cursor.
+    fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::dashboard::RowTarget;
+        match self.dashboard.cursor_target(cx) {
+            Some(RowTarget::Stream {
+                primary: Some(agent_id),
+                ..
+            }) => self.open_agent(agent_id, window, cx),
+            Some(RowTarget::FoldToggle) => self.toggle_rail_tail(cx),
+            Some(RowTarget::NewAgent) => self.enter_draft(None, window, cx),
+            Some(RowTarget::Stream { primary: None, .. })
+            | Some(RowTarget::None)
+            | None => {}
+        }
     }
 
-    /// The ambient rail beside the active context's tree: reachable by
+    /// The ambient dashboard beside the active context's tree: reachable by
     /// `space r` or the mouse, outside the pane cycle.
-    fn render_rail(
-        &self,
-        text_style: &gpui::TextStyle,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_rail(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let border_color = cx.theme().colors().border_variant.opacity(0.6);
         div()
             .h_full()
             .flex_none()
+            .w(gpui::relative(0.3))
             .overflow_hidden()
-            .track_focus(&self.rail_focus)
-            .key_context("RhoRail")
-            .child(crate::topic_rail::render_topic_rail(
-                &self.registry,
-                text_style,
-                cx,
-            ))
+            .border_r_1()
+            .border_color(border_color)
+            .py(px(2.))
+            .key_context("RhoDashboard")
+            .child(self.dashboard.editor().clone())
             .into_any_element()
     }
 
-    fn render_panes(
-        &self,
-        text_style: &gpui::TextStyle,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let rail = self.render_rail(text_style, cx);
+    fn render_panes(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let rail = self.render_rail(cx);
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
@@ -2643,9 +2646,12 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
+        // Regenerate the dashboard listing whenever anything redraws; sync
+        // is cheap and a near no-op when nothing changed.
+        self.dashboard.sync(&self.registry, window, cx);
         div()
             .id("rho-gui")
             .size_full()
@@ -2717,7 +2723,7 @@ impl Render for Workspace {
                 this.focus_rail(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RailOpen, window, cx| {
-                this.leave_rail(window, cx);
+                this.dashboard_open(window, cx);
             }))
             .on_action(cx.listener(|this, _: &crate::RootTransient, window, cx| {
                 this.open_transient(crate::transient::root_menu(), window, cx);
@@ -2746,7 +2752,7 @@ impl Render for Workspace {
                     this.minibuffer = Some(minibuffer);
                 }
             }))
-            .child(self.render_panes(&text_style, cx))
+            .child(self.render_panes(cx))
             .children(match (&self.minibuffer, &self.transient, &self.echo) {
                 (Some(minibuffer), _, _) => Some(minibuffer.render(&text_style, cx)),
                 // The wrapper mounts (and captures keys) as soon as the

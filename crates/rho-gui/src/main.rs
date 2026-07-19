@@ -18,7 +18,7 @@ mod style;
 mod terminal_view;
 #[cfg(test)]
 mod tests;
-mod topic_rail;
+mod dashboard;
 mod transcript;
 mod transient;
 mod workspace;
@@ -460,9 +460,9 @@ fn bind_rho_key_overrides(cx: &mut App) {
     // agent verbs, workstream triage — is a transient item, so practiced
     // sequences run at full speed without the menu ever flashing. Bound for
     // normal-mode editors (vim or helix flavor — helix reports
-    // `vim_mode == helix_normal`) and the rail, which has no editor.
+    // `vim_mode == helix_normal`); the dashboard is an editor too, so the
+    // same contexts cover it.
     for context in [
-        "RhoRail",
         "RhoTerminalNormal",
         "RhoGui > Editor && vim_mode == normal",
         "RhoGui > Editor && vim_mode == helix_normal",
@@ -481,13 +481,14 @@ fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
     ]);
-    // Rail navigation: vim keys without a leader, since the rail is not a
-    // text editor.
-    cx.bind_keys([
-        KeyBinding::new("j", AgentNext, Some("RhoRail")),
-        KeyBinding::new("k", AgentPrevious, Some("RhoRail")),
-        KeyBinding::new("enter", RailOpen, Some("RhoRail")),
-    ]);
+    // Dashboard: a read-only editor, so motions come from the editor
+    // itself; `enter` acts on the row under the cursor. Bound after the
+    // vim keymaps so it beats vim's own enter motion.
+    cx.bind_keys([KeyBinding::new(
+        "enter",
+        RailOpen,
+        Some("RhoDashboard > Editor"),
+    )]);
 }
 
 const DEFAULT_SETTINGS: &str = r#"// Rho GUI user settings. Values here override bundled defaults.
