@@ -35,6 +35,7 @@ mod pr;
 mod slack;
 mod term;
 mod tool_render;
+mod wayland;
 
 #[cfg(test)]
 mod tests;
@@ -61,6 +62,9 @@ pub fn main() -> Result<()> {
         let result = runtime.block_on(rho_daemon::run(daemon_args));
         drop(runtime);
         return profiler.finish(result);
+    }
+    if let Command::Wayland(args) = args.command {
+        return wayland::run(args);
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -93,6 +97,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Pr(args) => pr::run(args).await,
         Command::Slack(args) => slack::run(args).await,
         Command::Term(args) => term::run(args).await,
+        Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
             rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
@@ -1240,6 +1245,7 @@ enum Command {
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
     Term(term::TermArgs),
+    Wayland(wayland::WaylandArgs),
 }
 
 #[derive(Parser)]
@@ -1268,6 +1274,8 @@ enum CliCommand {
     Slack(SlackArgs),
     /// Attach this terminal to an agent's daemon-owned terminal.
     Term(term::TermArgs),
+    /// Run and control applications in an isolated headless Wayland session.
+    Wayland(wayland::WaylandArgs),
 }
 
 #[derive(Clone, clap::Args)]
@@ -1417,6 +1425,7 @@ impl Args {
             Some(CliCommand::ProtocolLog(args)) => Command::ProtocolLog(args),
             Some(CliCommand::Slack(args)) => Command::Slack(args),
             Some(CliCommand::Term(args)) => Command::Term(args),
+            Some(CliCommand::Wayland(args)) => Command::Wayland(args),
             None => Command::Chat(cli.chat),
         };
         Ok(Self { command })

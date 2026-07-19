@@ -43,6 +43,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   own harness prompt.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
   rendering. They should not own inference protocol details.
+- `rho wayland` is an application-agnostic CLI surface for launching and
+  controlling programs in isolated headless Sway sessions. It wraps the
+  compositor's IPC plus `grim` and `wtype`; the Nix build embeds those tool
+  paths and Mesa's software Vulkan driver rather than relying on the caller's
+  environment.
 - The daemon snapshots the user's login-shell environment and passes it
   explicitly to `rho-workspaces` for daemon-owned commands. Workspace-control
   subprocesses use that environment directly; agent shell and Claude processes

@@ -179,6 +179,11 @@
               env.RUSTDOCFLAGS = "-D warnings";
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
               env.OCTO_REMOTE_HTTP = "${octoGit}/libexec/git-core/git-remote-http";
+              env.RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
+              env.RHO_WAYLAND_SWAYMSG = "${pkgs.sway}/bin/swaymsg";
+              env.RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
+              env.RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
+              env.RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
               env.RUSTY_V8_ARCHIVE = rustyV8Archive;
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
@@ -246,6 +251,7 @@
                 cp -r ${./.agents/skills/github-workflow} $out/share/rho/skills/github-workflow
                 cp -r ${./.agents/skills/delegate-engineering} \
                   $out/share/rho/skills/delegate-engineering
+                cp -r ${./.agents/skills/rho-wayland} $out/share/rho/skills/rho-wayland
                 chmod -R u+w $out/share/rho/skills
               '';
             };
@@ -353,6 +359,11 @@
           ];
           NEXTEST_SHOW_PROGRESS = "none";
           RHO_LOG = "rho_agent=debug,info";
+          RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
+          RHO_WAYLAND_SWAYMSG = "${pkgs.sway}/bin/swaymsg";
+          RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
+          RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
+          RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
           packages = [
             cargoCrap
             selfciMq

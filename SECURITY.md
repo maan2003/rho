@@ -34,6 +34,13 @@ AI APIs.
   during shutdown; profiling is intended only for bounded diagnostic runs.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
   explicit user-facing capabilities.
+- `rho wayland` sessions expose a private Wayland socket and Sway IPC
+  socket below a mode-0700 runtime directory. Anyone able to access those
+  sockets can observe or inject input into applications in that session. The
+  driver never exposes them over the network, validates session names as a
+  single path component, and records process start identities before sending
+  signals during cleanup. Applications launched in a driver session are not
+  sandboxed and retain the invoking user's authority.
 - Long-running `exec_command` processes are retained only in their owning
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent
