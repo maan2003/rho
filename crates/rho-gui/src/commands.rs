@@ -15,9 +15,9 @@ pub struct Candidate {
     pub description: String,
 }
 
-/// Tag names by kind, feeding tag-prompt completion.
+/// Workstream, group, and label names, feeding prompt completion.
 #[derive(Default)]
-pub struct TagNames {
+pub struct PromptNames {
     pub workstreams: Vec<String>,
     pub groups: Vec<String>,
     pub labels: Vec<String>,

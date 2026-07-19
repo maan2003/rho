@@ -158,9 +158,9 @@ pub struct Workspace {
     _event_task: Task<()>,
 }
 
-/// Which tag operation a transient prompt collects a name for.
+/// Which workstream or label operation a transient prompt collects a name for.
 #[derive(Clone, Copy)]
-pub enum TagPrompt {
+pub enum WorkstreamPrompt {
     Move,
     Group,
     Label,
@@ -168,14 +168,14 @@ pub enum TagPrompt {
     Rename,
 }
 
-impl TagPrompt {
+impl WorkstreamPrompt {
     fn prompt(self) -> &'static str {
         match self {
-            TagPrompt::Move => "workstream:",
-            TagPrompt::Group => "group:",
-            TagPrompt::Label => "label:",
-            TagPrompt::Unlabel => "unlabel:",
-            TagPrompt::Rename => "rename workstream:",
+            WorkstreamPrompt::Move => "move to workstream:",
+            WorkstreamPrompt::Group => "group:",
+            WorkstreamPrompt::Label => "label:",
+            WorkstreamPrompt::Unlabel => "unlabel:",
+            WorkstreamPrompt::Rename => "rename workstream:",
         }
     }
 }
@@ -844,7 +844,7 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_tag_rename(&mut self, name: String, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_workstream_rename(&mut self, name: String, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
@@ -911,7 +911,7 @@ impl Workspace {
         });
     }
 
-    pub(crate) fn cmd_tag_pin(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_workstream_pin(&mut self, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
@@ -937,7 +937,7 @@ impl Workspace {
         });
     }
 
-    pub(crate) fn cmd_tag_move(&mut self, name: String, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_agent_move(&mut self, name: String, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
@@ -952,7 +952,7 @@ impl Workspace {
         });
     }
 
-    pub(crate) fn cmd_tag_group(&mut self, name: String, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_workstream_group(&mut self, name: String, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
@@ -968,7 +968,7 @@ impl Workspace {
         });
     }
 
-    pub(crate) fn cmd_tag_label(&mut self, name: String, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_agent_label(&mut self, name: String, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
@@ -982,7 +982,7 @@ impl Workspace {
         });
     }
 
-    pub(crate) fn cmd_tag_unlabel(&mut self, name: String, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_agent_unlabel(&mut self, name: String, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
@@ -1226,7 +1226,7 @@ impl Workspace {
             .unwrap_or_else(|| path.to_string())
     }
 
-    pub fn tag_names(&self) -> crate::commands::TagNames {
+    pub fn prompt_names(&self) -> crate::commands::PromptNames {
         let workstreams = self.registry.workstreams();
         let mut groups = workstreams
             .iter()
@@ -1234,7 +1234,7 @@ impl Workspace {
             .collect::<Vec<_>>();
         groups.sort();
         groups.dedup();
-        crate::commands::TagNames {
+        crate::commands::PromptNames {
             workstreams: workstreams
                 .iter()
                 .map(|workstream| workstream.name.clone())
@@ -2157,19 +2157,19 @@ impl Workspace {
         self.open_prompt("snooze (30m/2h/1d):", complete, on_submit, window, cx);
     }
 
-    pub(crate) fn prompt_tag(
+    pub(crate) fn prompt_workstream(
         &mut self,
-        kind: TagPrompt,
+        kind: WorkstreamPrompt,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let names = {
-            let tags = self.tag_names();
+            let names = self.prompt_names();
             match kind {
-                TagPrompt::Move => tags.workstreams,
-                TagPrompt::Group => tags.groups,
-                TagPrompt::Label | TagPrompt::Unlabel => tags.labels,
-                TagPrompt::Rename => Vec::new(),
+                WorkstreamPrompt::Move => names.workstreams,
+                WorkstreamPrompt::Group => names.groups,
+                WorkstreamPrompt::Label | WorkstreamPrompt::Unlabel => names.labels,
+                WorkstreamPrompt::Rename => Vec::new(),
             }
         };
         let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &gpui::App| {
@@ -2193,11 +2193,11 @@ impl Workspace {
                     return;
                 }
                 match kind {
-                    TagPrompt::Move => workspace.cmd_tag_move(name, cx),
-                    TagPrompt::Group => workspace.cmd_tag_group(name, cx),
-                    TagPrompt::Label => workspace.cmd_tag_label(name, cx),
-                    TagPrompt::Unlabel => workspace.cmd_tag_unlabel(name, cx),
-                    TagPrompt::Rename => workspace.cmd_tag_rename(name, cx),
+                    WorkstreamPrompt::Move => workspace.cmd_agent_move(name, cx),
+                    WorkstreamPrompt::Group => workspace.cmd_workstream_group(name, cx),
+                    WorkstreamPrompt::Label => workspace.cmd_agent_label(name, cx),
+                    WorkstreamPrompt::Unlabel => workspace.cmd_agent_unlabel(name, cx),
+                    WorkstreamPrompt::Rename => workspace.cmd_workstream_rename(name, cx),
                 }
             },
         );

@@ -15,7 +15,7 @@ use gpui::{AnyElement, Context, Keystroke, Window, div};
 use theme::ActiveTheme as _;
 
 use crate::minibuffer::bottom_strip;
-use crate::workspace::{TagPrompt, Workspace};
+use crate::workspace::{WorkstreamPrompt, Workspace};
 
 pub type TransientRun = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
@@ -198,8 +198,8 @@ pub fn agent_menu() -> Transient {
         .item("n", "new agent", |workspace, window, cx| {
             workspace.cmd_agent_new(window, cx);
         })
-        .item("shift-t", "tags…", |workspace, window, cx| {
-            workspace.open_transient(tag_menu(), window, cx);
+        .item("shift-t", "workstream…", |workspace, window, cx| {
+            workspace.open_transient(workstream_menu(), window, cx);
         })
 }
 
@@ -220,25 +220,25 @@ fn snooze_menu() -> Transient {
         })
 }
 
-/// `space a T`: tag operations, rare enough to live one level down.
-fn tag_menu() -> Transient {
-    Transient::new("tag")
-        .item("m", "move to workstream…", |workspace, window, cx| {
-            workspace.prompt_tag(TagPrompt::Move, window, cx);
+/// `space a T`: workstream operations, rare enough to live one level down.
+fn workstream_menu() -> Transient {
+    Transient::new("workstream")
+        .item("m", "move agent here…", |workspace, window, cx| {
+            workspace.prompt_workstream(WorkstreamPrompt::Move, window, cx);
         })
         .item("g", "group workstream…", |workspace, window, cx| {
-            workspace.prompt_tag(TagPrompt::Group, window, cx);
+            workspace.prompt_workstream(WorkstreamPrompt::Group, window, cx);
         })
         .item("l", "add label…", |workspace, window, cx| {
-            workspace.prompt_tag(TagPrompt::Label, window, cx);
+            workspace.prompt_workstream(WorkstreamPrompt::Label, window, cx);
         })
         .item("u", "remove label…", |workspace, window, cx| {
-            workspace.prompt_tag(TagPrompt::Unlabel, window, cx);
+            workspace.prompt_workstream(WorkstreamPrompt::Unlabel, window, cx);
         })
         .item("r", "rename workstream…", |workspace, window, cx| {
-            workspace.prompt_tag(TagPrompt::Rename, window, cx);
+            workspace.prompt_workstream(WorkstreamPrompt::Rename, window, cx);
         })
         .item("p", "pin workstream", |workspace, _, cx| {
-            workspace.cmd_tag_pin(cx);
+            workspace.cmd_workstream_pin(cx);
         })
 }
