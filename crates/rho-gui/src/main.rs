@@ -69,6 +69,8 @@ actions!(
         MinibufferNext,
         MinibufferPrevious,
         MinibufferComplete,
+        GitApprovalAllow,
+        GitApprovalDeny,
         TerminalPaste,
         TerminalNormalMode,
         TerminalRawMode,
@@ -482,6 +484,12 @@ fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("ctrl-p", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
+    ]);
+    cx.bind_keys([
+        KeyBinding::new("shift-y", GitApprovalAllow, Some("RhoGitApproval")),
+        KeyBinding::new("n", GitApprovalDeny, Some("RhoGitApproval")),
+        KeyBinding::new("enter", GitApprovalDeny, Some("RhoGitApproval")),
+        KeyBinding::new("escape", GitApprovalDeny, Some("RhoGitApproval")),
     ]);
     // Dashboard: the listing is read-only, so normal-mode letters are free
     // for acting on the row under the cursor — the magit trick. `enter`

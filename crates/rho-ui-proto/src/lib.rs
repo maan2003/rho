@@ -273,7 +273,9 @@ pub enum ClientMessage {
     GitTransportProvide {
         request_id: u64,
         provider_id: u64,
-        approved: bool,
+        /// Whether this GUI claims the transport. This selects the credential
+        /// provider; push authorization happens later in the selected GUI.
+        claim: bool,
     },
     /// One-shot query on a fresh local stream used by the remote helper to
     /// choose PAT-backed GitHub HTTP or client-held SSH before negotiation.
@@ -995,7 +997,7 @@ mod tests {
             ClientMessage::GitTransportProvide {
                 request_id: 9,
                 provider_id: 4,
-                approved: true,
+                claim: true,
             },
             ClientMessage::GitTransportQuery {
                 host: "github.com".to_owned(),

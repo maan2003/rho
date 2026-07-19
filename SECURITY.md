@@ -108,25 +108,37 @@ AI APIs.
   guidance changes.
 - SSH Git credentials stay on native GUI machines. Every native GUI
   automatically registers its connection as a provider. Requests expose the
-  typed destination and repository to all registered GUIs; the first approval
-  wins atomically, while every other recipient receives only an opaque `Done`
-  for that request id, revealing neither winner nor outcome. With no provider
-  the daemon rejects immediately; after 60 seconds without approval it rejects
-  and dismisses every outstanding prompt. A winning GUI validates bounded
-  typed host/user/port/repository/service fields, asks before starting local
-  OpenSSH, and independently parses the actual bounded receive-pack command
-  prefix before forwarding it. Updates outside `refs/heads/rho/*` require a
-  second one-operation approval displaying full old/new object ids. Ref names,
+  typed destination and repository to all registered GUIs. Fetches use the
+  first approval; pushes use the first provider claim so the selected GUI can
+  independently parse the receive-pack command list before asking for one
+  approval. Every other recipient receives only an opaque `Done` for that
+  request id, revealing neither winner nor outcome. With no provider the daemon
+  rejects immediately; after 60 seconds without a claim it rejects the
+  request. A winning GUI validates bounded typed
+  host/user/port/repository/service fields. It asks before starting OpenSSH for
+  fetches. For pushes it starts OpenSSH and receives the ref advertisement
+  before approval, but forwards no receive-pack update command until the user
+  approves the full typed destination and parsed branch, tag, or other ref
+  updates with full old/new object ids. No client-to-OpenSSH bytes are sent
+  before that approval; only the server's advertisement is relayed to the Git
+  client. Starting SSH, invoking configured SSH helpers such as `ProxyCommand`,
+  authenticating, and exposing the remote ref advertisement before approval
+  are necessary to learn the exact command list. Both provider claim and the
+  final user approval have 60-second deadlines. Ref names,
   repository fields, and prompts use a conservative character set and prompt
   text replaces control and bidirectional formatting characters. Push options,
   signed pushes, unknown framing, and unsupported object-id sizes fail closed.
   The daemon-side remote helper runs the same command parser, but the GUI never
   relies on that validation to protect its credential.
-- SSH Git approval is session-only. No provider or denial means a fast failure
-  for operations routed to SSH; PAT-backed GitHub fetch and `rho/*` push remain
+- SSH Git approval is session-only. No provider, a declined fetch, or a denied
+  push means a fast failure for operations routed to SSH; PAT-backed GitHub
+  fetch and `rho/*` push remain
   available without a GUI. At most eight requests wait in the daemon
-  and each GUI runs one SSH transport at a time. Streams are backpressured,
-  SSH diagnostics are capped at 64 KiB, and cancellation or disconnect drops
+  and each GUI runs one SSH transport at a time. A push is not failed over
+  after a GUI claims it, even if that GUI later
+  denies because another local prompt is active; retrying starts a new race.
+  Streams are backpressured, SSH diagnostics are capped at 64 KiB, and
+  cancellation or disconnect drops
   the stream and kills the GUI-owned OpenSSH child. OpenSSH config and host-key
   verification on the GUI machine remain part of the trust boundary. A lost
   connection after sending a receive-pack request has an ambiguous outcome;
@@ -283,6 +295,12 @@ AI APIs.
 - Rho-owned agent variables (`RHO_AGENT_ID` and `RHO_MCP_AGENT_ID`) are supplied
   explicitly to agent commands rather than copied
   incidentally from the daemon environment.
+- Rho forces all daemon-owned agent, terminal, and internal workspace
+  subprocesses through process-local Git URL rewrites for the exact
+  `git@github.com:` and `ssh://git@github.com/` prefixes. It appends these
+  entries to the captured `GIT_CONFIG_COUNT` environment without writing
+  repository or user Git configuration; other hosts and GitHub SSH aliases
+  keep their normal transport.
 - When present, `XDG_RUNTIME_DIR` is seeded into the login shell alongside the
   basic identity and shell variables so user-scoped runtime sockets remain
   reachable from agent subprocesses.

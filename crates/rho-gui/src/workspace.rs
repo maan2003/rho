@@ -24,18 +24,18 @@ use crate::agent_view::AgentModel;
 use crate::chime::Chime;
 use crate::connection::{ConnEvent, Connection, GitApprovalDecision};
 use crate::draft_view::DraftModel;
-use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer};
+use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
 use crate::registry::{ActivePane, AgentRegistry};
 use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::FileView;
 use crate::{
-    AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, MinibufferCancel,
-    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose,
-    DashboardNewAgent, DashboardReply, PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus,
-    RailOpen, RoleCycle, RoleCycleGroup,
-    SubmitPrompt, TaskBoard,
+    AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardNewAgent,
+    DashboardReply, GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete,
+    MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext,
+    PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, SubmitPrompt,
+    TaskBoard,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -53,6 +53,12 @@ pub struct Surface {
     /// (mouse click, vim motion) pulls pane focus along. Shared by all
     /// pane clones of the surface, dropped with the last one.
     _focus_follow: Option<std::rc::Rc<gpui::Subscription>>,
+}
+
+struct PendingGitApproval {
+    request_id: u64,
+    prompt: String,
+    response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
 }
 
 #[derive(Clone)]
@@ -151,6 +157,7 @@ pub struct Workspace {
     /// quit-one) before a final escape closes the strip.
     transient_stack: Vec<crate::transient::Transient>,
     transient_focus: gpui::FocusHandle,
+    git_approval_focus: gpui::FocusHandle,
     /// Where focus lived when the leader chord began — the dashboard or a
     /// pane. Transient actions run against (and closing returns to) that
     /// origin, so `space a d` from home mode stays in home mode.
@@ -158,7 +165,7 @@ pub struct Workspace {
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
-    pending_git_approval: Option<(u64, tokio::sync::oneshot::Sender<GitApprovalDecision>)>,
+    pending_git_approval: Option<PendingGitApproval>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
 }
@@ -251,6 +258,7 @@ impl Workspace {
             transient: None,
             transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
+            git_approval_focus: cx.focus_handle(),
             transient_origin: None,
             echo: None,
             pending_git_approval: None,
@@ -536,8 +544,14 @@ impl Workspace {
                 );
             }
             ConnEvent::Disconnected(reason) => {
-                if let Some((_, response)) = self.pending_git_approval.take() {
-                    let _ = response.send(GitApprovalDecision::Done);
+                let had_git_approval = if let Some(pending) = self.pending_git_approval.take() {
+                    let _ = pending.response.send(GitApprovalDecision::Done);
+                    true
+                } else {
+                    false
+                };
+                if had_git_approval {
+                    self.focus_active_surface(window, cx);
                 }
                 self.connected = false;
                 self.awaiting_draft_agent = false;
@@ -558,7 +572,10 @@ impl Workspace {
                 prompt,
                 response,
             } => {
-                if self.minibuffer.is_some() || self.pending_git_approval.is_some() {
+                if self.minibuffer.is_some()
+                    || self.transient.is_some()
+                    || self.pending_git_approval.is_some()
+                {
                     let _ = response.send(GitApprovalDecision::Deny);
                     self.notice_on(
                         None,
@@ -568,49 +585,24 @@ impl Workspace {
                     );
                     return;
                 }
-                self.pending_git_approval = Some((request_id, response));
-                let complete = std::rc::Rc::new(|_: &Workspace, input: &str, _: &gpui::App| {
-                    [
-                        crate::commands::Candidate {
-                            value: "allow".to_owned(),
-                            description: "approve this operation once".to_owned(),
-                        },
-                        crate::commands::Candidate {
-                            value: "deny".to_owned(),
-                            description: "reject this operation".to_owned(),
-                        },
-                    ]
-                    .into_iter()
-                    .filter(|candidate| candidate.value.starts_with(input.trim()))
-                    .collect()
+                self.pending_git_approval = Some(PendingGitApproval {
+                    request_id,
+                    prompt,
+                    response,
                 });
-                let on_submit = std::rc::Rc::new(
-                    |workspace: &mut Workspace,
-                     input: String,
-                     _window: &mut Window,
-                     _cx: &mut Context<Workspace>| {
-                        if let Some((_, response)) = workspace.pending_git_approval.take() {
-                            let decision = if input.trim() == "allow" {
-                                GitApprovalDecision::Allow
-                            } else {
-                                GitApprovalDecision::Deny
-                            };
-                            let _ = response.send(decision);
-                        }
-                    },
-                );
-                self.open_prompt(prompt, complete, on_submit, window, cx);
+                window.focus(&self.git_approval_focus, cx);
+                self.echo = None;
+                cx.notify();
             }
             ConnEvent::GitTransportDone { request_id } => {
                 if self
                     .pending_git_approval
                     .as_ref()
-                    .is_some_and(|(pending_id, _)| *pending_id == request_id)
+                    .is_some_and(|pending| pending.request_id == request_id)
                 {
-                    if let Some((_, response)) = self.pending_git_approval.take() {
-                        let _ = response.send(GitApprovalDecision::Done);
+                    if let Some(pending) = self.pending_git_approval.take() {
+                        let _ = pending.response.send(GitApprovalDecision::Done);
                     }
-                    self.minibuffer.take();
                     self.focus_active_surface(window, cx);
                     cx.notify();
                 }
@@ -2144,9 +2136,19 @@ impl Workspace {
 
     fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.minibuffer.take().is_some() {
-            if let Some((_, response)) = self.pending_git_approval.take() {
-                let _ = response.send(GitApprovalDecision::Deny);
-            }
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn finish_git_approval(
+        &mut self,
+        decision: GitApprovalDecision,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pending) = self.pending_git_approval.take() {
+            let _ = pending.response.send(decision);
             self.focus_active_surface(window, cx);
             cx.notify();
         }
@@ -3414,19 +3416,42 @@ impl Render for Workspace {
                     this.minibuffer = Some(minibuffer);
                 }
             }))
+            .on_action(cx.listener(|this, _: &GitApprovalAllow, window, cx| {
+                this.finish_git_approval(GitApprovalDecision::Allow, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GitApprovalDeny, window, cx| {
+                this.finish_git_approval(GitApprovalDecision::Deny, window, cx);
+            }))
             .child(self.render_panes(window, &text_style, cx))
-            .children(match (&self.minibuffer, &self.transient, &self.echo) {
-                (Some(minibuffer), _, _) => Some(minibuffer.render(&text_style, cx)),
-                (None, Some(transient), _) => Some(
-                    div()
-                        .track_focus(&self.transient_focus)
-                        .on_key_down(cx.listener(Self::transient_key))
-                        .child(transient.render(&text_style, cx))
-                        .into_any_element(),
-                ),
-                (None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
-                (None, None, None) => None,
-            })
+            .children(
+                match (
+                    &self.pending_git_approval,
+                    &self.minibuffer,
+                    &self.transient,
+                    &self.echo,
+                ) {
+                    (Some(pending), _, _, _) => Some(
+                        div()
+                            .key_context("RhoGitApproval")
+                            .track_focus(&self.git_approval_focus)
+                            .child(
+                                bottom_strip(&text_style, cx)
+                                    .child(div().px_2().child(pending.prompt.clone())),
+                            )
+                            .into_any_element(),
+                    ),
+                    (None, Some(minibuffer), _, _) => Some(minibuffer.render(&text_style, cx)),
+                    (None, None, Some(transient), _) => Some(
+                        div()
+                            .track_focus(&self.transient_focus)
+                            .on_key_down(cx.listener(Self::transient_key))
+                            .child(transient.render(&text_style, cx))
+                            .into_any_element(),
+                    ),
+                    (None, None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
+                    (None, None, None, None) => None,
+                },
+            )
     }
 }
 

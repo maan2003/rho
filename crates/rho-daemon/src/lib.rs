@@ -91,6 +91,48 @@ fn login_environment() -> anyhow::Result<Vec<(OsString, OsString)>> {
     Ok(environment)
 }
 
+fn configure_octo_git_transport(environment: &mut Vec<(OsString, OsString)>) -> anyhow::Result<()> {
+    let count = environment
+        .iter()
+        .find_map(|(name, value)| (name == "GIT_CONFIG_COUNT").then_some(value))
+        .map(|value| {
+            value
+                .to_str()
+                .context("GIT_CONFIG_COUNT is not valid UTF-8")?
+                .parse::<usize>()
+                .context("GIT_CONFIG_COUNT is not a number")
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let rewrites = [
+        ("url.octo://github.com/.insteadOf", "git@github.com:"),
+        ("url.octo://github.com/.insteadOf", "ssh://git@github.com/"),
+    ];
+    let new_count = count
+        .checked_add(rewrites.len())
+        .context("too many ambient Git configuration entries")?;
+    set_environment_value(environment, "GIT_CONFIG_COUNT", new_count.to_string());
+    for (offset, (key, value)) in rewrites.into_iter().enumerate() {
+        let index = count + offset;
+        set_environment_value(environment, &format!("GIT_CONFIG_KEY_{index}"), key);
+        set_environment_value(environment, &format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
+    Ok(())
+}
+
+fn set_environment_value(
+    environment: &mut Vec<(OsString, OsString)>,
+    name: &str,
+    value: impl Into<OsString>,
+) {
+    let value = value.into();
+    if let Some((_, current)) = environment.iter_mut().find(|(key, _)| key == name) {
+        *current = value;
+    } else {
+        environment.push((name.into(), value));
+    }
+}
+
 #[derive(Clone, Default)]
 struct PlatformSecrets {
     store: Arc<std::sync::Mutex<Option<Arc<rho_slack::SecretStore>>>>,
@@ -256,7 +298,9 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let platform_secrets = PlatformSecrets::from_fd_store();
     let octo_socket_path = octo_types::socket_path()?;
     spawn_octo_server(&octo_socket_path, platform_secrets.clone())?;
-    let user_environment = rho_workspaces::UserEnvironment::new(login_environment()?);
+    let mut user_environment = login_environment()?;
+    configure_octo_git_transport(&mut user_environment)?;
+    let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(default_db_path()?);
     let auth = InferenceAuth::named(&args.auth)?;
@@ -838,14 +882,14 @@ impl GitTransportBroker {
             }
         }
         let result = match tokio::time::timeout(timeout, rx).await {
-            Ok(result) => result.context("SSH Git approval request was abandoned")?,
+            Ok(result) => result.context("SSH Git provider claim was abandoned")?,
             Err(_) => {
                 let pending = self.state.lock().await.pending.remove(&request_id);
                 if let Some(pending) = pending {
                     Self::notify_done(request_id, &pending.recipients, None);
                 }
                 anyhow::bail!(
-                    "no registered GUI approved the SSH Git transport request within 60 seconds"
+                    "no registered GUI claimed the SSH Git transport request within 60 seconds"
                 );
             }
         };
@@ -856,7 +900,7 @@ impl GitTransportBroker {
         &self,
         request_id: u64,
         provider_id: u64,
-        approved: bool,
+        claim: bool,
     ) -> anyhow::Result<GitProviderClaim> {
         let mut state = self.state.lock().await;
         let Some(pending) = state.pending.get_mut(&request_id) else {
@@ -865,7 +909,7 @@ impl GitTransportBroker {
         if !pending.remaining.remove(&provider_id) {
             return Ok(GitProviderClaim::Done);
         }
-        if approved {
+        if claim {
             let pending = state
                 .pending
                 .remove(&request_id)
@@ -1655,7 +1699,7 @@ where
     if let ClientMessage::GitTransportProvide {
         request_id,
         provider_id,
-        approved,
+        claim,
     } = first
     {
         return serve_git_transport_provider(
@@ -1664,7 +1708,7 @@ where
             writer,
             request_id,
             provider_id,
-            approved,
+            claim,
         )
         .await;
     }
@@ -1868,7 +1912,7 @@ async fn serve_git_transport_provider<R, W>(
     mut writer: W,
     request_id: u64,
     provider_id: u64,
-    approved: bool,
+    claim: bool,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -1876,7 +1920,7 @@ where
 {
     match agents
         .git_transport
-        .claim(request_id, provider_id, approved)
+        .claim(request_id, provider_id, claim)
         .await?
     {
         GitProviderClaim::Done => {
@@ -2846,6 +2890,7 @@ fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
     use std::sync::Arc;
 
     use rho_agent::{AgentState, AgentStateKind, InputQueues};
@@ -2856,9 +2901,53 @@ mod tests {
     use rho_ui_proto::ServerMessage;
 
     use super::{
-        GitProviderClaim, GitTransportBroker, inference_response_count, latest_final_response,
-        load_or_create_iroh_secret,
+        GitProviderClaim, GitTransportBroker, configure_octo_git_transport,
+        inference_response_count, latest_final_response, load_or_create_iroh_secret,
     };
+
+    fn environment_value<'a>(
+        environment: &'a [(OsString, OsString)],
+        name: &str,
+    ) -> Option<&'a OsStr> {
+        environment
+            .iter()
+            .find_map(|(key, value)| (key == name).then_some(value.as_os_str()))
+    }
+
+    #[test]
+    fn ambient_octo_transport_appends_git_config_without_replacing_it() {
+        let mut environment = vec![
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "user.name".into()),
+            ("GIT_CONFIG_VALUE_0".into(), "Example".into()),
+        ];
+        configure_octo_git_transport(&mut environment).unwrap();
+
+        assert_eq!(
+            environment_value(&environment, "GIT_CONFIG_COUNT"),
+            Some(OsStr::new("3"))
+        );
+        assert_eq!(
+            environment_value(&environment, "GIT_CONFIG_KEY_0"),
+            Some(OsStr::new("user.name"))
+        );
+        assert_eq!(
+            environment_value(&environment, "GIT_CONFIG_VALUE_0"),
+            Some(OsStr::new("Example"))
+        );
+        assert_eq!(
+            environment_value(&environment, "GIT_CONFIG_KEY_1"),
+            Some(OsStr::new("url.octo://github.com/.insteadOf"))
+        );
+        assert_eq!(
+            environment_value(&environment, "GIT_CONFIG_VALUE_1"),
+            Some(OsStr::new("git@github.com:"))
+        );
+        assert_eq!(
+            environment_value(&environment, "GIT_CONFIG_VALUE_2"),
+            Some(OsStr::new("ssh://git@github.com/"))
+        );
+    }
 
     #[tokio::test]
     async fn iroh_secret_is_persisted_in_database() {
@@ -2872,7 +2961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_transport_broker_first_approval_wins() {
+    async fn git_transport_broker_first_claim_wins() {
         let broker = Arc::new(GitTransportBroker::default());
         let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
         let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();

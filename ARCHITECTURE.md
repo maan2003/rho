@@ -160,19 +160,28 @@ capability from the outset. It never retries an HTTP push after a rejection.
 
 Every connected native GUI registers as a client-held SSH Git transport
 provider. For each operation the daemon snapshots the live providers and fans
-out the same approval request. The first approval atomically wins and opens a
-dedicated GUI stream; every other recipient receives an outcome-neutral `Done`
-message carrying only the request id. With no registered GUI the helper fails
-immediately, and with no approval it fails after 60 seconds. There is no
-mid-operation failover.
+out the same request. Fetches prompt first; for pushes, the first provider to
+claim the request opens a dedicated GUI stream so it can independently parse
+the actual receive-pack commands before prompting. Every other recipient
+receives an outcome-neutral `Done` message carrying only the request id. With
+no registered GUI the helper fails immediately, and with no provider claim it
+fails after 60 seconds. There is no mid-operation failover.
 
 The winning GUI launches the user's local OpenSSH for a typed host, user, port,
-repository, and upload-pack/receive-pack service. The helper and GUI
-independently parse bounded receive-pack commands. The GUI asks before every
-SSH operation, allows updates below `refs/heads/rho/*` under that one-operation
-approval, and asks again on the exact old/new object ids for every other ref.
-Generic SSH hosts use `octo://[USER@]HOST[:PORT]/REPOSITORY` and always take
-this approved SSH path.
+repository, and upload-pack/receive-pack service. Fetches are approved before
+OpenSSH starts. Pushes start receive-pack negotiation first, but the GUI does
+not forward any update command until it has independently parsed the bounded
+command list and the user approves the repository and exact ref updates. Thus
+each push has one approval containing its branches, tags, and full old/new
+object ids. Rho injects process-local Git `insteadOf` entries into every agent,
+terminal, and internal workspace-management subprocess. Standard
+`git@github.com:OWNER/REPOSITORY.git` and
+`ssh://git@github.com/OWNER/REPOSITORY.git` remotes then select
+`git-remote-octo` without changing repository or user Git configuration. The
+explicit `octo://[USER@]HOST[:PORT]/REPOSITORY` form remains supported for
+other destinations. A push is not failed over after one GUI claims it,
+including when that GUI later denies because another local prompt is active;
+retrying starts a fresh provider race.
 
 `rho-pr-monitor` owns long-lived pull-request policy while Octo remains only
 the authenticated GitHub API boundary. Engineers create or adopt PRs through
