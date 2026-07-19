@@ -2067,9 +2067,10 @@ impl Workspace {
     }
 
     fn minibuffer_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(minibuffer) = self.minibuffer.take() else {
+        let Some(mut minibuffer) = self.minibuffer.take() else {
             return;
         };
+        minibuffer.accept_selected(window, cx);
         let (input, on_submit) = minibuffer.into_submission(cx);
         self.focus_active_surface(window, cx);
         on_submit(self, input, window, cx);

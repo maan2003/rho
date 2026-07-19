@@ -109,6 +109,9 @@ pub struct Minibuffer {
     on_submit: SubmitHandler,
     candidates: Vec<Candidate>,
     selected: usize,
+    /// The user moved the selection since the last edit, making the
+    /// highlighted candidate an explicit choice even on empty input.
+    selection_moved: bool,
     _edits: Subscription,
 }
 
@@ -151,6 +154,7 @@ impl Minibuffer {
             on_submit,
             candidates: Vec::new(),
             selected: 0,
+            selection_moved: false,
             _edits: edits,
         }
     }
@@ -165,6 +169,7 @@ impl Minibuffer {
         let input = self.input(cx);
         self.candidates = (self.complete)(workspace, &input, cx);
         self.selected = 0;
+        self.selection_moved = false;
     }
 
     pub fn select_by_delta(&mut self, delta: isize) {
@@ -173,6 +178,17 @@ impl Minibuffer {
         }
         let len = self.candidates.len() as isize;
         self.selected = (self.selected as isize + delta).rem_euclid(len) as usize;
+        self.selection_moved = true;
+    }
+
+    /// Enter accepts the highlighted candidate, emacs `completing-read`
+    /// style: it replaces the last token before submission whenever the
+    /// user has typed something or explicitly moved the selection. A bare
+    /// enter on an untouched minibuffer still submits the empty input.
+    pub fn accept_selected(&mut self, window: &mut Window, cx: &mut App) {
+        if !self.input(cx).trim().is_empty() || self.selection_moved {
+            self.complete_selected(window, cx);
+        }
     }
 
     /// Tab: replaces the last whitespace-delimited token of the input with
