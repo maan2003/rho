@@ -43,6 +43,11 @@ pub struct AgentModel {
     multi_buffer: Entity<MultiBuffer>,
     prompt_end: text::Anchor,
     status_spans: Vec<(String, gpui::HighlightStyle)>,
+    /// Editors whose keyboard focus is on this view right now. The prompt's
+    /// "Write a message…" invite only shows on a focused editor — a
+    /// transcript being previewed from the dashboard shouldn't ask for
+    /// input.
+    focused_editors: std::collections::HashSet<gpui::EntityId>,
     workspace: WeakEntity<Workspace>,
     /// Editors currently displaying this agent, weakly held: panes own
     /// their editors; the model only reconciles whoever is still alive.
@@ -99,6 +104,7 @@ impl AgentModel {
             multi_buffer,
             prompt_end,
             status_spans: Vec::new(),
+            focused_editors: std::collections::HashSet::new(),
             workspace,
             editors: Vec::new(),
             _subscriptions: subscriptions,
@@ -152,6 +158,18 @@ impl AgentModel {
         crate::banner::insert(&editor, &self.multi_buffer, cx);
         self.transcript
             .attach(&editor, crate::workspace::now_ms(), cx);
+        self._subscriptions
+            .push(cx.subscribe(&editor, |this, editor, event, cx| match event {
+                editor::EditorEvent::Focused => {
+                    this.focused_editors.insert(editor.entity_id());
+                    this.apply_prompt_chrome_to(&editor, cx);
+                }
+                editor::EditorEvent::Blurred => {
+                    this.focused_editors.remove(&editor.entity_id());
+                    this.apply_prompt_chrome_to(&editor, cx);
+                }
+                _ => {}
+            }));
         self.editors.push(editor.downgrade());
         self.apply_status_to(&editor, cx);
         self.apply_system_styles_to(&editor, cx);
@@ -356,7 +374,7 @@ impl AgentModel {
         };
 
         let mut inlays = Vec::new();
-        if draft_empty {
+        if draft_empty && self.focused_editors.contains(&editor.entity_id()) {
             inlays.push(Inlay::custom(
                 PROMPT_PLACEHOLDER_INLAY_ID,
                 prompt_end,

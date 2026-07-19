@@ -249,7 +249,9 @@ impl Workspace {
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
         this.display_surface(draft);
         this.seed_draft(false, window, cx);
-        this.focus_active_surface(window, cx);
+        // Startup lands in home mode: the dashboard is the front door.
+        let dashboard_focus = this.dashboard.focus_handle(cx);
+        window.focus(&dashboard_focus, cx);
         this
     }
 
@@ -2483,25 +2485,108 @@ impl Workspace {
         }
     }
 
-    /// The ambient dashboard beside the active context's tree: reachable by
-    /// `space r` or the mouse, outside the pane cycle.
-    fn render_rail(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The dashboard beside the active context's tree, breathing with
+    /// focus: home mode (dashboard focused) gives it half the frame, a
+    /// masthead, and margins — the main attraction. Unfocused it exhales
+    /// into the slim rail: lamps and titles at the edge of deep work.
+    fn render_rail(
+        &mut self,
+        home: bool,
+        text_style: &gpui::TextStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let border_color = cx.theme().colors().border_variant.opacity(0.6);
-        div()
+        let container = div()
             .h_full()
             .flex_none()
-            .w(gpui::relative(0.3))
             .overflow_hidden()
             .border_r_1()
             .border_color(border_color)
             .py(px(2.))
-            .key_context("RhoDashboard")
-            .child(self.dashboard.editor().clone())
+            .flex()
+            .flex_col()
+            .font_family(text_style.font_family.clone())
+            .text_size(text_style.font_size)
+            .line_height(text_style.line_height)
+            .text_color(text_style.color)
+            .key_context("RhoDashboard");
+        let container = if home {
+            container
+                .w(gpui::relative(0.5))
+                .px(px(24.))
+                .child(self.render_dashboard_header(text_style, cx))
+        } else {
+            container.w(px(275.)).pl(px(6.))
+        };
+        container
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .min_h_0()
+                    .child(self.dashboard.editor().clone()),
+            )
             .into_any_element()
     }
 
-    fn render_panes(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let rail = self.render_rail(cx);
+    /// The home-mode masthead: a centered title and a one-line attention
+    /// summary, so the dashboard reads as a place rather than a sidebar.
+    fn render_dashboard_header(
+        &self,
+        text_style: &gpui::TextStyle,
+        _cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut waiting = 0usize;
+        let mut working = 0usize;
+        for workstream in self.registry.workstreams() {
+            if workstream.hidden {
+                continue;
+            }
+            for agent_id in workstream.agent_ids() {
+                match self.registry.attention(agent_id) {
+                    rho_ui_proto::UiAttention::NeedsInput | rho_ui_proto::UiAttention::Pending => {
+                        waiting += 1;
+                    }
+                    rho_ui_proto::UiAttention::Working => working += 1,
+                    rho_ui_proto::UiAttention::Quiet => {}
+                }
+            }
+        }
+        let summary = match (waiting, working) {
+            (0, 0) => "all quiet".to_owned(),
+            (0, working) => format!("{working} working"),
+            (waiting, 0) => format!("{waiting} waiting on you"),
+            (waiting, working) => format!("{waiting} waiting on you · {working} working"),
+        };
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(10.))
+            .pb(px(14.))
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child("rho"),
+            )
+            .child(
+                div()
+                    .text_color(text_style.color.opacity(0.55))
+                    .child(summary),
+            )
+            .into_any_element()
+    }
+
+    fn render_panes(
+        &mut self,
+        window: &Window,
+        text_style: &gpui::TextStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // Home mode: the dashboard owns the keyboard, so it owns the frame;
+        // the panes are its preview, visibly subordinate.
+        let home = self.dashboard.focus_handle(cx).is_focused(window);
+        let rail = self.render_rail(home, text_style, cx);
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
@@ -2548,6 +2633,15 @@ impl Workspace {
             }
             element.children(separated).into_any_element()
         };
+        let panes = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            // Subordinate while the dashboard is home: the preview reads
+            // as "what the cursor points at", not "the workspace".
+            .when(home, |this| this.opacity(0.75))
+            .child(self.active_tree().layout(&mut leaf, &mut container));
         div()
             .flex()
             .flex_row()
@@ -2555,7 +2649,7 @@ impl Workspace {
             .flex_grow(1.0)
             .min_h_0()
             .child(rail)
-            .child(self.active_tree().layout(&mut leaf, &mut container))
+            .child(panes)
             .into_any_element()
     }
 
@@ -2903,7 +2997,7 @@ impl Render for Workspace {
                     this.minibuffer = Some(minibuffer);
                 }
             }))
-            .child(self.render_panes(cx))
+            .child(self.render_panes(window, &text_style, cx))
             .children(match (&self.minibuffer, &self.transient, &self.echo) {
                 (Some(minibuffer), _, _) => Some(minibuffer.render(&text_style, cx)),
                 // The wrapper mounts (and captures keys) as soon as the
