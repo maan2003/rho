@@ -226,6 +226,22 @@ impl AgentModel {
     ) {
         self.transcript
             .sync(state, summary, now_ms, agent_label, cx);
+        // Content growth moves the tail; re-anchor the tail elisions.
+        self.refresh_tail_elisions(cx);
+    }
+
+    /// Drops every tail elision and lets prompt chrome re-place them
+    /// against the current end of content.
+    fn refresh_tail_elisions(&mut self, cx: &mut Context<Self>) {
+        let stale = std::mem::take(&mut self.prompt_tail_elisions);
+        for editor in self.live_editors() {
+            if let Some(id) = stale.get(&editor.entity_id()) {
+                editor.update(cx, |editor, cx| {
+                    editor.remove_display_elisions([*id].into_iter().collect(), None, cx);
+                });
+            }
+            self.apply_prompt_chrome_to(&editor, cx);
+        }
     }
 
     pub fn tick_timers(&mut self, now_ms: u64, cx: &mut Context<Self>) {
@@ -280,15 +296,7 @@ impl AgentModel {
             });
             // Tail elisions anchored at the transcript's end would swallow
             // the new excerpt; rebuild them against the system buffer.
-            let stale = std::mem::take(&mut self.prompt_tail_elisions);
-            for editor in self.live_editors() {
-                if let Some(id) = stale.get(&editor.entity_id()) {
-                    editor.update(cx, |editor, cx| {
-                        editor.remove_display_elisions([*id].into_iter().collect(), None, cx);
-                    });
-                }
-                self.apply_prompt_chrome_to(&editor, cx);
-            }
+            self.refresh_tail_elisions(cx);
         }
         for editor in self.live_editors() {
             self.apply_system_styles_to(&editor, cx);
@@ -468,8 +476,20 @@ impl AgentModel {
                     self.transcript.buffer()
                 };
                 let tail_buffer = tail_buffer.read(cx);
+                let len = tail_buffer.len();
+                // Step back over trailing newlines (keeping the content's
+                // own terminator) so the blank separator rows fold away
+                // with the prompt row, not just the final one. Content
+                // appended after this anchor lands inside the hidden range
+                // until the next sync re-anchors — which it always does.
+                let trailing = tail_buffer
+                    .as_rope()
+                    .reversed_chars_at(len)
+                    .take_while(|c| *c == '\n')
+                    .count();
+                let start_offset = len - trailing.saturating_sub(1);
                 let tail_start =
-                    snapshot.anchor_in_excerpt(tail_buffer.anchor_after(tail_buffer.len()));
+                    snapshot.anchor_in_excerpt(tail_buffer.anchor_after(start_offset));
                 if let Some(start) = tail_start {
                     let ids = editor.update(cx, |editor, cx| {
                         editor.insert_display_elisions(

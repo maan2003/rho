@@ -2628,12 +2628,14 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let agent_id = self.registry.selected_agent().copied()?;
-        let label = self.registry.agent_display_label(agent_id);
         let spans = self
             .models
             .get(&agent_id)
             .map(|model| model.read(cx).status_spans().to_vec())
             .unwrap_or_default();
+        if spans.is_empty() {
+            return None;
+        }
         Some(
             div()
                 .flex_none()
@@ -2647,7 +2649,6 @@ impl Workspace {
                 .text_size(text_style.font_size)
                 .line_height(text_style.line_height)
                 .text_color(text_style.color)
-                .child(div().font_weight(gpui::FontWeight::BOLD).child(label))
                 .children(
                     spans
                         .into_iter()

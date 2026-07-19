@@ -202,8 +202,10 @@ fn user_messages_render_with_turn_gaps_and_gutters(cx: &mut TestAppContext) {
     );
 
     let text = display_text(&workspace, cx);
+    // (No trailing gap after the final message: an unfocused editor folds
+    // the tail away.)
     assert!(
-        text.contains("first\n\nanswer\n\nsecond\n\n"),
+        text.contains("first\n\nanswer\n\nsecond\n"),
         "subsequent user messages should start a new turn with a blank line: {text:?}"
     );
     // Leading newlines are the banner block's display rows; the transcript
