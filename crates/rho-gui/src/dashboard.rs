@@ -527,7 +527,14 @@ impl Dashboard {
         self.editor.update(cx, |editor, cx| {
             editor.splice_inlays(&to_remove, inlays, cx);
             for (class, highlights) in by_class {
-                editor.highlight_inlays(class.lamp_key(), highlights, class.style(cx), cx);
+                // `highlight_inlays` only ever inserts per inlay id; without
+                // the clear, a lamp that was once Working keeps its old entry
+                // under the Working key and stays cyan after the attention
+                // moves on.
+                editor.clear_highlights(class.lamp_key(), cx);
+                if !highlights.is_empty() {
+                    editor.highlight_inlays(class.lamp_key(), highlights, class.style(cx), cx);
+                }
             }
         });
     }
