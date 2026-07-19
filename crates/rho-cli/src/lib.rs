@@ -20,6 +20,7 @@ mod mcp_agent_tools;
 mod pr;
 mod slack;
 mod wayland;
+mod workstream;
 
 #[cfg(test)]
 mod tests;
@@ -67,6 +68,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Pr(args) => pr::run(args).await,
         Command::Slack(args) => slack::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
+        Command::Workstream(args) => workstream::run(args).await,
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
             rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
@@ -159,6 +161,7 @@ enum Command {
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
     Wayland(wayland::WaylandArgs),
+    Workstream(WorkstreamArgs),
 }
 
 #[derive(Parser)]
@@ -184,6 +187,9 @@ enum CliCommand {
     Slack(SlackArgs),
     /// Run and control applications in an isolated headless Wayland session.
     Wayland(wayland::WaylandArgs),
+    /// Inspect and edit workstreams: the persistent units of work.
+    #[command(alias = "ws")]
+    Workstream(WorkstreamArgs),
 }
 
 #[derive(Clone, clap::Args)]
@@ -303,6 +309,36 @@ pub(crate) struct LandArgs {
 }
 
 #[derive(Clone, clap::Args)]
+pub(crate) struct WorkstreamArgs {
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: WorkstreamCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum WorkstreamCommand {
+    /// List every workstream with its labels and member rollup.
+    List,
+    /// Show one workstream and its member agents.
+    Show { workstream: String },
+    /// Rename a workstream.
+    Rename { workstream: String, name: String },
+    /// Add a label to a workstream (`pin`, `hide`, `group:<name>`, or
+    /// anything else).
+    Label { workstream: String, label: String },
+    /// Remove a label from a workstream.
+    Unlabel { workstream: String, label: String },
+    /// Move an agent (and its spawned subtree) into a workstream, creating
+    /// the workstream when the name matches nothing.
+    Move { agent: String, workstream: String },
+    /// Write the stored view-config blob to stdout.
+    ViewGet,
+    /// Replace the stored view-config blob with stdin.
+    ViewSet,
+}
+
+#[derive(Clone, clap::Args)]
 struct ProtocolLogArgs {
     path: std::path::PathBuf,
 }
@@ -325,6 +361,7 @@ impl Args {
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),
             CliCommand::Slack(args) => Command::Slack(args),
             CliCommand::Wayland(args) => Command::Wayland(args),
+            CliCommand::Workstream(args) => Command::Workstream(args),
         };
         Ok(Self { command })
     }

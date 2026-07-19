@@ -47,3 +47,29 @@ fn pr_comment_parses_with_optional_reply() {
 fn bare_rho_requires_a_subcommand() {
     assert!(Args::try_parse(std::iter::empty()).is_err());
 }
+
+#[test]
+fn ws_alias_parses_to_workstream_commands() {
+    let args = Args::try_parse(["ws".to_owned(), "list".to_owned()].into_iter()).unwrap();
+    assert!(matches!(
+        args.command,
+        super::Command::Workstream(super::WorkstreamArgs {
+            command: super::WorkstreamCommand::List,
+            ..
+        })
+    ));
+
+    let args = Args::try_parse(
+        ["workstream", "move", "eng-16lh", "gui rebuild"]
+            .into_iter()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    assert!(matches!(
+        args.command,
+        super::Command::Workstream(super::WorkstreamArgs {
+            command: super::WorkstreamCommand::Move { agent, workstream },
+            ..
+        }) if agent == "eng-16lh" && workstream == "gui rebuild"
+    ));
+}
