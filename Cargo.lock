@@ -5143,7 +5143,8 @@ dependencies = [
  "anyhow",
  "octo-types",
  "reqwest 0.12.28",
- "rustls",
+ "rho-ui-proto",
+ "tokio",
 ]
 
 [[package]]
@@ -12161,6 +12162,7 @@ dependencies = [
  "languages",
  "multi_buffer",
  "node_runtime",
+ "octo-types",
  "prefix-id",
  "project",
  "prost",
@@ -12318,6 +12320,7 @@ dependencies = [
  "async-stream",
  "bytes",
  "camino",
+ "dirs",
  "futures",
  "rho-agent",
  "rho-core",

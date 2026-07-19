@@ -3,6 +3,7 @@
 //! [`ConnEvent`]s on a futures channel the workspace awaits (no polling);
 //! outbound commands are fire-and-forget.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -17,10 +18,10 @@ use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
-    AgentId, ClientMessage, ServerMessage, UiAgentSummary, UiProject, UiWorkstream, WorkspaceInfo,
-    read_frame, write_frame,
+    AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, UiAgentSummary,
+    UiProject, UiWorkstream, WorkspaceInfo, read_frame, write_frame,
 };
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::workspace::AttachTarget;
 
@@ -91,6 +92,21 @@ pub enum ConnEvent {
     },
     ServerError(String),
     Disconnected(String),
+    GitTransportApproval {
+        request_id: u64,
+        prompt: String,
+        response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
+    },
+    GitTransportDone {
+        request_id: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitApprovalDecision {
+    Allow,
+    Deny,
+    Done,
 }
 
 /// One open zed channel: a dedicated stream to the daemon carrying raw
@@ -428,10 +444,16 @@ async fn run(
         return Ok(());
     }
 
+    write_frame(&mut stream, &ClientMessage::GitTransportRegister).await?;
+
     let agent_stream_task = agent_connection.map(|connection| {
         let events = events.clone();
         tokio::spawn(run_agent_streams(connection, events))
     });
+    let git_transport_limit = Arc::new(tokio::sync::Semaphore::new(1));
+    let git_requests = Arc::new(Mutex::new(
+        HashMap::<u64, tokio::sync::watch::Sender<bool>>::new(),
+    ));
 
     let (mut reader, mut writer) = tokio::io::split(stream);
     let writer_task = tokio::spawn(async move {
@@ -492,6 +514,52 @@ async fn run(
                 attention,
             }),
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
+            ServerMessage::GitTransportRequested {
+                request_id,
+                provider_id,
+                request,
+            } => {
+                let events = events.clone();
+                let provider_dialer = dialer.lock().unwrap().clone();
+                let git_transport_limit = git_transport_limit.clone();
+                let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+                git_requests.lock().unwrap().insert(request_id, done_tx);
+                let git_requests = git_requests.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let _permit = tokio::select! {
+                            permit = git_transport_limit.acquire_owned() => {
+                                permit.context("Git transport provider closed")?
+                            }
+                            _ = done_rx.changed() => return Ok(()),
+                        };
+                        let provider_dialer =
+                            provider_dialer.context("not connected to rho daemon")?;
+                        run_git_transport_provider(
+                            provider_dialer,
+                            request_id,
+                            provider_id,
+                            request,
+                            events.clone(),
+                        )
+                        .await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        let _ = events.unbounded_send(ConnEvent::ServerError(format!(
+                            "SSH Git transport failed: {error:#}"
+                        )));
+                    }
+                    git_requests.lock().unwrap().remove(&request_id);
+                });
+                None
+            }
+            ServerMessage::GitTransportDone { request_id } => {
+                if let Some(done) = git_requests.lock().unwrap().remove(&request_id) {
+                    done.send_replace(true);
+                }
+                Some(ConnEvent::GitTransportDone { request_id })
+            }
             ServerMessage::Pong
             | ServerMessage::LandLeaseQueued { .. }
             | ServerMessage::LandLeaseGranted { .. }
@@ -500,7 +568,10 @@ async fn run(
             | ServerMessage::PlatformStatus { .. }
             | ServerMessage::IrohApproved { .. }
             | ServerMessage::IrohRevoked { .. }
-            | ServerMessage::PrCommandResult { .. } => None,
+            | ServerMessage::PrCommandResult { .. }
+            | ServerMessage::GitTransportReady
+            | ServerMessage::GitTransportRefused { .. }
+            | ServerMessage::GitTransportPolicy { .. } => None,
             // Zed channel and terminal handshake replies belong to dedicated
             // streams, never the UI session.
             ServerMessage::ChannelOpened { .. }
@@ -521,6 +592,288 @@ async fn run(
         task.abort();
     }
     Ok(())
+}
+
+async fn request_git_approval(
+    events: &futures_mpsc::UnboundedSender<ConnEvent>,
+    request_id: u64,
+    prompt: String,
+) -> anyhow::Result<GitApprovalDecision> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    events
+        .unbounded_send(ConnEvent::GitTransportApproval {
+            request_id,
+            prompt,
+            response: tx,
+        })
+        .map_err(|_| anyhow::anyhow!("GUI closed before Git transport approval"))?;
+    rx.await
+        .context("GUI closed the Git transport approval prompt")
+}
+
+async fn run_git_transport_provider(
+    dialer: ChannelDialer,
+    request_id: u64,
+    provider_id: u64,
+    request: GitTransportRequest,
+    events: futures_mpsc::UnboundedSender<ConnEvent>,
+) -> anyhow::Result<()> {
+    validate_git_transport_request(&request)?;
+    let action = match request.service {
+        GitService::UploadPack => "fetch from",
+        GitService::ReceivePack => "push to",
+    };
+    let decision = request_git_approval(
+        &events,
+        request_id,
+        format!(
+            "SSH Git: {action} {}@{}:{} / {}? (type allow):",
+            display_field(&request.user),
+            display_field(&request.host),
+            request.port,
+            display_field(&request.repository),
+        ),
+    )
+    .await?;
+    match decision {
+        GitApprovalDecision::Allow => {}
+        GitApprovalDecision::Deny => {
+            report_git_transport_decision(dialer, request_id, provider_id, false).await?;
+            return Ok(());
+        }
+        GitApprovalDecision::Done => return Ok(()),
+    }
+
+    let Some(mut stream) = open_git_transport_provider(dialer, request_id, provider_id).await?
+    else {
+        return Ok(());
+    };
+    let remote_command = format!(
+        "{} '{}'",
+        match request.service {
+            GitService::UploadPack => "git-upload-pack",
+            GitService::ReceivePack => "git-receive-pack",
+        },
+        request.repository
+    );
+    let mut child = tokio::process::Command::new("ssh")
+        .args(["-o", "BatchMode=yes"])
+        .args(["-o", "ClearAllForwardings=yes"])
+        .args(["-o", "PermitLocalCommand=no"])
+        .args(["-o", "ControlMaster=no"])
+        .arg("-p")
+        .arg(request.port.to_string())
+        .arg("-l")
+        .arg(&request.user)
+        .arg("--")
+        .arg(&request.host)
+        .arg(remote_command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("launch local OpenSSH")?;
+    let mut ssh_stdin = child.stdin.take().context("OpenSSH stdin unavailable")?;
+    let mut ssh_stdout = child.stdout.take().context("OpenSSH stdout unavailable")?;
+    let ssh_stderr = child.stderr.take().context("OpenSSH stderr unavailable")?;
+    let (mut transport_read, mut transport_write) = tokio::io::split(&mut stream);
+
+    let input = async {
+        if request.service == GitService::ReceivePack {
+            let (prefix, commands) = read_receive_pack_prefix(&mut transport_read).await?;
+            let needs_ref_approval = commands
+                .updates
+                .iter()
+                .any(|update| !update.reference.starts_with("refs/heads/rho/"));
+            if needs_ref_approval {
+                let mut details = format!(
+                    "Approve refs for {} / {} (type allow):",
+                    display_field(&request.host),
+                    display_field(&request.repository)
+                );
+                for update in &commands.updates {
+                    use std::fmt::Write as _;
+                    let zero = update.old.bytes().all(|byte| byte == b'0');
+                    let deletion = update.new.bytes().all(|byte| byte == b'0');
+                    let action = if zero {
+                        "create"
+                    } else if deletion {
+                        "delete"
+                    } else {
+                        "update"
+                    };
+                    let _ = write!(
+                        details,
+                        " {action} {} {}..{};",
+                        display_field(&update.reference),
+                        update.old,
+                        update.new
+                    );
+                }
+                anyhow::ensure!(
+                    request_git_approval(&events, request_id, details).await?
+                        == GitApprovalDecision::Allow,
+                    "Git ref update denied by the GUI user"
+                );
+            }
+            ssh_stdin.write_all(&prefix).await?;
+        }
+        tokio::io::copy(&mut transport_read, &mut ssh_stdin).await?;
+        ssh_stdin.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let output = async {
+        tokio::io::copy(&mut ssh_stdout, &mut transport_write).await?;
+        transport_write.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let stderr = async {
+        const MAX_STDERR: usize = 64 * 1024;
+        let mut bytes = Vec::new();
+        ssh_stderr
+            .take(MAX_STDERR as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > MAX_STDERR {
+            bytes.truncate(MAX_STDERR);
+            bytes.extend_from_slice(b"\n[SSH stderr truncated]");
+        }
+        Ok::<Vec<u8>, anyhow::Error>(bytes)
+    };
+    let ((), (), stderr) = tokio::try_join!(input, output, stderr)?;
+    let status = child.wait().await.context("wait for local OpenSSH")?;
+    anyhow::ensure!(
+        status.success(),
+        "OpenSSH exited with {status}: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    Ok(())
+}
+
+async fn report_git_transport_decision(
+    dialer: ChannelDialer,
+    request_id: u64,
+    provider_id: u64,
+    approved: bool,
+) -> anyhow::Result<()> {
+    let mut stream = dial_stream(dialer).await?;
+    write_frame(
+        &mut stream,
+        &ClientMessage::GitTransportProvide {
+            request_id,
+            provider_id,
+            approved,
+        },
+    )
+    .await?;
+    let _: ServerMessage = read_frame(&mut stream).await?;
+    Ok(())
+}
+
+async fn open_git_transport_provider(
+    dialer: ChannelDialer,
+    request_id: u64,
+    provider_id: u64,
+) -> anyhow::Result<Option<Box<dyn AsyncStream>>> {
+    let mut stream = dial_stream(dialer).await?;
+    write_frame(
+        &mut stream,
+        &ClientMessage::GitTransportProvide {
+            request_id,
+            provider_id,
+            approved: true,
+        },
+    )
+    .await?;
+    match read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::GitTransportReady => Ok(Some(stream)),
+        ServerMessage::GitTransportDone { .. } => Ok(None),
+        ServerMessage::GitTransportRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected Git transport provider handshake reply"),
+    }
+}
+
+async fn read_receive_pack_prefix<R>(
+    reader: &mut R,
+) -> anyhow::Result<(Vec<u8>, octo_types::ReceivePackCommands)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut prefix = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 8192];
+        let read = reader.read(&mut chunk).await?;
+        anyhow::ensure!(read != 0, "truncated Git receive-pack command list");
+        prefix.extend_from_slice(&chunk[..read]);
+        match octo_types::parse_receive_pack_commands(&prefix) {
+            Ok(Some(commands)) => return Ok((prefix, commands)),
+            Ok(None) => {}
+            Err(error) => anyhow::bail!(error),
+        }
+    }
+}
+
+fn validate_git_transport_request(request: &GitTransportRequest) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !request.host.is_empty()
+            && request.host.len() <= 255
+            && !request.host.starts_with('-')
+            && request.host.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':')
+            }),
+        "invalid SSH Git host"
+    );
+    anyhow::ensure!(request.port != 0, "invalid SSH Git port");
+    anyhow::ensure!(
+        !request.user.is_empty()
+            && request.user.len() <= 64
+            && !request.user.starts_with('-')
+            && request
+                .user
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "invalid SSH Git user"
+    );
+    anyhow::ensure!(
+        !request.repository.is_empty()
+            && request.repository.len() <= 1024
+            && !request.repository.starts_with(['-', '/'])
+            && !request.repository.contains("//")
+            && request.repository.split('/').all(|component| {
+                !component.is_empty()
+                    && component != "."
+                    && component != ".."
+                    && !component.starts_with('-')
+                    && component.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            }),
+        "invalid SSH Git repository path"
+    );
+    Ok(())
+}
+
+fn display_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+            {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 async fn run_agent_streams(
@@ -759,7 +1112,31 @@ fn is_safe_remote_executable(value: &str) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use super::AgentFrameAllocationBudget;
+    use rho_ui_proto::{GitService, GitTransportRequest};
+
+    use super::{AgentFrameAllocationBudget, display_field, validate_git_transport_request};
+
+    #[test]
+    fn client_rejects_unsafe_git_transport_fields() {
+        let valid = GitTransportRequest {
+            host: "git.example".to_owned(),
+            port: 22,
+            user: "git".to_owned(),
+            repository: "team/repo.git".to_owned(),
+            service: GitService::ReceivePack,
+        };
+        assert!(validate_git_transport_request(&valid).is_ok());
+        for repository in ["../repo", "-oProxyCommand=bad", "team//repo"] {
+            let mut request = valid.clone();
+            request.repository = repository.to_owned();
+            assert!(validate_git_transport_request(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn git_prompt_fields_replace_bidi_controls() {
+        assert_eq!(display_field("main\u{202e}txt"), "main\u{fffd}txt");
+    }
 
     #[test]
     fn small_frame_bypasses_waiting_large_allocation() {

@@ -94,16 +94,43 @@ AI APIs.
   attribution. Integration-internal control inputs (including PR-monitor
   wakeups) carry a process-local internal source tag and are not mirrored
   verbatim; the PM must relay an appropriate user-facing summary explicitly.
-- The embedded Octo server listens only on its fixed per-user Unix socket.
-  Clients derive that path from the same `octo-types` contract rather than an
-  environment variable. Octo uses the sealed platform
-  secret store as its GitHub token source and has no token argv/env/file/admin
-  import path in Rho. Its Git remote-helper endpoint proxies smart-HTTP fetches
-  for repositories readable by that token while retaining it in the daemon. It
-  rejects every receive-pack command outside `refs/heads/rho/*`; command
-  framing is bounded before pack data is streamed. GitHub API and Git protocol
-  responses and errors are remote, semi-trusted input and are returned to the
-  calling command rather than panicking.
+- The embedded Octo server listens only on its fixed per-user Unix socket and
+  uses the sealed platform secret store as its GitHub API and constrained Git
+  HTTP token source. It has no token argv/env/file/admin import path in Rho.
+  Token-backed fetches are limited to standard GitHub remotes; receive-pack
+  independently rejects every update outside `refs/heads/rho/*`. The helper
+  pre-routes any push batch containing another destination to client SSH and
+  never retries an HTTP rejection. When switching after an authenticated ref
+  listing, forced updates and deletions carry exact `--force-with-lease`
+  expectations so the second advertisement cannot widen the requested update.
+  The token's actual fine-grained GitHub
+  permissions still determine its authority and must be audited when setup
+  guidance changes.
+- SSH Git credentials stay on native GUI machines. Every native GUI
+  automatically registers its connection as a provider. Requests expose the
+  typed destination and repository to all registered GUIs; the first approval
+  wins atomically, while every other recipient receives only an opaque `Done`
+  for that request id, revealing neither winner nor outcome. With no provider
+  the daemon rejects immediately; after 60 seconds without approval it rejects
+  and dismisses every outstanding prompt. A winning GUI validates bounded
+  typed host/user/port/repository/service fields, asks before starting local
+  OpenSSH, and independently parses the actual bounded receive-pack command
+  prefix before forwarding it. Updates outside `refs/heads/rho/*` require a
+  second one-operation approval displaying full old/new object ids. Ref names,
+  repository fields, and prompts use a conservative character set and prompt
+  text replaces control and bidirectional formatting characters. Push options,
+  signed pushes, unknown framing, and unsupported object-id sizes fail closed.
+  The daemon-side remote helper runs the same command parser, but the GUI never
+  relies on that validation to protect its credential.
+- SSH Git approval is session-only. No provider or denial means a fast failure
+  for operations routed to SSH; PAT-backed GitHub fetch and `rho/*` push remain
+  available without a GUI. At most eight requests wait in the daemon
+  and each GUI runs one SSH transport at a time. Streams are backpressured,
+  SSH diagnostics are capped at 64 KiB, and cancellation or disconnect drops
+  the stream and kills the GUI-owned OpenSSH child. OpenSSH config and host-key
+  verification on the GUI machine remain part of the trust boundary. A lost
+  connection after sending a receive-pack request has an ambiguous outcome;
+  callers must inspect the remote ref before retrying.
 - `rho-pr-monitor` uses Octo only for bounded authenticated GitHub API calls;
   subscription ownership and operations stay behind `rho pr` on the normal
   daemon socket. Agent invocations identify the subscriber with

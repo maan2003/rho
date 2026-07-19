@@ -31,6 +31,14 @@ pub const IROH_ALPN: &[u8] = b"rho/ui/2";
 const FRAME_LEN_BYTES: u64 = size_of::<u32>() as u64;
 const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP2";
 
+/// Fixed per-user daemon socket used by normal CLI and Git helper clients.
+pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
+    let base = dirs::runtime_dir()
+        .or_else(dirs::state_dir)
+        .ok_or_else(|| anyhow::anyhow!("runtime directory not available"))?;
+    Ok(base.join("rho").join("rho.sock"))
+}
+
 /// Shared byte counters for one UI protocol connection.
 ///
 /// Counts successful length-prefixed frames on the wire, including the 4-byte
@@ -253,6 +261,40 @@ pub enum ClientMessage {
         /// Restrict to one agent's terminals (display handle or id prefix).
         agent: Option<String>,
     },
+    /// Advertise this control connection as a client-held SSH Git transport
+    /// provider. Every native GUI registers and may receive approval requests.
+    GitTransportRegister,
+    /// First frame on a Git remote-helper stream. The daemon pairs it with
+    /// the registered GUI provider, then the stream switches to raw Git data.
+    GitTransportRequest {
+        request: GitTransportRequest,
+    },
+    /// First frame on the GUI's dedicated provider stream.
+    GitTransportProvide {
+        request_id: u64,
+        provider_id: u64,
+        approved: bool,
+    },
+    /// One-shot query on a fresh local stream used by the remote helper to
+    /// choose PAT-backed GitHub HTTP or client-held SSH before negotiation.
+    GitTransportQuery {
+        host: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum GitService {
+    UploadPack,
+    ReceivePack,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct GitTransportRequest {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub repository: String,
+    pub service: GitService,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -502,6 +544,26 @@ pub enum ServerMessage {
     /// (of one agent, if the request named one).
     TerminalList {
         terminals: Vec<term::TerminalInfo>,
+    },
+    /// Request fanned out to every registered GUI credential provider.
+    GitTransportRequested {
+        request_id: u64,
+        provider_id: u64,
+        request: GitTransportRequest,
+    },
+    /// Dedicated Git stream handshake succeeded; subsequent bytes are raw
+    /// Git protocol data.
+    GitTransportReady,
+    GitTransportRefused {
+        reason: String,
+    },
+    GitTransportPolicy {
+        pat_available: bool,
+    },
+    /// An approval race completed or expired. Deliberately carries no result
+    /// or winner information.
+    GitTransportDone {
+        request_id: u64,
     },
 }
 
@@ -910,6 +972,50 @@ mod tests {
         }
 
         let message = ServerMessage::AgentStreamOpened { agent_id };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn git_transport_messages_round_trip() {
+        let request = GitTransportRequest {
+            host: "git.example".to_owned(),
+            port: 2222,
+            user: "deploy".to_owned(),
+            repository: "team/repo.git".to_owned(),
+            service: GitService::ReceivePack,
+        };
+        for message in [
+            ClientMessage::GitTransportRegister,
+            ClientMessage::GitTransportRequest {
+                request: request.clone(),
+            },
+            ClientMessage::GitTransportProvide {
+                request_id: 9,
+                provider_id: 4,
+                approved: true,
+            },
+            ClientMessage::GitTransportQuery {
+                host: "github.com".to_owned(),
+            },
+        ] {
+            let bytes = senax_encoder::pack(&message).unwrap();
+            let mut slice: &[u8] = &bytes;
+            let decoded = senax_encoder::unpack(&mut slice).unwrap();
+            assert_eq!(message, decoded);
+        }
+
+        let message = ServerMessage::GitTransportPolicy {
+            pat_available: true,
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
+
+        let message = ServerMessage::GitTransportDone { request_id: 9 };
         let bytes = senax_encoder::pack(&message).unwrap();
         let mut slice: &[u8] = &bytes;
         let decoded = senax_encoder::unpack(&mut slice).unwrap();

@@ -13,8 +13,9 @@ terminal CI result; creating the pull request alone is not completion.
 
 Use normal `jj` or `git` commands for local history and pushes. An Octo remote
 may route those pushes through `git-remote-octo` internally, but never invoke
-the helper or Octo API directly. Octo permits pushes only to
-`refs/heads/rho/*`.
+the helper or Octo API directly. Token-backed pushes are confined to
+`refs/heads/rho/*`; other refs require explicit local SSH approval and are not
+part of the normal agent workflow.
 
 Use only `rho pr` for pull-request and GitHub Actions operations:
 
@@ -51,7 +52,7 @@ milestones to their parent, and the PM relays them to the user-facing surface.
 2. Identify the intended change. Do not push incidental working-copy changes.
 3. Check whether the work already has a pull request. If it does, update its
    existing branch rather than creating a duplicate PR. Otherwise push it below
-   the only branch namespace Octo permits:
+   the unattended agent branch namespace:
 
 ```bash
 jj git push --remote origin --named rho/CHANGE_NAME=REVSET

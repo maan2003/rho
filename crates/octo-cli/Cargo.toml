@@ -10,4 +10,5 @@ rust-version.workspace = true
 anyhow.workspace = true
 octo-types.workspace = true
 reqwest.workspace = true
-rustls.workspace = true
+rho-ui-proto.workspace = true
+tokio.workspace = true

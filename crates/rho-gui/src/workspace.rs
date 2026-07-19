@@ -22,7 +22,7 @@ use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
 use crate::chime::Chime;
-use crate::connection::{ConnEvent, Connection};
+use crate::connection::{ConnEvent, Connection, GitApprovalDecision};
 use crate::draft_view::DraftModel;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer};
 use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
@@ -161,6 +161,7 @@ pub struct Workspace {
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
+    pending_git_approval: Option<(u64, tokio::sync::oneshot::Sender<GitApprovalDecision>)>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
 }
@@ -248,6 +249,7 @@ impl Workspace {
             transient_visible: false,
             transient_reveal: None,
             echo: None,
+            pending_git_approval: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
         };
@@ -530,6 +532,9 @@ impl Workspace {
                 );
             }
             ConnEvent::Disconnected(reason) => {
+                if let Some((_, response)) = self.pending_git_approval.take() {
+                    let _ = response.send(GitApprovalDecision::Done);
+                }
                 self.connected = false;
                 self.awaiting_draft_agent = false;
                 let notice = format!("[disconnected from rho daemon: {reason}]");
@@ -543,6 +548,68 @@ impl Workspace {
                 });
                 self.update_statuses(cx);
                 cx.notify();
+            }
+            ConnEvent::GitTransportApproval {
+                request_id,
+                prompt,
+                response,
+            } => {
+                if self.minibuffer.is_some() || self.pending_git_approval.is_some() {
+                    let _ = response.send(GitApprovalDecision::Deny);
+                    self.notice_on(
+                        None,
+                        "[SSH Git request denied: another prompt is active]",
+                        StyleClass::SystemImportant,
+                        cx,
+                    );
+                    return;
+                }
+                self.pending_git_approval = Some((request_id, response));
+                let complete = std::rc::Rc::new(|_: &Workspace, input: &str, _: &gpui::App| {
+                    [
+                        crate::commands::Candidate {
+                            value: "allow".to_owned(),
+                            description: "approve this operation once".to_owned(),
+                        },
+                        crate::commands::Candidate {
+                            value: "deny".to_owned(),
+                            description: "reject this operation".to_owned(),
+                        },
+                    ]
+                    .into_iter()
+                    .filter(|candidate| candidate.value.starts_with(input.trim()))
+                    .collect()
+                });
+                let on_submit = std::rc::Rc::new(
+                    |workspace: &mut Workspace,
+                     input: String,
+                     _window: &mut Window,
+                     _cx: &mut Context<Workspace>| {
+                        if let Some((_, response)) = workspace.pending_git_approval.take() {
+                            let decision = if input.trim() == "allow" {
+                                GitApprovalDecision::Allow
+                            } else {
+                                GitApprovalDecision::Deny
+                            };
+                            let _ = response.send(decision);
+                        }
+                    },
+                );
+                self.open_prompt(prompt, complete, on_submit, window, cx);
+            }
+            ConnEvent::GitTransportDone { request_id } => {
+                if self
+                    .pending_git_approval
+                    .as_ref()
+                    .is_some_and(|(pending_id, _)| *pending_id == request_id)
+                {
+                    if let Some((_, response)) = self.pending_git_approval.take() {
+                        let _ = response.send(GitApprovalDecision::Done);
+                    }
+                    self.minibuffer.take();
+                    self.focus_active_surface(window, cx);
+                    cx.notify();
+                }
             }
         }
     }
@@ -2076,6 +2143,9 @@ impl Workspace {
 
     fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.minibuffer.take().is_some() {
+            if let Some((_, response)) = self.pending_git_approval.take() {
+                let _ = response.send(GitApprovalDecision::Deny);
+            }
             self.focus_active_surface(window, cx);
             cx.notify();
         }

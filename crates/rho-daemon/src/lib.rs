@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -24,7 +24,9 @@ use rho_ui_proto::{
     UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, read_frame_counted, write_frame,
     write_frame_counted,
 };
-use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, watch};
+use tokio::sync::{
+    Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot, watch,
+};
 
 pub mod debug;
 mod terminal;
@@ -36,10 +38,7 @@ const IROH_SECRET: redb::TableDefinition<(), &[u8; 32]> =
     redb::TableDefinition::new("rho_daemon_iroh_secret_v1");
 
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
-    let base = dirs::runtime_dir()
-        .or_else(dirs::state_dir)
-        .ok_or_else(|| anyhow::anyhow!("runtime directory not available"))?;
-    Ok(base.join("rho").join("rho.sock"))
+    rho_ui_proto::socket_path()
 }
 
 pub fn default_db_path() -> anyhow::Result<PathBuf> {
@@ -126,6 +125,13 @@ impl PlatformSecrets {
         self.read()?
             .remove(key)
             .with_context(|| format!("{key} not among installed platform secrets"))
+    }
+
+    fn contains_nonempty(&self, key: &str) -> bool {
+        self.read()
+            .ok()
+            .and_then(|secrets| secrets.get(key).cloned())
+            .is_some_and(|value| !value.trim().is_empty())
     }
 
     fn install_merge(
@@ -497,6 +503,9 @@ async fn run_iroh_listener(
                                     | ClientMessage::TerminalCreate { .. }
                                     | ClientMessage::TerminalAttach { .. }
                                     | ClientMessage::TerminalList { .. }
+                                    | ClientMessage::GitTransportRequest { .. }
+                                    | ClientMessage::GitTransportProvide { .. }
+                                    | ClientMessage::GitTransportQuery { .. }
                             );
                             let control = if !dedicated {
                                 let streams = agent_streams
@@ -728,6 +737,168 @@ async fn serve_iroh_agent_stream(
     result
 }
 
+trait GitStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T> GitStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+type BoxGitStream = Box<dyn GitStream>;
+
+#[derive(Default)]
+struct GitTransportState {
+    providers: HashMap<u64, mpsc::UnboundedSender<ServerMessage>>,
+    pending: HashMap<u64, PendingGitTransport>,
+}
+
+struct PendingGitTransport {
+    response: oneshot::Sender<Result<BoxGitStream, String>>,
+    recipients: HashMap<u64, mpsc::UnboundedSender<ServerMessage>>,
+    remaining: HashSet<u64>,
+}
+
+#[derive(Default)]
+struct GitTransportBroker {
+    next_request_id: AtomicU64,
+    next_provider_id: AtomicU64,
+    state: TokioMutex<GitTransportState>,
+}
+
+enum GitProviderClaim {
+    Selected(oneshot::Sender<Result<BoxGitStream, String>>),
+    Done,
+}
+
+impl GitTransportBroker {
+    async fn register(&self, provider: mpsc::UnboundedSender<ServerMessage>) {
+        let provider_id = self.next_provider_id.fetch_add(1, Ordering::Relaxed);
+        let mut state = self.state.lock().await;
+        state.providers.retain(|_, provider| !provider.is_closed());
+        state.providers.insert(provider_id, provider);
+    }
+
+    async fn request(
+        &self,
+        request: rho_ui_proto::GitTransportRequest,
+    ) -> anyhow::Result<BoxGitStream> {
+        self.request_with_timeout(request, std::time::Duration::from_secs(60))
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        request: rho_ui_proto::GitTransportRequest,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<BoxGitStream> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut state = self.state.lock().await;
+            state.providers.retain(|_, provider| !provider.is_closed());
+            anyhow::ensure!(
+                !state.providers.is_empty(),
+                "no GUI clients are registered for SSH Git transport"
+            );
+            anyhow::ensure!(
+                state.pending.len() < 8,
+                "too many pending GUI Git transport requests"
+            );
+            let recipients = state.providers.clone();
+            let remaining = recipients.keys().copied().collect();
+            state.pending.insert(
+                request_id,
+                PendingGitTransport {
+                    response: tx,
+                    recipients: recipients.clone(),
+                    remaining,
+                },
+            );
+            let mut disconnected = Vec::new();
+            for (&provider_id, provider) in &recipients {
+                if provider
+                    .send(ServerMessage::GitTransportRequested {
+                        request_id,
+                        provider_id,
+                        request: request.clone(),
+                    })
+                    .is_err()
+                {
+                    disconnected.push(provider_id);
+                }
+            }
+            for provider_id in disconnected {
+                state.providers.remove(&provider_id);
+                if let Some(pending) = state.pending.get_mut(&request_id) {
+                    pending.remaining.remove(&provider_id);
+                }
+            }
+            if state
+                .pending
+                .get(&request_id)
+                .is_some_and(|pending| pending.remaining.is_empty())
+            {
+                state.pending.remove(&request_id);
+                anyhow::bail!("all registered GUI SSH Git clients disconnected");
+            }
+        }
+        let result = match tokio::time::timeout(timeout, rx).await {
+            Ok(result) => result.context("SSH Git approval request was abandoned")?,
+            Err(_) => {
+                let pending = self.state.lock().await.pending.remove(&request_id);
+                if let Some(pending) = pending {
+                    Self::notify_done(request_id, &pending.recipients, None);
+                }
+                anyhow::bail!(
+                    "no registered GUI approved the SSH Git transport request within 60 seconds"
+                );
+            }
+        };
+        result.map_err(anyhow::Error::msg)
+    }
+
+    async fn claim(
+        &self,
+        request_id: u64,
+        provider_id: u64,
+        approved: bool,
+    ) -> anyhow::Result<GitProviderClaim> {
+        let mut state = self.state.lock().await;
+        let Some(pending) = state.pending.get_mut(&request_id) else {
+            return Ok(GitProviderClaim::Done);
+        };
+        if !pending.remaining.remove(&provider_id) {
+            return Ok(GitProviderClaim::Done);
+        }
+        if approved {
+            let pending = state
+                .pending
+                .remove(&request_id)
+                .expect("pending request was just found");
+            Self::notify_done(request_id, &pending.recipients, Some(provider_id));
+            return Ok(GitProviderClaim::Selected(pending.response));
+        }
+        if pending.remaining.is_empty() {
+            let pending = state
+                .pending
+                .remove(&request_id)
+                .expect("pending request was just found");
+            Self::notify_done(request_id, &pending.recipients, None);
+            let _ = pending.response.send(Err(
+                "all registered GUI clients rejected the SSH Git transport request".to_owned(),
+            ));
+        }
+        Ok(GitProviderClaim::Done)
+    }
+
+    fn notify_done(
+        request_id: u64,
+        recipients: &HashMap<u64, mpsc::UnboundedSender<ServerMessage>>,
+        except: Option<u64>,
+    ) {
+        for (&provider_id, provider) in recipients {
+            if Some(provider_id) != except {
+                let _ = provider.send(ServerMessage::GitTransportDone { request_id });
+            }
+        }
+    }
+}
+
 struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
@@ -762,6 +933,7 @@ struct AgentRegistry {
     terminals: Arc<terminal::TerminalRegistry>,
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_workspaces::UserEnvironment,
+    git_transport: GitTransportBroker,
 }
 
 impl AgentRegistry {
@@ -800,6 +972,7 @@ impl AgentRegistry {
             zed_host: std::sync::OnceLock::new(),
             terminals: Arc::new(terminal::TerminalRegistry::default()),
             user_environment,
+            git_transport: GitTransportBroker::default(),
         };
         registry.pool.load_non_hidden_agents().await;
         Ok(registry)
@@ -1476,6 +1649,36 @@ where
     if let ClientMessage::TerminalList { agent } = first {
         return serve_terminal_list(agents, writer, agent).await;
     }
+    if let ClientMessage::GitTransportRequest { request } = first {
+        return serve_git_transport_request(agents, reader, writer, request).await;
+    }
+    if let ClientMessage::GitTransportProvide {
+        request_id,
+        provider_id,
+        approved,
+    } = first
+    {
+        return serve_git_transport_provider(
+            agents,
+            reader,
+            writer,
+            request_id,
+            provider_id,
+            approved,
+        )
+        .await;
+    }
+    if let ClientMessage::GitTransportQuery { host } = first {
+        let pat_available =
+            host == "github.com" && agents.platform_secrets.contains_nonempty("GITHUB_TOKEN");
+        let mut writer = writer;
+        write_frame(
+            &mut writer,
+            &ServerMessage::GitTransportPolicy { pat_available },
+        )
+        .await?;
+        return Ok(());
+    }
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let writer_counters = counters.clone();
@@ -1628,6 +1831,71 @@ where
     };
     events_task.abort();
     result
+}
+
+async fn serve_git_transport_request<R, W>(
+    agents: Arc<AgentRegistry>,
+    reader: R,
+    mut writer: W,
+    request: rho_ui_proto::GitTransportRequest,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut provider = match agents.git_transport.request(request).await {
+        Ok(provider) => provider,
+        Err(error) => {
+            write_frame(
+                &mut writer,
+                &ServerMessage::GitTransportRefused {
+                    reason: error.to_string(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    write_frame(&mut writer, &ServerMessage::GitTransportReady).await?;
+    let mut requester = tokio::io::join(reader, writer);
+    tokio::io::copy_bidirectional(&mut requester, &mut provider).await?;
+    Ok(())
+}
+
+async fn serve_git_transport_provider<R, W>(
+    agents: Arc<AgentRegistry>,
+    reader: R,
+    mut writer: W,
+    request_id: u64,
+    provider_id: u64,
+    approved: bool,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    match agents
+        .git_transport
+        .claim(request_id, provider_id, approved)
+        .await?
+    {
+        GitProviderClaim::Done => {
+            write_frame(&mut writer, &ServerMessage::GitTransportDone { request_id }).await?;
+        }
+        GitProviderClaim::Selected(response) => {
+            if let Err(error) = write_frame(&mut writer, &ServerMessage::GitTransportReady).await {
+                let _ = response.send(Err(format!(
+                    "selected GUI SSH Git client disconnected: {error}"
+                )));
+                return Err(error);
+            }
+            let stream = Box::new(tokio::io::join(reader, writer));
+            response
+                .send(Ok(stream))
+                .map_err(|_| anyhow::anyhow!("Git transport requester disconnected"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Mid-turn from the rail's point of view: the states that render as a
@@ -1788,6 +2056,10 @@ async fn handle_message(
     match message {
         ClientMessage::Ping => {
             let _ = outgoing_tx.send(ServerMessage::Pong);
+            Ok(Refresh::None)
+        }
+        ClientMessage::GitTransportRegister => {
+            agents.git_transport.register(outgoing_tx.clone()).await;
             Ok(Refresh::None)
         }
         ClientMessage::PlatformSecretsSet {
@@ -2245,7 +2517,10 @@ async fn handle_message(
         }
         ClientMessage::TerminalCreate { .. }
         | ClientMessage::TerminalAttach { .. }
-        | ClientMessage::TerminalList { .. } => {
+        | ClientMessage::TerminalList { .. }
+        | ClientMessage::GitTransportRequest { .. }
+        | ClientMessage::GitTransportProvide { .. }
+        | ClientMessage::GitTransportQuery { .. } => {
             anyhow::bail!("terminal messages must be the first frame on a dedicated stream")
         }
     }
@@ -2578,8 +2853,12 @@ mod tests {
         ContentPart, ContextBlock, InferenceResponseItem, MessagePhase, UnknownProviderSpecificData,
     };
     use rho_db::RhoDb;
+    use rho_ui_proto::ServerMessage;
 
-    use super::{inference_response_count, latest_final_response, load_or_create_iroh_secret};
+    use super::{
+        GitProviderClaim, GitTransportBroker, inference_response_count, latest_final_response,
+        load_or_create_iroh_secret,
+    };
 
     #[tokio::test]
     async fn iroh_secret_is_persisted_in_database() {
@@ -2590,6 +2869,126 @@ mod tests {
         let second = load_or_create_iroh_secret(&db).await.unwrap();
 
         assert_eq!(first.public(), second.public());
+    }
+
+    #[tokio::test]
+    async fn git_transport_broker_first_approval_wins() {
+        let broker = Arc::new(GitTransportBroker::default());
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+        broker.register(first_tx).await;
+        broker.register(second_tx).await;
+        let request = rho_ui_proto::GitTransportRequest {
+            host: "git.example".to_owned(),
+            port: 22,
+            user: "git".to_owned(),
+            repository: "team/repo.git".to_owned(),
+            service: rho_ui_proto::GitService::ReceivePack,
+        };
+        let waiting = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.request(request).await })
+        };
+        let (request_id, first_provider) = match first_rx.recv().await.unwrap() {
+            ServerMessage::GitTransportRequested {
+                request_id,
+                provider_id,
+                ..
+            } => (request_id, provider_id),
+            message => panic!("unexpected provider message: {message:?}"),
+        };
+        let second_provider = match second_rx.recv().await.unwrap() {
+            ServerMessage::GitTransportRequested {
+                request_id: second_request,
+                provider_id,
+                ..
+            } => {
+                assert_eq!(second_request, request_id);
+                provider_id
+            }
+            message => panic!("unexpected provider message: {message:?}"),
+        };
+        assert!(matches!(
+            broker
+                .claim(request_id, first_provider, false)
+                .await
+                .unwrap(),
+            GitProviderClaim::Done
+        ));
+        let response = match broker
+            .claim(request_id, second_provider, true)
+            .await
+            .unwrap()
+        {
+            GitProviderClaim::Selected(response) => response,
+            GitProviderClaim::Done => panic!("second provider did not win"),
+        };
+        let (provided, _peer) = tokio::io::duplex(64);
+        assert!(response.send(Ok(Box::new(provided))).is_ok());
+        waiting.await.unwrap().unwrap();
+        assert!(matches!(
+            first_rx.recv().await,
+            Some(ServerMessage::GitTransportDone {
+                request_id: done_request
+            }) if done_request == request_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn git_transport_broker_rejects_without_registered_clients() {
+        let result = GitTransportBroker::default()
+            .request(rho_ui_proto::GitTransportRequest {
+                host: "git.example".to_owned(),
+                port: 22,
+                user: "git".to_owned(),
+                repository: "team/repo.git".to_owned(),
+                service: rho_ui_proto::GitService::UploadPack,
+            })
+            .await;
+        let error = match result {
+            Ok(_) => panic!("request unexpectedly found a provider"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no GUI clients are registered"));
+    }
+
+    #[tokio::test]
+    async fn git_transport_broker_times_out_and_notifies_clients() {
+        let broker = Arc::new(GitTransportBroker::default());
+        let (provider_tx, mut provider_rx) = tokio::sync::mpsc::unbounded_channel();
+        broker.register(provider_tx).await;
+        let waiting = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .request_with_timeout(
+                        rho_ui_proto::GitTransportRequest {
+                            host: "git.example".to_owned(),
+                            port: 22,
+                            user: "git".to_owned(),
+                            repository: "team/repo.git".to_owned(),
+                            service: rho_ui_proto::GitService::UploadPack,
+                        },
+                        std::time::Duration::from_millis(10),
+                    )
+                    .await
+            })
+        };
+        let request_id = match provider_rx.recv().await.unwrap() {
+            ServerMessage::GitTransportRequested { request_id, .. } => request_id,
+            message => panic!("unexpected provider message: {message:?}"),
+        };
+        let error = match waiting.await.unwrap() {
+            Ok(_) => panic!("request unexpectedly received a provider"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("within 60 seconds"));
+        assert!(matches!(
+            provider_rx.recv().await,
+            Some(ServerMessage::GitTransportDone {
+                request_id: done_request
+            }) if done_request == request_id
+        ));
     }
 
     fn state_with_responses(texts: &[&str]) -> AgentState {

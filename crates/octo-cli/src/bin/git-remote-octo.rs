@@ -1,99 +1,666 @@
-use std::os::unix::fs::FileTypeExt as _;
+use std::collections::HashMap;
+use std::io::{BufRead as _, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result};
 use reqwest::Url;
+use rho_ui_proto::{ClientMessage, GitService, GitTransportRequest, ServerMessage};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let remote = args.next().context("missing remote name")?;
+    let first = args.next().context("missing remote name")?;
+    if first == "--bridge" {
+        return run_bridge();
+    }
+
+    let remote_name = first;
     let url = args.next().context("missing Octo remote URL")?;
-    let (owner, repo) = parse_remote(&url)?;
-    let socket = octo_types::socket_path()?;
-    let socket_path = Path::new(&socket);
-    let socket_type = socket_path
-        .metadata()
-        .with_context(|| format!("Octo socket is unavailable at {}", socket.display()))?
-        .file_type();
-    if !socket_type.is_socket() {
-        anyhow::bail!("Octo socket path does not refer to a Unix socket");
+    let remote = parse_remote(&url)?;
+    let pat_available = remote.github_http_eligible()
+        && runtime()?.block_on(query_pat_available(&remote.request.host))?;
+
+    if pat_available {
+        run_http_helper(&remote_name, &remote)
+    } else {
+        run_raw_remote_helper(remote.request)
     }
-    let remote_http: PathBuf = option_env!("OCTO_REMOTE_HTTP")
-        .map(PathBuf::from)
-        .context("git-remote-octo was built without Rho's patched git-remote-http")?;
-    if !Path::new(&remote_http).is_file() {
-        anyhow::bail!(
-            "Rho's patched git-remote-http was not found at {}",
-            Path::new(&remote_http).display()
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
+}
+
+#[derive(Clone, Debug)]
+struct Remote {
+    request: GitTransportRequest,
+}
+
+impl Remote {
+    fn github_http_eligible(&self) -> bool {
+        self.request.host == "github.com"
+            && self.request.port == 22
+            && self.request.user == "git"
+            && self.request.repository.split('/').count() == 2
+    }
+
+    fn http_url(&self) -> Result<String> {
+        anyhow::ensure!(
+            self.github_http_eligible(),
+            "PAT Git transport is only available for standard GitHub remotes"
         );
+        let mut parts = self.request.repository.split('/');
+        let owner = parts.next().unwrap();
+        let repository = parts.next().unwrap().trim_end_matches(".git");
+        Ok(format!("http://localhost/git/{owner}/{repository}.git"))
+    }
+}
+
+async fn query_pat_available(host: &str) -> Result<bool> {
+    let socket = rho_ui_proto::socket_path()?;
+    let mut client = rho_ui_proto::client::Client::connect(&socket)
+        .await
+        .with_context(|| format!("connect to rho daemon at {}", socket.display()))?;
+    client
+        .send(&ClientMessage::GitTransportQuery {
+            host: host.to_owned(),
+        })
+        .await?;
+    match client.recv().await? {
+        ServerMessage::GitTransportPolicy { pat_available } => Ok(pat_available),
+        message => anyhow::bail!("unexpected Git transport policy reply: {message:?}"),
+    }
+}
+
+fn run_raw_remote_helper(mut request: GitTransportRequest) -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut stdout = std::io::stdout();
+    loop {
+        let command = lines
+            .next()
+            .transpose()?
+            .context("Git closed the remote-helper control channel")?;
+        match command.as_str() {
+            "capabilities" => {
+                writeln!(stdout, "connect")?;
+                writeln!(stdout)?;
+                stdout.flush()?;
+            }
+            "connect git-upload-pack" => {
+                request.service = GitService::UploadPack;
+                break;
+            }
+            "connect git-receive-pack" => {
+                request.service = GitService::ReceivePack;
+                break;
+            }
+            "" => return Ok(()),
+            _ => anyhow::bail!("unsupported Git remote-helper command: {command}"),
+        }
+    }
+    drop(lines);
+    runtime()?.block_on(run_transport(request, true))
+}
+
+fn run_bridge() -> Result<()> {
+    let request = GitTransportRequest {
+        host: std::env::var("RHO_GIT_HOST").context("RHO_GIT_HOST is missing")?,
+        port: std::env::var("RHO_GIT_PORT")
+            .context("RHO_GIT_PORT is missing")?
+            .parse()
+            .context("RHO_GIT_PORT is invalid")?,
+        user: std::env::var("RHO_GIT_USER").context("RHO_GIT_USER is missing")?,
+        repository: std::env::var("RHO_GIT_REPOSITORY").context("RHO_GIT_REPOSITORY is missing")?,
+        service: GitService::ReceivePack,
+    };
+    runtime()?.block_on(run_transport(request, false))
+}
+
+async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> Result<()> {
+    let socket = rho_ui_proto::socket_path()?;
+    let mut client = rho_ui_proto::client::Client::connect(&socket)
+        .await
+        .with_context(|| format!("connect to rho daemon at {}", socket.display()))?;
+    client
+        .send(&ClientMessage::GitTransportRequest {
+            request: request.clone(),
+        })
+        .await?;
+    match client.recv().await? {
+        ServerMessage::GitTransportReady => {}
+        ServerMessage::GitTransportRefused { reason } => anyhow::bail!("{reason}"),
+        message => anyhow::bail!("unexpected Git transport reply: {message:?}"),
     }
 
-    let http_url = format!("http://localhost/git/{owner}/{repo}.git");
-    let status = Command::new(remote_http)
-        .arg(remote)
-        .arg(http_url)
-        .env("GIT_HTTP_UNIX_SOCKET", &socket)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("failed to run Git's remote-http helper")?;
+    if helper_handshake {
+        let mut stdout = std::io::stdout();
+        writeln!(stdout)?;
+        stdout.flush()?;
+    }
 
-    if !status.success() {
-        anyhow::bail!("git-remote-http exited with {status}");
+    let stream = client.into_stream();
+    let (mut daemon_read, mut daemon_write) = stream.into_split();
+    let service = request.service;
+    let upload = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        if service == GitService::ReceivePack {
+            copy_validated_receive_pack(&mut stdin, &mut daemon_write).await?;
+        } else {
+            tokio::io::copy(&mut stdin, &mut daemon_write).await?;
+        }
+        daemon_write.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let download = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        tokio::io::copy(&mut daemon_read, &mut stdout).await?;
+        stdout.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    });
+    upload.await.context("Git transport upload task failed")??;
+    download
+        .await
+        .context("Git transport download task failed")??;
+    Ok(())
+}
+
+async fn copy_validated_receive_pack<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut prefix = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 8192];
+        let read = reader.read(&mut chunk).await?;
+        anyhow::ensure!(read != 0, "truncated git receive-pack request");
+        prefix.extend_from_slice(&chunk[..read]);
+        match octo_types::parse_receive_pack_commands(&prefix) {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(error) => anyhow::bail!(error),
+        }
+    }
+    writer.write_all(&prefix).await?;
+    tokio::io::copy(reader, writer).await?;
+    Ok(())
+}
+
+struct HttpHelper {
+    child: Child,
+    input: ChildStdin,
+    output: std::io::BufReader<ChildStdout>,
+}
+
+impl HttpHelper {
+    fn spawn(remote_name: &str, remote: &Remote) -> Result<Self> {
+        let socket = octo_types::socket_path()?;
+        let socket_type = socket
+            .metadata()
+            .with_context(|| format!("Octo socket is unavailable at {}", socket.display()))?
+            .file_type();
+        anyhow::ensure!(
+            std::os::unix::fs::FileTypeExt::is_socket(&socket_type),
+            "Octo socket path does not refer to a Unix socket"
+        );
+        let remote_http: PathBuf = option_env!("OCTO_REMOTE_HTTP")
+            .map(PathBuf::from)
+            .context("git-remote-octo was built without Rho's patched git-remote-http")?;
+        anyhow::ensure!(
+            Path::new(&remote_http).is_file(),
+            "Rho's patched git-remote-http was not found at {}",
+            remote_http.display()
+        );
+        let mut child = Command::new(remote_http)
+            .arg(remote_name)
+            .arg(remote.http_url()?)
+            .env("GIT_HTTP_UNIX_SOCKET", socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("start Git's remote-http helper")?;
+        let input = child
+            .stdin
+            .take()
+            .context("remote-http stdin unavailable")?;
+        let output = std::io::BufReader::new(
+            child
+                .stdout
+                .take()
+                .context("remote-http stdout unavailable")?,
+        );
+        Ok(Self {
+            child,
+            input,
+            output,
+        })
+    }
+
+    fn send_line(&mut self, line: &str) -> Result<()> {
+        writeln!(self.input, "{line}")?;
+        self.input.flush()?;
+        Ok(())
+    }
+
+    fn read_line(&mut self) -> Result<String> {
+        let mut line = String::new();
+        anyhow::ensure!(
+            self.output.read_line(&mut line)? != 0,
+            "git-remote-http closed its protocol stream"
+        );
+        Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    fn relay_until_blank(&mut self, output: &mut impl Write) -> Result<()> {
+        loop {
+            let line = self.read_line()?;
+            writeln!(output, "{line}")?;
+            if line.is_empty() {
+                output.flush()?;
+                return Ok(());
+            }
+        }
+    }
+
+    fn relay_ref_list(
+        &mut self,
+        output: &mut impl Write,
+        refs: &mut HashMap<String, String>,
+    ) -> Result<()> {
+        loop {
+            let line = self.read_line()?;
+            writeln!(output, "{line}")?;
+            if line.is_empty() {
+                output.flush()?;
+                return Ok(());
+            }
+            let mut fields = line.split_ascii_whitespace();
+            if let (Some(object_id), Some(reference)) = (fields.next(), fields.next())
+                && matches!(object_id.len(), 40 | 64)
+                && object_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && reference.starts_with("refs/")
+            {
+                refs.insert(reference.to_owned(), object_id.to_owned());
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct PushOptions {
+    dry_run: bool,
+    force: bool,
+    atomic: bool,
+    progress: Option<bool>,
+    verbosity: u8,
+    pushcert: Option<String>,
+    push_options: Vec<String>,
+    service_path: Option<String>,
+}
+
+impl PushOptions {
+    fn record(&mut self, command: &str, accepted: bool) {
+        if !accepted {
+            return;
+        }
+        let Some(rest) = command.strip_prefix("option ") else {
+            return;
+        };
+        let (name, value) = rest.split_once(' ').unwrap_or((rest, ""));
+        match name {
+            "dry-run" => self.dry_run = value == "true",
+            "force" => self.force = value == "true",
+            "atomic" => self.atomic = value == "true",
+            "progress" => self.progress = Some(value == "true"),
+            "verbosity" => self.verbosity = value.parse().unwrap_or(1).min(3),
+            "pushcert" => self.pushcert = Some(value.to_owned()),
+            "push-option" => self.push_options.push(value.to_owned()),
+            "servpath" => self.service_path = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+}
+
+fn run_http_helper(remote_name: &str, remote: &Remote) -> Result<()> {
+    let mut helper = HttpHelper::spawn(remote_name, remote)?;
+    let stdin = std::io::stdin();
+    let mut commands = stdin.lock().lines();
+    let mut stdout = std::io::stdout();
+    let mut options = PushOptions::default();
+    let mut remote_refs = HashMap::new();
+
+    let first = commands
+        .next()
+        .transpose()?
+        .context("Git closed the remote-helper control channel")?;
+    anyhow::ensure!(
+        first == "capabilities",
+        "expected remote-helper capabilities"
+    );
+    helper.send_line(&first)?;
+    loop {
+        let capability = helper.read_line()?;
+        if capability.is_empty() {
+            writeln!(stdout)?;
+            stdout.flush()?;
+            break;
+        }
+        if !matches!(capability.as_str(), "stateless-connect" | "get") {
+            writeln!(stdout, "{capability}")?;
+        }
+    }
+
+    while let Some(command) = commands.next().transpose()? {
+        if command.is_empty() {
+            return Ok(());
+        }
+        if command.starts_with("option ") {
+            helper.send_line(&command)?;
+            let response = helper.read_line()?;
+            options.record(&command, response == "ok");
+            writeln!(stdout, "{response}")?;
+            stdout.flush()?;
+            continue;
+        }
+        if matches!(command.as_str(), "list" | "list for-push") {
+            helper.send_line(&command)?;
+            if command == "list for-push" {
+                remote_refs.clear();
+                helper.relay_ref_list(&mut stdout, &mut remote_refs)?;
+            } else {
+                helper.relay_until_blank(&mut stdout)?;
+            }
+            continue;
+        }
+        if command.starts_with("fetch ") {
+            let batch = collect_batch(command, &mut commands)?;
+            send_batch(&mut helper, &batch)?;
+            helper.relay_until_blank(&mut stdout)?;
+            continue;
+        }
+        if command.starts_with("push ") {
+            let batch = collect_batch(command, &mut commands)?;
+            let (pushes, has_protocol_options) = parse_push_batch(&batch)?;
+            if pushes_use_http(&pushes) {
+                send_batch(&mut helper, &batch)?;
+                helper.relay_until_blank(&mut stdout)?;
+                continue;
+            }
+            let _ = helper.child.kill();
+            let _ = helper.child.wait();
+            return run_ssh_send_pack(
+                remote,
+                &pushes,
+                &options,
+                has_protocol_options,
+                &remote_refs,
+                &mut stdout,
+            );
+        }
+        anyhow::bail!("unsupported git-remote-http command: {command}");
     }
     Ok(())
 }
 
-fn parse_remote(value: &str) -> Result<(String, String)> {
+fn collect_batch(
+    first: String,
+    commands: &mut impl Iterator<Item = std::io::Result<String>>,
+) -> Result<Vec<String>> {
+    let mut batch = vec![first];
+    loop {
+        let line = commands
+            .next()
+            .transpose()?
+            .context("truncated remote-helper command batch")?;
+        if line.is_empty() {
+            return Ok(batch);
+        }
+        batch.push(line);
+    }
+}
+
+fn send_batch(helper: &mut HttpHelper, batch: &[String]) -> Result<()> {
+    for command in batch {
+        helper.send_line(command)?;
+    }
+    helper.send_line("")
+}
+
+struct PushCommand {
+    refspec: String,
+    destination: String,
+}
+
+fn pushes_use_http(pushes: &[PushCommand]) -> bool {
+    !pushes.is_empty()
+        && pushes
+            .iter()
+            .all(|push| push.destination.starts_with("refs/heads/rho/"))
+}
+
+fn force_leases(
+    pushes: &[PushCommand],
+    force_all: bool,
+    remote_refs: &HashMap<String, String>,
+) -> Vec<String> {
+    pushes
+        .iter()
+        .filter_map(|push| {
+            let refspec = push.refspec.strip_prefix('+').unwrap_or(&push.refspec);
+            let source = refspec
+                .split_once(':')
+                .map(|(source, _)| source)
+                .unwrap_or("");
+            (force_all || push.refspec.starts_with('+') || source.is_empty())
+                .then(|| remote_refs.get(&push.destination))
+                .flatten()
+                .map(|old| format!("--force-with-lease={}:{}", push.destination, old))
+        })
+        .collect()
+}
+
+fn send_pack_refspecs(pushes: &[PushCommand], force_all: bool) -> Vec<&str> {
+    pushes
+        .iter()
+        .map(|push| {
+            if force_all || push.refspec.starts_with('+') {
+                push.refspec.strip_prefix('+').unwrap_or(&push.refspec)
+            } else {
+                push.refspec.as_str()
+            }
+        })
+        .collect()
+}
+
+fn parse_push_batch(batch: &[String]) -> Result<(Vec<PushCommand>, bool)> {
+    let mut pushes = Vec::new();
+    let mut has_protocol_options = false;
+    for command in batch {
+        let Some(refspec) = command.strip_prefix("push ") else {
+            has_protocol_options = true;
+            continue;
+        };
+        let refspec_without_force = refspec.strip_prefix('+').unwrap_or(refspec);
+        let (_, destination) = refspec_without_force
+            .split_once(':')
+            .context("invalid remote-helper push refspec")?;
+        anyhow::ensure!(
+            destination.starts_with("refs/"),
+            "push destination is not a fully qualified ref"
+        );
+        pushes.push(PushCommand {
+            refspec: refspec.to_owned(),
+            destination: destination.to_owned(),
+        });
+    }
+    anyhow::ensure!(!pushes.is_empty(), "empty remote-helper push batch");
+    Ok((pushes, has_protocol_options))
+}
+
+fn run_ssh_send_pack(
+    remote: &Remote,
+    pushes: &[PushCommand],
+    options: &PushOptions,
+    has_protocol_options: bool,
+    remote_refs: &HashMap<String, String>,
+    output: &mut impl Write,
+) -> Result<()> {
+    if options
+        .pushcert
+        .as_deref()
+        .is_some_and(|value| value != "false")
+        || !options.push_options.is_empty()
+        || options.service_path.is_some()
+        || has_protocol_options
+    {
+        for push in pushes {
+            writeln!(
+                output,
+                "error {} client SSH transport does not support signed pushes or push options",
+                push.destination
+            )?;
+        }
+        writeln!(output)?;
+        output.flush()?;
+        return Ok(());
+    }
+
+    let executable = std::env::current_exe().context("resolve git-remote-octo executable")?;
+    let receive_pack = format!("{} --bridge", shell_quote(&executable.to_string_lossy()));
+    let mut command = Command::new("git");
+    command
+        .arg("send-pack")
+        .arg("--helper-status")
+        .arg(format!("--receive-pack={receive_pack}"));
+    if options.dry_run {
+        command.arg("--dry-run");
+    }
+    if options.atomic {
+        command.arg("--atomic");
+    }
+    if let Some(progress) = options.progress {
+        command.arg(if progress {
+            "--progress"
+        } else {
+            "--no-progress"
+        });
+    }
+    for _ in 1..options.verbosity {
+        command.arg("--verbose");
+    }
+    command.args(force_leases(pushes, options.force, remote_refs));
+    command
+        .arg(".")
+        .args(send_pack_refspecs(pushes, options.force))
+        .env("RHO_GIT_HOST", &remote.request.host)
+        .env("RHO_GIT_PORT", remote.request.port.to_string())
+        .env("RHO_GIT_USER", &remote.request.user)
+        .env("RHO_GIT_REPOSITORY", &remote.request.repository)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let result = command
+        .output()
+        .context("run git send-pack over client SSH")?;
+    output.write_all(&result.stdout)?;
+    if !result.status.success() && result.stdout.is_empty() {
+        for push in pushes {
+            writeln!(
+                output,
+                "error {} SSH send-pack exited with {}",
+                push.destination, result.status
+            )?;
+        }
+    }
+    writeln!(output)?;
+    output.flush()?;
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn parse_remote(value: &str) -> Result<Remote> {
+    anyhow::ensure!(
+        !value
+            .split('/')
+            .any(|component| matches!(component, "." | "..")),
+        "invalid SSH Git repository path"
+    );
     let url =
-        Url::parse(value).context("Octo remote must be octo://github.com/OWNER/REPOSITORY")?;
+        Url::parse(value).context("Octo remote must be octo://[USER@]HOST[:PORT]/REPOSITORY")?;
     if url.scheme() != "octo"
-        || url.host_str() != Some("github.com")
-        || url.port().is_some()
-        || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        anyhow::bail!("Octo remote must be octo://github.com/OWNER/REPOSITORY");
+        anyhow::bail!("Octo remote must be octo://[USER@]HOST[:PORT]/REPOSITORY");
     }
-    let parts: Vec<_> = url
-        .path_segments()
-        .into_iter()
-        .flatten()
-        .filter(|part| !part.is_empty())
-        .collect();
-    if parts.len() != 2 {
-        anyhow::bail!("Octo remote must be octo://github.com/OWNER/REPOSITORY");
-    }
-    let owner = parts[0];
-    let repo = parts[1].trim_end_matches(".git");
-    if !valid_owner(owner) || !valid_repo(repo) {
-        anyhow::bail!("Octo remote must be octo://github.com/OWNER/REPOSITORY");
-    }
-    Ok((owner.to_owned(), repo.to_owned()))
+    let host = url
+        .host_str()
+        .filter(|host| valid_host(host))
+        .context("invalid or missing SSH Git host")?;
+    let user = if url.username().is_empty() {
+        "git"
+    } else {
+        url.username()
+    };
+    anyhow::ensure!(valid_user(user), "invalid SSH Git user");
+    let repository = url.path().trim_start_matches('/');
+    anyhow::ensure!(
+        valid_repository(repository),
+        "invalid SSH Git repository path"
+    );
+
+    Ok(Remote {
+        request: GitTransportRequest {
+            host: host.to_owned(),
+            port: url.port().unwrap_or(22),
+            user: user.to_owned(),
+            repository: repository.to_owned(),
+            service: GitService::UploadPack,
+        },
+    })
 }
 
-fn valid_owner(value: &str) -> bool {
+fn valid_host(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 100
-        && value != "."
-        && value != ".."
+        && value.len() <= 255
+        && !value.starts_with('-')
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'))
 }
 
-fn valid_repo(value: &str) -> bool {
+fn valid_user(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 100
-        && value != "."
-        && value != ".."
+        && value.len() <= 64
+        && !value.starts_with('-')
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_repository(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1024
+        && !value.starts_with(['-', '/'])
+        && !value.contains("//")
+        && value.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && !component.starts_with('-')
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
 }
 
 #[cfg(test)]
@@ -101,27 +668,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_github_path_segments() {
-        assert!(valid_owner("acme-inc"));
-        assert!(valid_repo("some_repo.rs"));
-        assert!(!valid_owner("acme?service=elsewhere"));
-        assert!(!valid_repo("../elsewhere"));
-        assert!(!valid_repo("repo/name"));
+    fn parses_github_compatibility_remote() {
+        let remote = parse_remote("octo://github.com/acme/library.git").unwrap();
+        assert!(remote.github_http_eligible());
+        assert_eq!(
+            remote.http_url().unwrap(),
+            "http://localhost/git/acme/library.git"
+        );
     }
 
     #[test]
-    fn parses_explicit_github_remote() {
-        assert_eq!(
-            parse_remote("octo://github.com/acme/library.git").unwrap(),
-            ("acme".to_owned(), "library".to_owned())
-        );
+    fn parses_generic_ssh_remote() {
+        let remote = parse_remote("octo://deploy@git.example.test:2222/team/project.git").unwrap();
+        assert!(!remote.github_http_eligible());
+        assert_eq!(remote.request.host, "git.example.test");
+        assert_eq!(remote.request.port, 2222);
+        assert_eq!(remote.request.user, "deploy");
+        assert_eq!(remote.request.repository, "team/project.git");
+    }
+
+    #[test]
+    fn rejects_unsafe_remote_fields() {
         for value in [
-            "octo::acme/library",
-            "octo://gitlab.com/acme/library",
-            "octo://github.com/acme/library/extra",
-            "octo://github.com/acme/library?other=true",
+            "octo://gitlab.example",
+            "octo://user:password@git.example/repo",
+            "octo://git.example/../repo",
+            "octo://git.example/-oProxyCommand=bad",
+            "https://github.com/acme/repo",
         ] {
             assert!(parse_remote(value).is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn routes_push_batches_by_destination_namespace() {
+        let (rho, options) =
+            parse_push_batch(&["push HEAD:refs/heads/rho/test".to_owned()]).unwrap();
+        assert!(!options);
+        assert!(pushes_use_http(&rho));
+
+        let (mixed, options) = parse_push_batch(&[
+            "push HEAD:refs/heads/rho/test".to_owned(),
+            "push HEAD:refs/heads/main".to_owned(),
+            "option unknown value".to_owned(),
+        ])
+        .unwrap();
+        assert!(options);
+        assert!(!pushes_use_http(&mixed));
+    }
+
+    #[test]
+    fn shell_quotes_receive_pack_program() {
+        assert_eq!(shell_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
+    }
+
+    #[test]
+    fn forced_updates_and_deletions_preserve_observed_old_ids() {
+        let (pushes, _) = parse_push_batch(&[
+            "push +HEAD:refs/heads/main".to_owned(),
+            "push :refs/heads/old".to_owned(),
+            "push HEAD:refs/heads/new".to_owned(),
+        ])
+        .unwrap();
+        let old = "a".repeat(40);
+        let refs = HashMap::from([
+            ("refs/heads/main".to_owned(), old.clone()),
+            ("refs/heads/old".to_owned(), old.clone()),
+            ("refs/heads/new".to_owned(), old.clone()),
+        ]);
+        assert_eq!(
+            force_leases(&pushes, false, &refs),
+            vec![
+                format!("--force-with-lease=refs/heads/main:{old}"),
+                format!("--force-with-lease=refs/heads/old:{old}"),
+            ]
+        );
+        assert_eq!(
+            send_pack_refspecs(&pushes, false),
+            vec![
+                "HEAD:refs/heads/main",
+                ":refs/heads/old",
+                "HEAD:refs/heads/new"
+            ]
+        );
     }
 }

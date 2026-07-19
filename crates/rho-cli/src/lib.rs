@@ -248,7 +248,7 @@ pub(crate) struct PrArgs {
 
 #[derive(Clone, Subcommand)]
 pub(crate) enum PrCliCommand {
-    /// Install the GitHub token used for PR and Git transport operations.
+    /// Install the GitHub token used for PR, Actions, and constrained Git operations.
     Init,
     /// Create a draft pull request and subscribe the current Engineer.
     Create {

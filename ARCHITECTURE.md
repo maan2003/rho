@@ -142,17 +142,37 @@ agent turn-completion and accepted-input reports through `AgentPool`; Slack uses
 completed-turn reports for reaction cleanup, not automatic final-answer posting,
 and the daemon does not own Slack routing policy.
 
-`octo-server` and its Git remote helper are vendored GitHub helper components.
-Rho runs `octo-server` in-process on the fixed per-user Octo Unix socket. The
-user- and agent-facing PR client is `rho pr` over the normal daemon socket;
-Octo remains an internal authenticated API/Git transport. The daemon owns platform secret
-installation and fd-store resume, so the server receives GitHub tokens only
-through a RAM-only callback into the sealed platform secret store. The
-`git-remote-octo` Git remote helper invokes a private
-Nix-patched `git-remote-http` whose libcurl connection uses that Unix socket; it
-does not replace Git globally. Octo proxies authenticated fetches for any
-repository available to its token, and pushes after restricting destination
-refs to `refs/heads/rho/*`.
+`octo-server` is the daemon's authenticated GitHub API and constrained Git
+HTTP component. Rho runs it
+in-process on the fixed per-user Octo Unix socket. The user- and agent-facing
+PR client is `rho pr` over the normal daemon socket. The daemon owns platform
+secret installation and fd-store resume, so Octo receives the GitHub token
+only through a RAM-only callback into the sealed platform secret store.
+
+`git-remote-octo` selects transport before executing an operation. Standard
+GitHub remotes use the private Nix-patched `git-remote-http` while a GitHub
+token is configured: fetches and pushes wholly below `refs/heads/rho/*` go
+through Octo's Unix-socket smart-HTTP proxy, which independently enforces that
+ref restriction. A push batch containing any other destination is instead
+performed by `git send-pack` over a raw Git-protocol stream. Without a token,
+or for a non-GitHub SSH host, the helper advertises Git's raw `connect`
+capability from the outset. It never retries an HTTP push after a rejection.
+
+Every connected native GUI registers as a client-held SSH Git transport
+provider. For each operation the daemon snapshots the live providers and fans
+out the same approval request. The first approval atomically wins and opens a
+dedicated GUI stream; every other recipient receives an outcome-neutral `Done`
+message carrying only the request id. With no registered GUI the helper fails
+immediately, and with no approval it fails after 60 seconds. There is no
+mid-operation failover.
+
+The winning GUI launches the user's local OpenSSH for a typed host, user, port,
+repository, and upload-pack/receive-pack service. The helper and GUI
+independently parse bounded receive-pack commands. The GUI asks before every
+SSH operation, allows updates below `refs/heads/rho/*` under that one-operation
+approval, and asks again on the exact old/new object ids for every other ref.
+Generic SSH hosts use `octo://[USER@]HOST[:PORT]/REPOSITORY` and always take
+this approved SSH path.
 
 `rho-pr-monitor` owns long-lived pull-request policy while Octo remains only
 the authenticated GitHub API boundary. Engineers create or adopt PRs through
@@ -165,8 +185,7 @@ review, mergeability, or terminal changes, and keeps watching after CI turns
 green until merge/close.
 The Engineer handles repository work and GitHub replies directly, then sends
 concise milestones to its parent so Slack-bound PMs can relay them. The
-standalone `octo` CLI is not installed; only `git-remote-octo` uses Octo's
-private socket directly.
+standalone `octo` CLI is not installed.
 
 The normal UI protocol carries request-id-scoped `rho pr` commands and their
 text or bounded log-archive results. Agent-side commands identify the

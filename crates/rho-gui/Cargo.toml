@@ -42,6 +42,7 @@ languages = { git = "https://github.com/maan2003/zed", branch = "rho", features 
 multi_buffer = { git = "https://github.com/maan2003/zed", branch = "rho" }
 prefix-id = { workspace = true, features = ["redb"] }
 node_runtime = { git = "https://github.com/maan2003/zed", branch = "rho" }
+octo-types.workspace = true
 project = { git = "https://github.com/maan2003/zed", branch = "rho" }
 prost = "0.9"
 release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
