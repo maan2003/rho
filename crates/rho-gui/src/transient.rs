@@ -69,27 +69,39 @@ impl Transient {
             .map(|item| item.run.clone())
     }
 
+    /// Magit's layout: a title line, then items flowing down short columns
+    /// so the eye scans vertically. Keys align in their own sub-column.
     pub fn render(&self, text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> AnyElement {
+        const COLUMN_ROWS: usize = 4;
         let colors = cx.theme().colors();
         let accent = colors.text_accent;
         let muted = colors.text_muted;
+        let columns = self.items.chunks(COLUMN_ROWS).map(|chunk| {
+            div().flex().flex_col().children(chunk.iter().map(|item| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .child(
+                        div()
+                            .w_8()
+                            .text_align(gpui::TextAlign::Right)
+                            .pr_2()
+                            .text_color(accent)
+                            .child(display_key(item.key)),
+                    )
+                    .child(item.label)
+            }))
+        });
         bottom_strip(text_style, cx)
+            .child(div().px_2().text_color(muted).child(self.title))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .flex_wrap()
-                    .gap_x_4()
+                    .gap_x_6()
                     .px_2()
-                    .child(div().text_color(muted).child(format!("{}:", self.title)))
-                    .children(self.items.iter().map(|item| {
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1()
-                            .child(div().text_color(accent).child(display_key(item.key)))
-                            .child(item.label)
-                    })),
+                    .children(columns),
             )
             .into_any_element()
     }
