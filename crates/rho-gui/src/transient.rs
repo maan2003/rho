@@ -118,18 +118,24 @@ fn display_key(spec: &str) -> String {
     }
 }
 
-/// `space :` — the root menu: everything that isn't about the current
-/// agent, plus a door into the agent menu.
+/// `space` — the root menu: every leader chord lives here (or one level
+/// down), so the whole vocabulary is discoverable by pausing.
 pub fn root_menu() -> Transient {
     Transient::new("rho")
         .item("n", "new agent", |workspace, window, cx| {
             workspace.cmd_agent_new(window, cx);
         })
-        .item("w", "workstream…", |workspace, window, cx| {
-            workspace.open_transient(workstream_menu(), window, cx);
-        })
         .item("a", "agent…", |workspace, window, cx| {
             workspace.open_transient(agent_menu(), window, cx);
+        })
+        .item("s", "workstream…", |workspace, window, cx| {
+            workspace.open_transient(workstream_menu(), window, cx);
+        })
+        .item("w", "window…", |workspace, window, cx| {
+            workspace.open_transient(window_menu(), window, cx);
+        })
+        .item("r", "rail", |workspace, window, cx| {
+            workspace.focus_rail(window, cx);
         })
         .item("b", "switch buffer…", |workspace, window, cx| {
             workspace.open_buffer_picker(window, cx);
@@ -155,6 +161,27 @@ pub fn root_menu() -> Transient {
         .item("q", "quit", |_, _, cx| cx.quit())
 }
 
+/// `space w`: pane arrangement, on vim's window letters — practiced
+/// `space w v` fingers land exactly where they always did.
+fn window_menu() -> Transient {
+    Transient::new("window")
+        .item("v", "split right", |workspace, window, cx| {
+            workspace.split_pane(crate::pane::SplitAxis::Row, window, cx);
+        })
+        .item("s", "split down", |workspace, window, cx| {
+            workspace.split_pane(crate::pane::SplitAxis::Column, window, cx);
+        })
+        .item("q", "close pane", |workspace, window, cx| {
+            workspace.close_pane(window, cx);
+        })
+        .item("w", "focus next", |workspace, window, cx| {
+            workspace.focus_pane_by_delta(1, window, cx);
+        })
+        .item("b", "back", |workspace, window, cx| {
+            workspace.pane_back(window, cx);
+        })
+}
+
 fn projects_menu() -> Transient {
     Transient::new("projects")
         .item("a", "add…", |workspace, window, cx| {
@@ -165,8 +192,8 @@ fn projects_menu() -> Transient {
         })
 }
 
-/// `space a`: everything about the current agent.
-pub fn agent_menu() -> Transient {
+/// `space a`: driving the current conversation.
+fn agent_menu() -> Transient {
     Transient::new("agent")
         .item("d", "done", |workspace, window, cx| {
             workspace.cmd_agent_done(false, window, cx);
@@ -214,7 +241,7 @@ fn snooze_menu() -> Transient {
         })
 }
 
-/// `space w`: the focused workstream as the rail row the user is
+/// `space s`: the focused workstream as the rail row the user is
 /// triaging — name it, keep it up, put it away, file it with its kin.
 fn workstream_menu() -> Transient {
     Transient::new("workstream")

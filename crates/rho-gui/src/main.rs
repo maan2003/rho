@@ -62,7 +62,6 @@ actions!(
         RailFocus,
         RailOpen,
         RootTransient,
-        AgentTransient,
         MinibufferConfirm,
         MinibufferCancel,
         MinibufferNext,
@@ -456,30 +455,19 @@ fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("g g", TerminalScrollTop, Some("RhoTerminalNormal")),
         KeyBinding::new("shift-g", TerminalScrollBottom, Some("RhoTerminalNormal")),
     ]);
-    // Vim-leader pane vocabulary. Bound both for editors in normal mode
-    // (vim or helix flavor — helix reports `vim_mode == helix_normal`) and
-    // for the rail (which has no editor, so plain keys are safe there).
-    // These load after the vim keymap, so they win ties at equal depth.
+    // The space leader: one binding, opening the root transient at once
+    // (invisible until the reveal delay). Every chord beneath it — panes,
+    // agent verbs, workstream triage — is a transient item, so practiced
+    // sequences run at full speed without the menu ever flashing. Bound for
+    // normal-mode editors (vim or helix flavor — helix reports
+    // `vim_mode == helix_normal`) and the rail, which has no editor.
     for context in [
         "RhoRail",
         "RhoTerminalNormal",
         "RhoGui > Editor && vim_mode == normal",
         "RhoGui > Editor && vim_mode == helix_normal",
     ] {
-        cx.bind_keys([
-            KeyBinding::new("space w v", PaneSplitRight, Some(context)),
-            KeyBinding::new("space w s", PaneSplitDown, Some(context)),
-            KeyBinding::new("space w q", PaneClose, Some(context)),
-            KeyBinding::new("space w w", PaneFocusNext, Some(context)),
-            KeyBinding::new("space b", PaneBack, Some(context)),
-            KeyBinding::new("space r", RailFocus, Some(context)),
-            // The agent transient: `space a d` marks done, `space a` alone
-            // shows the menu.
-            KeyBinding::new("space a", AgentTransient, Some(context)),
-            // The root menu sits where doom puts M-x; there is no `:`
-            // command line to inherit the bare key.
-            KeyBinding::new("space :", RootTransient, Some(context)),
-        ]);
+        cx.bind_keys([KeyBinding::new("space", RootTransient, Some(context))]);
     }
     // Minibuffer keys. The input is a single-line editor (vim skips those),
     // but enter/escape/tab still need to beat the editor's own bindings, so

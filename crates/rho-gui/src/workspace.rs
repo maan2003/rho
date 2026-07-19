@@ -1928,7 +1928,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn split_pane(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn split_pane(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
         let focused = self.active_tree().focused().surface.clone();
         let sibling = self.duplicate_surface(focused, window, cx);
         self.active_tree_mut().split(axis, sibling);
@@ -1936,21 +1936,21 @@ impl Workspace {
         cx.notify();
     }
 
-    fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.active_tree_mut().close_focused();
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
         cx.notify();
     }
 
-    fn focus_pane_by_delta(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_pane_by_delta(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         self.active_tree_mut().focus_by_delta(delta);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
         cx.notify();
     }
 
-    fn pane_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn pane_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tree_mut().focused_mut().back() {
             self.sync_selection_to_focus(cx);
             self.focus_active_surface(window, cx);
@@ -2272,7 +2272,7 @@ impl Workspace {
 
     /// `space r`: the rail is ambient chrome, not a pane — focus jumps to
     /// it directly and never lands on it through the pane cycle.
-    fn focus_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.rail_focus, cx);
         cx.notify();
     }
@@ -2674,9 +2674,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &crate::RootTransient, window, cx| {
                 this.open_transient(crate::transient::root_menu(), window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &crate::AgentTransient, window, cx| {
-                this.open_transient(crate::transient::agent_menu(), window, cx);
             }))
             .on_action(cx.listener(|this, _: &MinibufferConfirm, window, cx| {
                 this.minibuffer_confirm(window, cx);
