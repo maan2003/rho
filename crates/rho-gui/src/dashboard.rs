@@ -2,10 +2,14 @@
 //! magit-status. One line per workstream in triage order, generated
 //! read-only text in a normal editor, so the cursor, motions, and search
 //! all come from the editor rather than bespoke list chrome. Acting keys
-//! (`enter` to open, later reply and verdicts) address the row under the
-//! cursor; across refreshes the cursor sticks to its row's identity, not
-//! its line number.
+//! address the row under the cursor: `enter` opens, `r` splices an inline
+//! reply draft under the row. Every line is its own tiny buffer in the
+//! multibuffer, so reply drafts are ordinary writable buffers between
+//! read-only ones — a refresh rearranges excerpts but can never eat what
+//! the user typed, and the cursor rides its line's buffer through
+//! reorders instead of sticking to a line number.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use editor::hover_links::InlayHighlight;
@@ -16,6 +20,7 @@ use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
 use rho_ui_proto::{AgentId, UiAttention, WorkstreamId};
+use text::BufferId;
 use theme::ActiveTheme as _;
 
 use crate::registry::{AgentRegistry, Workstream};
@@ -27,6 +32,21 @@ const VISIBLE_TAGS: usize = 4;
 /// Highlight-key space for dashboard classes, clear of the transcript's
 /// semantic and syntax key ranges.
 const DASHBOARD_KEY_BASE: usize = usize::MAX - 200;
+
+/// Inlay id space for reply-draft placeholders, clear of the lamp ids.
+const PLACEHOLDER_ID_BASE: usize = 1_000_000;
+
+/// Identity of one dashboard line; each key owns one buffer in the
+/// multibuffer. Cursor position and reply drafts survive re-sorts by
+/// following their key, not their line number.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LineKey {
+    Group(String),
+    Stream(WorkstreamId),
+    FoldToggle,
+    NewAgent,
+    Reply(AgentId),
+}
 
 /// What the line under the cursor refers to; the object of every
 /// dashboard command.
@@ -40,58 +60,38 @@ pub enum RowTarget {
     },
     FoldToggle,
     NewAgent,
-}
-
-impl RowTarget {
-    /// Row identity for cursor restoration: the cursor follows the same
-    /// workstream across refreshes even as its line number or primary
-    /// agent changes.
-    fn same_row(&self, other: &RowTarget) -> bool {
-        match (self, other) {
-            (
-                RowTarget::Stream { workstream_id, .. },
-                RowTarget::Stream {
-                    workstream_id: other_id,
-                    ..
-                },
-            ) => workstream_id == other_id,
-            (RowTarget::None, _) | (_, RowTarget::None) => false,
-            _ => self == other,
-        }
-    }
+    /// An inline reply draft addressed to this agent.
+    Reply(AgentId),
 }
 
 pub struct Dashboard {
-    buffer: Entity<Buffer>,
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
-    /// One entry per buffer line, in order.
-    rows: Vec<RowTarget>,
-    /// The last generated listing, for cheap change detection.
-    text: String,
+    /// One buffer per line key: read-only listing lines and writable
+    /// reply drafts alike.
+    buffers: HashMap<LineKey, Entity<Buffer>>,
+    /// Current display order; index n is the multibuffer's path key n.
+    order: Vec<LineKey>,
+    /// What each present key means, for cursor lookup.
+    targets: HashMap<LineKey, RowTarget>,
+    /// Open reply drafts in creation order (position comes from `order`).
+    replies: Vec<AgentId>,
+    /// Keeps the workspace re-rendering on draft edits, so placeholder
+    /// and gutter chrome track the text.
+    reply_subscriptions: HashMap<AgentId, gpui::Subscription>,
+    /// Move the cursor into this key's buffer on the next sync — how a
+    /// freshly opened reply draft receives the cursor.
+    pending_cursor: Option<LineKey>,
     /// Attention lamps currently spliced in, for replacement on sync.
     lamp_ids: Vec<InlayId>,
+    /// Reply placeholder inlays currently spliced in.
+    placeholder_ids: Vec<InlayId>,
 }
 
 impl Dashboard {
     pub fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
-        let buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local("", cx);
-            buffer.set_capability(Capability::Read, cx);
-            buffer
-        });
-        let multi_buffer = cx.new(|cx| {
-            let mut multi_buffer = MultiBuffer::without_headers(Capability::Read);
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(0),
-                buffer.clone(),
-                [Point::zero()..buffer.read(cx).max_point()],
-                0,
-                cx,
-            );
-            multi_buffer
-        });
-        let buffer_id = buffer.read(cx).remote_id();
+        let multi_buffer =
+            cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::Full {
@@ -111,17 +111,19 @@ impl Dashboard {
             // Unlike the chat editors, clicking a row to put the cursor on
             // it is the whole point.
             editor.set_mouse_click_selection_enabled(true, cx);
-            editor.set_read_only(true);
-            editor.disable_header_for_buffer(buffer_id, cx);
             editor
         });
         Self {
-            buffer,
             multi_buffer,
             editor,
-            rows: Vec::new(),
-            text: String::new(),
+            buffers: HashMap::new(),
+            order: Vec::new(),
+            targets: HashMap::new(),
+            replies: Vec::new(),
+            reply_subscriptions: HashMap::new(),
+            pending_cursor: None,
             lamp_ids: Vec::new(),
+            placeholder_ids: Vec::new(),
         }
     }
 
@@ -133,57 +135,274 @@ impl Dashboard {
         self.editor.read(cx).focus_handle(cx)
     }
 
-    /// Regenerates the listing from the registry: replaces the buffer text
-    /// when it changed (keeping the cursor on its row by identity) and
-    /// reapplies highlights (attention lamps shift without text edits).
-    pub fn sync(&mut self, registry: &AgentRegistry, window: &mut Window, cx: &mut Context<Workspace>) {
-        let layout = generate(registry);
-        if layout.text != self.text {
-            let cursor_row = self.cursor_target(cx);
-            self.buffer.update(cx, |buffer, cx| {
-                let len = buffer.len();
-                buffer.edit([(0..len, layout.text.as_str())], None, cx);
-            });
-            let buffer = self.buffer.clone();
-            self.multi_buffer.update(cx, |multi_buffer, cx| {
-                multi_buffer.set_excerpts_for_path(
-                    PathKey::sorted(0),
-                    buffer.clone(),
-                    [Point::zero()..buffer.read(cx).max_point()],
-                    0,
-                    cx,
-                );
-            });
-            self.text = layout.text;
-            let restore = cursor_row.and_then(|target| {
-                layout
-                    .rows
-                    .iter()
-                    .position(|row| row.same_row(&target))
-                    .map(|line| Point::new(line as u32, 0))
-            });
-            self.rows = layout.rows;
-            if let Some(point) = restore {
-                self.editor.update(cx, |editor, cx| {
-                    editor.change_selections(Default::default(), window, cx, |selections| {
-                        selections.select_ranges([point..point]);
-                    });
-                });
-            }
-        } else {
-            self.rows = layout.rows;
+    /// Opens (or returns to) an inline reply draft under the agent's row.
+    /// The draft is a writable buffer of its own: it parks where it is
+    /// when the user wanders off and survives every refresh.
+    pub fn open_reply(&mut self, agent_id: AgentId, cx: &mut Context<Workspace>) {
+        let key = LineKey::Reply(agent_id);
+        if !self.replies.contains(&agent_id) {
+            self.replies.push(agent_id);
+            let buffer = self
+                .buffers
+                .entry(key.clone())
+                .or_insert_with(|| cx.new(|cx| Buffer::local("", cx)))
+                .clone();
+            self.reply_subscriptions.insert(
+                agent_id,
+                cx.subscribe(&buffer, |_, _, event, cx| {
+                    if matches!(event, language::BufferEvent::Edited { .. }) {
+                        cx.notify();
+                    }
+                }),
+            );
         }
-        self.apply_highlights(&layout.spans, cx);
-        // Lamps are inlays, not text: attention can shift without a text
-        // edit, so they are respliced every sync.
-        self.apply_lamps(&layout.lamps, cx);
+        self.pending_cursor = Some(key);
+        cx.notify();
+    }
+
+    /// Takes a reply draft's text and closes it. `None` when the draft is
+    /// empty (nothing worth sending).
+    pub fn take_reply(&mut self, agent_id: AgentId, cx: &mut Context<Workspace>) -> Option<String> {
+        let key = LineKey::Reply(agent_id);
+        let buffer = self.buffers.get(&key)?;
+        let text = buffer.read(cx).text().trim().to_owned();
+        self.replies.retain(|reply| *reply != agent_id);
+        self.buffers.remove(&key);
+        self.reply_subscriptions.remove(&agent_id);
+        cx.notify();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Regenerates the listing from the registry: per-line buffers are
+    /// created or edited as needed, arranged (with reply drafts after
+    /// their rows), and highlights and lamps reapplied. The cursor
+    /// follows its line's buffer through the rearrangement.
+    pub fn sync(
+        &mut self,
+        registry: &AgentRegistry,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let lines = generate(registry);
+
+        // Empty reply drafts the cursor has left are dead weight; drop them.
+        let cursor_key = self.cursor_key(cx);
+        let pending = self.pending_cursor.clone();
+        let empty_replies = self
+            .replies
+            .iter()
+            .copied()
+            .filter(|agent_id| {
+                let key = LineKey::Reply(*agent_id);
+                Some(&key) != cursor_key.as_ref()
+                    && Some(&key) != pending.as_ref()
+                    && self
+                        .buffers
+                        .get(&key)
+                        .is_some_and(|buffer| buffer.read(cx).is_empty())
+            })
+            .collect::<Vec<_>>();
+        for agent_id in empty_replies {
+            self.replies.retain(|reply| *reply != agent_id);
+            self.buffers.remove(&LineKey::Reply(agent_id));
+            self.reply_subscriptions.remove(&agent_id);
+        }
+
+        // Interleave: each reply draft directly under its agent's row;
+        // drafts whose row is folded away sit above the new-agent line so
+        // they are never lost off-screen.
+        let mut order = Vec::new();
+        let mut orphans = self.replies.clone();
+        for line in &lines {
+            if line.key == LineKey::NewAgent {
+                for agent_id in orphans.drain(..) {
+                    order.push(LineKey::Reply(agent_id));
+                }
+            }
+            order.push(line.key.clone());
+            if let LineKey::Stream(workstream_id) = &line.key {
+                let members = self
+                    .replies
+                    .iter()
+                    .copied()
+                    .filter(|agent_id| registry.workstream_of(*agent_id) == Some(*workstream_id))
+                    .collect::<Vec<_>>();
+                for agent_id in members {
+                    orphans.retain(|orphan| *orphan != agent_id);
+                    order.push(LineKey::Reply(agent_id));
+                }
+            }
+        }
+
+        // Create/refresh the listing buffers.
+        let mut edited = std::collections::HashSet::new();
+        for line in &lines {
+            let buffer = self.buffers.entry(line.key.clone()).or_insert_with(|| {
+                cx.new(|cx| {
+                    let mut buffer = Buffer::local("", cx);
+                    buffer.set_capability(Capability::Read, cx);
+                    buffer
+                })
+            });
+            if buffer.read(cx).text() != line.text {
+                buffer.update(cx, |buffer, cx| {
+                    let len = buffer.len();
+                    buffer.edit([(0..len, line.text.as_str())], None, cx);
+                });
+                edited.insert(line.key.clone());
+            }
+        }
+
+        // Arrange excerpts when the order changed; path keys are display
+        // indexes, and a buffer setting a new path leaves its old one.
+        let order_changed = order != self.order;
+        if order_changed || !edited.is_empty() {
+            let old_len = self.order.len();
+            self.multi_buffer.update(cx, |multi_buffer, cx| {
+                for (index, key) in order.iter().enumerate() {
+                    let Some(buffer) = self.buffers.get(key) else {
+                        continue;
+                    };
+                    multi_buffer.set_excerpts_for_path(
+                        PathKey::sorted(index as u64),
+                        buffer.clone(),
+                        [Point::zero()..buffer.read(cx).max_point()],
+                        0,
+                        cx,
+                    );
+                }
+                for stale in order.len()..old_len {
+                    multi_buffer.remove_excerpts(PathKey::sorted(stale as u64), cx);
+                }
+            });
+        }
+        // Prune buffers for lines that fell out of the listing (their
+        // excerpts are gone); open reply drafts always stay.
+        self.buffers
+            .retain(|key, _| order.contains(key) || matches!(key, LineKey::Reply(_)));
+
+        self.targets = lines
+            .iter()
+            .map(|line| (line.key.clone(), line.target.clone()))
+            .collect();
+        for agent_id in &self.replies {
+            self.targets
+                .insert(LineKey::Reply(*agent_id), RowTarget::Reply(*agent_id));
+        }
+
+        // The cursor follows its buffer: reposition only when the buffer
+        // moved or its text was rewritten under the cursor (or a fresh
+        // reply draft claims it).
+        let moved = |key: &LineKey| {
+            self.order.iter().position(|entry| entry == key)
+                != order.iter().position(|entry| entry == key)
+        };
+        let restore = match &self.pending_cursor {
+            Some(key) if order.contains(key) => Some(key.clone()),
+            _ => match &cursor_key {
+                Some(key) if order.contains(key) && (moved(key) || edited.contains(key)) => {
+                    Some(key.clone())
+                }
+                _ => None,
+            },
+        };
+        self.pending_cursor = None;
+        self.order = order;
+        if let Some(key) = restore {
+            self.move_cursor_to(&key, window, cx);
+        }
+
+        self.apply_highlights(&lines, cx);
+        self.apply_lamps(&lines, cx);
+        self.apply_reply_chrome(registry, cx);
+    }
+
+    /// Places the cursor at the start of a key's buffer.
+    fn move_cursor_to(&self, key: &LineKey, window: &mut Window, cx: &mut Context<Workspace>) {
+        let Some(buffer) = self.buffers.get(key) else {
+            return;
+        };
+        let anchor = buffer.read(cx).anchor_before(0);
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(anchor) = snapshot.anchor_in_excerpt(anchor) else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+    }
+
+    /// The key of the buffer the cursor is in.
+    fn cursor_key(&self, cx: &mut Context<Workspace>) -> Option<LineKey> {
+        let buffer_id = self.cursor_buffer(cx)?;
+        self.buffers
+            .iter()
+            .find(|(_, buffer)| buffer.read(cx).remote_id() == buffer_id)
+            .map(|(key, _)| key.clone())
+    }
+
+    fn cursor_buffer(&self, cx: &mut Context<Workspace>) -> Option<BufferId> {
+        self.editor.update(cx, |editor, cx| {
+            let head = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            snapshot
+                .point_to_buffer_offset(head)
+                .map(|(buffer, _)| buffer.remote_id())
+        })
+    }
+
+    /// The row under the cursor.
+    pub fn cursor_target(&self, cx: &mut Context<Workspace>) -> Option<RowTarget> {
+        let key = self.cursor_key(cx)?;
+        self.targets.get(&key).cloned()
+    }
+
+    fn apply_highlights(&self, lines: &[Line], cx: &mut Context<Workspace>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let mut by_class: Vec<(DashClass, Vec<Range<multi_buffer::Anchor>>)> = DashClass::ALL
+            .into_iter()
+            .map(|class| (class, Vec::new()))
+            .collect();
+        for line in lines {
+            let Some(buffer) = self.buffers.get(&line.key) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            for (class, range) in &line.spans {
+                let clamp = |offset: usize| offset.min(buffer_snapshot.len());
+                let Some(start) =
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(clamp(range.start)))
+                else {
+                    continue;
+                };
+                let Some(end) =
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(clamp(range.end)))
+                else {
+                    continue;
+                };
+                if let Some((_, ranges)) =
+                    by_class.iter_mut().find(|(entry, _)| entry == class)
+                {
+                    ranges.push(start..end);
+                }
+            }
+        }
+        self.editor.update(cx, |editor, cx| {
+            for (class, ranges) in by_class {
+                editor.highlight_text(class.key(), ranges, class.style(cx), cx);
+            }
+        });
     }
 
     /// Splices the attention lamps in as ` ●` inlays at each row's end —
     /// state chrome the cursor never lands on — and colors them per level.
-    fn apply_lamps(&mut self, lamps: &[(usize, UiAttention)], cx: &mut Context<Workspace>) {
+    fn apply_lamps(&mut self, lines: &[Line], cx: &mut Context<Workspace>) {
         const LAMP_TEXT: &str = " ●";
-        let buffer_snapshot = self.buffer.read(cx).snapshot();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let to_remove = std::mem::take(&mut self.lamp_ids);
         let mut inlays = Vec::new();
@@ -195,13 +414,17 @@ impl Dashboard {
         .into_iter()
         .map(|class| (class, Vec::new()))
         .collect();
-        for (index, (offset, attention)) in lamps.iter().enumerate() {
-            let Some(class) = DashClass::lamp(*attention) else {
+        for (index, line) in lines.iter().enumerate() {
+            let Some(class) = line.lamp.and_then(DashClass::lamp) else {
                 continue;
             };
-            let Some(position) = snapshot.anchor_in_excerpt(
-                buffer_snapshot.anchor_before((*offset).min(buffer_snapshot.len())),
-            ) else {
+            let Some(buffer) = self.buffers.get(&line.key) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            let Some(position) =
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(buffer_snapshot.len()))
+            else {
                 continue;
             };
             let inlay = Inlay::custom(index, position, LAMP_TEXT);
@@ -223,47 +446,51 @@ impl Dashboard {
         });
     }
 
-    /// The row under the cursor.
-    pub fn cursor_target(&self, cx: &mut Context<Workspace>) -> Option<RowTarget> {
-        let row = self.editor.update(cx, |editor, cx| {
-            editor
-                .selections
-                .newest::<Point>(&editor.display_snapshot(cx))
-                .head()
-                .row
-        });
-        self.rows.get(row as usize).cloned()
-    }
-
-    fn apply_highlights(&self, spans: &[(DashClass, Range<usize>)], cx: &mut Context<Workspace>) {
-        let buffer_snapshot = self.buffer.read(cx).snapshot();
+    /// Reply-draft chrome: an accent gutter stripe plus a placeholder
+    /// inlay naming the addressee while the draft is empty.
+    fn apply_reply_chrome(&mut self, registry: &AgentRegistry, cx: &mut Context<Workspace>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let anchors = |class: DashClass| {
-            spans
-                .iter()
-                .filter(|(span_class, _)| *span_class == class)
-                .filter_map(|(_, range)| {
-                    let start = snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(
-                        range.start.min(buffer_snapshot.len()),
-                    ))?;
-                    let end = snapshot.anchor_in_excerpt(
-                        buffer_snapshot.anchor_before(range.end.min(buffer_snapshot.len())),
-                    )?;
-                    Some(start..end)
-                })
-                .collect::<Vec<_>>()
-        };
-        let updates = DashClass::ALL
-            .into_iter()
-            .map(|class| (class, anchors(class)))
-            .collect::<Vec<_>>();
-        self.editor.update(cx, |editor, cx| {
-            for (class, ranges) in updates {
-                editor.highlight_text(class.key(), ranges, class.style(cx), cx);
+        let to_remove = std::mem::take(&mut self.placeholder_ids);
+        let mut inlays = Vec::new();
+        let mut gutter_ranges = Vec::new();
+        for (index, agent_id) in self.replies.iter().enumerate() {
+            let Some(buffer) = self.buffers.get(&LineKey::Reply(*agent_id)) else {
+                continue;
+            };
+            let buffer = buffer.read(cx);
+            let buffer_snapshot = buffer.snapshot();
+            let Some(start) = snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(0)) else {
+                continue;
+            };
+            let Some(end) =
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(buffer_snapshot.len()))
+            else {
+                continue;
+            };
+            gutter_ranges.push(start..end);
+            if buffer.is_empty() {
+                let label = format!(
+                    "reply to {}… (enter sends)",
+                    registry.agent_id_label(*agent_id)
+                );
+                let inlay = Inlay::custom(PLACEHOLDER_ID_BASE + index, end, label);
+                self.placeholder_ids.push(inlay.id);
+                inlays.push(inlay);
             }
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(&to_remove, inlays, cx);
+            editor.highlight_gutter::<ReplyGutter>(
+                gutter_ranges,
+                crate::style::user_prompt_gutter_color,
+                cx,
+            );
         });
     }
 }
+
+/// Gutter highlight marker type for reply drafts.
+pub struct ReplyGutter;
 
 /// Dashboard text classes: lamps, selection, and muted chrome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,70 +631,25 @@ fn rail_rows<'a>(
     rows
 }
 
-struct Layout {
+/// One generated dashboard line: its identity, text, spans (offsets
+/// relative to the line), lamp, and what acting on it means.
+struct Line {
+    key: LineKey,
     text: String,
-    rows: Vec<RowTarget>,
     spans: Vec<(DashClass, Range<usize>)>,
-    /// Attention lamps: byte offset at a row's end and the level to show.
-    lamps: Vec<(usize, UiAttention)>,
+    lamp: Option<UiAttention>,
+    target: RowTarget,
 }
 
-/// Serializes the registry into the dashboard listing: text, one row
-/// target per line, and highlight spans as byte ranges.
-fn generate(registry: &AgentRegistry) -> Layout {
-    let mut layout = Layout {
-        text: String::new(),
-        rows: Vec::new(),
-        spans: Vec::new(),
-        lamps: Vec::new(),
-    };
-    let (listed, folded) = registry.split_rows();
-    for row in rail_rows(listed, folded, registry.rail_tail_expanded()) {
-        match row {
-            RailRow::GroupHeader(name) => {
-                layout.rows.push(RowTarget::None);
-                layout.line(DashClass::Muted, |text| text.push_str(name));
-            }
-            RailRow::Task { topic, grouped } => task_line(topic, grouped, registry, &mut layout),
-            RailRow::FoldToggle {
-                folded_count,
-                expanded,
-            } => {
-                layout.rows.push(RowTarget::FoldToggle);
-                layout.line(DashClass::Muted, |text| {
-                    if expanded {
-                        text.push_str("fold");
-                    } else {
-                        text.push_str(&format!("{folded_count} more"));
-                    }
-                });
-            }
+impl Line {
+    fn new(key: LineKey, target: RowTarget) -> Self {
+        Self {
+            key,
+            text: String::new(),
+            spans: Vec::new(),
+            lamp: None,
+            target,
         }
-    }
-    let draft_selected = registry.selected_agent().is_none();
-    layout.rows.push(RowTarget::NewAgent);
-    layout.line(
-        if draft_selected {
-            DashClass::Selected
-        } else {
-            DashClass::Muted
-        },
-        |text| text.push_str("+ new agent"),
-    );
-    // Drop the final newline so lines and row targets stay one-to-one.
-    if layout.text.ends_with('\n') {
-        layout.text.pop();
-    }
-    layout
-}
-
-impl Layout {
-    /// Appends one whole line in a single class.
-    fn line(&mut self, class: DashClass, write: impl FnOnce(&mut String)) {
-        let start = self.text.len();
-        write(&mut self.text);
-        self.spans.push((class, start..self.text.len()));
-        self.text.push('\n');
     }
 
     fn span(&mut self, class: Option<DashClass>, write: impl FnOnce(&mut String)) {
@@ -479,10 +661,53 @@ impl Layout {
     }
 }
 
-/// One workstream's line: lamp glyph, title, then member tags beyond the
-/// primary. The primary agent answers `enter`; the lamp is the most urgent
-/// member — acting on the row means acting on whoever inside wants the user.
-fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry, layout: &mut Layout) {
+/// Serializes the registry into the dashboard listing.
+fn generate(registry: &AgentRegistry) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let (listed, folded) = registry.split_rows();
+    for row in rail_rows(listed, folded, registry.rail_tail_expanded()) {
+        match row {
+            RailRow::GroupHeader(name) => {
+                let mut line = Line::new(LineKey::Group(name.to_owned()), RowTarget::None);
+                line.span(Some(DashClass::Muted), |text| text.push_str(name));
+                lines.push(line);
+            }
+            RailRow::Task { topic, grouped } => lines.push(task_line(topic, grouped, registry)),
+            RailRow::FoldToggle {
+                folded_count,
+                expanded,
+            } => {
+                let mut line = Line::new(LineKey::FoldToggle, RowTarget::FoldToggle);
+                line.span(Some(DashClass::Muted), |text| {
+                    if expanded {
+                        text.push_str("fold");
+                    } else {
+                        text.push_str(&format!("{folded_count} more"));
+                    }
+                });
+                lines.push(line);
+            }
+        }
+    }
+    let draft_selected = registry.selected_agent().is_none();
+    let mut line = Line::new(LineKey::NewAgent, RowTarget::NewAgent);
+    line.span(
+        Some(if draft_selected {
+            DashClass::Selected
+        } else {
+            DashClass::Muted
+        }),
+        |text| text.push_str("+ new agent"),
+    );
+    lines.push(line);
+    lines
+}
+
+/// One workstream's line: title, then member tags beyond the primary. The
+/// primary agent answers `enter`; the lamp (an inlay at the row's end) is
+/// the most urgent member — acting on the row means acting on whoever
+/// inside it wants the user.
+fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Line {
     let (agents, _folded) = registry.split_workstream_agents(topic);
     let primary = agents.first().map(|summary| summary.agent_id);
     let selected_agent = registry.selected_agent().copied();
@@ -501,15 +726,18 @@ fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry, layout
         topic.name.clone()
     };
 
-    layout.rows.push(RowTarget::Stream {
-        workstream_id: topic.workstream_id,
-        primary,
-    });
+    let mut line = Line::new(
+        LineKey::Stream(topic.workstream_id),
+        RowTarget::Stream {
+            workstream_id: topic.workstream_id,
+            primary,
+        },
+    );
     if grouped {
-        layout.span(None, |text| text.push_str("  "));
+        line.span(None, |text| text.push_str("  "));
     }
     if topic.pinned {
-        layout.span(None, |text| text.push_str("◆ "));
+        line.span(None, |text| text.push_str("◆ "));
     }
     let title_class = if selected {
         Some(DashClass::Selected)
@@ -518,7 +746,7 @@ fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry, layout
     } else {
         None
     };
-    layout.span(title_class, |text| text.push_str(&title));
+    line.span(title_class, |text| text.push_str(&title));
 
     let members = agents.iter().skip(1).collect::<Vec<_>>();
     let overflow = members.len().saturating_sub(VISIBLE_TAGS);
@@ -528,22 +756,22 @@ fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry, layout
         } else {
             DashClass::lamp(registry.attention(member.agent_id)).unwrap_or(DashClass::Muted)
         };
-        layout.span(None, |text| text.push_str("  "));
-        layout.span(Some(class), |text| {
+        line.span(None, |text| text.push_str("  "));
+        line.span(Some(class), |text| {
             text.push_str(&registry.agent_id_label(member.agent_id))
         });
     }
     if overflow > 0 {
-        layout.span(None, |text| text.push_str("  "));
-        layout.span(Some(DashClass::Muted), |text| {
+        line.span(None, |text| text.push_str("  "));
+        line.span(Some(DashClass::Muted), |text| {
             text.push_str(&format!("+{overflow}"))
         });
     }
     // The attention lamp hangs off the row's right end as an inlay.
     if attention > UiAttention::Quiet {
-        layout.lamps.push((layout.text.len(), attention));
+        line.lamp = Some(attention);
     }
-    layout.text.push('\n');
+    line
 }
 
 #[cfg(test)]
@@ -689,44 +917,32 @@ mod tests {
     }
 
     #[test]
-    fn listing_lines_match_row_targets_one_to_one() {
-        let members = vec![agent(1, Status::Normal, 10), agent(2, Status::Normal, 10)];
+    fn listing_lines_carry_targets_and_lamp_state() {
+        let mut urgent = agent(1, Status::Normal, 10);
+        urgent.attention = UiAttention::NeedsInput;
+        let members = vec![urgent, agent(2, Status::Normal, 10)];
         let topic = topic(Status::Normal, members);
         let mut registry = AgentRegistry::default();
         install(&mut registry, &topic);
-
-        let layout = generate(&registry);
-        assert_eq!(layout.text.lines().count(), layout.rows.len());
-        assert!(layout.text.lines().next().unwrap().contains("topic"));
-        // The primary is the best-listed member: engagement recency puts
-        // the later fixture first.
-        assert_eq!(
-            layout.rows.first(),
-            Some(&RowTarget::Stream {
-                workstream_id: WorkstreamId(1),
-                primary: Some(AgentId::from_counter(2, &AgentIdDomain(0)).unwrap()),
-            })
+        registry.set_attention(
+            AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
+            UiAttention::NeedsInput,
         );
-        assert_eq!(layout.rows.last(), Some(&RowTarget::NewAgent));
-    }
 
-    #[test]
-    fn cursor_identity_follows_the_workstream_not_the_line() {
-        let stream_row = RowTarget::Stream {
-            workstream_id: WorkstreamId(7),
-            primary: None,
-        };
-        let same_stream_new_primary = RowTarget::Stream {
-            workstream_id: WorkstreamId(7),
-            primary: Some(AgentId::from_counter(1, &AgentIdDomain(0)).unwrap()),
-        };
-        assert!(stream_row.same_row(&same_stream_new_primary));
-        assert!(!stream_row.same_row(&RowTarget::Stream {
-            workstream_id: WorkstreamId(8),
-            primary: None,
-        }));
-        assert!(RowTarget::NewAgent.same_row(&RowTarget::NewAgent));
-        assert!(!RowTarget::None.same_row(&RowTarget::None));
+        let lines = generate(&registry);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].text.contains("topic"));
+        assert_eq!(lines[0].key, LineKey::Stream(WorkstreamId(1)));
+        assert_eq!(lines[0].lamp, Some(UiAttention::NeedsInput));
+        assert!(matches!(
+            lines[0].target,
+            RowTarget::Stream {
+                workstream_id: WorkstreamId(1),
+                primary: Some(_),
+            }
+        ));
+        assert_eq!(lines[1].key, LineKey::NewAgent);
+        assert_eq!(lines[1].target, RowTarget::NewAgent);
     }
 
     #[test]

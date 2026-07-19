@@ -50,6 +50,7 @@ actions!(
         AgentNew,
         AgentJumpAttention,
         AgentDone,
+        DashboardReply,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
@@ -481,14 +482,25 @@ fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
     ]);
-    // Dashboard: a read-only editor, so motions come from the editor
-    // itself; `enter` acts on the row under the cursor. Bound after the
-    // vim keymaps so it beats vim's own enter motion.
+    // Dashboard: the listing is read-only, so normal-mode letters are free
+    // for acting on the row under the cursor — the magit trick. `enter`
+    // binds for every mode: on a row it opens, in a reply draft it sends
+    // (so enter in insert mode submits, like the transcript prompt).
+    // Bound after the vim keymaps so they beat vim's own motions.
     cx.bind_keys([KeyBinding::new(
         "enter",
         RailOpen,
         Some("RhoDashboard > Editor"),
     )]);
+    for context in [
+        "RhoDashboard > Editor && vim_mode == normal",
+        "RhoDashboard > Editor && vim_mode == helix_normal",
+    ] {
+        cx.bind_keys([
+            KeyBinding::new("r", DashboardReply, Some(context)),
+            KeyBinding::new("d", AgentDone, Some(context)),
+        ]);
+    }
 }
 
 const DEFAULT_SETTINGS: &str = r#"// Rho GUI user settings. Values here override bundled defaults.

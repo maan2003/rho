@@ -33,7 +33,8 @@ use crate::zed_remote::FileView;
 use crate::{
     AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, MinibufferCancel,
     MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose,
-    PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup,
+    DashboardReply, PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle,
+    RoleCycleGroup,
     SubmitPrompt, TaskBoard,
 };
 
@@ -2405,9 +2406,33 @@ impl Workspace {
             }) => self.open_agent(agent_id, window, cx),
             Some(RowTarget::FoldToggle) => self.toggle_rail_tail(cx),
             Some(RowTarget::NewAgent) => self.enter_draft(None, window, cx),
+            // Enter sends the inline reply draft (and closes it); an empty
+            // draft just closes.
+            Some(RowTarget::Reply(agent_id)) => {
+                if let Some(text) = self.dashboard.take_reply(agent_id, cx) {
+                    self.handle_submit(agent_id, text, cx);
+                }
+            }
             Some(RowTarget::Stream { primary: None, .. })
             | Some(RowTarget::None)
             | None => {}
+        }
+    }
+
+    /// `r` in the dashboard: splice an inline reply draft under the row —
+    /// the cursor moves into it, but never leaves the dashboard. Drafts
+    /// park where they are: wander off mid-thought and come back later.
+    fn dashboard_reply(&mut self, cx: &mut Context<Self>) {
+        use crate::dashboard::RowTarget;
+        match self.dashboard.cursor_target(cx) {
+            Some(RowTarget::Stream {
+                primary: Some(agent_id),
+                ..
+            }) => self.dashboard.open_reply(agent_id, cx),
+            Some(RowTarget::Reply(_)) => {}
+            _ => {
+                self.notice_on(None, "reply: no agent under the cursor", StyleClass::SystemInfo, cx);
+            }
         }
     }
 
@@ -2756,8 +2781,14 @@ impl Render for Workspace {
                 };
                 this.set_agent_disposition(None, "done", disposition, cx);
                 if quiet {
-                    this.select_agent(None, window, cx);
+                    // From the dashboard this is triage: the row goes away
+                    // but the cursor stays home.
+                    let in_dashboard = this.dashboard.focus_handle(cx).is_focused(window);
+                    this.select_agent_inner(None, !in_dashboard, window, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &DashboardReply, _window, cx| {
+                this.dashboard_reply(cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(
