@@ -2516,8 +2516,10 @@ impl Workspace {
             .key_context("RhoDashboard");
         let container = if home {
             container
+                // The boxed preview card carries the hierarchy, so it can take
+                // the wider share; transcripts are the text-dense side.
                 .w(if show_panes {
-                    gpui::relative(0.5)
+                    gpui::relative(0.4)
                 } else {
                     gpui::relative(1.0)
                 })
