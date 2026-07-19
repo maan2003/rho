@@ -1288,8 +1288,8 @@ impl AgentRegistry {
     /// Titles an untitled agent from its first user message, in the
     /// background. Policy: only fills an empty `display_name` — a manual
     /// rename, before or during generation, always wins — and at most one
-    /// generation runs per agent at a time. The requesting connection gets a
-    /// `Ready` refresh when the title lands. A workstream the agent founded
+    /// generation runs per agent at a time. Every connection gets a `Ready`
+    /// refresh when the title lands. A workstream the agent founded
     /// (`retitle`: its id plus the provisional name it was created under)
     /// takes the same title, unless someone renamed it meanwhile.
     async fn maybe_generate_title(
@@ -1297,7 +1297,6 @@ impl AgentRegistry {
         agent_id: AgentId,
         text: String,
         retitle: Option<(WorkstreamId, String)>,
-        outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
     ) {
         if text.trim().is_empty() || self.db.read().get_agent(agent_id).display_name.is_some() {
             return;
@@ -1328,7 +1327,9 @@ impl AgentRegistry {
                             write.set_workstream_name(now, workstream_id, title);
                         }
                         write.commit();
-                        let _ = outgoing_tx.send(registry.ready_message().await);
+                        // Titles show on every client's rail, so the refresh
+                        // fans out instead of following the acting connection.
+                        let _ = registry.events.send(registry.ready_message().await);
                     }
                 }
                 Ok(Err(error)) => eprintln!("rho-daemon: title generation failed: {error:#}"),
@@ -1597,7 +1598,10 @@ where
         .await
         {
             Ok(Refresh::Ready) => {
-                let _ = outgoing_tx.send(agents.ready_message().await);
+                // Registry changes show on every client (GUI rails, the web
+                // UI, a waiting CLI), so the refreshed snapshot goes through
+                // the daemon-wide event fanout, not just this connection.
+                let _ = agents.events.send(agents.ready_message().await);
             }
             Ok(Refresh::None) => {}
             Err(error) => {
@@ -1749,7 +1753,8 @@ fn spawn_snooze_timer(
 }
 
 /// Whether a handled message changed registry state that clients see through
-/// `Ready` (tags, agents, workdirs).
+/// `Ready` (workstreams, agents, workdirs); `Ready` refreshes every
+/// connection, so all clients converge on the change at once.
 enum Refresh {
     Ready,
     None,
@@ -1930,7 +1935,7 @@ async fn handle_message(
                 // The agent is fresh, so the lanes are equivalent here.
                 agent.send_user_message(text.clone(), MessageDelivery::NextRequest);
                 agents
-                    .maybe_generate_title(agent_id, text, founded, outgoing_tx.clone())
+                    .maybe_generate_title(agent_id, text, founded)
                     .await;
             }
             Ok(Refresh::Ready)
@@ -2049,7 +2054,7 @@ async fn handle_message(
                 attention: attention_level(Some(&agent.state().kind), AgentDisposition::Done),
             });
             agents
-                .maybe_generate_title(agent_id, text, None, outgoing_tx.clone())
+                .maybe_generate_title(agent_id, text, None)
                 .await;
             Ok(Refresh::None)
         }

@@ -6,15 +6,13 @@
 //! unreadable blob (say, from a newer client) falls back to the default
 //! rather than failing the session.
 
-use rho_ui_proto::AgentId;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
+/// Only choices the user made belong here — derived state (rail ordering,
+/// attention, engagement recency) is rebuilt from the daemon's snapshots
+/// every session and must never be persisted.
 #[derive(Clone, Debug, Default, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct ViewConfig {
-    /// Retained top-to-bottom rail order, so the rail looks the same after
-    /// a GUI restart instead of reshuffling by engagement recency.
-    #[senax(default)]
-    pub rail_order: Vec<AgentId>,
     /// Whether the rail's quiet tail is expanded in place.
     #[senax(default)]
     pub rail_tail_expanded: bool,
@@ -38,18 +36,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_and_garbage_blobs_decode_to_default() {
+    fn empty_and_garbage_blobs_decode_without_failing() {
         assert_eq!(ViewConfig::decode(&[]), ViewConfig::default());
-        assert_eq!(ViewConfig::decode(&[0xff, 0x01, 0x02]), ViewConfig::default());
+        // Garbage may happen to parse (senax skips unknown fields) — the
+        // guarantee is only that it never errors out of the session.
+        let _ = ViewConfig::decode(&[0xff, 0x01, 0x02]);
     }
 
     #[test]
     fn config_round_trips() {
         let config = ViewConfig {
-            rail_order: vec![
-                AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(7)).unwrap(),
-                AgentId::from_counter(2, &rho_ui_proto::AgentIdDomain(7)).unwrap(),
-            ],
             rail_tail_expanded: true,
         };
         assert_eq!(ViewConfig::decode(&config.encode()), config);

@@ -574,40 +574,15 @@ impl AgentRegistry {
         self.rail_tail_expanded = !self.rail_tail_expanded;
     }
 
-    /// Seeds view state from the daemon-stored config, ahead of `set_data`:
-    /// agents in the persisted order count as already placed, so a refresh
-    /// keeps last session's rail instead of reshuffling by recency.
+    /// Seeds view state from the daemon-stored config: the user's own
+    /// choices only, everything else re-derives from the snapshots.
     pub fn load_view_config(&mut self, config: &crate::view_config::ViewConfig) {
         self.rail_tail_expanded = config.rail_tail_expanded;
-        let mut order = Vec::new();
-        let mut seen = BTreeSet::new();
-        for agent_id in config.rail_order.iter().chain(self.rail_order.iter()) {
-            if seen.insert(*agent_id) {
-                order.push(*agent_id);
-            }
-        }
-        self.rail_order = order;
-        self.rail_ranks = self
-            .rail_order
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(rank, agent_id)| (agent_id, rank))
-            .collect();
-        self.rebuild_topic_rail_layouts();
     }
 
-    /// The view state worth persisting, in blob form for `ViewConfigSet`.
-    /// The exported order keeps only agents the daemon still reports, so
-    /// the blob does not accrete departed agents forever.
+    /// The user's view choices, for persisting through `ViewConfigSet`.
     pub fn view_config(&self) -> crate::view_config::ViewConfig {
         crate::view_config::ViewConfig {
-            rail_order: self
-                .rail_order
-                .iter()
-                .copied()
-                .filter(|agent_id| self.agent_locations.contains_key(agent_id))
-                .collect(),
             rail_tail_expanded: self.rail_tail_expanded,
         }
     }
