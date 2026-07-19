@@ -155,24 +155,24 @@ pub struct Workspace {
     _event_task: Task<()>,
 }
 
-/// Which workstream or label operation a transient prompt collects a name for.
+/// Which workstream operation a transient prompt collects a name for.
 #[derive(Clone, Copy)]
 pub enum WorkstreamPrompt {
-    Move,
     Group,
     Label,
     Unlabel,
     Rename,
+    Merge,
 }
 
 impl WorkstreamPrompt {
     fn prompt(self) -> &'static str {
         match self {
-            WorkstreamPrompt::Move => "move to workstream:",
             WorkstreamPrompt::Group => "group:",
             WorkstreamPrompt::Label => "label:",
             WorkstreamPrompt::Unlabel => "unlabel:",
             WorkstreamPrompt::Rename => "rename workstream:",
+            WorkstreamPrompt::Merge => "merge into:",
         }
     }
 }
@@ -789,16 +789,6 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_agent_rename(&mut self, name: String, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
-        if let Some(agent_id) = self.selected_or_notice("rename", cx) {
-            self.connection
-                .send(ClientMessage::RenameAgent { agent_id, name });
-        }
-    }
-
     pub(crate) fn cmd_change_prompt_cache_key(&mut self, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
@@ -816,17 +806,38 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_workstream_rename(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+            self.connection.send(ClientMessage::WorkstreamRename {
+                workstream_id,
+                name,
+            });
+        }
+    }
+
+    /// The workstream the menus act on, or an echo-area notice saying why
+    /// there is none (not connected, or nothing selected).
+    fn focused_workstream_or_notice(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<rho_ui_proto::WorkstreamId> {
         if !self.require_connected(cx) {
-            return;
+            return None;
         }
         let selected = self.registry.selected_agent().copied();
-        let Some(workstream_id) = self.focused_workstream(selected) else {
+        let focused = self.focused_workstream(selected);
+        if focused.is_none() {
             self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
-            return;
-        };
-        self.connection.send(ClientMessage::WorkstreamRename {
+        }
+        focused
+    }
+
+    /// Adds or removes one label on the focused workstream; the toggles
+    /// (pin, hide) and the free-form label prompt all come through here.
+    fn send_workstream_label(&mut self, workstream_id: rho_ui_proto::WorkstreamId, label: String, add: bool) {
+        self.connection.send(ClientMessage::WorkstreamLabel {
             workstream_id,
-            name,
+            label,
+            add,
         });
     }
 
@@ -867,109 +878,115 @@ impl Workspace {
         );
     }
 
-    pub(crate) fn cmd_agent_pin(&mut self, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
-        let Some(agent_id) = self.selected_or_notice("pin", cx) else {
-            return;
-        };
-        let add = !self.registry.agent_pinned(agent_id);
-        self.connection.send(ClientMessage::AgentLabel {
-            agent_id,
-            label: crate::registry::PIN_LABEL.to_owned(),
-            add,
-        });
-    }
-
     pub(crate) fn cmd_workstream_pin(&mut self, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
+        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+            let pinned = self
+                .registry
+                .workstream_labels(workstream_id)
+                .iter()
+                .any(|label| label == crate::registry::PIN_LABEL);
+            self.send_workstream_label(
+                workstream_id,
+                crate::registry::PIN_LABEL.to_owned(),
+                !pinned,
+            );
         }
-        let selected = self.registry.selected_agent().copied();
-        let Some(workstream) = self
-            .focused_workstream(selected)
-            .and_then(|workstream_id| {
-                self.registry
-                    .workstreams()
-                    .iter()
-                    .find(|workstream| workstream.workstream_id == workstream_id)
-            })
-            .map(|workstream| (workstream.workstream_id, workstream.pinned))
-        else {
-            self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
-            return;
-        };
-        let (workstream_id, pinned) = workstream;
-        self.connection.send(ClientMessage::WorkstreamLabel {
-            workstream_id,
-            label: crate::registry::PIN_LABEL.to_owned(),
-            add: !pinned,
-        });
     }
 
-    pub(crate) fn cmd_agent_move(&mut self, name: String, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
+    pub(crate) fn cmd_workstream_hide(&mut self, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+            let hidden = self
+                .registry
+                .workstream_labels(workstream_id)
+                .iter()
+                .any(|label| label == crate::registry::HIDE_LABEL);
+            self.send_workstream_label(
+                workstream_id,
+                crate::registry::HIDE_LABEL.to_owned(),
+                !hidden,
+            );
         }
-        let Some(agent_id) = self.selected_or_notice("move", cx) else {
-            return;
-        };
-        // Named targets create the workstream when no name matches, so
-        // "spin off a workstream around this agent" is the same gesture.
-        self.connection.send(ClientMessage::AgentMove {
-            agent_id,
-            target: rho_ui_proto::WorkstreamTarget::Named(name),
-        });
     }
 
     pub(crate) fn cmd_workstream_group(&mut self, name: String, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
+        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+            self.send_workstream_label(
+                workstream_id,
+                format!("{}{name}", crate::registry::GROUP_LABEL_PREFIX),
+                true,
+            );
         }
-        let selected = self.registry.selected_agent().copied();
-        let Some(workstream_id) = self.focused_workstream(selected) else {
-            self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
-            return;
-        };
-        self.connection.send(ClientMessage::WorkstreamLabel {
-            workstream_id,
-            label: format!("{}{name}", crate::registry::GROUP_LABEL_PREFIX),
-            add: true,
-        });
     }
 
-    pub(crate) fn cmd_agent_label(&mut self, name: String, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
+    pub(crate) fn cmd_workstream_label(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+            self.send_workstream_label(workstream_id, name, true);
         }
-        let Some(agent_id) = self.selected_or_notice("label", cx) else {
-            return;
-        };
-        self.connection.send(ClientMessage::AgentLabel {
-            agent_id,
-            label: name,
-            add: true,
-        });
     }
 
-    pub(crate) fn cmd_agent_unlabel(&mut self, name: String, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
+    pub(crate) fn cmd_workstream_unlabel(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+            if !self
+                .registry
+                .workstream_labels(workstream_id)
+                .contains(&name)
+            {
+                let message = format!("no label named `{name}` on this workstream");
+                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                return;
+            }
+            self.send_workstream_label(workstream_id, name, false);
         }
-        let Some(agent_id) = self.selected_or_notice("unlabel", cx) else {
+    }
+
+    /// Moves every agent of the focused workstream into the named one; the
+    /// daemon deletes the emptied source. Merging targets existing streams
+    /// only — a typo should not found a stream.
+    pub(crate) fn cmd_workstream_merge(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(source_id) = self.focused_workstream_or_notice(cx) else {
             return;
         };
-        if !self.registry.agent_labels(agent_id).contains(&name) {
-            let message = format!("no label named `{name}` on this agent");
+        let Some(target) = self
+            .registry
+            .workstreams()
+            .iter()
+            .find(|workstream| workstream.name == name)
+            .map(|workstream| workstream.workstream_id)
+        else {
+            let message = format!("no workstream named `{name}`");
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return;
+        };
+        if target == source_id {
+            self.notice_on(None, "already that workstream", StyleClass::SystemInfo, cx);
+            return;
         }
-        self.connection.send(ClientMessage::AgentLabel {
-            agent_id,
-            label: name,
-            add: false,
-        });
+        let Some(source) = self
+            .registry
+            .workstreams()
+            .iter()
+            .find(|workstream| workstream.workstream_id == source_id)
+        else {
+            return;
+        };
+        // Roots only: a moved agent brings its spawned subtree along.
+        let members = source.agent_ids().collect::<Vec<_>>();
+        let roots = source
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent
+                    .parent_agent
+                    .is_none_or(|parent| !members.contains(&parent))
+            })
+            .map(|agent| agent.agent_id)
+            .collect::<Vec<_>>();
+        for agent_id in roots {
+            self.connection.send(ClientMessage::AgentMove {
+                agent_id,
+                target: rho_ui_proto::WorkstreamTarget::Existing(target),
+            });
+        }
     }
 
     pub(crate) fn cmd_project_add(
@@ -1210,7 +1227,7 @@ impl Workspace {
                 .map(|workstream| workstream.name.clone())
                 .collect(),
             groups,
-            labels: self.registry.agent_label_names(),
+            labels: self.registry.workstream_label_names(),
         }
     }
 
@@ -2086,22 +2103,6 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    pub(crate) fn prompt_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             _window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let name = input.trim().to_owned();
-                if !name.is_empty() {
-                    workspace.cmd_agent_rename(name, cx);
-                }
-            },
-        );
-        self.open_prompt("rename:", complete, on_submit, window, cx);
-    }
-
     pub(crate) fn prompt_snooze(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
         let on_submit = std::rc::Rc::new(
@@ -2136,7 +2137,7 @@ impl Workspace {
         let names = {
             let names = self.prompt_names();
             match kind {
-                WorkstreamPrompt::Move => names.workstreams,
+                WorkstreamPrompt::Merge => names.workstreams,
                 WorkstreamPrompt::Group => names.groups,
                 WorkstreamPrompt::Label | WorkstreamPrompt::Unlabel => names.labels,
                 WorkstreamPrompt::Rename => Vec::new(),
@@ -2163,10 +2164,10 @@ impl Workspace {
                     return;
                 }
                 match kind {
-                    WorkstreamPrompt::Move => workspace.cmd_agent_move(name, cx),
+                    WorkstreamPrompt::Merge => workspace.cmd_workstream_merge(name, cx),
                     WorkstreamPrompt::Group => workspace.cmd_workstream_group(name, cx),
-                    WorkstreamPrompt::Label => workspace.cmd_agent_label(name, cx),
-                    WorkstreamPrompt::Unlabel => workspace.cmd_agent_unlabel(name, cx),
+                    WorkstreamPrompt::Label => workspace.cmd_workstream_label(name, cx),
+                    WorkstreamPrompt::Unlabel => workspace.cmd_workstream_unlabel(name, cx),
                     WorkstreamPrompt::Rename => workspace.cmd_workstream_rename(name, cx),
                 }
             },

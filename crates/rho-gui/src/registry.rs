@@ -433,24 +433,22 @@ impl AgentRegistry {
         self.agent_summary(agent_id).map(|agent| agent.role)
     }
 
-    /// Whether an agent carries the "pin" label, from summaries.
-    pub fn agent_pinned(&self, agent_id: AgentId) -> bool {
-        self.agent_summary(agent_id).is_some_and(agent_pinned)
-    }
-
-    /// An agent's labels, from summaries.
-    pub fn agent_labels(&self, agent_id: AgentId) -> &[String] {
-        self.agent_summary(agent_id)
-            .map(|agent| agent.labels.as_slice())
+    /// A workstream's raw labels, from the snapshot.
+    pub fn workstream_labels(&self, workstream_id: WorkstreamId) -> &[String] {
+        self.raw_workstreams
+            .iter()
+            .find(|workstream| workstream.workstream_id == workstream_id)
+            .map(|workstream| workstream.labels.as_slice())
             .unwrap_or(&[])
     }
 
-    /// Every distinct label carried by any agent; label-prompt completion.
-    pub fn agent_label_names(&self) -> Vec<String> {
+    /// Every distinct label carried by any workstream; label-prompt
+    /// completion.
+    pub fn workstream_label_names(&self) -> Vec<String> {
         let mut labels = self
-            .summaries
+            .raw_workstreams
             .iter()
-            .flat_map(|agent| agent.labels.iter().cloned())
+            .flat_map(|workstream| workstream.labels.iter().cloned())
             .collect::<Vec<_>>();
         labels.sort();
         labels.dedup();

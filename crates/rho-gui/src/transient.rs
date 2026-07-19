@@ -122,6 +122,9 @@ fn display_key(spec: &str) -> String {
 /// agent, plus a door into the agent menu.
 pub fn root_menu() -> Transient {
     Transient::new("rho")
+        .item("n", "new agent", |workspace, window, cx| {
+            workspace.cmd_agent_new(window, cx);
+        })
         .item("w", "workstream…", |workspace, window, cx| {
             workspace.open_transient(workstream_menu(), window, cx);
         })
@@ -171,14 +174,8 @@ pub fn agent_menu() -> Transient {
         .item("shift-d", "done+hide", |workspace, window, cx| {
             workspace.cmd_agent_done(true, window, cx);
         })
-        .item("r", "rename…", |workspace, window, cx| {
-            workspace.prompt_rename(window, cx);
-        })
         .item("s", "snooze…", |workspace, window, cx| {
             workspace.open_transient(snooze_menu(), window, cx);
-        })
-        .item("p", "pin", |workspace, _, cx| {
-            workspace.cmd_agent_pin(cx);
         })
         .item("c", "cancel turn", |workspace, _, cx| {
             workspace.cmd_agent_cancel(cx);
@@ -197,9 +194,6 @@ pub fn agent_menu() -> Transient {
         })
         .item("shift-k", "new prompt cache key", |workspace, _, cx| {
             workspace.cmd_change_prompt_cache_key(cx);
-        })
-        .item("n", "new agent", |workspace, window, cx| {
-            workspace.cmd_agent_new(window, cx);
         })
 }
 
@@ -220,14 +214,20 @@ fn snooze_menu() -> Transient {
         })
 }
 
-/// `space w`: operations on the focused workstream (and moving agents
-/// into it).
+/// `space w`: the focused workstream as the rail row the user is
+/// triaging — name it, keep it up, put it away, file it with its kin.
 fn workstream_menu() -> Transient {
     Transient::new("workstream")
-        .item("m", "move agent here…", |workspace, window, cx| {
-            workspace.prompt_workstream(WorkstreamPrompt::Move, window, cx);
+        .item("r", "rename…", |workspace, window, cx| {
+            workspace.prompt_workstream(WorkstreamPrompt::Rename, window, cx);
         })
-        .item("g", "group workstream…", |workspace, window, cx| {
+        .item("p", "pin", |workspace, _, cx| {
+            workspace.cmd_workstream_pin(cx);
+        })
+        .item("h", "hide", |workspace, _, cx| {
+            workspace.cmd_workstream_hide(cx);
+        })
+        .item("g", "group…", |workspace, window, cx| {
             workspace.prompt_workstream(WorkstreamPrompt::Group, window, cx);
         })
         .item("l", "add label…", |workspace, window, cx| {
@@ -236,10 +236,7 @@ fn workstream_menu() -> Transient {
         .item("u", "remove label…", |workspace, window, cx| {
             workspace.prompt_workstream(WorkstreamPrompt::Unlabel, window, cx);
         })
-        .item("r", "rename workstream…", |workspace, window, cx| {
-            workspace.prompt_workstream(WorkstreamPrompt::Rename, window, cx);
-        })
-        .item("p", "pin workstream", |workspace, _, cx| {
-            workspace.cmd_workstream_pin(cx);
+        .item("m", "merge into…", |workspace, window, cx| {
+            workspace.prompt_workstream(WorkstreamPrompt::Merge, window, cx);
         })
 }
