@@ -24,6 +24,12 @@ pub struct TransientItem {
     key: &'static str,
     label: &'static str,
     run: TransientRun,
+    /// A toggle: running it keeps the menu open (magit's do-stay), so
+    /// several toggles chain without reopening.
+    stay: bool,
+    /// Menu-time applicability: items whose context is missing (no agent
+    /// selected, say) drop out at open instead of failing when pressed.
+    when: Option<fn(&Workspace) -> bool>,
 }
 
 pub struct Transient {
@@ -39,26 +45,87 @@ impl Transient {
         }
     }
 
-    fn item(
+    fn push(
         mut self,
         key: &'static str,
         label: &'static str,
+        stay: bool,
+        when: Option<fn(&Workspace) -> bool>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
         self.items.push(TransientItem {
             key,
             label,
             run: Rc::new(run),
+            stay,
+            when,
         });
         self
     }
 
-    /// The action bound to `keystroke`, if any.
-    pub fn action_for(&self, keystroke: &Keystroke) -> Option<TransientRun> {
+    fn item(
+        self,
+        key: &'static str,
+        label: &'static str,
+        run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    ) -> Self {
+        self.push(key, label, false, None, run)
+    }
+
+    /// An item that keeps the menu open after running.
+    fn toggle(
+        self,
+        key: &'static str,
+        label: &'static str,
+        run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    ) -> Self {
+        self.push(key, label, true, None, run)
+    }
+
+    /// An item present only while `when` holds at menu open.
+    fn item_when(
+        self,
+        when: fn(&Workspace) -> bool,
+        key: &'static str,
+        label: &'static str,
+        run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    ) -> Self {
+        self.push(key, label, false, Some(when), run)
+    }
+
+    /// Drops items whose context predicate fails right now.
+    pub fn retain_applicable(&mut self, workspace: &Workspace) {
+        self.items
+            .retain(|item| item.when.is_none_or(|when| when(workspace)));
+    }
+
+    /// The action bound to `keystroke` and whether the menu stays open.
+    pub fn action_for(&self, keystroke: &Keystroke) -> Option<(TransientRun, bool)> {
         self.items
             .iter()
             .find(|item| matches_key(item.key, keystroke))
-            .map(|item| item.run.clone())
+            .map(|item| (item.run.clone(), item.stay))
+    }
+
+    /// The one-line hint shown while the full menu waits out its reveal
+    /// delay: the menu's name and its keys, magit's brief summary.
+    pub fn render_hint(&self, text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let keys = self
+            .items
+            .iter()
+            .map(|item| display_key(item.key))
+            .collect::<Vec<_>>()
+            .join(" ");
+        bottom_strip(text_style, cx)
+            .child(
+                div()
+                    .px_2()
+                    .text_color(colors.text_muted)
+                    .child(format!("{}:", self.title)),
+            )
+            .child(div().text_color(colors.text_accent).child(keys))
+            .into_any_element()
     }
 
     /// Magit's layout: a title line, then items flowing down short columns
@@ -125,12 +192,22 @@ pub fn root_menu() -> Transient {
         .item("n", "new agent", |workspace, window, cx| {
             workspace.cmd_agent_new(window, cx);
         })
-        .item("a", "agent…", |workspace, window, cx| {
-            workspace.open_transient(agent_menu(), window, cx);
-        })
-        .item("s", "workstream…", |workspace, window, cx| {
-            workspace.open_transient(workstream_menu(), window, cx);
-        })
+        .item_when(
+            Workspace::has_selected_agent,
+            "a",
+            "agent…",
+            |workspace, window, cx| {
+                workspace.open_transient(agent_menu(), window, cx);
+            },
+        )
+        .item_when(
+            Workspace::has_focused_workstream,
+            "s",
+            "workstream…",
+            |workspace, window, cx| {
+                workspace.open_transient(workstream_menu(), window, cx);
+            },
+        )
         .item("w", "window…", |workspace, window, cx| {
             workspace.open_transient(window_menu(), window, cx);
         })
@@ -248,10 +325,10 @@ fn workstream_menu() -> Transient {
         .item("r", "rename…", |workspace, window, cx| {
             workspace.prompt_workstream(WorkstreamPrompt::Rename, window, cx);
         })
-        .item("p", "pin", |workspace, _, cx| {
+        .toggle("p", "pin", |workspace, _, cx| {
             workspace.cmd_workstream_pin(cx);
         })
-        .item("h", "hide", |workspace, _, cx| {
+        .toggle("h", "hide", |workspace, _, cx| {
             workspace.cmd_workstream_hide(cx);
         })
         .item("g", "group…", |workspace, window, cx| {

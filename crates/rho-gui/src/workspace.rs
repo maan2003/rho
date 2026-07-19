@@ -142,6 +142,9 @@ pub struct Workspace {
     /// An open transient menu in the bottom strip; captures the keyboard
     /// via `transient_focus` while shown.
     transient: Option<crate::transient::Transient>,
+    /// Parent menus beneath the open one; escape pops one level (magit's
+    /// quit-one) before a final escape closes the strip.
+    transient_stack: Vec<crate::transient::Transient>,
     transient_focus: gpui::FocusHandle,
     /// Menus stay invisible for a beat so fast fingers never see them;
     /// pausing reveals the full menu. Submenus opened from a visible menu
@@ -217,6 +220,7 @@ impl Workspace {
             rail_focus: cx.focus_handle(),
             minibuffer: None,
             transient: None,
+            transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
             transient_visible: false,
             transient_reveal: None,
@@ -2016,10 +2020,11 @@ impl Workspace {
 
     pub(crate) fn open_transient(
         &mut self,
-        transient: crate::transient::Transient,
+        mut transient: crate::transient::Transient,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        transient.retain_applicable(self);
         // A submenu opened from a menu the user was already reading shows
         // immediately; a fresh menu waits out the reveal delay. The flag
         // alone decides: `transient_key` keeps it up across an action so
@@ -2047,6 +2052,7 @@ impl Workspace {
     /// Clears the menu and its reveal state without touching focus.
     fn drop_transient(&mut self) {
         self.transient = None;
+        self.transient_stack.clear();
         self.transient_visible = false;
         self.transient_reveal = None;
     }
@@ -2059,8 +2065,10 @@ impl Workspace {
         }
     }
 
-    /// Keyboard dispatch while a transient is open: escape closes, a bound
-    /// key runs its action, anything else dismisses (magit's quiet exit).
+    /// Keyboard dispatch while a transient is open: a bound key runs its
+    /// action (toggles keep the menu up, submenus stack their parent),
+    /// escape pops one level, and an unbound key reveals the menu instead
+    /// of guessing — the menu itself is the error message.
     fn transient_key(
         &mut self,
         event: &gpui::KeyDownEvent,
@@ -2080,27 +2088,66 @@ impl Workspace {
             return;
         };
         if keystroke.key == "escape" {
-            self.close_transient(window, cx);
+            match self.transient_stack.pop() {
+                Some(parent) => {
+                    // Deliberate navigation: the popped-to menu shows at
+                    // once, whatever the reveal state was.
+                    self.transient = Some(parent);
+                    self.transient_visible = true;
+                    self.transient_reveal = None;
+                    cx.notify();
+                }
+                None => self.close_transient(window, cx),
+            }
             cx.stop_propagation();
             return;
         }
         match transient.action_for(keystroke) {
-            Some(run) => {
+            Some((run, stay)) if stay => {
+                run(self, window, cx);
+                // Interacting with a toggle is engagement: show the menu
+                // that is staying up.
+                self.transient_visible = true;
+                self.transient_reveal = None;
+                cx.notify();
+            }
+            Some((run, _)) => {
                 // A chord typed through an invisible menu keeps submenus
                 // invisible too: remember visibility across the action.
                 let was_visible = self.transient_visible;
-                self.drop_transient();
-                self.transient_visible = was_visible;
+                let parent = self.transient.take();
                 // Restore focus first so the action sees normal focus;
                 // submenus and prompts re-take the strip themselves.
                 self.focus_active_surface(window, cx);
                 run(self, window, cx);
-                self.transient_visible = self.transient.is_some() && was_visible;
+                if self.transient.is_some() {
+                    // The action opened a submenu: its parent waits under
+                    // it for escape.
+                    self.transient_stack.extend(parent);
+                    self.transient_visible = was_visible;
+                } else {
+                    self.transient_stack.clear();
+                    self.transient_visible = false;
+                    self.transient_reveal = None;
+                }
                 cx.notify();
             }
-            None => self.close_transient(window, cx),
+            None => {
+                self.transient_visible = true;
+                self.transient_reveal = None;
+                cx.notify();
+            }
         }
         cx.stop_propagation();
+    }
+
+    pub(crate) fn has_selected_agent(&self) -> bool {
+        self.registry.selected_agent().is_some()
+    }
+
+    pub(crate) fn has_focused_workstream(&self) -> bool {
+        let selected = self.registry.selected_agent().copied();
+        self.focused_workstream(selected).is_some()
     }
 
     pub(crate) fn prompt_snooze(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2708,10 +2755,13 @@ impl Render for Workspace {
                     div()
                         .track_focus(&self.transient_focus)
                         .on_key_down(cx.listener(Self::transient_key))
-                        .children(
-                            self.transient_visible
-                                .then(|| transient.render(&text_style, cx)),
-                        )
+                        .child(if self.transient_visible {
+                            transient.render(&text_style, cx)
+                        } else {
+                            // The magit brief summary: keys now, the full
+                            // menu once the reveal delay passes.
+                            transient.render_hint(&text_style, cx)
+                        })
                         .into_any_element(),
                 ),
                 (None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
