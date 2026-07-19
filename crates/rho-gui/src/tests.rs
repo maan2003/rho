@@ -319,6 +319,17 @@ fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
     );
 
     let editor = active_editor(&workspace, cx);
+    // Typing happens on a focused editor; unfocused ones elide the prompt
+    // row entirely (they are previews).
+    workspace
+        .update(cx, |_, window, cx| {
+            window.activate_window();
+            let handle = editor.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        })
+        .expect("focus transcript editor");
+    // Focus dispatches on draw; a keystroke draws the window.
+    cx.simulate_keystrokes(*workspace, "escape");
     workspace
         .update(cx, |_, window, cx| {
             editor.update(cx, |editor, cx| editor.insert("draft", window, cx));

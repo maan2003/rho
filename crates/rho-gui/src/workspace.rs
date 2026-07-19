@@ -1392,7 +1392,19 @@ impl Workspace {
             ) if self.registry.selected_agent() != Some(&agent_id) => {
                 self.preview_agent(Some(agent_id), window, cx);
             }
-            _ => {}
+            Some(
+                RowTarget::Stream {
+                    primary: Some(_), ..
+                }
+                | RowTarget::Reply(_),
+            ) => {}
+            // Rows with no agent behind them (group headers, the fold
+            // toggle, drafts-in-progress) preview nothing.
+            _ => {
+                if self.registry.selected_agent().is_some() {
+                    self.preview_agent(None, window, cx);
+                }
+            }
         }
     }
 
@@ -2408,11 +2420,6 @@ impl Workspace {
                 ..
             }) => self.open_agent(agent_id, window, cx),
             Some(RowTarget::FoldToggle) => self.toggle_rail_tail(cx),
-            // New agents draft inline, in the dashboard itself.
-            Some(RowTarget::NewAgent) => {
-                self.dashboard.open_new_draft(cx);
-                self.dashboard_enter_insert(window, cx);
-            }
             // Enter sends the inline reply draft (and closes it); an empty
             // draft just closes. Disconnected, the draft stays parked
             // rather than being consumed into the void.
@@ -2429,6 +2436,7 @@ impl Workspace {
                 if let Some(workstream_id) = self.registry.workstream_of(agent_id) {
                     self.dashboard.cursor_to_stream(workstream_id, cx);
                 }
+                self.dashboard_exit_insert(window, cx);
             }
             Some(RowTarget::NewDraft) => {
                 if !self.require_connected(cx) {
@@ -2437,6 +2445,7 @@ impl Workspace {
                 if let Some(body) = self.dashboard.take_new_draft(cx) {
                     self.create_inline_agent(body, cx);
                 }
+                self.dashboard_exit_insert(window, cx);
             }
             Some(RowTarget::Stream { primary: None, .. })
             | Some(RowTarget::None)
@@ -2492,6 +2501,14 @@ impl Workspace {
     /// reason these drafts exist).
     fn dashboard_enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
+            window.dispatch_action(action, cx);
+        }
+    }
+
+    /// Sending a draft ends the writing; the cursor goes back to being a
+    /// dashboard cursor, not an insertion point.
+    fn dashboard_exit_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(action) = cx.build_action("vim::SwitchToNormalMode", None) {
             window.dispatch_action(action, cx);
         }
     }
@@ -2601,11 +2618,11 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The preview sheet's header bar: the previewed agent's name and the
+    /// The preview sheet's bottom bar: the previewed agent's name and the
     /// status chips (working directory, workspace, role, context used) —
     /// left-aligned, real chrome on the sheet rather than a prompt row in
-    /// the transcript.
-    fn render_preview_header(
+    /// the transcript. A quiet modeline, not a header.
+    fn render_preview_bar(
         &self,
         text_style: &gpui::TextStyle,
         cx: &Context<Self>,
@@ -2617,7 +2634,6 @@ impl Workspace {
             .get(&agent_id)
             .map(|model| model.read(cx).status_spans().to_vec())
             .unwrap_or_default();
-        let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         Some(
             div()
                 .flex_none()
@@ -2627,8 +2643,6 @@ impl Workspace {
                 .gap(px(12.))
                 .px(px(12.))
                 .py(px(5.))
-                .border_b_1()
-                .border_color(separator_color)
                 .font_family(text_style.font_family.clone())
                 .text_size(text_style.font_size)
                 .line_height(text_style.line_height)
@@ -2665,9 +2679,7 @@ impl Workspace {
         let rail = self.render_rail(home, show_panes, text_style, cx);
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
-        let preview_header = home
-            .then(|| self.render_preview_header(text_style, cx))
-            .flatten();
+        let preview_bar = home.then(|| self.render_preview_bar(text_style, cx)).flatten();
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
             let id = pane.id;
             let content = self.render_surface(&pane.surface);
@@ -2718,7 +2730,7 @@ impl Workspace {
             // Home mode boxes the preview — a sheet hanging from a top
             // inset, flush with the bottom and right window edges, visibly
             // a card showing what the cursor points at, not an equal half.
-            // Its header carries the context the prompt row shows when
+            // Its bottom bar carries the context the prompt row shows when
             // focused: who this is, where it runs, how full its context is.
             if home {
                 element
@@ -2729,8 +2741,8 @@ impl Workspace {
                     .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .children(preview_header)
                     .child(div().flex_1().min_w_0().min_h_0().child(content))
+                    .children(preview_bar)
             } else {
                 element.h_full().child(content)
             }

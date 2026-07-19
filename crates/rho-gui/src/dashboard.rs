@@ -49,7 +49,6 @@ enum LineKey {
     Group(String),
     Stream(WorkstreamId),
     FoldToggle,
-    NewAgent,
     Reply(AgentId),
     /// The inline new-agent draft, at the top of the listing.
     NewDraft,
@@ -66,7 +65,6 @@ pub enum RowTarget {
         primary: Option<AgentId>,
     },
     FoldToggle,
-    NewAgent,
     /// An inline reply draft addressed to this agent.
     Reply(AgentId),
     /// The inline new-agent draft.
@@ -288,19 +286,14 @@ impl Dashboard {
         }
 
         // Interleave: each reply draft directly under its agent's row;
-        // drafts whose row is folded away sit above the new-agent line so
-        // they are never lost off-screen.
+        // drafts whose row is folded away trail the listing so they are
+        // never lost off-screen.
         let mut order = Vec::new();
         if self.new_draft.is_some() {
             order.push(LineKey::NewDraft);
         }
         let mut orphans = self.replies.clone();
         for line in &lines {
-            if line.key == LineKey::NewAgent {
-                for agent_id in orphans.drain(..) {
-                    order.push(LineKey::Reply(agent_id));
-                }
-            }
             order.push(line.key.clone());
             if let LineKey::Stream(workstream_id) = &line.key {
                 let members = self
@@ -314,6 +307,9 @@ impl Dashboard {
                     order.push(LineKey::Reply(agent_id));
                 }
             }
+        }
+        for agent_id in orphans {
+            order.push(LineKey::Reply(agent_id));
         }
 
         // Create/refresh the listing buffers.
@@ -536,13 +532,14 @@ impl Dashboard {
         });
     }
 
-    /// Reply-draft chrome: an accent gutter stripe plus a placeholder
-    /// inlay naming the addressee while the draft is empty.
+    /// Reply-draft chrome: draft text in the user-message accent plus a
+    /// placeholder inlay naming the addressee while the draft is empty.
+    /// No gutter stripe here — that belongs to the transcript's prompt;
+    /// in the listing the accent text is marker enough.
     fn apply_reply_chrome(&mut self, registry: &AgentRegistry, cx: &mut Context<Workspace>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let to_remove = std::mem::take(&mut self.placeholder_ids);
         let mut inlays = Vec::new();
-        let mut gutter_ranges = Vec::new();
         let mut draft_text_ranges = Vec::new();
         let drafts = self
             .replies
@@ -572,7 +569,6 @@ impl Dashboard {
             else {
                 continue;
             };
-            gutter_ranges.push(start..end);
             // Draft text wears the user-message accent, same as typed
             // prompts everywhere else in rho.
             draft_text_ranges.push(start..end);
@@ -592,18 +588,10 @@ impl Dashboard {
         let draft_style = crate::style::StyleClass::UserMessage.resolve(cx);
         self.editor.update(cx, |editor, cx| {
             editor.splice_inlays(&to_remove, inlays, cx);
-            editor.highlight_gutter::<ReplyGutter>(
-                gutter_ranges,
-                crate::style::user_prompt_gutter_color,
-                cx,
-            );
             editor.highlight_text(DRAFT_TEXT_KEY, draft_text_ranges, draft_style, cx);
         });
     }
 }
-
-/// Gutter highlight marker type for reply drafts.
-pub struct ReplyGutter;
 
 /// Dashboard text classes: lamps and muted chrome. The cursor itself is
 /// the selection indicator — rows carry no selected styling.
@@ -799,9 +787,6 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
             }
         }
     }
-    let mut line = Line::new(LineKey::NewAgent, RowTarget::NewAgent);
-    line.span(Some(DashClass::Muted), |text| text.push_str("+ new agent"));
-    lines.push(line);
     lines
 }
 
@@ -1023,7 +1008,7 @@ mod tests {
         );
 
         let lines = generate(&registry);
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 1);
         assert!(lines[0].text.contains("topic"));
         assert_eq!(lines[0].key, LineKey::Stream(WorkstreamId(1)));
         assert_eq!(lines[0].lamp, Some(UiAttention::NeedsInput));
@@ -1034,8 +1019,6 @@ mod tests {
                 primary: Some(_),
             }
         ));
-        assert_eq!(lines[1].key, LineKey::NewAgent);
-        assert_eq!(lines[1].target, RowTarget::NewAgent);
     }
 
     #[test]

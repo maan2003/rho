@@ -52,6 +52,10 @@ pub struct AgentModel {
     /// Editors currently displaying this agent, weakly held: panes own
     /// their editors; the model only reconciles whoever is still alive.
     editors: Vec<WeakEntity<Editor>>,
+    /// Per-editor display elision hiding the trailing blank row and the
+    /// empty prompt row on unfocused (preview) editors — those rows are
+    /// the prompt's breathing room, and a preview has no prompt.
+    prompt_tail_elisions: std::collections::HashMap<gpui::EntityId, editor::DisplayElisionId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -107,6 +111,7 @@ impl AgentModel {
             focused_editors: std::collections::HashSet::new(),
             workspace,
             editors: Vec::new(),
+            prompt_tail_elisions: std::collections::HashMap::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -159,19 +164,42 @@ impl AgentModel {
         self.transcript
             .attach(&editor, crate::workspace::now_ms(), cx);
         self._subscriptions
-            .push(cx.subscribe(&editor, |this, editor, event, cx| match event {
-                editor::EditorEvent::Focused => {
-                    this.focused_editors.insert(editor.entity_id());
-                    this.apply_prompt_chrome_to(&editor, cx);
-                    this.apply_status_to(&editor, cx);
-                }
-                editor::EditorEvent::Blurred => {
-                    this.focused_editors.remove(&editor.entity_id());
-                    this.apply_prompt_chrome_to(&editor, cx);
-                    this.apply_status_to(&editor, cx);
-                }
-                _ => {}
-            }));
+            .push(
+                cx.subscribe_in(&editor, window, |this, editor, event, window, cx| match event {
+                    editor::EditorEvent::Focused => {
+                        this.focused_editors.insert(editor.entity_id());
+                        let unhidden = this.apply_prompt_chrome_to(editor, cx);
+                        // The elision clamped the selection out of the
+                        // hidden prompt; with the prompt back, focus means
+                        // the user came here to type.
+                        if unhidden
+                            && let Some(anchor) = this
+                                .multi_buffer
+                                .read(cx)
+                                .snapshot(cx)
+                                .anchor_in_excerpt(this.prompt_end)
+                        {
+                            editor.update(cx, |editor, cx| {
+                                editor.change_selections(
+                                    SelectionEffects::default(),
+                                    window,
+                                    cx,
+                                    |selections| {
+                                        selections.select_anchor_ranges([anchor..anchor]);
+                                    },
+                                );
+                            });
+                        }
+                        this.apply_status_to(editor, cx);
+                    }
+                    editor::EditorEvent::Blurred => {
+                        this.focused_editors.remove(&editor.entity_id());
+                        this.apply_prompt_chrome_to(editor, cx);
+                        this.apply_status_to(editor, cx);
+                    }
+                    _ => {}
+                }),
+            );
         self.editors.push(editor.downgrade());
         self.apply_status_to(&editor, cx);
         self.apply_system_styles_to(&editor, cx);
@@ -250,6 +278,17 @@ impl AgentModel {
                     cx,
                 );
             });
+            // Tail elisions anchored at the transcript's end would swallow
+            // the new excerpt; rebuild them against the system buffer.
+            let stale = std::mem::take(&mut self.prompt_tail_elisions);
+            for editor in self.live_editors() {
+                if let Some(id) = stale.get(&editor.entity_id()) {
+                    editor.update(cx, |editor, cx| {
+                        editor.remove_display_elisions([*id].into_iter().collect(), None, cx);
+                    });
+                }
+                self.apply_prompt_chrome_to(&editor, cx);
+            }
         }
         for editor in self.live_editors() {
             self.apply_system_styles_to(&editor, cx);
@@ -372,17 +411,19 @@ impl AgentModel {
         cx.notify();
     }
 
-    fn apply_prompt_chrome_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+    /// Returns whether a tail elision was removed (the prompt row just
+    /// became visible again).
+    fn apply_prompt_chrome_to(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> bool {
         let buffer = self.prompt_buffer.read(cx);
         let draft_empty = buffer.is_empty();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(prompt_start) =
             snapshot.anchor_in_excerpt(self.prompt_buffer.read(cx).anchor_before(0))
         else {
-            return;
+            return false;
         };
         let Some(prompt_end) = snapshot.anchor_in_excerpt(self.prompt_end) else {
-            return;
+            return false;
         };
 
         // A previewed (unfocused) transcript shows no input affordances at
@@ -407,6 +448,60 @@ impl AgentModel {
         } else {
             Vec::new()
         };
+        // Unfocused with nothing typed, the tail — the blank spacing row
+        // plus the empty prompt row — is dead space; a per-editor display
+        // elision collapses it to a single blank row. (Zero-height would
+        // leave buffer positions with no display row and panic selection
+        // layout.) A parked draft stays visible. The start anchor is
+        // right-biased at the transcript's end, so it rides appends and
+        // keeps covering only the tail.
+        let hide_tail = !focused && draft_empty;
+        let elision = self.prompt_tail_elisions.get(&editor.entity_id()).copied();
+        let mut unhidden = false;
+        match (hide_tail, elision) {
+            (true, None) => {
+                // The tail begins after the last content excerpt — the
+                // system-notice buffer when present, else the transcript.
+                let tail_buffer = if self.system_excerpt_added {
+                    &self.system_buffer
+                } else {
+                    self.transcript.buffer()
+                };
+                let tail_buffer = tail_buffer.read(cx);
+                let tail_start =
+                    snapshot.anchor_in_excerpt(tail_buffer.anchor_after(tail_buffer.len()));
+                if let Some(start) = tail_start {
+                    let ids = editor.update(cx, |editor, cx| {
+                        editor.insert_display_elisions(
+                            [editor::DisplayElisionProperties {
+                                range: start..prompt_end,
+                                tail_rows: 0,
+                                height: Some(1),
+                                style: editor::display_map::BlockStyle::Fixed,
+                                render: std::sync::Arc::new(|_| {
+                                    gpui::Empty.into_any_element()
+                                }),
+                                priority: 0,
+                                type_tag: None,
+                            }],
+                            None,
+                            cx,
+                        )
+                    });
+                    if let Some(id) = ids.first() {
+                        self.prompt_tail_elisions.insert(editor.entity_id(), *id);
+                    }
+                }
+            }
+            (false, Some(id)) => {
+                editor.update(cx, |editor, cx| {
+                    editor.remove_display_elisions([id].into_iter().collect(), None, cx);
+                });
+                self.prompt_tail_elisions.remove(&editor.entity_id());
+                unhidden = true;
+            }
+            _ => {}
+        }
         let draft_style = StyleClass::UserMessage.resolve(cx);
         editor.update(cx, |editor, cx| {
             editor.splice_inlays(&[InlayId::Custom(PROMPT_PLACEHOLDER_INLAY_ID)], inlays, cx);
@@ -422,6 +517,7 @@ impl AgentModel {
                 cx,
             );
         });
+        unhidden
     }
 }
 
