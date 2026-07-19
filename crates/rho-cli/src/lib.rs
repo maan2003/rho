@@ -19,7 +19,6 @@ mod land;
 mod mcp_agent_tools;
 mod pr;
 mod slack;
-mod term;
 mod wayland;
 
 #[cfg(test)]
@@ -67,7 +66,6 @@ async fn run(command: Command) -> Result<()> {
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
         Command::Pr(args) => pr::run(args).await,
         Command::Slack(args) => slack::run(args).await,
-        Command::Term(args) => term::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
@@ -160,7 +158,6 @@ enum Command {
     Pr(PrArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
-    Term(term::TermArgs),
     Wayland(wayland::WaylandArgs),
 }
 
@@ -185,8 +182,6 @@ enum CliCommand {
     Pr(PrArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
-    /// Attach this terminal to an agent's daemon-owned terminal.
-    Term(term::TermArgs),
     /// Run and control applications in an isolated headless Wayland session.
     Wayland(wayland::WaylandArgs),
 }
@@ -329,7 +324,6 @@ impl Args {
             CliCommand::Pr(args) => Command::Pr(args),
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),
             CliCommand::Slack(args) => Command::Slack(args),
-            CliCommand::Term(args) => Command::Term(args),
             CliCommand::Wayland(args) => Command::Wayland(args),
         };
         Ok(Self { command })
