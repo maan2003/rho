@@ -18,8 +18,8 @@ pub struct Workstream {
     pub workstream_id: WorkstreamId,
     pub name: String,
     pub pinned: bool,
-    /// Derived, not stored: a workstream with no visible members (empty, or
-    /// every agent hidden) folds out of the rail automatically.
+    /// The stream's own `hide` label, or no visible members (empty, or
+    /// every agent hidden) — either folds it out of the rail.
     pub hidden: bool,
     /// The group this stream shelves under, from its `group:<name>` label.
     pub group: Option<String>,
@@ -58,7 +58,8 @@ fn derive_workstreams(workstreams: &[UiWorkstream], agents: &[UiAgentSummary]) -
                 workstream_id: workstream.workstream_id,
                 name: workstream.name.clone(),
                 pinned: workstream.labels.iter().any(|label| label == PIN_LABEL),
-                hidden: members.iter().all(|agent| agent.hidden),
+                hidden: workstream.labels.iter().any(|label| label == HIDE_LABEL)
+                    || members.iter().all(|agent| agent.hidden),
                 group: workstream.labels.iter().find_map(|label| {
                     label
                         .strip_prefix(GROUP_LABEL_PREFIX)
@@ -947,6 +948,27 @@ mod tests {
             agents.extend(members);
         }
         registry.set_data(workstreams, agents);
+    }
+
+    #[test]
+    fn hide_label_on_the_workstream_folds_it_despite_visible_members() {
+        let mut registry = AgentRegistry::default();
+        let (mut hidden_stream, hidden_members) =
+            topic(1, Status::Normal, vec![agent(1, Status::Normal)]);
+        hidden_stream.labels.push(HIDE_LABEL.to_owned());
+        let visible = topic(2, Status::Normal, vec![agent(2, Status::Normal)]);
+        let mut agents = hidden_members;
+        agents.extend(visible.1.clone());
+        registry.set_data(vec![hidden_stream, visible.0], agents);
+
+        let (listed, folded) = registry.split_rows();
+        let listed = listed
+            .iter()
+            .map(|row| row.workstream_id)
+            .collect::<Vec<_>>();
+        // Hidden rows appear in neither list; only the unhidden stream rides.
+        assert_eq!(listed, [WorkstreamId(2)]);
+        assert!(folded.is_empty());
     }
 
     #[test]
