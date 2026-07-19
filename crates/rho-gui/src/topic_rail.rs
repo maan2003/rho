@@ -247,6 +247,7 @@ mod tests {
             attention: UiAttention::Quiet,
             last_active: UnixMs(crate::workspace::now_ms() + id),
             hidden: false,
+            last_user_message_text: String::new(),
             workstream: WorkstreamId(1),
             labels: match status {
                 Status::Normal => Vec::new(),

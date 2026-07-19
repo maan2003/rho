@@ -654,11 +654,12 @@ async fn turn_end_and_user_message_set_dispositions() {
     );
 
     let mut write = db.write().await;
-    write.record_agent_user_message(UnixMs(5), agent_id);
+    write.record_agent_user_message(UnixMs(5), agent_id, "  please\ncheck the   claims  ");
     write.commit();
     let agent = db.read().get_agent(agent_id);
     assert_eq!(agent.disposition, AgentDisposition::Done);
     assert_eq!(agent.last_user_message, UnixMs(5));
+    assert_eq!(agent.last_user_message_text, "please check the claims");
 }
 
 #[tokio::test]

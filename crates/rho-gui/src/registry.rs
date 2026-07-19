@@ -898,6 +898,7 @@ mod tests {
                     .saturating_add(id),
             ),
             hidden: false,
+            last_user_message_text: String::new(),
             workstream: WorkstreamId(0),
             labels: status_labels(status),
         }

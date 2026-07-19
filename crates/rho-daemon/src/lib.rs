@@ -888,6 +888,7 @@ impl AgentRegistry {
                 attention: attention_level(kinds.get(&agent_id), agent.disposition),
                 last_active: agent.last_user_message.max(agent.created_at),
                 hidden: agent.disposition == AgentDisposition::Hidden,
+                last_user_message_text: agent.last_user_message_text,
                 workstream: agent.workstream,
                 labels: agent.labels,
             })
@@ -1254,11 +1255,25 @@ impl AgentRegistry {
                 .unwrap_or_else(|| write.create_workstream(now, name)),
         };
         let agents = read.list_agents();
-        if !agents.iter().any(|(id, _)| *id == agent_id) {
+        let Some((_, moved)) = agents.iter().find(|(id, _)| *id == agent_id) else {
             anyhow::bail!("agent is not known: {agent_id:?}");
+        };
+        let source = moved.workstream;
+        let members = spawn_subtree(&agents, agent_id);
+        for member in &members {
+            write.set_agent_workstream(now, *member, workstream_id);
         }
-        for member in spawn_subtree(&agents, agent_id) {
-            write.set_agent_workstream(now, member, workstream_id);
+        // A workstream is only a statement about its agents; when the move
+        // empties the source, nothing is being said and the record goes,
+        // rather than lingering as a nameless husk (and letting merges be
+        // plain moves).
+        let source_emptied = source != workstream_id
+            && agents
+                .iter()
+                .filter(|(_, agent)| agent.workstream == source)
+                .all(|(id, _)| members.contains(id));
+        if source_emptied {
+            write.delete_workstream(source);
         }
         write.commit();
         Ok(())
@@ -2043,7 +2058,7 @@ async fn handle_message(
             agent.send_user_message(text.clone(), delivery);
             {
                 let mut write = agents.db.write().await;
-                write.record_agent_user_message(rho_core::UnixMs::now(), agent_id);
+                write.record_agent_user_message(rho_core::UnixMs::now(), agent_id, &text);
                 write.commit();
             }
             // Replying cleared the disposition; say so even when the turn

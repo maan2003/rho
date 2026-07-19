@@ -88,6 +88,48 @@ pub(crate) async fn run(args: WorkstreamArgs) -> anyhow::Result<()> {
                 Err(_) => WorkstreamTarget::Named(workstream),
             },
         },
+        WorkstreamCommand::Merge { from, into } => {
+            let from_id = snapshot.resolve_stream(&from)?;
+            let into_id = snapshot.resolve_stream(&into)?;
+            if from_id == into_id {
+                bail!("`{from}` and `{into}` are the same workstream");
+            }
+            let members = snapshot.members(from_id).collect::<Vec<_>>();
+            // Moving a root brings its spawned subtree along, so only roots
+            // are sent; the daemon deletes the source once it empties.
+            let member_ids = members
+                .iter()
+                .map(|agent| agent.agent_id)
+                .collect::<Vec<_>>();
+            let roots = members
+                .iter()
+                .filter(|agent| {
+                    agent
+                        .parent_agent
+                        .is_none_or(|parent| !member_ids.contains(&parent))
+                })
+                .map(|agent| agent.agent_id)
+                .collect::<Vec<_>>();
+            if roots.is_empty() {
+                bail!("workstream `{from}` has no agents");
+            }
+            for agent_id in &roots {
+                client
+                    .send(&ClientMessage::AgentMove {
+                        agent_id: *agent_id,
+                        target: WorkstreamTarget::Existing(into_id),
+                    })
+                    .await?;
+                await_refresh(&mut client).await?;
+            }
+            println!(
+                "moved {} agent{} into ws-{}",
+                member_ids.len(),
+                if member_ids.len() == 1 { "" } else { "s" },
+                into_id.0,
+            );
+            return Ok(());
+        }
         WorkstreamCommand::ViewGet => {
             std::io::stdout().write_all(&snapshot.view_config)?;
             return Ok(());
@@ -104,15 +146,21 @@ pub(crate) async fn run(args: WorkstreamArgs) -> anyhow::Result<()> {
     let await_ready = !matches!(request, ClientMessage::ViewConfigSet { .. });
     client.send(&request).await?;
     if await_ready {
-        loop {
-            match client.recv().await? {
-                ServerMessage::Ready { .. } => return Ok(()),
-                ServerMessage::Error { message } => bail!("{message}"),
-                _ => {}
-            }
-        }
+        await_refresh(&mut client).await?;
     }
     Ok(())
+}
+
+/// Waits out the daemon's verdict on one mutation: the refreshed `Ready`
+/// broadcast on success, `Error` on failure.
+async fn await_refresh(client: &mut Client) -> anyhow::Result<()> {
+    loop {
+        match client.recv().await? {
+            ServerMessage::Ready { .. } => return Ok(()),
+            ServerMessage::Error { message } => bail!("{message}"),
+            _ => {}
+        }
+    }
 }
 
 struct Snapshot {
@@ -137,13 +185,22 @@ impl Snapshot {
             .map(|agent| agent.attention)
             .max()
             .unwrap_or(UiAttention::Quiet);
+        let last_active = self
+            .members(workstream.workstream_id)
+            .map(|agent| agent.last_active.max(agent.updated_at).0)
+            .max();
         let mut line = format!(
-            "ws-{}  {}  ({members} agent{}, {})",
+            "ws-{}  {}  ({members} agent{}, {}",
             workstream.workstream_id.0,
             workstream.name,
             if members == 1 { "" } else { "s" },
             attention_name(attention),
         );
+        if let Some(last_active) = last_active {
+            line.push_str(", ");
+            line.push_str(&relative_age(last_active));
+        }
+        line.push(')');
         if !workstream.labels.is_empty() {
             line.push_str("  [");
             line.push_str(&workstream.labels.join(", "));
@@ -160,11 +217,19 @@ impl Snapshot {
         }
         line.push_str("  (");
         line.push_str(attention_name(agent.attention));
+        line.push_str(", ");
+        line.push_str(&relative_age(agent.last_active.max(agent.updated_at).0));
         line.push(')');
+        line.push_str("  ");
+        line.push_str(agent.workspace.repo().as_str());
         if !agent.labels.is_empty() {
             line.push_str("  [");
             line.push_str(&agent.labels.join(", "));
             line.push(']');
+        }
+        if !agent.last_user_message_text.is_empty() {
+            line.push_str("\n      > ");
+            line.push_str(&agent.last_user_message_text);
         }
         line
     }
@@ -222,6 +287,24 @@ impl Snapshot {
             }
             prefix_id::PrefixResolution::NotFound => bail!("no agent with id `{text}`"),
         }
+    }
+}
+
+/// A coarse "how long ago" tag: enough to tell fresh work from last
+/// month's, no more.
+fn relative_age(at_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    let elapsed_ms = now.saturating_sub(at_ms);
+    let minutes = elapsed_ms / 60_000;
+    match minutes {
+        0 => "now".to_owned(),
+        1..=59 => format!("{minutes}m"),
+        60..=1439 => format!("{}h", minutes / 60),
+        1440..=43_199 => format!("{}d", minutes / 1440),
+        _ => format!("{}mo", minutes / 43_200),
     }
 }
 

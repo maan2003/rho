@@ -26,6 +26,10 @@ mod workstream;
 mod tests;
 
 pub fn main() -> Result<()> {
+    // Dying quietly on a closed pipe (`rho ws show | head`) is the correct
+    // CLI behavior; Rust's default ignore turns it into a print panic.
+    // SAFETY: top of main, single-threaded, resetting to default handling.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     rho_daemon::install_crypto_provider()?;
     let args = Args::parse_or_exit(std::env::args().skip(1));
     if let Command::Daemon(mut daemon_args) = args.command {
@@ -332,6 +336,9 @@ pub(crate) enum WorkstreamCommand {
     /// Move an agent (and its spawned subtree) into a workstream, creating
     /// the workstream when the name matches nothing.
     Move { agent: String, workstream: String },
+    /// Move every agent of one workstream into another; the emptied source
+    /// is deleted.
+    Merge { from: String, into: String },
     /// Write the stored view-config blob to stdout.
     ViewGet,
     /// Replace the stored view-config blob with stdin.

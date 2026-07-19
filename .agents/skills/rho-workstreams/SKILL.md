@@ -36,6 +36,7 @@ rho ws rename <ws> "<name>"       # retitle
 rho ws label <ws> <label>         # add a label (pin, hide, group:infra, ...)
 rho ws unlabel <ws> <label>       # remove a label
 rho ws move <agent> <ws>          # move an agent (and its spawned subtree)
+rho ws merge <from> <into>        # move every agent over; the source is deleted
 ```
 
 `<ws>` is `ws-<id>` (as printed by `list`) or the workstream's exact name.
@@ -44,7 +45,11 @@ rho ws move <agent> <ws>          # move an agent (and its spawned subtree)
 `move` with a name that matches no workstream creates one — so "spin off a
 new workstream around this agent" is `rho ws move eng-xyz "new topic name"`.
 Moving an agent always brings its spawned subtree along; a spawn tree never
-straddles workstreams.
+straddles workstreams. A move that empties its source workstream deletes it.
+
+`show` prints each member's repo, how recently it was active, and a snippet
+of the user's last message to it — usually enough to tell what a stream is
+about before renaming or merging it.
 
 ## Guidance
 

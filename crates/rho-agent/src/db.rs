@@ -253,6 +253,10 @@ pub struct AgentRecord {
     /// engagement signal, finishing is the agent's schedule.
     #[senax(default)]
     pub last_user_message: UnixMillis,
+    /// A one-line snippet of that message, so summaries can say what the
+    /// user last asked without replaying the transcript.
+    #[senax(default)]
+    pub last_user_message_text: String,
     /// The workstream this agent belongs to: exactly one, founded with the
     /// top-level agent and inherited by its spawn tree.
     #[senax(default)]
@@ -314,6 +318,8 @@ impl senax_encoder::Decoder for AgentRecord {
             #[senax(default)]
             last_user_message: UnixMillis,
             #[senax(default)]
+            last_user_message_text: String,
+            #[senax(default)]
             disposition: AgentDisposition,
             #[senax(default)]
             tags: Vec<TagId>,
@@ -336,6 +342,7 @@ impl senax_encoder::Decoder for AgentRecord {
             binding: encoded.binding,
             runtime: encoded.runtime,
             last_user_message: encoded.last_user_message,
+            last_user_message_text: encoded.last_user_message_text,
             workstream: encoded.workstream,
             labels: encoded.labels,
             disposition: encoded.disposition,
@@ -767,9 +774,14 @@ pub trait AgentWriteTxnExt {
     /// `Pending` — every finished turn demands a fresh disposition.
     fn record_agent_turn_end(&mut self, agent_id: AgentId);
 
-    /// Stamps the user's engagement with an agent (rail recency) and clears
-    /// its disposition: replying is as much a verdict as acking.
-    fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId);
+    /// Stamps the user's engagement with an agent (rail recency), keeps a
+    /// one-line snippet of the message, and clears its disposition:
+    /// replying is as much a verdict as acking.
+    fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId, text: &str);
+
+    /// Removes a workstream record. Callers ensure no agent still points at
+    /// it — the daemon deletes only streams its moves emptied.
+    fn delete_workstream(&mut self, workstream_id: WorkstreamId);
 
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
 }
@@ -832,6 +844,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             binding: mode,
             runtime,
             last_user_message: now,
+            last_user_message_text: String::new(),
             workstream,
             labels: Vec::new(),
             disposition: AgentDisposition::Done,
@@ -995,6 +1008,10 @@ impl AgentWriteTxnExt for WriteTxn {
         workstream_id
     }
 
+    fn delete_workstream(&mut self, workstream_id: WorkstreamId) {
+        self.open_table(WORKSTREAMS).remove(&workstream_id);
+    }
+
     fn set_workstream_name(&mut self, now: UnixMillis, workstream_id: WorkstreamId, name: String) {
         let name = unique_workstream_name(self, name, Some(workstream_id));
         update_workstream(self, now, workstream_id, |workstream| {
@@ -1134,7 +1151,7 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
-    fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId) {
+    fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId, text: &str) {
         let mut agents = self.open_table(AGENTS);
         let mut agent = agents
             .get(&agent_id)
@@ -1142,6 +1159,7 @@ impl AgentWriteTxnExt for WriteTxn {
             .value()
             .into_owned();
         agent.last_user_message = now;
+        agent.last_user_message_text = message_snippet(text);
         // Replying is a verdict like acking — the ball moves to the agent's
         // court even if the turn hasn't started yet (queued delivery), so a
         // pending lamp must not linger.
@@ -1214,6 +1232,18 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
 /// Workstream names are unique (so a name identifies a workstream); a
 /// colliding name gets a numeric suffix rather than failing, since names
 /// are auto-generated from agent titles.
+/// One display line from a user message: whitespace collapsed, cut at a
+/// character boundary. Long enough to recall what was asked, short enough
+/// for a summary row.
+fn message_snippet(text: &str) -> String {
+    let mut snippet = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some((limit, _)) = snippet.char_indices().nth(160) {
+        snippet.truncate(limit);
+        snippet.push('\u{2026}');
+    }
+    snippet
+}
+
 fn unique_workstream_name(
     write: &mut WriteTxn,
     base: String,

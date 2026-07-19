@@ -541,6 +541,10 @@ pub struct UiAgentSummary {
     /// The user filed this agent away (`AgentDisposition::Hidden`): fold it
     /// immediately instead of waiting out the rail's idle window.
     pub hidden: bool,
+    /// One-line snippet of the user's last message; empty if none yet.
+    /// What the work is about, for summaries and naming.
+    #[senax(default)]
+    pub last_user_message_text: String,
     /// The workstream this agent belongs to (exactly one).
     pub workstream: WorkstreamId,
     /// Free-form markers ("pin", …); semantics live in the client's view
