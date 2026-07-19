@@ -116,6 +116,9 @@ pub struct Workspace {
     /// when the draft was entered. Only used to derive the default workdir —
     /// a submitted draft always founds its own workstream.
     draft_workstream: Option<rho_ui_proto::WorkstreamId>,
+    /// Launch arguments for the dashboard's parked new-root draft. The
+    /// transient edits these; the writable dashboard row owns the message.
+    new_agent_draft: Option<NewAgentDraft>,
     /// A NewAgent request from the draft is in flight; the draft buffer is
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
@@ -176,6 +179,14 @@ pub enum WorkstreamPrompt {
     Merge,
 }
 
+#[derive(Clone)]
+struct NewAgentDraft {
+    workdir: Option<Utf8PathBuf>,
+    mode: crate::draft_view::StartFieldMode,
+    target: String,
+    role: String,
+}
+
 impl WorkstreamPrompt {
     fn prompt(self) -> &'static str {
         match self {
@@ -233,6 +244,7 @@ impl Workspace {
             draft_model,
             workdirs: Vec::new(),
             draft_workstream: None,
+            new_agent_draft: None,
             awaiting_draft_agent: false,
             connected: false,
             duration_timer: None,
@@ -833,12 +845,6 @@ impl Workspace {
         selected
     }
 
-    pub(crate) fn cmd_agent_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.require_connected(cx) {
-            self.enter_draft(None, window, cx);
-        }
-    }
-
     pub(crate) fn cmd_agent_cancel(&mut self, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
@@ -1154,6 +1160,7 @@ impl Workspace {
     /// Opens the draft compose view. `working_directory` is an explicit
     /// choice (`:agent new <path>`, rewrites the header even mid-draft);
     /// otherwise the scaffold default is derived from the inherited topic.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn enter_draft(
         &mut self,
         working_directory: Option<Utf8PathBuf>,
@@ -1457,17 +1464,19 @@ impl Workspace {
             // A reply draft previews its addressee, same as the row above it.
             Some(
                 RowTarget::Stream {
-                    primary: Some(agent_id),
+                    root: Some(agent_id),
                     ..
                 }
+                | RowTarget::Agent(agent_id)
                 | RowTarget::Reply(agent_id),
             ) if self.registry.selected_agent() != Some(&agent_id) => {
                 self.preview_agent(Some(agent_id), window, cx);
             }
             Some(
                 RowTarget::Stream {
-                    primary: Some(_), ..
+                    root: Some(_), ..
                 }
+                | RowTarget::Agent(_)
                 | RowTarget::Reply(_),
             ) => {}
             // Rows with no agent behind them (group headers, the fold
@@ -2506,14 +2515,241 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(crate) fn open_new_agent_transient(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.new_agent_draft.is_none() {
+            use crate::dashboard::RowTarget;
+
+            let contextual = if self.dashboard.focus_handle(cx).is_focused(window) {
+                match self.dashboard.cursor_target(cx) {
+                    Some(RowTarget::Stream {
+                        root: Some(agent_id),
+                        ..
+                    })
+                    | Some(RowTarget::Agent(agent_id))
+                    | Some(RowTarget::Reply(agent_id)) => {
+                        self.registry.working_directory(agent_id)
+                    }
+                    Some(RowTarget::Stream { workstream_id, .. }) => {
+                        self.registry.last_working_directory(workstream_id)
+                    }
+                    _ => None,
+                }
+            } else {
+                self.registry
+                    .selected_agent()
+                    .and_then(|agent_id| self.registry.working_directory(*agent_id))
+            };
+            let workdir = contextual.or_else(|| match self.workdirs.as_slice() {
+                [workdir] => Some(workdir.path.clone()),
+                _ => None,
+            });
+            self.new_agent_draft = Some(NewAgentDraft {
+                workdir,
+                mode: crate::draft_view::StartFieldMode::NewOn,
+                target: crate::draft_view::DEFAULT_START.to_owned(),
+                role: crate::draft_view::DEFAULT_ROLE.to_owned(),
+            });
+        }
+        let draft = self.new_agent_draft.as_ref().expect("draft initialized");
+        let project = draft
+            .workdir
+            .as_deref()
+            .map(|path| self.workdir_label(path))
+            .unwrap_or_else(|| "<choose>".to_owned());
+        let mode = match draft.mode {
+            crate::draft_view::StartFieldMode::NewOn => "new on",
+            crate::draft_view::StartFieldMode::Join => "join",
+            crate::draft_view::StartFieldMode::Sandbox => "sandbox",
+        };
+        self.open_transient(
+            crate::transient::new_agent_menu(
+                project,
+                mode.to_owned(),
+                draft.target.clone(),
+                draft.role.clone(),
+            ),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn prompt_new_agent_project(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            workspace
+                .workdir_table()
+                .into_iter()
+                .filter(|(name, path)| {
+                    name.to_lowercase().contains(&needle) || path.to_lowercase().contains(&needle)
+                })
+                .map(|(name, path)| crate::commands::Candidate {
+                    value: name,
+                    description: path,
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let input = input.trim();
+                if !input.is_empty() {
+                    let path = workspace.resolve_workdir_path(Utf8PathBuf::from(input));
+                    if let Some(draft) = &mut workspace.new_agent_draft {
+                        draft.workdir = Some(path);
+                    }
+                }
+                workspace.open_new_agent_transient(window, cx);
+            },
+        );
+        self.open_prompt("project:", complete, on_submit, window, cx);
+    }
+
+    pub(crate) fn prompt_new_agent_base(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            let mut candidates = workspace.live_agent_targets();
+            if workspace
+                .new_agent_draft
+                .as_ref()
+                .is_some_and(|draft| draft.mode == crate::draft_view::StartFieldMode::Join)
+            {
+                candidates.insert(
+                    0,
+                    crate::commands::Candidate {
+                        value: "user".to_owned(),
+                        description: "your checkout".to_owned(),
+                    },
+                );
+            }
+            candidates
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.value.to_lowercase().contains(&needle)
+                        || candidate.description.to_lowercase().contains(&needle)
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let input = input.trim();
+                if !input.is_empty()
+                    && let Some(draft) = &mut workspace.new_agent_draft
+                {
+                    draft.target = input.to_owned();
+                }
+                workspace.open_new_agent_transient(window, cx);
+            },
+        );
+        let prompt = if self
+            .new_agent_draft
+            .as_ref()
+            .is_some_and(|draft| draft.mode == crate::draft_view::StartFieldMode::Join)
+        {
+            "join target:"
+        } else {
+            "base:"
+        };
+        self.open_prompt(prompt, complete, on_submit, window, cx);
+    }
+
+    pub(crate) fn cycle_new_agent_mode(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(draft) = &mut self.new_agent_draft {
+            use crate::draft_view::StartFieldMode;
+            draft.mode = match draft.mode {
+                StartFieldMode::NewOn => StartFieldMode::Join,
+                StartFieldMode::Join => StartFieldMode::Sandbox,
+                StartFieldMode::Sandbox => StartFieldMode::NewOn,
+            };
+            if draft.mode == StartFieldMode::Join && draft.target == crate::draft_view::DEFAULT_START
+            {
+                draft.target = "user".to_owned();
+            } else if draft.mode != StartFieldMode::Join && draft.target.eq_ignore_ascii_case("user")
+            {
+                draft.target = crate::draft_view::DEFAULT_START.to_owned();
+            }
+        }
+        self.open_new_agent_transient(window, cx);
+    }
+
+    pub(crate) fn cycle_new_agent_role(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(draft) = &mut self.new_agent_draft {
+            draft.role = cycle_agent_role_text(&draft.role).to_owned();
+        }
+        self.open_new_agent_transient(window, cx);
+    }
+
+    pub(crate) fn compose_new_agent(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = &self.new_agent_draft else {
+            return;
+        };
+        let project = draft
+            .workdir
+            .as_deref()
+            .map(|path| self.workdir_label(path))
+            .unwrap_or_else(|| "no project".to_owned());
+        let mode = match draft.mode {
+            crate::draft_view::StartFieldMode::NewOn => "new on",
+            crate::draft_view::StartFieldMode::Join => "join",
+            crate::draft_view::StartFieldMode::Sandbox => "sandbox",
+        };
+        let summary = format!(
+            "{project} · {} · {mode} {}",
+            draft.role, draft.target
+        );
+        self.dashboard.open_new_draft(summary, cx);
+        let handle = self.dashboard.focus_handle(cx);
+        window.focus(&handle, cx);
+        self.dashboard_enter_insert(window, cx);
+    }
+
+    fn new_agent_launch(&self) -> Result<(rho_ui_proto::StartMode, AgentRole), String> {
+        let draft = self
+            .new_agent_draft
+            .as_ref()
+            .ok_or_else(|| "new agent has no launch configuration".to_owned())?;
+        let start = self.parse_start(draft.mode, &draft.target, draft.workdir.clone())?;
+        let role = parse_agent_role(&draft.role)?;
+        Ok((start, role))
+    }
+
     /// `enter` in the dashboard: act on the row under the cursor.
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(cx) {
             Some(RowTarget::Stream {
-                primary: Some(agent_id),
+                root: Some(agent_id),
                 ..
-            }) => self.open_agent(agent_id, window, cx),
+            })
+            | Some(RowTarget::Agent(agent_id)) => self.open_agent(agent_id, window, cx),
             Some(RowTarget::FoldToggle) => self.toggle_rail_tail(cx),
             // Enter sends the inline reply draft (and closes it); an empty
             // draft just closes. Disconnected, the draft stays parked
@@ -2529,7 +2765,7 @@ impl Workspace {
                 // whatever text slid into the gap; park it back on the row
                 // the reply belonged to.
                 if let Some(workstream_id) = self.registry.workstream_of(agent_id) {
-                    self.dashboard.cursor_to_stream(workstream_id, cx);
+                    self.dashboard.cursor_to_agent(agent_id, workstream_id, cx);
                 }
                 self.dashboard_exit_insert(window, cx);
             }
@@ -2537,34 +2773,34 @@ impl Workspace {
                 if !self.require_connected(cx) {
                     return;
                 }
+                let (start, role) = match self.new_agent_launch() {
+                    Ok(launch) => launch,
+                    Err(message) => {
+                        self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                        return;
+                    }
+                };
                 if let Some(body) = self.dashboard.take_new_draft(cx) {
-                    self.create_inline_agent(body, cx);
+                    self.create_inline_agent(body, start, role);
                 }
+                self.new_agent_draft = None;
                 self.dashboard_exit_insert(window, cx);
             }
-            Some(RowTarget::Stream { primary: None, .. })
+            Some(RowTarget::Stream { root: None, .. })
             | Some(RowTarget::None)
             | None => {}
         }
     }
 
-    /// Creates an agent from the dashboard's inline draft with the same
-    /// defaults the compose view seeds: a new change on `@-` in the
-    /// default working directory, default role. The compose surface
-    /// remains the place to pick anything else.
-    fn create_inline_agent(&mut self, body: String, cx: &mut Context<Self>) {
-        let workdir = self.draft_default_workdir();
-        let start = match self.parse_start(crate::draft_view::StartFieldMode::NewOn, "@-", workdir)
-        {
-            Ok(start) => start,
-            Err(message) => {
-                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                return;
-            }
-        };
+    fn create_inline_agent(
+        &mut self,
+        body: String,
+        start: rho_ui_proto::StartMode,
+        role: AgentRole,
+    ) {
         self.connection.send(ClientMessage::NewAgent {
             workstream: None,
-            role: rho_ui_proto::AgentRole::default(),
+            role,
             start,
             content: Some(vec![ContentPart::Text { text: body }]),
         });
@@ -2578,9 +2814,10 @@ impl Workspace {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(cx) {
             Some(RowTarget::Stream {
-                primary: Some(agent_id),
+                root: Some(agent_id),
                 ..
             })
+            | Some(RowTarget::Agent(agent_id))
             | Some(RowTarget::Reply(agent_id)) => {
                 self.dashboard.open_reply(agent_id, cx);
                 self.dashboard_enter_insert(window, cx);
@@ -3135,7 +3372,7 @@ impl Render for Workspace {
                 this.switch_agent_by_delta(1, window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentNew, window, cx| {
-                this.enter_draft(None, window, cx);
+                this.open_new_agent_transient(window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentJumpAttention, window, cx| {
                 this.jump_to_attention(window, cx);
@@ -3164,8 +3401,7 @@ impl Render for Workspace {
                 this.dashboard_reply(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
-                this.dashboard.open_new_draft(cx);
-                this.dashboard_enter_insert(window, cx);
+                this.open_new_agent_transient(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(

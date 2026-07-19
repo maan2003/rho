@@ -22,7 +22,7 @@ pub type TransientRun = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Work
 pub struct TransientItem {
     /// Keystroke in binding notation: `"d"`, `"shift-d"`, `"3"`.
     key: &'static str,
-    label: &'static str,
+    label: String,
     run: TransientRun,
     /// A toggle: running it keeps the menu open (magit's do-stay), so
     /// several toggles chain without reopening.
@@ -48,14 +48,14 @@ impl Transient {
     fn push(
         mut self,
         key: &'static str,
-        label: &'static str,
+        label: impl Into<String>,
         stay: bool,
         when: Option<fn(&Workspace) -> bool>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
         self.items.push(TransientItem {
             key,
-            label,
+            label: label.into(),
             run: Rc::new(run),
             stay,
             when,
@@ -66,7 +66,7 @@ impl Transient {
     fn item(
         self,
         key: &'static str,
-        label: &'static str,
+        label: impl Into<String>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
         self.push(key, label, false, None, run)
@@ -76,7 +76,7 @@ impl Transient {
     fn toggle(
         self,
         key: &'static str,
-        label: &'static str,
+        label: impl Into<String>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
         self.push(key, label, true, None, run)
@@ -87,7 +87,7 @@ impl Transient {
         self,
         when: fn(&Workspace) -> bool,
         key: &'static str,
-        label: &'static str,
+        label: impl Into<String>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
         self.push(key, label, false, Some(when), run)
@@ -148,7 +148,7 @@ impl Transient {
                             .text_color(accent)
                             .child(display_key(item.key)),
                     )
-                    .child(item.label)
+                    .child(item.label.clone())
             }))
         });
         bottom_strip(text_style, cx)
@@ -190,7 +190,7 @@ fn display_key(spec: &str) -> String {
 pub fn root_menu() -> Transient {
     Transient::new("rho")
         .item("n", "new agent", |workspace, window, cx| {
-            workspace.cmd_agent_new(window, cx);
+            workspace.open_new_agent_transient(window, cx);
         })
         .item_when(
             Workspace::has_selected_agent,
@@ -236,6 +236,25 @@ pub fn root_menu() -> Transient {
             workspace.cmd_version(cx);
         })
         .item("q", "quit", |_, _, cx| cx.quit())
+}
+
+pub fn new_agent_menu(project: String, mode: String, target: String, role: String) -> Transient {
+    Transient::new("new agent")
+        .item("p", format!("project  {project}"), |workspace, window, cx| {
+            workspace.prompt_new_agent_project(window, cx);
+        })
+        .toggle("m", format!("workspace  {mode}"), |workspace, window, cx| {
+            workspace.cycle_new_agent_mode(window, cx);
+        })
+        .item("b", format!("base  {target}"), |workspace, window, cx| {
+            workspace.prompt_new_agent_base(window, cx);
+        })
+        .toggle("r", format!("role  {role}"), |workspace, window, cx| {
+            workspace.cycle_new_agent_role(window, cx);
+        })
+        .item("c", "compose", |workspace, window, cx| {
+            workspace.compose_new_agent(window, cx);
+        })
 }
 
 /// `space w`: pane arrangement, on vim's window letters — practiced

@@ -1,13 +1,12 @@
 //! The dashboard: the rail reborn as a real editor buffer — rho's
-//! magit-status. One line per workstream in triage order, generated
-//! read-only text in a normal editor, so the cursor, motions, and search
-//! all come from the editor rather than bespoke list chrome. Acting keys
-//! address the row under the cursor: `enter` opens, `r` splices an inline
-//! reply draft under the row. Every line is its own tiny buffer in the
-//! multibuffer, so reply drafts are ordinary writable buffers between
-//! read-only ones — a refresh rearranges excerpts but can never eat what
-//! the user typed, and the cursor rides its line's buffer through
-//! reorders instead of sticking to a line number.
+//! magit-status. A single-root workstream is one compact row; the uncommon
+//! multi-root workstream becomes a header followed by human-named root rows.
+//! Generated read-only text lives in a normal editor, so cursor motions and
+//! search come from the editor rather than bespoke list chrome. Acting keys
+//! address the stable root under the cursor: `enter` opens, `r` splices an
+//! inline reply draft under that root. Every line is its own tiny buffer in
+//! the multibuffer, so refreshes can rearrange excerpts without eating typed
+//! drafts or leaving the cursor attached to a stale line number.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -25,9 +24,6 @@ use theme::ActiveTheme as _;
 
 use crate::registry::{AgentRegistry, Workstream};
 use crate::workspace::Workspace;
-
-/// How many member tags a workstream row shows before collapsing into `+n`.
-const VISIBLE_TAGS: usize = 4;
 
 /// Highlight-key space for dashboard classes, clear of the transcript's
 /// semantic and syntax key ranges.
@@ -48,6 +44,7 @@ const DRAFT_TEXT_KEY: HighlightKey =
 enum LineKey {
     Group(String),
     Stream(WorkstreamId),
+    Agent(AgentId),
     FoldToggle,
     Reply(AgentId),
     /// The inline new-agent draft, at the top of the listing.
@@ -62,8 +59,9 @@ pub enum RowTarget {
     None,
     Stream {
         workstream_id: WorkstreamId,
-        primary: Option<AgentId>,
+        root: Option<AgentId>,
     },
+    Agent(AgentId),
     FoldToggle,
     /// An inline reply draft addressed to this agent.
     Reply(AgentId),
@@ -88,7 +86,7 @@ pub struct Dashboard {
     reply_subscriptions: HashMap<AgentId, gpui::Subscription>,
     /// The inline new-agent draft, when open: its buffer plus the edit
     /// subscription that keeps chrome fresh.
-    new_draft: Option<(Entity<Buffer>, gpui::Subscription)>,
+    new_draft: Option<(Entity<Buffer>, gpui::Subscription, String)>,
     /// Move the cursor into this key's buffer on the next sync — how a
     /// freshly opened reply draft receives the cursor.
     pending_cursor: Option<LineKey>,
@@ -196,8 +194,10 @@ impl Dashboard {
     /// Opens (or returns to) the inline new-agent draft at the top of the
     /// listing. Like a reply draft it parks when left and survives
     /// refreshes.
-    pub fn open_new_draft(&mut self, cx: &mut Context<Workspace>) {
-        if self.new_draft.is_none() {
+    pub fn open_new_draft(&mut self, summary: String, cx: &mut Context<Workspace>) {
+        if let Some((_, _, current)) = &mut self.new_draft {
+            *current = summary;
+        } else {
             let buffer = cx.new(|cx| Buffer::local("", cx));
             let subscription = cx.subscribe(&buffer, |_, _, event, cx| {
                 if matches!(event, language::BufferEvent::Edited { .. }) {
@@ -205,7 +205,7 @@ impl Dashboard {
                 }
             });
             self.buffers.insert(LineKey::NewDraft, buffer.clone());
-            self.new_draft = Some((buffer, subscription));
+            self.new_draft = Some((buffer, subscription, summary));
         }
         self.pending_cursor = Some(LineKey::NewDraft);
         cx.notify();
@@ -213,17 +213,27 @@ impl Dashboard {
 
     /// Takes the new-agent draft's text and closes it. `None` when empty.
     pub fn take_new_draft(&mut self, cx: &mut Context<Workspace>) -> Option<String> {
-        let (buffer, _) = self.new_draft.take()?;
+        let (buffer, _, _) = self.new_draft.take()?;
         let text = buffer.read(cx).text().trim().to_owned();
         self.buffers.remove(&LineKey::NewDraft);
         cx.notify();
         (!text.is_empty()).then_some(text)
     }
 
-    /// Parks the cursor on a workstream's row at the next sync — for when
-    /// a consumed draft's excerpt vanishes under the cursor.
-    pub fn cursor_to_stream(&mut self, workstream_id: WorkstreamId, cx: &mut Context<Workspace>) {
-        self.pending_cursor = Some(LineKey::Stream(workstream_id));
+    /// Parks the cursor on an explicit agent row, or on its flattened
+    /// singleton workstream row when the agent has no separate line.
+    pub fn cursor_to_agent(
+        &mut self,
+        agent_id: AgentId,
+        workstream_id: WorkstreamId,
+        cx: &mut Context<Workspace>,
+    ) {
+        let key = LineKey::Agent(agent_id);
+        self.pending_cursor = Some(if self.buffers.contains_key(&key) {
+            key
+        } else {
+            LineKey::Stream(workstream_id)
+        });
         cx.notify();
     }
 
@@ -277,7 +287,7 @@ impl Dashboard {
         if self
             .new_draft
             .as_ref()
-            .is_some_and(|(buffer, _)| buffer.read(cx).is_empty())
+            .is_some_and(|(buffer, _, _)| buffer.read(cx).is_empty())
             && cursor_key != Some(LineKey::NewDraft)
             && pending != Some(LineKey::NewDraft)
         {
@@ -295,17 +305,17 @@ impl Dashboard {
         let mut orphans = self.replies.clone();
         for line in &lines {
             order.push(line.key.clone());
-            if let LineKey::Stream(workstream_id) = &line.key {
-                let members = self
-                    .replies
-                    .iter()
-                    .copied()
-                    .filter(|agent_id| registry.workstream_of(*agent_id) == Some(*workstream_id))
-                    .collect::<Vec<_>>();
-                for agent_id in members {
-                    orphans.retain(|orphan| *orphan != agent_id);
-                    order.push(LineKey::Reply(agent_id));
+            let reply = match line.target {
+                RowTarget::Stream {
+                    root: Some(agent_id),
+                    ..
                 }
+                | RowTarget::Agent(agent_id) => Some(agent_id),
+                _ => None,
+            };
+            if let Some(agent_id) = reply.filter(|agent_id| self.replies.contains(agent_id)) {
+                orphans.retain(|orphan| *orphan != agent_id);
+                order.push(LineKey::Reply(agent_id));
             }
         }
         for agent_id in orphans {
@@ -554,13 +564,15 @@ impl Dashboard {
             .map(|agent_id| {
                 (
                     LineKey::Reply(*agent_id),
-                    format!("reply to {}…", registry.agent_id_label(*agent_id)),
+                    format!("reply to {}…", registry.agent_human_name(*agent_id)),
                 )
             })
             .chain(
                 self.new_draft
-                    .is_some()
-                    .then(|| (LineKey::NewDraft, "new agent…".to_owned())),
+                    .as_ref()
+                    .map(|(_, _, summary)| {
+                        (LineKey::NewDraft, format!("new agent · {summary}…"))
+                    }),
             );
         for (index, (key, placeholder)) in drafts.enumerate() {
             let Some(buffer) = self.buffers.get(&key) else {
@@ -588,6 +600,21 @@ impl Dashboard {
                     continue;
                 };
                 let inlay = Inlay::custom(PLACEHOLDER_ID_BASE + index, position, placeholder);
+                self.placeholder_ids.push(inlay.id);
+                inlays.push(inlay);
+            } else if key == LineKey::NewDraft
+                && let Some((_, _, summary)) = &self.new_draft
+            {
+                let Some(position) =
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(buffer_snapshot.len()))
+                else {
+                    continue;
+                };
+                let inlay = Inlay::custom(
+                    PLACEHOLDER_ID_BASE + index,
+                    position,
+                    format!("  · {summary}"),
+                );
                 self.placeholder_ids.push(inlay.id);
                 inlays.push(inlay);
             }
@@ -777,7 +804,9 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
                 line.span(Some(DashClass::Muted), |text| text.push_str(name));
                 lines.push(line);
             }
-            RailRow::Task { topic, grouped } => lines.push(task_line(topic, grouped, registry)),
+            RailRow::Task { topic, grouped } => {
+                lines.extend(task_lines(topic, grouped, registry));
+            }
             RailRow::FoldToggle {
                 folded_count,
                 expanded,
@@ -797,22 +826,55 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
     lines
 }
 
-/// One workstream's line: title, then member tags beyond the primary. The
-/// primary agent answers `enter`; the lamp (an inlay at the row's end) is
-/// the most urgent member — acting on the row means acting on whoever
-/// inside it wants the user.
-fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Line {
-    let (agents, _folded) = registry.split_workstream_agents(topic);
-    let primary = agents.first().map(|summary| summary.agent_id);
-    let attention = agents
+/// A workstream is flat in the common single-root case. Multiple roots make
+/// the container meaningful, so it becomes a header followed by explicit,
+/// human-named root rows. Descendants contribute attention to their root but
+/// never replace the stable target under the cursor.
+fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Vec<Line> {
+    let roots = root_agents(topic);
+    let attention = |root: AgentId| {
+        topic
+            .agents
+            .iter()
+            .filter(|agent| !agent.hidden && root_of(topic, agent.agent_id) == Some(root))
+            .map(|agent| registry.attention(agent.agent_id))
+            .max()
+            .unwrap_or(UiAttention::Quiet)
+    };
+    let aggregate = roots
         .iter()
-        .map(|summary| registry.attention(summary.agent_id))
+        .map(|root| attention(root.agent_id))
         .max()
         .unwrap_or(UiAttention::Quiet);
+
+    match roots.as_slice() {
+        [root] => vec![workstream_line(
+            topic,
+            grouped,
+            Some(root.agent_id),
+            attention(root.agent_id),
+        )],
+        [] => vec![workstream_line(topic, grouped, None, aggregate)],
+        _ => {
+            let mut lines = vec![workstream_line(topic, grouped, None, aggregate)];
+            lines.extend(
+                roots
+                    .into_iter()
+                    .map(|root| root_line(root, grouped, attention(root.agent_id), registry)),
+            );
+            lines
+        }
+    }
+}
+
+fn workstream_line(
+    topic: &Workstream,
+    grouped: bool,
+    root: Option<AgentId>,
+    attention: UiAttention,
+) -> Line {
     let title = if topic.name.trim().is_empty() {
-        primary
-            .map(|agent_id| registry.agent_display_label(agent_id))
-            .unwrap_or_else(|| "task".to_owned())
+        "Untitled workstream".to_owned()
     } else {
         topic.name.clone()
     };
@@ -821,7 +883,7 @@ fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Lin
         LineKey::Stream(topic.workstream_id),
         RowTarget::Stream {
             workstream_id: topic.workstream_id,
-            primary,
+            root,
         },
     );
     // Rows, headers, and reply drafts all sit flush at one level — the
@@ -836,27 +898,60 @@ fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Lin
     let title_class = (attention >= UiAttention::Pending).then_some(DashClass::Urgent);
     line.span(title_class, |text| text.push_str(&title));
 
-    let members = agents.iter().skip(1).collect::<Vec<_>>();
-    let overflow = members.len().saturating_sub(VISIBLE_TAGS);
-    for member in members.into_iter().take(VISIBLE_TAGS) {
-        let class =
-            DashClass::lamp(registry.attention(member.agent_id)).unwrap_or(DashClass::Muted);
-        line.span(None, |text| text.push_str("  "));
-        line.span(Some(class), |text| {
-            text.push_str(&registry.agent_id_label(member.agent_id))
-        });
-    }
-    if overflow > 0 {
-        line.span(None, |text| text.push_str("  "));
-        line.span(Some(DashClass::Muted), |text| {
-            text.push_str(&format!("+{overflow}"))
-        });
-    }
     // The attention lamp hangs off the row's right end as an inlay.
     if attention > UiAttention::Quiet {
         line.lamp = Some(attention);
     }
     line
+}
+
+fn root_line(
+    root: &rho_ui_proto::UiAgentSummary,
+    grouped: bool,
+    attention: UiAttention,
+    registry: &AgentRegistry,
+) -> Line {
+    let mut line = Line::new(LineKey::Agent(root.agent_id), RowTarget::Agent(root.agent_id));
+    line.span(None, |text| text.push_str(if grouped { "    " } else { "  " }));
+    let class = (attention >= UiAttention::Pending).then_some(DashClass::Urgent);
+    line.span(class, |text| {
+        text.push_str(&registry.agent_human_name(root.agent_id))
+    });
+    if attention > UiAttention::Quiet {
+        line.lamp = Some(attention);
+    }
+    line
+}
+
+fn root_agents(topic: &Workstream) -> Vec<&rho_ui_proto::UiAgentSummary> {
+    topic
+        .agents
+        .iter()
+        .filter(|agent| {
+            !agent.hidden
+                && agent.parent_agent.is_none_or(|parent| {
+                    !topic.agents.iter().any(|candidate| candidate.agent_id == parent)
+                })
+        })
+        .collect()
+}
+
+fn root_of(topic: &Workstream, mut agent_id: AgentId) -> Option<AgentId> {
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(agent_id) {
+        let agent = topic
+            .agents
+            .iter()
+            .find(|candidate| candidate.agent_id == agent_id)?;
+        match agent
+            .parent_agent
+            .filter(|parent| topic.agents.iter().any(|candidate| candidate.agent_id == *parent))
+        {
+            Some(parent) => agent_id = parent,
+            None => return Some(agent_id),
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1003,16 +1098,17 @@ mod tests {
 
     #[test]
     fn listing_lines_carry_targets_and_lamp_state() {
-        let mut urgent = agent(1, Status::Normal, 10);
-        urgent.attention = UiAttention::NeedsInput;
-        let members = vec![urgent, agent(2, Status::Normal, 10)];
+        let root = agent(1, Status::Normal, 10);
+        let root_id = root.agent_id;
+        let mut urgent_child = agent(2, Status::Normal, 10);
+        urgent_child.parent_agent = Some(root_id);
+        urgent_child.attention = UiAttention::NeedsInput;
+        let child_id = urgent_child.agent_id;
+        let members = vec![root, urgent_child];
         let topic = topic(Status::Normal, members);
         let mut registry = AgentRegistry::default();
         install(&mut registry, &topic);
-        registry.set_attention(
-            AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
-            UiAttention::NeedsInput,
-        );
+        registry.set_attention(child_id, UiAttention::NeedsInput);
 
         let lines = generate(&registry);
         assert_eq!(lines.len(), 1);
@@ -1023,9 +1119,35 @@ mod tests {
             lines[0].target,
             RowTarget::Stream {
                 workstream_id: WorkstreamId(1),
-                primary: Some(_),
+                root: Some(agent_id),
             }
+            if agent_id == root_id
         ));
+    }
+
+    #[test]
+    fn multiple_roots_get_human_named_rows_without_id_labels() {
+        let mut release_notes = agent(1, Status::Normal, 10);
+        release_notes.display_name = Some("Prepare release notes".to_owned());
+        let release_id = release_notes.agent_id;
+        let mut deployment = agent(2, Status::Normal, 10);
+        deployment.last_user_message_text = "Verify staging deployment".to_owned();
+        let deployment_id = deployment.agent_id;
+        let topic = topic(Status::Normal, vec![release_notes, deployment]);
+        let mut registry = AgentRegistry::default();
+        install(&mut registry, &topic);
+
+        let lines = generate(&registry);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].text, "topic");
+        assert_eq!(lines[1].text, "  Prepare release notes");
+        assert_eq!(lines[2].text, "  Verify staging deployment");
+        assert!(matches!(
+            lines[0].target,
+            RowTarget::Stream { root: None, .. }
+        ));
+        assert_eq!(lines[1].target, RowTarget::Agent(release_id));
+        assert_eq!(lines[2].target, RowTarget::Agent(deployment_id));
     }
 
     #[test]

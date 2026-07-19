@@ -139,6 +139,7 @@ pub struct AgentRegistry {
 #[derive(Default)]
 struct TopicRailLayout {
     listed: Vec<(AgentId, usize)>,
+    #[cfg(test)]
     folded: Vec<(AgentId, usize)>,
 }
 
@@ -473,6 +474,30 @@ impl AgentRegistry {
         }
     }
 
+    /// Human-facing dashboard name. Generated ids remain available through
+    /// `agent_display_label` for addressing and disambiguation, not scanning.
+    pub fn agent_human_name(&self, agent_id: AgentId) -> String {
+        let Some(agent) = self.agent_summary(agent_id) else {
+            return "Untitled agent".to_owned();
+        };
+        if let Some(name) = agent.display_name.as_deref().map(str::trim)
+            && !name.is_empty()
+        {
+            return name.to_owned();
+        }
+        let message = agent.last_user_message_text.trim();
+        if !message.is_empty() {
+            return message.to_owned();
+        }
+        if agent.role.is_pm() {
+            "Project manager".to_owned()
+        } else if agent.role.is_engineer() {
+            "Engineer".to_owned()
+        } else {
+            "Advisor".to_owned()
+        }
+    }
+
     pub fn add_workstream(&mut self, workstream: UiWorkstream) {
         // Workstreams stay in the daemon's creation order; a new one is the
         // newest, so it belongs at the end.
@@ -487,52 +512,40 @@ impl AgentRegistry {
         &self.workstreams
     }
 
-    /// Rail row order, the same machinery agent rows used before tasks:
-    /// each workstream is represented by its primary agent (its layout's
-    /// best-listed member), and rows sort by pinned workstream, pinned
-    /// primary, the primary's membership in the attention/recency top
-    /// bucket, then the retained engagement order — so rows with live
-    /// attention or fresh engagement surface without reshuffling the rest.
-    /// Creation order is the stable tiebreak; workstreams with nothing
-    /// listed trail.
+    /// Rail row order aggregates the whole workstream: pinned containers,
+    /// pinned members, and any member in the attention/recency bucket surface
+    /// their row. The earliest retained member rank keeps the rest stable.
     pub fn ordered_workstreams(&self) -> Vec<&Workstream> {
         let bucket = self.row_bucket();
         let mut rows = self.workstreams.iter().collect::<Vec<_>>();
         rows.sort_by_key(|workstream| {
-            let primary = self.row_primary(workstream);
             (
                 !workstream.pinned,
-                primary.is_none_or(|agent| !agent_pinned(agent)),
-                primary.is_none_or(|agent| !bucket.contains(&agent.agent_id)),
-                primary
-                    .and_then(|agent| self.rail_ranks.get(&agent.agent_id))
+                !workstream.agents.iter().any(agent_pinned),
+                !workstream
+                    .agents
+                    .iter()
+                    .any(|agent| bucket.contains(&agent.agent_id)),
+                workstream
+                    .agents
+                    .iter()
+                    .filter_map(|agent| self.rail_ranks.get(&agent.agent_id))
                     .copied()
+                    .min()
                     .unwrap_or(usize::MAX),
             )
         });
         rows
     }
 
-    /// The workstream's face in the rail: its layout's best-listed member.
-    fn row_primary(&self, workstream: &Workstream) -> Option<&UiAgentSummary> {
-        self.topic_rail_layouts
-            .get(&workstream.workstream_id)
-            .and_then(|layout| layout.listed.first())
-            .and_then(|(agent_id, _)| self.agent_summary(*agent_id))
-    }
-
-    /// The attention/recency top bucket over row primaries.
+    /// The attention/recency top bucket over all visible members.
     fn row_bucket(&self) -> BTreeSet<AgentId> {
-        self.top_bucket(
-            self.workstreams
-                .iter()
-                .filter_map(|workstream| self.row_primary(workstream)),
-        )
+        self.top_bucket(self.workstreams.iter().flat_map(|workstream| &workstream.agents))
     }
 
     /// Rail rows split into the listed set and the folded tail, the same
-    /// policy the agent rail applied per topic: pinned rows, rows whose
-    /// primary is pinned or in the top bucket, and the selected row stay,
+    /// policy the agent rail applied per topic: pinned rows, rows with any
+    /// pinned or top-bucket member, and the selected row stay,
     /// plus [`EXTRA_ROWS`] more in retained order; quiet leftovers fold.
     /// Hidden rows appear in neither list.
     pub fn split_rows(&self) -> (Vec<&Workstream>, Vec<&Workstream>) {
@@ -548,11 +561,11 @@ impl AgentRegistry {
             if workstream.hidden {
                 continue;
             }
-            let primary = self.row_primary(workstream);
             let keep = workstream.pinned
                 || selected_row == Some(workstream.workstream_id)
-                || primary
-                    .is_some_and(|agent| agent_pinned(agent) || bucket.contains(&agent.agent_id));
+                || workstream.agents.iter().any(|agent| {
+                    agent_pinned(agent) || bucket.contains(&agent.agent_id)
+                });
             if keep {
                 listed.push(workstream);
             } else if extra < EXTRA_ROWS {
@@ -720,13 +733,18 @@ impl AgentRegistry {
             .iter()
             .map(|topic| {
                 let state = TopicRailState::new(self, topic);
-                let (listed, mut folded): (Vec<_>, Vec<_>) = topic
+                let (listed, folded): (Vec<_>, Vec<_>) = topic
                     .agents
                     .iter()
                     .filter(|agent| !state.auto_collapsed(agent.agent_id))
                     .partition(|agent| !state.folded(agent.agent_id));
                 let listed = self.order_topic_agents_with_state(&state, listed);
+                #[cfg(test)]
+                let mut folded = folded;
+                #[cfg(test)]
                 folded.sort_by_key(|agent| Reverse(agent.updated_at));
+                #[cfg(not(test))]
+                let _ = folded;
                 let indexes = topic
                     .agents
                     .iter()
@@ -743,6 +761,7 @@ impl AgentRegistry {
                     topic.workstream_id,
                     TopicRailLayout {
                         listed: cache(listed),
+                        #[cfg(test)]
                         folded: cache(folded),
                     },
                 )
@@ -751,6 +770,7 @@ impl AgentRegistry {
         self.topic_rail_layouts = layouts;
     }
 
+    #[cfg(test)]
     fn resolve_cached_agents<'a>(
         topic: &'a Workstream,
         cached: &[(AgentId, usize)],
@@ -772,6 +792,7 @@ impl AgentRegistry {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn split_workstream_agents<'a>(
         &self,
         topic: &'a Workstream,
@@ -998,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_sort_by_primary_engagement_and_attention_not_creation() {
+    fn rows_sort_by_member_engagement_and_attention_not_creation() {
         use rho_ui_proto::UiAttention;
 
         let mut registry = AgentRegistry::default();
@@ -1023,7 +1044,7 @@ mod tests {
                 .map(|workstream| workstream.workstream_id.0)
                 .collect::<Vec<_>>()
         };
-        // Pinned primary leads; then retained engagement order (1 above 2),
+        // Pinned membership leads; then retained engagement order (1 above 2),
         // not creation order.
         assert_eq!(order(&registry), [3, 1, 2]);
 
@@ -1069,7 +1090,7 @@ mod tests {
         use rho_ui_proto::UiAttention;
 
         // Thirteen single-agent workstreams, engagement recency growing
-        // with id: the top bucket admits five quiet primaries, five more
+        // with id: the top bucket admits five quiet members, five more
         // ride the extra tail, the oldest three fold.
         let mut registry = AgentRegistry::default();
         set_topics(
@@ -1092,7 +1113,7 @@ mod tests {
         assert!(registry.agent_folded(agent_id(1)));
         assert!(!registry.agent_folded(agent_id(13)));
 
-        // Attention admits a folded row's primary to the bucket, unfolding
+        // Attention admits a folded row's member to the bucket, unfolding
         // the row; selection keeps the open row visible regardless.
         registry.set_attention(agent_id(1), UiAttention::Pending);
         let (_, folded) = registry.split_rows();
