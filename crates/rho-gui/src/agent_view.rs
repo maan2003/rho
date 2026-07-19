@@ -322,6 +322,12 @@ impl AgentModel {
         }
     }
 
+    /// The status chips as styled spans; the preview sheet's header
+    /// renders these as real UI outside the editor.
+    pub fn status_spans(&self) -> &[(String, gpui::HighlightStyle)] {
+        &self.status_spans
+    }
+
     #[cfg(test)]
     pub(crate) fn status_span_text(&self) -> String {
         self.status_spans

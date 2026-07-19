@@ -2601,6 +2601,56 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The preview sheet's header bar: the previewed agent's name and the
+    /// status chips (working directory, workspace, role, context used) —
+    /// left-aligned, real chrome on the sheet rather than a prompt row in
+    /// the transcript.
+    fn render_preview_header(
+        &self,
+        text_style: &gpui::TextStyle,
+        cx: &Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let agent_id = self.registry.selected_agent().copied()?;
+        let label = self.registry.agent_display_label(agent_id);
+        let spans = self
+            .models
+            .get(&agent_id)
+            .map(|model| model.read(cx).status_spans().to_vec())
+            .unwrap_or_default();
+        let separator_color = cx.theme().colors().border_variant.opacity(0.6);
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(px(12.))
+                .px(px(12.))
+                .py(px(5.))
+                .border_b_1()
+                .border_color(separator_color)
+                .font_family(text_style.font_family.clone())
+                .text_size(text_style.font_size)
+                .line_height(text_style.line_height)
+                .text_color(text_style.color)
+                .child(div().font_weight(gpui::FontWeight::BOLD).child(label))
+                .children(
+                    spans
+                        .into_iter()
+                        .filter(|(text, _)| !text.trim().is_empty())
+                        .map(|(text, style)| {
+                            let mut chip = div()
+                                .text_color(style.color.unwrap_or(text_style.color));
+                            if let Some(weight) = style.font_weight {
+                                chip = chip.font_weight(weight);
+                            }
+                            chip.child(text)
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_panes(
         &mut self,
         window: &Window,
@@ -2615,6 +2665,9 @@ impl Workspace {
         let rail = self.render_rail(home, show_panes, text_style, cx);
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
+        let preview_header = home
+            .then(|| self.render_preview_header(text_style, cx))
+            .flatten();
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
             let id = pane.id;
             let content = self.render_surface(&pane.surface);
@@ -2660,21 +2713,27 @@ impl Workspace {
             element.children(separated).into_any_element()
         };
         let panes = show_panes.then(|| {
+            let content = self.active_tree().layout(&mut leaf, &mut container);
             let element = div().flex_1().min_w_0().min_h_0();
             // Home mode boxes the preview — a sheet hanging from a top
             // inset, flush with the bottom and right window edges, visibly
             // a card showing what the cursor points at, not an equal half.
-            let element = if home {
+            // Its header carries the context the prompt row shows when
+            // focused: who this is, where it runs, how full its context is.
+            if home {
                 element
                     .mt(gpui::relative(0.05))
                     .border_1()
                     .border_color(separator_color)
                     .rounded_t_md()
                     .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .children(preview_header)
+                    .child(div().flex_1().min_w_0().min_h_0().child(content))
             } else {
-                element.h_full()
-            };
-            element.child(self.active_tree().layout(&mut leaf, &mut container))
+                element.h_full().child(content)
+            }
         });
         div()
             .flex()
