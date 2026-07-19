@@ -8,22 +8,15 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-stream.workspace = true
 camino.workspace = true
 clap.workspace = true
 dirs.workspace = true
-futures.workspace = true
 libc.workspace = true
 prefix-id.workspace = true
 rho-agent.workspace = true
 rho-ci.workspace = true
-rho-cli-term-raw.workspace = true
-rho-commands.workspace = true
-rho-core.workspace = true
 rho-daemon.workspace = true
-rho-db.workspace = true
 rho-inference.workspace = true
-rho-tool-shell.workspace = true
 rho-ui-proto.workspace = true
 rho-workspaces.workspace = true
 serde.workspace = true

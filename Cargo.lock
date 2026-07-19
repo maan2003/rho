@@ -12043,22 +12043,15 @@ name = "rho-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "camino",
  "clap",
  "dirs",
- "futures",
  "libc",
  "prefix-id",
  "rho-agent",
  "rho-ci",
- "rho-cli-term-raw",
- "rho-commands",
- "rho-core",
  "rho-daemon",
- "rho-db",
  "rho-inference",
- "rho-tool-shell",
  "rho-ui-proto",
  "rho-workspaces",
  "serde",
@@ -12094,14 +12087,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "rho-commands"
-version = "0.1.0"
-dependencies = [
- "camino",
- "rho-ui-proto",
 ]
 
 [[package]]
@@ -12215,7 +12200,6 @@ dependencies = [
  "prost",
  "release_channel",
  "remote",
- "rho-commands",
  "rho-core",
  "rho-daemon",
  "rho-iroh-auth",

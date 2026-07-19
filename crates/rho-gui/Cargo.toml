@@ -46,7 +46,6 @@ project = { git = "https://github.com/maan2003/zed", branch = "rho" }
 prost = "0.9"
 release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
 remote = { git = "https://github.com/maan2003/zed", branch = "rho" }
-rho-commands.workspace = true
 rho-core.workspace = true
 rho-daemon.workspace = true
 rho-iroh-auth.workspace = true

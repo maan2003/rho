@@ -3,6 +3,7 @@
 mod agent_view;
 mod banner;
 mod chime;
+mod command;
 mod commands;
 mod connection;
 mod draft_view;
@@ -61,7 +62,7 @@ actions!(
         PaneBack,
         RailFocus,
         RailOpen,
-        MinibufferCommand,
+        RootTransient,
         AgentTransient,
         MinibufferConfirm,
         MinibufferCancel,
@@ -431,7 +432,7 @@ fn bind_rho_key_overrides(cx: &mut App) {
         // anyway. `ctrl-\ ctrl-n` is vim's terminal escape; `ctrl-shift-n`
         // is the discoverable chord for the same thing.
         KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("RhoTerminal")),
-        KeyBinding::new("ctrl-shift-;", MinibufferCommand, Some("RhoTerminal")),
+        KeyBinding::new("ctrl-shift-;", RootTransient, Some("RhoTerminal")),
         KeyBinding::new("ctrl-\\ ctrl-n", TerminalNormalMode, Some("RhoTerminal")),
         KeyBinding::new("ctrl-shift-n", TerminalNormalMode, Some("RhoTerminal")),
         // Terminal normal mode: the keyboard belongs to rho again. Insert
@@ -476,9 +477,9 @@ fn bind_rho_key_overrides(cx: &mut App) {
             // The agent transient: `space a d` marks done, `space a` alone
             // shows the menu.
             KeyBinding::new("space a", AgentTransient, Some(context)),
-            // Vim's own command line: `:` drops into the minibuffer. Loads
-            // after the vim keymap, so it beats any bundled `:` binding.
-            KeyBinding::new(":", MinibufferCommand, Some(context)),
+            // Where vim's command line was: `:` opens the root transient.
+            // Loads after the vim keymap, so it beats any bundled binding.
+            KeyBinding::new(":", RootTransient, Some(context)),
         ]);
     }
     // Minibuffer keys. The input is a single-line editor (vim skips those),

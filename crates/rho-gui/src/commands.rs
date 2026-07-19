@@ -1,5 +1,4 @@
-//! Prompt completions for `:` commands (shared grammar from
-//! [`rho_commands`]) and `@` agent mentions.
+//! Prompt completions: `@` agent mentions and the draft's field buffers.
 
 use std::rc::Rc;
 
@@ -16,7 +15,7 @@ pub struct Candidate {
     pub description: String,
 }
 
-/// Tag names by kind, feeding `:tag` argument completion.
+/// Tag names by kind, feeding tag-prompt completion.
 #[derive(Default)]
 pub struct TagNames {
     pub workstreams: Vec<String>,
@@ -24,50 +23,19 @@ pub struct TagNames {
     pub labels: Vec<String>,
 }
 
-/// Completion candidates for the text before the cursor. Values replace the
-/// current whitespace-delimited token (the `:` of the leading command token
-/// is preserved).
-pub fn completions_for(
-    text_before_cursor: &str,
-    workdirs: &[(String, String)],
-    live_agents: &[Candidate],
-    tags: &TagNames,
-    buffers: &[(String, String)],
-) -> Vec<Candidate> {
-    if let Some(mention) = mention_prefix(text_before_cursor) {
-        return live_agents
-            .iter()
-            .filter(|agent| {
-                fuzzy_contains(&agent.value, mention) || fuzzy_contains(&agent.description, mention)
-            })
-            .cloned()
-            .collect();
-    }
-    let trimmed = text_before_cursor.trim_start();
-    if !trimmed.starts_with(':') {
+/// Completion candidates for the text before the cursor: `@` mentions of
+/// live agents. Values replace the current whitespace-delimited token.
+pub fn completions_for(text_before_cursor: &str, live_agents: &[Candidate]) -> Vec<Candidate> {
+    let Some(mention) = mention_prefix(text_before_cursor) else {
         return Vec::new();
-    }
-    let colon = if last_token(text_before_cursor).starts_with(':') {
-        ":"
-    } else {
-        ""
     };
-    rho_commands::completion_candidates(
-        trimmed,
-        &rho_commands::CompletionCtx {
-            workdirs,
-            workstreams: &tags.workstreams,
-            groups: &tags.groups,
-            labels: &tags.labels,
-            buffers,
-        },
-    )
-    .into_iter()
-    .map(|candidate| Candidate {
-        value: format!("{colon}{}", candidate.value),
-        description: candidate.description,
-    })
-    .collect()
+    live_agents
+        .iter()
+        .filter(|agent| {
+            fuzzy_contains(&agent.value, mention) || fuzzy_contains(&agent.description, mention)
+        })
+        .cloned()
+        .collect()
 }
 
 fn fuzzy_contains(value: &str, needle: &str) -> bool {
@@ -193,17 +161,12 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         _window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<anyhow::Result<Vec<CompletionResponse>>> {
-        let (workdirs, live_agents, tags, buffers) = self
+        let (workdirs, live_agents) = self
             .workspace
             .upgrade()
             .map(|workspace| {
                 let workspace = workspace.read(cx);
-                (
-                    workspace.workdir_table(),
-                    workspace.live_agent_targets(),
-                    workspace.tag_names(),
-                    workspace.buffer_table(),
-                )
+                (workspace.workdir_table(), workspace.live_agent_targets())
             })
             .unwrap_or_default();
 
@@ -223,13 +186,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         } else if in_start_field {
             start_field_candidates(&text_before_cursor, &live_agents)
         } else {
-            completions_for(
-                &text_before_cursor,
-                &workdirs,
-                &live_agents,
-                &tags,
-                &buffers,
-            )
+            completions_for(&text_before_cursor, &live_agents)
         };
         let completions = candidates
             .into_iter()
@@ -299,36 +256,6 @@ mod tests {
     }
 
     #[test]
-    fn root_commands_complete_by_prefix() {
-        let candidates = completions_for(":", &[], &[], &Default::default(), &[]);
-        assert!(candidates.iter().any(|c| c.value == ":agent"));
-        assert!(candidates.iter().any(|c| c.value == ":projects"));
-        let candidates = completions_for(":agent re", &[], &[], &Default::default(), &[]);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "rename");
-    }
-
-    #[test]
-    fn agent_new_completes_workdirs() {
-        let workdirs = vec![("rho".to_owned(), "/home/u/src/rho".to_owned())];
-        let candidates = completions_for(":agent new ", &workdirs, &[], &Default::default(), &[]);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "rho");
-        assert_eq!(candidates[0].description, "/home/u/src/rho");
-    }
-
-    #[test]
-    fn topic_move_completes_topics() {
-        let tags = TagNames {
-            workstreams: vec!["infra".to_owned(), "1".to_owned()],
-            ..Default::default()
-        };
-        let candidates = completions_for(":tag move in", &[], &[], &tags, &[]);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "infra");
-    }
-
-    #[test]
     fn mentions_complete_live_agents() {
         let live = vec![
             Candidate {
@@ -340,7 +267,7 @@ mod tests {
                 description: "agent".to_owned(),
             },
         ];
-        let candidates = completions_for("ask @w", &[], &live, &Default::default(), &[]);
+        let candidates = completions_for("ask @w", &live);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].value, "worker");
     }

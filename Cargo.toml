@@ -12,7 +12,6 @@ members = [
   "crates/rho-cli",
   "crates/rho-cli-term-raw",
   "crates/rho-code-mode",
-  "crates/rho-commands",
   "crates/rho-context-config",
   "crates/rho-core",
   "crates/rho-daemon",
@@ -89,7 +88,6 @@ rho-claude = { path = "crates/rho-claude" }
 rho-cli = { path = "crates/rho-cli" }
 rho-cli-term-raw = { path = "crates/rho-cli-term-raw" }
 rho-code-mode = { path = "crates/rho-code-mode" }
-rho-commands = { path = "crates/rho-commands" }
 rho-context-config = { path = "crates/rho-context-config" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }

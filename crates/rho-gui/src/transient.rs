@@ -4,17 +4,17 @@
 //! in the bottom strip while it captures the keyboard. A key either runs a
 //! command and closes, opens a nested transient, or drops into the
 //! minibuffer for a value. Typed fast, `space a d` acts before the menu
-//! registers visually; pausing shows every option. These menus are the
-//! long-term replacement for the `:` command grammar — commands stay Rust
-//! values, the menu is how fingers reach them.
+//! registers visually; pausing shows every option. There is no textual
+//! command grammar — commands are Rust values, the menus are how fingers
+//! reach them.
 
 use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, Keystroke, Window, div};
-use rho_commands::Command;
 use theme::ActiveTheme as _;
 
+use crate::command::Command;
 use crate::minibuffer::bottom_strip;
 use crate::workspace::{TagPrompt, Workspace};
 
@@ -126,6 +126,41 @@ fn display_key(spec: &str) -> String {
     }
 }
 
+/// `:` — the root menu: everything that isn't about the current agent,
+/// plus a door into the agent menu.
+pub fn root_menu() -> Transient {
+    Transient::new("rho")
+        .item("a", "agent…", |workspace, window, cx| {
+            workspace.open_transient(agent_menu(), window, cx);
+        })
+        .item("b", "switch buffer…", |workspace, window, cx| {
+            workspace.open_buffer_picker(window, cx);
+        })
+        .item("k", "close buffer", |workspace, window, cx| {
+            workspace.close_surface(None, window, cx);
+        })
+        .item("f", "open file…", |workspace, window, cx| {
+            workspace.prompt_open_file(window, cx);
+        })
+        .command("t", "terminal", Command::Term { new: false })
+        .command("shift-t", "new terminal", Command::Term { new: true })
+        .item("p", "projects…", |workspace, window, cx| {
+            workspace.open_transient(projects_menu(), window, cx);
+        })
+        .command("v", "version", Command::Version)
+        .command("q", "quit", Command::Quit)
+}
+
+fn projects_menu() -> Transient {
+    Transient::new("projects")
+        .item("a", "add…", |workspace, window, cx| {
+            workspace.prompt_project_add(window, cx);
+        })
+        .item("r", "remove…", |workspace, window, cx| {
+            workspace.prompt_project_remove(window, cx);
+        })
+}
+
 /// `space a`: everything about the current agent.
 pub fn agent_menu() -> Transient {
     Transient::new("agent")
@@ -141,6 +176,15 @@ pub fn agent_menu() -> Transient {
         .command("c", "cancel turn", Command::AgentCancel)
         .command("k", "compact", Command::Compact)
         .command("w", "rewind turn", Command::Rewind { turns: 1 })
+        .item("shift-w", "rewind turns…", |workspace, window, cx| {
+            workspace.prompt_rewind(window, cx);
+        })
+        .command("shift-c", "continue turn", Command::Continue)
+        .command(
+            "shift-k",
+            "new prompt cache key",
+            Command::AgentChangePromptCacheKey,
+        )
         .command(
             "n",
             "new agent",
