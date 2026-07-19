@@ -119,9 +119,6 @@ pub struct Workspace {
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
     awaiting_draft_agent: bool,
-    /// The view config as last loaded or persisted; `None` until the first
-    /// `Ready` delivers the stored blob (nothing is pushed before then).
-    synced_view_config: Option<crate::view_config::ViewConfig>,
     connected: bool,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
@@ -211,7 +208,6 @@ impl Workspace {
             workdirs: Vec::new(),
             draft_workstream: None,
             awaiting_draft_agent: false,
-            synced_view_config: None,
             connected: false,
             duration_timer: None,
             chime: Chime::default(),
@@ -306,23 +302,6 @@ impl Workspace {
             self.handle_frame_batch(frames, window, cx);
         }
         drop(allocations);
-        self.sync_view_config();
-    }
-
-    /// Pushes the current view config to the daemon when it drifted from
-    /// what was last loaded or sent — silent otherwise, and never before
-    /// the first `Ready` delivered the stored blob to drift from.
-    fn sync_view_config(&mut self) {
-        let Some(synced) = &self.synced_view_config else {
-            return;
-        };
-        let current = self.registry.view_config();
-        if current != *synced {
-            self.connection.send(ClientMessage::ViewConfigSet {
-                data: current.encode(),
-            });
-            self.synced_view_config = Some(current);
-        }
     }
 
     fn handle_frame_batch(
@@ -424,7 +403,6 @@ impl Workspace {
                 workstreams,
                 agents,
                 projects: workdirs,
-                view_config,
                 machine_seed,
                 agent_counter,
                 workspace_counter,
@@ -433,13 +411,6 @@ impl Workspace {
                 self.registry.set_machine_seed(machine_seed);
                 self.registry.set_agent_counter(agent_counter);
                 self.registry.set_workspace_counter(workspace_counter);
-                if first_ready {
-                    // Loaded before set_data so persisted agents count as
-                    // already placed and keep last session's rail order.
-                    let config = crate::view_config::ViewConfig::decode(&view_config);
-                    self.registry.load_view_config(&config);
-                    self.synced_view_config = Some(config);
-                }
                 self.registry.set_data(workstreams, agents);
                 self.prune_contexts();
                 self.workdirs = workdirs;
@@ -1136,7 +1107,6 @@ impl Workspace {
 
     pub fn toggle_rail_tail(&mut self, cx: &mut Context<Self>) {
         self.registry.toggle_rail_tail();
-        self.sync_view_config();
         cx.notify();
     }
 

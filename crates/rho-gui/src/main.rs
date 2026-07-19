@@ -21,7 +21,6 @@ mod tests;
 mod topic_rail;
 mod transcript;
 mod transient;
-mod view_config;
 mod workspace;
 mod zed_remote;
 

@@ -12141,7 +12141,6 @@ dependencies = [
  "askpass",
  "assets",
  "async-trait",
- "bytes",
  "camino",
  "clap",
  "client",

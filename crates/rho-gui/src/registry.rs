@@ -574,19 +574,6 @@ impl AgentRegistry {
         self.rail_tail_expanded = !self.rail_tail_expanded;
     }
 
-    /// Seeds view state from the daemon-stored config: the user's own
-    /// choices only, everything else re-derives from the snapshots.
-    pub fn load_view_config(&mut self, config: &crate::view_config::ViewConfig) {
-        self.rail_tail_expanded = config.rail_tail_expanded;
-    }
-
-    /// The user's view choices, for persisting through `ViewConfigSet`.
-    pub fn view_config(&self) -> crate::view_config::ViewConfig {
-        crate::view_config::ViewConfig {
-            rail_tail_expanded: self.rail_tail_expanded,
-        }
-    }
-
     pub fn mark_known(&mut self, agent_id: AgentId) {
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
     }
