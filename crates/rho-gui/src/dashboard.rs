@@ -8,11 +8,13 @@
 
 use std::ops::Range;
 
-use editor::{Editor, EditorMode, HighlightKey, SizingBehavior};
+use editor::hover_links::InlayHighlight;
+use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, FontWeight, HighlightStyle, Window};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
+use project::InlayId;
 use rho_ui_proto::{AgentId, UiAttention, WorkstreamId};
 use theme::ActiveTheme as _;
 
@@ -67,6 +69,8 @@ pub struct Dashboard {
     rows: Vec<RowTarget>,
     /// The last generated listing, for cheap change detection.
     text: String,
+    /// Attention lamps currently spliced in, for replacement on sync.
+    lamp_ids: Vec<InlayId>,
 }
 
 impl Dashboard {
@@ -117,6 +121,7 @@ impl Dashboard {
             editor,
             rows: Vec::new(),
             text: String::new(),
+            lamp_ids: Vec::new(),
         }
     }
 
@@ -169,6 +174,53 @@ impl Dashboard {
             self.rows = layout.rows;
         }
         self.apply_highlights(&layout.spans, cx);
+        // Lamps are inlays, not text: attention can shift without a text
+        // edit, so they are respliced every sync.
+        self.apply_lamps(&layout.lamps, cx);
+    }
+
+    /// Splices the attention lamps in as ` ●` inlays at each row's end —
+    /// state chrome the cursor never lands on — and colors them per level.
+    fn apply_lamps(&mut self, lamps: &[(usize, UiAttention)], cx: &mut Context<Workspace>) {
+        const LAMP_TEXT: &str = " ●";
+        let buffer_snapshot = self.buffer.read(cx).snapshot();
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let to_remove = std::mem::take(&mut self.lamp_ids);
+        let mut inlays = Vec::new();
+        let mut by_class: Vec<(DashClass, Vec<InlayHighlight>)> = [
+            DashClass::Working,
+            DashClass::Pending,
+            DashClass::NeedsInput,
+        ]
+        .into_iter()
+        .map(|class| (class, Vec::new()))
+        .collect();
+        for (index, (offset, attention)) in lamps.iter().enumerate() {
+            let Some(class) = DashClass::lamp(*attention) else {
+                continue;
+            };
+            let Some(position) = snapshot.anchor_in_excerpt(
+                buffer_snapshot.anchor_before((*offset).min(buffer_snapshot.len())),
+            ) else {
+                continue;
+            };
+            let inlay = Inlay::custom(index, position, LAMP_TEXT);
+            if let Some((_, highlights)) = by_class.iter_mut().find(|(entry, _)| *entry == class) {
+                highlights.push(InlayHighlight {
+                    inlay: inlay.id,
+                    inlay_position: position,
+                    range: 0..LAMP_TEXT.len(),
+                });
+            }
+            self.lamp_ids.push(inlay.id);
+            inlays.push(inlay);
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(&to_remove, inlays, cx);
+            for (class, highlights) in by_class {
+                editor.highlight_inlays(class.lamp_key(), highlights, class.style(cx), cx);
+            }
+        });
     }
 
     /// The row under the cursor.
@@ -245,6 +297,14 @@ impl DashClass {
             DashClass::Urgent => 5,
         };
         HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + slot)
+    }
+
+    /// A parallel key space for lamp inlay highlights.
+    fn lamp_key(self) -> HighlightKey {
+        let HighlightKey::SyntaxTreeView(slot) = self.key() else {
+            unreachable!("dashboard keys are syntax-tree-view keys");
+        };
+        HighlightKey::SyntaxTreeView(slot + DashClass::ALL.len())
     }
 
     fn style(self, cx: &App) -> HighlightStyle {
@@ -348,6 +408,8 @@ struct Layout {
     text: String,
     rows: Vec<RowTarget>,
     spans: Vec<(DashClass, Range<usize>)>,
+    /// Attention lamps: byte offset at a row's end and the level to show.
+    lamps: Vec<(usize, UiAttention)>,
 }
 
 /// Serializes the registry into the dashboard listing: text, one row
@@ -357,6 +419,7 @@ fn generate(registry: &AgentRegistry) -> Layout {
         text: String::new(),
         rows: Vec::new(),
         spans: Vec::new(),
+        lamps: Vec::new(),
     };
     let (listed, folded) = registry.split_rows();
     for row in rail_rows(listed, folded, registry.rail_tail_expanded()) {
@@ -445,19 +508,9 @@ fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry, layout
     if grouped {
         layout.span(None, |text| text.push_str("  "));
     }
-    let glyph_class = if selected {
-        Some(DashClass::Selected)
-    } else if let Some(lamp) = DashClass::lamp(attention) {
-        Some(lamp)
-    } else if topic.pinned {
-        None
-    } else {
-        Some(DashClass::Muted)
-    };
-    layout.span(glyph_class, |text| {
-        text.push(if topic.pinned { '◆' } else { '●' })
-    });
-    layout.span(None, |text| text.push(' '));
+    if topic.pinned {
+        layout.span(None, |text| text.push_str("◆ "));
+    }
     let title_class = if selected {
         Some(DashClass::Selected)
     } else if attention >= UiAttention::Pending {
@@ -485,6 +538,10 @@ fn task_line(topic: &Workstream, grouped: bool, registry: &AgentRegistry, layout
         layout.span(Some(DashClass::Muted), |text| {
             text.push_str(&format!("+{overflow}"))
         });
+    }
+    // The attention lamp hangs off the row's right end as an inlay.
+    if attention > UiAttention::Quiet {
+        layout.lamps.push((layout.text.len(), attention));
     }
     layout.text.push('\n');
 }

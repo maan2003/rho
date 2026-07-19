@@ -157,6 +157,7 @@ pub struct Workspace {
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
     _event_task: Task<()>,
+    _dashboard_subscription: gpui::Subscription,
 }
 
 /// Which workstream operation a transient prompt collects a name for.
@@ -202,6 +203,21 @@ impl Workspace {
             }
         });
 
+        let dashboard = crate::dashboard::Dashboard::new(window, cx);
+        // The preview follows the dashboard cursor: any local selection
+        // change while the dashboard is focused re-aims the panes.
+        let dashboard_subscription = cx.subscribe_in(
+            dashboard.editor(),
+            window,
+            |this, _, event: &editor::EditorEvent, window, cx| {
+                if matches!(
+                    event,
+                    editor::EditorEvent::SelectionsChanged { local: true }
+                ) {
+                    this.dashboard_cursor_moved(window, cx);
+                }
+            },
+        );
         let mut this = Self {
             connection,
             store: AgentStore::default(),
@@ -218,7 +234,7 @@ impl Workspace {
             contexts: HashMap::new(),
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
-            dashboard: crate::dashboard::Dashboard::new(window, cx),
+            dashboard,
             minibuffer: None,
             transient: None,
             transient_stack: Vec::new(),
@@ -227,6 +243,7 @@ impl Workspace {
             transient_reveal: None,
             echo: None,
             _event_task: event_task,
+            _dashboard_subscription: dashboard_subscription,
         };
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
         this.display_surface(draft);
@@ -1297,6 +1314,34 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.select_agent_inner(agent_id, true, window, cx);
+    }
+
+    /// Selects and displays an agent (or the draft) without moving keyboard
+    /// focus: the dashboard's preview — the cursor stays home, the panes
+    /// follow it.
+    fn preview_agent(
+        &mut self,
+        agent_id: Option<AgentId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(agent_id) = agent_id
+            && self.connected
+            && !self.registry.is_live(agent_id)
+        {
+            self.connection.send(ClientMessage::LoadAgent { agent_id });
+        }
+        self.select_agent_inner(agent_id, false, window, cx);
+    }
+
+    fn select_agent_inner(
+        &mut self,
+        agent_id: Option<AgentId>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(agent_id) = &agent_id {
             let view = self.materialize_model(agent_id, cx);
             view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
@@ -1317,10 +1362,34 @@ impl Workspace {
         self.active_context = context;
         let surface = self.make_surface(key, window, cx);
         self.display_surface(surface);
-        self.focus_active_surface(window, cx);
+        if focus {
+            self.focus_active_surface(window, cx);
+        }
         self.connection.focus_agent(agent_id);
         self.ensure_duration_timer(cx);
         cx.notify();
+    }
+
+    /// The dashboard cursor moved: preview the row it landed on. Only
+    /// while the dashboard owns the keyboard — programmatic cursor
+    /// restoration and unfocused syncs never drive the panes.
+    fn dashboard_cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::dashboard::RowTarget;
+        if !self.dashboard.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        match self.dashboard.cursor_target(cx) {
+            Some(RowTarget::Stream {
+                primary: Some(agent_id),
+                ..
+            }) if self.registry.selected_agent() != Some(&agent_id) => {
+                self.preview_agent(Some(agent_id), window, cx);
+            }
+            Some(RowTarget::NewAgent) if self.registry.selected_agent().is_some() => {
+                self.preview_agent(None, window, cx);
+            }
+            _ => {}
+        }
     }
 
     /// The active context's surface with the given key, whether or not
