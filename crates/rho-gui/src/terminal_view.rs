@@ -421,7 +421,18 @@ impl Render for TerminalView {
             .text_size(font_size)
             .line_height(line_height)
             .child(div().absolute().size_full().child(measure))
-            .child(div().flex().flex_col().children(rows))
+            // The grid paints in an absolute layer: pty content is sized by
+            // the pane, never the other way around, so a wide row can only
+            // be clipped — it can't push the split.
+            .child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
             .children(normal_badge)
             .children(status.map(|status| {
                 div()

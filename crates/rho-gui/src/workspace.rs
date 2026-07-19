@@ -2127,10 +2127,13 @@ impl Workspace {
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
             let id = pane.id;
             let content = self.render_surface(&pane.surface);
+            // `flex: 1 1 0` — basis zero, so splits share space by pane
+            // count alone and content (a terminal's widest row) can never
+            // move a split edge.
             div()
                 .h_full()
                 .overflow_hidden()
-                .flex_grow(1.0)
+                .flex_1()
                 .min_w_0()
                 .min_h_0()
                 .on_mouse_down(
@@ -2147,7 +2150,7 @@ impl Workspace {
                 .into_any_element()
         };
         let mut container = |axis: SplitAxis, children: Vec<gpui::AnyElement>| {
-            let element = div().flex().size_full().flex_grow(1.0).min_h_0().min_w_0();
+            let element = div().flex().size_full().flex_1().min_h_0().min_w_0();
             let element = match axis {
                 SplitAxis::Row => element.flex_row(),
                 SplitAxis::Column => element.flex_col(),
