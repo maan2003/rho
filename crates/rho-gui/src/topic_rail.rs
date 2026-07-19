@@ -41,21 +41,11 @@ pub fn render_topic_rail(
     let selected_agent = registry.selected_agent().cloned();
 
     let (listed, folded) = registry.split_rows();
-    let expanded = registry.rail_tail_expanded();
-    // Expansion merges the folded tail back before grouping, so a group
-    // split across the fold reunites instead of repeating its header.
-    let display = if expanded {
-        listed.iter().chain(folded.iter()).copied().collect()
-    } else {
-        listed
-    };
-    // A group section anchors at its best-sorted member's position and
-    // gathers the rest of the group up to it; ungrouped rows stay put.
-    let mut rows: Vec<Div> = Vec::new();
-    let mut seen_groups = std::collections::BTreeSet::new();
-    for (index, topic) in display.iter().enumerate() {
-        let row = |topic, grouped: bool, cx: &mut Context<Workspace>| {
-            task_row(
+    let rows = rail_rows(listed, folded, registry.rail_tail_expanded())
+        .into_iter()
+        .map(|row| match row {
+            RailRow::GroupHeader(group) => group_header(group, text_style),
+            RailRow::Task { topic, grouped } => task_row(
                 topic,
                 grouped,
                 selected_agent.as_ref(),
@@ -65,29 +55,13 @@ pub fn render_topic_rail(
                 tag_background,
                 lamps,
                 cx,
-            )
-        };
-        match &topic.group {
-            None => rows.push(row(topic, false, cx)),
-            Some(group) => {
-                if !seen_groups.insert(group.clone()) {
-                    continue;
-                }
-                rows.push(group_header(group, text_style));
-                for member in display[index..]
-                    .iter()
-                    .filter(|member| member.group.as_ref() == Some(group))
-                {
-                    rows.push(row(member, true, cx));
-                }
-            }
-        }
-    }
-    // The quiet tail collapses behind a "n more" row; clicking expands the
-    // folded rows in place (and again to fold them back).
-    if !folded.is_empty() {
-        rows.push(fold_row(folded.len(), expanded, text_style, cx));
-    }
+            ),
+            RailRow::FoldToggle {
+                folded_count,
+                expanded,
+            } => fold_row(folded_count, expanded, text_style, cx),
+        })
+        .collect::<Vec<_>>();
 
     div()
         .id("rho-gui-topic-rail")
@@ -125,6 +99,72 @@ pub fn render_topic_rail(
 
 /// How many member tags a task row shows before collapsing into `+n`.
 const VISIBLE_TAGS: usize = 4;
+
+/// One row of the assembled rail, in display order.
+#[derive(Debug, PartialEq)]
+pub enum RailRow<'a> {
+    /// A workstream-group section starts; its member tasks follow.
+    GroupHeader(&'a str),
+    Task {
+        topic: &'a Workstream,
+        grouped: bool,
+    },
+    /// The quiet tail's "n more" / "fold" toggle.
+    FoldToggle { folded_count: usize, expanded: bool },
+}
+
+/// Assembles the rail from the split rows: the whole rail structure as
+/// plain data, decided here and only painted by the caller.
+///
+/// Expansion merges the folded tail back before grouping, so a group split
+/// across the fold reunites instead of repeating its header. A group
+/// section anchors at its best-sorted member's position and gathers the
+/// rest of the group up to it; ungrouped rows stay put. A non-empty tail
+/// trails as the fold toggle.
+fn rail_rows<'a>(
+    listed: Vec<&'a Workstream>,
+    folded: Vec<&'a Workstream>,
+    expanded: bool,
+) -> Vec<RailRow<'a>> {
+    let folded_count = folded.len();
+    let display = if expanded {
+        listed.into_iter().chain(folded).collect()
+    } else {
+        listed
+    };
+    let mut rows = Vec::new();
+    let mut seen_groups = std::collections::BTreeSet::new();
+    for (index, topic) in display.iter().enumerate() {
+        match &topic.group {
+            None => rows.push(RailRow::Task {
+                topic,
+                grouped: false,
+            }),
+            Some(group) => {
+                if !seen_groups.insert(group.clone()) {
+                    continue;
+                }
+                rows.push(RailRow::GroupHeader(group));
+                rows.extend(
+                    display[index..]
+                        .iter()
+                        .filter(|member| member.group.as_ref() == Some(group))
+                        .map(|member| RailRow::Task {
+                            topic: member,
+                            grouped: true,
+                        }),
+                );
+            }
+        }
+    }
+    if folded_count > 0 {
+        rows.push(RailRow::FoldToggle {
+            folded_count,
+            expanded,
+        });
+    }
+    rows
+}
 
 /// A workstream-group's section header: a dim line with the group's name;
 /// its member rows indent beneath it.
@@ -239,6 +279,74 @@ mod tests {
             }],
             topic.agents.clone(),
         );
+    }
+
+    /// Bare workstream fixture for row-assembly tests: identity and group
+    /// only, no members.
+    fn stream(id: u64, group: Option<&str>) -> Workstream {
+        Workstream {
+            workstream_id: WorkstreamId(id),
+            name: format!("ws-{id}"),
+            pinned: false,
+            hidden: false,
+            group: group.map(str::to_owned),
+            agents: Vec::new(),
+        }
+    }
+
+    fn ids(rows: &[RailRow<'_>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                RailRow::GroupHeader(group) => format!("[{group}]"),
+                RailRow::Task { topic, grouped } => {
+                    format!("{}{}", if *grouped { "  " } else { "" }, topic.name)
+                }
+                RailRow::FoldToggle {
+                    folded_count,
+                    expanded,
+                } => format!("fold({folded_count},{expanded})"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn groups_anchor_at_first_member_and_gather_the_rest() {
+        let rows = [
+            stream(1, None),
+            stream(2, Some("infra")),
+            stream(3, None),
+            stream(4, Some("infra")),
+        ];
+        let assembled = rail_rows(rows.iter().collect(), Vec::new(), false);
+        assert_eq!(
+            ids(&assembled),
+            ["ws-1", "[infra]", "  ws-2", "  ws-4", "ws-3"]
+        );
+    }
+
+    #[test]
+    fn expansion_reunites_a_group_split_across_the_fold() {
+        let listed = [stream(1, Some("infra")), stream(2, None)];
+        let folded = [stream(3, Some("infra"))];
+
+        let collapsed = rail_rows(listed.iter().collect(), folded.iter().collect(), false);
+        assert_eq!(
+            ids(&collapsed),
+            ["[infra]", "  ws-1", "ws-2", "fold(1,false)"]
+        );
+
+        let expanded = rail_rows(listed.iter().collect(), folded.iter().collect(), true);
+        assert_eq!(
+            ids(&expanded),
+            ["[infra]", "  ws-1", "  ws-3", "ws-2", "fold(1,true)"]
+        );
+    }
+
+    #[test]
+    fn empty_tail_gets_no_fold_toggle() {
+        let listed = [stream(1, None)];
+        let assembled = rail_rows(listed.iter().collect(), Vec::new(), false);
+        assert_eq!(ids(&assembled), ["ws-1"]);
     }
 
     #[test]
