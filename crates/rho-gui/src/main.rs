@@ -3,7 +3,6 @@
 mod agent_view;
 mod banner;
 mod chime;
-mod command;
 mod commands;
 mod connection;
 mod draft_view;

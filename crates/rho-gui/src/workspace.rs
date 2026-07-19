@@ -143,6 +143,12 @@ pub struct Workspace {
     /// via `transient_focus` while shown.
     transient: Option<crate::transient::Transient>,
     transient_focus: gpui::FocusHandle,
+    /// Menus stay invisible for a beat so fast fingers never see them;
+    /// pausing reveals the full menu. Submenus opened from a visible menu
+    /// show immediately.
+    transient_visible: bool,
+    /// Timer that reveals the pending menu; dropped on close.
+    transient_reveal: Option<Task<()>>,
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
@@ -212,6 +218,8 @@ impl Workspace {
             minibuffer: None,
             transient: None,
             transient_focus: cx.focus_handle(),
+            transient_visible: false,
+            transient_reveal: None,
             echo: None,
             _event_task: event_task,
         };
@@ -700,275 +708,282 @@ impl Workspace {
         })
     }
 
-    fn handle_command(
-        &mut self,
-        source_agent: Option<AgentId>,
-        command: crate::command::Command,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::command::Command;
-        if !self.connected && !matches!(command, Command::Quit | Command::Version) {
+    /// Every command a transient can run goes through one of these
+    /// `cmd_*` methods: no textual grammar, no dispatch enum — the menu
+    /// item closure is the command.
+    fn require_connected(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.connected {
             self.notice_on(
-                source_agent.as_ref(),
+                None,
                 "not connected to rho-daemon",
                 StyleClass::SystemInfo,
                 cx,
             );
+        }
+        self.connected
+    }
+
+    /// The selected agent, or a `{verb}: no agent selected` notice.
+    fn selected_or_notice(&mut self, verb: &str, cx: &mut Context<Self>) -> Option<AgentId> {
+        let selected = self.registry.selected_agent().copied();
+        if selected.is_none() {
+            let message = format!("{verb}: no agent selected");
+            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+        }
+        selected
+    }
+
+    pub(crate) fn cmd_agent_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.require_connected(cx) {
+            self.enter_draft(None, window, cx);
+        }
+    }
+
+    pub(crate) fn cmd_agent_cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
             return;
         }
-        match command {
-            Command::AgentNew { working_directory } => {
-                self.enter_draft(working_directory, window, cx);
-            }
-            Command::AgentCancel => {
-                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
-                match target {
-                    Some(agent_id) => {
-                        self.connection.send(ClientMessage::CancelTurn { agent_id });
-                    }
-                    None => self.notice_on(
-                        None,
-                        "cancel: no agent selected",
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            }
-            Command::Rewind { turns } => {
-                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
-                match target {
-                    Some(agent_id) => {
-                        self.connection
-                            .send(ClientMessage::RewindAgent { agent_id, turns });
-                    }
-                    None => self.notice_on(
-                        None,
-                        "rewind: no agent selected",
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            }
-            Command::Continue => {
-                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
-                match target {
-                    Some(agent_id) => {
-                        self.connection
-                            .send(ClientMessage::ContinueTurn { agent_id });
-                    }
-                    None => self.notice_on(
-                        None,
-                        "continue: no agent selected",
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            }
-            Command::Compact => {
-                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
-                match target {
-                    Some(agent_id) => {
-                        self.connection.send(ClientMessage::CompactAgent {
-                            agent_id,
-                            delivery: rho_ui_proto::MessageDelivery::NextTurn,
-                        });
-                        self.notice_on(
-                            source_agent.as_ref(),
-                            "compacting context",
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                    }
-                    None => self.notice_on(
-                        None,
-                        "compact: no agent selected",
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            }
-            Command::AgentRename { name } => {
-                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
-                match target {
-                    Some(agent_id) => {
-                        self.connection
-                            .send(ClientMessage::RenameAgent { agent_id, name });
-                    }
-                    None => self.notice_on(
-                        None,
-                        "rename: no agent selected",
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            }
-            Command::AgentChangePromptCacheKey => {
-                let target = source_agent.or_else(|| self.registry.selected_agent().cloned());
-                match target {
-                    Some(agent_id) => {
-                        self.connection
-                            .send(ClientMessage::ChangePromptCacheKey { agent_id });
-                        self.notice_on(
-                            source_agent.as_ref(),
-                            "changed prompt cache key",
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                    }
-                    None => self.notice_on(
-                        None,
-                        "change-prompt-cache-key: no agent selected",
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            }
-            Command::TagRename { name } => {
-                let Some(tag_id) = self.focused_workstream(source_agent) else {
-                    self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
-                    return;
-                };
+        if let Some(agent_id) = self.selected_or_notice("cancel", cx) {
+            self.connection.send(ClientMessage::CancelTurn { agent_id });
+        }
+    }
+
+    pub(crate) fn cmd_rewind(&mut self, turns: u32, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        if let Some(agent_id) = self.selected_or_notice("rewind", cx) {
+            self.connection
+                .send(ClientMessage::RewindAgent { agent_id, turns });
+        }
+    }
+
+    pub(crate) fn cmd_continue_turn(&mut self, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        if let Some(agent_id) = self.selected_or_notice("continue", cx) {
+            self.connection
+                .send(ClientMessage::ContinueTurn { agent_id });
+        }
+    }
+
+    pub(crate) fn cmd_compact(&mut self, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        if let Some(agent_id) = self.selected_or_notice("compact", cx) {
+            self.connection.send(ClientMessage::CompactAgent {
+                agent_id,
+                delivery: rho_ui_proto::MessageDelivery::NextTurn,
+            });
+            self.notice_on(
+                Some(&agent_id),
+                "compacting context",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
+    }
+
+    pub(crate) fn cmd_agent_rename(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        if let Some(agent_id) = self.selected_or_notice("rename", cx) {
+            self.connection
+                .send(ClientMessage::RenameAgent { agent_id, name });
+        }
+    }
+
+    pub(crate) fn cmd_change_prompt_cache_key(&mut self, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        if let Some(agent_id) = self.selected_or_notice("change-prompt-cache-key", cx) {
+            self.connection
+                .send(ClientMessage::ChangePromptCacheKey { agent_id });
+            self.notice_on(
+                Some(&agent_id),
+                "changed prompt cache key",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
+    }
+
+    pub(crate) fn cmd_tag_rename(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let selected = self.registry.selected_agent().copied();
+        let Some(tag_id) = self.focused_workstream(selected) else {
+            self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
+            return;
+        };
+        self.connection
+            .send(ClientMessage::RenameTag { tag_id, name });
+    }
+
+    pub(crate) fn cmd_agent_done(
+        &mut self,
+        hide: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let disposition = if hide {
+            rho_ui_proto::AgentDisposition::Hidden
+        } else {
+            rho_ui_proto::AgentDisposition::Done
+        };
+        let selected = self.registry.selected_agent().copied();
+        let agent_id = self.set_agent_disposition(selected, "done", disposition, cx);
+        // Hiding the open agent closes its tab, or it would stay
+        // rail-visible through the selection exemption.
+        if hide && agent_id.is_some() && agent_id.as_ref() == self.registry.selected_agent() {
+            self.select_agent(None, window, cx);
+        }
+    }
+
+    pub(crate) fn cmd_agent_snooze(&mut self, duration_ms: u64, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let until = rho_core::UnixMs(now_ms().saturating_add(duration_ms));
+        let selected = self.registry.selected_agent().copied();
+        self.set_agent_disposition(
+            selected,
+            "snooze",
+            rho_ui_proto::AgentDisposition::Snoozed { until },
+            cx,
+        );
+    }
+
+    pub(crate) fn cmd_agent_pin(&mut self, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let selected = self.registry.selected_agent().copied();
+        self.toggle_agent_status(selected, rho_ui_proto::Status::Pinned, cx);
+    }
+
+    pub(crate) fn cmd_tag_pin(&mut self, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let selected = self.registry.selected_agent().copied();
+        self.toggle_workstream_status(selected, None, rho_ui_proto::Status::Pinned, cx);
+    }
+
+    pub(crate) fn cmd_tag_move(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let selected = self.registry.selected_agent().copied();
+        self.tag_by_name(selected, name, rho_ui_proto::TagKind::Workstream, cx);
+    }
+
+    pub(crate) fn cmd_tag_group(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let selected = self.registry.selected_agent().copied();
+        self.tag_by_name(selected, name, rho_ui_proto::TagKind::WorkstreamGroup, cx);
+    }
+
+    pub(crate) fn cmd_tag_label(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let selected = self.registry.selected_agent().copied();
+        self.tag_by_name(selected, name, rho_ui_proto::TagKind::Label, cx);
+    }
+
+    pub(crate) fn cmd_tag_unlabel(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let Some(agent_id) = self.selected_or_notice("unlabel", cx) else {
+            return;
+        };
+        match resolve_tag(&name, &self.tag_labels(rho_ui_proto::TagKind::Label)) {
+            Some(tag_id) => {
                 self.connection
-                    .send(ClientMessage::RenameTag { tag_id, name });
+                    .send(ClientMessage::UntagAgent { agent_id, tag_id });
             }
-            Command::AgentDone { hide } => {
-                let disposition = if hide {
-                    rho_ui_proto::AgentDisposition::Hidden
-                } else {
-                    rho_ui_proto::AgentDisposition::Done
-                };
-                let agent_id = self.set_agent_disposition(source_agent, "done", disposition, cx);
-                // Hiding the open agent closes its tab, or it would stay
-                // rail-visible through the selection exemption.
-                if hide && agent_id.is_some() && agent_id.as_ref() == self.registry.selected_agent()
-                {
-                    self.select_agent(None, window, cx);
-                }
-            }
-            Command::AgentSnooze { duration_ms } => {
-                let until = rho_core::UnixMs(now_ms().saturating_add(duration_ms));
-                self.set_agent_disposition(
-                    source_agent,
-                    "snooze",
-                    rho_ui_proto::AgentDisposition::Snoozed { until },
-                    cx,
-                );
-            }
-            Command::AgentPin => {
-                self.toggle_agent_status(source_agent, rho_ui_proto::Status::Pinned, cx);
-            }
-            Command::TagPin { name } => {
-                self.toggle_workstream_status(source_agent, name, rho_ui_proto::Status::Pinned, cx);
-            }
-            Command::TagMove { name } => {
-                self.tag_by_name(source_agent, name, rho_ui_proto::TagKind::Workstream, cx);
-            }
-            Command::TagGroup { name } => {
-                self.tag_by_name(
-                    source_agent,
-                    name,
-                    rho_ui_proto::TagKind::WorkstreamGroup,
-                    cx,
-                );
-            }
-            Command::TagLabel { name } => {
-                self.tag_by_name(source_agent, name, rho_ui_proto::TagKind::Label, cx);
-            }
-            Command::TagUnlabel { name } => {
-                let target = source_agent.or_else(|| self.registry.selected_agent().copied());
-                let Some(agent_id) = target else {
-                    self.notice_on(
-                        None,
-                        "unlabel: no agent selected",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                };
-                match crate::command::resolve_tag(
-                    &name,
-                    &self.tag_labels(rho_ui_proto::TagKind::Label),
-                ) {
-                    Some(tag_id) => {
-                        self.connection
-                            .send(ClientMessage::UntagAgent { agent_id, tag_id });
-                    }
-                    None => {
-                        let message = format!("no label named `{name}`");
-                        self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
-                    }
-                }
-            }
-            Command::ProjectAdd {
-                path,
-                name,
-                description,
-            } => {
-                // Unlike the CLI, the GUI may run on another machine, so
-                // there is no local directory to default to.
-                let Some(path) = path else {
-                    self.notice_on(
-                        source_agent.as_ref(),
-                        "projects add: path required",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                };
-                self.connection.send(ClientMessage::ProjectSet {
-                    path: self.resolve_workdir_path(path),
-                    name,
-                    description,
-                });
-            }
-            Command::ProjectRemove { path } => {
-                match crate::command::resolve_workdir(&path, &self.workdir_table()) {
-                    Some(path) => {
-                        self.connection
-                            .send(ClientMessage::ProjectRemove { path: path.into() });
-                    }
-                    None => {
-                        let message = format!("no registered project `{path}`");
-                        self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
-                    }
-                }
-            }
-            Command::Open { path } => {
-                let target = source_agent.or_else(|| self.registry.selected_agent().copied());
-                let Some(agent_id) = target else {
-                    self.notice_on(None, "open: no agent selected", StyleClass::SystemInfo, cx);
-                    return;
-                };
-                let Some(workspace) = self.registry.agent_workspace(agent_id).cloned() else {
-                    self.notice_on(
-                        None,
-                        "open: agent has no workspace",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                };
-                self.open_file_surface(agent_id, workspace, path, cx);
-            }
-            Command::Term { new } => {
-                let target = source_agent.or_else(|| self.registry.selected_agent().copied());
-                let Some(agent_id) = target else {
-                    self.notice_on(None, "term: no agent selected", StyleClass::SystemInfo, cx);
-                    return;
-                };
-                self.open_terminal_surface(agent_id, new, cx);
-            }
-            Command::Quit => cx.quit(),
-            Command::Version => {
-                self.notice_on(
-                    source_agent.as_ref(),
-                    env!("CARGO_PKG_VERSION"),
-                    StyleClass::SystemInfo,
-                    cx,
-                );
+            None => {
+                let message = format!("no label named `{name}`");
+                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             }
         }
+    }
+
+    pub(crate) fn cmd_project_add(
+        &mut self,
+        path: Utf8PathBuf,
+        name: Option<String>,
+        description: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        self.connection.send(ClientMessage::ProjectSet {
+            path: self.resolve_workdir_path(path),
+            name,
+            description,
+        });
+    }
+
+    pub(crate) fn cmd_project_remove(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        match resolve_workdir(&path, &self.workdir_table()) {
+            Some(path) => {
+                self.connection
+                    .send(ClientMessage::ProjectRemove { path: path.into() });
+            }
+            None => {
+                let message = format!("no registered project `{path}`");
+                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+            }
+        }
+    }
+
+    pub(crate) fn cmd_open(&mut self, path: Utf8PathBuf, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let Some(agent_id) = self.selected_or_notice("open", cx) else {
+            return;
+        };
+        let Some(workspace) = self.registry.agent_workspace(agent_id).cloned() else {
+            self.notice_on(
+                None,
+                "open: agent has no workspace",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        self.open_file_surface(agent_id, workspace, path, cx);
+    }
+
+    pub(crate) fn cmd_term(&mut self, new: bool, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        if let Some(agent_id) = self.selected_or_notice("term", cx) {
+            self.open_terminal_surface(agent_id, new, cx);
+        }
+    }
+
+    pub(crate) fn cmd_version(&mut self, cx: &mut Context<Self>) {
+        self.notice_on(None, env!("CARGO_PKG_VERSION"), StyleClass::SystemInfo, cx);
     }
 
     /// Opens the draft compose view. `working_directory` is an explicit
@@ -1027,7 +1042,7 @@ impl Workspace {
             self.notice_on(None, "no agent selected", StyleClass::SystemInfo, cx);
             return;
         };
-        let status = crate::command::toggle_status(self.registry.agent_status(agent_id), target);
+        let status = toggle_status(self.registry.agent_status(agent_id), target);
         self.connection
             .send(ClientMessage::SetAgentStatus { agent_id, status });
     }
@@ -1115,7 +1130,7 @@ impl Workspace {
             .find(|workstream| workstream.tag_id == tag_id)
             .map(|workstream| workstream.status)
             .unwrap_or(rho_ui_proto::Status::Normal);
-        let status = crate::command::toggle_status(current, target);
+        let status = toggle_status(current, target);
         self.connection
             .send(ClientMessage::SetTagStatus { tag_id, status });
     }
@@ -1128,10 +1143,8 @@ impl Workspace {
     ) -> Option<rho_ui_proto::TagId> {
         match &name {
             Some(name) => {
-                let resolved = crate::command::resolve_tag(
-                    name,
-                    &self.tag_labels(rho_ui_proto::TagKind::Workstream),
-                );
+                let resolved =
+                    resolve_tag(name, &self.tag_labels(rho_ui_proto::TagKind::Workstream));
                 if resolved.is_none() {
                     let message = format!("no workstream named `{name}`");
                     self.notice_on(source_agent.as_ref(), &message, StyleClass::SystemInfo, cx);
@@ -1257,7 +1270,7 @@ impl Workspace {
     /// so the GUI never joins its own cwd or expands its own home — the
     /// daemon expands `~` and validates.
     fn resolve_workdir_path(&self, path: Utf8PathBuf) -> Utf8PathBuf {
-        crate::command::resolve_workdir(path.as_str(), &self.workdir_table())
+        resolve_workdir(path.as_str(), &self.workdir_table())
             .map(Utf8PathBuf::from)
             .unwrap_or(path)
     }
@@ -2014,24 +2027,17 @@ impl Workspace {
         let mut minibuffer = Minibuffer::open(prompt, &text_style, complete, on_submit, window, cx);
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
-        self.transient = None;
+        self.drop_transient();
         // The strip is single-occupancy; a stale message reappearing after
         // the prompt closes would be confusing.
         self.echo = None;
         cx.notify();
     }
 
-    /// Runs a command as if fully typed: the single dispatch point shared
-    /// by transient items and the (legacy) `:` command line.
-    pub(crate) fn dispatch_command(
-        &mut self,
-        command: crate::command::Command,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let agent_id = self.registry.selected_agent().copied();
-        self.handle_command(agent_id, command, window, cx);
-    }
+    /// How long a transient stays invisible before revealing itself: long
+    /// enough that a practiced chord never flashes the menu, short enough
+    /// that a hesitation is answered.
+    const TRANSIENT_REVEAL: std::time::Duration = std::time::Duration::from_millis(400);
 
     pub(crate) fn open_transient(
         &mut self,
@@ -2039,15 +2045,40 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A submenu opened from a menu the user was already reading shows
+        // immediately; a fresh menu waits out the reveal delay. The flag
+        // alone decides: `transient_key` keeps it up across an action so
+        // inheritance works even though the parent is already cleared.
+        let visible = self.transient_visible;
         self.transient = Some(transient);
+        self.transient_visible = visible;
+        self.transient_reveal = (!visible).then(|| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Self::TRANSIENT_REVEAL).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.transient.is_some() {
+                        this.transient_visible = true;
+                        cx.notify();
+                    }
+                });
+            })
+        });
         self.minibuffer = None;
         self.echo = None;
         window.focus(&self.transient_focus, cx);
         cx.notify();
     }
 
+    /// Clears the menu and its reveal state without touching focus.
+    fn drop_transient(&mut self) {
+        self.transient = None;
+        self.transient_visible = false;
+        self.transient_reveal = None;
+    }
+
     fn close_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.transient.take().is_some() {
+        if self.transient.is_some() {
+            self.drop_transient();
             self.focus_active_surface(window, cx);
             cx.notify();
         }
@@ -2080,11 +2111,16 @@ impl Workspace {
         }
         match transient.action_for(keystroke) {
             Some(run) => {
-                self.transient = None;
+                // A chord typed through an invisible menu keeps submenus
+                // invisible too: remember visibility across the action.
+                let was_visible = self.transient_visible;
+                self.drop_transient();
+                self.transient_visible = was_visible;
                 // Restore focus first so the action sees normal focus;
                 // submenus and prompts re-take the strip themselves.
                 self.focus_active_surface(window, cx);
                 run(self, window, cx);
+                self.transient_visible = self.transient.is_some() && was_visible;
                 cx.notify();
             }
             None => self.close_transient(window, cx),
@@ -2097,15 +2133,11 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             window: &mut Window,
+             _window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let name = input.trim().to_owned();
                 if !name.is_empty() {
-                    workspace.dispatch_command(
-                        crate::command::Command::AgentRename { name },
-                        window,
-                        cx,
-                    );
+                    workspace.cmd_agent_rename(name, cx);
                 }
             },
         );
@@ -2117,18 +2149,14 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             window: &mut Window,
+             _window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let input = input.trim();
                 if input.is_empty() {
                     return;
                 }
-                match crate::command::parse_duration_ms(input) {
-                    Some(duration_ms) => workspace.dispatch_command(
-                        crate::command::Command::AgentSnooze { duration_ms },
-                        window,
-                        cx,
-                    ),
+                match parse_duration_ms(input) {
+                    Some(duration_ms) => workspace.cmd_agent_snooze(duration_ms, cx),
                     None => workspace.notice_on(
                         None,
                         &format!("snooze: bad duration `{input}` (30m, 2h, 1d)"),
@@ -2170,20 +2198,19 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             move |workspace: &mut Workspace,
                   input: String,
-                  window: &mut Window,
+                  _window: &mut Window,
                   cx: &mut Context<Workspace>| {
                 let name = input.trim().to_owned();
                 if name.is_empty() {
                     return;
                 }
-                let command = match kind {
-                    TagPrompt::Move => crate::command::Command::TagMove { name },
-                    TagPrompt::Group => crate::command::Command::TagGroup { name },
-                    TagPrompt::Label => crate::command::Command::TagLabel { name },
-                    TagPrompt::Unlabel => crate::command::Command::TagUnlabel { name },
-                    TagPrompt::Rename => crate::command::Command::TagRename { name },
-                };
-                workspace.dispatch_command(command, window, cx);
+                match kind {
+                    TagPrompt::Move => workspace.cmd_tag_move(name, cx),
+                    TagPrompt::Group => workspace.cmd_tag_group(name, cx),
+                    TagPrompt::Label => workspace.cmd_tag_label(name, cx),
+                    TagPrompt::Unlabel => workspace.cmd_tag_unlabel(name, cx),
+                    TagPrompt::Rename => workspace.cmd_tag_rename(name, cx),
+                }
             },
         );
         self.open_prompt(kind.prompt(), complete, on_submit, window, cx);
@@ -2195,17 +2222,11 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             window: &mut Window,
+             _window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let path = input.trim().to_owned();
                 if !path.is_empty() {
-                    workspace.dispatch_command(
-                        crate::command::Command::Open {
-                            path: camino::Utf8PathBuf::from(path),
-                        },
-                        window,
-                        cx,
-                    );
+                    workspace.cmd_open(camino::Utf8PathBuf::from(path), cx);
                 }
             },
         );
@@ -2218,7 +2239,7 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             window: &mut Window,
+             _window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let input = input.trim();
                 let turns = if input.is_empty() {
@@ -2227,11 +2248,7 @@ impl Workspace {
                     input.parse::<u32>().ok().filter(|turns| *turns > 0)
                 };
                 match turns {
-                    Some(turns) => workspace.dispatch_command(
-                        crate::command::Command::Rewind { turns },
-                        window,
-                        cx,
-                    ),
+                    Some(turns) => workspace.cmd_rewind(turns, cx),
                     None => workspace.notice_on(
                         None,
                         &format!("rewind: bad turn count `{input}`"),
@@ -2250,7 +2267,7 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             window: &mut Window,
+             _window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let mut tokens = input.split_whitespace();
                 let Some(path) = tokens.next() else {
@@ -2258,15 +2275,7 @@ impl Workspace {
                 };
                 let name = tokens.next().map(str::to_owned);
                 let description = tokens.collect::<Vec<_>>().join(" ");
-                workspace.dispatch_command(
-                    crate::command::Command::ProjectAdd {
-                        path: Some(camino::Utf8PathBuf::from(path)),
-                        name,
-                        description,
-                    },
-                    window,
-                    cx,
-                );
+                workspace.cmd_project_add(camino::Utf8PathBuf::from(path), name, description, cx);
             },
         );
         self.open_prompt("project path [name]:", complete, on_submit, window, cx);
@@ -2291,15 +2300,11 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             window: &mut Window,
+             _window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let path = input.trim().to_owned();
                 if !path.is_empty() {
-                    workspace.dispatch_command(
-                        crate::command::Command::ProjectRemove { path },
-                        window,
-                        cx,
-                    );
+                    workspace.cmd_project_remove(path, cx);
                 }
             },
         );
@@ -2741,11 +2746,16 @@ impl Render for Workspace {
             .child(self.render_panes(&text_style, cx))
             .children(match (&self.minibuffer, &self.transient, &self.echo) {
                 (Some(minibuffer), _, _) => Some(minibuffer.render(&text_style, cx)),
+                // The wrapper mounts (and captures keys) as soon as the
+                // menu opens; the menu itself renders only once revealed.
                 (None, Some(transient), _) => Some(
                     div()
                         .track_focus(&self.transient_focus)
                         .on_key_down(cx.listener(Self::transient_key))
-                        .child(transient.render(&text_style, cx))
+                        .children(
+                            self.transient_visible
+                                .then(|| transient.render(&text_style, cx)),
+                        )
                         .into_any_element(),
                 ),
                 (None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
@@ -2759,6 +2769,54 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// `30m`, `2h`, `1d`; a bare number means minutes.
+fn parse_duration_ms(text: &str) -> Option<u64> {
+    let (digits, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => text.split_at(at),
+        None => (text, "m"),
+    };
+    let count: u64 = digits.parse().ok()?;
+    let minutes = match unit {
+        "m" | "min" => count,
+        "h" | "hr" => count.checked_mul(60)?,
+        "d" => count.checked_mul(60 * 24)?,
+        _ => return None,
+    };
+    minutes.checked_mul(60 * 1000)
+}
+
+/// Toggle semantics for pin commands: applying the state an item is
+/// already in returns it to normal.
+fn toggle_status(
+    current: rho_ui_proto::Status,
+    target: rho_ui_proto::Status,
+) -> rho_ui_proto::Status {
+    if current == target {
+        rho_ui_proto::Status::Normal
+    } else {
+        target
+    }
+}
+
+/// Resolves a tag argument against `(name, id)` pairs; tag names are unique,
+/// so the name is the identity. `None` means no such tag exists yet.
+fn resolve_tag(
+    argument: &str,
+    tags: &[(String, rho_ui_proto::TagId)],
+) -> Option<rho_ui_proto::TagId> {
+    tags.iter()
+        .find(|(name, _)| name == argument)
+        .map(|(_, tag_id)| *tag_id)
+}
+
+/// Resolves a workdir argument (registered name or path) to its path.
+fn resolve_workdir<'a>(argument: &str, workdirs: &'a [(String, String)]) -> Option<&'a str> {
+    workdirs
+        .iter()
+        .find(|(name, path)| name == argument || path == argument)
+        .map(|(_, path)| path.as_str())
 }
 
 #[cfg(test)]
