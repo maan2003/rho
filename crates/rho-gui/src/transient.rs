@@ -126,8 +126,8 @@ fn display_key(spec: &str) -> String {
     }
 }
 
-/// `:` — the root menu: everything that isn't about the current agent,
-/// plus a door into the agent menu.
+/// `space :` — the root menu: everything that isn't about the current
+/// agent, plus a door into the agent menu.
 pub fn root_menu() -> Transient {
     Transient::new("rho")
         .item("a", "agent…", |workspace, window, cx| {

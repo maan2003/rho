@@ -477,9 +477,9 @@ fn bind_rho_key_overrides(cx: &mut App) {
             // The agent transient: `space a d` marks done, `space a` alone
             // shows the menu.
             KeyBinding::new("space a", AgentTransient, Some(context)),
-            // Where vim's command line was: `:` opens the root transient.
-            // Loads after the vim keymap, so it beats any bundled binding.
-            KeyBinding::new(":", RootTransient, Some(context)),
+            // The root menu sits where doom puts M-x; there is no `:`
+            // command line to inherit the bare key.
+            KeyBinding::new("space :", RootTransient, Some(context)),
         ]);
     }
     // Minibuffer keys. The input is a single-line editor (vim skips those),
