@@ -2712,7 +2712,12 @@ impl Workspace {
         // Home mode: the dashboard owns the keyboard, so it owns the frame;
         // the panes are its preview. With nothing selected there is
         // nothing to preview — the dashboard takes the whole frame.
-        let home = self.dashboard.focus_handle(cx).is_focused(window);
+        // An open leader chord parks focus on the transient handle; the
+        // frame stays in the mode the chord began in.
+        let dashboard_handle = self.dashboard.focus_handle(cx);
+        let home = dashboard_handle.is_focused(window)
+            || (self.transient_focus.is_focused(window)
+                && self.transient_origin.as_ref() == Some(&dashboard_handle));
         let show_panes = !home || self.registry.selected_agent().is_some();
         let rail = self.render_rail(home, show_panes, text_style, cx);
         // Same hairline the rail uses against the panes.

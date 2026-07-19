@@ -348,6 +348,11 @@ impl ClaudeLoop {
                         Ok(None) => {
                             self.process = None;
                             self.remove_claude_runtime_files();
+                            // Unechoed sends died with the process; a stale
+                            // entry here would pin every later turn end in
+                            // the streaming state (the rail's lamp never
+                            // settles).
+                            self.queued_turns.clear();
                             // An exit without a result leaves the turn open;
                             // settle it as an error so the turn end is
                             // observable (attention, parent mail).
@@ -364,6 +369,7 @@ impl ClaudeLoop {
                         Err(error) => {
                             self.process = None;
                             self.remove_claude_runtime_files();
+                            self.queued_turns.clear();
                             self.fail(error);
                         }
                     },
@@ -448,6 +454,7 @@ impl ClaudeLoop {
                     });
                 }
                 self.state.write().expect("poison").queued_inputs.clear();
+                self.queued_turns.clear();
                 self.set_kind(AgentStateKind::Idle);
             }
         }
