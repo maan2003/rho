@@ -38,6 +38,7 @@ gpui_tokio = { git = "https://github.com/maan2003/zed", branch = "rho" }
 http_client = { git = "https://github.com/maan2003/zed", branch = "rho" }
 json-stream.workspace = true
 language = { git = "https://github.com/maan2003/zed", branch = "rho" }
+languages = { git = "https://github.com/maan2003/zed", branch = "rho", features = ["load-grammars"] }
 multi_buffer = { git = "https://github.com/maan2003/zed", branch = "rho" }
 prefix-id = { workspace = true, features = ["redb"] }
 node_runtime = { git = "https://github.com/maan2003/zed", branch = "rho" }

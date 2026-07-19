@@ -373,7 +373,7 @@ fn init_app(cx: &mut App) -> Result<()> {
     RhoAssets.load_fonts(cx)?;
     let settings_path = settings_path()?;
     let user_settings = load_or_create_settings(&settings_path)?;
-    let mut store = SettingsStore::new(cx, settings::default_settings().as_ref());
+    let mut store = SettingsStore::new(cx, rho_assets::RHO_DEFAULT_SETTINGS);
     store
         .set_user_settings(&user_settings, cx)
         .result()

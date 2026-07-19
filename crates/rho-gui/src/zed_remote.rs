@@ -74,16 +74,14 @@ pub fn open_remote_project(
             .await?
             .context("remote client connection was cancelled")?;
         let project = cx.update(|cx| {
-            let (client, user_store) = project_deps(cx);
+            let (client, user_store, languages, fs) = project_deps(cx);
             Project::remote(
                 remote_client,
                 client,
                 node_runtime::NodeRuntime::unavailable(),
                 user_store,
-                Arc::new(language::LanguageRegistry::new(
-                    cx.background_executor().clone(),
-                )),
-                Arc::new(fs::RealFs::new(None, cx.background_executor().clone())),
+                languages,
+                fs,
                 false,
                 cx,
             )
@@ -150,8 +148,11 @@ impl FileView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let editor =
-            cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx));
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx);
+            crate::editor_config::configure_file(&mut editor, window, cx);
+            editor
+        });
         Self {
             editor,
             project,
@@ -201,17 +202,29 @@ fn workspace_label(workspace: &WorkspaceInfo) -> String {
     }
 }
 
-/// Client/user-store pair shared by every remote project in this process.
-/// Zed's project layer wants them, but they never talk to collab — the http
-/// client is blocked.
+/// Dependencies shared by every remote project in this process: the
+/// client/user-store pair zed's project layer wants (they never talk to
+/// collab — the http client is blocked), plus one language registry with
+/// the bundled grammars so remote buffers get detection and syntax
+/// highlighting. Language servers stay on the daemon side; the registry
+/// here only ever parses.
 struct RemoteProjectDeps {
     client: Arc<Client>,
     user_store: Entity<UserStore>,
+    languages: Arc<language::LanguageRegistry>,
+    fs: Arc<dyn fs::Fs>,
 }
 
 impl gpui::Global for RemoteProjectDeps {}
 
-fn project_deps(cx: &mut App) -> (Arc<Client>, Entity<UserStore>) {
+fn project_deps(
+    cx: &mut App,
+) -> (
+    Arc<Client>,
+    Entity<UserStore>,
+    Arc<language::LanguageRegistry>,
+    Arc<dyn fs::Fs>,
+) {
     if !cx.has_global::<RemoteProjectDeps>() {
         let http = Arc::new(http_client::HttpClientWithUrl::new(
             Arc::new(http_client::BlockedHttpClient),
@@ -221,10 +234,31 @@ fn project_deps(cx: &mut App) -> (Arc<Client>, Entity<UserStore>) {
         let client = Client::new(Arc::new(clock::RealSystemClock), http, cx);
         let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
         Project::init(&client, cx);
-        cx.set_global(RemoteProjectDeps { client, user_store });
+        let languages = Arc::new(language::LanguageRegistry::new(
+            cx.background_executor().clone(),
+        ));
+        let fs: Arc<dyn fs::Fs> =
+            Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
+        languages::init(
+            languages.clone(),
+            fs.clone(),
+            node_runtime::NodeRuntime::unavailable(),
+            cx,
+        );
+        cx.set_global(RemoteProjectDeps {
+            client,
+            user_store,
+            languages,
+            fs,
+        });
     }
     let deps = cx.global::<RemoteProjectDeps>();
-    (deps.client.clone(), deps.user_store.clone())
+    (
+        deps.client.clone(),
+        deps.user_store.clone(),
+        deps.languages.clone(),
+        deps.fs.clone(),
+    )
 }
 
 /// The transport: envelopes ride a dedicated stream to the daemon. There is

@@ -28,7 +28,9 @@ fn frame_distribution_reports_nearest_rank_percentiles() {
 fn init_test_app(cx: &mut App) {
     gpui_tokio::init(cx);
     assets::Assets.load_test_fonts(cx);
-    let store = SettingsStore::new(cx, settings::default_settings().as_ref());
+    // The vendored defaults, same as production — this also guards the
+    // vendored file against edits that would fail to parse at startup.
+    let store = SettingsStore::new(cx, crate::rho_assets::RHO_DEFAULT_SETTINGS);
     cx.set_global(store);
     theme_settings::init(theme::LoadThemes::JustBase, cx);
     release_channel::init(semver::Version::new(0, 0, 0), cx);

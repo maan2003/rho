@@ -1,6 +1,6 @@
-//! Chrome settings shared by rho's chat-style editors (the agent view and
-//! the draft compose view): no gutters, no scrollbars, soft wrap, no code
-//! assists.
+//! Chrome settings for rho's editors: bare buffers in the frame. Chat
+//! editors (agent view, draft compose) also drop editing affordances;
+//! file editors keep them but shed the same chrome.
 
 use editor::Editor;
 use gpui::{Context, Window};
@@ -24,5 +24,26 @@ pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
     editor.set_autoindent(false);
     editor.set_show_edit_predictions(Some(false), window, cx);
     editor.set_use_selection_highlight(false);
+    editor.disable_expand_excerpt_buttons(cx);
+}
+
+/// Chrome for file buffers: a real code editor dressed as a rho buffer.
+/// Unlike the chat editors it keeps editing behavior (autoindent, mouse
+/// selection, no soft wrap), but sheds every gutter column and overlay —
+/// no line numbers by choice, no scrollbars, no guides.
+pub fn configure_file(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    editor.set_show_gutter(false, cx);
+    editor.set_show_line_numbers(false, cx);
+    editor.set_show_git_diff_gutter(false, cx);
+    editor.set_show_code_actions(false, cx);
+    editor.set_show_runnables(false, cx);
+    editor.set_show_breakpoints(false, cx);
+    editor.set_show_bookmarks(false, cx);
+    editor.set_show_vertical_scrollbar(false, cx);
+    editor.set_show_horizontal_scrollbar(false, cx);
+    editor.set_offset_content(false, cx);
+    editor.set_show_wrap_guides(false, cx);
+    editor.set_show_indent_guides(false, cx);
+    editor.set_show_edit_predictions(Some(false), window, cx);
     editor.disable_expand_excerpt_buttons(cx);
 }
