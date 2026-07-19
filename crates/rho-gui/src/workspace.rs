@@ -155,12 +155,6 @@ pub struct Workspace {
     /// pane. Transient actions run against (and closing returns to) that
     /// origin, so `space a d` from home mode stays in home mode.
     transient_origin: Option<gpui::FocusHandle>,
-    /// Menus stay invisible for a beat so fast fingers never see them;
-    /// pausing reveals the full menu. Submenus opened from a visible menu
-    /// show immediately.
-    transient_visible: bool,
-    /// Timer that reveals the pending menu; dropped on close.
-    transient_reveal: Option<Task<()>>,
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
@@ -258,8 +252,6 @@ impl Workspace {
             transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
             transient_origin: None,
-            transient_visible: false,
-            transient_reveal: None,
             echo: None,
             pending_git_approval: None,
             _event_task: event_task,
@@ -2183,11 +2175,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// How long a transient stays invisible before revealing itself: long
-    /// enough that a practiced chord never flashes the menu, short enough
-    /// that a hesitation is answered.
-    const TRANSIENT_REVEAL: std::time::Duration = std::time::Duration::from_millis(400);
-
     pub(crate) fn open_transient(
         &mut self,
         mut transient: crate::transient::Transient,
@@ -2195,24 +2182,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         transient.retain_applicable(self);
-        // A submenu opened from a menu the user was already reading shows
-        // immediately; a fresh menu waits out the reveal delay. The flag
-        // alone decides: `transient_key` keeps it up across an action so
-        // inheritance works even though the parent is already cleared.
-        let visible = self.transient_visible;
         self.transient = Some(transient);
-        self.transient_visible = visible;
-        self.transient_reveal = (!visible).then(|| {
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Self::TRANSIENT_REVEAL).await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.transient.is_some() {
-                        this.transient_visible = true;
-                        cx.notify();
-                    }
-                });
-            })
-        });
         self.minibuffer = None;
         self.echo = None;
         // Capture the chain's origin on first open; submenu reopens see
@@ -2236,12 +2206,10 @@ impl Workspace {
         }
     }
 
-    /// Clears the menu and its reveal state without touching focus.
+    /// Clears the menu without touching focus.
     fn drop_transient(&mut self) {
         self.transient = None;
         self.transient_stack.clear();
-        self.transient_visible = false;
-        self.transient_reveal = None;
     }
 
     fn close_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2255,8 +2223,7 @@ impl Workspace {
 
     /// Keyboard dispatch while a transient is open: a bound key runs its
     /// action (toggles keep the menu up, submenus stack their parent),
-    /// escape pops one level, and an unbound key reveals the menu instead
-    /// of guessing — the menu itself is the error message.
+    /// escape pops one level; unbound keys leave the menu open.
     fn transient_key(
         &mut self,
         event: &gpui::KeyDownEvent,
@@ -2278,11 +2245,7 @@ impl Workspace {
         if keystroke.key == "escape" {
             match self.transient_stack.pop() {
                 Some(parent) => {
-                    // Deliberate navigation: the popped-to menu shows at
-                    // once, whatever the reveal state was.
                     self.transient = Some(parent);
-                    self.transient_visible = true;
-                    self.transient_reveal = None;
                     cx.notify();
                 }
                 None => self.close_transient(window, cx),
@@ -2293,16 +2256,9 @@ impl Workspace {
         match transient.action_for(keystroke) {
             Some((run, stay)) if stay => {
                 run(self, window, cx);
-                // Interacting with a toggle is engagement: show the menu
-                // that is staying up.
-                self.transient_visible = true;
-                self.transient_reveal = None;
                 cx.notify();
             }
             Some((run, _)) => {
-                // A chord typed through an invisible menu keeps submenus
-                // invisible too: remember visibility across the action.
-                let was_visible = self.transient_visible;
                 let parent = self.transient.take();
                 // Restore focus to the chord's origin first so the action
                 // sees normal focus (and a dashboard chord stays home);
@@ -2313,20 +2269,13 @@ impl Workspace {
                     // The action opened a submenu: its parent waits under
                     // it for escape.
                     self.transient_stack.extend(parent);
-                    self.transient_visible = was_visible;
                 } else {
                     self.transient_stack.clear();
-                    self.transient_visible = false;
-                    self.transient_reveal = None;
                     self.transient_origin = None;
                 }
                 cx.notify();
             }
-            None => {
-                self.transient_visible = true;
-                self.transient_reveal = None;
-                cx.notify();
-            }
+            None => {}
         }
         cx.stop_propagation();
     }
@@ -3468,19 +3417,11 @@ impl Render for Workspace {
             .child(self.render_panes(window, &text_style, cx))
             .children(match (&self.minibuffer, &self.transient, &self.echo) {
                 (Some(minibuffer), _, _) => Some(minibuffer.render(&text_style, cx)),
-                // The wrapper mounts (and captures keys) as soon as the
-                // menu opens; the menu itself renders only once revealed.
                 (None, Some(transient), _) => Some(
                     div()
                         .track_focus(&self.transient_focus)
                         .on_key_down(cx.listener(Self::transient_key))
-                        .child(if self.transient_visible {
-                            transient.render(&text_style, cx)
-                        } else {
-                            // The magit brief summary: keys now, the full
-                            // menu once the reveal delay passes.
-                            transient.render_hint(&text_style, cx)
-                        })
+                        .child(transient.render(&text_style, cx))
                         .into_any_element(),
                 ),
                 (None, None, Some(echo)) => Some(echo.render(&text_style, cx)),

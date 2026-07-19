@@ -3,10 +3,9 @@
 //! A transient is data — a title and rows of (key, label, action) — shown
 //! in the bottom strip while it captures the keyboard. A key either runs a
 //! command and closes, opens a nested transient, or drops into the
-//! minibuffer for a value. Typed fast, `space a d` acts before the menu
-//! registers visually; pausing shows every option. There is no textual
-//! command grammar — commands are Rust values, the menus are how fingers
-//! reach them.
+//! minibuffer for a value. The full menu appears immediately and stays up
+//! for toggles. There is no textual command grammar — commands are Rust
+//! values, the menus are how fingers reach them.
 
 use std::rc::Rc;
 
@@ -105,27 +104,6 @@ impl Transient {
             .iter()
             .find(|item| matches_key(item.key, keystroke))
             .map(|item| (item.run.clone(), item.stay))
-    }
-
-    /// The one-line hint shown while the full menu waits out its reveal
-    /// delay: the menu's name and its keys, magit's brief summary.
-    pub fn render_hint(&self, text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let keys = self
-            .items
-            .iter()
-            .map(|item| display_key(item.key))
-            .collect::<Vec<_>>()
-            .join(" ");
-        bottom_strip(text_style, cx)
-            .child(
-                div()
-                    .px_2()
-                    .text_color(colors.text_muted)
-                    .child(format!("{}:", self.title)),
-            )
-            .child(div().text_color(colors.text_accent).child(keys))
-            .into_any_element()
     }
 
     /// Magit's layout: a title line, then items flowing down short columns
