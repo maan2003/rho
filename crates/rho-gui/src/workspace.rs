@@ -2454,19 +2454,32 @@ impl Workspace {
     }
 
     /// `r` in the dashboard: splice an inline reply draft under the row —
-    /// the cursor moves into it, but never leaves the dashboard. Drafts
-    /// park where they are: wander off mid-thought and come back later.
-    fn dashboard_reply(&mut self, cx: &mut Context<Self>) {
+    /// the cursor moves into it, in insert mode, but never leaves the
+    /// dashboard. Drafts park where they are: wander off mid-thought and
+    /// come back later.
+    fn dashboard_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(cx) {
             Some(RowTarget::Stream {
                 primary: Some(agent_id),
                 ..
-            }) => self.dashboard.open_reply(agent_id, cx),
-            Some(RowTarget::Reply(_)) => {}
+            })
+            | Some(RowTarget::Reply(agent_id)) => {
+                self.dashboard.open_reply(agent_id, cx);
+                self.dashboard_enter_insert(window, cx);
+            }
             _ => {
                 self.notice_on(None, "reply: no agent under the cursor", StyleClass::SystemInfo, cx);
             }
+        }
+    }
+
+    /// A draft was just opened under the cursor: drop the editor into
+    /// insert mode so typing starts immediately (writing is the only
+    /// reason these drafts exist).
+    fn dashboard_enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
+            window.dispatch_action(action, cx);
         }
     }
 
@@ -2821,11 +2834,12 @@ impl Render for Workspace {
                     this.select_agent_inner(None, !in_dashboard, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &DashboardReply, _window, cx| {
-                this.dashboard_reply(cx);
+            .on_action(cx.listener(|this, _: &DashboardReply, window, cx| {
+                this.dashboard_reply(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &DashboardNewAgent, _window, cx| {
+            .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
                 this.dashboard.open_new_draft(cx);
+                this.dashboard_enter_insert(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(

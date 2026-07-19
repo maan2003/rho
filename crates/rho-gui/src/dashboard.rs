@@ -93,6 +93,10 @@ pub struct Dashboard {
     lamp_ids: Vec<InlayId>,
     /// Reply placeholder inlays currently spliced in.
     placeholder_ids: Vec<InlayId>,
+    /// Buffers already registered as headerless with the editor. A
+    /// boundary onto a headerless buffer draws nothing, so this is what
+    /// keeps the per-line excerpts seamless.
+    headers_disabled: std::collections::HashSet<BufferId>,
 }
 
 impl Dashboard {
@@ -112,9 +116,6 @@ impl Dashboard {
                 cx,
             );
             crate::editor_config::configure(&mut editor, window, cx);
-            // Listing lines clip like the rail did; wrapping would break the
-            // line-per-row shape.
-            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
             // Unlike the chat editors, clicking a row to put the cursor on
             // it is the whole point.
             editor.set_mouse_click_selection_enabled(true, cx);
@@ -132,7 +133,28 @@ impl Dashboard {
             pending_cursor: None,
             lamp_ids: Vec::new(),
             placeholder_ids: Vec::new(),
+            headers_disabled: std::collections::HashSet::new(),
         }
+    }
+
+    /// Registers every current buffer as headerless with the editor, so
+    /// excerpt boundaries between the per-line buffers draw no divider.
+    fn ensure_headerless(&mut self, cx: &mut Context<Workspace>) {
+        let new_ids = self
+            .buffers
+            .values()
+            .map(|buffer| buffer.read(cx).remote_id())
+            .filter(|id| !self.headers_disabled.contains(id))
+            .collect::<Vec<_>>();
+        if new_ids.is_empty() {
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            for id in &new_ids {
+                editor.disable_header_for_buffer(*id, cx);
+            }
+        });
+        self.headers_disabled.extend(new_ids);
     }
 
     pub fn editor(&self) -> &Entity<Editor> {
@@ -301,6 +323,8 @@ impl Dashboard {
             }
         }
 
+        self.ensure_headerless(cx);
+
         // Arrange excerpts when the order changed; path keys are display
         // indexes, and a buffer setting a new path leaves its old one.
         let order_changed = order != self.order;
@@ -374,7 +398,9 @@ impl Dashboard {
         let Some(buffer) = self.buffers.get(key) else {
             return;
         };
-        let anchor = buffer.read(cx).anchor_before(0);
+        // Right-biased, like the transcript's prompt anchor: the cursor
+        // stays ahead of same-position inlays (the draft placeholder).
+        let anchor = buffer.read(cx).anchor_after(0);
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let Some(anchor) = snapshot.anchor_in_excerpt(anchor) else {
             return;
@@ -538,7 +564,14 @@ impl Dashboard {
             };
             gutter_ranges.push(start..end);
             if buffer.is_empty() {
-                let inlay = Inlay::custom(PLACEHOLDER_ID_BASE + index, end, placeholder);
+                // Right-biased like the transcript's prompt placeholder, so
+                // the cursor renders before the hint, not after it.
+                let Some(position) =
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(0))
+                else {
+                    continue;
+                };
+                let inlay = Inlay::custom(PLACEHOLDER_ID_BASE + index, position, placeholder);
                 self.placeholder_ids.push(inlay.id);
                 inlays.push(inlay);
             }
