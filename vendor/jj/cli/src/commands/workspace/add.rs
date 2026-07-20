@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::fs;
+use std::io::ErrorKind;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -28,6 +30,8 @@ use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::workspace::Workspace;
+use prefix_id::PrefixId;
+use prefix_id::PrefixIdDomain;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
@@ -105,15 +109,17 @@ pub struct WorkspaceAddArgs {
     ///
     /// The workspace only exists in the repo view, tracking its working-copy
     /// commit like any other workspace. Materialize it into a directory later
-    /// with `jj workspace pool attach`. Requires `--name`.
-    #[arg(long, requires = "name", conflicts_with = "pool")]
+    /// with `jj workspace pool attach`. If `--name` is omitted, jj generates a
+    /// prefix-id workspace name.
+    #[arg(long, conflicts_with = "pool")]
     detached: bool,
 
     /// Create the workspace in a slot of the workspace pool
     ///
     /// Equivalent to creating a detached workspace and running `jj workspace
-    /// pool attach` on it. Requires `--name`.
-    #[arg(long, requires = "name")]
+    /// pool attach` on it. If `--name` is omitted, jj generates a prefix-id
+    /// workspace name.
+    #[arg(long)]
     pool: bool,
 }
 
@@ -124,10 +130,15 @@ pub async fn cmd_workspace_add(
     args: &WorkspaceAddArgs,
 ) -> Result<(), CommandError> {
     if args.detached || args.pool {
-        let workspace_name = args
-            .name
-            .clone()
-            .expect("clap requires --name with --detached/--pool");
+        let generated_name = args.name.is_none();
+        let workspace_command = command.workspace_helper(ui).await?;
+        let workspace_name = args.name.clone().map(Ok).unwrap_or_else(|| {
+            generate_workspace_name(
+                workspace_command.repo_path(),
+                workspace_command.repo().as_ref(),
+            )
+        })?;
+        drop(workspace_command);
         create_detached_workspace(
             ui,
             command,
@@ -138,6 +149,9 @@ pub async fn cmd_workspace_add(
         .await?;
         if args.pool {
             super::attach::attach_to_pool(ui, command, &workspace_name).await?;
+        }
+        if generated_name {
+            writeln!(ui.stdout(), "{}", workspace_name.as_str())?;
         }
         return Ok(());
     }
@@ -299,6 +313,71 @@ pub async fn cmd_workspace_add(
         ),
     )
     .await?;
+    Ok(())
+}
+
+struct WorkspaceIdDomain(u64);
+
+impl PrefixIdDomain for WorkspaceIdDomain {
+    const KIND: &'static str = "workspace-id";
+
+    fn machine_seed(&self) -> u64 {
+        self.0
+    }
+}
+
+type WorkspaceId = PrefixId<WorkspaceIdDomain>;
+
+const WORKSPACE_ID_LABEL_HEADROOM: u64 = 200;
+
+fn generate_workspace_name(
+    repo_path: &Path,
+    repo: &dyn jj_lib::repo::Repo,
+) -> Result<WorkspaceNameBuf, CommandError> {
+    let state_path = repo_path.join("workspace-id-state");
+    let (seed, mut counter) = load_workspace_id_state(&state_path)?;
+    let domain = WorkspaceIdDomain(seed);
+    let used = repo.view().wc_commit_ids();
+    while counter < prefix_id::CAPACITY {
+        let id = WorkspaceId::from_counter(counter, &domain)
+            .expect("counter is below prefix-id capacity");
+        let prefix_len = prefix_id::uniform_prefix_len(counter, WORKSPACE_ID_LABEL_HEADROOM).max(4);
+        counter += 1;
+        let encoded = id.encoded();
+        let name = WorkspaceNameBuf::from(format!("ws-{}", &encoded[..prefix_len]));
+        if !used.contains_key(&name) {
+            store_workspace_id_state(&state_path, seed, counter)?;
+            return Ok(name);
+        }
+    }
+    Err(user_error("Workspace id space is exhausted"))
+}
+
+fn load_workspace_id_state(path: &Path) -> Result<(u64, u64), CommandError> {
+    match fs::read_to_string(path) {
+        Ok(state) => {
+            let mut fields = state.split_whitespace();
+            let seed = fields
+                .next()
+                .and_then(|field| field.parse().ok())
+                .ok_or_else(|| {
+                    user_error(format!("Malformed workspace id state: {}", path.display()))
+                })?;
+            let counter = fields
+                .next()
+                .and_then(|field| field.parse().ok())
+                .ok_or_else(|| {
+                    user_error(format!("Malformed workspace id state: {}", path.display()))
+                })?;
+            Ok((seed, counter))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok((rand::random(), 0)),
+        Err(err) => Ok(Err(err).context(path)?),
+    }
+}
+
+fn store_workspace_id_state(path: &Path, seed: u64, counter: u64) -> Result<(), CommandError> {
+    fs::write(path, format!("{seed} {counter}\n")).context(path)?;
     Ok(())
 }
 

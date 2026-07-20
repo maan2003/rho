@@ -20,6 +20,16 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 
+struct WorkspaceIdDomain;
+
+impl prefix_id::PrefixIdDomain for WorkspaceIdDomain {
+    const KIND: &'static str = "workspace-id";
+
+    fn machine_seed(&self) -> u64 {
+        0
+    }
+}
+
 #[test]
 fn test_workspaces_invalid_name() {
     let test_env = TestEnvironment::default();
@@ -44,6 +54,44 @@ fn test_workspaces_invalid_name() {
     [EOF]
     [exit status: 1]
     ");
+}
+
+#[test]
+fn test_workspace_add_detached_generates_prefix_id_name() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    let output = work_dir
+        .run_jj(["workspace", "add", "--detached"])
+        .success();
+    let generated_name = output.stdout.normalized().trim().to_owned();
+    assert!(!generated_name.is_empty());
+    let generated_id = generated_name
+        .strip_prefix("ws-")
+        .expect("generated workspace name has ws- prefix");
+    assert!(generated_id.len() >= 4);
+    assert!(generated_id.len() <= prefix_id::LEN);
+    prefix_id::PrefixId::from_prefix(generated_id, 1, &WorkspaceIdDomain)
+        .expect("generated workspace name has prefix-id shape");
+
+    let output = work_dir.run_jj(["workspace", "list", "-T", "name ++ \"\\n\""]);
+    assert!(output.stdout.normalized().contains(&generated_name));
+    let output = work_dir.run_jj([
+        "log",
+        "-r",
+        &generated_name[..7],
+        "--no-graph",
+        "-T",
+        "working_copies",
+    ]);
+    assert!(
+        output
+            .success()
+            .stdout
+            .normalized()
+            .contains(&generated_name)
+    );
 }
 
 /// Test adding a second and a third workspace

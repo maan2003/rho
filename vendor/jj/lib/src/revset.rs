@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::collections::hash_map;
 use std::convert::Infallible;
 use std::fmt;
+use std::fs;
 use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::Arc;
@@ -29,6 +30,9 @@ use futures::StreamExt as _;
 use futures::stream::LocalBoxStream;
 use itertools::Itertools as _;
 use pollster::FutureExt as _;
+use prefix_id::PrefixId;
+use prefix_id::PrefixIdDomain;
+use prefix_id::PrefixResolution as PrefixIdResolution;
 use thiserror::Error;
 
 use crate::backend::BackendError;
@@ -2719,7 +2723,70 @@ impl PartialSymbolResolver for BookmarkResolver {
     }
 }
 
-const DEFAULT_RESOLVERS: &[&dyn PartialSymbolResolver] = &[&TagResolver, &BookmarkResolver];
+struct WorkspacePrefixResolver;
+
+struct WorkspaceIdDomain(u64);
+
+impl PrefixIdDomain for WorkspaceIdDomain {
+    const KIND: &'static str = "workspace-id";
+
+    fn machine_seed(&self) -> u64 {
+        self.0
+    }
+}
+
+type WorkspaceId = PrefixId<WorkspaceIdDomain>;
+
+const WORKSPACE_ID_LABEL_HEADROOM: u64 = 200;
+
+fn load_workspace_id_state(repo: &dyn Repo) -> Option<(u64, u64)> {
+    let path = repo
+        .base_repo()
+        .loader()
+        .repo_path()?
+        .join("workspace-id-state");
+    let state = fs::read_to_string(path).ok()?;
+    let mut fields = state.split_whitespace();
+    let seed = fields.next()?.parse().ok()?;
+    let counter = fields.next()?.parse().ok()?;
+    Some((seed, counter))
+}
+
+fn generated_workspace_name(id: WorkspaceId, domain: &WorkspaceIdDomain) -> WorkspaceNameBuf {
+    let counter = id.to_counter(domain);
+    let prefix_len = prefix_id::uniform_prefix_len(counter, WORKSPACE_ID_LABEL_HEADROOM).max(4);
+    let encoded = id.encoded();
+    WorkspaceNameBuf::from(format!("ws-{}", &encoded[..prefix_len]))
+}
+
+impl PartialSymbolResolver for WorkspacePrefixResolver {
+    fn resolve_symbol(
+        &self,
+        repo: &dyn Repo,
+        symbol: &str,
+    ) -> Result<Option<CommitId>, RevsetResolutionError> {
+        let Some(prefix) = symbol
+            .strip_prefix("ws-")
+            .filter(|prefix| !prefix.is_empty())
+        else {
+            return Ok(None);
+        };
+        let Some((seed, counter)) = load_workspace_id_state(repo) else {
+            return Ok(None);
+        };
+        let domain = WorkspaceIdDomain(seed);
+        let id = match WorkspaceId::from_prefix(prefix, counter, &domain) {
+            Ok(PrefixIdResolution::Unique(id)) => id,
+            Ok(PrefixIdResolution::Ambiguous { first, .. }) => first,
+            Ok(PrefixIdResolution::NotFound) | Err(_) => return Ok(None),
+        };
+        let name = generated_workspace_name(id, &domain);
+        Ok(repo.view().get_wc_commit_id(&name).cloned())
+    }
+}
+
+const DEFAULT_RESOLVERS: &[&dyn PartialSymbolResolver] =
+    &[&WorkspacePrefixResolver, &TagResolver, &BookmarkResolver];
 
 struct CommitPrefixResolver<'a> {
     context_repo: &'a dyn Repo,

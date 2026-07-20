@@ -2605,6 +2605,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "pollster",
+ "prefix-id",
  "proptest",
  "proptest-state-machine",
  "rand 0.10.2",
@@ -2671,6 +2672,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "pollster",
+ "prefix-id",
  "pretty_assertions",
  "proptest",
  "prost",
@@ -3541,6 +3543,13 @@ checksum = "d0de1b847b39c8131db0467e9df1ff60e6d0562ab8e9a16e568ad0fdb372e2f2"
 dependencies = [
  "predicates-core",
  "termtree",
+]
+
+[[package]]
+name = "prefix-id"
+version = "0.1.0"
+dependencies = [
+ "fnv",
 ]
 
 [[package]]

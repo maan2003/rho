@@ -81,6 +81,16 @@ use testutils::repo_path;
 use testutils::write_random_commit;
 use testutils::write_random_commit_with_parents;
 
+struct WorkspaceIdDomain;
+
+impl prefix_id::PrefixIdDomain for WorkspaceIdDomain {
+    const KIND: &'static str = "workspace-id";
+
+    fn machine_seed(&self) -> u64 {
+        0
+    }
+}
+
 fn remote_symbol<'a, N, M>(name: &'a N, remote: &'a M) -> RemoteRefSymbol<'a>
 where
     N: AsRef<RefName> + ?Sized,
@@ -622,6 +632,54 @@ fn test_resolve_working_copy() -> TestResult {
     assert_eq!(resolve(ws1), vec![commit1.id().clone()]);
     // Can resolve an explicit checkout
     assert_eq!(resolve(ws2), vec![commit2.id().clone()]);
+    Ok(())
+}
+
+#[test]
+fn test_resolve_workspace_prefix_symbol() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let domain = WorkspaceIdDomain;
+    let workspace_name = |counter| {
+        let id = prefix_id::PrefixId::from_counter(counter, &domain).unwrap();
+        let prefix_len = prefix_id::uniform_prefix_len(counter, 200).max(4);
+        let encoded = id.encoded();
+        WorkspaceNameBuf::from(format!("ws-{}", &encoded[..prefix_len]))
+    };
+    std::fs::write(test_repo.repo_path().join("workspace-id-state"), "0 37\n")?;
+
+    let mut tx = repo.start_transaction();
+    let commit1 = write_random_commit(tx.repo_mut());
+    let commit2 = write_random_commit(tx.repo_mut());
+    let ws1 = workspace_name(0);
+    let ws2 = workspace_name(36);
+    let non_rho_workspace = WorkspaceNameBuf::from("abc-name");
+    tx.repo_mut()
+        .set_wc_commit(ws1.clone(), commit1.id().clone())?;
+    tx.repo_mut()
+        .set_wc_commit(ws2.clone(), commit2.id().clone())?;
+    tx.repo_mut()
+        .set_wc_commit(non_rho_workspace, commit2.id().clone())?;
+
+    assert_eq!(
+        resolve_commit_ids(tx.repo(), &ws1.as_str()[..7]),
+        vec![commit1.id().clone()]
+    );
+    assert_eq!(
+        resolve_commit_ids(tx.repo(), &ws2.as_str()[..7]),
+        vec![commit2.id().clone()]
+    );
+    let ambiguous_prefix = format!("ws-{}", &ws1.as_str()[3..4]);
+    assert_eq!(
+        // Ambiguous workspace id prefixes resolve to PrefixId::from_prefix()'s
+        // first generated id, matching rho agent id prefix handling.
+        resolve_commit_ids(tx.repo(), &ambiguous_prefix),
+        vec![commit1.id().clone()]
+    );
+    assert_matches!(
+        try_resolve_commit_ids(tx.repo(), "ws-missing"),
+        Err(RevsetResolutionError::NoSuchRevision { .. })
+    );
     Ok(())
 }
 

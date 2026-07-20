@@ -581,6 +581,7 @@ pub async fn cmd_git_push(
         tx.finish(ui, tx_description).await?;
     }
     if push_stats.all_ok() {
+        writeln!(ui.status(), "Push completed successfully.")?;
         Ok(())
     } else {
         Err(user_error("Failed to push some bookmarks"))

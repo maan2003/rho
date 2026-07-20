@@ -141,6 +141,7 @@ fn test_git_push_default_remote_selection() {
     Hint: Pushing to the only existing remote: other
     Changes to push to other:
       bookmark: bookmark1 [add to 9b2e76de3920]
+    Push completed successfully.
     [EOF]
     ");
 }
