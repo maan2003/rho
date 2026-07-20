@@ -101,12 +101,28 @@ impl View {
         &self.data.git_head
     }
 
+    pub fn git_heads(&self) -> &BTreeMap<WorkspaceNameBuf, RefTarget> {
+        &self.data.git_heads
+    }
+
+    pub fn git_head_for_workspace(&self, name: &WorkspaceName) -> &RefTarget {
+        if name == WorkspaceName::DEFAULT {
+            self.data.git_heads.get(name).unwrap_or(&self.data.git_head)
+        } else {
+            self.data
+                .git_heads
+                .get(name)
+                .unwrap_or_else(|| RefTarget::absent_ref())
+        }
+    }
+
     pub fn set_wc_commit(&mut self, name: WorkspaceNameBuf, commit_id: CommitId) {
         self.data.wc_commit_ids.insert(name, commit_id);
     }
 
     pub fn remove_wc_commit(&mut self, name: &WorkspaceName) {
         self.data.wc_commit_ids.remove(name);
+        self.data.git_heads.remove(name);
     }
 
     pub fn rename_workspace(
@@ -124,7 +140,12 @@ impl View {
                 name: old_name.to_owned(),
             }
         })?;
-        self.data.wc_commit_ids.insert(new_name, wc_commit_id);
+        self.data
+            .wc_commit_ids
+            .insert(new_name.clone(), wc_commit_id);
+        if let Some(git_head) = self.data.git_heads.remove(old_name) {
+            self.data.git_heads.insert(new_name, git_head);
+        }
         Ok(())
     }
 
@@ -545,6 +566,19 @@ impl View {
         self.data.git_head = target;
     }
 
+    /// Sets Git HEAD for the given workspace. If the target is absent, the
+    /// workspace-specific reference will be cleared.
+    pub fn set_git_head_target_for_workspace(&mut self, name: WorkspaceNameBuf, target: RefTarget) {
+        if name == WorkspaceName::DEFAULT {
+            self.data.git_head = target.clone();
+        }
+        if target.is_present() {
+            self.data.git_heads.insert(name, target);
+        } else {
+            self.data.git_heads.remove(&name);
+        }
+    }
+
     /// Iterates all commit ids referenced by this view.
     ///
     /// This can include hidden commits referenced by remote bookmarks, previous
@@ -569,6 +603,7 @@ impl View {
             remote_views,
             git_refs,
             git_head,
+            git_heads,
             wc_commit_ids,
         } = &self.data;
         itertools::chain!(
@@ -582,6 +617,7 @@ impl View {
             }),
             git_refs.values().flat_map(ref_target_ids),
             ref_target_ids(git_head),
+            git_heads.values().flat_map(ref_target_ids),
             wc_commit_ids.values()
         )
     }

@@ -71,15 +71,20 @@ pub async fn cmd_git_colocation(
     }
 }
 
-/// Check that the repository supports colocation commands
-/// which means that the repo is backed by Git and is a main workspace
+/// Check that the repository supports colocation commands, which means that
+/// the repo is backed by Git.
 fn workspace_supports_git_colocation_commands(
     workspace_command: &WorkspaceCommandHelper,
 ) -> Result<(), CommandError> {
     // Check if backend is Git (will show an error otherwise)
     git::get_git_backend(workspace_command.repo().store())?;
 
-    // Ensure that this is the main workspace
+    Ok(())
+}
+
+fn workspace_is_main(
+    workspace_command: &crate::cli_util::WorkspaceCommandHelper,
+) -> Result<(), CommandError> {
     let repo_dir = workspace_command.workspace_root().join(".jj").join("repo");
     if repo_dir.is_file() {
         return Err(user_error(
@@ -101,7 +106,9 @@ async fn cmd_git_colocation_status(
 
     let repo = workspace_command.repo();
     let is_colocated = is_colocated_git_workspace(workspace_command.workspace(), repo);
-    let git_head = repo.view().git_head();
+    let git_head = repo
+        .view()
+        .git_head_for_workspace(workspace_command.workspace_name());
 
     if is_colocated {
         writeln!(ui.stdout(), "Workspace is currently colocated with Git.")?;
@@ -151,6 +158,7 @@ async fn cmd_git_colocation_enable(
 
     // Make sure that the workspace supports git colocation commands
     workspace_supports_git_colocation_commands(&workspace_command)?;
+    workspace_is_main(&workspace_command)?;
 
     // Then ensure that the workspace is not already colocated before proceeding
     if is_colocated_git_workspace(workspace_command.workspace(), workspace_command.repo()) {
@@ -221,6 +229,7 @@ async fn cmd_git_colocation_disable(
 
     // Make sure that the repository supports git colocation commands
     workspace_supports_git_colocation_commands(&workspace_command)?;
+    workspace_is_main(&workspace_command)?;
 
     // Then ensure that the repo is colocated before proceeding
     if !is_colocated_git_workspace(workspace_command.workspace(), workspace_command.repo()) {

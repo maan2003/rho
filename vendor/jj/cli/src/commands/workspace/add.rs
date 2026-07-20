@@ -13,12 +13,17 @@
 // limitations under the License.
 
 use std::fs;
+use std::path::Path;
+use std::process::Command;
 
 use futures::future::try_join_all;
 use itertools::Itertools as _;
 use jj_lib::commit::CommitIteratorExt as _;
 use jj_lib::file_util;
 use jj_lib::file_util::IoResultExt as _;
+use jj_lib::git;
+use jj_lib::object_id::ObjectId as _;
+use jj_lib::ref_name::WorkspaceName;
 use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
@@ -30,6 +35,8 @@ use crate::cli_util::RevisionArg;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
+use crate::command_error::user_error_with_message;
+use crate::commands::git::maybe_add_gitignore;
 use crate::description_util::add_trailers;
 use crate::description_util::join_message_paragraphs;
 use crate::ui::Ui;
@@ -84,6 +91,11 @@ pub struct WorkspaceAddArgs {
     /// How to handle sparse patterns when creating a new workspace.
     #[arg(long, value_enum, default_value_t = SparseInheritance::Copy)]
     sparse_patterns: SparseInheritance,
+
+    /// Create Git worktree metadata so Git commands can run in the new
+    /// workspace.
+    #[arg(long)]
+    git: bool,
 }
 
 #[instrument(skip_all)]
@@ -124,6 +136,16 @@ pub async fn cmd_workspace_add(
 
     let working_copy_factory = command.get_working_copy_factory()?;
     let repo_path = old_workspace_command.repo_path();
+    if args.git {
+        let base_commit_id =
+            git_worktree_base_commit(repo.as_ref(), old_workspace_command.workspace_name())?;
+        create_git_worktree_with_git(
+            command.settings(),
+            repo.as_ref(),
+            &destination_path,
+            &base_commit_id,
+        )?;
+    }
     // If we add per-workspace configuration, we'll need to reload settings for
     // the new workspace.
     let (new_workspace, repo) = Workspace::init_workspace_with_existing_repo(
@@ -151,6 +173,9 @@ pub async fn cmd_workspace_add(
     }
 
     let mut new_workspace_command = command.for_workable_repo(ui, new_workspace, repo)?;
+    if args.git {
+        maybe_add_gitignore(&new_workspace_command)?;
+    }
 
     let sparsity = match args.sparse_patterns {
         SparseInheritance::Full => None,
@@ -233,4 +258,66 @@ pub async fn cmd_workspace_add(
     )
     .await?;
     Ok(())
+}
+
+fn git_worktree_base_commit(
+    repo: &dyn jj_lib::repo::Repo,
+    workspace_name: &WorkspaceName,
+) -> Result<String, CommandError> {
+    if let Some(commit_id) = repo
+        .view()
+        .git_head_for_workspace(workspace_name)
+        .as_normal()
+    {
+        return Ok(commit_id.hex());
+    }
+    if let Some(wc_commit_id) = repo.view().get_wc_commit_id(workspace_name) {
+        let wc_commit = repo.store().get_commit(wc_commit_id)?;
+        if let Some(parent_id) = wc_commit
+            .parent_ids()
+            .iter()
+            .find(|id| *id != repo.store().root_commit_id())
+        {
+            return Ok(parent_id.hex());
+        }
+    }
+    Err(user_error(
+        "Cannot create a Git worktree because there is no Git commit to initialize it from",
+    ))
+}
+
+fn create_git_worktree_with_git(
+    settings: &jj_lib::settings::UserSettings,
+    repo: &dyn jj_lib::repo::Repo,
+    destination_path: &Path,
+    base_commit_id: &str,
+) -> Result<(), CommandError> {
+    let git_backend = git::get_git_backend(repo.store())?;
+    let git_settings = git::GitSettings::from_settings(settings)?;
+    let output = Command::new(&git_settings.executable_path)
+        .args(["-c", "core.fsmonitor=false"])
+        .arg("--git-dir")
+        .arg(git_backend.git_repo_path())
+        .args(["worktree", "add", "--detach", "--no-checkout"])
+        .arg(destination_path)
+        .arg(base_commit_id)
+        .output()
+        .map_err(|err| {
+            user_error_with_message(
+                format!(
+                    "Could not execute git worktree add using '{}'",
+                    git_settings.executable_path.display()
+                ),
+                err,
+            )
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(user_error(format!(
+            "Git failed to create a worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ))
+        .hinted("The Jujutsu workspace was not created. Resolve the Git worktree error and retry."))
+    }
 }

@@ -1992,8 +1992,18 @@ impl MutableRepo {
         self.view.with_ref(|v| v.git_head().clone())
     }
 
+    pub fn git_head_for_workspace(&self, name: &WorkspaceName) -> RefTarget {
+        self.view
+            .with_ref(|v| v.git_head_for_workspace(name).clone())
+    }
+
     pub fn set_git_head_target(&mut self, target: RefTarget) {
         self.view_mut().set_git_head_target(target);
+    }
+
+    pub fn set_git_head_target_for_workspace(&mut self, name: WorkspaceNameBuf, target: RefTarget) {
+        self.view_mut()
+            .set_git_head_target_for_workspace(name, target);
     }
 
     pub fn set_view(&mut self, data: op_store::View) {
@@ -2069,6 +2079,18 @@ impl MutableRepo {
             self.merge_git_ref(name, base_target, other_target)?;
         }
 
+        let changed_git_heads = diff_named_ref_targets(base.git_heads(), other.git_heads());
+        for (name, (base_target, other_target)) in changed_git_heads {
+            if name == WorkspaceName::DEFAULT {
+                continue;
+            }
+            let self_target = self.view().git_head_for_workspace(name);
+            let new_target =
+                merge_ref_targets(self.index(), self_target, base_target, other_target)?;
+            self.view_mut()
+                .set_git_head_target_for_workspace(name.to_owned(), new_target);
+        }
+
         let changed_remote_bookmarks =
             diff_named_remote_refs(base.all_remote_bookmarks(), other.all_remote_bookmarks());
         for (symbol, (base_ref, other_ref)) in changed_remote_bookmarks {
@@ -2087,7 +2109,10 @@ impl MutableRepo {
             base.git_head(),
             other.git_head(),
         )?;
-        self.set_git_head_target(new_git_head_target);
+        self.set_git_head_target_for_workspace(
+            WorkspaceName::DEFAULT.to_owned(),
+            new_git_head_target,
+        );
 
         Ok(())
     }

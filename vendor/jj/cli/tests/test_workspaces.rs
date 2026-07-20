@@ -458,6 +458,59 @@ fn test_workspaces_add_workspace_at_revision() {
     "#);
 }
 
+#[test]
+fn test_workspaces_add_git_workspace() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir
+        .run_jj([
+            "workspace",
+            "add",
+            "--git",
+            "--name",
+            "second",
+            "../secondary",
+        ])
+        .success();
+
+    assert!(secondary_dir.root().join(".git").is_file());
+    let main_git_repo = git::open(main_dir.root());
+    let secondary_git_repo = git::open(secondary_dir.root());
+    assert_ne!(
+        secondary_git_repo.git_dir(),
+        secondary_git_repo.common_dir()
+    );
+    assert_eq!(
+        dunce::canonicalize(main_git_repo.common_dir())?,
+        dunce::canonicalize(secondary_git_repo.common_dir())?
+    );
+
+    let output = std::process::Command::new("git")
+        .current_dir(secondary_dir.root())
+        .args(["status", "--porcelain=v1"])
+        .output()?;
+    assert!(output.status.success());
+    insta::assert_snapshot!(String::from_utf8(output.stdout)?, @"");
+
+    secondary_dir.write_file("file", "changed\n");
+    let output = std::process::Command::new("git")
+        .current_dir(secondary_dir.root())
+        .args(["diff", "--name-only"])
+        .output()?;
+    assert!(output.status.success());
+    insta::assert_snapshot!(String::from_utf8(output.stdout)?, @"file
+");
+    Ok(())
+}
+
 /// Test multiple `-r` flags to `workspace add` to create a workspace
 /// working-copy commit with multiple parents.
 #[test]

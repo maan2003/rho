@@ -59,6 +59,16 @@ use crate::ui::ProgressOutput;
 use crate::ui::Ui;
 
 pub fn is_colocated_git_workspace(workspace: &Workspace, repo: &ReadonlyRepo) -> bool {
+    if open_workspace_git_repo(workspace, repo)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return true;
+    }
+
+    // Fallback for older/main-workspace setups where the backend itself is the
+    // worktree repo.
     let Ok(git_backend) = git::get_git_backend(repo.store()) else {
         return false;
     };
@@ -74,6 +84,35 @@ pub fn is_colocated_git_workspace(workspace: &Workspace, repo: &ReadonlyRepo) ->
         return false;
     };
     dunce::canonicalize(git_workdir).ok().as_deref() == dot_git_path.parent()
+}
+
+pub fn open_workspace_git_repo(
+    workspace: &Workspace,
+    repo: &dyn Repo,
+) -> Result<Option<gix::Repository>, CommandError> {
+    let Ok(git_backend) = git::get_git_backend(repo.store()) else {
+        return Ok(None);
+    };
+    if !workspace.workspace_root().join(".git").exists() {
+        return Ok(None);
+    }
+    let git_repo = match gix::open(workspace.workspace_root()) {
+        Ok(git_repo) => git_repo,
+        Err(_) => return Ok(None),
+    };
+    let Some(git_workdir) = git_repo.workdir() else {
+        return Ok(None);
+    };
+    if dunce::canonicalize(git_workdir).ok().as_deref() != Some(workspace.workspace_root()) {
+        return Ok(None);
+    }
+    let backend_common_dir = dunce::canonicalize(git_backend.git_repo_path()).map_err(cli_error)?;
+    let workspace_common_dir = dunce::canonicalize(git_repo.common_dir()).map_err(cli_error)?;
+    if workspace_common_dir == backend_common_dir {
+        Ok(Some(git_repo))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Parses user-specified remote URL or path to absolute form.

@@ -76,6 +76,11 @@ message GitRef {
   RefTarget target = 3;
 }
 
+message GitHead {
+  string workspace = 1;
+  RefTarget target = 2;
+}
+
 message RemoteRef {
   string name = 1;
   repeated RefTargetTerm target_terms = 2;
@@ -104,6 +109,7 @@ message View {
   // TODO: Delete support for the old format.
   bytes git_head_legacy = 7 [deprecated = true];
   RefTarget git_head = 9;
+  repeated GitHead git_heads = 13;
   // Whether "@git" tags have been migrated to remote_views.
   bool has_git_refs_migrated_to_remote_tags = 12;
   reserved 10;

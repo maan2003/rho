@@ -358,10 +358,12 @@ fn test_git_colocation_in_secondary_workspace() {
 
     let output = secondary_dir.run_jj(["git", "colocation", "status"]);
     insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Error: This command cannot be used in a non-main Jujutsu workspace
+    Workspace is currently not colocated with Git.
+    Last imported/exported Git HEAD: (none)
     [EOF]
-    [exit status: 1]
+    ------- stderr -------
+    Hint: To enable colocation, run: `jj git colocation enable`
+    [EOF]
     ");
 
     let output = secondary_dir.run_jj(["git", "colocation", "enable"]);

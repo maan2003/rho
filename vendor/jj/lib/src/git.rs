@@ -67,6 +67,7 @@ use crate::ref_name::RemoteName;
 use crate::ref_name::RemoteNameBuf;
 use crate::ref_name::RemoteRefSymbol;
 use crate::ref_name::RemoteRefSymbolBuf;
+use crate::ref_name::WorkspaceName;
 use crate::repo::MutableRepo;
 use crate::repo::Repo;
 use crate::repo_path::RepoPath;
@@ -1166,8 +1167,19 @@ pub async fn import_head(mut_repo: &mut MutableRepo) -> Result<(), GitImportErro
     let store = mut_repo.store();
     let git_backend = get_git_backend(store)?;
     let git_repo = git_backend.git_repo();
+    import_head_from_repo(mut_repo, WorkspaceName::DEFAULT, &git_repo).await
+}
 
-    let old_git_head = mut_repo.view().git_head();
+/// Imports HEAD from the given Git worktree repo.
+pub async fn import_head_from_repo(
+    mut_repo: &mut MutableRepo,
+    workspace_name: &WorkspaceName,
+    git_repo: &gix::Repository,
+) -> Result<(), GitImportError> {
+    let store = mut_repo.store();
+    let git_backend = get_git_backend(store)?;
+
+    let old_git_head = mut_repo.view().git_head_for_workspace(workspace_name);
     let new_git_head_id = if let Ok(oid) = git_repo.head_id() {
         Some(CommitId::from_bytes(oid.as_bytes()))
     } else {
@@ -1194,7 +1206,10 @@ pub async fn import_head(mut_repo: &mut MutableRepo) -> Result<(), GitImportErro
         mut_repo.add_head(&commit).await?;
     }
 
-    mut_repo.set_git_head_target(RefTarget::resolved(new_git_head_id));
+    mut_repo.set_git_head_target_for_workspace(
+        workspace_name.to_owned(),
+        RefTarget::resolved(new_git_head_id),
+    );
     Ok(())
 }
 
@@ -1799,7 +1814,17 @@ pub async fn reset_head(
     wc_commit: &Commit,
 ) -> Result<(), GitResetHeadError> {
     let git_repo = get_git_repo(mut_repo.store())?;
+    reset_head_for_workspace(mut_repo, WorkspaceName::DEFAULT, &git_repo, wc_commit).await
+}
 
+/// Sets Git HEAD in the given Git worktree to the parent of the given
+/// working-copy commit and resets that worktree's Git index.
+pub async fn reset_head_for_workspace(
+    mut_repo: &mut MutableRepo,
+    workspace_name: &WorkspaceName,
+    git_repo: &gix::Repository,
+    wc_commit: &Commit,
+) -> Result<(), GitResetHeadError> {
     let first_parent_id = &wc_commit.parent_ids()[0];
     let new_head_target = if first_parent_id != mut_repo.store().root_commit_id() {
         RefTarget::normal(first_parent_id.clone())
@@ -1808,7 +1833,7 @@ pub async fn reset_head(
     };
 
     // If the first parent of the working copy has changed, reset the Git HEAD.
-    let old_head_target = mut_repo.git_head();
+    let old_head_target = mut_repo.git_head_for_workspace(workspace_name);
     if old_head_target != new_head_target {
         let expected_ref = if let Some(id) = old_head_target.as_normal() {
             // We have to check the actual HEAD state because we don't record a
@@ -1827,18 +1852,18 @@ pub async fn reset_head(
             gix::refs::transaction::PreviousValue::MustExist
         };
         let new_oid = new_head_target.as_normal().map(owned_oid_from_commit_id);
-        update_git_head(&git_repo, expected_ref, new_oid)
+        update_git_head(git_repo, expected_ref, new_oid)
             .map_err(|err| GitResetHeadError::UpdateHeadRef(err.into()))?;
-        mut_repo.set_git_head_target(new_head_target);
+        mut_repo.set_git_head_target_for_workspace(workspace_name.to_owned(), new_head_target);
     }
 
     // If there is an ongoing operation (merge, rebase, etc.), we need to clean it
     // up.
     if git_repo.state().is_some() {
-        clear_operation_state(&git_repo)?;
+        clear_operation_state(git_repo)?;
     }
 
-    reset_index(mut_repo, &git_repo, wc_commit).await
+    reset_index(mut_repo, git_repo, wc_commit).await
 }
 
 // TODO: Polish and upstream this to `gix`.

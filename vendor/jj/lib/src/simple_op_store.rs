@@ -576,6 +576,16 @@ fn view_to_proto(view: &View) -> crate::protos::simple_op_store::View {
         .collect();
 
     let git_head = ref_target_to_proto(&view.git_head);
+    let git_heads = view
+        .git_heads
+        .iter()
+        .map(
+            |(workspace, target)| crate::protos::simple_op_store::GitHead {
+                workspace: workspace.into(),
+                target: ref_target_to_proto(target),
+            },
+        )
+        .collect();
 
     #[expect(deprecated)]
     crate::protos::simple_op_store::View {
@@ -588,6 +598,7 @@ fn view_to_proto(view: &View) -> crate::protos::simple_op_store::View {
         git_refs,
         git_head_legacy: Default::default(),
         git_head,
+        git_heads,
         // New/loaded view should have been migrated to the latest format
         has_git_refs_migrated_to_remote_tags: true,
     }
@@ -675,6 +686,21 @@ fn view_from_proto(proto: crate::protos::simple_op_store::View) -> Result<View, 
     } else {
         RefTarget::absent()
     };
+    let mut git_heads: BTreeMap<_, _> = proto
+        .git_heads
+        .into_iter()
+        .map(|git_head| {
+            (
+                WorkspaceNameBuf::from(git_head.workspace),
+                ref_target_from_proto(git_head.target),
+            )
+        })
+        .collect();
+    if git_head.is_present() {
+        git_heads
+            .entry(WorkspaceName::DEFAULT.to_owned())
+            .or_insert_with(|| git_head.clone());
+    }
 
     Ok(View {
         head_ids,
@@ -683,6 +709,7 @@ fn view_from_proto(proto: crate::protos::simple_op_store::View) -> Result<View, 
         remote_views,
         git_refs,
         git_head,
+        git_heads,
         wc_commit_ids,
     })
 }
@@ -976,6 +1003,8 @@ mod tests {
             [CommitId::from_hex("fff111")],
             [CommitId::from_hex("fff222"), CommitId::from_hex("fff333")],
         );
+        let default_git_head = RefTarget::normal(CommitId::from_hex("fff111"));
+        let test_git_head = RefTarget::normal(CommitId::from_hex("fff222"));
         let default_wc_commit_id = CommitId::from_hex("abc111");
         let test_wc_commit_id = CommitId::from_hex("abc222");
         View {
@@ -1002,7 +1031,11 @@ mod tests {
                 "refs/heads/main".into() => git_refs_main_target,
                 "refs/heads/feature".into() => git_refs_feature_target,
             },
-            git_head: RefTarget::normal(CommitId::from_hex("fff111")),
+            git_head: default_git_head.clone(),
+            git_heads: btreemap! {
+                WorkspaceName::DEFAULT.to_owned() => default_git_head,
+                "test".into() => test_git_head,
+            },
             wc_commit_ids: btreemap! {
                 WorkspaceName::DEFAULT.to_owned() => default_wc_commit_id,
                 "test".into() => test_wc_commit_id,
