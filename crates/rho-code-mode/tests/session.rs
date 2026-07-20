@@ -22,7 +22,11 @@ impl FakeDispatcher {
 }
 
 impl ToolDispatcher for FakeDispatcher {
-    fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, NestedToolOutput> {
+    fn call_tool(
+        &self,
+        context: rho_core::ToolExecutionContext,
+        call: ToolCall,
+    ) -> BoxFuture<'static, NestedToolOutput> {
         Box::pin(async move {
             match call.name.as_str() {
                 "echo" => NestedToolOutput {
@@ -31,6 +35,10 @@ impl ToolDispatcher for FakeDispatcher {
                 },
                 "structured" => NestedToolOutput {
                     value: json!({"session_id": 42, "output": "ready"}),
+                    status: ToolOutputStatus::Success,
+                },
+                "context" => NestedToolOutput {
+                    value: json!(context.model.as_ref()),
                     status: ToolOutputStatus::Success,
                 },
                 "slow_echo" => {
@@ -70,7 +78,7 @@ fn exec_id() -> ToolCallId {
 }
 
 fn nested_tools() -> Vec<NestedTool> {
-    ["echo", "structured", "slow_echo", "hang", "fail"]
+    ["echo", "structured", "context", "slow_echo", "hang", "fail"]
         .into_iter()
         .map(|name| {
             NestedTool::from_spec(&ToolSpec {
@@ -160,6 +168,22 @@ async fn nested_tool_calls_round_trip() {
         "{}",
         result.output
     );
+}
+
+#[tokio::test]
+async fn nested_tool_uses_the_context_captured_by_its_exec_cell() {
+    let (session, _) = session();
+    let result = session
+        .execute_with_context(
+            exec_id(),
+            "text(await tools.context({}))",
+            rho_core::ToolExecutionContext {
+                model: "test-model".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(result.output.contains("test-model"), "{}", result.output);
 }
 
 #[tokio::test]

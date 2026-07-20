@@ -6,7 +6,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rho_core::ToolCallId;
+use rho_core::{ToolCallId, ToolExecutionContext};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -26,6 +26,7 @@ pub(crate) struct CellShared {
     /// attributed to this call for the cell's whole lifetime, across later
     /// `wait` calls (matching Codex).
     pub(crate) exec_call_id: ToolCallId,
+    pub(crate) tool_context: ToolExecutionContext,
     output: Mutex<CellBuffer>,
     status: Mutex<CellStatus>,
     /// Wakes observers on new output, yield requests, and status changes.
@@ -45,10 +46,15 @@ struct CellBuffer {
 }
 
 impl CellShared {
-    pub(crate) fn new(id: u32, exec_call_id: ToolCallId) -> Self {
+    pub(crate) fn new(
+        id: u32,
+        exec_call_id: ToolCallId,
+        tool_context: ToolExecutionContext,
+    ) -> Self {
         Self {
             id,
             exec_call_id,
+            tool_context,
             output: Mutex::new(CellBuffer::default()),
             status: Mutex::new(CellStatus::Running),
             notify: Notify::new(),

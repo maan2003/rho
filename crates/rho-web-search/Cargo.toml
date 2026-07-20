@@ -1,0 +1,17 @@
+[package]
+name = "rho-web-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+futures.workspace = true
+reqwest.workspace = true
+rho-core.workspace = true
+rho-inference.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

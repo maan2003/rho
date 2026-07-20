@@ -149,6 +149,15 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Turn-local context available to tools without placing it in model-authored
+/// arguments. Tools should retain only the bounded parts they actually need.
+#[derive(Clone, Debug, Default)]
+pub struct ToolExecutionContext {
+    pub model: Arc<str>,
+    pub input: Arc<[Arc<ContextBlock>]>,
+    pub max_output_tokens: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub enum ToolOutputStatus {
     Success,

@@ -22,6 +22,17 @@ pub enum InferenceModel {
     Gpt56Terra,
 }
 
+impl InferenceModel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gpt55 => "gpt-5.5",
+            Self::Gpt56Sol => "gpt-5.6-sol",
+            Self::Gpt56Luna => "gpt-5.6-luna",
+            Self::Gpt56Terra => "gpt-5.6-terra",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Encode, Serialize, Pack, Unpack)]
 pub struct InferenceProfile {
     pub effort: ReasoningEffort,

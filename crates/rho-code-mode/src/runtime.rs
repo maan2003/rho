@@ -89,7 +89,7 @@ async fn op_call_tool(
         tool_type,
         arguments,
     };
-    let dispatch = ctx.dispatcher.call_tool(call);
+    let dispatch = ctx.dispatcher.call_tool(cell.tool_context.clone(), call);
     tokio::select! {
         biased;
         _ = cell.cancel.cancelled() => {

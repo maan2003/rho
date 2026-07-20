@@ -71,11 +71,18 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `exec_command` yields a process session id when a command remains live and
   `write_stdin` writes to or polls that session. Command continuation state is
   per agent because each agent owns its `ShellTools` instance.
+- `rho-web-search` owns the Codex-compatible client-side `web__run` tool and
+  the bounded conversion of tool execution context into ChatGPT search input.
+  `rho-agent` assembles it as a built-in tool and supplies the configured model,
+  recent transcript, and output budget; the tool resolves the same ChatGPT
+  OAuth credentials as inference and calls the first-party search endpoint.
 - `rho-code-mode` is a tool crate: it runs model-authored JavaScript in an
   in-process V8 isolate (deno_core) and exposes the `exec`/`wait` tool pair.
   Nested tool calls made by scripts leave the crate through a `ToolDispatcher`
-  trait implemented by the assembling harness; the crate depends only on
-  `rho-core` vocabulary.
+  trait implemented by the assembling harness. Each cell retains the immutable
+  tool execution context from the `exec` call that created it, so nested tools
+  cannot observe a later turn's context; the crate depends only on `rho-core`
+  vocabulary.
 
 Claude Code MCP support follows the same boundary: `rho-claude` knows how to
 set per-agent MCP environment, but the MCP server that exposes Rho multi-agent

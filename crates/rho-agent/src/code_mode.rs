@@ -6,8 +6,11 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rho_code_mode::{CodeModeSession, NestedTool, NestedToolOutput, ToolDispatcher};
-use rho_core::{ToolCall, ToolCallId, ToolOutputStatus, ToolSpec, ToolType, UnixMs};
+use rho_core::{
+    ToolCall, ToolCallId, ToolExecutionContext, ToolOutputStatus, ToolSpec, ToolType, UnixMs,
+};
 use rho_tool_shell::ShellTools;
+use rho_web_search::WebSearchTools;
 use tokio::sync::mpsc;
 
 use crate::multi_agent_tools::{self, MultiAgentTools};
@@ -58,6 +61,7 @@ fn nested_tools(
     if let Some(extension) = tool_extension {
         specs.extend(extension.specs());
     }
+    specs.push(rho_web_search::web_search_spec());
     specs
         .iter()
         .map(|spec| {
@@ -74,6 +78,7 @@ struct Dispatcher {
     shell_tools: ShellTools,
     multi_agent: Option<MultiAgentTools>,
     tool_extension: Option<Arc<dyn AgentToolExtension>>,
+    web_search: WebSearchTools,
     /// Nested calls run on the agent's runtime, not the code-mode thread's
     /// current-thread runtime: agent tools spawn tasks (sub-agent loops) that
     /// must outlive the session.
@@ -84,7 +89,11 @@ struct Dispatcher {
 }
 
 impl ToolDispatcher for Dispatcher {
-    fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, NestedToolOutput> {
+    fn call_tool(
+        &self,
+        context: ToolExecutionContext,
+        call: ToolCall,
+    ) -> BoxFuture<'static, NestedToolOutput> {
         let shell_tools = self.shell_tools.clone();
         let agent_tools = multi_agent_tools::is_agent_tool(call.name.as_str())
             .then(|| self.multi_agent.clone())
@@ -96,8 +105,16 @@ impl ToolDispatcher for Dispatcher {
                 .any(|spec| spec.name == call.name)
                 .then(|| Arc::clone(extension))
         });
+        let web_search = (call.name.as_str() == rho_web_search::WEB_SEARCH_TOOL_NAME)
+            .then(|| self.web_search.clone());
         let task = self.runtime.spawn(async move {
-            if let Some(extension) = extension {
+            if let Some(web_search) = web_search {
+                let output = web_search.call(call, context).await;
+                NestedToolOutput {
+                    value: serde_json::Value::String(output.output.as_ref().clone()),
+                    status: output.status,
+                }
+            } else if let Some(extension) = extension {
                 let output = extension.call(call).await;
                 NestedToolOutput {
                     value: serde_json::Value::String(output.output.as_ref().clone()),
@@ -150,12 +167,14 @@ pub(crate) fn start_session(
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
     tool_extension: Option<&Arc<dyn AgentToolExtension>>,
+    web_search: &WebSearchTools,
     control: mpsc::UnboundedSender<AgentControl>,
 ) -> Result<CodeModeSession, String> {
     let dispatcher = Arc::new(Dispatcher {
         shell_tools: shell_tools.clone(),
         multi_agent: multi_agent.cloned(),
         tool_extension: tool_extension.cloned(),
+        web_search: web_search.clone(),
         runtime: tokio::runtime::Handle::current(),
         control,
     });
@@ -198,6 +217,7 @@ mod tests {
         let exec = &specs[0].description;
         assert!(exec.contains("exec_command"), "{exec}");
         assert!(exec.contains("write_stdin"), "{exec}");
+        assert!(exec.contains("web__run"), "{exec}");
         assert!(!exec.contains("spawn_engineer"), "{exec}");
         assert!(exec.contains("message_agent"), "{exec}");
         assert!(!exec.contains("interrupt_engineer"), "{exec}");

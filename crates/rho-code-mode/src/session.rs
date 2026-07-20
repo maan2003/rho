@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
-use rho_core::{ToolCall, ToolCallId, ToolOutput, ToolOutputStatus};
+use rho_core::{ToolCall, ToolCallId, ToolExecutionContext, ToolOutput, ToolOutputStatus};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -26,7 +26,11 @@ use crate::truncate::truncate_middle;
 /// must honor cancellation by simply completing; the cell-side future is
 /// dropped when a cell is terminated.
 pub trait ToolDispatcher: Send + Sync + 'static {
-    fn call_tool(&self, call: ToolCall) -> BoxFuture<'static, NestedToolOutput>;
+    fn call_tool(
+        &self,
+        context: ToolExecutionContext,
+        call: ToolCall,
+    ) -> BoxFuture<'static, NestedToolOutput>;
 
     /// A `notify(...)` progress note from a running script, attributed to the
     /// `exec` call that started the cell. Fire-and-forget.
@@ -92,6 +96,16 @@ impl CodeModeSession {
     /// first-line `// @exec:` pragma. `call_id` is the exec call's id; the
     /// cell's `notify(...)` updates are attributed to it.
     pub async fn execute(&self, call_id: ToolCallId, input: &str) -> ToolOutput {
+        self.execute_with_context(call_id, input, ToolExecutionContext::default())
+            .await
+    }
+
+    pub async fn execute_with_context(
+        &self,
+        call_id: ToolCallId,
+        input: &str,
+        context: ToolExecutionContext,
+    ) -> ToolOutput {
         let parsed = match parse_exec_source(input) {
             Ok(parsed) => parsed,
             Err(error) => return error_output(error),
@@ -99,6 +113,7 @@ impl CodeModeSession {
         let cell = Arc::new(CellShared::new(
             self.next_cell.fetch_add(1, Ordering::Relaxed),
             call_id,
+            context,
         ));
         self.cells
             .lock()

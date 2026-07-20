@@ -11,6 +11,11 @@ AI APIs.
   and tool inputs.
 - Inference APIs and streamed inference events are remote, semi-trusted inputs and
   must be parsed defensively.
+- Client-side web search sends the configured model and a bounded recent
+  transcript excerpt to ChatGPT's first-party search endpoint using the same
+  OAuth identity as inference. Search responses are remote, semi-trusted tool
+  output: HTTP bodies are capped at 4 MiB, parsed, and independently truncated
+  to the tool output budget before entering context.
 - Local filesystem state may contain transcripts and OAuth credentials;
   credential files are secrets.
 - Provider debug logs under the rho state directory may contain full inference

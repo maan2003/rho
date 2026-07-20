@@ -53,6 +53,14 @@ pub(crate) struct ResolvedAuth {
     pub(crate) client_secret: [u8; 32],
 }
 
+/// OAuth credentials resolved for another first-party ChatGPT endpoint.
+/// The per-session client secret remains private to the Responses transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedOAuth {
+    pub bearer_token: String,
+    pub account_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OAuthFile {
     path: PathBuf,
@@ -75,6 +83,13 @@ impl InferenceAuth {
 
     pub(crate) fn resolve(&self) -> io::Result<ResolvedAuth> {
         self.resolve_with_refresh(openai_codex_refresh)
+    }
+
+    pub fn resolve_oauth(&self) -> io::Result<ResolvedOAuth> {
+        self.resolve().map(|auth| ResolvedOAuth {
+            bearer_token: auth.bearer_token,
+            account_id: auth.account_id,
+        })
     }
 
     pub(crate) fn resolve_with_refresh(

@@ -10,11 +10,13 @@ use futures::{Stream, StreamExt};
 use rho_core::{
     ApplyPatchMetadata, ContentPart, ContextBlock, InferenceEvent, InferenceRequest,
     InferenceResponseItem, PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId,
-    ToolOutput, ToolOutputStatus, ToolResult, ToolResultMetadata, ToolSpec, ToolUpdate, UnixMs,
+    ToolExecutionContext, ToolOutput, ToolOutputStatus, ToolResult, ToolResultMetadata, ToolSpec,
+    ToolUpdate, UnixMs,
 };
 use rho_db::RhoDb;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
+use rho_web_search::WebSearchTools;
 use rho_workspaces::{Repo, View, Workspace};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -710,6 +712,7 @@ impl Agent {
         // Role policy wins over persisted profiles created before PM code mode
         // was disabled.
         let code_mode_enabled = config.code_mode && !role.is_pm();
+        let web_search = WebSearchTools::new(auth.clone(), agent_id.encoded().to_owned());
         let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
         let multi_agent = pool
             .upgrade()
@@ -727,11 +730,13 @@ impl Agent {
             let view = Arc::clone(&view);
             let multi_agent = multi_agent.clone();
             let tool_extension = tool_extension.clone();
+            let web_search = web_search.clone();
             let control = control.clone();
             move || {
                 let view = Arc::clone(&view);
                 let multi_agent = multi_agent.clone();
                 let tool_extension = tool_extension.clone();
+                let web_search = web_search.clone();
                 let control = control.clone();
                 let projects = projects.clone();
                 async move {
@@ -740,6 +745,8 @@ impl Agent {
                         view,
                         role,
                         agent_id,
+                        model,
+                        web_search,
                         code_mode_enabled,
                         agent_tools_enabled,
                         multi_agent.as_ref(),
@@ -903,9 +910,12 @@ fn arm_wait(
 async fn code_mode_tool_body(
     session: &rho_code_mode::CodeModeSession,
     call: &ToolCall,
+    context: ToolExecutionContext,
 ) -> ToolOutput {
     if call.name.as_str() == rho_code_mode::EXEC_TOOL_NAME {
-        return session.execute(call.id.clone(), &call.arguments).await;
+        return session
+            .execute_with_context(call.id.clone(), &call.arguments, context)
+            .await;
     }
     match serde_json::from_str::<rho_code_mode::WaitArgs>(&call.arguments) {
         Ok(args) => session.wait(args).await,
@@ -953,6 +963,7 @@ fn agent_tool_specs(
     if let Some(extension) = tool_extension {
         specs.extend(extension.specs());
     }
+    specs.push(rho_web_search::web_search_spec());
     specs.into()
 }
 
@@ -963,12 +974,19 @@ fn start_code_mode(
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
     tool_extension: Option<&Arc<dyn AgentToolExtension>>,
+    web_search: &WebSearchTools,
     control: mpsc::UnboundedSender<AgentControl>,
 ) -> Option<Arc<rho_code_mode::CodeModeSession>> {
     if !enabled {
         return None;
     }
-    match code_mode::start_session(shell_tools, multi_agent, tool_extension, control) {
+    match code_mode::start_session(
+        shell_tools,
+        multi_agent,
+        tool_extension,
+        web_search,
+        control,
+    ) {
         Ok(session) => Some(Arc::new(session)),
         Err(error) => {
             eprintln!("rho-agent: code mode unavailable, using direct tools: {error}");
@@ -1036,6 +1054,8 @@ struct ExecutionContext {
     view: Arc<View>,
     system_prompt: Arc<str>,
     shell_tools: ShellTools,
+    web_search: WebSearchTools,
+    model: Arc<str>,
     tool_specs: Arc<[ToolSpec]>,
     code_mode: Option<Arc<rho_code_mode::CodeModeSession>>,
 }
@@ -1046,6 +1066,8 @@ impl ExecutionContext {
         view: Arc<View>,
         role: db::AgentRole,
         agent_id: AgentId,
+        model: InferenceModel,
+        web_search: WebSearchTools,
         code_mode_enabled: bool,
         agent_tools_enabled: bool,
         multi_agent: Option<&MultiAgentTools>,
@@ -1063,6 +1085,7 @@ impl ExecutionContext {
             &shell_tools,
             agent_tools_enabled.then_some(()).and(multi_agent),
             tool_extension,
+            &web_search,
             control,
         );
         let tool_specs = agent_tool_specs(
@@ -1083,6 +1106,8 @@ impl ExecutionContext {
             view,
             system_prompt,
             shell_tools,
+            web_search,
+            model: Arc::from(model.as_str()),
             tool_specs,
             code_mode,
         }
@@ -1498,6 +1523,15 @@ impl AgentLoop {
                                 } else {
                                     let mut previews = BTreeMap::new();
                                     let mut waiting = None;
+                                    let tool_context = ToolExecutionContext {
+                                        model: Arc::clone(&self
+                                            .execution
+                                            .get_if_ready()
+                                            .expect("tool call has an execution context")
+                                            .model),
+                                        input: state.blocks.clone().into(),
+                                        max_output_tokens: Some(10_000),
+                                    };
                                     for call in calls {
                                         let started_at = UnixMs::now();
                                         let execution = self
@@ -1527,9 +1561,11 @@ impl AgentLoop {
                                                     == rho_code_mode::WAIT_TOOL_NAME)
                                         {
                                             let session = Arc::clone(session);
+                                            let context = tool_context.clone();
                                             self.pending_tools.push(Box::pin(async move {
-                                                let body = code_mode_tool_body(&session, &call)
-                                                    .await;
+                                                let body = code_mode_tool_body(
+                                                    &session, &call, context,
+                                                ).await;
                                                 ToolResult {
                                                     call_id: call.id.clone(),
                                                     tool_type: call.tool_type,
@@ -1561,6 +1597,10 @@ impl AgentLoop {
                                             continue;
                                         }
                                         let shell_tools = execution.shell_tools.clone();
+                                        let web_search = (call.name.as_str()
+                                            == rho_web_search::WEB_SEARCH_TOOL_NAME)
+                                            .then(|| execution.web_search.clone());
+                                        let context = tool_context.clone();
                                         let agent_tools = (self.agent_tools_enabled
                                             && multi_agent_tools::is_agent_tool(call.name.as_str()))
                                             .then(|| self.multi_agent.clone())
@@ -1575,7 +1615,9 @@ impl AgentLoop {
                                         self.pending_tools.push(Box::pin(async move {
                                             let call_id = call.id.clone();
                                             let tool_type = call.tool_type;
-                                            let (body, metadata) = if let Some(extension) = extension {
+                                            let (body, metadata) = if let Some(web_search) = web_search {
+                                                (web_search.call(call, context).await, None)
+                                            } else if let Some(extension) = extension {
                                                 (extension.call(call).await, None)
                                             } else if let Some(tools) = agent_tools {
                                                 (multi_agent_tools::call_agent_tool(tools, call).await, None)

@@ -23,6 +23,7 @@ members = [
   "crates/rho-tool-shell",
   "crates/rho-ui-proto",
   "crates/rho-webui-messages",
+  "crates/rho-web-search",
   "crates/rho-workspaces",
   "crates/rho-zed-host",
   "crates/senax-encoder",
@@ -90,6 +91,7 @@ rho-slack = { path = "crates/rho-slack" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
 rho-webui-messages = { path = "crates/rho-webui-messages" }
+rho-web-search = { path = "crates/rho-web-search" }
 rho-workspaces = { path = "crates/rho-workspaces" }
 rho-zed-host = { path = "crates/rho-zed-host" }
 rustix-openpty = "0.2"
@@ -98,6 +100,7 @@ rustls = { version = "0.23", default-features = false, features = [
   "std",
   "tls12",
 ] }
+schemars = "0.8.22"
 senax-encoder = { path = "crates/senax-encoder" }
 senax-encoder-derive = { path = "crates/senax-encoder/derive" }
 serde = { version = "1", features = ["derive"] }

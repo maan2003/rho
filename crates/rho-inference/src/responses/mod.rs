@@ -12,7 +12,7 @@ mod tests;
 mod wire;
 mod ws;
 
-pub use oauth::InferenceAuth;
+pub use oauth::{InferenceAuth, ResolvedOAuth};
 pub use session::{InferenceSession, PromptCacheKey};
 pub use wire::OpenAiResponsesProviderData;
 
