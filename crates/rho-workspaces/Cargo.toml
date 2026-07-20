@@ -11,6 +11,9 @@ anyhow.workspace = true
 bytes = "1"
 camino.workspace = true
 dirs.workspace = true
+futures.workspace = true
+jj-lib.workspace = true
+jj-cli.workspace = true
 libc.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
 rho-context-config.workspace = true

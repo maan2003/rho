@@ -26,6 +26,8 @@ pub enum SurfaceKey {
     },
     /// An editor-native shell process and transcript owned by the daemon.
     Shell(AgentId),
+    /// The jj working-copy diff for an agent's workspace.
+    Diff { agent_id: AgentId },
     /// A daemon-owned terminal attached over a dedicated stream.
     Terminal { agent_id: AgentId, terminal_id: u64 },
 }
@@ -33,7 +35,7 @@ pub enum SurfaceKey {
 impl SurfaceKey {
     /// Conversation content (the draft composer, agent transcripts), as
     /// opposed to artifacts the user opened deliberately (files,
-    /// terminals). Display policy routes conversations through panes
+    /// diffs, terminals). Display policy routes conversations through panes
     /// already showing conversation, so switching agents never covers an
     /// artifact pane.
     pub fn is_conversation(&self) -> bool {

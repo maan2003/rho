@@ -286,6 +286,38 @@ AI APIs.
   protocol frames are rejected (`MAX_FRAME_LEN`), web UI JSON lines are
   length-bounded (`MAX_LINE_LEN`), malformed frames end the connection, and
   malformed browser JSON produces an error message, never a panic.
+- An authenticated native UI client may request a diff for any workspace it
+  can already open through the fully privileged UI protocol. A refresh is a
+  persistent jj write: it snapshots that workspace and descendant workspace
+  commits under the per-repo lock and may therefore rebase/materialize those
+  descendants. Unrelated workspace branches are not scanned. The returned
+  repository epoch is consumed under the same lock, avoiding mixed-operation
+  manifests. The blocking job owns that lock, so an RPC timeout cannot admit a
+  concurrent jj mutation while the timed-out worker finishes.
+- Diff manifests expose repository-relative paths and bounded parent file
+  contents to the requesting GUI; current-side contents stay on the existing
+  Zed channel. Reads are limited per file, aggregate I/O, aggregate payload,
+  and file count; both parent materialization and target text/binary probes
+  charge the aggregate I/O budget. Dirty-path requests have count and path-byte
+  limits. The headless Zed host enforces an 8 MiB limit while reading each live
+  file on initial open, watcher/manual reload, and binary load, closing
+  replacement/growth races after the metadata check; the GUI also caps
+  aggregate live text before building diffs. Daemon loads have a semaphore and
+  30-second wait, and use a low-priority one-shot iroh stream. Both encoded and
+  raw frame writers enforce the same 64 MiB bound as readers.
+- Hidden diff surfaces retain their Zed watch stream and local buffer identity,
+  but watcher/buffer invalidations cannot initiate jj manifest RPCs until that
+  model is shown in an active pane. Hidden changes coalesce; an already-started
+  request may still finish after the surface is hidden.
+- Checked Zed saves use a separate RPC, so an older host cannot ignore a new
+  field and silently fall back to overwrite. Within one headless project,
+  checked and unchecked saves for the same server buffer share a gate. A
+  checked save performs no write when its immediate host-side metadata check
+  sees path existence or exact mtime differ from the buffer's last
+  saved/reloaded baseline; only an explicit overwrite/recreation response uses
+  the unchecked RPC. This is not filesystem CAS: an external writer can race
+  after the check, preserve/collide on metadata, or write through another host
+  session or buffer identity. Rho therefore still does not focus-loss autosave.
 
 
 ## Runtime assumptions

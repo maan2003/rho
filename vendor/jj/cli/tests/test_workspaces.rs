@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::PathBuf;
+
 use test_case::test_case;
 use testutils::TestResult;
 use testutils::git;
@@ -19,6 +21,44 @@ use testutils::git;
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
+
+fn prepare_git_worktree(source: &TestWorkDir<'_>, destination: &TestWorkDir<'_>) -> PathBuf {
+    let revision = source
+        .run_jj(["log", "--no-graph", "-r", "@-", "-T", "commit_id"])
+        .success()
+        .stdout
+        .into_raw();
+    let output = std::process::Command::new("git")
+        .current_dir(source.root())
+        .args(["worktree", "add", "--detach", "--no-checkout"])
+        .arg(destination.root())
+        .arg(revision.trim())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    // `workspace add` requires an empty destination and no longer creates Git
+    // metadata itself, so hide the worktree link until jj initializes it.
+    let metadata = destination.root().with_extension("git-worktree-metadata");
+    std::fs::rename(destination.root().join(".git"), &metadata).unwrap();
+    metadata
+}
+
+fn restore_git_worktree(destination: &TestWorkDir<'_>, metadata: PathBuf) {
+    std::fs::rename(metadata, destination.root().join(".git")).unwrap();
+    std::fs::write(destination.root().join(".jj/.gitignore"), "/*\n").unwrap();
+    // Match managed-workspace materialization: Git creates an empty index for
+    // `--no-checkout`, while jj has already populated the working tree.
+    let status = std::process::Command::new("git")
+        .current_dir(destination.root())
+        .args(["read-tree", "HEAD"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "git read-tree failed: {status}");
+}
 
 /// Test adding a second and a third workspace
 #[test]
@@ -444,16 +484,11 @@ fn test_workspaces_add_git_workspace() -> TestResult {
     main_dir.write_file("file", "contents\n");
     main_dir.run_jj(["commit", "-m", "initial"]).success();
 
+    let git_metadata = prepare_git_worktree(&main_dir, &secondary_dir);
     main_dir
-        .run_jj([
-            "workspace",
-            "add",
-            "--git",
-            "--name",
-            "second",
-            "../secondary",
-        ])
+        .run_jj(["workspace", "add", "--name", "second", "../secondary"])
         .success();
+    restore_git_worktree(&secondary_dir, git_metadata);
 
     assert!(secondary_dir.root().join(".git").is_file());
     let main_git_repo = git::open(main_dir.root());
@@ -498,18 +533,11 @@ fn test_workspaces_snapshot_updates_child_git_head() -> TestResult {
 
     main_dir.write_file("base", "base\n");
     main_dir.run_jj(["commit", "-m", "initial"]).success();
+    let git_metadata = prepare_git_worktree(&main_dir, &child_dir);
     main_dir
-        .run_jj([
-            "workspace",
-            "add",
-            "--git",
-            "--name",
-            "child",
-            "-r",
-            "@",
-            "../child",
-        ])
+        .run_jj(["workspace", "add", "--name", "child", "-r", "@", "../child"])
         .success();
+    restore_git_worktree(&child_dir, git_metadata);
     child_dir.run_jj(["new", "default@"]).success();
 
     let old_child_git_head = git_head(&child_dir)?;

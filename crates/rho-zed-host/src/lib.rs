@@ -97,6 +97,7 @@ fn run_app(mut commands: mpsc::UnboundedReceiver<HostCmd>) {
     app.run(move |cx| {
         release_channel::init(semver::Version::new(0, 1, 0), cx);
         gpui_tokio::init(cx);
+        worktree::set_file_size_limit(8 * 1024 * 1024);
         HeadlessProject::init(cx);
         disable_language_servers(cx);
 

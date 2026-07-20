@@ -550,6 +550,7 @@ async fn run_iroh_listener(
                             let dedicated = matches!(
                                 &first,
                                 ClientMessage::ChannelOpen { .. }
+                                    | ClientMessage::DiffSnapshot { .. }
                                     | ClientMessage::TerminalCreate { .. }
                                     | ClientMessage::TerminalAttach { .. }
                                     | ClientMessage::TerminalList { .. }
@@ -1679,6 +1680,15 @@ where
     if let ClientMessage::ChannelOpen { workspace } = first {
         return serve_zed_channel(agents, reader, writer, workspace).await;
     }
+    if let ClientMessage::DiffSnapshot {
+        workspace,
+        known_commit_id,
+        include_paths,
+    } = first
+    {
+        return serve_diff_snapshot(agents, writer, workspace, known_commit_id, include_paths)
+            .await;
+    }
     if let ClientMessage::TerminalCreate {
         agent,
         terminal_id,
@@ -2613,7 +2623,8 @@ async fn handle_message(
         ClientMessage::ChannelOpen { .. } => {
             anyhow::bail!("ChannelOpen must be the first frame on a dedicated stream")
         }
-        ClientMessage::TerminalCreate { .. }
+        ClientMessage::DiffSnapshot { .. }
+        | ClientMessage::TerminalCreate { .. }
         | ClientMessage::TerminalAttach { .. }
         | ClientMessage::TerminalList { .. }
         | ClientMessage::ShellAttach { .. }
@@ -2877,6 +2888,55 @@ fn rho_pager_program() -> std::ffi::OsString {
         }
     }
     "rho-pager".into()
+}
+
+/// Persists one jj working-copy snapshot and serves its bounded parent-side
+/// manifest on a dedicated stream, avoiding control-session head-of-line
+/// blocking.
+async fn serve_diff_snapshot<W>(
+    agents: Arc<AgentRegistry>,
+    mut writer: W,
+    workspace: WorkspaceInfo,
+    known_commit_id: Option<String>,
+    include_paths: Vec<Utf8PathBuf>,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
+        let workspace = agents.pool.open_workspace(&workspace).await?;
+        workspace
+            .diff_snapshot(known_commit_id.as_deref(), &include_paths)
+            .await
+    })
+    .await
+    .context("diff snapshot timed out after 30 seconds")
+    .and_then(|result| result);
+    match result {
+        Ok(Some(snapshot)) => {
+            write_frame(&mut writer, &ServerMessage::DiffSnapshot { snapshot }).await
+        }
+        Ok(None) => {
+            write_frame(
+                &mut writer,
+                &ServerMessage::DiffUnchanged {
+                    commit_id: known_commit_id.unwrap_or_default(),
+                },
+            )
+            .await
+        }
+        Err(error) => {
+            write_frame(
+                &mut writer,
+                &ServerMessage::DiffRefused {
+                    reason: format!("{error:#}"),
+                },
+            )
+            .await
+        }
+    }
 }
 
 /// How a terminal stream's first frame opens its terminal.

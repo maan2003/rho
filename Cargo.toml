@@ -58,6 +58,7 @@ async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
+buffer_diff = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 camino = "1"
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
@@ -69,6 +70,7 @@ futures = "0.3"
 futures-util = "0.3"
 iroh = { version = "1.0.2", default-features = false }
 json-stream = { path = "crates/json-stream" }
+jj-lib = { path = "vendor/jj/lib" }
 jj-cli = { path = "vendor/jj/cli" }
 libc = "0.2"
 noq-proto = { version = "=1.0.1", default-features = false }
@@ -143,6 +145,7 @@ tracing = { version = "0.1", default-features = false, features = [
 ] }
 url = { version = "2", default-features = false }
 uuid = { version = "1", features = ["serde", "v4"] }
+worktree = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 zip = { version = "2", default-features = false, features = [
   "deflate",
   "time",

@@ -13,6 +13,7 @@
 //!
 //! Requires the bundled jj fork on PATH. jj owns managed-id allocation,
 //! materialization, recovery, and garbage collection; Rho owns live use.
+//! Live-diff barriers use the same vendored implementation directly in-process.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -31,9 +32,14 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
 
+mod diff;
 mod ns;
 mod sandbox;
 
+pub use diff::{
+    WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
+    WorkspaceDiffTarget,
+};
 pub use ns::init_daemon_namespace;
 
 pub type WorkspaceId = PrefixId<WorkspaceIdDomain>;
@@ -160,6 +166,10 @@ impl UserEnvironment {
             .iter()
             .find_map(|(key, value)| (key == name).then_some(value.as_os_str()))
     }
+
+    fn values(&self) -> Vec<(OsString, OsString)> {
+        self.0.iter().cloned().collect()
+    }
 }
 
 impl PathOverrides {
@@ -266,7 +276,7 @@ pub struct Repo {
     path_overrides: PathOverrides,
     user_environment: Option<UserEnvironment>,
     /// Serializes jj invocations. jj's op log makes concurrent commands safe
-    /// on its own; this is simplicity insurance while the fork's
+    /// on its own; this is simplicity insurance while the vendored
     /// descendant-workspace snapshot path is young.
     jj_lock: Mutex<()>,
     /// Weakly indexes live workspaces, so agents and views remain their strong
@@ -814,6 +824,74 @@ impl Workspace {
         run_jj(command).await.context("jj snapshot")?;
         Ok(())
     }
+
+    /// Snapshots this repository's live workspaces, then reads the current
+    /// workspace commit and its automatically merged parent tree through
+    /// `jj-lib`. The result is immutable: later filesystem edits do not alter
+    /// the returned commit id or base/target contents.
+    pub async fn diff_snapshot(
+        &self,
+        known_commit_id: Option<&str>,
+        include_paths: &[Utf8PathBuf],
+    ) -> anyhow::Result<Option<WorkspaceDiffSnapshot>> {
+        anyhow::ensure!(
+            include_paths.len() <= 2_048,
+            "too many live diff paths: {}",
+            include_paths.len()
+        );
+        anyhow::ensure!(
+            include_paths
+                .iter()
+                .try_fold(0_usize, |total, path| total
+                    .checked_add(path.as_str().len()))
+                .is_some_and(|total| total <= 1024 * 1024),
+            "live diff paths exceed the 1 MiB path budget"
+        );
+        anyhow::ensure!(
+            self.repo.is_jj,
+            "diff view requires a jj repository: {}",
+            self.repo.root
+        );
+        static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let permit = DIFF_READERS
+            .acquire()
+            .await
+            .context("diff readers closed")?;
+        let checkout = self.checkout.clone();
+        let repo = Arc::clone(&self.repo);
+        let known_commit_id = known_commit_id.map(str::to_owned);
+        let include_paths = include_paths.to_vec();
+        let environment = self
+            .repo
+            .user_environment
+            .as_ref()
+            .map(UserEnvironment::values)
+            .unwrap_or_else(|| std::env::vars_os().collect());
+        tokio::task::spawn_blocking(move || {
+            // jj-lib's repository/index graph is intentionally !Send. Keep
+            // every jj value and future on this one blocking worker; only the
+            // fully-owned wire DTO crosses back to Tokio. The permit moves
+            // with the worker, so cancellation/timeouts cannot create an
+            // unbounded population of zombie repository reads.
+            let _permit = permit;
+            let _guard = repo.jj_lock.blocking_lock();
+            futures::executor::block_on(async {
+                let epoch = jj_cli::cli_util::snapshot_workspace_descendants_at_with_environment(
+                    checkout.as_std_path(),
+                    environment,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+                let captured = diff::capture(epoch).await?;
+                if known_commit_id.as_deref() == Some(captured.commit_id_hex().as_str()) {
+                    return Ok(None);
+                }
+                diff::load(captured, &include_paths).await.map(Some)
+            })
+        })
+        .await
+        .context("jj diff reader panicked")?
+    }
 }
 
 /// One agent's view of the filesystem: a working set of workdir entries
@@ -1118,6 +1196,7 @@ fn enter_workspace_ns(
 }
 
 async fn run_jj(mut command: tokio::process::Command) -> anyhow::Result<Vec<u8>> {
+    command.kill_on_drop(true);
     let output = command.output().await.context("spawn jj")?;
     if !output.status.success() {
         anyhow::bail!(
@@ -1285,7 +1364,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    use super::{Repo, copy_mtime_if_same, sandbox_join};
+    use camino::{Utf8Path, Utf8PathBuf};
+
+    use super::{
+        PathOverrides, Repo, UserEnvironment, WorkspaceDiffContent, WorkspaceDiffStatus,
+        WorkspaceDiffTarget, copy_mtime_if_same, sandbox_join,
+    };
 
     #[tokio::test]
     async fn repo_cache_weakly_deduplicates_workspaces() {
@@ -1306,6 +1390,100 @@ mod tests {
 
         let (first, second) = tokio::join!(repo.user_checkout(), repo.user_checkout());
         assert!(Arc::ptr_eq(&first.unwrap(), &second.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn diff_snapshot_persists_live_text_but_only_sends_parent_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        let jj = |args: &[&str]| {
+            let status = std::process::Command::new("jj")
+                .current_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "jj {args:?} failed with {status}");
+        };
+        jj(&["git", "init", "--no-colocate"]);
+        std::fs::write(repo_path.join("file.txt"), "parent\n").unwrap();
+        std::fs::write(repo_path.join("unchanged.txt"), "same\n").unwrap();
+        jj(&["commit", "-m", "parent"]);
+        std::fs::write(repo_path.join("file.txt"), "live target\n").unwrap();
+
+        let mut environment = std::env::vars_os().collect::<Vec<_>>();
+        environment.push(("COMPLETE".into(), "bash".into()));
+        environment.push(("_CLAP_COMPLETE_INDEX".into(), "1".into()));
+        let repo = Arc::new(
+            Repo::open_with_environment(
+                &repo_path,
+                PathOverrides::default(),
+                UserEnvironment::new(environment),
+            )
+            .unwrap(),
+        );
+        let workspace = repo.user_checkout().await.unwrap();
+        let first = workspace.diff_snapshot(None, &[]).await.unwrap().unwrap();
+        assert_eq!(first.files.len(), 1);
+        assert_eq!(first.files[0].status, WorkspaceDiffStatus::Modified);
+        assert_eq!(
+            first.files[0].base,
+            WorkspaceDiffContent::Text("parent\n".to_owned())
+        );
+        assert_eq!(
+            first.files[0].target,
+            WorkspaceDiffTarget::Text {
+                bytes: "live target\n".len() as u64
+            }
+        );
+        let with_live_path = workspace
+            .diff_snapshot(None, &[Utf8PathBuf::from("unchanged.txt")])
+            .await
+            .unwrap()
+            .unwrap();
+        let unchanged = with_live_path
+            .files
+            .iter()
+            .find(|file| file.path == Utf8Path::new("unchanged.txt"))
+            .unwrap();
+        assert_eq!(unchanged.status, WorkspaceDiffStatus::Modified);
+        assert_eq!(
+            unchanged.base,
+            WorkspaceDiffContent::Text("same\n".to_owned())
+        );
+        assert!(
+            workspace
+                .diff_snapshot(Some(&first.commit_id), &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(repo_path.join("file.txt"), "new target\n").unwrap();
+        std::fs::write(repo_path.join("binary.bin"), [0, 159, 146, 150]).unwrap();
+        let second = workspace
+            .diff_snapshot(Some(&first.commit_id), &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(second.commit_id, first.commit_id);
+        let changed_text = second
+            .files
+            .iter()
+            .find(|file| file.path == Utf8Path::new("file.txt"))
+            .unwrap();
+        assert_eq!(
+            changed_text.target,
+            WorkspaceDiffTarget::Text {
+                bytes: "new target\n".len() as u64
+            }
+        );
+        let binary = second
+            .files
+            .iter()
+            .find(|file| file.path == Utf8Path::new("binary.bin"))
+            .unwrap();
+        assert_eq!(binary.target, WorkspaceDiffTarget::Binary { bytes: 4 });
     }
 
     #[tokio::test]

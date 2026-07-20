@@ -277,6 +277,50 @@ async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<Box<dyn AsyncStrea
     })
 }
 
+async fn dial_diff_snapshot(
+    dialer: ChannelDialer,
+    workspace: WorkspaceInfo,
+    known_commit_id: Option<String>,
+    include_paths: Vec<Utf8PathBuf>,
+) -> anyhow::Result<Option<rho_ui_proto::WorkspaceDiffSnapshot>> {
+    let mut stream = dial_bulk_stream(dialer).await?;
+    write_frame(
+        &mut stream,
+        &ClientMessage::DiffSnapshot {
+            workspace,
+            known_commit_id,
+            include_paths,
+        },
+    )
+    .await?;
+    match read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::DiffSnapshot { snapshot } => Ok(Some(snapshot)),
+        ServerMessage::DiffUnchanged { .. } => Ok(None),
+        ServerMessage::DiffRefused { reason } => anyhow::bail!("{reason}"),
+        _ => anyhow::bail!("unexpected reply to DiffSnapshot"),
+    }
+}
+
+/// Opens a low-priority one-shot/bulk stream. Unlike terminal streams this
+/// deliberately keeps iroh's default priority below interactive traffic.
+async fn dial_bulk_stream(dialer: ChannelDialer) -> anyhow::Result<Box<dyn AsyncStream>> {
+    Ok(match dialer {
+        ChannelDialer::Unix(socket_path) => {
+            let client = Client::connect(&socket_path)
+                .await
+                .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+            Box::new(client.into_stream()) as Box<dyn AsyncStream>
+        }
+        ChannelDialer::Iroh(connection) => {
+            let (send, recv) = connection
+                .open_bi()
+                .await
+                .context("open iroh bulk stream")?;
+            Box::new(tokio::io::join(recv, send)) as Box<dyn AsyncStream>
+        }
+    })
+}
+
 /// One-shot `TerminalList` request for one agent's running terminals.
 async fn dial_terminal_list(
     dialer: ChannelDialer,
@@ -461,7 +505,35 @@ pub struct Connection {
     _io_task: Task<Result<(), gpui_tokio::JoinError>>,
 }
 
+#[derive(Clone)]
+pub struct DiffClient {
+    dialer: Arc<Mutex<Option<ChannelDialer>>>,
+}
+
+impl DiffClient {
+    pub fn snapshot(
+        &self,
+        workspace: WorkspaceInfo,
+        known_commit_id: Option<String>,
+        include_paths: Vec<Utf8PathBuf>,
+        cx: &App,
+    ) -> Task<
+        Result<anyhow::Result<Option<rho_ui_proto::WorkspaceDiffSnapshot>>, gpui_tokio::JoinError>,
+    > {
+        let dialer = self.dialer.lock().unwrap().clone();
+        Tokio::spawn(cx, async move {
+            let dialer = dialer.context("not connected to rho-daemon")?;
+            dial_diff_snapshot(dialer, workspace, known_commit_id, include_paths).await
+        })
+    }
+}
+
 impl Connection {
+    pub fn diff_client(&self) -> DiffClient {
+        DiffClient {
+            dialer: self.dialer.clone(),
+        }
+    }
     pub fn send(&self, message: ClientMessage) {
         let _ = self.commands.unbounded_send(message);
     }
@@ -814,6 +886,9 @@ async fn run(
             | ServerMessage::TerminalList { .. }
             | ServerMessage::ShellOpened
             | ServerMessage::ShellAttachRefused { .. }
+            | ServerMessage::DiffSnapshot { .. }
+            | ServerMessage::DiffUnchanged { .. }
+            | ServerMessage::DiffRefused { .. }
             | ServerMessage::AgentStreamOpened { .. } => None,
         };
         if let Some(event) = event

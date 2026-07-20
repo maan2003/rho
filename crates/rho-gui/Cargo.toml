@@ -13,40 +13,41 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-askpass = { git = "https://github.com/maan2003/zed", branch = "rho" }
-assets = { git = "https://github.com/maan2003/zed", branch = "rho" }
+askpass = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+assets = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+buffer_diff.workspace = true
 async-trait = "0.1"
 camino.workspace = true
 clap.workspace = true
-client = { git = "https://github.com/maan2003/zed", branch = "rho" }
-clock = { git = "https://github.com/maan2003/zed", branch = "rho" }
-collections = { git = "https://github.com/maan2003/zed", branch = "rho" }
-command_palette = { git = "https://github.com/maan2003/zed", branch = "rho" }
+client = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+clock = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+collections = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+command_palette = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 dirs.workspace = true
-editor = { git = "https://github.com/maan2003/zed", branch = "rho" }
-fs = { git = "https://github.com/maan2003/zed", branch = "rho" }
+editor = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+fs = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 futures.workspace = true
 iroh = { workspace = true, features = ["qlog", "tls-aws-lc-rs"] }
-gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
+gpui = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4", default-features = false, features = [
   "wayland",
 ] }
-gpui_platform = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
+gpui_platform = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4", default-features = false, features = [
   "font-kit",
   "wayland",
 ] }
-gpui_tokio = { git = "https://github.com/maan2003/zed", branch = "rho" }
-http_client = { git = "https://github.com/maan2003/zed", branch = "rho" }
+gpui_tokio = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+http_client = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 json-stream.workspace = true
-language = { git = "https://github.com/maan2003/zed", branch = "rho" }
-languages = { git = "https://github.com/maan2003/zed", branch = "rho", features = ["load-grammars"] }
-multi_buffer = { git = "https://github.com/maan2003/zed", branch = "rho" }
+language = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+languages = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4", features = ["load-grammars"] }
+multi_buffer = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 prefix-id = { workspace = true, features = ["redb"] }
-node_runtime = { git = "https://github.com/maan2003/zed", branch = "rho" }
+node_runtime = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 octo-types.workspace = true
-project = { git = "https://github.com/maan2003/zed", branch = "rho" }
+project = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 prost = "0.9"
-release_channel = { git = "https://github.com/maan2003/zed", branch = "rho" }
-remote = { git = "https://github.com/maan2003/zed", branch = "rho" }
+release_channel = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+remote = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 rho-core.workspace = true
 rho-daemon.workspace = true
 rho-iroh-auth.workspace = true
@@ -59,26 +60,26 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
   "playback",
   "wav",
 ] }
-rpc = { git = "https://github.com/maan2003/zed", branch = "rho" }
+rpc = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 rustc-hash = "2.1.0"
-search = { git = "https://github.com/maan2003/zed", branch = "rho" }
+search = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 semver = { version = "1.0", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
-settings = { git = "https://github.com/maan2003/zed", branch = "rho" }
-text = { git = "https://github.com/maan2003/zed", branch = "rho" }
-theme = { git = "https://github.com/maan2003/zed", branch = "rho" }
-theme_settings = { git = "https://github.com/maan2003/zed", branch = "rho" }
+settings = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+text = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+theme = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+theme_settings = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 tokio = { workspace = true, features = ["io-util", "net", "process", "rt"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
-ui = { git = "https://github.com/maan2003/zed", branch = "rho" }
-util = { git = "https://github.com/maan2003/zed", branch = "rho" }
-vim = { git = "https://github.com/maan2003/zed", branch = "rho" }
-vim_mode_setting = { git = "https://github.com/maan2003/zed", branch = "rho" }
+ui = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+util = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+vim = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+vim_mode_setting = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
 
 [dev-dependencies]
-gpui = { git = "https://github.com/maan2003/zed", branch = "rho", default-features = false, features = [
+gpui = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4", default-features = false, features = [
   "test-support",
 ] }

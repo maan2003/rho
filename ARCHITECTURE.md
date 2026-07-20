@@ -47,6 +47,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   multi-repository agent's prompt lists a separate `ws-<id>` handle for every
   workdir.
   Sandbox and ordinary workspaces cannot be mixed in one view.
+  Live-diff semantic barriers use the same vendored descendant-snapshot
+  implementation through an embedded `jj-cli` API under the repo lock. The
+  API returns the exact immutable repository epoch it wrote, so derived
+  manifests never reload a racing operation head.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Rho packages platform-owned skills under
   `$out/share/rho/skills`; the final package build embeds that immutable root in
@@ -299,6 +303,40 @@ role, and isolated-versus-user-checkout start choice. The web UI page itself
 is a static Leptos/wasm app (`webui/` at the
 repo root, its own cargo workspace, hostable anywhere) that connects as an
 iroh client from the browser.
+
+Native GUI file and diff surfaces share one remote Zed `Project` per workspace,
+and therefore one buffer identity, dirty state, and reload stream per path. The
+daemon's headless Zed host owns filesystem watching and serialized saves;
+its worktree events both update/reload Zed buffers and invalidate the live diff.
+That host configures Zed's worktree reader with an 8 MiB per-file limit, which
+is enforced while reading as well as by the metadata preflight for initial
+opens, watcher/manual reloads, and binary loads.
+A diff refresh is a semantic barrier, not a second watcher snapshot: the daemon
+persists the requested jj workspace/descendant closure and returns a bounded
+manifest containing the exact operation and working-copy commit, parent-side
+text, and bounded target type/size/mode descriptors. Current-side text is
+deliberately omitted and always comes from the live Zed buffer. The GUI unions
+dirty shared-buffer paths into each manifest request so unsaved-only files get
+their immutable parent side and survive reconciliation. Conditional one-shot
+requests suppress unchanged manifests when that dirty-path set is stable.
+
+Each diff surface has one shared GUI `DiffModel`; split panes create independent
+editors over its multibuffer. Stable repository-path keys and subscriptions to
+buffers, buffer diffs, and worktree events let refreshes reconcile paths and
+recalculate hunks without replacing the surface. Manifest invalidations are
+lazy: a hidden diff stays subscribed to its retained Zed project but cannot
+start a jj manifest request. Returning it to an active pane coalesces all hidden
+changes into one refresh; a request already started while visible may finish
+after it becomes hidden.
+
+The headless Zed server owns save conflict detection. Checked saves use a
+distinct RPC, are serialized per server buffer, and compare current path
+existence and exact mtime with the buffer's last saved/reloaded baseline just
+before writing. Rho's stateless save helper only renders the authoritative
+modified/created/deleted result: overwrite or recreation uses Zed's legacy
+unchecked save only after explicit confirmation, while discard reloads through
+Zed. Focus loss does not save because arbitrary external writers can still race
+the metadata check and write.
 
 Rho patches iroh's `noq` transport dependencies to vendored copies. The local
 extension preserves strict stream priorities and adds relative send-stream

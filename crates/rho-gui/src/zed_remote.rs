@@ -14,13 +14,14 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context as _, Result, anyhow};
 use camino::Utf8PathBuf;
 use client::{Client, UserStore};
+use collections::HashSet;
 use editor::Editor;
 use futures::channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 use futures::channel::oneshot;
 use futures::{FutureExt as _, StreamExt as _, select_biased};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Styled as _, Task, Window, div,
+    ParentElement as _, PromptLevel, Render, Styled as _, Task, Window, div,
 };
 use project::{Project, ProjectPath};
 use prost::Message as _;
@@ -29,6 +30,7 @@ use remote::{
     RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions,
 };
 use rho_ui_proto::WorkspaceInfo;
+use rpc::ErrorExt as _;
 use rpc::proto::Envelope;
 use theme::ActiveTheme as _;
 use util::paths::{PathStyle, RemotePathBuf};
@@ -42,7 +44,7 @@ pub fn open_remote_project(
     connection: &Connection,
     workspace: WorkspaceInfo,
     cx: &mut App,
-) -> Task<Result<(Entity<Project>, Utf8PathBuf)>> {
+) -> Task<Result<RemoteProject>> {
     let name = workspace_label(&workspace);
     let channel_task = connection.open_channel(workspace, cx);
     cx.spawn(async move |cx| {
@@ -86,49 +88,191 @@ pub fn open_remote_project(
                 cx,
             )
         });
-        Ok((project, root))
+        Ok(RemoteProject { project, root })
     })
 }
 
-/// Opens `path` (relative to the workspace root, or absolute) as a buffer
-/// in a remote project over `workspace`'s channel. The caller builds the
-/// [`FileView`] with its own window.
-pub fn open_file_buffer(
-    connection: &Connection,
-    workspace: WorkspaceInfo,
-    path: Utf8PathBuf,
+/// One live remote Zed project for a materialized Rho workspace. File and
+/// diff surfaces share this value so the same path has one buffer identity and
+/// dirty state throughout the GUI.
+#[derive(Clone)]
+pub struct RemoteProject {
+    pub project: Entity<Project>,
+    pub root: Utf8PathBuf,
+}
+
+pub fn save_buffers(
+    project: Entity<Project>,
+    buffers: impl IntoIterator<Item = Entity<language::Buffer>>,
+    window: &mut Window,
     cx: &mut App,
-) -> Task<Result<(Entity<Project>, Entity<language::Buffer>)>> {
-    let project_task = open_remote_project(connection, workspace, cx);
-    cx.spawn(async move |cx| {
-        let (project, root) = project_task.await?;
-        let abs_path = if path.is_absolute() {
-            path
-        } else {
-            root.join(path)
-        };
-        let (worktree, rel_path) = cx
-            .update(|cx| {
-                project.update(cx, |project, cx| {
-                    project.find_or_create_worktree(abs_path.as_std_path(), true, cx)
-                })
-            })
-            .await?;
-        let buffer = cx
-            .update(|cx| {
-                project.update(cx, |project, cx| {
-                    let worktree_id = worktree.read(cx).id();
-                    project.open_buffer(
-                        ProjectPath {
-                            worktree_id,
-                            path: rel_path,
-                        },
+) {
+    let buffers = buffers
+        .into_iter()
+        .filter(|buffer| {
+            let buffer = buffer.read(cx);
+            buffer.file().is_some() && buffer.is_dirty()
+        })
+        .collect::<Vec<_>>();
+    let saves = buffers
+        .into_iter()
+        .map(|buffer| {
+            let save = project.update(cx, |project, cx| {
+                project.save_buffer_checked(buffer.clone(), cx)
+            });
+            (buffer, save)
+        })
+        .collect::<Vec<_>>();
+    if saves.is_empty() {
+        return;
+    }
+
+    window
+        .spawn(cx, async move |cx| {
+            let results = futures::future::join_all(
+                saves
+                    .into_iter()
+                    .map(|(buffer, save)| async move { (buffer, save.await) }),
+            )
+            .await;
+            let mut conflicted = HashSet::default();
+            let mut deleted = HashSet::default();
+            for (buffer, result) in results {
+                match result {
+                    Ok(()) => {}
+                    Err(error) if error.error_code() == rpc::ErrorCode::SaveConflict => {
+                        match error.error_tag("kind") {
+                            Some("deleted") => {
+                                deleted.insert(buffer);
+                            }
+                            Some("modified" | "created") => {
+                                conflicted.insert(buffer);
+                            }
+                            kind => tracing::error!(?kind, %error, "unknown save conflict"),
+                        }
+                    }
+                    Err(error) => tracing::error!("save buffer: {error:#}"),
+                }
+            }
+
+            if !conflicted.is_empty() {
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        "One or more files changed on disk.",
+                        Some("Overwrite saves the live editor contents; Reload discards them."),
+                        &["Overwrite", "Reload", "Cancel"],
                         cx,
                     )
-                })
+                })?;
+                match answer.await {
+                    Ok(0) => project
+                        .update(cx, |project, cx| project.save_buffers(conflicted, cx))
+                        .await
+                        .map_err(|error| tracing::error!("overwrite buffers: {error:#}"))
+                        .ok(),
+                    Ok(1) => project
+                        .update(cx, |project, cx| {
+                            project.reload_buffers(conflicted, true, cx)
+                        })
+                        .await
+                        .map_err(|error| tracing::error!("reload buffers: {error:#}"))
+                        .ok()
+                        .map(|_| ()),
+                    _ => None,
+                };
+            }
+
+            if !deleted.is_empty() {
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        "One or more files were deleted on disk.",
+                        Some("Recreate writes the live editor contents. Keep Editing leaves the deletion untouched."),
+                        &["Recreate", "Keep Editing", "Cancel"],
+                        cx,
+                    )
+                })?;
+                if answer.await == Ok(0) {
+                    project
+                        .update(cx, |project, cx| project.save_buffers(deleted, cx))
+                        .await
+                        .map_err(|error| tracing::error!("recreate buffers: {error:#}"))
+                        .ok();
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach();
+}
+
+/// Opens `path` (relative to the workspace root, or absolute) in an existing
+/// remote project.
+pub async fn open_file_buffer(
+    remote: &RemoteProject,
+    path: Utf8PathBuf,
+    cx: &mut AsyncApp,
+) -> Result<Entity<language::Buffer>> {
+    let project_path = remote_project_path(remote, path, cx).await?;
+    let project = remote.project.clone();
+    let buffer = cx
+        .update(|cx| project.update(cx, |project, cx| project.open_buffer(project_path, cx)))
+        .await?;
+    Ok(buffer)
+}
+
+/// Returns the already-open buffer for `path` without creating a new file.
+/// This is used for deleted diff entries so a dirty buffer survives an
+/// external deletion, while an unopened deletion remains read-only.
+pub async fn opened_dirty_file_buffer(
+    remote: &RemoteProject,
+    path: Utf8PathBuf,
+    cx: &mut AsyncApp,
+) -> Result<Option<Entity<language::Buffer>>> {
+    let project_path = remote_project_path(remote, path, cx).await?;
+    Ok(cx.update(|cx| {
+        remote
+            .project
+            .read(cx)
+            .opened_buffers(cx)
+            .into_iter()
+            .find(|buffer| {
+                let buffer = buffer.read(cx);
+                buffer.is_dirty()
+                    && buffer.file().is_some_and(|file| {
+                        file.worktree_id(cx) == project_path.worktree_id
+                            && file.path() == &project_path.path
+                    })
             })
-            .await?;
-        Ok((project, buffer))
+    }))
+}
+
+async fn remote_project_path(
+    remote: &RemoteProject,
+    path: Utf8PathBuf,
+    cx: &mut AsyncApp,
+) -> Result<ProjectPath> {
+    let rel_path = if path.is_absolute() {
+        path.strip_prefix(&remote.root)
+            .with_context(|| format!("file {path} is outside workspace {}", remote.root))?
+            .to_owned()
+    } else {
+        path
+    };
+    let rel_path = util::rel_path::RelPath::new(rel_path.as_std_path(), PathStyle::local())?
+        .into_owned()
+        .into();
+    let project = remote.project.clone();
+    let (worktree, _) = cx
+        .update(|cx| {
+            project.update(cx, |project, cx| {
+                project.find_or_create_worktree(remote.root.as_std_path(), true, cx)
+            })
+        })
+        .await?;
+    Ok(ProjectPath {
+        worktree_id: worktree.read_with(cx, |worktree, _| worktree.id()),
+        path: rel_path,
     })
 }
 
@@ -172,12 +316,7 @@ impl FileView {
 
     fn save(&mut self, _: &crate::FileSave, _window: &mut Window, cx: &mut Context<Self>) {
         let buffers = self.editor.read(cx).buffer().read(cx).all_buffers();
-        let project = self.project.clone();
-        for buffer in buffers {
-            project
-                .update(cx, |project, cx| project.save_buffer(buffer, cx))
-                .detach();
-        }
+        save_buffers(self.project.clone(), buffers, _window, cx);
     }
 }
 

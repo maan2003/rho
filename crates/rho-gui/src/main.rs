@@ -5,6 +5,7 @@ mod banner;
 mod chime;
 mod commands;
 mod connection;
+mod diff_view;
 mod draft_view;
 mod editor_config;
 mod highlights;
@@ -435,6 +436,7 @@ fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoGui > Editor && !showing_completions"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
+        KeyBinding::new("ctrl-s", FileSave, Some("RhoDiffView")),
         // A Comint-style shell submits complete input lines to the daemon;
         // its transcript remains an ordinary Vim-navigable editor buffer.
         KeyBinding::new(

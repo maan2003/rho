@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
@@ -29,7 +30,7 @@ use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
 use crate::registry::{ActivePane, AgentRegistry};
 use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
-use crate::zed_remote::FileView;
+use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardNewAgent,
     DashboardReply, GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete,
@@ -78,6 +79,7 @@ enum SurfaceView {
         model: Entity<crate::shell_view::ShellModel>,
         editor: Entity<editor::Editor>,
     },
+    Diff(Entity<crate::diff_view::DiffView>),
     Terminal(Entity<crate::terminal_view::TerminalView>),
 }
 
@@ -115,6 +117,12 @@ pub struct Workspace {
     store: AgentStore,
     registry: AgentRegistry,
     models: HashMap<AgentId, Entity<AgentModel>>,
+    /// Weak project cache keyed by daemon-side workspace identity. Artifact
+    /// surfaces hold the strong references; when the last file/diff closes,
+    /// the remote channel and cache entry naturally expire.
+    remote_projects:
+        HashMap<rho_ui_proto::WorkspaceInfo, (gpui::WeakEntity<project::Project>, Utf8PathBuf)>,
+    pending_diff_loads: HashMap<AgentId, Task<()>>,
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
@@ -292,6 +300,8 @@ impl Workspace {
             store: AgentStore::default(),
             registry: AgentRegistry::default(),
             models: HashMap::new(),
+            remote_projects: HashMap::new(),
+            pending_diff_loads: HashMap::new(),
             pending_syncs: HashMap::new(),
             draft_model,
             workdirs: Vec::new(),
@@ -783,7 +793,8 @@ impl Workspace {
     /// the agent's workspace — `<ws-id>@` as a stacking base, or the workspace
     /// itself for Join; anything else is a revset (stacking only). `user` is
     /// only meaningful for Join — your own checkout. Agent targets carry their
-    /// own repo; `workdir` is only needed (and only checked) for the other arms.
+    /// own repo; `workdir` is only needed (and only checked) for the other
+    /// arms.
     fn parse_start(
         &self,
         mode: crate::draft_view::StartFieldMode,
@@ -1005,7 +1016,12 @@ impl Workspace {
 
     /// Adds or removes one label on the focused workstream; the toggles
     /// (pin, hide) and the free-form label prompt all come through here.
-    fn send_workstream_label(&mut self, workstream_id: rho_ui_proto::WorkstreamId, label: String, add: bool) {
+    fn send_workstream_label(
+        &mut self,
+        workstream_id: rho_ui_proto::WorkstreamId,
+        label: String,
+        add: bool,
+    ) {
         self.connection.send(ClientMessage::WorkstreamLabel {
             workstream_id,
             label,
@@ -1262,6 +1278,25 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn cmd_diff(&mut self, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let Some(agent_id) = self.selected_or_notice("diff", cx) else {
+            return;
+        };
+        let Some(workspace) = self.registry.agent_workspace(agent_id).cloned() else {
+            self.notice_on(
+                None,
+                "diff: agent has no workspace",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        self.open_diff_surface(agent_id, workspace, cx);
+    }
+
     pub(crate) fn cmd_version(&mut self, cx: &mut Context<Self>) {
         self.notice_on(None, env!("CARGO_PKG_VERSION"), StyleClass::SystemInfo, cx);
     }
@@ -1355,7 +1390,10 @@ impl Workspace {
         self.open_agent(agent_id, window, cx);
     }
 
-    fn focused_workstream(&self, source_agent: Option<AgentId>) -> Option<rho_ui_proto::WorkstreamId> {
+    fn focused_workstream(
+        &self,
+        source_agent: Option<AgentId>,
+    ) -> Option<rho_ui_proto::WorkstreamId> {
         source_agent
             .or_else(|| self.registry.selected_agent().copied())
             .and_then(|agent_id| self.registry.workstream_of(agent_id))
@@ -1582,11 +1620,7 @@ impl Workspace {
                 self.preview_agent(Some(agent_id), window, cx);
             }
             Some(
-                RowTarget::Stream {
-                    root: Some(_), ..
-                }
-                | RowTarget::Agent(_)
-                | RowTarget::Reply(_),
+                RowTarget::Stream { root: Some(_), .. } | RowTarget::Agent(_) | RowTarget::Reply(_),
             ) => {}
             // Rows with no agent behind them (group headers, the fold
             // toggle, drafts-in-progress) preview nothing.
@@ -1616,6 +1650,9 @@ impl Workspace {
             SurfaceKey::Shell(agent_id) => {
                 format!("shell {}", self.registry.agent_id_label(*agent_id))
             }
+            SurfaceKey::Diff { agent_id } => {
+                format!("changes {}", self.registry.agent_display_label(*agent_id))
+            }
             SurfaceKey::Terminal {
                 agent_id,
                 terminal_id,
@@ -1632,6 +1669,7 @@ impl Workspace {
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
+            SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
         }
     }
@@ -1833,8 +1871,8 @@ impl Workspace {
         tree.focused_mut().show(surface);
     }
 
-    /// `:open`: dials a zed channel for the agent's workspace (once per
-    /// file) and shows the file surface in the main pane.
+    /// `:open`: reuses the agent workspace's remote Zed project and shows the
+    /// file surface in the main pane.
     fn open_file_surface(
         &mut self,
         agent_id: AgentId,
@@ -1851,27 +1889,51 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let task =
-            crate::zed_remote::open_file_buffer(&self.connection, workspace, path.clone(), cx);
-        cx.spawn(async move |this, cx| match task.await {
-            Ok((project, buffer)) => {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
-                    let surface = Self::wrap_surface(key, SurfaceView::File(view), window, cx);
-                    this.display_surface(surface);
-                    this.focus_active_surface(window, cx);
-                    cx.notify();
-                });
-            }
-            Err(error) => {
-                let _ = this.update(cx, |this, cx| {
-                    this.notice_on(
-                        None,
-                        &format!(":open failed: {error:#}"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                });
+        let cached = self.cached_remote_project(&workspace);
+        let project_task = cached.is_none().then(|| {
+            crate::zed_remote::open_remote_project(&self.connection, workspace.clone(), cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let opened = match cached {
+                Some(project) => Ok(project),
+                None => match project_task.expect("missing project task").await {
+                    Ok(project) => Ok(project),
+                    Err(error) => Err(error),
+                },
+            };
+            let result = match opened {
+                Ok(project) => {
+                    let Ok(project) =
+                        this.update(cx, |this, _| this.cache_remote_project(workspace, project))
+                    else {
+                        return;
+                    };
+                    crate::zed_remote::open_file_buffer(&project, path, cx)
+                        .await
+                        .map(|buffer| (project, buffer))
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok((project, buffer)) => {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        let view = cx.new(|cx| FileView::new(project.project, buffer, window, cx));
+                        let surface = Self::wrap_surface(key, SurfaceView::File(view), window, cx);
+                        this.display_surface(surface);
+                        this.focus_active_surface(window, cx);
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.notice_on(
+                            None,
+                            &format!(":open failed: {error:#}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    });
+                }
             }
         })
         .detach();
@@ -1923,6 +1985,122 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    fn cached_remote_project(
+        &mut self,
+        workspace: &rho_ui_proto::WorkspaceInfo,
+    ) -> Option<RemoteProject> {
+        let (project, root) = self.remote_projects.get(workspace)?.clone();
+        match project.upgrade() {
+            Some(project) => Some(RemoteProject { project, root }),
+            _ => {
+                self.remote_projects.remove(workspace);
+                None
+            }
+        }
+    }
+
+    fn cache_remote_project(
+        &mut self,
+        workspace: rho_ui_proto::WorkspaceInfo,
+        opened: RemoteProject,
+    ) -> RemoteProject {
+        if let Some(existing) = self.cached_remote_project(&workspace) {
+            return existing;
+        }
+        self.remote_projects
+            .insert(workspace, (opened.project.downgrade(), opened.root.clone()));
+        opened
+    }
+
+    /// Persists the agent's jj working-copy snapshot, then projects its
+    /// parent-side manifest over the workspace's shared live Zed buffers.
+    /// Reopening refreshes the existing shared model.
+    fn open_diff_surface(
+        &mut self,
+        agent_id: AgentId,
+        workspace: rho_ui_proto::WorkspaceInfo,
+        cx: &mut Context<Self>,
+    ) {
+        let key = SurfaceKey::Diff { agent_id };
+        if let Some(surface) = self.find_surface(|surface| surface.key == key).cloned() {
+            if let SurfaceView::Diff(view) = &surface.view {
+                view.update(cx, |view, cx| {
+                    view.model().update(cx, |model, cx| model.refresh_now(cx));
+                });
+            }
+            self.display_surface(surface);
+            cx.notify();
+            return;
+        }
+
+        let cached = self.cached_remote_project(&workspace);
+        let project_task = cached.is_none().then(|| {
+            crate::zed_remote::open_remote_project(&self.connection, workspace.clone(), cx)
+        });
+        let diff_client = self.connection.diff_client();
+        let task = cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<(RemoteProject, crate::diff_view::PreparedDiff)> = async {
+                let opened = match cached {
+                    Some(project) => project,
+                    None => project_task
+                        .expect("missing project task")
+                        .await
+                        .context("project dial task failed")?,
+                };
+                let project = this
+                    .update(cx, |this, _| {
+                        this.cache_remote_project(workspace.clone(), opened)
+                    })
+                    .map_err(|_| anyhow::anyhow!("GUI closed while loading diff"))?;
+                let live_paths = cx.update(|cx| crate::diff_view::dirty_paths(&project, cx));
+                let snapshot_task = cx.update(|cx| {
+                    diff_client.snapshot(workspace.clone(), None, live_paths.clone(), cx)
+                });
+                let snapshot = snapshot_task
+                    .await
+                    .map_err(|error| anyhow::anyhow!("diff dial task failed: {error}"))??
+                    .context("initial diff snapshot unexpectedly unchanged")?;
+                let prepared =
+                    crate::diff_view::PreparedDiff::load(&project, snapshot, live_paths, cx)
+                        .await?;
+                Ok((project, prepared))
+            }
+            .await;
+
+            match result {
+                Ok((project, prepared)) => {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        let model = cx.new(|cx| {
+                            crate::diff_view::DiffModel::new(
+                                project,
+                                diff_client,
+                                workspace,
+                                prepared,
+                                cx,
+                            )
+                        });
+                        let view = cx.new(|cx| crate::diff_view::DiffView::new(model, window, cx));
+                        let surface = Self::wrap_surface(key, SurfaceView::Diff(view), window, cx);
+                        this.display_surface(surface);
+                        this.focus_active_surface(window, cx);
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.notice_on(
+                            None,
+                            &format!("diff failed: {error:#}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    });
+                }
+            }
+        });
+        self.pending_diff_loads.insert(agent_id, task);
     }
 
     /// `:term`: dials a dedicated terminal stream for the agent (attaching
@@ -2088,6 +2266,7 @@ impl Workspace {
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
+            SurfaceView::Diff(view) => view.read(cx).editor().clone(),
             SurfaceView::Terminal(_) => self
                 .any_draft_editor()
                 .expect("the draft context always holds a draft surface"),
@@ -2123,6 +2302,7 @@ impl Workspace {
             SurfaceView::Transcript { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
             SurfaceView::File(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
             SurfaceView::Shell { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
+            SurfaceView::Diff(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
             SurfaceView::Terminal(view) => window.focus(&view.read(cx).focus_handle(cx), cx),
         }
     }
@@ -2158,6 +2338,9 @@ impl Workspace {
             SurfaceKey::Shell(_) => {
                 unreachable!("shell surfaces are created by open_shell_surface")
             }
+            SurfaceKey::Diff { .. } => {
+                unreachable!("diff surfaces are created by open_diff_surface")
+            }
             SurfaceKey::Terminal { .. } => {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
             }
@@ -2179,6 +2362,11 @@ impl Workspace {
                 let (project, buffer) = view.read(cx).shared_content();
                 let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
                 Self::wrap_surface(surface.key.clone(), SurfaceView::File(view), window, cx)
+            }
+            SurfaceView::Diff(view) => {
+                let model = view.read(cx).model();
+                let view = cx.new(|cx| crate::diff_view::DiffView::new(model, window, cx));
+                Self::wrap_surface(surface.key.clone(), SurfaceView::Diff(view), window, cx)
             }
             SurfaceView::Transcript { model, .. } => {
                 let model = model.clone();
@@ -2240,6 +2428,10 @@ impl Workspace {
             SurfaceView::Shell { editor, .. } => {
                 (editor.focus_handle(cx), editor.entity_id())
             }
+            SurfaceView::Diff(view) => {
+                let editor = view.read(cx).editor();
+                (editor.focus_handle(cx), editor.entity_id())
+            }
             // Terminals have no editor; the view itself carries focus.
             SurfaceView::Terminal(view) => (view.read(cx).focus_handle(cx), view.entity_id()),
         };
@@ -2273,6 +2465,7 @@ impl Workspace {
                 self.registry.select_agent(agent_id)
             }
             SurfaceKey::Terminal { agent_id, .. } => self.registry.select_agent(agent_id),
+            SurfaceKey::Diff { agent_id } => self.registry.select_agent(agent_id),
             SurfaceKey::Draft => self.registry.enter_draft(),
             // Files keep whatever agent context was current.
             SurfaceKey::File { .. } => {}
@@ -2280,7 +2473,12 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn split_pane(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn split_pane(
+        &mut self,
+        axis: SplitAxis,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let focused = self.active_tree().focused().surface.clone();
         let sibling = self.duplicate_surface(focused, window, cx);
         self.active_tree_mut().split(axis, sibling);
@@ -2295,7 +2493,12 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn focus_pane_by_delta(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_pane_by_delta(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.active_tree_mut().focus_by_delta(delta);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
@@ -2663,11 +2866,7 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn open_new_agent_transient(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn open_new_agent_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.new_agent_draft.is_none() {
             use crate::dashboard::RowTarget;
 
@@ -2678,9 +2877,7 @@ impl Workspace {
                         ..
                     })
                     | Some(RowTarget::Agent(agent_id))
-                    | Some(RowTarget::Reply(agent_id)) => {
-                        self.registry.working_directory(agent_id)
-                    }
+                    | Some(RowTarget::Reply(agent_id)) => self.registry.working_directory(agent_id),
                     Some(RowTarget::Stream { workstream_id, .. }) => {
                         self.registry.last_working_directory(workstream_id)
                     }
@@ -2708,21 +2905,13 @@ impl Workspace {
             .map(|path| self.workdir_label(path))
             .unwrap_or_else(|| "<choose>".to_owned());
         self.open_transient(
-            crate::transient::new_agent_menu(
-                project,
-                draft.workspace.label(),
-                draft.role.clone(),
-            ),
+            crate::transient::new_agent_menu(project, draft.workspace.label(), draft.role.clone()),
             window,
             cx,
         );
     }
 
-    pub(crate) fn prompt_new_agent_project(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn prompt_new_agent_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
             let needle = input.trim().to_lowercase();
             workspace
@@ -2827,22 +3016,14 @@ impl Workspace {
         self.open_prompt(prompt, complete, on_submit, window, cx);
     }
 
-    pub(crate) fn cycle_new_agent_role(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn cycle_new_agent_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(draft) = &mut self.new_agent_draft {
             draft.role = cycle_agent_role_text(&draft.role).to_owned();
         }
         self.open_new_agent_transient(window, cx);
     }
 
-    pub(crate) fn compose_new_agent(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn compose_new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft) = &self.new_agent_draft else {
             return;
         };
@@ -2914,9 +3095,7 @@ impl Workspace {
                 self.new_agent_draft = None;
                 self.dashboard_exit_insert(window, cx);
             }
-            Some(RowTarget::Stream { root: None, .. })
-            | Some(RowTarget::None)
-            | None => {}
+            Some(RowTarget::Stream { root: None, .. }) | Some(RowTarget::None) | None => {}
         }
     }
 
@@ -2951,7 +3130,12 @@ impl Workspace {
                 self.dashboard_enter_insert(window, cx);
             }
             _ => {
-                self.notice_on(None, "reply: no agent under the cursor", StyleClass::SystemInfo, cx);
+                self.notice_on(
+                    None,
+                    "reply: no agent under the cursor",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
             }
         }
     }
@@ -3049,11 +3233,7 @@ impl Workspace {
             .items_center()
             .pt(px(10.))
             .pb(px(26.))
-            .child(
-                div()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("rho"),
-            )
+            .child(div().font_weight(gpui::FontWeight::BOLD).child("rho"))
             .child(
                 div()
                     .text_color(text_style.color.opacity(0.55))
@@ -3099,8 +3279,8 @@ impl Workspace {
                         .into_iter()
                         .filter(|(text, _)| !text.trim().is_empty())
                         .map(|(text, style)| {
-                            let mut chip = div()
-                                .text_color(style.color.unwrap_or(text_style.color));
+                            let mut chip =
+                                div().text_color(style.color.unwrap_or(text_style.color));
                             if let Some(weight) = style.font_weight {
                                 chip = chip.font_weight(weight);
                             }
@@ -3137,11 +3317,14 @@ impl Workspace {
         let home = dashboard_handle.is_focused(window)
             || (self.transient_focus.is_focused(window)
                 && self.transient_origin.as_ref() == Some(&dashboard_handle));
+        self.sync_diff_visibility(!home, cx);
         let show_panes = !home || self.registry.selected_agent().is_some();
         let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
-        let preview_bar = home.then(|| self.render_preview_bar(text_style, cx)).flatten();
+        let preview_bar = home
+            .then(|| self.render_preview_bar(text_style, cx))
+            .flatten();
         let preview = home
             .then(|| self.selected_preview_editor(window, cx))
             .flatten()
@@ -3234,6 +3417,39 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Hidden surfaces stay alive as editor buffers, but they must not turn
+    /// worktree events into jj manifest traffic. Only models currently shown
+    /// in an active pane are allowed to refresh.
+    fn sync_diff_visibility(&self, panes_visible: bool, cx: &mut Context<Self>) {
+        let visible = if panes_visible {
+            self.active_tree()
+                .panes()
+                .into_iter()
+                .filter_map(|pane| match &pane.surface.view {
+                    SurfaceView::Diff(view) => Some(view.read(cx).model().entity_id()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        let models = self
+            .surfaces
+            .values()
+            .flatten()
+            .filter_map(|surface| match &surface.view {
+                SurfaceView::Diff(view) => Some(view.read(cx).model()),
+                _ => None,
+            })
+            .fold(HashMap::new(), |mut models, model| {
+                models.entry(model.entity_id()).or_insert(model);
+                models
+            });
+        for (id, model) in models {
+            model.update(cx, |model, cx| model.set_visible(visible.contains(&id), cx));
+        }
+    }
+
     fn render_surface(&self, surface: &Surface) -> gpui::AnyElement {
         match &surface.view {
             SurfaceView::Draft { editor, .. } => div()
@@ -3260,6 +3476,12 @@ impl Workspace {
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
+                .into_any_element(),
+            SurfaceView::Diff(view) => div()
+                .id("rho-surface-diff")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
                 .into_any_element(),
             SurfaceView::Terminal(view) => div()
                 .id("rho-surface-terminal")

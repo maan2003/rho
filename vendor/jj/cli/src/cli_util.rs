@@ -14,6 +14,7 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -174,6 +175,7 @@ use crate::config::ConfigArgKind;
 use crate::config::ConfigEnv;
 use crate::config::RawConfig;
 use crate::config::config_from_environment;
+use crate::config::config_from_environment_map;
 use crate::config::load_aliases_map;
 use crate::config::parse_config_args;
 use crate::description_util::TextEditor;
@@ -1157,6 +1159,22 @@ struct PendingSecondaryWorkspaceSnapshot {
     snapshot: PendingWorkspaceSnapshot,
 }
 
+/// Result of an in-process snapshot rooted at one workspace.
+///
+/// The repository is the exact immutable operation produced by the snapshot,
+/// so callers can materialize derived data without racing a later op-head.
+pub struct WorkspaceSnapshotEpoch {
+    pub repo: Arc<ReadonlyRepo>,
+    pub workspace_name: WorkspaceNameBuf,
+    pub stats: SnapshotStats,
+}
+
+#[derive(clap::Subcommand)]
+enum EmbeddedSnapshotCommand {
+    #[command(name = "snapshot-workspace-descendants", hide = true)]
+    SnapshotWorkspaceDescendants,
+}
+
 impl SnapshotWorkingCopyError {
     fn into_command_error(self) -> CommandError {
         match self {
@@ -1633,6 +1651,27 @@ impl WorkspaceCommandHelper {
         Ok(current_stats)
     }
 
+    /// Snapshots only this workspace and workspaces whose working-copy commits
+    /// descend from it, then returns the exact resulting repository epoch.
+    ///
+    /// This is the embedding API for consumers that need a current jj view
+    /// without scanning unrelated workspace branches.
+    pub async fn snapshot_workspace_descendants(
+        &mut self,
+        ui: &Ui,
+    ) -> Result<WorkspaceSnapshotEpoch, CommandError> {
+        let workspace_name = self.workspace_name().to_owned();
+        let stats = self
+            .maybe_snapshot_workspace_descendants(ui)
+            .await
+            .map_err(SnapshotWorkingCopyError::into_command_error)?;
+        Ok(WorkspaceSnapshotEpoch {
+            repo: self.user_repo.repo.clone(),
+            workspace_name,
+            stats,
+        })
+    }
+
     /// Snapshots the working copy if allowed, and imports Git refs if the
     /// working copy is colocated with Git.
     ///
@@ -1971,17 +2010,17 @@ to the current parents may contain changes from multiple commits.
                 // the "git" command would read the file at the work-tree directory.
                 Some(self.workspace_root().join(path))
             } else {
-                xdg_config_home().map(|x| x.join("git").join("ignore"))
+                xdg_config_home(self.env.command.config_env()).map(|x| x.join("git").join("ignore"))
             }
         };
 
-        fn xdg_config_home() -> Option<PathBuf> {
-            if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
+        fn xdg_config_home(config_env: &ConfigEnv) -> Option<PathBuf> {
+            if let Some(x) = config_env.environment_variable("XDG_CONFIG_HOME")
                 && !x.is_empty()
             {
                 return Some(PathBuf::from(x));
             }
-            etcetera::home_dir().ok().map(|home| home.join(".config"))
+            config_env.home_dir().map(|home| home.join(".config"))
         }
 
         let mut git_ignores = GitIgnoreFile::empty();
@@ -5049,7 +5088,7 @@ where
 /// CLI command builder and runner.
 #[must_use]
 pub struct CliRunner<'a> {
-    tracing_subscription: TracingSubscription,
+    tracing_subscription: Option<TracingSubscription>,
     app: Command,
     config_layers: Vec<ConfigLayer>,
     config_migrations: Vec<ConfigMigrationRule>,
@@ -5073,6 +5112,16 @@ impl<'a> CliRunner<'a> {
     pub fn init() -> Self {
         let tracing_subscription = TracingSubscription::init();
         crate::cleanup_guard::init();
+        Self::init_inner(Some(tracing_subscription))
+    }
+
+    /// Initializes a runner without installing tracing or signal handlers in
+    /// the embedding process.
+    fn init_embedded() -> Self {
+        Self::init_inner(None)
+    }
+
+    fn init_inner(tracing_subscription: Option<TracingSubscription>) -> Self {
         Self {
             tracing_subscription,
             app: crate::commands::default_app(),
@@ -5235,18 +5284,19 @@ impl<'a> CliRunner<'a> {
         self,
         ui: &mut Ui,
         mut raw_config: RawConfig,
+        cwd: PathBuf,
+        process_args: Vec<OsString>,
+        environment: Option<HashMap<String, String>>,
     ) -> Result<(), CommandError> {
-        // `cwd` is canonicalized for consistency with `Workspace::workspace_root()` and
-        // to easily compute relative paths between them.
-        let cwd = env::current_dir()
-            .and_then(dunce::canonicalize)
-            .map_err(|_| {
-                user_error("Could not determine current directory").hinted(
-                    "Did you update to a commit where the directory doesn't exist or can't be \
-                     accessed?",
-                )
-            })?;
-        let mut config_env = ConfigEnv::from_environment();
+        let shell_completion = match environment.as_ref() {
+            Some(environment) => environment
+                .get("COMPLETE")
+                .is_some_and(|value| !value.is_empty() && value != "0"),
+            None => env::var_os("COMPLETE").is_some_and(|value| value != "" && value != "0"),
+        };
+        let mut config_env = environment
+            .map(ConfigEnv::from_environment_map)
+            .unwrap_or_else(ConfigEnv::from_environment);
         let mut last_config_migration_descriptions = Vec::new();
         let mut migrate_config = |config: &mut StackedConfig| -> Result<(), CommandError> {
             last_config_migration_descriptions =
@@ -5275,11 +5325,11 @@ impl<'a> CliRunner<'a> {
         migrate_config(&mut config)?;
         ui.reset(&config)?;
 
-        if env::var_os("COMPLETE").is_some_and(|v| !v.is_empty() && v != "0") {
+        if shell_completion {
             return handle_shell_completion(&Ui::null(), &self.app, &config, &cwd);
         }
 
-        let string_args = expand_args(ui, &self.app, env::args_os(), &config)?;
+        let string_args = expand_args(ui, &self.app, process_args, &config)?;
         let (args, config_layers) = parse_early_args(&self.app, &string_args)?;
         if !config_layers.is_empty() {
             raw_config.as_mut().extend_layers(config_layers);
@@ -5296,7 +5346,10 @@ impl<'a> CliRunner<'a> {
             .map_err(|err| map_clap_cli_error(err, ui, &config))?;
         if args.global_args.debug {
             // TODO: set up debug logging as early as possible
-            self.tracing_subscription.enable_debug_logging()?;
+            self.tracing_subscription
+                .as_ref()
+                .ok_or_else(|| internal_error("embedded runner cannot enable debug logging"))?
+                .enable_debug_logging()?;
         }
         for process_global_args_fn in self.process_global_args_fns {
             process_global_args_fn(ui, &matches)?;
@@ -5391,11 +5444,106 @@ impl<'a> CliRunner<'a> {
         // If it had, the configuration will be fixed by the next ui.reset().
         let mut ui = Ui::with_config(config.as_ref())
             .expect("default config should be valid, env vars are stringly typed");
-        let result = self.run_internal(&mut ui, config).block_on();
+        // `cwd` is canonicalized for consistency with `Workspace::workspace_root()` and
+        // to easily compute relative paths between them.
+        let cwd = env::current_dir()
+            .and_then(dunce::canonicalize)
+            .map_err(|_| {
+                user_error("Could not determine current directory").hinted(
+                    "Did you update to a commit where the directory doesn't exist or can't be \
+                     accessed?",
+                )
+            });
+        let result = match cwd {
+            Ok(cwd) => self
+                .run_internal(&mut ui, config, cwd, env::args_os().collect(), None)
+                .block_on(),
+            Err(error) => Err(error),
+        };
         let exit_code = handle_command_result(&mut ui, result);
         ui.finalize_pager();
         exit_code
     }
+
+    /// Runs the fixed embedded command path with explicit cwd, argv, and
+    /// environment. Kept private so arbitrary CLI commands with process-global
+    /// behavior cannot be dispatched by embedding consumers.
+    async fn run_with_args_and_environment(
+        mut self,
+        cwd: &Path,
+        args: impl IntoIterator<Item = OsString>,
+        environment: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Result<(), CommandError> {
+        let cwd = dunce::canonicalize(cwd).map_err(|_| {
+            user_error(format!(
+                "Could not access working directory {}",
+                cwd.display()
+            ))
+        })?;
+        let mut environment: HashMap<_, _> = environment
+            .into_iter()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
+        // Completion inspects and mutates process-global argv/environment.
+        // It is never meaningful for the fixed hidden snapshot command.
+        environment.remove("COMPLETE");
+        environment.remove("_CLAP_COMPLETE_INDEX");
+        let config = config_from_environment_map(self.config_layers.drain(..), &environment);
+        let mut ui = Ui::null();
+        self.run_internal(
+            &mut ui,
+            config,
+            cwd,
+            args.into_iter().collect(),
+            Some(environment),
+        )
+        .await
+    }
+}
+
+/// Loads normal jj system/user/repository/workspace configuration and
+/// snapshots `workspace_path` plus workspace commits descended from it, all
+/// in the current process.
+///
+/// Unlike invoking a CLI command, the returned repository is the exact epoch
+/// produced by the snapshot and can be consumed immediately without an
+/// op-head race.
+pub async fn snapshot_workspace_descendants_at(
+    workspace_path: &Path,
+) -> Result<WorkspaceSnapshotEpoch, CommandError> {
+    snapshot_workspace_descendants_at_with_environment(workspace_path, env::vars_os()).await
+}
+
+/// Explicit-environment variant of
+/// [`snapshot_workspace_descendants_at`].
+pub async fn snapshot_workspace_descendants_at_with_environment(
+    workspace_path: &Path,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<WorkspaceSnapshotEpoch, CommandError> {
+    let output = Rc::new(RefCell::new(None));
+    let output_for_dispatch = output.clone();
+    let runner = CliRunner::init_embedded().add_subcommand::<EmbeddedSnapshotCommand, _>(
+        async move |ui, command, _command| {
+            let mut workspace_command = command.workspace_helper_no_snapshot(ui).await?;
+            let epoch = workspace_command.snapshot_workspace_descendants(ui).await?;
+            *output_for_dispatch.borrow_mut() = Some(epoch);
+            Ok(())
+        },
+    );
+    runner
+        .run_with_args_and_environment(
+            workspace_path,
+            [
+                OsString::from("jj"),
+                OsString::from("snapshot-workspace-descendants"),
+            ],
+            environment,
+        )
+        .await?;
+    output
+        .borrow_mut()
+        .take()
+        .ok_or_else(|| internal_error("embedded snapshot produced no repository epoch"))
 }
 
 fn map_clap_cli_error(err: clap::Error, ui: &Ui, config: &StackedConfig) -> CommandError {

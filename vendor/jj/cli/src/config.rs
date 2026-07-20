@@ -418,8 +418,68 @@ impl ConfigEnv {
         }
     }
 
+    /// Initializes the loader from an explicit process environment.
+    ///
+    /// Embedded callers use this to avoid consulting or mutating the host
+    /// process environment while preserving jj's conditional config behavior.
+    pub fn from_environment_map(environment: HashMap<String, String>) -> Self {
+        let home_dir = environment.get("HOME").map(PathBuf::from).map(|path| {
+            // Canonicalize home as we do canonicalize cwd in CliRunner. $HOME might
+            // point to symlink.
+            dunce::canonicalize(&path).unwrap_or(path)
+        });
+        let user_config_dir = environment
+            .get("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home_dir.as_ref().map(|home| home.join(".config")));
+
+        let system_config_dir = if cfg!(unix) {
+            Some("/etc".into())
+        } else {
+            None
+        };
+
+        let env = UnresolvedConfigEnv {
+            user_config_dir,
+            home_dir: home_dir.clone(),
+            jj_config: environment.get("JJ_CONFIG").cloned(),
+            system_config_dir,
+        };
+        let randomness_seed = environment
+            .get("JJ_RANDOMNESS_SEED")
+            .and_then(|value| value.parse::<u64>().ok());
+        Self {
+            home_dir,
+            root_config_dir: env.root_config_dir(),
+            repo_path: None,
+            workspace_path: None,
+            system_config_paths: env.resolve_system(),
+            user_config_paths: env.resolve_user(),
+            repo_config: None,
+            workspace_config: None,
+            command: None,
+            hostname: whoami::hostname().ok(),
+            environment,
+            // We would ideally use JjRng, but that requires the seed from the
+            // config, which requires the config to be loaded.
+            rng: Arc::new(Mutex::new(if let Some(value) = randomness_seed {
+                ChaCha20Rng::seed_from_u64(value)
+            } else {
+                rand::make_rng()
+            })),
+        }
+    }
+
     pub fn set_command_name(&mut self, command: String) {
         self.command = Some(command);
+    }
+
+    pub fn environment_variable(&self, name: &str) -> Option<&str> {
+        self.environment.get(name).map(String::as_str)
+    }
+
+    pub fn home_dir(&self) -> Option<&Path> {
+        self.home_dir.as_deref()
     }
 
     /// Loads system-wide config files into the given `config`. The old
@@ -722,10 +782,25 @@ fn config_files_for(
 ///
 /// This function sets up 1, 3, and 7.
 pub fn config_from_environment(default_layers: impl IntoIterator<Item = ConfigLayer>) -> RawConfig {
+    let environment = env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    config_from_environment_map(default_layers, &environment)
+}
+
+/// Initializes stacked config from an explicit environment.
+///
+/// This is the embedded equivalent of [`config_from_environment`]; callers
+/// that isolate subprocess environments must not accidentally consult the
+/// embedding process's variables while running jj in-process.
+pub fn config_from_environment_map(
+    default_layers: impl IntoIterator<Item = ConfigLayer>,
+    environment: &HashMap<String, String>,
+) -> RawConfig {
     let mut config = StackedConfig::with_defaults();
     config.extend_layers(default_layers);
-    config.add_layer(env_base_layer());
-    config.add_layer(env_overrides_layer());
+    config.add_layer(env_base_layer(environment));
+    config.add_layer(env_overrides_layer(environment));
     RawConfig(config)
 }
 
@@ -733,7 +808,7 @@ const OP_HOSTNAME: &str = "operation.hostname";
 const OP_USERNAME: &str = "operation.username";
 
 /// Environment variables that should be overridden by config values
-fn env_base_layer() -> ConfigLayer {
+fn env_base_layer(environment: &HashMap<String, String>) -> ConfigLayer {
     let mut layer = ConfigLayer::empty(ConfigSource::EnvBase);
     if let Ok(value) =
         whoami::hostname().inspect_err(|err| tracing::warn!(?err, "failed to get hostname"))
@@ -744,19 +819,22 @@ fn env_base_layer() -> ConfigLayer {
         whoami::username().inspect_err(|err| tracing::warn!(?err, "failed to get username"))
     {
         layer.set_value(OP_USERNAME, value).unwrap();
-    } else if let Ok(value) = env::var("USER") {
+    } else if let Some(value) = environment.get("USER") {
         // On Unix, $USER is set by login(1). Use it as a fallback because
         // getpwuid() of musl libc appears not (fully?) supporting nsswitch.
         layer.set_value(OP_USERNAME, value).unwrap();
     }
-    if !env::var("NO_COLOR").unwrap_or_default().is_empty() {
+    if environment
+        .get("NO_COLOR")
+        .is_some_and(|value| !value.is_empty())
+    {
         // "User-level configuration files and per-instance command-line arguments
         // should override $NO_COLOR." https://no-color.org/
         layer.set_value("ui.color", "never").unwrap();
     }
-    if let Ok(value) = env::var("VISUAL") {
+    if let Some(value) = environment.get("VISUAL") {
         layer.set_value("ui.editor", value).unwrap();
-    } else if let Ok(value) = env::var("EDITOR") {
+    } else if let Some(value) = environment.get("EDITOR") {
         layer.set_value("ui.editor", value).unwrap();
     }
     // Intentionally NOT respecting $PAGER here as it often creates a bad
@@ -786,33 +864,36 @@ pub fn default_config_layers() -> Vec<ConfigLayer> {
 }
 
 /// Environment variables that override config values
-fn env_overrides_layer() -> ConfigLayer {
+fn env_overrides_layer(environment: &HashMap<String, String>) -> ConfigLayer {
     let mut layer = ConfigLayer::empty(ConfigSource::EnvOverrides);
-    if let Ok(value) = env::var("JJ_USER") {
+    if let Some(value) = environment.get("JJ_USER") {
         layer.set_value("user.name", value).unwrap();
     }
-    if let Ok(value) = env::var("JJ_EMAIL") {
+    if let Some(value) = environment.get("JJ_EMAIL") {
         layer.set_value("user.email", value).unwrap();
     }
-    if let Ok(value) = env::var("JJ_TIMESTAMP") {
+    if let Some(value) = environment.get("JJ_TIMESTAMP") {
         layer.set_value("debug.commit-timestamp", value).unwrap();
     }
-    if let Ok(Ok(value)) = env::var("JJ_RANDOMNESS_SEED").map(|s| s.parse::<i64>()) {
+    if let Some(Ok(value)) = environment
+        .get("JJ_RANDOMNESS_SEED")
+        .map(|value| value.parse::<i64>())
+    {
         layer.set_value("debug.randomness-seed", value).unwrap();
     }
-    if let Ok(value) = env::var("JJ_OP_TIMESTAMP") {
+    if let Some(value) = environment.get("JJ_OP_TIMESTAMP") {
         layer.set_value("debug.operation-timestamp", value).unwrap();
     }
-    if let Ok(value) = env::var("JJ_OP_HOSTNAME") {
+    if let Some(value) = environment.get("JJ_OP_HOSTNAME") {
         layer.set_value(OP_HOSTNAME, value).unwrap();
     }
-    if let Ok(value) = env::var("JJ_OP_USERNAME") {
+    if let Some(value) = environment.get("JJ_OP_USERNAME") {
         layer.set_value(OP_USERNAME, value).unwrap();
     }
-    if let Ok(value) = env::var("JJ_EDITOR") {
+    if let Some(value) = environment.get("JJ_EDITOR") {
         layer.set_value("ui.editor", value).unwrap();
     }
-    if let Ok(value) = env::var("JJ_PAGER") {
+    if let Some(value) = environment.get("JJ_PAGER") {
         layer.set_value("ui.pager", value).unwrap();
     }
     layer

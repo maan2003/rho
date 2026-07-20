@@ -253,6 +253,12 @@ pub fn root_menu() -> Transient {
         .item("shift-c", "close shell", |workspace, _, cx| {
             workspace.cmd_shell_close(cx);
         })
+        .item_when(
+            Workspace::has_selected_agent,
+            "d",
+            "changes",
+            |workspace, _, cx| workspace.cmd_diff(cx),
+        )
         .item("t", "terminal", |workspace, _, cx| {
             workspace.cmd_term(false, cx);
         })

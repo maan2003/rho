@@ -15,7 +15,10 @@ pub use rho_agent::db::{
     WorkstreamId,
 };
 use rho_core::ContentPart;
-pub use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
+pub use rho_workspaces::{
+    WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
+    WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
+};
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 pub mod client;
@@ -304,6 +307,18 @@ pub enum ClientMessage {
     ShellClose {
         request_id: u64,
         agent: String,
+    },
+    /// One-shot request on a fresh stream for a persistent jj snapshot and
+    /// parent-side diff manifest. Current-side text remains in Zed buffers.
+    /// The daemon replies with
+    /// [`ServerMessage::DiffSnapshot`] or [`ServerMessage::DiffRefused`] and
+    /// closes the stream.
+    DiffSnapshot {
+        workspace: WorkspaceInfo,
+        known_commit_id: Option<String>,
+        /// Dirty Zed buffers whose paths may not yet exist in jj's disk
+        /// snapshot. The daemon supplies their immutable parent side.
+        include_paths: Vec<Utf8PathBuf>,
     },
 }
 
@@ -614,6 +629,15 @@ pub enum ServerMessage {
     ShellAttachRefused {
         reason: String,
     },
+    DiffSnapshot {
+        snapshot: WorkspaceDiffSnapshot,
+    },
+    DiffUnchanged {
+        commit_id: String,
+    },
+    DiffRefused {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -712,6 +736,12 @@ where
     T: Packer,
 {
     let payload = senax_encoder::pack(value).context("pack protocol frame")?;
+    if payload.len() > MAX_FRAME_LEN {
+        bail!(
+            "protocol frame length {} exceeds {MAX_FRAME_LEN}",
+            payload.len()
+        );
+    }
     let len: u32 = payload
         .len()
         .try_into()
@@ -778,6 +808,9 @@ pub async fn write_raw_frame<W>(writer: &mut W, payload: &[u8]) -> anyhow::Resul
 where
     W: AsyncWrite + Unpin,
 {
+    if payload.len() > MAX_FRAME_LEN {
+        bail!("raw frame length {} exceeds {MAX_FRAME_LEN}", payload.len());
+    }
     let len: u32 = payload.len().try_into().context("raw frame too large")?;
     writer
         .write_u32_le(len)
@@ -1107,5 +1140,41 @@ mod tests {
         let mut slice: &[u8] = &bytes;
         let decoded = senax_encoder::unpack(&mut slice).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn diff_manifest_messages_round_trip() {
+        let workspace = WorkspaceInfo::UserCheckout {
+            repo: Utf8PathBuf::from("/repo"),
+        };
+        let request = ClientMessage::DiffSnapshot {
+            workspace,
+            known_commit_id: Some("known".to_owned()),
+            include_paths: vec![Utf8PathBuf::from("src/live.rs")],
+        };
+        let bytes = senax_encoder::pack(&request).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(request, decoded);
+
+        let response = ServerMessage::DiffSnapshot {
+            snapshot: WorkspaceDiffSnapshot {
+                operation_id: "operation".to_owned(),
+                commit_id: "commit".to_owned(),
+                files: vec![WorkspaceDiffFile {
+                    path: Utf8PathBuf::from("src/lib.rs"),
+                    status: WorkspaceDiffStatus::Modified,
+                    base: WorkspaceDiffContent::Text("old".to_owned()),
+                    target: WorkspaceDiffTarget::Text { bytes: 3 },
+                    base_executable: Some(false),
+                    target_executable: Some(false),
+                }],
+                truncated: false,
+            },
+        };
+        let bytes = senax_encoder::pack(&response).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(response, decoded);
     }
 }
