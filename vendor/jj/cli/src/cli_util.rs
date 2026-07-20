@@ -1538,6 +1538,10 @@ impl WorkspaceCommandHelper {
                 )
                 .map_err(snapshot_command_error)?;
             }
+            #[cfg(feature = "git")]
+            self.export_rebased_git_heads_for_workspaces(ui, &mut tx)
+                .await
+                .map_err(snapshot_command_error)?;
             let repo = self
                 .env
                 .command
@@ -2690,63 +2694,7 @@ to the current parents may contain changes from multiple commits.
         }
 
         #[cfg(feature = "git")]
-        if jj_lib::git::get_git_backend(tx.repo().store()).is_ok()
-            && self.env.command.should_commit_transaction()
-        {
-            use std::error::Error as _;
-            let workspace_names = tx
-                .repo()
-                .view()
-                .wc_commit_ids()
-                .keys()
-                .cloned()
-                .collect_vec();
-            let mut exported_git_head = false;
-            for workspace_name in workspace_names {
-                let Some(wc_commit_id) = tx.repo().view().get_wc_commit_id(&workspace_name) else {
-                    continue;
-                };
-                let wc_commit = tx.repo().store().get_commit(wc_commit_id)?;
-                let maybe_git_repo = if workspace_name.as_str() == self.workspace_name().as_str() {
-                    crate::git_util::open_workspace_git_repo(&self.workspace, tx.repo())?
-                } else if let Some(workspace) =
-                    self.load_workspace_object_for_name(&workspace_name)?
-                {
-                    crate::git_util::open_workspace_git_repo(&workspace, tx.repo())?
-                } else {
-                    None
-                };
-                let Some(git_repo) = maybe_git_repo else {
-                    continue;
-                };
-                exported_git_head = true;
-                // Export Git HEAD while holding the git-head lock to prevent races:
-                // - Between two finish_transaction calls updating HEAD
-                // - With import_git_head importing HEAD concurrently
-                // This can still fail if HEAD was updated concurrently by another JJ process
-                // (overlapping transaction) or a non-JJ process (e.g., git checkout). In that
-                // case, the actual state will be imported on the next snapshot.
-                match jj_lib::git::reset_head_for_workspace(
-                    tx.repo_mut(),
-                    &workspace_name,
-                    &git_repo,
-                    &wc_commit,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(err @ jj_lib::git::GitResetHeadError::UpdateHeadRef(_)) => {
-                        writeln!(ui.warning_default(), "{err}")?;
-                        print_error_sources(ui, err.source())?;
-                    }
-                    Err(err) => return Err(err.into()),
-                }
-            }
-            if exported_git_head {
-                let stats = jj_lib::git::export_refs(tx.repo_mut())?;
-                crate::git_util::print_git_export_stats(ui, &stats)?;
-            }
-        }
+        self.export_git_head_for_workspaces(ui, &mut tx).await?;
 
         self.user_repo = ReadonlyUserRepo::new(
             self.env
@@ -2801,6 +2749,148 @@ to the current parents may contain changes from multiple commits.
                 )?;
             }
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "git")]
+    async fn export_git_head_for_workspaces(
+        &mut self,
+        ui: &Ui,
+        tx: &mut Transaction,
+    ) -> Result<(), CommandError> {
+        if jj_lib::git::get_git_backend(tx.repo().store()).is_err()
+            || !self.env.command.should_commit_transaction()
+        {
+            return Ok(());
+        }
+
+        use std::error::Error as _;
+        let workspace_names = tx
+            .repo()
+            .view()
+            .wc_commit_ids()
+            .keys()
+            .cloned()
+            .collect_vec();
+        let mut exported_git_head = false;
+        for workspace_name in workspace_names {
+            let Some(wc_commit_id) = tx.repo().view().get_wc_commit_id(&workspace_name) else {
+                continue;
+            };
+            let wc_commit = tx.repo().store().get_commit(wc_commit_id)?;
+            let maybe_git_repo = if workspace_name.as_str() == self.workspace_name().as_str() {
+                crate::git_util::open_workspace_git_repo(&self.workspace, tx.repo())?
+            } else if let Some(workspace) = self.load_workspace_object_for_name(&workspace_name)? {
+                crate::git_util::open_workspace_git_repo(&workspace, tx.repo())?
+            } else {
+                None
+            };
+            let Some(git_repo) = maybe_git_repo else {
+                continue;
+            };
+            exported_git_head = true;
+            // Export Git HEAD while holding the git-head lock to prevent races:
+            // - Between two finish_transaction calls updating HEAD
+            // - With import_git_head importing HEAD concurrently
+            // This can still fail if HEAD was updated concurrently by another JJ process
+            // (overlapping transaction) or a non-JJ process (e.g., git checkout). In that
+            // case, the actual state will be imported on the next snapshot.
+            match jj_lib::git::reset_head_for_workspace(
+                tx.repo_mut(),
+                &workspace_name,
+                &git_repo,
+                &wc_commit,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(err @ jj_lib::git::GitResetHeadError::UpdateHeadRef(_)) => {
+                    writeln!(ui.warning_default(), "{err}")?;
+                    print_error_sources(ui, err.source())?;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if exported_git_head {
+            let stats = jj_lib::git::export_refs(tx.repo_mut())?;
+            crate::git_util::print_git_export_stats(ui, &stats)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "git")]
+    async fn export_rebased_git_heads_for_workspaces(
+        &mut self,
+        ui: &Ui,
+        tx: &mut Transaction,
+    ) -> Result<(), CommandError> {
+        if jj_lib::git::get_git_backend(tx.repo().store()).is_err()
+            || !self.env.command.should_commit_transaction()
+        {
+            return Ok(());
+        }
+
+        use std::error::Error as _;
+        let workspace_names = tx
+            .repo()
+            .view()
+            .wc_commit_ids()
+            .keys()
+            .cloned()
+            .collect_vec();
+        let mut exported_git_head = false;
+        for workspace_name in workspace_names {
+            let Some(wc_commit_id) = tx.repo().view().get_wc_commit_id(&workspace_name) else {
+                continue;
+            };
+            let wc_commit = tx.repo().store().get_commit(wc_commit_id)?;
+            let Some(old_wc_commit_id) = tx.base_repo().view().get_wc_commit_id(&workspace_name)
+            else {
+                continue;
+            };
+            let old_wc_commit = tx.base_repo().store().get_commit(old_wc_commit_id)?;
+            if old_wc_commit.parent_ids().first() == wc_commit.parent_ids().first() {
+                continue;
+            }
+            let old_head_target = tx
+                .base_repo()
+                .view()
+                .git_head_for_workspace(&workspace_name)
+                .clone();
+            let maybe_git_repo = if workspace_name.as_str() == self.workspace_name().as_str() {
+                crate::git_util::open_workspace_git_repo(&self.workspace, tx.repo())?
+            } else if let Some(workspace) = self.load_workspace_object_for_name(&workspace_name)? {
+                crate::git_util::open_workspace_git_repo(&workspace, tx.repo())?
+            } else {
+                None
+            };
+            let Some(git_repo) = maybe_git_repo else {
+                continue;
+            };
+            exported_git_head = true;
+            match jj_lib::git::reset_head_for_workspace_from_old_target(
+                tx.repo_mut(),
+                &workspace_name,
+                &git_repo,
+                &wc_commit,
+                old_head_target,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(err @ jj_lib::git::GitResetHeadError::UpdateHeadRef(_)) => {
+                    writeln!(ui.warning_default(), "{err}")?;
+                    print_error_sources(ui, err.source())?;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if exported_git_head {
+            let stats = jj_lib::git::export_refs(tx.repo_mut())?;
+            crate::git_util::print_git_export_stats(ui, &stats)?;
+        }
+
         Ok(())
     }
 

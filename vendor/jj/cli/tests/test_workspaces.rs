@@ -511,6 +511,62 @@ fn test_workspaces_add_git_workspace() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_workspaces_snapshot_updates_child_git_head() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    test_env.add_env_var("GIT_COMMITTER_NAME", "Test User");
+    test_env.add_env_var("GIT_COMMITTER_EMAIL", "test.user@example.com");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let child_dir = test_env.work_dir("child");
+
+    main_dir.write_file("base", "base\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj([
+            "workspace",
+            "add",
+            "--git",
+            "--name",
+            "child",
+            "-r",
+            "@",
+            "../child",
+        ])
+        .success();
+    child_dir.run_jj(["new", "default@"]).success();
+
+    let old_child_git_head = git_head(&child_dir)?;
+    main_dir.write_file("parent-file", "contents\n");
+
+    child_dir.run_jj(["status"]).success();
+
+    let expected_git_head = child_dir
+        .run_jj([
+            "log",
+            "--no-graph",
+            "-r",
+            "child@-",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ])
+        .success()
+        .stdout
+        .into_raw();
+    assert_ne!(old_child_git_head, expected_git_head.trim());
+    assert_eq!(git_head(&child_dir)?, expected_git_head.trim());
+
+    let output = std::process::Command::new("git")
+        .current_dir(child_dir.root())
+        .args(["status", "--porcelain=v1"])
+        .output()?;
+    assert!(output.status.success());
+    insta::assert_snapshot!(String::from_utf8(output.stdout)?, @"");
+    Ok(())
+}
+
 /// Test multiple `-r` flags to `workspace add` to create a workspace
 /// working-copy commit with multiple parents.
 #[test]
@@ -2336,4 +2392,13 @@ fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     )
     "#;
     work_dir.run_jj(["log", "-T", template, "-r", "all()"])
+}
+
+fn git_head(work_dir: &TestWorkDir) -> TestResult<String> {
+    let output = std::process::Command::new("git")
+        .current_dir(work_dir.root())
+        .args(["rev-parse", "HEAD"])
+        .output()?;
+    assert!(output.status.success());
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }

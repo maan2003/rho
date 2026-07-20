@@ -1825,6 +1825,30 @@ pub async fn reset_head_for_workspace(
     git_repo: &gix::Repository,
     wc_commit: &Commit,
 ) -> Result<(), GitResetHeadError> {
+    let old_head_target = mut_repo.git_head_for_workspace(workspace_name);
+    reset_head_for_workspace_from_old_target(
+        mut_repo,
+        workspace_name,
+        git_repo,
+        wc_commit,
+        old_head_target,
+    )
+    .await
+}
+
+/// Sets Git HEAD in the given Git worktree to the parent of the given
+/// working-copy commit and resets that worktree's Git index.
+///
+/// The old Git HEAD target must come from the view loaded before the current
+/// transaction rewrote commits. This matters when rebasing descendants has
+/// already rewritten the git-head target in `mut_repo`.
+pub async fn reset_head_for_workspace_from_old_target(
+    mut_repo: &mut MutableRepo,
+    workspace_name: &WorkspaceName,
+    git_repo: &gix::Repository,
+    wc_commit: &Commit,
+    old_head_target: RefTarget,
+) -> Result<(), GitResetHeadError> {
     let first_parent_id = &wc_commit.parent_ids()[0];
     let new_head_target = if first_parent_id != mut_repo.store().root_commit_id() {
         RefTarget::normal(first_parent_id.clone())
@@ -1833,7 +1857,6 @@ pub async fn reset_head_for_workspace(
     };
 
     // If the first parent of the working copy has changed, reset the Git HEAD.
-    let old_head_target = mut_repo.git_head_for_workspace(workspace_name);
     if old_head_target != new_head_target {
         let expected_ref = if let Some(id) = old_head_target.as_normal() {
             // We have to check the actual HEAD state because we don't record a
