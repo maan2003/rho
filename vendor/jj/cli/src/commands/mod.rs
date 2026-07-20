@@ -57,6 +57,7 @@ mod sparse;
 mod split;
 mod squash;
 mod status;
+mod subtree;
 mod tag;
 mod undo;
 mod unsign;
@@ -150,6 +151,8 @@ enum Command {
     Squash(squash::SquashArgs),
     Status(status::StatusArgs),
     #[command(subcommand)]
+    Subtree(subtree::SubtreeCommand),
+    #[command(subcommand)]
     Tag(tag::TagCommand),
     Undo(undo::UndoArgs),
     Unsign(unsign::UnsignArgs),
@@ -215,6 +218,7 @@ pub async fn run_command(ui: &mut Ui, command_helper: &CommandHelper) -> Result<
         Command::Split(args) => split::cmd_split(ui, command_helper, args).await,
         Command::Squash(args) => squash::cmd_squash(ui, command_helper, args).await,
         Command::Status(args) => status::cmd_status(ui, command_helper, args).await,
+        Command::Subtree(args) => subtree::cmd_subtree(ui, command_helper, args).await,
         Command::Tag(args) => tag::cmd_tag(ui, command_helper, args).await,
         Command::Undo(args) => undo::cmd_undo(ui, command_helper, args).await,
         Command::Unsign(args) => unsign::cmd_unsign(ui, command_helper, args).await,

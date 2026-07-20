@@ -1645,7 +1645,7 @@ impl WorkspaceCommandHelper {
     async fn import_git_head(
         &mut self,
         ui: &Ui,
-        _git_import_export_lock: &GitImportExportLock,
+        git_import_export_lock: &GitImportExportLock,
     ) -> Result<(), CommandError> {
         assert!(self.may_snapshot_working_copy);
         let git_repo =
@@ -2671,7 +2671,7 @@ to the current parents may contain changes from multiple commits.
         ui: &Ui,
         mut tx: Transaction,
         description: impl Into<String>,
-        git_import_export_lock: &GitImportExportLock,
+        _git_import_export_lock: &GitImportExportLock,
     ) -> Result<(), CommandError> {
         let old_repo = tx.base_repo().clone();
 

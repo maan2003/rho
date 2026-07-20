@@ -106,6 +106,10 @@ This document contains the help content for the `jj` command-line program.
 * [`jj split`↴](#jj-split)
 * [`jj squash`↴](#jj-squash)
 * [`jj status`↴](#jj-status)
+* [`jj subtree`↴](#jj-subtree)
+* [`jj subtree add`↴](#jj-subtree-add)
+* [`jj subtree list`↴](#jj-subtree-list)
+* [`jj subtree update`↴](#jj-subtree-update)
 * [`jj tag`↴](#jj-tag)
 * [`jj tag delete`↴](#jj-tag-delete)
 * [`jj tag list`↴](#jj-tag-list)
@@ -191,6 +195,7 @@ To get started, see the tutorial [`jj help -k tutorial`].
 * `split` — Split a revision in two
 * `squash` — Move changes from a revision into another revision
 * `status` — Show high-level repo status [default alias: st]
+* `subtree` — Manage imported directory trees
 * `tag` — Manage tags
 * `undo` — Undo the last operation
 * `unsign` — Drop a cryptographic signature
@@ -3332,6 +3337,60 @@ Note: You can use `jj diff --summary -r <rev>` to see the changed files for a sp
 ###### **Arguments:**
 
 * `<FILESETS>` — Restrict the status display to these paths
+
+
+
+## `jj subtree`
+
+Manage imported directory trees
+
+**Usage:** `jj subtree <COMMAND>`
+
+###### **Subcommands:**
+
+* `add` — Add the root tree of another revision at a new path
+* `list` — List managed subtrees in the working-copy commit
+* `update` — Merge a newer source revision into a managed subtree
+
+
+
+## `jj subtree add`
+
+Add the root tree of another revision at a new path
+
+**Usage:** `jj subtree add --source <REV> <DESTINATION>`
+
+###### **Arguments:**
+
+* `<DESTINATION>` — Destination directory for the imported tree
+
+###### **Options:**
+
+* `-s`, `--source <REV>` — Revision whose root tree should be imported
+
+
+
+## `jj subtree list`
+
+List managed subtrees in the working-copy commit
+
+**Usage:** `jj subtree list`
+
+
+
+## `jj subtree update`
+
+Merge a newer source revision into a managed subtree
+
+**Usage:** `jj subtree update --source <REV> <DESTINATION>`
+
+###### **Arguments:**
+
+* `<DESTINATION>` — Managed subtree directory to update
+
+###### **Options:**
+
+* `-s`, `--source <REV>` — New source revision to merge into the subtree
 
 
 
