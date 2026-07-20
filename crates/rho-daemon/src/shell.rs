@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
+use std::ops::Range;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +19,9 @@ use alacritty_terminal::vte::{self, Params, Perform};
 use anyhow::Context as _;
 use rho_shell_proto::{MAX_PROMPT_BYTES, PROTOCOL_VERSION, Request, Response};
 use rho_ui_proto::AgentId;
-use rho_ui_proto::shell::ShellServerFrame;
+use rho_ui_proto::shell::{
+    MAX_STYLE_SPANS, ShellColor, ShellServerFrame, ShellStyleSpan, ShellTextStyle,
+};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
@@ -29,6 +32,7 @@ const SIDECAR_QUEUE: usize = 64;
 const TICK: std::time::Duration = std::time::Duration::from_millis(16);
 const SHELL_STATE_CAP: usize = 4 * 1024 * 1024;
 const OUTPUT_TRIM_TO: usize = 2 * 1024 * 1024;
+const STYLE_SPAN_COST: usize = 64;
 const OMITTED: &str = "[... older shell output omitted ...]\n";
 const SHELL_COLS: u16 = 80;
 const SHELL_ROWS: u16 = 24;
@@ -355,6 +359,7 @@ impl State {
             cwd: String::new(),
             state: rho_ui_proto::shell::ShellExecutionState::Queued,
             output: String::new(),
+            styles: Vec::new(),
         };
         self.shell.executions.push(block.clone());
         self.send_state_frame(ShellServerFrame::ExecutionQueued { execution: block });
@@ -383,13 +388,21 @@ impl State {
     }
 
     fn execution_output(&mut self, execution: u64, bytes: &[u8]) {
-        let Some((start, end, text)) = self.execution_outputs.get_mut(&execution).map(|output| {
-            let end = output.text.len();
-            let start = output.line_start;
-            output.advance(bytes);
-            let start = if output.trim() { 0 } else { start };
-            (start, end, output.text[start..].to_owned())
-        }) else {
+        let Some((start, end, text, styles, all_styles)) =
+            self.execution_outputs.get_mut(&execution).map(|output| {
+                let end = output.text.len();
+                let start = output.line_start;
+                output.advance(bytes);
+                let start = if output.trim() { 0 } else { start };
+                (
+                    start,
+                    end,
+                    output.text[start..].to_owned(),
+                    output.styles_from(start),
+                    output.styles.clone(),
+                )
+            })
+        else {
             self.terminal_output(bytes);
             return;
         };
@@ -400,12 +413,14 @@ impl State {
             .find(|block| block.execution == execution)
         {
             block.output.replace_range(start..end, &text);
+            block.styles = all_styles;
         }
         self.send_state_frame(ShellServerFrame::ExecutionOutput {
             execution,
             start: start as u64,
             end: end as u64,
             text,
+            styles,
         });
         self.trim_shell_state();
     }
@@ -460,17 +475,26 @@ impl State {
             start
         };
         let text = self.terminal_output.text[start..].to_owned();
+        let styles = self.terminal_output.styles_from(start);
         self.shell.terminal_output.replace_range(start..end, &text);
+        self.shell
+            .terminal_styles
+            .clone_from(&self.terminal_output.styles);
         self.send_state_frame(ShellServerFrame::TerminalOutput {
             start: start as u64,
             end: end as u64,
             text,
+            styles,
         });
     }
 
     fn trim_shell_state(&mut self) {
         let retained_bytes = |block: &rho_ui_proto::shell::ShellExecution| {
-            block.command.len() + block.prompt.len() + block.cwd.len() + block.output.len()
+            block.command.len()
+                + block.prompt.len()
+                + block.cwd.len()
+                + block.output.len()
+                + block.styles.len() * STYLE_SPAN_COST
         };
         while self
             .shell
@@ -529,10 +553,13 @@ impl State {
     }
 }
 
-/// Plain-text output accumulator. Escape sequences are discarded, while
-/// carriage return, backspace, and erase-line rewrite only the active line.
+/// Safe output accumulator. SGR is retained as bounded structured spans; all
+/// other escape sequences are discarded, while carriage return, backspace,
+/// and erase-line rewrite only the active line.
 struct PlainOutput {
     text: String,
+    styles: Vec<ShellStyleSpan>,
+    current_style: ShellTextStyle,
     cursor: usize,
     line_start: usize,
     parser: vte::Parser,
@@ -542,6 +569,8 @@ impl Default for PlainOutput {
     fn default() -> Self {
         Self {
             text: String::new(),
+            styles: Vec::new(),
+            current_style: ShellTextStyle::default(),
             cursor: 0,
             line_start: 0,
             parser: vte::Parser::new(),
@@ -562,6 +591,105 @@ impl PlainOutput {
             .map_or(self.text.len(), |offset| self.cursor + offset)
     }
 
+    fn styles_from(&self, start: usize) -> Vec<ShellStyleSpan> {
+        let first = self.styles.partition_point(|span| span.end <= start as u64);
+        self.styles
+            .iter()
+            .skip(first)
+            .filter_map(|span| {
+                let span_start = usize::try_from(span.start).ok()?;
+                let span_end = usize::try_from(span.end).ok()?;
+                (span_end > start).then(|| ShellStyleSpan {
+                    start: span_start.max(start) as u64,
+                    end: span_end as u64,
+                    style: span.style,
+                })
+            })
+            .collect()
+    }
+
+    fn push_style(&mut self, range: Range<usize>, style: ShellTextStyle) {
+        if range.is_empty() || style == ShellTextStyle::default() {
+            return;
+        }
+        if let Some(last) = self.styles.last_mut()
+            && last.end == range.start as u64
+            && last.style == style
+        {
+            last.end = range.end as u64;
+            return;
+        }
+        self.styles.push(ShellStyleSpan {
+            start: range.start as u64,
+            end: range.end as u64,
+            style,
+        });
+        if self.styles.len() > MAX_STYLE_SPANS {
+            self.styles.truncate(MAX_STYLE_SPANS);
+        }
+    }
+
+    fn replace_styled(&mut self, range: Range<usize>, replacement: &str, style: ShellTextStyle) {
+        let replacement_end = range.start + replacement.len();
+        let first = self
+            .styles
+            .partition_point(|span| span.end <= range.start as u64);
+        let affected = self.styles.split_off(first);
+        let mut styles = Vec::with_capacity(affected.len() + 2);
+        for span in affected {
+            let start = span.start as usize;
+            let end = span.end as usize;
+            if end <= range.start {
+                styles.push(span);
+            } else if start >= range.end {
+                let shifted_start = replacement_end + start.saturating_sub(range.end);
+                let shifted_end = replacement_end + end.saturating_sub(range.end);
+                styles.push(ShellStyleSpan {
+                    start: shifted_start as u64,
+                    end: shifted_end as u64,
+                    style: span.style,
+                });
+            } else {
+                if start < range.start {
+                    styles.push(ShellStyleSpan {
+                        start: start as u64,
+                        end: range.start as u64,
+                        style: span.style,
+                    });
+                }
+                if end > range.end {
+                    styles.push(ShellStyleSpan {
+                        start: replacement_end as u64,
+                        end: (replacement_end + end - range.end) as u64,
+                        style: span.style,
+                    });
+                }
+            }
+        }
+        if !replacement.is_empty() && style != ShellTextStyle::default() {
+            styles.push(ShellStyleSpan {
+                start: range.start as u64,
+                end: replacement_end as u64,
+                style,
+            });
+        }
+        styles.sort_unstable_by_key(|span| (span.start, span.end));
+        for span in styles {
+            if let Some(last) = self.styles.last_mut()
+                && last.end == span.start
+                && last.style == span.style
+            {
+                last.end = span.end;
+            } else {
+                self.styles.push(span);
+            }
+        }
+        if self.styles.len() > MAX_STYLE_SPANS {
+            self.styles.truncate(MAX_STYLE_SPANS);
+        }
+        self.text.replace_range(range, replacement);
+    }
+
     fn trim(&mut self) -> bool {
         if self.text.len() <= SHELL_STATE_CAP {
             return false;
@@ -573,8 +701,7 @@ impl PlainOutput {
         let cut = self.text[target..]
             .find('\n')
             .map_or(target, |offset| target + offset + 1);
-        self.text.drain(..cut);
-        self.text.insert_str(0, OMITTED);
+        self.replace_styled(0..cut, OMITTED, ShellTextStyle::default());
         let delta = cut.saturating_sub(OMITTED.len());
         self.cursor = self.cursor.saturating_sub(delta).min(self.text.len());
         self.line_start = self.text[..self.cursor]
@@ -586,15 +713,19 @@ impl PlainOutput {
 
 impl Perform for PlainOutput {
     fn print(&mut self, c: char) {
+        let mut bytes = [0; 4];
+        let text = c.encode_utf8(&mut bytes);
         if self.cursor < self.text.len() {
             let next = self.cursor
                 + self.text[self.cursor..]
                     .chars()
                     .next()
                     .map_or(0, char::len_utf8);
-            self.text.replace_range(self.cursor..next, &c.to_string());
+            self.replace_styled(self.cursor..next, text, self.current_style);
         } else {
+            let start = self.text.len();
             self.text.push(c);
+            self.push_style(start..self.text.len(), self.current_style);
         }
         self.cursor += c.len_utf8();
     }
@@ -606,7 +737,11 @@ impl Perform for PlainOutput {
                 if self.text.as_bytes().get(end) == Some(&b'\n') {
                     self.cursor = end + 1;
                 } else {
-                    self.text.insert(end, '\n');
+                    if end == self.text.len() {
+                        self.text.push('\n');
+                    } else {
+                        self.replace_styled(end..end, "\n", ShellTextStyle::default());
+                    }
                     self.cursor = end + 1;
                 }
                 self.line_start = self.cursor;
@@ -626,7 +761,74 @@ impl Perform for PlainOutput {
     }
 
     fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], ignore: bool, action: char) {
-        if ignore || action != 'K' {
+        if ignore {
+            return;
+        }
+        if action == 'm' {
+            let mut params = params.iter();
+            while let Some(param) = params.next() {
+                let code = param.first().copied().unwrap_or(0);
+                match code {
+                    0 => self.current_style = ShellTextStyle::default(),
+                    1 => self.current_style.bold = true,
+                    2 => self.current_style.dim = true,
+                    3 => self.current_style.italic = true,
+                    4 => self.current_style.underline = param.get(1).copied().unwrap_or(1) != 0,
+                    7 => self.current_style.inverse = true,
+                    9 => self.current_style.strikethrough = true,
+                    21 => self.current_style.bold = false,
+                    22 => {
+                        self.current_style.bold = false;
+                        self.current_style.dim = false;
+                    }
+                    23 => self.current_style.italic = false,
+                    24 => self.current_style.underline = false,
+                    27 => self.current_style.inverse = false,
+                    29 => self.current_style.strikethrough = false,
+                    30..=37 => {
+                        self.current_style.foreground =
+                            Some(ShellColor::Indexed((code - 30) as u8));
+                    }
+                    38 => {
+                        let color = if param.len() > 1 {
+                            colon_sgr_color(&param[1..])
+                        } else {
+                            semicolon_sgr_color(&mut params)
+                        };
+                        if let Some(color) = color {
+                            self.current_style.foreground = Some(color);
+                        }
+                    }
+                    39 => self.current_style.foreground = None,
+                    40..=47 => {
+                        self.current_style.background =
+                            Some(ShellColor::Indexed((code - 40) as u8));
+                    }
+                    48 => {
+                        let color = if param.len() > 1 {
+                            colon_sgr_color(&param[1..])
+                        } else {
+                            semicolon_sgr_color(&mut params)
+                        };
+                        if let Some(color) = color {
+                            self.current_style.background = Some(color);
+                        }
+                    }
+                    49 => self.current_style.background = None,
+                    90..=97 => {
+                        self.current_style.foreground =
+                            Some(ShellColor::Indexed((code - 90 + 8) as u8));
+                    }
+                    100..=107 => {
+                        self.current_style.background =
+                            Some(ShellColor::Indexed((code - 100 + 8) as u8));
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        if action != 'K' {
             return;
         }
         let mode = params
@@ -637,13 +839,46 @@ impl Perform for PlainOutput {
             .unwrap_or(0);
         let end = self.line_end();
         match mode {
-            0 => self.text.replace_range(self.cursor..end, ""),
+            0 => self.replace_styled(self.cursor..end, "", ShellTextStyle::default()),
             2 => {
-                self.text.replace_range(self.line_start..end, "");
+                self.replace_styled(self.line_start..end, "", ShellTextStyle::default());
                 self.cursor = self.line_start;
             }
             _ => {}
         }
+    }
+}
+
+fn semicolon_sgr_color<'a>(params: &mut impl Iterator<Item = &'a [u16]>) -> Option<ShellColor> {
+    match params.next()?.first().copied()? {
+        2 => Some(ShellColor::Rgb {
+            red: u8::try_from(params.next()?.first().copied()?).ok()?,
+            green: u8::try_from(params.next()?.first().copied()?).ok()?,
+            blue: u8::try_from(params.next()?.first().copied()?).ok()?,
+        }),
+        5 => Some(ShellColor::Indexed(
+            u8::try_from(params.next()?.first().copied()?).ok()?,
+        )),
+        _ => None,
+    }
+}
+
+fn colon_sgr_color(params: &[u16]) -> Option<ShellColor> {
+    match params.first().copied()? {
+        2 => {
+            let rgb = if params.len() > 4 {
+                params.get(2..5)?
+            } else {
+                params.get(1..4)?
+            };
+            Some(ShellColor::Rgb {
+                red: u8::try_from(rgb[0]).ok()?,
+                green: u8::try_from(rgb[1]).ok()?,
+                blue: u8::try_from(rgb[2]).ok()?,
+            })
+        }
+        5 => Some(ShellColor::Indexed(u8::try_from(*params.get(1)?).ok()?)),
+        _ => None,
     }
 }
 
@@ -743,8 +978,8 @@ impl Session {
         let mut command = tokio::process::Command::new(&spawn.program);
         command.args(&spawn.args);
         command
-            .env("TERM", "dumb")
-            .env("NO_COLOR", "1")
+            .env("TERM", "xterm-256color")
+            .env_remove("NO_COLOR")
             .env("PAGER", "cat")
             .env("GIT_PAGER", "cat")
             .env("COLUMNS", SHELL_COLS.to_string())
@@ -792,6 +1027,7 @@ impl Session {
                 cwd: String::new(),
                 executions: Vec::new(),
                 terminal_output: String::new(),
+                terminal_styles: Vec::new(),
             },
             execution_outputs: HashMap::new(),
             terminal_output: PlainOutput::default(),
@@ -1273,17 +1509,118 @@ mod tests {
         let mut output = PlainOutput::default();
         output.advance(b"count 1\rcount 2\x1b[K\n\x1b[31mdone\x1b[0m\n");
         assert_eq!(output.text, "count 2\ndone\n");
+        assert_eq!(
+            output.styles,
+            vec![ShellStyleSpan {
+                start: 8,
+                end: 12,
+                style: ShellTextStyle {
+                    foreground: Some(ShellColor::Indexed(1)),
+                    ..Default::default()
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn plain_output_tracks_extended_colors_through_rewrites() {
+        let mut output = PlainOutput::default();
+        output.advance(b"\x1b[38;5;196mred\r\x1b[38:2::1:2:3mG\x1b[48;2;4;5;6mB\x1b[0m");
+        assert_eq!(output.text, "GBd");
+        assert_eq!(
+            output.styles,
+            vec![
+                ShellStyleSpan {
+                    start: 0,
+                    end: 1,
+                    style: ShellTextStyle {
+                        foreground: Some(ShellColor::Rgb {
+                            red: 1,
+                            green: 2,
+                            blue: 3,
+                        }),
+                        ..Default::default()
+                    },
+                },
+                ShellStyleSpan {
+                    start: 1,
+                    end: 2,
+                    style: ShellTextStyle {
+                        foreground: Some(ShellColor::Rgb {
+                            red: 1,
+                            green: 2,
+                            blue: 3,
+                        }),
+                        background: Some(ShellColor::Rgb {
+                            red: 4,
+                            green: 5,
+                            blue: 6,
+                        }),
+                        ..Default::default()
+                    },
+                },
+                ShellStyleSpan {
+                    start: 2,
+                    end: 3,
+                    style: ShellTextStyle {
+                        foreground: Some(ShellColor::Indexed(196)),
+                        ..Default::default()
+                    },
+                },
+            ]
+        );
     }
 
     #[test]
     fn plain_output_trim_stays_on_utf8_boundaries() {
         let mut output = PlainOutput::default();
         output.text = "λ".repeat(SHELL_STATE_CAP / 2 + 1);
+        output.styles.push(ShellStyleSpan {
+            start: 0,
+            end: output.text.len() as u64,
+            style: ShellTextStyle {
+                foreground: Some(ShellColor::Indexed(2)),
+                ..Default::default()
+            },
+        });
         output.cursor = output.text.len();
         output.line_start = output.cursor;
         assert!(output.trim());
         assert!(output.text.starts_with(OMITTED));
         assert!(output.text.len() <= OUTPUT_TRIM_TO + OMITTED.len() + 2);
+        assert_eq!(output.styles[0].start, OMITTED.len() as u64);
+        assert_eq!(output.styles[0].end, output.text.len() as u64);
+    }
+
+    #[test]
+    fn plain_output_style_overflow_preserves_incremental_prefix() {
+        let mut bytes = Vec::new();
+        for index in 0..MAX_STYLE_SPANS - 2 {
+            let color = if index % 2 == 0 { 31 } else { 32 };
+            bytes.extend_from_slice(format!("\x1b[{color}mx\x1b[0m\n").as_bytes());
+        }
+        let mut output = PlainOutput::default();
+        output.advance(&bytes);
+        let current_line = output.line_start;
+        output.advance(b"\x1b[33ma\x1b[0m \x1b[34mb\x1b[0m \x1b[35mc\x1b[0m");
+
+        assert_eq!(output.styles.len(), MAX_STYLE_SPANS);
+        assert!(
+            output
+                .styles
+                .windows(2)
+                .all(|spans| spans[0].end <= spans[1].start)
+        );
+        assert_eq!(output.styles[0].start, 0);
+
+        let prefix_end = output
+            .styles
+            .partition_point(|span| span.end <= current_line as u64);
+        let mut reconstructed = output.styles[..prefix_end].to_vec();
+        let current_styles = output.styles_from(current_line);
+        assert_eq!(current_styles.len(), 2);
+        reconstructed.extend(current_styles);
+        assert_eq!(reconstructed, output.styles);
     }
 
     #[test]
@@ -1434,6 +1771,35 @@ mod tests {
             .await
             .unwrap();
         wait_for_text(&mut first, &mut first_state, prompt_token).await;
+
+        let color_token = "colored-shell-output";
+        let color_execution = first
+            .submit
+            .send(format!("printf '\\033[31m{color_token}\\033[0m\\n'"))
+            .await
+            .unwrap();
+        wait_for_finished(&mut first, &mut first_state, color_execution).await;
+        let color_block = first_state
+            .executions
+            .iter()
+            .find(|block| block.execution == color_execution)
+            .unwrap();
+        let color_start = color_block.output.find(color_token).unwrap() as u64;
+        assert!(color_block.styles.iter().any(|span| {
+            span.start <= color_start
+                && span.end >= color_start + color_token.len() as u64
+                && span.style.foreground == Some(ShellColor::Indexed(1))
+        }));
+        let color_env_token = "color-environment-ok";
+        first
+            .submit
+            .send(format!(
+                "test \"$TERM\" = xterm-256color && test -z \"${{NO_COLOR+x}}\" && {}",
+                shell_token(color_env_token)
+            ))
+            .await
+            .unwrap();
+        wait_for_text(&mut first, &mut first_state, color_env_token).await;
 
         // Prompt construction is bounded independently of command execution.
         first
@@ -1770,6 +2136,7 @@ mod tests {
                 start,
                 end,
                 text,
+                styles,
             } => {
                 let block = state
                     .executions
@@ -1779,6 +2146,8 @@ mod tests {
                 block
                     .output
                     .replace_range(start as usize..end as usize, &text);
+                block.styles.retain(|span| span.end <= start);
+                block.styles.extend(styles);
             }
             ShellServerFrame::ExecutionFinished { execution, status } => {
                 let block = state
@@ -1798,9 +2167,18 @@ mod tests {
                     block.state = ShellExecutionState::Failed;
                 }
             }
-            ShellServerFrame::TerminalOutput { start, end, text } => state
-                .terminal_output
-                .replace_range(start as usize..end as usize, &text),
+            ShellServerFrame::TerminalOutput {
+                start,
+                end,
+                text,
+                styles,
+            } => {
+                state
+                    .terminal_output
+                    .replace_range(start as usize..end as usize, &text);
+                state.terminal_styles.retain(|span| span.end <= start);
+                state.terminal_styles.extend(styles);
+            }
             ShellServerFrame::Prompt { prompt, cwd } => {
                 state.prompt = prompt;
                 state.cwd = cwd;

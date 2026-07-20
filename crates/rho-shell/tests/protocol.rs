@@ -9,7 +9,6 @@ fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(home.join(".bashrc"), "PS1='test> '\n").unwrap();
 
     let (mut control, child_control) = std::os::unix::net::UnixStream::pair().unwrap();
     control
@@ -40,10 +39,14 @@ fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
     }
     let mut child = command.spawn().unwrap();
 
-    let Response::Ready { protocol, .. } = read(&mut control) else {
+    let Response::Ready {
+        protocol, prompt, ..
+    } = read(&mut control)
+    else {
         panic!("rho-shell did not send Ready");
     };
     assert_eq!(protocol, PROTOCOL_VERSION);
+    assert!(matches!(prompt.as_str(), "$ " | "# "), "{prompt:?}");
 
     write(
         &mut control,

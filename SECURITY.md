@@ -340,15 +340,17 @@ AI APIs.
   terminal.
 - The daemon is the canonical owner of bounded structured `ShellState`: accepted
   command text, prompt/cwd, execution status, and sanitized per-execution output.
-  ANSI control strings are discarded and carriage-return/backspace edits are
-  confined to the active output line. Slow or newly attached clients receive a
-  full structured snapshot rather than a separate flat transcript, and the final
-  canonical state and exit status bypass congested incremental queues. The shell
-  runs in its own process session; normal exit sends TERM then KILL to all
-  remaining members of that session, while task cancellation kills the session
-  immediately. A command can intentionally create a new session and thereby
-  outlive the shell, just as it can deliberately start a user service; this is
-  accepted because editor-shell commands are trusted with the workspace's
+  Output ANSI SGR colors and attributes are decoded into bounded structured style
+  spans; prompt ANSI and all other control strings are discarded, and
+  carriage-return/backspace edits are confined to the active output line. Slow or
+  newly attached clients receive a full structured snapshot rather than a
+  separate flat transcript, and the final canonical state and exit status bypass
+  congested incremental queues.
+  The shell runs in its own process session; normal exit sends TERM then KILL to
+  all remaining members of that session, while task cancellation kills the
+  session immediately. A command can intentionally create a new session and
+  thereby outlive the shell, just as it can deliberately start a user service;
+  this is accepted because editor-shell commands are trusted with the workspace's
   authority rather than sandboxed.
 - Rho-owned agent variables (`RHO_AGENT_ID` and `RHO_MCP_AGENT_ID`) are supplied
   explicitly to agent commands rather than copied

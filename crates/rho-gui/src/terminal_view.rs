@@ -497,8 +497,8 @@ impl Palette<'_> {
         match color {
             TermColor::Foreground => self.foreground,
             TermColor::Background => self.background,
-            TermColor::Indexed(index) => self.indexed(index),
-            TermColor::Rgb(r, g, b) => rgb8(r, g, b),
+            TermColor::Indexed(index) => terminal_indexed_color(index, self.colors),
+            TermColor::Rgb(r, g, b) => terminal_rgb_color(r, g, b),
         }
     }
 
@@ -509,46 +509,46 @@ impl Palette<'_> {
             other => Some(self.fg(other)),
         }
     }
-
-    fn indexed(&self, index: u8) -> Hsla {
-        let named: gpui::Color = match index {
-            0 => self.colors.terminal_ansi_black,
-            1 => self.colors.terminal_ansi_red,
-            2 => self.colors.terminal_ansi_green,
-            3 => self.colors.terminal_ansi_yellow,
-            4 => self.colors.terminal_ansi_blue,
-            5 => self.colors.terminal_ansi_magenta,
-            6 => self.colors.terminal_ansi_cyan,
-            7 => self.colors.terminal_ansi_white,
-            8 => self.colors.terminal_ansi_bright_black,
-            9 => self.colors.terminal_ansi_bright_red,
-            10 => self.colors.terminal_ansi_bright_green,
-            11 => self.colors.terminal_ansi_bright_yellow,
-            12 => self.colors.terminal_ansi_bright_blue,
-            13 => self.colors.terminal_ansi_bright_magenta,
-            14 => self.colors.terminal_ansi_bright_cyan,
-            15 => self.colors.terminal_ansi_bright_white,
-            // xterm 6×6×6 color cube.
-            16..=231 => {
-                let index = index - 16;
-                let component = |value: u8| if value == 0 { 0 } else { value * 40 + 55 };
-                return rgb8(
-                    component(index / 36),
-                    component(index / 6 % 6),
-                    component(index % 6),
-                );
-            }
-            // Grayscale ramp.
-            232..=255 => {
-                let level = (index - 232) * 10 + 8;
-                return rgb8(level, level, level);
-            }
-        };
-        named.into()
-    }
 }
 
-fn rgb8(r: u8, g: u8, b: u8) -> Hsla {
+pub(crate) fn terminal_indexed_color(index: u8, colors: &theme::ThemeColors) -> Hsla {
+    let named: gpui::Color = match index {
+        0 => colors.terminal_ansi_black,
+        1 => colors.terminal_ansi_red,
+        2 => colors.terminal_ansi_green,
+        3 => colors.terminal_ansi_yellow,
+        4 => colors.terminal_ansi_blue,
+        5 => colors.terminal_ansi_magenta,
+        6 => colors.terminal_ansi_cyan,
+        7 => colors.terminal_ansi_white,
+        8 => colors.terminal_ansi_bright_black,
+        9 => colors.terminal_ansi_bright_red,
+        10 => colors.terminal_ansi_bright_green,
+        11 => colors.terminal_ansi_bright_yellow,
+        12 => colors.terminal_ansi_bright_blue,
+        13 => colors.terminal_ansi_bright_magenta,
+        14 => colors.terminal_ansi_bright_cyan,
+        15 => colors.terminal_ansi_bright_white,
+        // xterm 6×6×6 color cube.
+        16..=231 => {
+            let index = index - 16;
+            let component = |value: u8| if value == 0 { 0 } else { value * 40 + 55 };
+            return terminal_rgb_color(
+                component(index / 36),
+                component(index / 6 % 6),
+                component(index % 6),
+            );
+        }
+        // Grayscale ramp.
+        232..=255 => {
+            let level = (index - 232) * 10 + 8;
+            return terminal_rgb_color(level, level, level);
+        }
+    };
+    named.into()
+}
+
+pub(crate) fn terminal_rgb_color(r: u8, g: u8, b: u8) -> Hsla {
     gpui::Rgba {
         r: f32::from(r) / 255.0,
         g: f32::from(g) / 255.0,

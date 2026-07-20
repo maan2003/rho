@@ -20,7 +20,8 @@ use anyhow::{Context as _, anyhow};
 use brush_builtins::{BuiltinSet, ShellBuilderExt as _};
 use brush_core::openfiles::{OpenFile, OpenFiles};
 use brush_core::{
-    ExecutionControlFlow, ExecutionParameters, ProcessGroupPolicy, Shell, ShellValue, SourceInfo,
+    ExecutionControlFlow, ExecutionParameters, ProcessGroupPolicy, Shell, ShellValue,
+    ShellVariable, SourceInfo,
 };
 use rho_shell_proto::{MAX_PROMPT_BYTES, PROTOCOL_VERSION, Request, Response};
 
@@ -199,7 +200,7 @@ async fn initialize_shell() -> anyhow::Result<Shell> {
         (OpenFiles::STDOUT_FD, brush_core::openfiles::null()?),
         (OpenFiles::STDERR_FD, brush_core::openfiles::null()?),
     ]);
-    Shell::builder()
+    let mut shell = Shell::builder()
         .interactive(true)
         .no_editing(true)
         .disable_option("monitor")
@@ -208,7 +209,17 @@ async fn initialize_shell() -> anyhow::Result<Shell> {
         .build()
         .await
         .map_err(|error| anyhow!(error))
-        .context("initialize Brush shell")
+        .context("initialize Brush shell")?;
+    // Brush's stock prompt is `\s-\v\$ `. The embedded shell has no argv[0]
+    // shell name, so that renders as the unhelpful `-<version>$ `. Keep any
+    // prompt supplied by startup files, but use a conventional prompt when
+    // the stock value is still present.
+    if shell.env_str("PS1").as_deref() == Some(r"\s-\v\$ ") {
+        shell
+            .set_env_global("PS1", ShellVariable::new(r"\$ "))
+            .context("set default prompt")?;
+    }
+    Ok(shell)
 }
 
 async fn run_kernel(

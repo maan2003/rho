@@ -8,6 +8,40 @@
 pub use rho_shell_proto::{MAX_COMMAND_BYTES, command_fits};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
+/// Maximum structured SGR runs retained for one output stream.
+pub const MAX_STYLE_SPANS: usize = 4096;
+
+/// A safe, structured color decoded from shell SGR output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
+pub enum ShellColor {
+    Indexed(u8),
+    Rgb { red: u8, green: u8, blue: u8 },
+}
+
+/// Terminal attributes that apply to a byte range in sanitized shell output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
+pub struct ShellTextStyle {
+    pub foreground: Option<ShellColor>,
+    pub background: Option<ShellColor>,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+    pub strikethrough: bool,
+}
+
+/// A styled byte range in one execution's output or in terminal output.
+///
+/// Span lists are capped at [`MAX_STYLE_SPANS`], sorted, non-overlapping, and
+/// aligned to UTF-8 boundaries in the corresponding sanitized output string.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct ShellStyleSpan {
+    pub start: u64,
+    pub end: u64,
+    pub style: ShellTextStyle,
+}
+
 /// One daemon-owned shell returned by [`crate::ServerMessage::ShellList`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ShellInfo {
@@ -36,6 +70,8 @@ pub struct ShellExecution {
     pub state: ShellExecutionState,
     /// Sanitized merged stdout/stderr output.
     pub output: String,
+    /// Non-default SGR styles over `output` byte ranges.
+    pub styles: Vec<ShellStyleSpan>,
 }
 
 /// Structured state retained by the daemon independently of GUI rendering.
@@ -46,6 +82,8 @@ pub struct ShellState {
     pub executions: Vec<ShellExecution>,
     /// Sanitized output not attributable to a submitted execution.
     pub terminal_output: String,
+    /// Non-default SGR styles over `terminal_output` byte ranges.
+    pub terminal_styles: Vec<ShellStyleSpan>,
 }
 
 /// Client to daemon frames after the shell handshake.
@@ -88,6 +126,8 @@ pub enum ShellServerFrame {
         start: u64,
         end: u64,
         text: String,
+        /// Absolute styled byte ranges in the replacement tail.
+        styles: Vec<ShellStyleSpan>,
     },
     ExecutionFinished {
         execution: u64,
@@ -100,6 +140,8 @@ pub enum ShellServerFrame {
         start: u64,
         end: u64,
         text: String,
+        /// Absolute styled byte ranges in the replacement tail.
+        styles: Vec<ShellStyleSpan>,
     },
     /// Current prompt for the client-local writable draft. Prompt bytes are
     /// sanitized by the daemon before crossing this protocol.

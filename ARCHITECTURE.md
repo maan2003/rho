@@ -65,7 +65,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   leaves the explicitly started kernel running. The daemon is the sole owner of
   a bounded structured `ShellState`; each GUI projects that state into a
   read-only buffer beside a client-local writable draft, so pending edits never
-  compete with shell-side state or leak between clients.
+  compete with shell-side state or leak between clients. Command-output SGR
+  colors and attributes cross this boundary as bounded structured spans and are
+  resolved against the client theme; prompts remain semantic client-themed text,
+  and raw terminal control sequences never reach the editor buffer.
 - `rho wayland` is an application-agnostic CLI surface for launching and
   controlling programs in isolated headless Sway sessions. It wraps the
   compositor's IPC plus `grim` and `wtype`; the Nix build embeds those tool

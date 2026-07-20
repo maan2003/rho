@@ -1046,6 +1046,15 @@ mod tests {
             start: 0,
             end: 0,
             text: "λ".to_owned(),
+            styles: vec![shell::ShellStyleSpan {
+                start: 0,
+                end: 2,
+                style: shell::ShellTextStyle {
+                    foreground: Some(shell::ShellColor::Indexed(1)),
+                    bold: true,
+                    ..Default::default()
+                },
+            }],
         };
         let bytes = senax_encoder::pack(&frame).unwrap();
         let mut slice: &[u8] = &bytes;
@@ -1053,9 +1062,9 @@ mod tests {
         assert_eq!(frame, decoded);
 
         assert!(shell::command_fits(&"x".repeat(shell::MAX_COMMAND_BYTES)));
-        assert!(!shell::command_fits(&"x".repeat(
-            shell::MAX_COMMAND_BYTES + 1
-        )));
+        assert!(!shell::command_fits(
+            &"x".repeat(shell::MAX_COMMAND_BYTES + 1)
+        ));
     }
 
     #[test]

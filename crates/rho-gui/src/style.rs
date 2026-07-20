@@ -32,6 +32,8 @@ pub enum StyleClass {
     StatusCancelled,
     Time,
     AgentMessage,
+    ShellPrompt,
+    ShellCommand,
     /// Tree-sitter highlight, by syntax-theme index (see
     /// `language::HighlightId`).
     Syntax(u32),
@@ -67,6 +69,8 @@ impl StyleClass {
             Self::StatusCancelled => 11,
             Self::Time => 12,
             Self::AgentMessage => 13,
+            Self::ShellPrompt => 14,
+            Self::ShellCommand => 15,
             Self::Syntax(id) => SYNTAX_KEY_BASE + id as usize,
         };
         let region_bit = match region {
@@ -93,6 +97,8 @@ impl StyleClass {
             Self::StatusCancelled => (colors.terminal_ansi_yellow.into(), false),
             Self::Time => (colors.text_muted.into(), false),
             Self::AgentMessage => (colors.terminal_ansi_magenta.into(), false),
+            Self::ShellPrompt => (colors.terminal_ansi_green.into(), true),
+            Self::ShellCommand => (colors.text_accent.into(), false),
             Self::Syntax(id) => {
                 return cx
                     .theme()
