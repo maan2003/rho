@@ -20,7 +20,7 @@ use crate::search::{
 };
 
 pub const WEB_SEARCH_TOOL_NAME: &str = "web__run";
-const SEARCH_URL: &str = "https://chatgpt.com/backend-api/codex/v1/alpha/search";
+const SEARCH_URL: &str = "https://chatgpt.com/backend-api/codex/alpha/search";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const ASSISTANT_CONTEXT_TOKENS: usize = 1_000;
 const APPROX_CHARS_PER_TOKEN: u64 = 4;
@@ -362,6 +362,14 @@ mod tests {
                 "description": "Whether to filter by recency, as a number of recent days.",
                 "type": "integer"
             })
+        );
+    }
+
+    #[test]
+    fn production_url_matches_codex_provider_path_join() {
+        assert_eq!(
+            SEARCH_URL,
+            "https://chatgpt.com/backend-api/codex/alpha/search"
         );
     }
 
