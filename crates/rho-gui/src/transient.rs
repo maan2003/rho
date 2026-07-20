@@ -21,7 +21,9 @@ pub type TransientRun = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Work
 pub struct TransientItem {
     /// Keystroke in binding notation: `"d"`, `"shift-d"`, `"3"`.
     key: &'static str,
-    label: String,
+    description: String,
+    /// Infixes display their current value separately from their description.
+    value: Option<String>,
     run: TransientRun,
     /// A toggle: running it keeps the menu open (magit's do-stay), so
     /// several toggles chain without reopening.
@@ -47,14 +49,16 @@ impl Transient {
     fn push(
         mut self,
         key: &'static str,
-        label: impl Into<String>,
+        description: impl Into<String>,
+        value: Option<String>,
         stay: bool,
         when: Option<fn(&Workspace) -> bool>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
         self.items.push(TransientItem {
             key,
-            label: label.into(),
+            description: description.into(),
+            value,
             run: Rc::new(run),
             stay,
             when,
@@ -68,7 +72,7 @@ impl Transient {
         label: impl Into<String>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
-        self.push(key, label, false, None, run)
+        self.push(key, label, None, false, None, run)
     }
 
     /// An item that keeps the menu open after running.
@@ -78,7 +82,30 @@ impl Transient {
         label: impl Into<String>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
-        self.push(key, label, true, None, run)
+        self.push(key, label, None, true, None, run)
+    }
+
+    /// A value-setting item. Like upstream Transient infixes, its current
+    /// value is rendered separately from the command description.
+    fn infix(
+        self,
+        key: &'static str,
+        description: impl Into<String>,
+        value: impl Into<String>,
+        run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    ) -> Self {
+        self.push(key, description, Some(value.into()), false, None, run)
+    }
+
+    /// An infix that updates immediately and keeps the transient open.
+    fn infix_toggle(
+        self,
+        key: &'static str,
+        description: impl Into<String>,
+        value: impl Into<String>,
+        run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    ) -> Self {
+        self.push(key, description, Some(value.into()), true, None, run)
     }
 
     /// An item present only while `when` holds at menu open.
@@ -89,7 +116,7 @@ impl Transient {
         label: impl Into<String>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
-        self.push(key, label, false, Some(when), run)
+        self.push(key, label, None, false, Some(when), run)
     }
 
     /// Drops items whose context predicate fails right now.
@@ -113,11 +140,13 @@ impl Transient {
         let colors = cx.theme().colors();
         let accent = colors.text_accent;
         let muted = colors.text_muted;
+        let value_color = colors.terminal_ansi_green;
         let columns = self.items.chunks(COLUMN_ROWS).map(|chunk| {
             div().flex().flex_col().children(chunk.iter().map(|item| {
-                div()
+                let mut row = div()
                     .flex()
                     .flex_row()
+                    .items_baseline()
                     .child(
                         div()
                             .w_8()
@@ -126,11 +155,28 @@ impl Transient {
                             .text_color(accent)
                             .child(display_key(item.key)),
                     )
-                    .child(item.label.clone())
+                    .child(item.description.clone());
+                if let Some(value) = &item.value {
+                    row = row
+                        .child(div().pl_1().text_color(muted).child("("))
+                        .child(
+                            div()
+                                .text_color(value_color)
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(value.clone()),
+                        )
+                        .child(div().text_color(muted).child(")"));
+                }
+                row
             }))
         });
         bottom_strip(text_style, cx)
-            .child(div().px_2().text_color(muted).child(self.title))
+            .child(
+                div()
+                    .px_2()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child(self.title),
+            )
             .child(
                 div()
                     .flex()
@@ -218,21 +264,13 @@ pub fn root_menu() -> Transient {
 
 pub fn new_agent_menu(project: String, workspace: String, role: String) -> Transient {
     Transient::new("new agent")
-        .item(
-            "p",
-            format!("project  {project}"),
-            |workspace, window, cx| {
-                workspace.prompt_new_agent_project(window, cx);
-            },
-        )
-        .item(
-            "w",
-            format!("workspace  {workspace}"),
-            |workspace, window, cx| {
-                workspace.open_new_agent_workspace_transient(window, cx);
-            },
-        )
-        .toggle("r", format!("role  {role}"), |workspace, window, cx| {
+        .infix("p", "project", project, |workspace, window, cx| {
+            workspace.prompt_new_agent_project(window, cx);
+        })
+        .infix("w", "workspace", workspace, |workspace, window, cx| {
+            workspace.open_new_agent_workspace_transient(window, cx);
+        })
+        .infix_toggle("r", "role", role, |workspace, window, cx| {
             workspace.cycle_new_agent_role(window, cx);
         })
         .item("c", "compose", |workspace, window, cx| {
