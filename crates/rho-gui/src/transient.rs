@@ -247,6 +247,12 @@ pub fn root_menu() -> Transient {
         .item("f", "open file…", |workspace, window, cx| {
             workspace.prompt_open_file(window, cx);
         })
+        .item("c", "start/attach shell", |workspace, _, cx| {
+            workspace.cmd_shell(cx);
+        })
+        .item("shift-c", "close shell", |workspace, _, cx| {
+            workspace.cmd_shell_close(cx);
+        })
         .item("t", "terminal", |workspace, _, cx| {
             workspace.cmd_term(false, cx);
         })

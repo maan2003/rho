@@ -1,7 +1,8 @@
 [package]
 edition.workspace = true
 license.workspace = true
-name = "rho-ui-proto"
+name = "rho-shell"
+publish = false
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -9,14 +10,12 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-stream.workspace = true
-bytes.workspace = true
-camino.workspace = true
-dirs.workspace = true
-futures.workspace = true
-rho-agent.workspace = true
-rho-core.workspace = true
+brush-builtins.workspace = true
+brush-core.workspace = true
+libc.workspace = true
 rho-shell-proto.workspace = true
-rho-workspaces.workspace = true
-senax-encoder.workspace = true
+rustix-openpty.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

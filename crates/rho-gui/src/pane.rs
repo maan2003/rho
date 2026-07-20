@@ -24,6 +24,8 @@ pub enum SurfaceKey {
         agent_id: AgentId,
         path: Utf8PathBuf,
     },
+    /// An editor-native shell process and transcript owned by the daemon.
+    Shell(AgentId),
     /// A daemon-owned terminal attached over a dedicated stream.
     Terminal { agent_id: AgentId, terminal_id: u64 },
 }

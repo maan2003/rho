@@ -21,6 +21,7 @@ use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 pub mod client;
 pub mod remote;
 pub mod server;
+pub mod shell;
 pub mod term;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -281,6 +282,28 @@ pub enum ClientMessage {
     /// choose PAT-backed GitHub HTTP or client-held SSH before negotiation.
     GitTransportQuery {
         host: String,
+    },
+    /// Starts the daemon-owned Comint-style shell for an agent. This travels
+    /// on the main UI control stream; attachment is a separate stream.
+    ShellStart {
+        request_id: u64,
+        /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
+        agent: String,
+    },
+    /// Attaches this dedicated stream to an already-running shell. Closing
+    /// the stream only detaches; it does not stop the shell.
+    ShellAttach {
+        agent: String,
+    },
+    /// Main-control request listing running shells, optionally for one agent.
+    ShellList {
+        request_id: u64,
+        agent: Option<String>,
+    },
+    /// Main-control request to gracefully stop an agent's running shell.
+    ShellClose {
+        request_id: u64,
+        agent: String,
     },
 }
 
@@ -569,6 +592,30 @@ pub enum ServerMessage {
     /// or winner information.
     GitTransportDone {
         request_id: u64,
+    },
+    /// Handshake reply on a Comint-style shell stream.
+    ShellOpened,
+    /// Main-control reply to [`ClientMessage::ShellStart`].
+    ShellStarted {
+        request_id: u64,
+    },
+    /// Main-control reply to [`ClientMessage::ShellList`].
+    ShellList {
+        request_id: u64,
+        shells: Vec<shell::ShellInfo>,
+    },
+    /// Main-control reply after [`ClientMessage::ShellClose`] stops the shell.
+    ShellClosed {
+        request_id: u64,
+    },
+    /// Failed main-control lifecycle request.
+    ShellRequestFailed {
+        request_id: u64,
+        reason: String,
+    },
+    /// Handshake refusal on a dedicated shell attachment stream.
+    ShellAttachRefused {
+        reason: String,
     },
 }
 
@@ -981,6 +1028,34 @@ mod tests {
         let mut slice: &[u8] = &bytes;
         let decoded = senax_encoder::unpack(&mut slice).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn shell_messages_round_trip() {
+        let client = ClientMessage::ShellStart {
+            request_id: 7,
+            agent: "eng-test".to_owned(),
+        };
+        let bytes = senax_encoder::pack(&client).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(client, decoded);
+
+        let frame = shell::ShellServerFrame::ExecutionOutput {
+            execution: 3,
+            start: 0,
+            end: 0,
+            text: "λ".to_owned(),
+        };
+        let bytes = senax_encoder::pack(&frame).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(frame, decoded);
+
+        assert!(shell::command_fits(&"x".repeat(shell::MAX_COMMAND_BYTES)));
+        assert!(!shell::command_fits(&"x".repeat(
+            shell::MAX_COMMAND_BYTES + 1
+        )));
     }
 
     #[test]

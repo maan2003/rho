@@ -29,6 +29,7 @@ use tokio::sync::{
 };
 
 pub mod debug;
+mod shell;
 mod terminal;
 mod webui;
 
@@ -543,8 +544,8 @@ async fn run_iroh_listener(
                             let first =
                                 read_frame_counted::<_, ClientMessage>(&mut recv, Some(&counters))
                                     .await?;
-                            // Dedicated streams (zed channels, terminals,
-                            // one-shot queries) are not the UI control
+                            // Dedicated streams (zed channels, shells,
+                            // terminals, one-shot queries) are not the UI control
                             // session and must not claim it.
                             let dedicated = matches!(
                                 &first,
@@ -552,6 +553,7 @@ async fn run_iroh_listener(
                                     | ClientMessage::TerminalCreate { .. }
                                     | ClientMessage::TerminalAttach { .. }
                                     | ClientMessage::TerminalList { .. }
+                                    | ClientMessage::ShellAttach { .. }
                                     | ClientMessage::GitTransportRequest { .. }
                                     | ClientMessage::GitTransportProvide { .. }
                                     | ClientMessage::GitTransportQuery { .. }
@@ -574,9 +576,10 @@ async fn run_iroh_listener(
                                 &first,
                                 ClientMessage::TerminalCreate { .. }
                                     | ClientMessage::TerminalAttach { .. }
+                                    | ClientMessage::ShellAttach { .. }
                             ) {
                                 send.set_priority(50)
-                                    .context("set iroh terminal stream priority")?;
+                                    .context("set iroh interactive stream priority")?;
                             }
                             let result = serve_connection_io(
                                 agents,
@@ -978,6 +981,8 @@ struct AgentRegistry {
     /// first channel open so daemons that never serve an editing client
     /// never start it.
     zed_host: std::sync::OnceLock<rho_zed_host::ZedHost>,
+    /// Daemon-owned Comint-style shell sessions, one per agent.
+    shells: Arc<shell::ShellRegistry>,
     /// Daemon-owned terminal sessions, keyed per agent.
     terminals: Arc<terminal::TerminalRegistry>,
     /// The snapshotted login environment, for terminal shells.
@@ -1019,6 +1024,7 @@ impl AgentRegistry {
             events: broadcast::channel(1024).0,
             iroh_auth,
             zed_host: std::sync::OnceLock::new(),
+            shells: Arc::new(shell::ShellRegistry::default()),
             terminals: Arc::new(terminal::TerminalRegistry::default()),
             user_environment,
             git_transport: GitTransportBroker::default(),
@@ -1698,6 +1704,9 @@ where
     if let ClientMessage::TerminalList { agent } = first {
         return serve_terminal_list(agents, writer, agent).await;
     }
+    if let ClientMessage::ShellAttach { agent } = first {
+        return serve_shell(agents, reader, writer, agent).await;
+    }
     if let ClientMessage::GitTransportRequest { request } = first {
         return serve_git_transport_request(agents, reader, writer, request).await;
     }
@@ -2105,6 +2114,47 @@ async fn handle_message(
     match message {
         ClientMessage::Ping => {
             let _ = outgoing_tx.send(ServerMessage::Pong);
+            Ok(Refresh::None)
+        }
+        ClientMessage::ShellStart { request_id, agent } => {
+            let agents = Arc::clone(agents);
+            let outgoing_tx = outgoing_tx.clone();
+            tokio::spawn(async move {
+                let response = match shell_start(&agents, &agent).await {
+                    Ok(()) => ServerMessage::ShellStarted { request_id },
+                    Err(error) => ServerMessage::ShellRequestFailed {
+                        request_id,
+                        reason: format!("{error:#}"),
+                    },
+                };
+                let _ = outgoing_tx.send(response);
+            });
+            Ok(Refresh::None)
+        }
+        ClientMessage::ShellList { request_id, agent } => {
+            let response = match shell_list(agents, agent.as_deref()).await {
+                Ok(shells) => ServerMessage::ShellList { request_id, shells },
+                Err(error) => ServerMessage::ShellRequestFailed {
+                    request_id,
+                    reason: format!("{error:#}"),
+                },
+            };
+            let _ = outgoing_tx.send(response);
+            Ok(Refresh::None)
+        }
+        ClientMessage::ShellClose { request_id, agent } => {
+            let agents = Arc::clone(agents);
+            let outgoing_tx = outgoing_tx.clone();
+            tokio::spawn(async move {
+                let response = match shell_close(&agents, &agent).await {
+                    Ok(()) => ServerMessage::ShellClosed { request_id },
+                    Err(error) => ServerMessage::ShellRequestFailed {
+                        request_id,
+                        reason: format!("{error:#}"),
+                    },
+                };
+                let _ = outgoing_tx.send(response);
+            });
             Ok(Refresh::None)
         }
         ClientMessage::GitTransportRegister => {
@@ -2567,12 +2617,237 @@ async fn handle_message(
         ClientMessage::TerminalCreate { .. }
         | ClientMessage::TerminalAttach { .. }
         | ClientMessage::TerminalList { .. }
+        | ClientMessage::ShellAttach { .. }
         | ClientMessage::GitTransportRequest { .. }
         | ClientMessage::GitTransportProvide { .. }
         | ClientMessage::GitTransportQuery { .. } => {
-            anyhow::bail!("terminal messages must be the first frame on a dedicated stream")
+            anyhow::bail!("channel messages must be the first frame on a dedicated stream")
         }
     }
+}
+
+/// Attaches a dedicated Comint-style shell stream. The daemon retains the
+/// process when this client detaches.
+async fn serve_shell<R, W>(
+    agents: Arc<AgentRegistry>,
+    mut reader: R,
+    mut writer: W,
+    agent: String,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let client = shell_attach(&agents, &agent).await;
+    let shell::ShellClient {
+        mut frames,
+        mut exit,
+        submit,
+        control,
+    } = match client {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = write_frame(
+                &mut writer,
+                &ServerMessage::ShellAttachRefused {
+                    reason: format!("{error:#}"),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    write_frame(&mut writer, &ServerMessage::ShellOpened).await?;
+    let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(shell::SUBMIT_QUEUE);
+
+    let mut writer_task = tokio::spawn(async move {
+        loop {
+            while let Ok((submission, execution)) = accepted_rx.try_recv() {
+                if write_frame(
+                    &mut writer,
+                    &rho_ui_proto::shell::ShellServerFrame::Accepted {
+                        submission,
+                        execution,
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
+            let final_state = { exit.borrow_and_update().clone() };
+            if let Some(final_state) = final_state {
+                let snapshot = rho_ui_proto::shell::ShellServerFrame::Snapshot {
+                    state: final_state.state.clone(),
+                };
+                if write_frame(&mut writer, &snapshot).await.is_ok() {
+                    let _ = write_frame(
+                        &mut writer,
+                        &rho_ui_proto::shell::ShellServerFrame::Exited {
+                            status: final_state.status,
+                        },
+                    )
+                    .await;
+                }
+                break;
+            }
+            tokio::select! {
+                biased;
+                changed = exit.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                accepted = accepted_rx.recv() => match accepted {
+                    Some((submission, execution)) => {
+                        if write_frame(
+                            &mut writer,
+                            &rho_ui_proto::shell::ShellServerFrame::Accepted {
+                                submission,
+                                execution,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                frame = frames.recv() => match frame {
+                    Some(frame) => {
+                        if write_frame(&mut writer, &frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    });
+    let result = loop {
+        tokio::select! {
+            _ = &mut writer_task => break Ok(()),
+            frame = read_frame::<_, rho_ui_proto::shell::ShellClientFrame>(&mut reader) => {
+                use rho_ui_proto::shell::{ShellClientFrame, command_fits};
+                match frame {
+                    Ok(ShellClientFrame::Submit { submission, command }) => {
+                        if !command_fits(&command) {
+                            break Err(anyhow::anyhow!("shell command exceeds the input limit"));
+                        }
+                        match submit.try_send(command) {
+                            Ok(execution) => {
+                                if accepted_tx.send((submission, execution)).await.is_err() {
+                                    break Ok(());
+                                }
+                            }
+                            Err(shell::ShellSubmitError::Full) => {
+                                break Err(anyhow::anyhow!("shell command queue is full"));
+                            }
+                            Err(shell::ShellSubmitError::Closed) => break Ok(()),
+                            Err(shell::ShellSubmitError::Exhausted) => {
+                                break Err(anyhow::anyhow!("shell execution ids exhausted"));
+                            }
+                            Err(shell::ShellSubmitError::TooLarge) => {
+                                break Err(anyhow::anyhow!("shell command exceeds the input limit"));
+                            }
+                        }
+                    }
+                    Ok(ShellClientFrame::Interrupt) => {
+                        if control.send(shell::ShellControl::Interrupt).await.is_err() {
+                            break Ok(());
+                        }
+                    }
+                    Ok(ShellClientFrame::Eof) => {
+                        if control.send(shell::ShellControl::Eof).await.is_err() {
+                            break Ok(());
+                        }
+                    }
+                    Err(_) => break Ok(()),
+                }
+            }
+        }
+    };
+    if !writer_task.is_finished() {
+        writer_task.abort();
+    }
+    result
+}
+
+async fn shell_start(
+    agents: &Arc<AgentRegistry>,
+    agent: &str,
+) -> anyhow::Result<()> {
+    let agent_id = agents.resolve_display_agent_id(agent)?;
+    let record = agents.db.read().get_agent(agent_id);
+    shell::ensure_supported_workdirs(&record.workdirs)?;
+    let view = agents
+        .pool
+        .materialize_view(&record.workdirs)
+        .await
+        .context("materialize agent view")?;
+    agents
+        .shells
+        .start(
+            agent_id,
+            shell::ShellSpawn {
+                view,
+                program: rho_shell_program(),
+                args: Vec::new(),
+            },
+        )
+        .await
+}
+
+async fn shell_attach(
+    agents: &Arc<AgentRegistry>,
+    agent: &str,
+) -> anyhow::Result<shell::ShellClient> {
+    let agent_id = agents.resolve_display_agent_id(agent)?;
+    agents.shells.attach(agent_id).await
+}
+
+async fn shell_list(
+    agents: &Arc<AgentRegistry>,
+    agent: Option<&str>,
+) -> anyhow::Result<Vec<rho_ui_proto::shell::ShellInfo>> {
+    let filter = agent
+        .map(|agent| agents.resolve_display_agent_id(agent))
+        .transpose()?;
+    Ok(agents
+        .shells
+        .list()
+        .await
+        .into_iter()
+        .filter(|entry| filter.is_none_or(|agent_id| entry.agent_id == agent_id))
+        .map(|entry| rho_ui_proto::shell::ShellInfo {
+            agent: entry.agent_id.encoded(),
+            clients: entry.clients as u32,
+        })
+        .collect())
+}
+
+async fn shell_close(agents: &Arc<AgentRegistry>, agent: &str) -> anyhow::Result<()> {
+    let agent_id = agents.resolve_display_agent_id(agent)?;
+    agents.shells.close(agent_id).await
+}
+
+fn rho_shell_program() -> std::ffi::OsString {
+    if let Some(program) = std::env::var_os("RHO_SHELL") {
+        return program;
+    }
+    if let Ok(current) = std::env::current_exe()
+        && let Some(directory) = current.parent()
+    {
+        let sibling = directory.join("rho-shell");
+        if sibling.is_file() {
+            return sibling.into_os_string();
+        }
+    }
+    "rho-shell".into()
 }
 
 /// How a terminal stream's first frame opens its terminal.

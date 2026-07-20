@@ -14,6 +14,8 @@ members = [
   "crates/rho-core",
   "crates/rho-daemon",
   "crates/rho-db",
+  "crates/rho-shell",
+  "crates/rho-shell-proto",
   "crates/rho-gui",
   "crates/rho-inference",
   "crates/rho-iroh-auth",
@@ -48,6 +50,8 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
+brush-builtins = { path = "vendor/brush/brush-builtins" }
+brush-core = { path = "vendor/brush/brush-core" }
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
 anyhow = "1"
 async-stream = "0.3"
@@ -89,10 +93,12 @@ rho-context-config = { path = "crates/rho-context-config" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
+rho-shell-proto = { path = "crates/rho-shell-proto" }
 rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
+rho-shell = { path = "crates/rho-shell" }
 rho-slack = { path = "crates/rho-slack" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }

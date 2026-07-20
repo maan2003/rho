@@ -42,7 +42,30 @@ than by running a supervisor, extension protocol, or daemon process graph.
   discovery and receives only Rho role/team context on top of Claude Code's
   own harness prompt.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
-  rendering. They should not own inference protocol details.
+  rendering. They should not own inference protocol details. The native GUI
+  exposes two deliberately separate daemon-owned process surfaces: an
+  editor-native, Comint-style shell for ordinary commands and a raw terminal
+  for programs that require a terminal screen. The editor shell starts a
+  `rho-shell` sidecar inside the agent View. That sidecar embeds one persistent,
+  serialized Brush evaluator retaining cwd, variables, functions, aliases,
+  Bash-compatible configuration, history, and jobs. The process boundary keeps
+  shell-global effects out of the daemon and preserves the View's namespace;
+  the neutral bounded `rho-shell-proto` sideband supplies execution and lifecycle
+  boundaries.
+  Each execution receives a fresh PTY whose slave is Brush's stdin, stdout, and
+  stderr. A relay reads that PTY's controller and tags every output byte with
+  the daemon-assigned execution id; background descendants retain their
+  originating PTY, so late output cannot be attributed to a newer execution.
+  The PTY is not the persistent evaluator's controlling terminal. Programs
+  requiring `/dev/tty`, persistent terminal job control, or a terminal screen
+  belong in the raw terminal.
+  Shell start/list/close operations use the main UI control stream, while each
+  long-lived attachment uses its own Unix connection or iroh bidirectional
+  stream, preserving transport-level prioritization. Closing an attachment
+  leaves the explicitly started kernel running. The daemon is the sole owner of
+  a bounded structured `ShellState`; each GUI projects that state into a
+  read-only buffer beside a client-local writable draft, so pending edits never
+  compete with shell-side state or leak between clients.
 - `rho wayland` is an application-agnostic CLI surface for launching and
   controlling programs in isolated headless Sway sessions. It wraps the
   compositor's IPC plus `grim` and `wtype`; the Nix build embeds those tool
@@ -50,8 +73,18 @@ than by running a supervisor, extension protocol, or daemon process graph.
   environment.
 - The daemon snapshots the user's login-shell environment and passes it
   explicitly to `rho-workspaces` for daemon-owned commands. Workspace-control
-  subprocesses use that environment directly; agent shell and Claude processes
-  add the primary project's environment through direnv.
+  subprocesses use that environment directly; agent execution shells and
+  Claude processes add the primary project's environment through `direnv exec`.
+  The GUI's Comint-style surface instead starts `rho-shell` through the agent
+  View and lets Brush load normal Bash-compatible interactive configuration
+  (`~/.bashrc`, `PS1`, and `PROMPT_COMMAND`), including a configured direnv Bash
+  hook. Brush's `brush-v0.4.0` tag (commit `96a26d0c`) is imported under
+  `vendor/brush` as a squashed Git subtree and linked only into the sidecar.
+  Sandboxed agents remain refused until a sandbox-native startup policy can
+  replace the intentionally empty sandbox HOME. The daemon treats the sidecar
+  protocol as untrusted: it assigns execution ids, retains accepted command
+  text, validates response ordering and bounds, sanitizes output, and exposes
+  only canonical structured state to clients.
 - `rho-voice` is a provider-protocol crate outside the inference contract: it
   speaks the xAI realtime voice WebSocket (audio streams, voice tool calls)
   and deliberately never touches `rho-core` transcript vocabulary. Voice is a

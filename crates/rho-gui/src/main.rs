@@ -11,6 +11,7 @@ mod highlights;
 mod minibuffer;
 mod pane;
 mod registry;
+mod shell_view;
 mod render;
 mod rho_assets;
 mod store;
@@ -79,7 +80,9 @@ actions!(
         TerminalScrollHalfPageUp,
         TerminalScrollHalfPageDown,
         TerminalScrollTop,
-        TerminalScrollBottom
+        TerminalScrollBottom,
+        ShellInterrupt,
+        ShellEof
     ]
 );
 
@@ -429,6 +432,23 @@ fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoGui > Editor && !showing_completions"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
+        // A Comint-style shell submits complete input lines to the daemon;
+        // its transcript remains an ordinary Vim-navigable editor buffer.
+        KeyBinding::new(
+            "enter",
+            SubmitPrompt,
+            Some("RhoShell > Editor && vim_mode == insert"),
+        ),
+        KeyBinding::new(
+            "ctrl-c",
+            ShellInterrupt,
+            Some("RhoShell > Editor && vim_mode == insert"),
+        ),
+        KeyBinding::new(
+            "ctrl-d",
+            ShellEof,
+            Some("RhoShell > Editor && vim_mode == insert"),
+        ),
         // Terminal surface, raw mode: every unbound key becomes terminal
         // input, so its few chrome bindings use chords shells don't see
         // anyway. `ctrl-\ ctrl-n` is vim's terminal escape; `ctrl-shift-n`

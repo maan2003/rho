@@ -34,8 +34,8 @@ use crate::{
     AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardNewAgent,
     DashboardReply, GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete,
     MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext,
-    PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, SubmitPrompt,
-    TaskBoard,
+    PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
+    ShellInterrupt, SubmitPrompt, TaskBoard,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -74,6 +74,10 @@ enum SurfaceView {
         editor: Entity<editor::Editor>,
     },
     File(Entity<FileView>),
+    Shell {
+        model: Entity<crate::shell_view::ShellModel>,
+        editor: Entity<editor::Editor>,
+    },
     Terminal(Entity<crate::terminal_view::TerminalView>),
 }
 
@@ -658,6 +662,10 @@ impl Workspace {
     }
 
     fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
+        if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
+            model.clone().update(cx, |model, cx| model.submit(cx));
+            return;
+        }
         match self.registry.selected_agent().copied() {
             Some(agent_id) => {
                 let Some(view) = self.models.get(&agent_id).cloned() else {
@@ -669,6 +677,18 @@ impl Workspace {
                 self.handle_submit(agent_id, text, cx);
             }
             None => self.submit_draft(window, cx),
+        }
+    }
+
+    fn shell_interrupt(&mut self, _: &ShellInterrupt, _: &mut Window, cx: &mut Context<Self>) {
+        if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
+            model.clone().update(cx, |model, _| model.interrupt());
+        }
+    }
+
+    fn shell_eof(&mut self, _: &ShellEof, _: &mut Window, cx: &mut Context<Self>) {
+        if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
+            model.clone().update(cx, |model, cx| model.eof(cx));
         }
     }
 
@@ -1185,6 +1205,46 @@ impl Workspace {
         self.open_file_surface(agent_id, workspace, path, cx);
     }
 
+    pub(crate) fn cmd_shell(&mut self, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        if let Some(agent_id) = self.selected_or_notice("shell", cx) {
+            self.open_shell_surface(agent_id, cx);
+        }
+    }
+
+    pub(crate) fn cmd_shell_close(&mut self, cx: &mut Context<Self>) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let Some(agent_id) = self.selected_or_notice("close shell", cx) else {
+            return;
+        };
+        let task = self.connection.close_shell(agent_id.encoded(), cx);
+        cx.spawn(async move |this, cx| {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!("shell close failed: {error}")),
+            };
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => this.notice_on(
+                    Some(&agent_id),
+                    "shell closed",
+                    StyleClass::SystemInfo,
+                    cx,
+                ),
+                Err(error) => this.notice_on(
+                    Some(&agent_id),
+                    &format!("close shell failed: {error:#}"),
+                    StyleClass::SystemInfo,
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn cmd_term(&mut self, new: bool, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
@@ -1545,6 +1605,9 @@ impl Workspace {
             SurfaceKey::Draft => "draft".to_owned(),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
+            SurfaceKey::Shell(agent_id) => {
+                format!("shell {}", self.registry.agent_id_label(*agent_id))
+            }
             SurfaceKey::Terminal {
                 agent_id,
                 terminal_id,
@@ -1560,6 +1623,7 @@ impl Workspace {
             SurfaceKey::Draft => "compose",
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
+            SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Terminal { .. } => "terminal",
         }
     }
@@ -1805,6 +1869,54 @@ impl Workspace {
         .detach();
     }
 
+    /// Explicitly starts the agent's editor-native shell when absent, or
+    /// attaches to the existing persistent kernel.
+    fn open_shell_surface(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let key = SurfaceKey::Shell(agent_id);
+        if let Some(surface) = self.find_surface(|surface| surface.key == key).cloned() {
+            self.display_surface(surface);
+            cx.notify();
+            return;
+        }
+        let task = self.connection.open_shell(agent_id.encoded(), cx);
+        cx.spawn(async move |this, cx| {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(join_error) => Err(anyhow::anyhow!("shell dial failed: {join_error}")),
+            };
+            match result {
+                Ok(channel) => {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        let model =
+                            cx.new(|cx| crate::shell_view::ShellModel::new(channel, cx));
+                        let editor =
+                            model.update(cx, |model, cx| model.build_editor(window, cx));
+                        let surface = Self::wrap_surface(
+                            key,
+                            SurfaceView::Shell { model, editor },
+                            window,
+                            cx,
+                        );
+                        this.display_surface(surface);
+                        this.focus_active_surface(window, cx);
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.notice_on(
+                            None,
+                            &format!("shell failed: {error:#}"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
     /// `:term`: dials a dedicated terminal stream for the agent (attaching
     /// its first running terminal, spawning the default one when none run,
     /// or a fresh one with `new`) and shows the terminal surface.
@@ -1967,6 +2079,7 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
+            SurfaceView::Shell { editor, .. } => editor.clone(),
             SurfaceView::Terminal(_) => self
                 .any_draft_editor()
                 .expect("the draft context always holds a draft surface"),
@@ -2001,6 +2114,7 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
             SurfaceView::Transcript { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
             SurfaceView::File(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
+            SurfaceView::Shell { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
             SurfaceView::Terminal(view) => window.focus(&view.read(cx).focus_handle(cx), cx),
         }
     }
@@ -2032,6 +2146,9 @@ impl Workspace {
             }
             SurfaceKey::File { .. } => {
                 unreachable!("file surfaces are created by open_file_surface")
+            }
+            SurfaceKey::Shell(_) => {
+                unreachable!("shell surfaces are created by open_shell_surface")
             }
             SurfaceKey::Terminal { .. } => {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
@@ -2075,6 +2192,16 @@ impl Workspace {
                     cx,
                 )
             }
+            SurfaceView::Shell { model, .. } => {
+                let model = model.clone();
+                let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
+                Self::wrap_surface(
+                    surface.key.clone(),
+                    SurfaceView::Shell { model, editor },
+                    window,
+                    cx,
+                )
+            }
             // Terminals share one model (one wire client) but each pane
             // gets its own view: own focus, scroll offset, and mode. Only
             // the focused view sizes the pty, so splits don't fight.
@@ -2100,6 +2227,9 @@ impl Workspace {
             SurfaceView::Transcript { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
             SurfaceView::File(view) => {
                 let editor = view.read(cx).editor();
+                (editor.focus_handle(cx), editor.entity_id())
+            }
+            SurfaceView::Shell { editor, .. } => {
                 (editor.focus_handle(cx), editor.entity_id())
             }
             // Terminals have no editor; the view itself carries focus.
@@ -2131,7 +2261,9 @@ impl Workspace {
     /// focused pane, so `:` commands resolve against what the user sees.
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
         match self.active_tree().focused().surface.key.clone() {
-            SurfaceKey::Transcript(agent_id) => self.registry.select_agent(agent_id),
+            SurfaceKey::Transcript(agent_id) | SurfaceKey::Shell(agent_id) => {
+                self.registry.select_agent(agent_id)
+            }
             SurfaceKey::Terminal { agent_id, .. } => self.registry.select_agent(agent_id),
             SurfaceKey::Draft => self.registry.enter_draft(),
             // Files keep whatever agent context was current.
@@ -3114,6 +3246,13 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
+            SurfaceView::Shell { editor, .. } => div()
+                .id("rho-surface-shell")
+                .key_context("RhoShell")
+                .size_full()
+                .overflow_hidden()
+                .child(editor.clone())
+                .into_any_element(),
             SurfaceView::Terminal(view) => div()
                 .id("rho-surface-terminal")
                 .size_full()
@@ -3337,6 +3476,8 @@ impl Render for Workspace {
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
             .on_action(cx.listener(Self::submit_prompt))
+            .on_action(cx.listener(Self::shell_interrupt))
+            .on_action(cx.listener(Self::shell_eof))
             .on_action(cx.listener(|this, _: &AgentPrevious, window, cx| {
                 this.switch_agent_by_delta(-1, window, cx);
             }))

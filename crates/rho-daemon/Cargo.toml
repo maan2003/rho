@@ -26,6 +26,7 @@ rho-agent.workspace = true
 rho-claude.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
+rho-shell-proto.workspace = true
 rho-inference.workspace = true
 rho-iroh-auth.workspace = true
 rho-pr-monitor.workspace = true
@@ -47,3 +48,4 @@ url.workspace = true
 [dev-dependencies]
 prost = "0.9"
 rpc = { git = "https://github.com/maan2003/zed", branch = "rho" }
+rho-shell.workspace = true

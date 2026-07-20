@@ -298,6 +298,58 @@ AI APIs.
   Agent shell commands and Claude Code additionally run through `direnv exec`
   in their project directory. Project `.envrc` files are trusted local code and
   have the same authority as the agent shell tools they configure.
+- The GUI's editor-native shell is also a daemon-owned command surface with the
+  agent workspace's authority. The daemon starts `rho-shell` through the agent
+  View and gives it one private framed Unix socket as stdin. The sidecar makes a
+  close-on-exec duplicate of that socket, replaces OS stdin/stdout/stderr with
+  `/dev/null`, and gives Brush only explicit virtual descriptors backed by the
+  current execution's PTY slave. Consequently, evaluated commands cannot
+  accidentally inherit or redirect the protocol socket. The process boundary
+  also keeps Brush and shell-global operations such
+  as `exit` or `exec` out of the daemon process while retaining the View's mount
+  namespace and filesystem authority.
+  The daemon treats every sidecar frame as untrusted: decoding is bounded,
+  response state and daemon-assigned execution ids are validated, command text
+  remains daemon-owned, prompts/output are sanitized, and a violation terminates
+  that shell session rather than being forwarded to a client. This is a protocol
+  boundary, not an OS sandbox. Configuration and commands run as the daemon's
+  user with workspace authority, so deliberately malicious same-user code may
+  attack other local processes through ordinary operating-system facilities.
+  Strong process isolation would require a separate sandbox or identity.
+  `RHO_SHELL` may override the sibling/PATH executable lookup and is therefore
+  trusted daemon-administrator input. `rho-shell` loads Bash-compatible
+  interactive configuration from Brush, including `~/.bashrc`, `PS1`, and
+  `PROMPT_COMMAND`; any configuration or `.envrc` reached from those hooks is
+  trusted local code with the same authority. Sandboxed agents remain refused
+  because their intentionally empty HOME has no trusted startup hook to activate
+  the project environment.
+- One serialized Brush evaluator persists per agent across client detach. A GUI
+  explicitly starts or attaches to it; closing an attachment only detaches,
+  while an explicit close gracefully stops the kernel and remaining jobs.
+  Complete client-local drafts travel over the sideband protocol and are capped
+  at 1 MiB; protocol frames are capped at 2 MiB. Each execution receives a fresh
+  80x24 PTY whose slave supplies stdin, stdout, and stderr. Its controller has a
+  dedicated relay tagged with the daemon-assigned execution id; background
+  descendants retain their originating PTY and therefore their output
+  attribution. EOF writes the PTY's configured VEOF byte only to the active
+  execution. Interrupt sends SIGINT only to sidecar-session descendants with a
+  standard descriptor still attached to the active PTY. This per-execution PTY
+  is not the persistent evaluator's controlling terminal, so programs needing
+  arbitrary interactive input, `/dev/tty`, persistent job-control terminal
+  semantics, a terminal screen, or hidden password entry belong in the raw
+  terminal.
+- The daemon is the canonical owner of bounded structured `ShellState`: accepted
+  command text, prompt/cwd, execution status, and sanitized per-execution output.
+  ANSI control strings are discarded and carriage-return/backspace edits are
+  confined to the active output line. Slow or newly attached clients receive a
+  full structured snapshot rather than a separate flat transcript, and the final
+  canonical state and exit status bypass congested incremental queues. The shell
+  runs in its own process session; normal exit sends TERM then KILL to all
+  remaining members of that session, while task cancellation kills the session
+  immediately. A command can intentionally create a new session and thereby
+  outlive the shell, just as it can deliberately start a user service; this is
+  accepted because editor-shell commands are trusted with the workspace's
+  authority rather than sandboxed.
 - Rho-owned agent variables (`RHO_AGENT_ID` and `RHO_MCP_AGENT_ID`) are supplied
   explicitly to agent commands rather than copied
   incidentally from the daemon environment.

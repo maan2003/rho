@@ -231,7 +231,8 @@
               # dependencies. The patched noq crates are dependencies of iroh,
               # so they must retain their implementations in the dummy source.
               extraDummyScript = ''
-                rm -rf $out/vendor/noq $out/vendor/noq-proto
+                rm -rf $out/vendor/brush $out/vendor/noq $out/vendor/noq-proto
+                cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/brush $out/vendor/brush
                 cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/noq $out/vendor/noq
                 cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/noq-proto $out/vendor/noq-proto
               '';
@@ -243,7 +244,7 @@
 
             package = craneLib.buildPackage {
               cargoArtifacts = workspaceDeps;
-              cargoExtraArgs = "-p rho-cli -p rho-daemon -p git-remote-octo";
+              cargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo";
               doCheck = false;
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
               postInstall = ''
