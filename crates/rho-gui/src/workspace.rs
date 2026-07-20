@@ -2796,18 +2796,13 @@ impl Workspace {
         }
     }
 
-    /// The dashboard beside the active context's tree, breathing with
-    /// focus: home mode (dashboard focused) gives it half the frame, a
-    /// masthead, and margins — the main attraction. Unfocused it exhales
-    /// into the slim rail: lamps and titles at the edge of deep work.
+    /// The home-mode dashboard beside the active context's preview.
     fn render_rail(
         &mut self,
-        home: bool,
         show_panes: bool,
         text_style: &gpui::TextStyle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let border_color = cx.theme().colors().border_variant.opacity(0.6);
         let container = div()
             .h_full()
             .flex_none()
@@ -2820,28 +2815,17 @@ impl Workspace {
             .line_height(text_style.line_height)
             .text_color(text_style.color)
             .key_context("RhoDashboard");
-        let container = if home {
-            container
-                // The boxed preview card carries the hierarchy, so it can take
-                // the wider share; transcripts are the text-dense side.
-                .w(if show_panes {
-                    gpui::relative(0.4)
-                } else {
-                    gpui::relative(1.0)
-                })
-                .pl(px(24.))
-                .pr(px(24.))
-                .child(self.render_dashboard_header(text_style, cx))
-        } else {
-            container.w(px(275.)).pl(px(6.))
-        };
-        // In home mode the boxed preview provides its own separation; the
-        // hairline is only needed against full-bleed work-mode panes.
-        let container = if show_panes && !home {
-            container.border_r_1().border_color(border_color)
-        } else {
-            container
-        };
+        let container = container
+            // The boxed preview card carries the hierarchy, so it can take
+            // the wider share; transcripts are the text-dense side.
+            .w(if show_panes {
+                gpui::relative(0.4)
+            } else {
+                gpui::relative(1.0)
+            })
+            .pl(px(24.))
+            .pr(px(24.))
+            .child(self.render_dashboard_header(text_style, cx));
         container
             .child(
                 div()
@@ -2977,7 +2961,7 @@ impl Workspace {
             || (self.transient_focus.is_focused(window)
                 && self.transient_origin.as_ref() == Some(&dashboard_handle));
         let show_panes = !home || self.registry.selected_agent().is_some();
-        let rail = self.render_rail(home, show_panes, text_style, cx);
+        let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         let preview_bar = home.then(|| self.render_preview_bar(text_style, cx)).flatten();
@@ -3068,7 +3052,7 @@ impl Workspace {
             .w_full()
             .flex_grow(1.0)
             .min_h_0()
-            .child(rail)
+            .children(rail)
             .children(panes)
             .into_any_element()
     }
