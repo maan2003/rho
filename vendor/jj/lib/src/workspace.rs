@@ -454,6 +454,21 @@ impl Workspace {
         })
     }
 
+    pub async fn start_working_copy_mutation_owned(
+        &self,
+    ) -> Result<Box<dyn LockedWorkingCopy>, WorkingCopyStateError> {
+        self.working_copy.start_mutation().await
+    }
+
+    pub async fn finish_working_copy_mutation(
+        &mut self,
+        locked_wc: Box<dyn LockedWorkingCopy>,
+        operation_id: OperationId,
+    ) -> Result<(), WorkingCopyStateError> {
+        self.working_copy = locked_wc.finish(operation_id).await?;
+        Ok(())
+    }
+
     pub async fn check_out(
         &mut self,
         operation_id: OperationId,

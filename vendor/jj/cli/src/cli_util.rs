@@ -80,6 +80,7 @@ use jj_lib::lock::FileLock;
 use jj_lib::matchers::Matcher;
 use jj_lib::matchers::NothingMatcher;
 use jj_lib::merge::Diff;
+use jj_lib::merge::Merge;
 use jj_lib::merge::MergedTreeValue;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
@@ -121,6 +122,7 @@ use jj_lib::revset::RevsetStreamExt as _;
 use jj_lib::revset::RevsetWorkspaceContext;
 use jj_lib::revset::SymbolResolverExtension;
 use jj_lib::revset::UserRevsetExpression;
+use jj_lib::rewrite::CommitRewriter;
 use jj_lib::rewrite::RebaseOptions;
 use jj_lib::rewrite::restore_tree;
 use jj_lib::settings::HumanByteSize;
@@ -148,6 +150,8 @@ use jj_lib::workspace::WorkspaceLoader;
 use jj_lib::workspace::WorkspaceLoaderFactory;
 use jj_lib::workspace::default_working_copy_factories;
 use jj_lib::workspace::get_working_copy_factory;
+use jj_lib::workspace_store::SimpleWorkspaceStore;
+use jj_lib::workspace_store::WorkspaceStore as _;
 use pollster::FutureExt as _;
 use tracing::instrument;
 use tracing_chrome::ChromeLayerBuilder;
@@ -473,22 +477,24 @@ impl CommandHelper {
     ) -> Result<(WorkspaceCommandHelper, SnapshotStats), CommandError> {
         let mut workspace_command = self.workspace_helper_no_snapshot(ui).await?;
 
-        let (workspace_command, stats) = match workspace_command.maybe_snapshot_impl(ui).await {
-            Ok(stats) => (workspace_command, stats),
-            Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
-            Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
-                let auto_update_stale = self.settings().get_bool("snapshot.auto-update-stale")?;
-                if !auto_update_stale {
-                    return Err(err);
-                }
+        let (workspace_command, stats) =
+            match workspace_command.maybe_snapshot_all_workspaces(ui).await {
+                Ok(stats) => (workspace_command, stats),
+                Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
+                Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
+                    let auto_update_stale =
+                        self.settings().get_bool("snapshot.auto-update-stale")?;
+                    if !auto_update_stale {
+                        return Err(err);
+                    }
 
-                // We detected the working copy was stale and the client is configured to
-                // auto-update-stale, so let's do that now. We need to do it up here, not at a
-                // lower level (e.g. inside snapshot_working_copy()) to avoid recursive locking
-                // of the working copy.
-                self.recover_stale_working_copy(ui).await?
-            }
-        };
+                    // We detected the working copy was stale and the client is configured to
+                    // auto-update-stale, so let's do that now. We need to do it up here, not at a
+                    // lower level (e.g. inside snapshot_working_copy()) to avoid recursive locking
+                    // of the working copy.
+                    self.recover_stale_working_copy(ui).await?
+                }
+            };
 
         Ok((workspace_command, stats))
     }
@@ -1136,6 +1142,20 @@ enum SnapshotWorkingCopyError {
     StaleWorkingCopy(CommandError),
 }
 
+struct PendingWorkspaceSnapshot {
+    workspace_name: WorkspaceNameBuf,
+    locked_wc: Box<dyn LockedWorkingCopy>,
+    wc_commit_id: CommitId,
+    old_tree: MergedTree,
+    new_tree: MergedTree,
+    stats: SnapshotStats,
+}
+
+struct PendingSecondaryWorkspaceSnapshot {
+    workspace: Workspace,
+    snapshot: PendingWorkspaceSnapshot,
+}
+
 impl SnapshotWorkingCopyError {
     fn into_command_error(self) -> CommandError {
         match self {
@@ -1214,7 +1234,13 @@ impl WorkspaceCommandHelper {
     /// that need to import from or export to Git. For non-colocated repos,
     /// returns a token with no lock inside.
     fn lock_git_import_export(&self) -> Result<GitImportExportLock, CommandError> {
-        let lock = if self.working_copy_shared_with_git {
+        #[cfg(feature = "git")]
+        let needs_lock = self.working_copy_shared_with_git
+            || jj_lib::git::get_git_backend(self.repo().store()).is_ok();
+        #[cfg(not(feature = "git"))]
+        let needs_lock = self.working_copy_shared_with_git;
+
+        let lock = if needs_lock {
             let lock_path = self.workspace.repo_path().join("git_import_export.lock");
             Some(FileLock::lock(lock_path.clone()).map_err(|err| {
                 user_error_with_message("Failed to take lock for Git import/export", err)
@@ -1292,6 +1318,289 @@ impl WorkspaceCommandHelper {
         Ok(stats)
     }
 
+    fn workspace_path_from_store(
+        &self,
+        workspace_name: &WorkspaceName,
+    ) -> Result<Option<PathBuf>, CommandError> {
+        let workspace_store = SimpleWorkspaceStore::load(self.repo_path())?;
+        Ok(workspace_store
+            .get_workspace_path(workspace_name)?
+            .map(|path| self.repo_path().join(path)))
+    }
+
+    fn load_workspace_object_for_name(
+        &self,
+        workspace_name: &WorkspaceName,
+    ) -> Result<Option<Workspace>, CommandError> {
+        let Some(workspace_path) = self.workspace_path_from_store(workspace_name)? else {
+            return Ok(None);
+        };
+        let Ok(workspace_path) = dunce::canonicalize(&workspace_path) else {
+            return Ok(None);
+        };
+        let workspace = match self
+            .env
+            .command
+            .load_workspace_at(&workspace_path, self.settings())
+        {
+            Ok(workspace) => workspace,
+            Err(_err) => return Ok(None),
+        };
+        Ok(Some(workspace))
+    }
+
+    fn load_workspace_for_name(
+        &self,
+        ui: &Ui,
+        workspace_name: &WorkspaceName,
+        repo: Arc<ReadonlyRepo>,
+    ) -> Result<Option<WorkspaceCommandHelper>, CommandError> {
+        let Some(workspace) = self.load_workspace_object_for_name(workspace_name)? else {
+            return Ok(None);
+        };
+        let workspace_repo = workspace
+            .repo_loader()
+            .load_at(repo.operation())
+            .block_on()?;
+        Ok(Some(self.env.command.for_workable_repo(
+            ui,
+            workspace,
+            workspace_repo,
+        )?))
+    }
+
+    async fn snapshot_working_copy_for_transaction(
+        &mut self,
+        ui: &Ui,
+    ) -> Result<Option<PendingWorkspaceSnapshot>, SnapshotWorkingCopyError> {
+        let workspace_name = self.workspace_name().to_owned();
+        let repo = self.repo().clone();
+        let auto_tracking_matcher = self
+            .auto_tracking_matcher(ui)
+            .map_err(snapshot_command_error)?;
+        let options = self
+            .snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)
+            .map_err(snapshot_command_error)?;
+        let mut locked_wc = self
+            .workspace
+            .start_working_copy_mutation_owned()
+            .await
+            .map_err(snapshot_command_error)?;
+
+        let Some((repo, wc_commit)) =
+            handle_stale_working_copy(locked_wc.as_mut(), repo, &workspace_name).await?
+        else {
+            return Ok(None);
+        };
+
+        self.user_repo = ReadonlyUserRepo::new(repo);
+        let (new_tree, stats) = {
+            let mut options = options;
+            let progress = crate::progress::snapshot_progress(ui);
+            options.progress = progress.as_ref().map(|x| x as _);
+            locked_wc
+                .snapshot(&options)
+                .await
+                .map_err(snapshot_command_error)?
+        };
+        Ok(Some(PendingWorkspaceSnapshot {
+            workspace_name,
+            locked_wc,
+            wc_commit_id: wc_commit.id().clone(),
+            old_tree: wc_commit.tree(),
+            new_tree,
+            stats,
+        }))
+    }
+
+    async fn maybe_snapshot_all_workspaces(
+        &mut self,
+        ui: &Ui,
+    ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
+        if !self.may_snapshot_working_copy {
+            return Ok(SnapshotStats::default());
+        }
+
+        #[cfg_attr(not(feature = "git"), allow(unused_variables))]
+        let git_import_export_lock = self
+            .lock_git_import_export()
+            .map_err(snapshot_command_error)?;
+
+        // Preserve current-workspace Git behavior. Secondary Git HEAD import can
+        // be folded in later; the tree snapshot below is batched for all live
+        // workspaces.
+        #[cfg(feature = "git")]
+        if self.working_copy_shared_with_git {
+            self.import_git_head(ui, &git_import_export_lock)
+                .await
+                .map_err(snapshot_command_error)?;
+        }
+
+        let current_workspace_name = self.workspace_name().to_owned();
+        let mut current_snapshot = self.snapshot_working_copy_for_transaction(ui).await?;
+        let current_stats = current_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.stats.clone())
+            .unwrap_or_default();
+        let mut secondary_snapshots = Vec::new();
+        let workspace_names = self
+            .repo()
+            .view()
+            .wc_commit_ids()
+            .keys()
+            .filter(|name| name.as_str() != current_workspace_name.as_str())
+            .cloned()
+            .collect_vec();
+        for workspace_name in workspace_names {
+            let repo = self.repo().clone();
+            let Some(mut workspace_command) = self
+                .load_workspace_for_name(ui, &workspace_name, repo)
+                .map_err(snapshot_command_error)?
+            else {
+                continue;
+            };
+            let snapshot = match workspace_command
+                .snapshot_working_copy_for_transaction(ui)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(SnapshotWorkingCopyError::StaleWorkingCopy(_)) => {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
+            print_snapshot_stats(
+                ui,
+                &snapshot.stats,
+                workspace_command.env().path_converter(),
+            )
+            .map_err(snapshot_command_error)?;
+            let repo = self
+                .workspace
+                .repo_loader()
+                .load_at(workspace_command.repo().operation())
+                .await
+                .map_err(snapshot_command_error)?;
+            self.user_repo = ReadonlyUserRepo::new(repo);
+            secondary_snapshots.push(PendingSecondaryWorkspaceSnapshot {
+                workspace: workspace_command.workspace,
+                snapshot,
+            });
+        }
+
+        let changed_current = current_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.new_tree.tree_ids_and_labels() != snapshot.old_tree.tree_ids_and_labels()
+        });
+        let changed_secondary = secondary_snapshots.iter().any(|pending| {
+            pending.snapshot.new_tree.tree_ids_and_labels()
+                != pending.snapshot.old_tree.tree_ids_and_labels()
+        });
+        let mut checkout_commit_ids = HashMap::new();
+        if changed_current || changed_secondary {
+            let mut tx = start_repo_transaction(
+                &self.user_repo.repo,
+                &current_workspace_name,
+                self.env.command.string_args(),
+            );
+            tx.set_is_snapshot(true);
+            let mut pending_snapshots = current_snapshot
+                .iter()
+                .chain(secondary_snapshots.iter().map(|pending| &pending.snapshot))
+                .collect_vec();
+            let mut pending_snapshot_groups = group_pending_snapshots(&mut pending_snapshots);
+            topo_order_pending_snapshot_groups(tx.repo(), &mut pending_snapshot_groups)?;
+            for snapshot_group in pending_snapshot_groups {
+                if let Some(commit) =
+                    write_pending_snapshot_group_to_tx(ui, &mut tx, &snapshot_group).await?
+                {
+                    for snapshot in snapshot_group {
+                        if commit.tree().tree_ids_and_labels()
+                            != snapshot.new_tree.tree_ids_and_labels()
+                        {
+                            checkout_commit_ids
+                                .insert(snapshot.workspace_name.clone(), commit.id().clone());
+                        }
+                    }
+                }
+            }
+            let num_rebased = tx
+                .repo_mut()
+                .rebase_descendants()
+                .await
+                .map_err(snapshot_command_error)?;
+            if num_rebased > 0 {
+                writeln!(
+                    ui.status(),
+                    "Rebased {num_rebased} descendant commits onto updated working copies"
+                )
+                .map_err(snapshot_command_error)?;
+            }
+            let repo = self
+                .env
+                .command
+                .maybe_commit_transaction(tx, "snapshot working copies")
+                .await
+                .map_err(snapshot_command_error)?;
+            self.user_repo = ReadonlyUserRepo::new(repo);
+        }
+
+        let op_id = self.user_repo.repo.op_id().clone();
+        if self.env.command.should_commit_transaction() {
+            if let Some(snapshot) = current_snapshot.take() {
+                let workspace_name = snapshot.workspace_name.clone();
+                self.workspace
+                    .finish_working_copy_mutation(snapshot.locked_wc, op_id.clone())
+                    .await
+                    .map_err(snapshot_command_error)?;
+                if let Some(commit_id) = checkout_commit_ids.get(&workspace_name) {
+                    check_out_rebased_snapshot(
+                        ui,
+                        &self.user_repo.repo,
+                        &mut self.workspace,
+                        &workspace_name,
+                        commit_id,
+                    )
+                    .await?;
+                }
+            }
+            for mut pending in secondary_snapshots {
+                let workspace_name = pending.snapshot.workspace_name.clone();
+                pending
+                    .workspace
+                    .finish_working_copy_mutation(pending.snapshot.locked_wc, op_id.clone())
+                    .await
+                    .map_err(snapshot_command_error)?;
+                if let Some(commit_id) = checkout_commit_ids.get(&workspace_name) {
+                    let workspace_repo = pending
+                        .workspace
+                        .repo_loader()
+                        .load_at(self.user_repo.repo.operation())
+                        .await
+                        .map_err(snapshot_command_error)?;
+                    check_out_rebased_snapshot(
+                        ui,
+                        &workspace_repo,
+                        &mut pending.workspace,
+                        &workspace_name,
+                        commit_id,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        #[cfg(feature = "git")]
+        if self.working_copy_shared_with_git {
+            self.import_git_refs(ui, &git_import_export_lock)
+                .await
+                .map_err(snapshot_command_error)?;
+        }
+        Ok(current_stats)
+    }
+
     /// Snapshots the working copy if allowed, and imports Git refs if the
     /// working copy is colocated with Git.
     ///
@@ -1300,7 +1609,7 @@ impl WorkspaceCommandHelper {
     pub async fn maybe_snapshot(&mut self, ui: &Ui) -> Result<bool, CommandError> {
         let op_id_before = self.repo().op_id().clone();
         let stats = self
-            .maybe_snapshot_impl(ui)
+            .maybe_snapshot_all_workspaces(ui)
             .await
             .map_err(|err| err.into_command_error())?;
         print_snapshot_stats(ui, &stats, self.env().path_converter())?;
@@ -1319,7 +1628,7 @@ impl WorkspaceCommandHelper {
     async fn import_git_head(
         &mut self,
         ui: &Ui,
-        git_import_export_lock: &GitImportExportLock,
+        _git_import_export_lock: &GitImportExportLock,
     ) -> Result<(), CommandError> {
         assert!(self.may_snapshot_working_copy);
         let git_repo =
@@ -2223,6 +2532,73 @@ to the current parents may contain changes from multiple commits.
         self.print_updated_working_copy_stats(ui, maybe_old_commit, new_commit, &stats)
     }
 
+    async fn update_all_working_copies(
+        &mut self,
+        ui: &Ui,
+        old_repo: &Arc<ReadonlyRepo>,
+    ) -> Result<(), CommandError> {
+        assert!(self.may_update_working_copy);
+        let new_repo = self.repo().clone();
+        let workspace_names = new_repo
+            .view()
+            .wc_commit_ids()
+            .keys()
+            .cloned()
+            .collect_vec();
+        for workspace_name in workspace_names {
+            let maybe_old_wc_commit = old_repo
+                .view()
+                .get_wc_commit_id(&workspace_name)
+                .map(|commit_id| old_repo.store().get_commit(commit_id))
+                .transpose()?;
+            let Some(new_wc_commit_id) = new_repo.view().get_wc_commit_id(&workspace_name) else {
+                continue;
+            };
+            let new_wc_commit = new_repo.store().get_commit(new_wc_commit_id)?;
+            if workspace_name.as_str() == self.workspace_name().as_str() {
+                self.update_working_copy(ui, maybe_old_wc_commit.as_ref(), &new_wc_commit)
+                    .await?;
+            } else {
+                let Some(mut workspace) = self.load_workspace_object_for_name(&workspace_name)?
+                else {
+                    continue;
+                };
+                let workspace_repo = workspace
+                    .repo_loader()
+                    .load_at(new_repo.operation())
+                    .await?;
+                let maybe_old_wc_commit = old_repo
+                    .view()
+                    .get_wc_commit_id(&workspace_name)
+                    .map(|commit_id| workspace_repo.store().get_commit(commit_id))
+                    .transpose()?;
+                let Some(new_wc_commit_id) =
+                    workspace_repo.view().get_wc_commit_id(&workspace_name)
+                else {
+                    continue;
+                };
+                let new_wc_commit = workspace_repo.store().get_commit(new_wc_commit_id)?;
+                let stats = update_working_copy(
+                    &workspace_repo,
+                    &mut workspace,
+                    maybe_old_wc_commit.as_ref(),
+                    &new_wc_commit,
+                )
+                .await?;
+                if stats.skipped_files != 0 {
+                    writeln!(
+                        ui.warning_default(),
+                        "Skipped {} updates in workspace '{}' because there were conflicting \
+                         changes in the working copy.",
+                        stats.skipped_files,
+                        workspace_name.as_symbol()
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn print_updated_working_copy_stats(
         &self,
         ui: &Ui,
@@ -2282,11 +2658,6 @@ to the current parents may contain changes from multiple commits.
     ) -> Result<(), CommandError> {
         let old_repo = tx.base_repo().clone();
 
-        let maybe_old_wc_commit = old_repo
-            .view()
-            .get_wc_commit_id(self.workspace_name())
-            .map(|commit_id| tx.base_repo().store().get_commit(commit_id))
-            .transpose()?;
         let maybe_new_wc_commit = tx
             .repo()
             .view()
@@ -2297,7 +2668,7 @@ to the current parents may contain changes from multiple commits.
         // This isn't strictly required for correctness, so symbol resolution
         // failures can be ignored. snapshot_working_copy() ensures that the
         // working-copy commit is mutable.
-        let maybe_new_wc_commit = if let Some(wc_commit) = &maybe_new_wc_commit
+        if let Some(wc_commit) = &maybe_new_wc_commit
             && let Ok(immutable_expr) = self.env.resolve_immutable_expression(tx.repo())
             && !immutable_expr
                 .intersection(&RevsetExpression::commit(wc_commit.id().clone()))
@@ -2316,18 +2687,39 @@ to the current parents may contain changes from multiple commits.
                 "The working-copy commit became immutable; a new commit has been created on top \
                  of it.",
             )?;
-            Some(new_wc_commit)
-        } else {
-            maybe_new_wc_commit
-        };
+        }
 
         #[cfg(feature = "git")]
-        if self.working_copy_shared_with_git && self.env.command.should_commit_transaction() {
+        if jj_lib::git::get_git_backend(tx.repo().store()).is_ok()
+            && self.env.command.should_commit_transaction()
+        {
             use std::error::Error as _;
-            let git_repo = crate::git_util::open_workspace_git_repo(&self.workspace, tx.repo())?
-                .ok_or_else(|| internal_error("colocated Git workspace has no Git repo"))?;
-            let workspace_name = self.workspace_name().to_owned();
-            if let Some(wc_commit) = &maybe_new_wc_commit {
+            let workspace_names = tx
+                .repo()
+                .view()
+                .wc_commit_ids()
+                .keys()
+                .cloned()
+                .collect_vec();
+            let mut exported_git_head = false;
+            for workspace_name in workspace_names {
+                let Some(wc_commit_id) = tx.repo().view().get_wc_commit_id(&workspace_name) else {
+                    continue;
+                };
+                let wc_commit = tx.repo().store().get_commit(wc_commit_id)?;
+                let maybe_git_repo = if workspace_name.as_str() == self.workspace_name().as_str() {
+                    crate::git_util::open_workspace_git_repo(&self.workspace, tx.repo())?
+                } else if let Some(workspace) =
+                    self.load_workspace_object_for_name(&workspace_name)?
+                {
+                    crate::git_util::open_workspace_git_repo(&workspace, tx.repo())?
+                } else {
+                    None
+                };
+                let Some(git_repo) = maybe_git_repo else {
+                    continue;
+                };
+                exported_git_head = true;
                 // Export Git HEAD while holding the git-head lock to prevent races:
                 // - Between two finish_transaction calls updating HEAD
                 // - With import_git_head importing HEAD concurrently
@@ -2338,7 +2730,7 @@ to the current parents may contain changes from multiple commits.
                     tx.repo_mut(),
                     &workspace_name,
                     &git_repo,
-                    wc_commit,
+                    &wc_commit,
                 )
                 .await
                 {
@@ -2350,8 +2742,10 @@ to the current parents may contain changes from multiple commits.
                     Err(err) => return Err(err.into()),
                 }
             }
-            let stats = jj_lib::git::export_refs(tx.repo_mut())?;
-            crate::git_util::print_git_export_stats(ui, &stats)?;
+            if exported_git_head {
+                let stats = jj_lib::git::export_refs(tx.repo_mut())?;
+                crate::git_util::print_git_export_stats(ui, &stats)?;
+            }
         }
 
         self.user_repo = ReadonlyUserRepo::new(
@@ -2365,13 +2759,7 @@ to the current parents may contain changes from multiple commits.
         // potential errors while reporting changes (broken pipe, etc)
         // don't leave the working copy in a stale state.
         if self.may_update_working_copy {
-            if let Some(new_commit) = &maybe_new_wc_commit {
-                self.update_working_copy(ui, maybe_old_wc_commit.as_ref(), new_commit)
-                    .await?;
-            } else {
-                // It seems the workspace was deleted, so we shouldn't try to
-                // update it.
-            }
+            self.update_all_working_copies(ui, &old_repo).await?;
         }
 
         self.report_repo_changes(ui, &old_repo).await?;
@@ -2940,6 +3328,212 @@ async fn rebase_mutable_descendants(
         )
         .await?;
     Ok(num_rebased)
+}
+
+async fn write_pending_snapshot_group_to_tx(
+    ui: &Ui,
+    tx: &mut Transaction,
+    snapshots: &[&PendingWorkspaceSnapshot],
+) -> Result<Option<Commit>, SnapshotWorkingCopyError> {
+    let first_snapshot = snapshots
+        .first()
+        .expect("snapshot group should not be empty");
+    debug_assert!(
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot.wc_commit_id == first_snapshot.wc_commit_id)
+    );
+    let store = tx.repo().store().clone();
+    let rehome_tree = |tree: &MergedTree| {
+        let (tree_ids, labels) = tree.tree_ids_and_labels();
+        MergedTree::new(store.clone(), tree_ids.clone(), labels.clone())
+    };
+    let old_tree = rehome_tree(&first_snapshot.old_tree);
+    let new_trees = snapshots
+        .iter()
+        .map(|snapshot| rehome_tree(&snapshot.new_tree))
+        .collect_vec();
+    let wc_commit = tx
+        .repo()
+        .store()
+        .get_commit(&first_snapshot.wc_commit_id)
+        .map_err(snapshot_command_error)?;
+    let parent_ids = tx.repo_mut().new_parents(wc_commit.parent_ids());
+    let parents_changed = parent_ids != wc_commit.parent_ids();
+    let tree_changed = new_trees
+        .iter()
+        .any(|new_tree| new_tree.tree_ids_and_labels() != old_tree.tree_ids_and_labels());
+    if !parents_changed && !tree_changed {
+        return Ok(None);
+    }
+
+    let commit = if parents_changed {
+        let builder = CommitRewriter::new(tx.repo_mut(), wc_commit.clone(), parent_ids)
+            .rebase()
+            .await
+            .map_err(snapshot_command_error)?;
+        let rebased_tree = builder.tree();
+        let new_tree =
+            merge_group_snapshot_trees(snapshots, &old_tree, &new_trees, rebased_tree).await?;
+        builder
+            .set_tree(new_tree)
+            .write()
+            .await
+            .map_err(snapshot_command_error)?
+    } else if snapshots.len() == 1 {
+        tx.repo_mut()
+            .rewrite_commit(&wc_commit)
+            .set_tree(new_trees[0].clone())
+            .write()
+            .await
+            .map_err(snapshot_command_error)?
+    } else {
+        let new_tree =
+            merge_group_snapshot_trees(snapshots, &old_tree, &new_trees, old_tree.clone()).await?;
+        tx.repo_mut()
+            .rewrite_commit(&wc_commit)
+            .set_tree(new_tree)
+            .write()
+            .await
+            .map_err(snapshot_command_error)?
+    };
+    for snapshot in snapshots {
+        tx.repo_mut()
+            .set_wc_commit(snapshot.workspace_name.clone(), commit.id().clone())
+            .map_err(snapshot_command_error)?;
+    }
+
+    #[cfg(feature = "git")]
+    if jj_lib::git::get_git_backend(tx.repo().store()).is_ok() {
+        export_working_copy_changes_to_git(ui, tx.repo_mut(), &old_tree, &commit.tree())
+            .await
+            .map_err(snapshot_command_error)?;
+    }
+
+    Ok(Some(commit))
+}
+
+async fn merge_group_snapshot_trees(
+    snapshots: &[&PendingWorkspaceSnapshot],
+    old_tree: &MergedTree,
+    new_trees: &[MergedTree],
+    base_tree: MergedTree,
+) -> Result<MergedTree, SnapshotWorkingCopyError> {
+    if !new_trees
+        .iter()
+        .any(|new_tree| new_tree.tree_ids_and_labels() != old_tree.tree_ids_and_labels())
+    {
+        return Ok(base_tree);
+    }
+    let mut merge_terms = Vec::with_capacity(1 + snapshots.len() * 2);
+    merge_terms.push((
+        base_tree,
+        "working-copy commit rebased onto updated parents".to_string(),
+    ));
+    for (snapshot, new_tree) in snapshots.iter().zip(new_trees) {
+        if new_tree.tree_ids_and_labels() == old_tree.tree_ids_and_labels() {
+            continue;
+        }
+        merge_terms.extend([
+            (
+                old_tree.clone(),
+                format!(
+                    "{} working copy before snapshot",
+                    snapshot.workspace_name.as_str()
+                ),
+            ),
+            (
+                new_tree.clone(),
+                format!("{} working copy snapshot", snapshot.workspace_name.as_str()),
+            ),
+        ]);
+    }
+    MergedTree::merge(Merge::from_vec(merge_terms))
+        .await
+        .map_err(snapshot_command_error)
+}
+
+async fn check_out_rebased_snapshot(
+    ui: &Ui,
+    repo: &Arc<ReadonlyRepo>,
+    workspace: &mut Workspace,
+    workspace_name: &WorkspaceName,
+    commit_id: &CommitId,
+) -> Result<(), SnapshotWorkingCopyError> {
+    let commit = repo
+        .store()
+        .get_commit(commit_id)
+        .map_err(snapshot_command_error)?;
+    let stats = workspace
+        .check_out(repo.op_id().clone(), None, &commit)
+        .await
+        .map_err(|err| {
+            snapshot_command_error(internal_error_with_message(
+                format!(
+                    "Failed to update working copy in workspace '{}'",
+                    workspace_name.as_symbol()
+                ),
+                err,
+            ))
+        })?;
+    if stats.skipped_files != 0 {
+        writeln!(
+            ui.warning_default(),
+            "Skipped {} updates in workspace '{}' because there were conflicting changes in the \
+             working copy.",
+            stats.skipped_files,
+            workspace_name.as_symbol()
+        )
+        .map_err(snapshot_command_error)?;
+    }
+    Ok(())
+}
+
+fn group_pending_snapshots<'a>(
+    snapshots: &mut Vec<&'a PendingWorkspaceSnapshot>,
+) -> Vec<Vec<&'a PendingWorkspaceSnapshot>> {
+    let mut groups: Vec<Vec<&PendingWorkspaceSnapshot>> = Vec::new();
+    for snapshot in mem::take(snapshots) {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group[0].wc_commit_id == snapshot.wc_commit_id)
+        {
+            group.push(snapshot);
+        } else {
+            groups.push(vec![snapshot]);
+        }
+    }
+    groups
+}
+
+fn topo_order_pending_snapshot_groups<'a>(
+    repo: &dyn Repo,
+    groups: &mut Vec<Vec<&'a PendingWorkspaceSnapshot>>,
+) -> Result<(), SnapshotWorkingCopyError> {
+    let mut pending = mem::take(groups);
+    while !pending.is_empty() {
+        let mut selected_pos = None;
+        'candidate: for (i, group) in pending.iter().enumerate() {
+            for (j, other_group) in pending.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                if repo
+                    .index()
+                    .is_ancestor(&other_group[0].wc_commit_id, &group[0].wc_commit_id)
+                    .map_err(snapshot_command_error)?
+                {
+                    continue 'candidate;
+                }
+            }
+            selected_pos = Some(i);
+            break;
+        }
+        let selected_pos =
+            selected_pos.expect("pending workspace working-copy commits should be acyclic");
+        groups.push(pending.remove(selected_pos));
+    }
+    Ok(())
 }
 
 /// Check if the working copy is stale and reload the repo if the repo is ahead
