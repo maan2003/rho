@@ -11,6 +11,7 @@ anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
 dirs.workspace = true
+jj-cli.workspace = true
 libc.workspace = true
 prefix-id.workspace = true
 rho-agent.workspace = true

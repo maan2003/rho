@@ -8,12 +8,14 @@ function job_cargo() {
   fi
 
   selfci step start "build"
-  if ! cargo build --locked --workspace --all-targets; then
+  if ! cargo build --locked --workspace --all-targets || \
+    ! cargo build --locked --package jj-cli --bin jj; then
     selfci step fail
   fi
 
   selfci step start "clippy"
-  if ! cargo clippy --locked --workspace --all-targets -- --deny warnings --allow deprecated; then
+  if ! cargo clippy --locked --workspace --all-targets -- --deny warnings --allow deprecated || \
+    ! cargo clippy --locked --package jj-cli --bin jj -- --deny warnings --allow deprecated; then
     selfci step fail
   fi
 

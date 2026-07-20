@@ -43,7 +43,6 @@
         };
 
         projectName = "rho";
-        cargoCrap = pkgs.callPackage ./nix/pkgs/cargo-crap.nix { };
         octoGit = pkgs.git.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [
             ./nix/patches/git-http-unix-socket.patch
@@ -185,6 +184,13 @@
               env.RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
               env.RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
               env.RUSTY_V8_ARCHIVE = rustyV8Archive;
+              postPatch = ''
+                # Brush denies warnings, but the root lockfile can select a
+                # newer Clap which deprecates attributes used by Brush.
+                substituteInPlace vendor/brush/Cargo.toml \
+                  --replace-fail 'warnings = { level = "deny" }' \
+                    'warnings = { level = "warn" }'
+              '';
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
             };
@@ -244,10 +250,11 @@
 
             package = craneLib.buildPackage {
               cargoArtifacts = workspaceDeps;
-              cargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo";
+              cargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo -p jj-cli";
               doCheck = false;
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
               postInstall = ''
+                install -Dm755 target/release/jj $out/bin/jj
                 mkdir -p $out/share/rho/skills
                 cp -r ${./.agents/skills/github-workflow} $out/share/rho/skills/github-workflow
                 cp -r ${./.agents/skills/delegate-engineering} \
@@ -311,25 +318,6 @@
               doCheck = false;
             };
 
-            crapReport = craneLib.mkCargoDerivation {
-              pname = "${projectName}-cargo-crap-ccov-report";
-              cargoArtifacts = workspaceCcov;
-              buildPhaseCargoCommand = ''
-                test -s ${testsCcov}/lcov.info
-                mkdir -p $out
-                ${cargoCrap}/bin/cargo-crap \
-                  --workspace \
-                  --lcov ${testsCcov}/lcov.info \
-                  --top 100 \
-                  --min 50 \
-                  --format markdown \
-                  --output $out/cargo-crap.md
-                cp ${testsCcov}/lcov.info $out/lcov.info
-              '';
-              doInstallCargoArtifacts = false;
-              nativeBuildInputs = [ cargoCrap ];
-              doCheck = false;
-            };
           }
         );
       in
@@ -338,7 +326,6 @@
           default = multiBuild.package;
           rho = multiBuild.package;
           workspace = multiBuild.workspace;
-          "cargo-crap" = cargoCrap;
         };
 
         ci = {
@@ -348,7 +335,6 @@
             tests
             workspaceCcov
             testsCcov
-            crapReport
             ;
         };
 
@@ -367,7 +353,6 @@
           RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
           RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
           packages = [
-            cargoCrap
             selfciMq
             pkgs.cargo-nextest
             pkgs.clang

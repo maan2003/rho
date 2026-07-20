@@ -8,7 +8,6 @@ members = [
     "lib/gen-protos",
     "lib/proc-macros",
     "lib/testutils",
-    "prefix-id",
 ]
 
 [workspace.package]
@@ -88,7 +87,7 @@ num_cpus = "1.17.0"
 once_cell = "1.21.4"
 percent-encoding = "2.3.2"
 pest = "2.8.6"
-prefix-id = { path = "prefix-id", default-features = false }
+prefix-id = { path = "../../crates/prefix-id", default-features = false }
 pest_derive = "2.8.6"
 pollster = "0.4.0"
 pretty_assertions = "1.4.1"
