@@ -922,7 +922,7 @@ impl Workspace {
         if let Some(agent_id) = self.selected_or_notice("compact", cx) {
             self.connection.send(ClientMessage::CompactAgent {
                 agent_id,
-                delivery: rho_ui_proto::MessageDelivery::NextTurn,
+                delivery: rho_ui_proto::MessageDelivery::NextRequest,
             });
             self.notice_on(
                 Some(&agent_id),
