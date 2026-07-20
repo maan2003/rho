@@ -120,6 +120,9 @@ pub struct TerminalView {
     seen_history: u64,
     /// One terminal line in pixels, for wheel-delta conversion.
     line_height_px: Rc<Cell<f32>>,
+    /// Paint-time cell geometry for mouse-report coordinates.
+    cell_width_px: Rc<Cell<f32>>,
+    grid_origin_px: Rc<Cell<(f32, f32)>>,
     _model_changed: Subscription,
 }
 
@@ -146,6 +149,8 @@ impl TerminalView {
             scroll_offset: 0,
             seen_history,
             line_height_px: Rc::new(Cell::new(16.0)),
+            cell_width_px: Rc::new(Cell::new(8.0)),
+            grid_origin_px: Rc::new(Cell::new((0.0, 0.0))),
             _model_changed: model_changed,
         }
     }
@@ -229,7 +234,37 @@ impl TerminalView {
             ScrollDelta::Lines(delta) => delta.y,
             ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.line_height_px.get().max(1.0),
         };
-        self.scroll_lines((lines * 3.0).round() as isize, cx);
+        let lines = (lines * 3.0).round() as isize;
+        let (application_scroll, cols, rows) = {
+            let model = self.model.read(cx);
+            (
+                model.screen.application_scroll,
+                model.screen.cols,
+                model.screen.rows.len(),
+            )
+        };
+        if self.raw && application_scroll && lines != 0 {
+            let (origin_x, origin_y) = self.grid_origin_px.get();
+            let col = ((f32::from(event.position.x) - origin_x) / self.cell_width_px.get().max(1.0))
+                .floor()
+                .clamp(0.0, f32::from(cols.saturating_sub(1))) as u16;
+            let row = ((f32::from(event.position.y) - origin_y)
+                / self.line_height_px.get().max(1.0))
+            .floor()
+            .clamp(0.0, rows.saturating_sub(1) as f32) as u16;
+            self.scroll_offset = 0;
+            self.model.read(cx).send(TermClientFrame::Scroll {
+                lines: lines.clamp(i16::MIN as isize, i16::MAX as isize) as i16,
+                col,
+                row,
+                ctrl: event.modifiers.control,
+                alt: event.modifiers.alt,
+                shift: event.modifiers.shift,
+            });
+            cx.notify();
+        } else {
+            self.scroll_lines(lines, cx);
+        }
     }
 
     /// The window of lines the viewport shows: the live screen, shifted up
@@ -305,6 +340,7 @@ impl Render for TerminalView {
                 font_size,
             )
             .unwrap_or(px(8.0));
+        self.cell_width_px.set(f32::from(cell_width));
 
         let focused = self.focus_handle.is_focused(window);
 
@@ -315,8 +351,10 @@ impl Render for TerminalView {
         let model = self.model.read(cx);
         let sent_size = model.sent_size.clone();
         let input = model.input.clone();
+        let grid_origin_px = self.grid_origin_px.clone();
         let measure = canvas(
             move |bounds, _window, _cx| {
+                grid_origin_px.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
                 if !focused {
                     return;
                 }

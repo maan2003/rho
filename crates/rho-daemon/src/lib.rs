@@ -2639,6 +2639,21 @@ where
                 terminal::ClientInput::Keystroke(keystroke)
             }
             Ok(TermClientFrame::Paste(text)) => terminal::ClientInput::Paste(text),
+            Ok(TermClientFrame::Scroll {
+                lines,
+                col,
+                row,
+                ctrl,
+                alt,
+                shift,
+            }) => terminal::ClientInput::Scroll {
+                lines,
+                col,
+                row,
+                ctrl,
+                alt,
+                shift,
+            },
             Err(_) => break Ok(()),
         };
         let _ = input.send(client_input);

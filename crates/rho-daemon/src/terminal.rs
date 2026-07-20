@@ -86,6 +86,14 @@ pub enum ClientInput {
     /// Encoded against the terminal's live modes when the session applies it.
     Keystroke(rho_ui_proto::term::TermKeystroke),
     Paste(String),
+    Scroll {
+        lines: i16,
+        col: u16,
+        row: u16,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    },
 }
 
 #[derive(Default)]
@@ -253,6 +261,7 @@ struct ClientState {
     /// a skipped tick simply coalesces into the next diff.
     screen: Vec<TermRow>,
     cursor: TermCursor,
+    application_scroll: bool,
     /// History lines synced, against the session's `total_scrolled`.
     synced_scrolled: u64,
     /// Send a full snapshot instead of a diff (attach, resize).
@@ -425,6 +434,12 @@ async fn run_session(
                     let bytes = keys::encode_paste(&text, state.term.mode());
                     state.outbuf.extend_from_slice(&bytes);
                 }
+                ClientInput::Scroll { lines, col, row, ctrl, alt, shift } => {
+                    let bytes = keys::encode_scroll(
+                        lines, col, row, ctrl, alt, shift, state.term.mode(),
+                    );
+                    state.outbuf.extend_from_slice(&bytes);
+                }
             },
             ready = master.readable(), if !pty_eof => {
                 let Ok(mut guard) = ready else { break None };
@@ -526,6 +541,7 @@ impl SyncState {
                 visible: true,
                 shape: TermCursorShape::Block,
             },
+            application_scroll: false,
             // Start the full retained history behind so the first ticks
             // replay it.
             synced_scrolled: self
@@ -635,6 +651,11 @@ impl SyncState {
         }
         let screen = self.extract_screen();
         let cursor = self.extract_cursor();
+        let application_scroll = self.term.mode().intersects(TermMode::MOUSE_MODE)
+            || self
+                .term
+                .mode()
+                .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL);
         let history_size = self.term.history_size() as u64;
         let grid = self.term.grid();
         // A client that could not take every frame this tick (queue full or
@@ -685,6 +706,7 @@ impl SyncState {
                         cols: self.cols,
                         rows: screen.clone(),
                         cursor,
+                        application_scroll,
                     }))
                 } else {
                     let rows: Vec<(u16, TermRow)> = screen
@@ -693,8 +715,14 @@ impl SyncState {
                         .filter(|&(row, cells)| client.screen[row] != *cells)
                         .map(|(row, cells)| (row as u16, cells.clone()))
                         .collect();
-                    (!rows.is_empty() || client.cursor != cursor)
-                        .then_some(TermServerFrame::Screen { rows, cursor })
+                    (!rows.is_empty()
+                        || client.cursor != cursor
+                        || client.application_scroll != application_scroll)
+                        .then_some(TermServerFrame::Screen {
+                            rows,
+                            cursor,
+                            application_scroll,
+                        })
                 };
                 if let Some(frame) = frame {
                     match client.frames.try_send(frame) {
@@ -702,6 +730,7 @@ impl SyncState {
                             client.needs_snapshot = false;
                             client.screen = screen.clone();
                             client.cursor = cursor;
+                            client.application_scroll = application_scroll;
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => congested = true,
                         Err(mpsc::error::TrySendError::Closed(_)) => alive = false,

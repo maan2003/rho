@@ -28,6 +28,17 @@ pub enum TermClientFrame {
     Keystroke(TermKeystroke),
     /// Pasted text; the daemon applies bracketed-paste mode.
     Paste(String),
+    /// A vertical wheel gesture in terminal-cell coordinates. The daemon
+    /// routes it against the live terminal modes (mouse reporting or
+    /// alternate-screen scrolling).
+    Scroll {
+        lines: i16,
+        col: u16,
+        row: u16,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    },
 }
 
 /// A key event in gpui keystroke vocabulary: `key` is a lowercase key name
@@ -55,6 +66,7 @@ pub enum TermServerFrame {
     Screen {
         rows: Vec<(u16, TermRow)>,
         cursor: TermCursor,
+        application_scroll: bool,
     },
     /// Lines that scrolled off the top of the screen into history since the
     /// last `History` frame, oldest first. `lost` counts lines that scrolled
@@ -78,6 +90,8 @@ pub struct TermScreen {
     pub cols: u16,
     pub rows: Vec<TermRow>,
     pub cursor: TermCursor,
+    /// Whether wheel input belongs to the application rather than scrollback.
+    pub application_scroll: bool,
 }
 
 /// One row of cells, trailing default-blank cells trimmed.
@@ -220,6 +234,8 @@ pub struct WireScreen {
     pub cols: u16,
     pub rows: Vec<TermRow>,
     pub cursor: TermCursor,
+    /// Whether wheel input belongs to the application rather than scrollback.
+    pub application_scroll: bool,
     /// Last OSC title; empty until the shell sets one.
     pub title: String,
     /// Scrollback above the screen, oldest first, at most `history_limit`
@@ -241,6 +257,7 @@ impl WireScreen {
                 visible: true,
                 shape: TermCursorShape::Block,
             },
+            application_scroll: false,
             title: String::new(),
             scrollback: VecDeque::new(),
             exited: None,
@@ -254,9 +271,14 @@ impl WireScreen {
                 self.cols = screen.cols;
                 self.rows = screen.rows;
                 self.cursor = screen.cursor;
+                self.application_scroll = screen.application_scroll;
                 FrameApplied::Snapshot
             }
-            TermServerFrame::Screen { rows, cursor } => {
+            TermServerFrame::Screen {
+                rows,
+                cursor,
+                application_scroll,
+            } => {
                 let mut changed = Vec::with_capacity(rows.len());
                 for (row, cells) in rows {
                     let index = row as usize;
@@ -267,6 +289,7 @@ impl WireScreen {
                     changed.push(row);
                 }
                 self.cursor = cursor;
+                self.application_scroll = application_scroll;
                 FrameApplied::Rows(changed)
             }
             TermServerFrame::History { lines, lost } => {

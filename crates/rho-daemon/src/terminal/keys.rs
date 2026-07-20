@@ -228,6 +228,71 @@ pub(super) fn encode_paste(text: &str, mode: &TermMode) -> Vec<u8> {
     }
 }
 
+/// Encode a wheel gesture for the application owning the alternate screen.
+/// Mouse reporting takes precedence; otherwise xterm alternate-scroll maps
+/// the wheel to application cursor keys.
+pub(super) fn encode_scroll(
+    lines: i16,
+    col: u16,
+    row: u16,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    mode: &TermMode,
+) -> Vec<u8> {
+    if lines == 0 {
+        return Vec::new();
+    }
+
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        let mut button = if lines > 0 { 64 } else { 65 };
+        button += u8::from(shift) * 4 + u8::from(alt) * 8 + u8::from(ctrl) * 16;
+        let report = if mode.contains(TermMode::SGR_MOUSE) {
+            format!(
+                "\x1b[<{button};{};{}M",
+                col.saturating_add(1),
+                row.saturating_add(1)
+            )
+            .into_bytes()
+        } else {
+            normal_mouse_report(button, col, row, mode.contains(TermMode::UTF8_MOUSE))
+                .unwrap_or_default()
+        };
+        return report.repeat(lines.unsigned_abs() as usize);
+    }
+
+    if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        let key = if lines > 0 { b'A' } else { b'B' };
+        let mut bytes = Vec::with_capacity(lines.unsigned_abs() as usize * 3);
+        for _ in 0..lines.unsigned_abs() {
+            bytes.extend_from_slice(&[b'\x1b', b'O', key]);
+        }
+        return bytes;
+    }
+
+    Vec::new()
+}
+
+fn normal_mouse_report(button: u8, col: u16, row: u16, utf8: bool) -> Option<Vec<u8>> {
+    let max = if utf8 { 2015 } else { 223 };
+    if col >= max || row >= max {
+        return None;
+    }
+    let mut bytes = vec![b'\x1b', b'[', b'M', 32 + button];
+    let mut encode_position = |position: u16| {
+        let position = usize::from(position) + 33;
+        if utf8 && position >= 128 {
+            bytes
+                .extend_from_slice(&[(0xc0 + position / 64) as u8, (0x80 + (position & 63)) as u8]);
+        } else {
+            bytes.push(position as u8);
+        }
+    };
+    encode_position(col);
+    encode_position(row);
+    Some(bytes)
+}
+
 /// xterm PC-style modifier codes: 1 + (shift | alt<<1 | ctrl<<2).
 fn modifier_code(keystroke: &TermKeystroke) -> u32 {
     let mut code = 0;
@@ -310,6 +375,35 @@ mod tests {
         assert_eq!(
             encode_paste("a\x1b[201~b", &bracketed),
             b"\x1b[200~a[201~b\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn scroll_follows_terminal_modes() {
+        assert!(encode_scroll(2, 3, 4, false, false, false, &TermMode::empty()).is_empty());
+        assert_eq!(
+            encode_scroll(
+                2,
+                3,
+                4,
+                false,
+                false,
+                false,
+                &(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL),
+            ),
+            b"\x1bOA\x1bOA"
+        );
+        assert_eq!(
+            encode_scroll(
+                -2,
+                3,
+                4,
+                true,
+                false,
+                false,
+                &(TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE),
+            ),
+            b"\x1b[<81;4;5M\x1b[<81;4;5M"
         );
     }
 }
