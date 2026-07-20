@@ -32,6 +32,26 @@ impl Workstream {
     }
 }
 
+fn root_of(workstream: &Workstream, mut agent_id: AgentId) -> Option<AgentId> {
+    let mut seen = BTreeSet::new();
+    while seen.insert(agent_id) {
+        let agent = workstream
+            .agents
+            .iter()
+            .find(|candidate| candidate.agent_id == agent_id)?;
+        match agent.parent_agent.filter(|parent| {
+            workstream
+                .agents
+                .iter()
+                .any(|candidate| candidate.agent_id == *parent)
+        }) {
+            Some(parent) => agent_id = parent,
+            None => return Some(agent_id),
+        }
+    }
+    None
+}
+
 /// The well-known label that hides whatever carries it.
 pub const HIDE_LABEL: &str = "hide";
 
@@ -43,6 +63,33 @@ pub const GROUP_LABEL_PREFIX: &str = "group:";
 
 pub fn agent_pinned(agent: &UiAgentSummary) -> bool {
     agent.labels.iter().any(|label| label == PIN_LABEL)
+}
+
+/// The old rail's coarse active cohort: every colored item, plus enough
+/// recently engaged quiet items to fill five slots. Ordering inside the
+/// returned bucket is deliberately left to retained rail rank.
+fn active_bucket<K: Copy + Ord>(
+    mut candidates: Vec<(K, rho_ui_proto::UiAttention, rho_core::UnixMs)>,
+) -> BTreeSet<K> {
+    let colored_count = candidates
+        .iter()
+        .filter(|(_, attention, _)| *attention != rho_ui_proto::UiAttention::Quiet)
+        .count();
+    let recent_quiet_slots = 5usize.saturating_sub(colored_count);
+    let mut top = candidates
+        .iter()
+        .filter(|(_, attention, _)| *attention != rho_ui_proto::UiAttention::Quiet)
+        .map(|(key, _, _)| *key)
+        .collect::<BTreeSet<_>>();
+    candidates.sort_by_key(|(key, _, last_active)| (Reverse(*last_active), *key));
+    top.extend(
+        candidates
+            .into_iter()
+            .filter(|(_, attention, _)| *attention == rho_ui_proto::UiAttention::Quiet)
+            .take(recent_quiet_slots)
+            .map(|(key, _, _)| key),
+    );
+    top
 }
 
 fn derive_workstreams(workstreams: &[UiWorkstream], agents: &[UiAgentSummary]) -> Vec<Workstream> {
@@ -138,6 +185,9 @@ pub struct AgentRegistry {
 
 #[derive(Default)]
 struct TopicRailLayout {
+    /// Every visible root in retained rail order. Dashboard rows use this
+    /// directly; the listed/folded split below remains navigation policy.
+    roots: Vec<(AgentId, usize)>,
     listed: Vec<(AgentId, usize)>,
     #[cfg(test)]
     folded: Vec<(AgentId, usize)>,
@@ -189,7 +239,39 @@ impl<'a> TopicRailState<'a> {
                     .is_none_or(|parent| !by_id.contains_key(&parent))
             })
             .collect::<Vec<_>>();
-        let top_roots = registry.top_bucket(roots.iter().copied());
+        // Descendant attention belongs to its visible root in the dashboard.
+        // Build the same coarse active cohort the old agent rail used, but at
+        // root granularity so a large subtree cannot consume several slots.
+        let normal = roots
+            .iter()
+            .copied()
+            .filter(|agent| !agent_pinned(agent) && !agent.hidden)
+            .collect::<Vec<_>>();
+        let root_attention = |root_id| {
+            topic
+                .agents
+                .iter()
+                .filter(|agent| !agent.hidden && root_by_id.get(&agent.agent_id) == Some(&root_id))
+                .map(|agent| registry.attention(agent.agent_id))
+                .max()
+                .unwrap_or_default()
+        };
+        let top_roots = active_bucket(
+            normal
+                .into_iter()
+                .map(|root| {
+                    (
+                        root.agent_id,
+                        root_attention(root.agent_id),
+                        registry
+                            .last_active
+                            .get(&root.agent_id)
+                            .copied()
+                            .unwrap_or(root.last_active),
+                    )
+                })
+                .collect(),
+        );
         let mut extra = roots
             .into_iter()
             .filter(|agent| {
@@ -512,40 +594,68 @@ impl AgentRegistry {
         &self.workstreams
     }
 
-    /// Rail row order aggregates the whole workstream: pinned containers,
-    /// pinned members, and any member in the attention/recency bucket surface
-    /// their row. The earliest retained member rank keeps the rest stable.
+    /// Rail row order applies the retained agent-rail policy at workstream
+    /// granularity: pinned containers, pinned roots, then the coarse active
+    /// cohort, with the best statefully ordered root as the stable tiebreak.
     pub fn ordered_workstreams(&self) -> Vec<&Workstream> {
         let bucket = self.row_bucket();
         let mut rows = self.workstreams.iter().collect::<Vec<_>>();
         rows.sort_by_key(|workstream| {
+            let roots = self.ordered_workstream_roots(workstream);
             (
                 !workstream.pinned,
-                !workstream.agents.iter().any(agent_pinned),
-                !workstream
-                    .agents
-                    .iter()
-                    .any(|agent| bucket.contains(&agent.agent_id)),
-                workstream
-                    .agents
-                    .iter()
-                    .filter_map(|agent| self.rail_ranks.get(&agent.agent_id))
+                !roots.iter().any(|root| agent_pinned(root)),
+                !bucket.contains(&workstream.workstream_id),
+                roots
+                    .first()
+                    .and_then(|root| self.rail_ranks.get(&root.agent_id))
                     .copied()
-                    .min()
                     .unwrap_or(usize::MAX),
             )
         });
         rows
     }
 
-    /// The attention/recency top bucket over all visible members.
-    fn row_bucket(&self) -> BTreeSet<AgentId> {
-        self.top_bucket(self.workstreams.iter().flat_map(|workstream| &workstream.agents))
+    /// The attention/recency top bucket over workstream rows. Descendant
+    /// attention rolls up through roots, while quiet recency is represented
+    /// once per workstream, so member count cannot distort the five-row
+    /// cohort.
+    fn row_bucket(&self) -> BTreeSet<WorkstreamId> {
+        let normal = self
+            .workstreams
+            .iter()
+            .filter_map(|workstream| {
+                if workstream.hidden || workstream.pinned {
+                    return None;
+                }
+                let roots = self.ordered_workstream_roots(workstream);
+                if roots.is_empty() || roots.iter().any(|root| agent_pinned(root)) {
+                    return None;
+                }
+                let attention = roots
+                    .iter()
+                    .map(|root| self.root_attention(workstream, root.agent_id))
+                    .max()
+                    .unwrap_or_default();
+                let last_active = roots
+                    .iter()
+                    .map(|root| {
+                        self.last_active
+                            .get(&root.agent_id)
+                            .copied()
+                            .unwrap_or(root.last_active)
+                    })
+                    .max()
+                    .unwrap_or_default();
+                Some((workstream.workstream_id, attention, last_active))
+            })
+            .collect::<Vec<_>>();
+        active_bucket(normal)
     }
 
     /// Rail rows split into the listed set and the folded tail, the same
-    /// policy the agent rail applied per topic: pinned rows, rows with any
-    /// pinned or top-bucket member, and the selected row stay,
+    /// policy the agent rail applied per topic: pinned rows, rows with a
+    /// pinned root or active-cohort membership, and the selected row stay,
     /// plus [`EXTRA_ROWS`] more in retained order; quiet leftovers fold.
     /// Hidden rows appear in neither list.
     pub fn split_rows(&self) -> (Vec<&Workstream>, Vec<&Workstream>) {
@@ -561,11 +671,11 @@ impl AgentRegistry {
             if workstream.hidden {
                 continue;
             }
+            let roots = self.ordered_workstream_roots(workstream);
             let keep = workstream.pinned
                 || selected_row == Some(workstream.workstream_id)
-                || workstream.agents.iter().any(|agent| {
-                    agent_pinned(agent) || bucket.contains(&agent.agent_id)
-                });
+                || roots.iter().any(|root| agent_pinned(root))
+                || bucket.contains(&workstream.workstream_id);
             if keep {
                 listed.push(workstream);
             } else if extra < EXTRA_ROWS {
@@ -733,6 +843,17 @@ impl AgentRegistry {
             .iter()
             .map(|topic| {
                 let state = TopicRailState::new(self, topic);
+                let roots = self.order_topic_agents_with_state(
+                    &state,
+                    topic
+                        .agents
+                        .iter()
+                        .filter(|agent| {
+                            !agent.hidden
+                                && state.root_by_id.get(&agent.agent_id) == Some(&agent.agent_id)
+                        })
+                        .collect(),
+                );
                 let (listed, folded): (Vec<_>, Vec<_>) = topic
                     .agents
                     .iter()
@@ -760,6 +881,7 @@ impl AgentRegistry {
                 (
                     topic.workstream_id,
                     TopicRailLayout {
+                        roots: cache(roots),
                         listed: cache(listed),
                         #[cfg(test)]
                         folded: cache(folded),
@@ -770,7 +892,6 @@ impl AgentRegistry {
         self.topic_rail_layouts = layouts;
     }
 
-    #[cfg(test)]
     fn resolve_cached_agents<'a>(
         topic: &'a Workstream,
         cached: &[(AgentId, usize)],
@@ -792,6 +913,36 @@ impl AgentRegistry {
             .collect()
     }
 
+    /// Every visible root in the retained, coarse-bucket order used by the
+    /// old agent rail. Unlike navigation folding, this does not drop quiet
+    /// roots from a multi-root dashboard section.
+    pub(crate) fn ordered_workstream_roots<'a>(
+        &self,
+        workstream: &'a Workstream,
+    ) -> Vec<&'a UiAgentSummary> {
+        self.topic_rail_layouts
+            .get(&workstream.workstream_id)
+            .map(|layout| Self::resolve_cached_agents(workstream, &layout.roots))
+            .unwrap_or_default()
+    }
+
+    /// Attention displayed for one dashboard root, including its visible
+    /// descendants. This is also the signal used to place the root and its
+    /// containing workstream in their coarse active cohorts.
+    pub(crate) fn root_attention(
+        &self,
+        workstream: &Workstream,
+        root_id: AgentId,
+    ) -> rho_ui_proto::UiAttention {
+        workstream
+            .agents
+            .iter()
+            .filter(|agent| !agent.hidden && root_of(workstream, agent.agent_id) == Some(root_id))
+            .map(|agent| self.attention(agent.agent_id))
+            .max()
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub(crate) fn split_workstream_agents<'a>(
         &self,
@@ -804,46 +955,6 @@ impl AgentRegistry {
             Self::resolve_cached_agents(topic, &layout.listed),
             Self::resolve_cached_agents(topic, &layout.folded),
         )
-    }
-
-    pub fn top_bucket<'a>(
-        &self,
-        agents: impl IntoIterator<Item = &'a UiAgentSummary>,
-    ) -> BTreeSet<AgentId> {
-        let mut normal = agents
-            .into_iter()
-            .filter(|agent| !agent_pinned(agent) && !agent.hidden)
-            .collect::<Vec<_>>();
-        let colored_count = normal
-            .iter()
-            .filter(|agent| self.attention(agent.agent_id) != rho_ui_proto::UiAttention::Quiet)
-            .count();
-        let recent_quiet_slots = 5usize.saturating_sub(colored_count);
-        let mut top = normal
-            .iter()
-            .filter(|agent| self.attention(agent.agent_id) != rho_ui_proto::UiAttention::Quiet)
-            .map(|agent| agent.agent_id)
-            .collect::<BTreeSet<_>>();
-
-        normal.sort_by_key(|agent| {
-            (
-                Reverse(
-                    self.last_active
-                        .get(&agent.agent_id)
-                        .copied()
-                        .unwrap_or(agent.last_active),
-                ),
-                agent.agent_id,
-            )
-        });
-        top.extend(
-            normal
-                .into_iter()
-                .filter(|agent| self.attention(agent.agent_id) == rho_ui_proto::UiAttention::Quiet)
-                .take(recent_quiet_slots)
-                .map(|agent| agent.agent_id),
-        );
-        top
     }
 
     /// Resolves an agent label (as produced by [`Self::agent_id_label`],
@@ -1019,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_sort_by_member_engagement_and_attention_not_creation() {
+    fn rows_sort_by_root_engagement_and_attention_not_creation() {
         use rho_ui_proto::UiAttention;
 
         let mut registry = AgentRegistry::default();
@@ -1061,6 +1172,113 @@ mod tests {
             ],
         );
         assert_eq!(order(&registry), [2, 3, 1]);
+    }
+
+    #[test]
+    fn workstream_bucket_counts_roots_not_descendants() {
+        let mut registry = AgentRegistry::default();
+        let root = agent(1, Status::Normal);
+        let root_id = root.agent_id;
+        let descendants = (100..=104)
+            .map(|id| {
+                let mut descendant = agent(id, Status::Normal);
+                descendant.parent_agent = Some(root_id);
+                descendant
+            })
+            .collect::<Vec<_>>();
+        let mut crowded = vec![root];
+        crowded.extend(descendants);
+        let mut topics = vec![topic(1, Status::Normal, crowded)];
+        topics.extend((2..=6).map(|id| topic(id, Status::Normal, vec![agent(id, Status::Normal)])));
+        set_topics(&mut registry, topics);
+
+        let order = registry
+            .ordered_workstreams()
+            .into_iter()
+            .map(|workstream| workstream.workstream_id.0)
+            .collect::<Vec<_>>();
+
+        // The five recent descendants belong to one old root. They neither
+        // consume all five row slots nor become that workstream's rank.
+        assert_eq!(order, [6, 5, 4, 3, 2, 1]);
+
+        for id in 100..=104 {
+            registry.set_attention(agent_id(id), rho_ui_proto::UiAttention::Working);
+        }
+        let order = registry
+            .ordered_workstreams()
+            .into_iter()
+            .map(|workstream| workstream.workstream_id.0)
+            .collect::<Vec<_>>();
+        // Five colored descendants still occupy one workstream slot, leaving
+        // four quiet rows in the five-row cohort.
+        assert_eq!(order, [6, 5, 4, 3, 1, 2]);
+    }
+
+    #[test]
+    fn descendant_attention_moves_its_root_into_the_coarse_bucket() {
+        use rho_ui_proto::UiAttention;
+
+        let root = agent(1, Status::Normal);
+        let root_id = root.agent_id;
+        let mut agents = vec![root];
+        agents.extend((2..=7).map(|id| agent(id, Status::Normal)));
+        let children = (8..=10)
+            .map(|id| {
+                let mut child = agent(id, Status::Normal);
+                child.parent_agent = Some(root_id);
+                child
+            })
+            .collect::<Vec<_>>();
+        let child_ids = children
+            .iter()
+            .map(|child| child.agent_id)
+            .collect::<Vec<_>>();
+        agents.extend(children);
+
+        let mut registry = AgentRegistry::default();
+        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
+        let roots = |registry: &AgentRegistry| {
+            registry
+                .ordered_workstream_roots(&registry.workstreams()[0])
+                .into_iter()
+                .map(|root| root.agent_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roots(&registry), [7, 6, 5, 4, 3, 2, 1].map(agent_id));
+
+        for child_id in child_ids {
+            registry.set_attention(child_id, UiAttention::Pending);
+        }
+
+        // Root 1 crosses into the five-root active cohort, but retained rank
+        // keeps it behind the four already-higher roots instead of jumping.
+        assert_eq!(roots(&registry), [7, 6, 5, 4, 1, 3, 2].map(agent_id));
+    }
+
+    #[test]
+    fn descendant_pin_does_not_pin_its_root_or_workstream() {
+        let root = agent(1, Status::Normal);
+        let mut child = agent(100, Status::Pinned);
+        child.parent_agent = Some(root.agent_id);
+
+        let mut registry = AgentRegistry::default();
+        set_topics(
+            &mut registry,
+            vec![
+                topic(1, Status::Normal, vec![root, child]),
+                topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
+            ],
+        );
+
+        assert_eq!(
+            registry
+                .ordered_workstreams()
+                .into_iter()
+                .map(|workstream| workstream.workstream_id.0)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
     }
 
     #[test]
@@ -1175,6 +1393,40 @@ mod tests {
         registry.set_attention(agent_id(2), UiAttention::Quiet);
         registry.select_agent(agent_id(1));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
+    }
+
+    #[test]
+    fn refresh_does_not_reseed_retained_root_order() {
+        let mut first = agent(1, Status::Normal);
+        first.last_active = rho_core::UnixMs(20);
+        let mut second = agent(2, Status::Normal);
+        second.last_active = rho_core::UnixMs(10);
+        let mut registry = AgentRegistry::default();
+        set_topics(
+            &mut registry,
+            vec![topic(1, Status::Normal, vec![first, second])],
+        );
+
+        let roots = |registry: &AgentRegistry| {
+            registry
+                .ordered_workstream_roots(&registry.workstreams()[0])
+                .into_iter()
+                .map(|root| root.agent_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roots(&registry), [1, 2].map(agent_id));
+
+        let mut first = agent(1, Status::Normal);
+        first.last_active = rho_core::UnixMs(20);
+        let mut second = agent(2, Status::Normal);
+        second.last_active = rho_core::UnixMs(30);
+        set_topics(
+            &mut registry,
+            vec![topic(1, Status::Normal, vec![second, first])],
+        );
+
+        // Changed snapshot order and timestamps do not rewrite retained rank.
+        assert_eq!(roots(&registry), [1, 2].map(agent_id));
     }
 
     #[test]

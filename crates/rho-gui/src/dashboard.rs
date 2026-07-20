@@ -831,16 +831,8 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
 /// human-named root rows. Descendants contribute attention to their root but
 /// never replace the stable target under the cursor.
 fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Vec<Line> {
-    let roots = root_agents(topic);
-    let attention = |root: AgentId| {
-        topic
-            .agents
-            .iter()
-            .filter(|agent| !agent.hidden && root_of(topic, agent.agent_id) == Some(root))
-            .map(|agent| registry.attention(agent.agent_id))
-            .max()
-            .unwrap_or(UiAttention::Quiet)
-    };
+    let roots = registry.ordered_workstream_roots(topic);
+    let attention = |root: AgentId| registry.root_attention(topic, root);
     let aggregate = roots
         .iter()
         .map(|root| attention(root.agent_id))
@@ -921,37 +913,6 @@ fn root_line(
         line.lamp = Some(attention);
     }
     line
-}
-
-fn root_agents(topic: &Workstream) -> Vec<&rho_ui_proto::UiAgentSummary> {
-    topic
-        .agents
-        .iter()
-        .filter(|agent| {
-            !agent.hidden
-                && agent.parent_agent.is_none_or(|parent| {
-                    !topic.agents.iter().any(|candidate| candidate.agent_id == parent)
-                })
-        })
-        .collect()
-}
-
-fn root_of(topic: &Workstream, mut agent_id: AgentId) -> Option<AgentId> {
-    let mut seen = std::collections::HashSet::new();
-    while seen.insert(agent_id) {
-        let agent = topic
-            .agents
-            .iter()
-            .find(|candidate| candidate.agent_id == agent_id)?;
-        match agent
-            .parent_agent
-            .filter(|parent| topic.agents.iter().any(|candidate| candidate.agent_id == *parent))
-        {
-            Some(parent) => agent_id = parent,
-            None => return Some(agent_id),
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1072,6 +1033,38 @@ mod tests {
     }
 
     #[test]
+    fn groups_anchor_in_stateful_order_instead_of_at_the_top() {
+        let mut agents = (1..=4)
+            .map(|id| agent(id, Status::Normal, 10))
+            .collect::<Vec<_>>();
+        for (index, agent) in agents.iter_mut().enumerate() {
+            agent.workstream = WorkstreamId(index as u64 + 1);
+        }
+        let workstreams = (1..=4)
+            .map(|id| UiWorkstream {
+                workstream_id: WorkstreamId(id),
+                name: format!("ws-{id}"),
+                labels: if matches!(id, 1 | 3) {
+                    vec!["group:infra".to_owned()]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        let mut registry = AgentRegistry::default();
+        registry.set_data(workstreams, agents);
+
+        let lines = generate(&registry)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+
+        // Stateful order is 4, 3, 2, 1. The infra section anchors at 3 and
+        // gathers 1 beneath it; ungrouped 4 remains above the section.
+        assert_eq!(lines, ["ws-4", "infra", "  ws-3", "  ws-1", "ws-2"]);
+    }
+
+    #[test]
     fn expansion_reunites_a_group_split_across_the_fold() {
         let listed = [stream(1, Some("infra")), stream(2, None)];
         let folded = [stream(3, Some("infra"))];
@@ -1126,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_roots_get_human_named_rows_without_id_labels() {
+    fn multiple_roots_follow_retained_engagement_order() {
         let mut release_notes = agent(1, Status::Normal, 10);
         release_notes.display_name = Some("Prepare release notes".to_owned());
         let release_id = release_notes.agent_id;
@@ -1140,14 +1133,16 @@ mod tests {
         let lines = generate(&registry);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "topic");
-        assert_eq!(lines[1].text, "  Prepare release notes");
-        assert_eq!(lines[2].text, "  Verify staging deployment");
+        // Agent 2 was engaged more recently, so the registry's retained
+        // order wins over the daemon snapshot order used to build `topic`.
+        assert_eq!(lines[1].text, "  Verify staging deployment");
+        assert_eq!(lines[2].text, "  Prepare release notes");
         assert!(matches!(
             lines[0].target,
             RowTarget::Stream { root: None, .. }
         ));
-        assert_eq!(lines[1].target, RowTarget::Agent(release_id));
-        assert_eq!(lines[2].target, RowTarget::Agent(deployment_id));
+        assert_eq!(lines[1].target, RowTarget::Agent(deployment_id));
+        assert_eq!(lines[2].target, RowTarget::Agent(release_id));
     }
 
     #[test]
