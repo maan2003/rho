@@ -49,6 +49,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
             Arc::new(ContextBlock::ToolResults {
                 results: vec![tool_result_success(tool_call_id("call-1"), "done")],
             }),
+            Arc::new(ContextBlock::CompactionTrigger),
         ],
         vec![ToolSpec {
             name: tool_name("shell_run"),
@@ -70,6 +71,8 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     assert_eq!(json["input"][1]["name"], "shell_run");
     assert_eq!(json["input"][1]["arguments"], r#"{"command":"pwd"}"#);
     assert_eq!(json["input"][2]["type"], "function_call_output");
+    assert_eq!(json["input"][2]["call_id"], "call-1");
+    assert_eq!(json["input"][3]["type"], "compaction_trigger");
     assert_eq!(json["tools"][0]["name"], "shell_run");
     assert_eq!(json["tool_choice"], "auto");
     assert!(json.get("parallel_tool_calls").is_none());

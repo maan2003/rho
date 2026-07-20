@@ -13,6 +13,29 @@ fn chatgpt_codex_config_sets_endpoint_defaults() {
 
     assert_eq!(session.base_url, DEFAULT_CHATGPT_BASE_URL);
     assert_eq!(session.responses_config.auto_compaction, None);
+    assert_eq!(session.context_window(), Some(272_000));
+    assert_eq!(session.auto_compact_token_limit(), Some(232_560));
+}
+
+#[test]
+fn gpt56_models_use_explicit_context_and_compaction_limits() {
+    for model in [
+        InferenceModel::Gpt56Sol,
+        InferenceModel::Gpt56Luna,
+        InferenceModel::Gpt56Terra,
+    ] {
+        let (_temp, auth) = test_oauth_file("token", None);
+        let session = InferenceSession::new_deep(
+            auth,
+            InferenceProfile::default(),
+            model,
+            PromptCacheKey::from_bytes(*b"testkey2"),
+        );
+
+        assert_eq!(session.context_window(), Some(372_000));
+        assert_eq!(session.auto_compact_token_limit(), Some(280_000));
+        assert_eq!(session.responses_config.auto_compaction, None);
+    }
 }
 
 #[test]

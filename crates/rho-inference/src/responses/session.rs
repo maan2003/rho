@@ -142,13 +142,12 @@ pub(crate) struct ResponsesConfig {
 
 impl ResponsesConfig {
     fn deep(config: InferenceProfile, model: ResponsesModel) -> Self {
-        let context_window = model.context_window();
+        let info = model.info();
         Self {
-            // Responses Lite rejects server-side compaction requests, so
-            // lite models get no auto-compaction for now.
-            auto_compaction: (!model.use_responses_lite()).then_some(AutoCompaction::Threshold(
-                context_window * 95 / 100 * 90 / 100,
-            )),
+            // Responses Lite rejects server-side compaction requests. The
+            // agent's explicit trigger policy works for both wire shapes.
+            auto_compaction: (!model.use_responses_lite())
+                .then_some(AutoCompaction::Threshold(info.auto_compact_token_limit)),
             model,
             reasoning_context: ReasoningContext::AllTurns,
             effort: config.effort.into(),
@@ -182,6 +181,12 @@ pub(crate) enum ResponsesModel {
     Gpt54Mini,
     #[cfg(test)]
     Test(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ResponsesModelInfo {
+    context_window: u64,
+    auto_compact_token_limit: u64,
 }
 
 impl From<InferenceModel> for ResponsesModel {
@@ -221,12 +226,21 @@ impl ResponsesModel {
         }
     }
 
-    fn context_window(&self) -> u64 {
+    fn info(&self) -> ResponsesModelInfo {
         match self {
-            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra => 372_000,
-            Self::Gpt55 | Self::Gpt54Mini => 272_000,
+            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra => ResponsesModelInfo {
+                context_window: 372_000,
+                auto_compact_token_limit: 280_000,
+            },
+            Self::Gpt55 | Self::Gpt54Mini => ResponsesModelInfo {
+                context_window: 272_000,
+                auto_compact_token_limit: 232_560,
+            },
             #[cfg(test)]
-            Self::Test(_) => 272_000,
+            Self::Test(_) => ResponsesModelInfo {
+                context_window: 272_000,
+                auto_compact_token_limit: 232_560,
+            },
         }
     }
 }
@@ -329,6 +343,19 @@ impl InferenceSession {
 
     pub fn has_active_request(&self) -> bool {
         self.turn.is_some()
+    }
+
+    /// Report the advertised context window for a deep inference session.
+    pub fn context_window(&self) -> Option<u64> {
+        matches!(self.mode, InferenceSessionMode::Deep(_))
+            .then(|| self.responses_config.model.info().context_window)
+    }
+
+    /// Report the context occupancy at which the client should explicitly
+    /// request compaction.
+    pub fn auto_compact_token_limit(&self) -> Option<u64> {
+        matches!(self.mode, InferenceSessionMode::Deep(_))
+            .then(|| self.responses_config.model.info().auto_compact_token_limit)
     }
 
     /// Queue a turn. The work happens in `run`.

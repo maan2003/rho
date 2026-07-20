@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 
@@ -381,7 +381,14 @@ fn restore_events(events: Vec<AgentEvent<'static>>) -> RestoredAgent {
                 provider_response_id,
                 context_used: response_context_used,
             } => {
-                if response_context_used.is_some() {
+                let compacted = items
+                    .iter()
+                    .any(|item| matches!(item, InferenceResponseItem::Compaction { .. }));
+                if compacted {
+                    // Compaction response usage describes the old, full input,
+                    // not the newly compacted context.
+                    context_used = None;
+                } else if response_context_used.is_some() {
                     context_used = response_context_used;
                 }
                 commit_finished_turn(&mut turn, &mut blocks);
@@ -752,6 +759,7 @@ impl Agent {
         let notify = Arc::new(Notify::new());
         let agent_loop = AgentLoop {
             inference_session,
+            auto_compaction_in_flight: false,
             pending_tools: FuturesUnordered::new(),
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
@@ -1000,6 +1008,10 @@ enum AgentControl {
 
 struct AgentLoop {
     inference_session: InferenceSession,
+    /// The active request includes a trigger injected by the automatic
+    /// context-occupancy policy. A compaction-only response must continue the
+    /// interrupted turn; a manually requested compaction remains standalone.
+    auto_compaction_in_flight: bool,
     /// The tool calls from the current `ToolCalling` turn, running
     /// concurrently. Empty in every other state. Driven as a `select!` arm
     /// alongside the provider stream.
@@ -1346,6 +1358,7 @@ impl AgentLoop {
                             };
                         }
                         InferenceEvent::Failed { error } => {
+                            self.auto_compaction_in_flight = false;
                             let attempt_count = previous_attempt
                                 .map_or(NonZeroU64::MIN, |a| a.attempt_count.saturating_add(1));
                             // A silently stuck child is the failure mode worth
@@ -1364,12 +1377,8 @@ impl AgentLoop {
                             usage,
                             provider_response_id,
                         } => {
-                            let context_used = usage
-                                .as_ref()
-                                .map(|usage| usage.input_tokens + usage.output_tokens);
-                            if context_used.is_some() {
-                                state.context_used = context_used;
-                            }
+                            let auto_compaction_in_flight =
+                                std::mem::take(&mut self.auto_compaction_in_flight);
                             match pending_response.finish() {
                             Err(error) => {
                                 let attempt_count = previous_attempt
@@ -1385,6 +1394,21 @@ impl AgentLoop {
                                 });
                             }
                             Ok(items) => {
+                                let compacted = items.iter().any(|item| {
+                                    matches!(item, InferenceResponseItem::Compaction { .. })
+                                });
+                                let context_used = if compacted {
+                                    None
+                                } else {
+                                    usage
+                                        .as_ref()
+                                        .map(|usage| usage.input_tokens + usage.output_tokens)
+                                };
+                                if compacted {
+                                    state.context_used = None;
+                                } else if context_used.is_some() {
+                                    state.context_used = context_used;
+                                }
                                 let calls: Vec<ToolCall> = items
                                     .iter()
                                     .filter_map(|item| match item {
@@ -1414,7 +1438,16 @@ impl AgentLoop {
                                     items,
                                     provider_response_id,
                                 }));
-                                if calls.is_empty() {
+                                let continue_after_compaction =
+                                    compacted && auto_compaction_in_flight;
+                                if continue_after_compaction {
+                                    self.deliver_queued(
+                                        &mut state,
+                                        MessageDelivery::NextRequest,
+                                    )
+                                    .await;
+                                    self.start_request(&mut state, None).await;
+                                } else if calls.is_empty() {
                                     // A child's finished turn is its report:
                                     // mail the result to the parent so it can
                                     // react.
@@ -1817,11 +1850,29 @@ impl AgentLoop {
         state: &mut AgentState,
         previous_attempt: Option<FailedInferenceResponse>,
     ) {
+        let auto_compacting =
+            should_auto_compact(state, self.inference_session.auto_compact_token_limit());
+        if auto_compacting {
+            // `start_request` is reached from a tool turn only after the
+            // complete result batch has been appended, so the wire-level
+            // tail ordering is call -> result -> compaction trigger.
+            let item = QueuedItem {
+                kind: QueuedItemKind::Compaction,
+                delivery: MessageDelivery::NextRequest,
+            };
+            self.persist_event(AgentEvent::Queued(item.clone())).await;
+            state.queued_inputs.push(item);
+            self.deliver_queued(state, MessageDelivery::NextRequest)
+                .await;
+        }
+        self.auto_compaction_in_flight = auto_compacting;
         if self.send_request(state).await {
             state.kind = AgentStateKind::ApiStreaming {
                 pending_response: PendingInferenceResponse::default(),
                 previous_attempt,
             };
+        } else {
+            self.auto_compaction_in_flight = false;
         }
     }
 
@@ -1864,6 +1915,62 @@ impl AgentLoop {
             })
             .collect()
     }
+}
+
+fn should_auto_compact(state: &AgentState, token_limit: Option<u64>) -> bool {
+    let limit_reached = state
+        .context_used
+        .zip(token_limit)
+        .is_some_and(|(used, limit)| used >= limit);
+    if !limit_reached || has_unanswered_tool_calls(&state.blocks) {
+        return false;
+    }
+
+    // A delivered manual trigger already covers this request. Only the most
+    // recent response or trigger matters; older triggers remain in the
+    // append-only transcript after their compaction response arrives.
+    !state
+        .blocks
+        .iter()
+        .rev()
+        .find_map(|block| match &**block {
+            ContextBlock::CompactionTrigger => Some(true),
+            ContextBlock::InferenceResponse { .. } => Some(false),
+            ContextBlock::UserMessage { .. }
+            | ContextBlock::ToolResults { .. }
+            | ContextBlock::ToolUpdate(_) => None,
+        })
+        .unwrap_or(false)
+}
+
+fn has_unanswered_tool_calls(blocks: &[Arc<ContextBlock>]) -> bool {
+    let mut outstanding = HashSet::new();
+    for block in blocks {
+        match &**block {
+            ContextBlock::InferenceResponse { items, .. } => {
+                for item in items {
+                    match item {
+                        // Earlier calls are represented inside the opaque
+                        // compacted context and no longer need local results.
+                        InferenceResponseItem::Compaction { .. } => outstanding.clear(),
+                        InferenceResponseItem::ToolCall { id, .. } => {
+                            outstanding.insert(id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ContextBlock::ToolResults { results } => {
+                for result in results {
+                    outstanding.remove(&result.call_id);
+                }
+            }
+            ContextBlock::UserMessage { .. }
+            | ContextBlock::ToolUpdate(_)
+            | ContextBlock::CompactionTrigger => {}
+        }
+    }
+    !outstanding.is_empty()
 }
 
 fn should_yield_code_mode_wait_for_queued(state: &AgentState) -> bool {
@@ -1994,6 +2101,12 @@ mod tests {
             name: ToolName::try_from("shell_command").unwrap(),
             tool_type: rho_core::ToolType::Function,
             arguments: String::new(),
+        }
+    }
+
+    fn compaction_item() -> InferenceResponseItem {
+        InferenceResponseItem::Compaction {
+            provider_specific: test_provider_specific_data(),
         }
     }
 
@@ -2235,6 +2348,61 @@ mod tests {
         ]);
         assert!(restored.blocks.is_empty());
         assert!(restored.queued_inputs.is_empty());
+    }
+
+    #[test]
+    fn compaction_response_clears_restored_context_usage() {
+        let restored = restore_events(vec![
+            AgentEvent::InferenceResponse {
+                items: Cow::Owned(Vec::new()),
+                provider_response_id: None,
+                context_used: Some(230_000),
+            },
+            AgentEvent::InferenceResponse {
+                items: Cow::Owned(vec![compaction_item()]),
+                provider_response_id: None,
+                context_used: Some(240_000),
+            },
+        ]);
+
+        assert_eq!(restored.context_used, None);
+    }
+
+    #[test]
+    fn auto_compaction_respects_threshold_and_manual_trigger() {
+        let mut state = AgentState {
+            blocks: Vec::new(),
+            queued_inputs: InputQueues::default(),
+            kind: AgentStateKind::Idle,
+            context_used: Some(232_560),
+        };
+        assert!(should_auto_compact(&state, Some(232_560)));
+        assert!(!should_auto_compact(&state, Some(232_561)));
+
+        state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
+            items: vec![tool_call("c1")],
+            provider_response_id: None,
+        }));
+        assert!(has_unanswered_tool_calls(&state.blocks));
+        assert!(!should_auto_compact(&state, Some(232_560)));
+
+        let AgentEvent::ToolResult { result } = tool_result("c1") else {
+            unreachable!()
+        };
+        state.blocks.push(Arc::new(ContextBlock::ToolResults {
+            results: vec![result.into_owned()],
+        }));
+        assert!(!has_unanswered_tool_calls(&state.blocks));
+        assert!(should_auto_compact(&state, Some(232_560)));
+
+        state.blocks.push(Arc::new(ContextBlock::CompactionTrigger));
+        assert!(!should_auto_compact(&state, Some(232_560)));
+
+        state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
+            items: Vec::new(),
+            provider_response_id: None,
+        }));
+        assert!(should_auto_compact(&state, Some(232_560)));
     }
 
     #[test]
