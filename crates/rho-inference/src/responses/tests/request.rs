@@ -396,7 +396,7 @@ fn chatgpt_codex_with_compaction_requests_configured_threshold() {
 }
 
 #[test]
-fn compaction_trigger_is_sent_as_provider_input_item() {
+fn compaction_trigger_is_the_last_provider_input_item() {
     let (_temp, auth) = test_oauth_file("token", None);
     let session = test_inference_service_with(
         auth,
@@ -404,14 +404,24 @@ fn compaction_trigger_is_sent_as_provider_input_item() {
         PromptCacheKey::from_bytes(*b"testkey1"),
         Some(AutoCompaction::Threshold(42_000)),
     );
-    let request = inference_request(vec![Arc::new(ContextBlock::CompactionTrigger)], Vec::new());
+    let request = inference_request(
+        vec![
+            Arc::new(ContextBlock::CompactionTrigger),
+            user_block("queued after compaction"),
+            Arc::new(ContextBlock::CompactionTrigger),
+        ],
+        Vec::new(),
+    );
 
     let body = ResponsesRequest::from_inference_request(&session, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["context_management"][0]["type"], "compaction");
     assert_eq!(json["context_management"][0]["compact_threshold"], 42_000);
-    assert_eq!(json["input"][0]["type"], "compaction_trigger");
+    let input = json["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2);
+    assert_eq!(input[0]["content"][0]["text"], "queued after compaction");
+    assert_eq!(input[1]["type"], "compaction_trigger");
 }
 
 #[test]

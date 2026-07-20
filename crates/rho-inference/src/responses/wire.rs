@@ -174,8 +174,20 @@ impl ResponsesRequest {
             .map(convert_tool_spec)
             .collect::<Vec<_>>();
         let mut input = Vec::new();
-        for item in timeline {
+        for item in timeline
+            .iter()
+            .filter(|item| !matches!(item, WireTimelineItem::CompactionTrigger))
+        {
             convert_timeline_item(item.clone(), &mut input);
+        }
+        // The Responses API requires a manual compaction trigger to be the
+        // final input item. Multiple queued requests are equivalent, so
+        // coalesce them into one trigger at the tail.
+        if timeline
+            .iter()
+            .any(|item| matches!(item, WireTimelineItem::CompactionTrigger))
+        {
+            convert_timeline_item(WireTimelineItem::CompactionTrigger, &mut input);
         }
 
         let prompt_cache_key = session
