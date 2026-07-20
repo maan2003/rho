@@ -2612,6 +2612,7 @@ dependencies = [
  "ratatui",
  "regex",
  "rpassword",
+ "rustix",
  "sapling-renderdag",
  "sapling-streampager",
  "scm-record",

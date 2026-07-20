@@ -95,6 +95,7 @@ rand_chacha = { workspace = true }
 regex = { workspace = true }
 ratatui = { workspace = true }
 rpassword = { workspace = true }
+rustix = { workspace = true }
 sapling-renderdag = { workspace = true }
 sapling-streampager = { workspace = true }
 scm-record = { workspace = true }

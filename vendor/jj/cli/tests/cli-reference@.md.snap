@@ -128,6 +128,11 @@ This document contains the help content for the `jj` command-line program.
 * [`jj workspace forget`↴](#jj-workspace-forget)
 * [`jj workspace list`↴](#jj-workspace-list)
 * [`jj workspace rename`↴](#jj-workspace-rename)
+* [`jj workspace pool`↴](#jj-workspace-pool)
+* [`jj workspace pool attach`↴](#jj-workspace-pool-attach)
+* [`jj workspace pool detach`↴](#jj-workspace-pool-detach)
+* [`jj workspace pool list`↴](#jj-workspace-pool-list)
+* [`jj workspace pool prepare`↴](#jj-workspace-pool-prepare)
 * [`jj workspace root`↴](#jj-workspace-root)
 * [`jj workspace update-stale`↴](#jj-workspace-update-stale)
 
@@ -3692,6 +3697,7 @@ Each workspace also has own sparse patterns.
 * `forget` — Stop tracking a workspace's working-copy commit in the repo
 * `list` — List workspaces
 * `rename` — Renames the current workspace
+* `pool` — Manage the pool of workspace checkout directories
 * `root` — Show the workspace root directory
 * `update-stale` — Update a workspace that has become stale
 
@@ -3703,7 +3709,7 @@ Add a workspace
 
 By default, the new workspace inherits the sparse patterns of the current workspace. You can override this with the `--sparse-patterns` option.
 
-**Usage:** `jj workspace add [OPTIONS] <DESTINATION>`
+**Usage:** `jj workspace add [OPTIONS] [DESTINATION]`
 
 ###### **Arguments:**
 
@@ -3732,6 +3738,13 @@ By default, the new workspace inherits the sparse patterns of the current worksp
   - `empty`:
     Clear all files from the workspace (it will be empty)
 
+* `--git` — Create Git worktree metadata so Git commands can run in the new workspace
+* `--detached` — Create the workspace without a working-copy directory
+
+   The workspace only exists in the repo view, tracking its working-copy commit like any other workspace. Materialize it into a directory later with `jj workspace pool attach`. Requires `--name`.
+* `--pool` — Create the workspace in a slot of the workspace pool
+
+   Equivalent to creating a detached workspace and running `jj workspace pool attach` on it. Requires `--name`.
 
 
 
@@ -3780,6 +3793,94 @@ Renames the current workspace
 ###### **Arguments:**
 
 * `<NEW_WORKSPACE_NAME>` — The name of the workspace to update to
+
+
+
+## `jj workspace pool`
+
+Manage the pool of workspace checkout directories
+
+Slots are anonymous numbered directories under `.jj/ws-pool/`. A slot is bound to a workspace by `jj workspace pool attach` and freed again by `jj workspace pool detach`, keeping its build caches for the next occupant.
+
+**Usage:** `jj workspace pool <COMMAND>`
+
+###### **Subcommands:**
+
+* `attach` — Attach a detached workspace to a pool slot
+* `detach` — Detach workspaces from their pool slots
+* `list` — List pool slots and their occupancy
+* `prepare` — Warm up slots before they are needed
+
+
+
+## `jj workspace pool attach`
+
+Attach a detached workspace to a pool slot
+
+The working copy is checked out into a free slot of the workspace pool (see `jj workspace pool`), creating one if necessary. A slot previously freed by `jj workspace pool detach` is updated incrementally, so ignored files (build caches etc.) and unchanged tracked files are reused.
+
+To create a new workspace directly in a pool slot, use `jj workspace add --pool --name <NAME>`.
+
+If the repo is backed by Git, a Git worktree is created in the slot so Git commands work inside it.
+
+**Usage:** `jj workspace pool attach <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the workspace to attach
+
+   The workspace must already exist in the repo (e.g. created with `jj workspace add --detached` or freed with `jj workspace pool detach`) and must not be attached elsewhere.
+
+
+
+## `jj workspace pool detach`
+
+Detach workspaces from their pool slots
+
+The workspaces keep tracking their working-copy commits in the repo view (they follow rebases like any other workspace); only their slots are released. A freed slot keeps its build caches and is reused by the next `jj workspace pool attach`; its Git worktree metadata is deleted (a new worktree is created on attach).
+
+The working copies are snapshotted before detaching, so no changes are lost. Do not modify files in a freed slot: the next attach will not notice such changes and they would leak into the attached workspace's commit.
+
+Already-detached and unknown workspaces are skipped with a note, so a batch detach of every possibly-attached workspace is cheap: one invocation, one snapshot.
+
+Only workspaces attached to a pool slot can be detached.
+
+**Usage:** `jj workspace pool detach [OPTIONS] [NAMES]...`
+
+###### **Arguments:**
+
+* `<NAMES>` — Names of the workspaces to detach
+
+###### **Options:**
+
+* `--all` — Detach every workspace currently attached to a pool slot
+
+
+
+## `jj workspace pool list`
+
+List pool slots and their occupancy
+
+**Usage:** `jj workspace pool list`
+
+
+
+## `jj workspace pool prepare`
+
+Warm up slots before they are needed
+
+Ensures the pool has at least `--count` free slots, allocating new slot directories as needed and seeding each with the ignored files (build caches etc.) of an existing workspace, reflinking file contents when the filesystem supports it. A later `jj workspace pool attach` then starts with warm caches. Existing free slots (which keep their previous occupant's caches) count toward the target, so this is safe to run repeatedly.
+
+**Usage:** `jj workspace pool prepare [OPTIONS]`
+
+###### **Options:**
+
+* `--count <COUNT>` — Number of free slots to ensure
+
+  Default value: `1`
+* `--seed-from <SEED_FROM>` — Workspace whose ignored files seed new slots
+
+   Defaults to the current workspace.
 
 
 

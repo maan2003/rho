@@ -59,8 +59,12 @@ enum SparseInheritance {
 #[derive(clap::Args, Clone, Debug)]
 pub struct WorkspaceAddArgs {
     /// Where to create the new workspace
-    #[arg(value_hint = clap::ValueHint::DirPath)]
-    destination: String,
+    #[arg(
+        value_hint = clap::ValueHint::DirPath,
+        required_unless_present_any = ["detached", "pool"],
+        conflicts_with_all = ["detached", "pool"]
+    )]
+    destination: Option<String>,
 
     /// A name for the workspace
     ///
@@ -96,6 +100,21 @@ pub struct WorkspaceAddArgs {
     /// workspace.
     #[arg(long)]
     git: bool,
+
+    /// Create the workspace without a working-copy directory
+    ///
+    /// The workspace only exists in the repo view, tracking its working-copy
+    /// commit like any other workspace. Materialize it into a directory later
+    /// with `jj workspace pool attach`. Requires `--name`.
+    #[arg(long, requires = "name", conflicts_with = "pool")]
+    detached: bool,
+
+    /// Create the workspace in a slot of the workspace pool
+    ///
+    /// Equivalent to creating a detached workspace and running `jj workspace
+    /// pool attach` on it. Requires `--name`.
+    #[arg(long, requires = "name")]
+    pool: bool,
 }
 
 #[instrument(skip_all)]
@@ -104,8 +123,30 @@ pub async fn cmd_workspace_add(
     command: &CommandHelper,
     args: &WorkspaceAddArgs,
 ) -> Result<(), CommandError> {
+    if args.detached || args.pool {
+        let workspace_name = args
+            .name
+            .clone()
+            .expect("clap requires --name with --detached/--pool");
+        create_detached_workspace(
+            ui,
+            command,
+            workspace_name.clone(),
+            &args.revisions,
+            &args.message_paragraphs,
+        )
+        .await?;
+        if args.pool {
+            super::attach::attach_to_pool(ui, command, &workspace_name).await?;
+        }
+        return Ok(());
+    }
+    let destination = args
+        .destination
+        .as_ref()
+        .expect("clap requires destination");
     let old_workspace_command = command.workspace_helper(ui).await?;
-    let destination_path = command.cwd().join(&args.destination);
+    let destination_path = command.cwd().join(destination);
     let workspace_name = if let Some(name) = &args.name {
         name.to_owned()
     } else {
@@ -144,6 +185,7 @@ pub async fn cmd_workspace_add(
             repo.as_ref(),
             &destination_path,
             &base_commit_id,
+            false,
         )?;
     }
     // If we add per-workspace configuration, we'll need to reload settings for
@@ -163,11 +205,11 @@ pub async fn cmd_workspace_add(
     )?;
     // Show a warning if the user passed a path without a separator, since they
     // may have intended the argument to only be the name for the workspace.
-    if !args.destination.contains(std::path::is_separator) {
+    if !destination.contains(std::path::is_separator) {
         writeln!(
             ui.warning_default(),
             r#"Workspace created inside current directory. If this was unintentional, delete the "{}" directory and run `jj workspace forget {name}` to remove it."#,
-            args.destination,
+            destination,
             name = workspace_name.as_symbol()
         )?;
     }
@@ -260,7 +302,88 @@ pub async fn cmd_workspace_add(
     Ok(())
 }
 
-fn git_worktree_base_commit(
+#[instrument(skip_all)]
+/// Creates a detached workspace: a working-copy commit tracked in the view
+/// without any directory attached to it.
+pub(super) async fn create_detached_workspace(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    workspace_name: jj_lib::ref_name::WorkspaceNameBuf,
+    revisions: &[crate::cli_util::RevisionArg],
+    message_paragraphs: &[String],
+) -> Result<(), CommandError> {
+    let mut workspace_command = command.workspace_helper(ui).await?;
+    if workspace_command
+        .repo()
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .is_some()
+    {
+        return Err(user_error(format!(
+            "Workspace named '{name}' already exists",
+            name = workspace_name.as_symbol()
+        )));
+    }
+
+    // Resolve parents against the current repo before starting the
+    // transaction; same semantics as the materialized path below.
+    let parent_ids = if revisions.is_empty() {
+        if let Some(old_wc_commit_id) = workspace_command
+            .repo()
+            .view()
+            .get_wc_commit_id(workspace_command.workspace_name())
+        {
+            workspace_command
+                .repo()
+                .store()
+                .get_commit(old_wc_commit_id)?
+                .parent_ids()
+                .to_vec()
+        } else {
+            vec![workspace_command.repo().store().root_commit_id().clone()]
+        }
+    } else {
+        workspace_command
+            .resolve_some_revsets(ui, revisions)
+            .await?
+            .into_iter()
+            .collect_vec()
+    };
+
+    let mut tx = workspace_command.start_transaction();
+    let parents: Vec<_> = parent_ids
+        .iter()
+        .map(|id| tx.repo().store().get_commit(id))
+        .try_collect()?;
+    let tree = merge_commit_trees(tx.repo(), &parents).await?;
+    let mut commit_builder = tx.repo_mut().new_commit(parent_ids, tree).detach();
+    let mut description = join_message_paragraphs(message_paragraphs);
+    if !description.is_empty() {
+        commit_builder.set_description(description);
+        description = add_trailers(ui, &tx, &commit_builder).await?;
+    }
+    commit_builder.set_description(&description);
+    let new_wc_commit = commit_builder.write(tx.repo_mut()).await?;
+    tx.repo_mut()
+        .edit(workspace_name.clone(), &new_wc_commit)
+        .await?;
+    writeln!(
+        ui.status(),
+        "Created detached workspace {name}",
+        name = workspace_name.as_symbol()
+    )?;
+    tx.finish(
+        ui,
+        format!(
+            "create initial working-copy commit in detached workspace {name}",
+            name = workspace_name.as_symbol()
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+pub(super) fn git_worktree_base_commit(
     repo: &dyn jj_lib::repo::Repo,
     workspace_name: &WorkspaceName,
 ) -> Result<String, CommandError> {
@@ -286,11 +409,47 @@ fn git_worktree_base_commit(
     ))
 }
 
-fn create_git_worktree_with_git(
+/// Runs a Git command against the repo's backing Git repository.
+pub(super) fn run_git_command(
+    settings: &jj_lib::settings::UserSettings,
+    repo: &dyn jj_lib::repo::Repo,
+    args: &[&std::ffi::OsStr],
+) -> Result<(), CommandError> {
+    let git_backend = git::get_git_backend(repo.store())?;
+    let git_settings = git::GitSettings::from_settings(settings)?;
+    let output = Command::new(&git_settings.executable_path)
+        .args(["-c", "core.fsmonitor=false"])
+        .arg("--git-dir")
+        .arg(git_backend.git_repo_path())
+        .args(args)
+        .output()
+        .map_err(|err| {
+            user_error_with_message(
+                format!(
+                    "Could not execute git using '{}'",
+                    git_settings.executable_path.display()
+                ),
+                err,
+            )
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(user_error(format!(
+            "Git command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        )))
+    }
+}
+
+pub(super) fn create_git_worktree_with_git(
     settings: &jj_lib::settings::UserSettings,
     repo: &dyn jj_lib::repo::Repo,
     destination_path: &Path,
     base_commit_id: &str,
+    // Required when the destination already exists and is not empty (e.g. a
+    // directory pre-populated with build caches).
+    force: bool,
 ) -> Result<(), CommandError> {
     let git_backend = git::get_git_backend(repo.store())?;
     let git_settings = git::GitSettings::from_settings(settings)?;
@@ -299,6 +458,7 @@ fn create_git_worktree_with_git(
         .arg("--git-dir")
         .arg(git_backend.git_repo_path())
         .args(["worktree", "add", "--detach", "--no-checkout"])
+        .args(force.then_some("--force"))
         .arg(destination_path)
         .arg(base_commit_id)
         .output()

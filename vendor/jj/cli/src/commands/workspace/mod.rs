@@ -13,8 +13,11 @@
 // limitations under the License.
 
 mod add;
+mod attach;
+mod detach;
 mod forget;
 mod list;
+mod pool;
 mod rename;
 mod root;
 mod update_stale;
@@ -28,6 +31,8 @@ use self::forget::WorkspaceForgetArgs;
 use self::forget::cmd_workspace_forget;
 use self::list::WorkspaceListArgs;
 use self::list::cmd_workspace_list;
+use self::pool::WorkspacePoolCommand;
+use self::pool::cmd_workspace_pool;
 use self::rename::WorkspaceRenameArgs;
 use self::rename::cmd_workspace_rename;
 use self::root::WorkspaceRootArgs;
@@ -55,6 +60,8 @@ pub(crate) enum WorkspaceCommand {
     Forget(WorkspaceForgetArgs),
     List(WorkspaceListArgs),
     Rename(WorkspaceRenameArgs),
+    #[command(subcommand)]
+    Pool(WorkspacePoolCommand),
     Root(WorkspaceRootArgs),
     UpdateStale(WorkspaceUpdateStaleArgs),
 }
@@ -70,6 +77,7 @@ pub(crate) async fn cmd_workspace(
         WorkspaceCommand::Forget(args) => cmd_workspace_forget(ui, command, args).await,
         WorkspaceCommand::List(args) => cmd_workspace_list(ui, command, args).await,
         WorkspaceCommand::Rename(args) => cmd_workspace_rename(ui, command, args).await,
+        WorkspaceCommand::Pool(subcommand) => cmd_workspace_pool(ui, command, subcommand).await,
         WorkspaceCommand::Root(args) => cmd_workspace_root(ui, command, args).await,
         WorkspaceCommand::UpdateStale(args) => cmd_workspace_update_stale(ui, command, args).await,
     }
