@@ -62,17 +62,24 @@ fn mention_prefix(text: &str) -> Option<&str> {
     text.get(token_start(text)..)?.strip_prefix('@')
 }
 
-/// Completion inside the draft's start field buffer: `user` plus the live
-/// agent labels, filtered by the token being typed.
+/// Completion inside the draft's start field buffer: automatic base, `user`,
+/// and live agent labels, filtered by the token being typed.
 pub fn start_field_candidates(
     text_before_cursor: &str,
     live_agents: &[Candidate],
 ) -> Vec<Candidate> {
     let needle = last_token(text_before_cursor);
-    std::iter::once(Candidate {
-        value: "user".to_owned(),
-        description: "your checkout (Join mode)".to_owned(),
-    })
+    [
+        Candidate {
+            value: crate::draft_view::DEFAULT_START.to_owned(),
+            description: "local main → local master → trunk (New/Sandbox)".to_owned(),
+        },
+        Candidate {
+            value: "user".to_owned(),
+            description: "your checkout (Join mode)".to_owned(),
+        },
+    ]
+    .into_iter()
     .chain(live_agents.iter().cloned())
     .filter(|candidate| {
         fuzzy_contains(&candidate.value, needle) || fuzzy_contains(&candidate.description, needle)
@@ -241,13 +248,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn start_field_offers_user_and_agents() {
+    fn start_field_offers_auto_user_and_agents() {
         let agents = vec![Candidate {
             value: "a3f".to_owned(),
             description: "fix tests".to_owned(),
         }];
         let candidates = start_field_candidates("", &agents);
-        assert_eq!(candidates[0].value, "user");
+        assert_eq!(candidates[0].value, crate::draft_view::DEFAULT_START);
+        assert!(candidates.iter().any(|c| c.value == "user"));
         assert!(candidates.iter().any(|c| c.value == "a3f"));
         let candidates = start_field_candidates("tes", &agents);
         assert_eq!(candidates.len(), 1);

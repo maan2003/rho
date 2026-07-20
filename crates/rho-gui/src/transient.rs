@@ -14,7 +14,7 @@ use gpui::{AnyElement, Context, Keystroke, Window, div};
 use theme::ActiveTheme as _;
 
 use crate::minibuffer::bottom_strip;
-use crate::workspace::{WorkstreamPrompt, Workspace};
+use crate::workspace::{Workspace, WorkstreamPrompt};
 
 pub type TransientRun = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
@@ -216,22 +216,52 @@ pub fn root_menu() -> Transient {
         .item("q", "quit", |_, _, cx| cx.quit())
 }
 
-pub fn new_agent_menu(project: String, mode: String, target: String, role: String) -> Transient {
+pub fn new_agent_menu(project: String, workspace: String, role: String) -> Transient {
     Transient::new("new agent")
-        .item("p", format!("project  {project}"), |workspace, window, cx| {
-            workspace.prompt_new_agent_project(window, cx);
-        })
-        .toggle("m", format!("workspace  {mode}"), |workspace, window, cx| {
-            workspace.cycle_new_agent_mode(window, cx);
-        })
-        .item("b", format!("base  {target}"), |workspace, window, cx| {
-            workspace.prompt_new_agent_base(window, cx);
-        })
+        .item(
+            "p",
+            format!("project  {project}"),
+            |workspace, window, cx| {
+                workspace.prompt_new_agent_project(window, cx);
+            },
+        )
+        .item(
+            "w",
+            format!("workspace  {workspace}"),
+            |workspace, window, cx| {
+                workspace.open_new_agent_workspace_transient(window, cx);
+            },
+        )
         .toggle("r", format!("role  {role}"), |workspace, window, cx| {
             workspace.cycle_new_agent_role(window, cx);
         })
         .item("c", "compose", |workspace, window, cx| {
             workspace.compose_new_agent(window, cx);
+        })
+}
+
+pub fn new_agent_workspace_menu() -> Transient {
+    Transient::new("workspace")
+        .item("n", "new on…", |workspace, window, cx| {
+            workspace.prompt_new_agent_workspace(
+                crate::draft_view::StartFieldMode::NewOn,
+                window,
+                cx,
+            );
+        })
+        .item("j", "join…", |workspace, window, cx| {
+            workspace.prompt_new_agent_workspace(
+                crate::draft_view::StartFieldMode::Join,
+                window,
+                cx,
+            );
+        })
+        .item("s", "sandbox on…", |workspace, window, cx| {
+            workspace.prompt_new_agent_workspace(
+                crate::draft_view::StartFieldMode::Sandbox,
+                window,
+                cx,
+            );
         })
 }
 

@@ -34,9 +34,11 @@ const MODE_LABEL_INLAY_ID: usize = 2;
 const START_LABEL_INLAY_ID: usize = 3;
 const START_TARGET_HINT_INLAY_ID: usize = 4;
 
-/// The start field's default base: the parents of the user's working copy —
-/// visible and editable rather than an empty field with implicit meaning.
-pub const DEFAULT_START: &str = "@-";
+/// The user-facing name for selecting the first available conventional base.
+pub const DEFAULT_START: &str = "auto";
+/// The jj revset represented by [`DEFAULT_START`].
+pub const AUTO_BASE_REVSET: &str =
+    r#"coalesce(bookmarks(exact:"main"), bookmarks(exact:"master"), trunk())"#;
 pub const DEFAULT_ROLE: &str = "eng";
 
 /// How the start field's target is interpreted; cycled with Shift-Tab while

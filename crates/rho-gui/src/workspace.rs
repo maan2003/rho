@@ -183,9 +183,56 @@ pub enum WorkstreamPrompt {
 #[derive(Clone)]
 struct NewAgentDraft {
     workdir: Option<Utf8PathBuf>,
-    mode: crate::draft_view::StartFieldMode,
-    target: String,
+    workspace: DraftWorkspace,
     role: String,
+}
+
+#[derive(Clone)]
+enum DraftWorkspace {
+    NewOn(DraftBase),
+    Join(String),
+    Sandbox(DraftBase),
+}
+
+#[derive(Clone)]
+enum DraftBase {
+    Auto,
+    Explicit(String),
+}
+
+impl DraftBase {
+    fn from_input(input: &str) -> Self {
+        if input.eq_ignore_ascii_case(crate::draft_view::DEFAULT_START) {
+            Self::Auto
+        } else {
+            Self::Explicit(input.to_owned())
+        }
+    }
+
+    fn target(&self) -> &str {
+        match self {
+            Self::Auto => crate::draft_view::DEFAULT_START,
+            Self::Explicit(target) => target,
+        }
+    }
+}
+
+impl DraftWorkspace {
+    fn label(&self) -> String {
+        match self {
+            Self::NewOn(base) => format!("new on {}", base.target()),
+            Self::Join(target) => format!("join {target}"),
+            Self::Sandbox(base) => format!("sandbox on {}", base.target()),
+        }
+    }
+
+    fn mode_and_target(&self) -> (crate::draft_view::StartFieldMode, &str) {
+        match self {
+            Self::NewOn(base) => (crate::draft_view::StartFieldMode::NewOn, base.target()),
+            Self::Join(target) => (crate::draft_view::StartFieldMode::Join, target),
+            Self::Sandbox(base) => (crate::draft_view::StartFieldMode::Sandbox, base.target()),
+        }
+    }
 }
 
 impl WorkstreamPrompt {
@@ -703,12 +750,12 @@ impl Workspace {
         });
     }
 
-    /// Interprets the draft's start field (seeded with `@-`, the parents of
-    /// your working copy). An agent label resolves to the agent's workspace
-    /// — `<name>@` as a stacking base, or the workspace itself for Join;
-    /// anything else is a revset (stacking only). `user` is only meaningful
-    /// for Join — your own checkout. Agent targets carry their own repo;
-    /// `workdir` is only needed (and only checked) for the other arms.
+    /// Interprets the draft's start field (`auto` selects the first available
+    /// local `main`, local `master`, or `trunk()`). An agent label resolves to
+    /// the agent's workspace — `<name>@` as a stacking base, or the workspace
+    /// itself for Join; anything else is a revset (stacking only). `user` is
+    /// only meaningful for Join — your own checkout. Agent targets carry their
+    /// own repo; `workdir` is only needed (and only checked) for the other arms.
     fn parse_start(
         &self,
         mode: crate::draft_view::StartFieldMode,
@@ -750,7 +797,12 @@ impl Workspace {
             }
             (StartFieldMode::Sandbox, _, None) => StartMode::Sandbox {
                 repo: require_workdir()?,
-                revset: target.to_owned(),
+                revset: if target.eq_ignore_ascii_case(crate::draft_view::DEFAULT_START) {
+                    crate::draft_view::AUTO_BASE_REVSET
+                } else {
+                    target
+                }
+                .to_owned(),
             },
             (StartFieldMode::NewOn, "", _) => {
                 return Err("pick a base: a revset like `@-` or an agent label".to_owned());
@@ -784,7 +836,12 @@ impl Workspace {
                 }
                 StartMode::NewOn {
                     repo: require_workdir()?,
-                    revset: target.to_owned(),
+                    revset: if target.eq_ignore_ascii_case(crate::draft_view::DEFAULT_START) {
+                        crate::draft_view::AUTO_BASE_REVSET
+                    } else {
+                        target
+                    }
+                    .to_owned(),
                 }
             }
             (StartFieldMode::Join, _, Some(workspace)) => {
@@ -2500,8 +2557,7 @@ impl Workspace {
             });
             self.new_agent_draft = Some(NewAgentDraft {
                 workdir,
-                mode: crate::draft_view::StartFieldMode::NewOn,
-                target: crate::draft_view::DEFAULT_START.to_owned(),
+                workspace: DraftWorkspace::NewOn(DraftBase::Auto),
                 role: crate::draft_view::DEFAULT_ROLE.to_owned(),
             });
         }
@@ -2511,16 +2567,10 @@ impl Workspace {
             .as_deref()
             .map(|path| self.workdir_label(path))
             .unwrap_or_else(|| "<choose>".to_owned());
-        let mode = match draft.mode {
-            crate::draft_view::StartFieldMode::NewOn => "new on",
-            crate::draft_view::StartFieldMode::Join => "join",
-            crate::draft_view::StartFieldMode::Sandbox => "sandbox",
-        };
         self.open_transient(
             crate::transient::new_agent_menu(
                 project,
-                mode.to_owned(),
-                draft.target.clone(),
+                draft.workspace.label(),
                 draft.role.clone(),
             ),
             window,
@@ -2565,82 +2615,76 @@ impl Workspace {
         self.open_prompt("project:", complete, on_submit, window, cx);
     }
 
-    pub(crate) fn prompt_new_agent_base(
+    pub(crate) fn open_new_agent_workspace_transient(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
-            let needle = input.trim().to_lowercase();
-            let mut candidates = workspace.live_agent_targets();
-            if workspace
-                .new_agent_draft
-                .as_ref()
-                .is_some_and(|draft| draft.mode == crate::draft_view::StartFieldMode::Join)
-            {
+        self.open_transient(crate::transient::new_agent_workspace_menu(), window, cx);
+    }
+
+    pub(crate) fn prompt_new_agent_workspace(
+        &mut self,
+        mode: crate::draft_view::StartFieldMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::draft_view::StartFieldMode;
+
+        let complete =
+            std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &gpui::App| {
+                let needle = input.trim().to_lowercase();
+                let mut candidates = workspace.live_agent_targets();
                 candidates.insert(
                     0,
-                    crate::commands::Candidate {
-                        value: "user".to_owned(),
-                        description: "your checkout".to_owned(),
+                    if mode == StartFieldMode::Join {
+                        crate::commands::Candidate {
+                            value: "user".to_owned(),
+                            description: "your checkout".to_owned(),
+                        }
+                    } else {
+                        crate::commands::Candidate {
+                            value: crate::draft_view::DEFAULT_START.to_owned(),
+                            description: "local main → local master → trunk".to_owned(),
+                        }
                     },
                 );
-            }
-            candidates
-                .into_iter()
-                .filter(|candidate| {
-                    candidate.value.to_lowercase().contains(&needle)
-                        || candidate.description.to_lowercase().contains(&needle)
-                })
-                .collect()
-        });
+                candidates
+                    .into_iter()
+                    .filter(|candidate| {
+                        candidate.value.to_lowercase().contains(&needle)
+                            || candidate.description.to_lowercase().contains(&needle)
+                    })
+                    .collect()
+            });
         let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
                 let input = input.trim();
                 if !input.is_empty()
                     && let Some(draft) = &mut workspace.new_agent_draft
                 {
-                    draft.target = input.to_owned();
+                    draft.workspace = match mode {
+                        StartFieldMode::NewOn => {
+                            DraftWorkspace::NewOn(DraftBase::from_input(input))
+                        }
+                        StartFieldMode::Join => DraftWorkspace::Join(input.to_owned()),
+                        StartFieldMode::Sandbox => {
+                            DraftWorkspace::Sandbox(DraftBase::from_input(input))
+                        }
+                    };
                 }
                 workspace.open_new_agent_transient(window, cx);
             },
         );
-        let prompt = if self
-            .new_agent_draft
-            .as_ref()
-            .is_some_and(|draft| draft.mode == crate::draft_view::StartFieldMode::Join)
-        {
-            "join target:"
-        } else {
-            "base:"
+        let prompt = match mode {
+            StartFieldMode::NewOn => "new workspace on:",
+            StartFieldMode::Join => "join workspace:",
+            StartFieldMode::Sandbox => "sandbox on:",
         };
         self.open_prompt(prompt, complete, on_submit, window, cx);
-    }
-
-    pub(crate) fn cycle_new_agent_mode(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(draft) = &mut self.new_agent_draft {
-            use crate::draft_view::StartFieldMode;
-            draft.mode = match draft.mode {
-                StartFieldMode::NewOn => StartFieldMode::Join,
-                StartFieldMode::Join => StartFieldMode::Sandbox,
-                StartFieldMode::Sandbox => StartFieldMode::NewOn,
-            };
-            if draft.mode == StartFieldMode::Join && draft.target == crate::draft_view::DEFAULT_START
-            {
-                draft.target = "user".to_owned();
-            } else if draft.mode != StartFieldMode::Join && draft.target.eq_ignore_ascii_case("user")
-            {
-                draft.target = crate::draft_view::DEFAULT_START.to_owned();
-            }
-        }
-        self.open_new_agent_transient(window, cx);
     }
 
     pub(crate) fn cycle_new_agent_role(
@@ -2667,15 +2711,7 @@ impl Workspace {
             .as_deref()
             .map(|path| self.workdir_label(path))
             .unwrap_or_else(|| "no project".to_owned());
-        let mode = match draft.mode {
-            crate::draft_view::StartFieldMode::NewOn => "new on",
-            crate::draft_view::StartFieldMode::Join => "join",
-            crate::draft_view::StartFieldMode::Sandbox => "sandbox",
-        };
-        let summary = format!(
-            "{project} · {} · {mode} {}",
-            draft.role, draft.target
-        );
+        let summary = format!("{project} · {} · {}", draft.role, draft.workspace.label());
         self.dashboard.open_new_draft(summary, cx);
         let handle = self.dashboard.focus_handle(cx);
         window.focus(&handle, cx);
@@ -2687,7 +2723,8 @@ impl Workspace {
             .new_agent_draft
             .as_ref()
             .ok_or_else(|| "new agent has no launch configuration".to_owned())?;
-        let start = self.parse_start(draft.mode, &draft.target, draft.workdir.clone())?;
+        let (mode, target) = draft.workspace.mode_and_target();
+        let start = self.parse_start(mode, target, draft.workdir.clone())?;
         let role = parse_agent_role(&draft.role)?;
         Ok((start, role))
     }

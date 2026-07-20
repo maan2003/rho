@@ -10,6 +10,9 @@ use wasm_bindgen::JsCast as _;
 
 use crate::{App, Phase, conn, md};
 
+const AUTO_BASE_REVSET: &str =
+    r#"coalesce(bookmarks(exact:"main"), bookmarks(exact:"master"), trunk())"#;
+
 pub fn Root(app: App) -> impl IntoView {
     view! {
         <div class="shell" class=("chat-open", move || app.chat_open.get())>
@@ -578,7 +581,7 @@ fn NewAgentPage(app: App) -> impl IntoView {
     let role = RwSignal::new("eng".to_owned());
     let join = RwSignal::new(false);
     let sandbox = RwSignal::new(false);
-    let revset = RwSignal::new("@-".to_owned());
+    let revset = RwSignal::new("auto".to_owned());
     let area: NodeRef<html::Textarea> = NodeRef::new();
     let create = move || {
         let Some(element) = area.get_untracked() else {
@@ -591,13 +594,18 @@ fn NewAgentPage(app: App) -> impl IntoView {
             app.show_toast("Pick a repository and write a first message.".to_owned());
             return;
         }
+        let revset = revset.get_untracked();
         app.send(FromBrowser::NewAgent {
             topic_id: topic_id.get_untracked(),
             repo,
             role: role.get_untracked(),
             join: join.get_untracked(),
             sandbox: sandbox.get_untracked(),
-            revset: revset.get_untracked(),
+            revset: if revset.eq_ignore_ascii_case("auto") {
+                AUTO_BASE_REVSET.to_owned()
+            } else {
+                revset
+            },
             text: text.to_owned(),
         });
     };
@@ -665,7 +673,9 @@ fn NewAgentPage(app: App) -> impl IntoView {
                         </label>
                         <div class="revset" class:hidden=move || join.get()>
                             <label>"Base revision"</label>
-                            <input value="@-" on:input=move |event| revset.set(event_target_value(&event)) />
+                            <input value="auto"
+                                on:input=move |event| revset.set(event_target_value(&event)) />
+                            <small>"Local main, then local master, then trunk"</small>
                         </div>
                     </section>
                 </div>
