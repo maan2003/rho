@@ -98,6 +98,27 @@ async fn write_stdin_continues_a_running_process() {
 }
 
 #[tokio::test]
+async fn reaps_a_session_that_exits_without_another_poll() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("pid");
+    let tools = test_tools(2);
+    let result = tools
+        .call(shell_call(json!({
+            "cmd": format!("printf '%s' $$ > {}; sleep 0.05", pid_file.display()),
+            "yield_time_ms": 1
+        })))
+        .await;
+    assert!(result.output.as_ref().contains("Process running"));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    assert!(
+        !std::path::Path::new("/proc").join(pid).exists(),
+        "unpolled shell session was not reaped"
+    );
+}
+
+#[tokio::test]
 async fn shell_command_inherits_tool_environment() {
     let tools = test_tools(2).with_env("RHO_AGENT_ID", "agent-id");
     let result = tools

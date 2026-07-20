@@ -52,10 +52,16 @@ async fn collect_process_output(
     let deadline = time::Instant::now() + yield_time.min(Duration::from_secs(300));
     let mut output = BoundedOutput::new(MAX_OUTPUT_BYTES);
     let status = loop {
-        if let Some(status) = session.child.try_wait()? {
+        if let Some(status) = session.status {
             break Some(status);
         }
         tokio::select! {
+            biased;
+            status = &mut session.wait_task => {
+                let status = status.map_err(|error| anyhow!("shell wait task failed: {error}"))??;
+                session.status = Some(status);
+                break Some(status);
+            }
             chunk = session.output_rx.recv() => {
                 if let Some(chunk) = chunk { output.push(&chunk); }
             }
@@ -190,8 +196,18 @@ struct ProcessManager {
 
 #[derive(Debug)]
 struct ProcessSession {
-    child: tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    wait_task: tokio::task::JoinHandle<io::Result<std::process::ExitStatus>>,
+    status: Option<std::process::ExitStatus>,
     output_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+impl Drop for ProcessSession {
+    fn drop(&mut self) {
+        // Cancelling the waiter drops its `Child`; `kill_on_drop` terminates a
+        // live command and Tokio's orphan queue takes responsibility for reap.
+        self.wait_task.abort();
+    }
 }
 
 impl Default for ProcessManager {
@@ -452,6 +468,10 @@ impl ShellTools {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture command stdin"))?;
         let stdout = child
             .stdout
             .take()
@@ -466,7 +486,13 @@ impl ShellTools {
 
         drop(stdout_task);
         drop(stderr_task);
-        let mut session = ProcessSession { child, output_rx };
+        let wait_task = tokio::spawn(async move { child.wait().await });
+        let mut session = ProcessSession {
+            stdin: Some(stdin),
+            wait_task,
+            status: None,
+            output_rx,
+        };
         let (status, output) =
             collect_process_output(&mut session, Duration::from_millis(args.yield_time_ms)).await?;
         let process_id = status
@@ -496,7 +522,6 @@ impl ShellTools {
             .ok_or_else(|| anyhow!("unknown session ID {}", args.session_id))?;
         if !args.chars.is_empty() {
             let stdin = session
-                .child
                 .stdin
                 .as_mut()
                 .ok_or_else(|| anyhow!("session stdin is closed"))?;
