@@ -1087,51 +1087,41 @@ fn test_workspaces_updated_by_other_with_changes_in_working_copy_automatic() {
     [EOF]
     ");
 
-    // The first working copy gets automatically updated.
+    // The first working copy was already updated on disk when the `squash`
+    // command snapshotted all workspaces, so no staleness arises: the
+    // modification lands directly in the updated working-copy commit.
     secondary_dir.write_file("file", "modified contents\n");
     let output = secondary_dir.run_jj(["describe", "-m", "modified"]);
     insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Concurrent modification detected, resolving automatically.
-    Rebased 1 descendant commits onto commits rewritten by other operation.
-    Working copy  (@) now at: pmmvwywv/2 90f3d42e (divergent) (empty) (no description set)
-    Parent commit (@-)      : qpvuntsm b853f7c8 (no description set)
-    Added 0 files, modified 1 files, removed 0 files
-    Updated working copy to fresh commit 90f3d42e0bff
-    Working copy  (@) now at: pmmvwywv/0 c38323e3 (divergent) (empty) modified
+    Working copy  (@) now at: pmmvwywv 4b16c3a1 modified
     Parent commit (@-)      : qpvuntsm b853f7c8 (no description set)
     [EOF]
     ");
 
-    // The snapshotting of the modified contents happens on top of the old
-    // operation. The `describe` operation itself happens on top the reconciled
-    // operation.
+    // The operation log stays linear: every command snapshots all workspaces,
+    // so the secondary working copy never falls behind and no reconciliation
+    // is needed.
     let output = main_dir.run_jj(["op", "log", "-Tdescription"]);
     insta::assert_snapshot!(output, @"
-    @  describe commit 90f3d42e0bff073721e2640e32c18fb1c386d7ce
-    ○    reconcile divergent operations
-    ├─╮
-    ○ │  squash commits into 9a462e35578a347e6a3951bf7a58ad7146959a8b
-    ○ │  snapshot working copy
-    │ ○  snapshot working copy
-    ├─╯
+    @  describe commit 2207ea20e15f0bdcfe5ce93dc4af246322fd8623
+    ○  snapshot working copies
+    ○  squash commits into 9a462e35578a347e6a3951bf7a58ad7146959a8b
+    ○  snapshot working copies
     ○  create initial working-copy commit in workspace secondary
     ○  add workspace 'secondary'
     ○  new empty commit
-    ○  snapshot working copy
+    ○  snapshot working copies
     ○  add workspace 'default'
     ○
     [EOF]
     ");
 
-    // We get divergence between the newly described commit and the commit created
-    // by snapshotting (the reconciliation happened to point secondary@ to the child
-    // of the squashed commit rather than the snapshot commit).
+    // No divergence: the modification was snapshotted into the already
+    // updated working-copy commit.
     insta::assert_snapshot!(get_log_output(&secondary_dir),
     @r#"
-    @  c38323e3e6f3 secondary@ (divergent) "modified"
-    │ ×  48a90f069c8c (divergent)
-    ├─╯
+    @  4b16c3a1a98f secondary@ "modified"
     │ ○  3a9b690d6e67 default@
     ├─╯
     ○  b853f7c8b006

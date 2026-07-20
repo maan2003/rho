@@ -1513,18 +1513,7 @@ impl WorkspaceCommandHelper {
             let mut pending_snapshot_groups = group_pending_snapshots(&mut pending_snapshots);
             topo_order_pending_snapshot_groups(tx.repo(), &mut pending_snapshot_groups)?;
             for snapshot_group in pending_snapshot_groups {
-                if let Some(commit) =
-                    write_pending_snapshot_group_to_tx(ui, &mut tx, &snapshot_group).await?
-                {
-                    for snapshot in snapshot_group {
-                        if commit.tree().tree_ids_and_labels()
-                            != snapshot.new_tree.tree_ids_and_labels()
-                        {
-                            checkout_commit_ids
-                                .insert(snapshot.workspace_name.clone(), commit.id().clone());
-                        }
-                    }
-                }
+                write_pending_snapshot_group_to_tx(ui, &self.env, &mut tx, &snapshot_group).await?;
             }
             let num_rebased = tx
                 .repo_mut()
@@ -1537,6 +1526,30 @@ impl WorkspaceCommandHelper {
                     "Rebased {num_rebased} descendant commits onto updated working copies"
                 )
                 .map_err(snapshot_command_error)?;
+            }
+            // Decide which working copies need their on-disk state updated
+            // from the FINAL view: rebasing descendants may have moved a
+            // snapshotted workspace's commit (e.g. a dirty child stacked on
+            // a dirty parent), and comparing against the pre-rebase commit
+            // would leave stale on-disk trees that later checkouts reject as
+            // concurrent.
+            for snapshot in current_snapshot
+                .iter()
+                .chain(secondary_snapshots.iter().map(|pending| &pending.snapshot))
+            {
+                let Some(commit_id) = tx.repo().view().get_wc_commit_id(&snapshot.workspace_name)
+                else {
+                    continue;
+                };
+                let commit = tx
+                    .repo()
+                    .store()
+                    .get_commit(commit_id)
+                    .map_err(snapshot_command_error)?;
+                if commit.tree().tree_ids_and_labels() != snapshot.new_tree.tree_ids_and_labels() {
+                    checkout_commit_ids
+                        .insert(snapshot.workspace_name.clone(), commit.id().clone());
+                }
             }
             #[cfg(feature = "git")]
             self.export_rebased_git_heads_for_workspaces(ui, &mut tx)
@@ -3422,6 +3435,7 @@ async fn rebase_mutable_descendants(
 
 async fn write_pending_snapshot_group_to_tx(
     ui: &Ui,
+    env: &WorkspaceCommandEnvironment,
     tx: &mut Transaction,
     snapshots: &[&PendingWorkspaceSnapshot],
 ) -> Result<Option<Commit>, SnapshotWorkingCopyError> {
@@ -3457,7 +3471,39 @@ async fn write_pending_snapshot_group_to_tx(
         return Ok(None);
     }
 
-    let commit = if parents_changed {
+    let immutable_expr = env
+        .resolve_immutable_expression(tx.repo())
+        .map_err(snapshot_command_error)?;
+    let wc_immutable = tree_changed
+        && immutable_expr
+            .intersection(&RevsetExpression::commit(wc_commit.id().clone()))
+            .evaluate(tx.repo())
+            .map_err(snapshot_command_error)?
+            .stream()
+            .try_next()
+            .await
+            .map_err(snapshot_command_error)?
+            .is_some();
+
+    let commit = if wc_immutable {
+        // An immutable commit's parents are also immutable, so they can't
+        // have been rewritten in this transaction.
+        debug_assert!(!parents_changed);
+        let new_tree =
+            merge_group_snapshot_trees(snapshots, &old_tree, &new_trees, old_tree.clone()).await?;
+        let commit = tx
+            .repo_mut()
+            .new_commit(vec![wc_commit.id().clone()], new_tree)
+            .write()
+            .await
+            .map_err(snapshot_command_error)?;
+        writeln!(
+            ui.warning_default(),
+            "The working-copy commit is immutable; a new commit has been created on top of it.",
+        )
+        .map_err(snapshot_command_error)?;
+        commit
+    } else if parents_changed {
         let builder = CommitRewriter::new(tx.repo_mut(), wc_commit.clone(), parent_ids)
             .rebase()
             .await
@@ -3488,6 +3534,12 @@ async fn write_pending_snapshot_group_to_tx(
             .map_err(snapshot_command_error)?
     };
     for snapshot in snapshots {
+        // A clean workspace stays checked out on the immutable commit; only
+        // workspaces with new changes move to the commit created on top.
+        if wc_immutable && snapshot.new_tree.tree_ids_and_labels() == old_tree.tree_ids_and_labels()
+        {
+            continue;
+        }
         tx.repo_mut()
             .set_wc_commit(snapshot.workspace_name.clone(), commit.id().clone())
             .map_err(snapshot_command_error)?;
