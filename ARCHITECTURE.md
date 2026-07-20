@@ -154,7 +154,7 @@ ref. With a GitHub token, standard GitHub fetches and pushes wholly below
 `refs/heads/rho/*` use the private Nix-patched `git-remote-http` through Octo's
 Unix-socket smart-HTTP proxy. A push batch containing any other destination is
 performed by `git send-pack` over a raw Git-protocol stream instead; no HTTP
-push is attempted first. Without a token, or for another SSH host, fetches use
+push is attempted first. Without a token, and always for SourceHut, fetches use
 Git's raw `connect` capability while receive-pack connection attempts fall back
 to the helper's `push` capability. The helper reports local remote-tracking
 refs for `list for-push`, learns the requested destination refs, and sends every
@@ -180,10 +180,15 @@ process-local Git `insteadOf` entries into every agent,
 terminal, and internal workspace-management subprocess. Standard
 `git@github.com:OWNER/REPOSITORY.git` and
 `ssh://git@github.com/OWNER/REPOSITORY.git` remotes then select
-`git-remote-octo` without changing repository or user Git configuration. The
-explicit `octo://[USER@]HOST[:PORT]/REPOSITORY` form remains supported for
-other destinations. There is no failover after an approved GUI claims an
-operation; retrying starts a fresh provider race.
+`git-remote-octo` without changing repository or user Git configuration.
+SourceHut's `git@git.sr.ht:~USER/REPOSITORY` and equivalent SSH URL are also
+rewritten, but are never PAT-eligible, so both fetches and pushes require GUI
+approval. Explicit `octo://` URLs are restricted to these two hosts, SSH user
+`git`, and normalized two-component repository paths: `OWNER/REPOSITORY` for
+GitHub and `~USER/REPOSITORY` for SourceHut. Repository components are ASCII
+alphanumeric, and an input `.git` suffix is removed before validation. There is
+no failover after an approved GUI claims an operation; retrying starts a fresh
+provider race.
 
 `rho-pr-monitor` owns long-lived pull-request policy while Octo remains only
 the authenticated GitHub API boundary. Engineers create or adopt PRs through

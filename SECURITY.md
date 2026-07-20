@@ -117,15 +117,18 @@ AI APIs.
   claims the credential-provider role. Every other recipient receives only an opaque `Done` for that
   request id, revealing neither winner nor outcome. With no provider the daemon
   rejects immediately; after 60 seconds without a claim it rejects the
-  request. A winning GUI validates bounded typed
-  host/user/port/repository/service fields and destination refs. It asks before
+  request. A winning GUI permits only hosts `github.com` and `git.sr.ht`, fixes
+  the SSH user to `git`, and validates the port, normalized two-component
+  repository path, service, and destination refs. The username is therefore
+  omitted from the approval prompt. It asks before
   starting OpenSSH. For pushes it independently parses the actual bounded
   receive-pack command list and requires its destination-ref set to exactly
   match the approved plan. Any missing, additional, duplicated, or changed ref
   fails closed without a second prompt or any client-to-OpenSSH bytes. The
   approval and provider claim are one operation with a 60-second deadline. Ref names,
   repository fields, and prompts use a conservative character set and prompt
-  text replaces control and bidirectional formatting characters. Push options,
+  text replaces control and bidirectional formatting characters. The helper
+  and GUI both enforce the same host, user, and repository rules. Push options,
   signed pushes, unknown framing, and unsupported object-id sizes fail closed.
   The daemon-side remote helper runs the same command parser, but the GUI never
   relies on that validation to protect its credential.
@@ -295,7 +298,8 @@ AI APIs.
   incidentally from the daemon environment.
 - Rho forces all daemon-owned agent, terminal, and internal workspace
   subprocesses through process-local Git URL rewrites for the exact
-  `git@github.com:` and `ssh://git@github.com/` prefixes. It appends these
+  `git@github.com:`, `ssh://git@github.com/`, `git@git.sr.ht:`, and
+  `ssh://git@git.sr.ht/` prefixes. It appends these
   entries to the captured `GIT_CONFIG_COUNT` environment without writing
   repository or user Git configuration; other hosts and GitHub SSH aliases
   keep their normal transport.

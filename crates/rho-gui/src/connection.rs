@@ -627,8 +627,7 @@ async fn run_git_transport_provider(
     }
     let prompt = match request.service {
         GitService::UploadPack => format!(
-            "Fetch via SSH from {}@{}:{}/{}? [shift-Y/N]",
-            display_field(&request.user),
+            "Fetch via SSH from {}:{}/{}? [shift-Y/N]",
             display_field(&request.host),
             request.port,
             display_field(&request.repository),
@@ -771,8 +770,7 @@ fn receive_pack_refs_match(
 
 fn git_push_prompt(request: &GitTransportRequest, planned_refs: &[String]) -> String {
     let destination = format!(
-        "ssh://{}@{}:{}/{}",
-        display_field(&request.user),
+        "ssh://{}:{}/{}",
         display_field(&request.host),
         request.port,
         display_field(&request.repository)
@@ -860,39 +858,13 @@ where
 
 fn validate_git_transport_request(request: &GitTransportRequest) -> anyhow::Result<()> {
     anyhow::ensure!(
-        !request.host.is_empty()
-            && request.host.len() <= 255
-            && !request.host.starts_with('-')
-            && request.host.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':')
-            }),
+        matches!(request.host.as_str(), "github.com" | "git.sr.ht"),
         "invalid SSH Git host"
     );
     anyhow::ensure!(request.port != 0, "invalid SSH Git port");
+    anyhow::ensure!(request.user == "git", "invalid SSH Git user");
     anyhow::ensure!(
-        !request.user.is_empty()
-            && request.user.len() <= 64
-            && !request.user.starts_with('-')
-            && request
-                .user
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
-        "invalid SSH Git user"
-    );
-    anyhow::ensure!(
-        !request.repository.is_empty()
-            && request.repository.len() <= 1024
-            && !request.repository.starts_with(['-', '/'])
-            && !request.repository.contains("//")
-            && request.repository.split('/').all(|component| {
-                !component.is_empty()
-                    && component != "."
-                    && component != ".."
-                    && !component.starts_with('-')
-                    && component.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-                    })
-            }),
+        octo_types::valid_ssh_repository(&request.host, &request.repository),
         "invalid SSH Git repository path"
     );
     match (&request.service, &request.planned_refs) {
@@ -1198,15 +1170,28 @@ mod tests {
     #[test]
     fn client_rejects_unsafe_git_transport_fields() {
         let valid = GitTransportRequest {
-            host: "git.example".to_owned(),
+            host: "github.com".to_owned(),
             port: 22,
             user: "git".to_owned(),
-            repository: "team/repo.git".to_owned(),
+            repository: "team/repo".to_owned(),
             service: GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
         assert!(validate_git_transport_request(&valid).is_ok());
-        for repository in ["../repo", "-oProxyCommand=bad", "team//repo"] {
+        let mut sourcehut = valid.clone();
+        sourcehut.host = "git.sr.ht".to_owned();
+        sourcehut.repository = "~alice/project".to_owned();
+        assert!(validate_git_transport_request(&sourcehut).is_ok());
+        for host in ["github.com", "git.sr.ht"] {
+            let mut request = valid.clone();
+            request.host = host.to_owned();
+            request.user = "root".to_owned();
+            assert!(validate_git_transport_request(&request).is_err());
+        }
+        let mut unknown_host = valid.clone();
+        unknown_host.host = "git.example".to_owned();
+        assert!(validate_git_transport_request(&unknown_host).is_err());
+        for repository in ["../repo", "team/repo-name", "team/repo.git", "team//repo"] {
             let mut request = valid.clone();
             request.repository = repository.to_owned();
             assert!(validate_git_transport_request(&request).is_err());
@@ -1242,7 +1227,7 @@ mod tests {
             host: "github.com".to_owned(),
             port: 2222,
             user: "git".to_owned(),
-            repository: "acme/repo.git".to_owned(),
+            repository: "acme/repo".to_owned(),
             service: GitService::ReceivePack,
             planned_refs: Some(vec![
                 "refs/heads/main".to_owned(),
@@ -1252,7 +1237,8 @@ mod tests {
             ]),
         };
         let prompt = git_push_prompt(&request, request.planned_refs.as_deref().unwrap());
-        assert!(prompt.contains("ssh://git@github.com:2222/acme/repo.git"));
+        assert!(prompt.contains("ssh://github.com:2222/acme/repo"));
+        assert!(!prompt.contains("git@"));
         assert!(prompt.contains("branch main"));
         assert!(prompt.contains("tag v1"));
         assert!(prompt.contains("branch rho/test"));

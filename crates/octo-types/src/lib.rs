@@ -120,6 +120,26 @@ pub fn valid_git_ref(reference: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
 }
 
+pub fn valid_ssh_repository(host: &str, value: &str) -> bool {
+    let value = match host {
+        "github.com" => value,
+        "git.sr.ht" => {
+            let Some(value) = value.strip_prefix('~') else {
+                return false;
+            };
+            value
+        }
+        _ => return false,
+    };
+    let mut components = value.split('/');
+    let valid = |component: &str| {
+        !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    };
+    components.next().is_some_and(valid)
+        && components.next().is_some_and(valid)
+        && components.next().is_none()
+}
+
 /// Socket shared by Octo API clients, the HTTP Git helper, and Rho daemon.
 pub fn socket_path() -> std::io::Result<std::path::PathBuf> {
     dirs::runtime_dir()
@@ -266,5 +286,19 @@ mod git_tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_allowlisted_repository_shapes() {
+        assert!(valid_ssh_repository("github.com", "acme/project"));
+        assert!(valid_ssh_repository("git.sr.ht", "~alice/project"));
+        for (host, repository) in [
+            ("github.com", "acme/project-name"),
+            ("github.com", "acme/project.git"),
+            ("git.sr.ht", "alice/project"),
+            ("git.sr.ht", "~alice/project-name"),
+        ] {
+            assert!(!valid_ssh_repository(host, repository));
+        }
     }
 }

@@ -107,6 +107,11 @@ fn configure_octo_git_transport(environment: &mut Vec<(OsString, OsString)>) -> 
     let rewrites = [
         ("url.octo://github.com/.insteadOf", "git@github.com:"),
         ("url.octo://github.com/.insteadOf", "ssh://git@github.com/"),
+        ("url.octo://git@git.sr.ht/.insteadOf", "git@git.sr.ht:"),
+        (
+            "url.octo://git@git.sr.ht/.insteadOf",
+            "ssh://git@git.sr.ht/",
+        ),
     ];
     let new_count = count
         .checked_add(rewrites.len())
@@ -2940,7 +2945,7 @@ mod tests {
 
         assert_eq!(
             environment_value(&environment, "GIT_CONFIG_COUNT"),
-            Some(OsStr::new("3"))
+            Some(OsStr::new("5"))
         );
         assert_eq!(
             environment_value(&environment, "GIT_CONFIG_KEY_0"),
@@ -2961,6 +2966,18 @@ mod tests {
         assert_eq!(
             environment_value(&environment, "GIT_CONFIG_VALUE_2"),
             Some(OsStr::new("ssh://git@github.com/"))
+        );
+        assert_eq!(
+            environment_value(&environment, "GIT_CONFIG_KEY_3"),
+            Some(OsStr::new("url.octo://git@git.sr.ht/.insteadOf"))
+        );
+        assert_eq!(
+            environment_value(&environment, "GIT_CONFIG_VALUE_3"),
+            Some(OsStr::new("git@git.sr.ht:"))
+        );
+        assert_eq!(
+            environment_value(&environment, "GIT_CONFIG_VALUE_4"),
+            Some(OsStr::new("ssh://git@git.sr.ht/"))
         );
     }
 

@@ -786,10 +786,11 @@ fn parse_remote(value: &str) -> Result<Remote> {
     } else {
         url.username()
     };
-    anyhow::ensure!(valid_user(user), "invalid SSH Git user");
+    anyhow::ensure!(user == "git", "invalid SSH Git user");
     let repository = url.path().trim_start_matches('/');
+    let repository = repository.strip_suffix(".git").unwrap_or(repository);
     anyhow::ensure!(
-        valid_repository(repository),
+        octo_types::valid_ssh_repository(host, repository),
         "invalid SSH Git repository path"
     );
 
@@ -806,37 +807,7 @@ fn parse_remote(value: &str) -> Result<Remote> {
 }
 
 fn valid_host(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 255
-        && !value.starts_with('-')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'))
-}
-
-fn valid_user(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && !value.starts_with('-')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
-fn valid_repository(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 1024
-        && !value.starts_with(['-', '/'])
-        && !value.contains("//")
-        && value.split('/').all(|component| {
-            !component.is_empty()
-                && component != "."
-                && component != ".."
-                && !component.starts_with('-')
-                && component
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        })
+    matches!(value, "github.com" | "git.sr.ht")
 }
 
 #[cfg(test)]
@@ -847,6 +818,7 @@ mod tests {
     fn parses_github_compatibility_remote() {
         let remote = parse_remote("octo://github.com/acme/library.git").unwrap();
         assert!(remote.github_http_eligible());
+        assert_eq!(remote.request.repository, "acme/library");
         assert_eq!(
             remote.http_url().unwrap(),
             "http://localhost/git/acme/library.git"
@@ -854,13 +826,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_generic_ssh_remote() {
-        let remote = parse_remote("octo://deploy@git.example.test:2222/team/project.git").unwrap();
+    fn rejects_non_allowlisted_ssh_remote() {
+        assert!(parse_remote("octo://git@git.example.test/team/project").is_err());
+    }
+
+    #[test]
+    fn parses_sourcehut_remote() {
+        let remote = parse_remote("octo://git@git.sr.ht/~alice/project.git").unwrap();
         assert!(!remote.github_http_eligible());
-        assert_eq!(remote.request.host, "git.example.test");
-        assert_eq!(remote.request.port, 2222);
-        assert_eq!(remote.request.user, "deploy");
-        assert_eq!(remote.request.repository, "team/project.git");
+        assert_eq!(remote.request.host, "git.sr.ht");
+        assert_eq!(remote.request.user, "git");
+        assert_eq!(remote.request.repository, "~alice/project");
     }
 
     #[test]
@@ -870,6 +846,11 @@ mod tests {
             "octo://user:password@git.example/repo",
             "octo://git.example/../repo",
             "octo://git.example/-oProxyCommand=bad",
+            "octo://root@github.com/acme/repo",
+            "octo://deploy@git.sr.ht/~alice/repo",
+            "octo://git@github.com/acme/project-name",
+            "octo://git@git.sr.ht/alice/repo",
+            "octo://git@git.sr.ht/~alice/project-name",
             "https://github.com/acme/repo",
         ] {
             assert!(parse_remote(value).is_err(), "accepted {value}");
