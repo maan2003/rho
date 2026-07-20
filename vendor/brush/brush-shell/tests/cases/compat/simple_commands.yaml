@@ -1,0 +1,39 @@
+name: "Simple commands"
+cases:
+  - name: "Simple command"
+    stdin: |
+      echo 1
+
+  - name: "Simple command with reserved word args"
+    stdin: |
+      echo then
+
+  - name: "Command that's a directory"
+    ignore_stderr: true
+    stdin: |
+      mkdir test-dir
+      ./test-dir
+      echo "Result: $?"
+
+  - name: "Non-existent command"
+    ignore_stderr: true
+    stdin: |
+      ./non-existent-command
+      echo "Result: $?"
+
+  - name: "Redirection of errors"
+    stdin: |
+      ./non-existent-command 2>/dev/null
+      echo "Result: $?"
+
+  - name: "Simple command with non-existent cwd"
+    # N.B. We intentionally fail here because there's no safe way to pick an
+    # alternate working directory that we are okay with. To our knowledge,
+    # there's no easy way to hold onto the current working directory past
+    # its deletion.
+    known_failure: true
+    stdin: |
+      mkdir test-dir
+      cd test-dir
+      rmdir $(pwd)
+      ls

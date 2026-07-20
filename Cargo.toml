@@ -30,7 +30,13 @@ members = [
   "crates/senax-encoder/derive",
 ]
 # The web UI is its own workspace: it targets wasm32 and is built with trunk.
-exclude = ["vendor/jj", "vendor/noq", "vendor/noq-proto", "webui"]
+exclude = [
+  "vendor/brush",
+  "vendor/jj",
+  "vendor/noq",
+  "vendor/noq-proto",
+  "webui",
+]
 resolver = "2"
 
 [workspace.package]

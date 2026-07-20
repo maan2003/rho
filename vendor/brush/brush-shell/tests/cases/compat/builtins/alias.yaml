@@ -1,0 +1,33 @@
+name: "Builtins: alias"
+cases:
+  - name: "Basic alias usage"
+    stdin: |
+      shopt -s expand_aliases
+      alias myalias=echo
+      alias
+      myalias 'hello'
+
+  - name: "Alias with trailing space"
+    known_failure: true # Issue #57
+    stdin: |
+      shopt -s expand_aliases
+      alias cmd='echo '
+      alias other='replaced '
+      alias otherother='also-replaced'
+
+      cmd other otherother
+
+  - name: "Alias referencing to alias"
+    known_failure: true # Issue #57
+    stdin: |
+      shopt -s expand_aliases
+      alias myalias=echo
+      alias outeralias=myalias
+      outeralias 'hello'
+
+  - name: "Alias to keywords"
+    known_failure: true # Issue #286
+    stdin: |
+      shopt -s expand_aliases
+      alias myalias=if
+      myalias true; then echo "true"; fi

@@ -1,0 +1,72 @@
+name: "Devcontainer"
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - ".devcontainer/**"
+
+permissions: {}
+
+# Only allow one run of the workflow per branch / PR at a time.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "Build devcontainer"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pre-build dev container image
+        uses: devcontainers/ci@b63b30de439b47a52267f241112c5b453b673db5 # v0.3.1900000449
+        with:
+          imageName: ghcr.io/reubeno/brush/devcontainer
+          imageTag: latest
+          cacheFrom: ghcr.io/reubeno/brush/devcontainer
+          push: never
+
+  build_and_publish:
+    name: "Build and publish devcontainer"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pre-build dev container image
+        uses: devcontainers/ci@b63b30de439b47a52267f241112c5b453b673db5 # v0.3.1900000449
+        with:
+          imageName: ghcr.io/reubeno/brush/devcontainer
+          imageTag: latest
+          cacheFrom: ghcr.io/reubeno/brush/devcontainer
+          push: filter
+          refFilterForPush: refs/heads/main
+          eventFilterForPush: push
