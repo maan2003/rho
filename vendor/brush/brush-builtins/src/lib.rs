@@ -1,5 +1,9 @@
 //! Standard builtins.
 
+// Brush's pinned Clap derive spellings remain functional, but Clap 4.6 marks
+// them deprecated and rho builds dependencies with `-D warnings`.
+#![allow(deprecated)]
+
 #[cfg(feature = "builtin.alias")]
 mod alias;
 #[cfg(feature = "builtin.bg")]
