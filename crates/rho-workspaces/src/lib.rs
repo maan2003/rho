@@ -505,8 +505,7 @@ impl Repo {
         Ok((managed, lease))
     }
 
-    /// Opens a managed workspace. Legacy conversion is deliberately excluded:
-    /// it runs once at database migration rather than on ordinary opens.
+    /// Opens a managed workspace.
     async fn open_managed(
         &self,
         id: WorkspaceId,
@@ -541,48 +540,6 @@ impl Repo {
         };
         self.prepare_managed_checkout(&managed)?;
         Ok((managed, lease))
-    }
-
-    /// Temporary one-shot migration helper. Existing managed IDs pass
-    /// through unchanged; a legacy bare workspace name is adopted by jj while
-    /// preserving its exact working-copy commit.
-    pub async fn adopt_legacy_workspace_info(
-        &self,
-        info: &WorkspaceInfo,
-    ) -> anyhow::Result<WorkspaceInfo> {
-        let Some(id) = info.workspace_id() else {
-            return Ok(info.clone());
-        };
-        let _guard = self.jj_lock.lock().await;
-        let handle = workspace_handle(id);
-        let mut resolve = self.jj();
-        resolve.args(["workspace", "managed", "resolve", &handle]);
-        if run_managed_jj(resolve).await.is_ok() {
-            return Ok(info.clone());
-        }
-
-        let mut adopt = self.jj();
-        adopt.args(["workspace", "managed", "adopt", &id.encoded()]);
-        let managed = run_managed_jj(adopt)
-            .await
-            .context("adopt legacy jj workspace")?;
-        let new_id = managed.id()?;
-        self.prepare_managed_checkout(&managed)?;
-        if matches!(info, WorkspaceInfo::Sandbox { .. }) {
-            let old_base = sandbox_base(&self.root, id)?;
-            let new_base = sandbox_base(&self.root, new_id)?;
-            if old_base.exists() && !new_base.exists() {
-                std::fs::rename(&old_base, &new_base).context("migrate sandbox state directory")?;
-            }
-        }
-        Ok(match info {
-            WorkspaceInfo::Workspace { .. } => self.workspace_info(new_id),
-            WorkspaceInfo::Sandbox { .. } => WorkspaceInfo::Sandbox {
-                repo: self.root.clone(),
-                id: new_id,
-            },
-            WorkspaceInfo::UserCheckout { .. } => unreachable!(),
-        })
     }
 
     fn prepare_managed_checkout(&self, managed: &ManagedWorkspace) -> anyhow::Result<()> {
@@ -1323,9 +1280,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    use super::{
-        Repo, WorkspaceId, WorkspaceIdDomain, copy_mtime_if_same, sandbox_join, workspace_handle,
-    };
+    use super::{Repo, copy_mtime_if_same, sandbox_join};
 
     #[tokio::test]
     async fn repo_cache_weakly_deduplicates_workspaces() {
@@ -1406,92 +1361,6 @@ mod tests {
                 .is_empty()
         );
         std::fs::remove_dir_all(workspace.sandbox_base().unwrap()).unwrap();
-    }
-
-    #[tokio::test]
-    async fn adopts_legacy_bare_workspace_id() {
-        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
-        let repo = temp.path().join("repo");
-        let legacy = temp.path().join("legacy");
-        std::fs::create_dir(&repo).unwrap();
-        assert!(
-            std::process::Command::new("jj")
-                .current_dir(&repo)
-                .args(["git", "init", "--colocate"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        std::fs::write(repo.join("tracked"), "base").unwrap();
-        assert!(
-            std::process::Command::new("jj")
-                .current_dir(&repo)
-                .args(["commit", "-m", "base"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let old_id = WorkspaceId::from_counter(42, &WorkspaceIdDomain(7)).unwrap();
-        assert!(
-            std::process::Command::new("jj")
-                .arg("--repository")
-                .arg(&repo)
-                .args(["workspace", "add", "--name", &old_id.encoded()])
-                .arg(&legacy)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let legacy_commit = std::process::Command::new("jj")
-            .arg("--repository")
-            .arg(&repo)
-            .args([
-                "log",
-                "--no-graph",
-                "-r",
-                &format!("{}@", old_id.encoded()),
-                "-T",
-                "commit_id",
-            ])
-            .output()
-            .unwrap();
-        assert!(legacy_commit.status.success());
-
-        let repo = Arc::new(Repo::open(&repo).unwrap());
-        let old_info = repo.workspace_info(old_id);
-        let new_info = repo.adopt_legacy_workspace_info(&old_info).await.unwrap();
-        let new_id = new_info.workspace_id().unwrap();
-        assert_ne!(new_id, old_id);
-        assert_eq!(new_info.workspace_handle(), Some(workspace_handle(new_id)));
-        let workspace = repo.open_workspace(new_id).await.unwrap();
-        assert!(workspace.checkout().is_dir());
-        let managed_commit = std::process::Command::new("jj")
-            .arg("--repository")
-            .arg(repo.root())
-            .args([
-                "log",
-                "--no-graph",
-                "-r",
-                &format!("{}@", workspace_handle(new_id)),
-                "-T",
-                "commit_id",
-            ])
-            .output()
-            .unwrap();
-        assert!(managed_commit.status.success());
-        assert_eq!(legacy_commit.stdout, managed_commit.stdout);
-        let legacy_lookup = std::process::Command::new("jj")
-            .arg("--repository")
-            .arg(repo.root())
-            .args(["log", "-r", &format!("{}@", old_id.encoded())])
-            .output()
-            .unwrap();
-        assert!(!legacy_lookup.status.success());
-        drop(workspace);
-        assert_eq!(
-            repo.adopt_legacy_workspace_info(&old_info).await.unwrap(),
-            new_info
-        );
     }
 
     #[test]

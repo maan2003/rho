@@ -8,7 +8,6 @@
 //! workspace name, while checkout and lease paths are derived solely from the
 //! repository path and ID.
 
-use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -133,42 +132,13 @@ fn parse_registry(text: &str, path: &Path) -> Result<Registry, CommandError> {
     Ok(Registry { seed, counter })
 }
 
-/// Temporary restart journal for the one-shot Rho migration. It is separate
-/// from the durable registry format so removing adoption support later leaves
-/// only an ignored sidecar, not a compatibility requirement.
-fn load_adoptions(repo_path: &Path) -> Result<BTreeMap<String, String>, CommandError> {
-    let path = repo_path.join("managed-workspace-adoptions");
-    match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| user_error(format!("Malformed {}: {error}", path.display()))),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(error) => Ok(Err(error).context(&path)?),
-    }
-}
-
-fn store_adoptions(
-    repo_path: &Path,
-    adoptions: &BTreeMap<String, String>,
-) -> Result<(), CommandError> {
-    let path = repo_path.join("managed-workspace-adoptions");
-    let pending = path.with_extension("pending");
-    fs::write(&pending, serde_json::to_vec(adoptions).unwrap()).context(&pending)?;
-    fs::rename(&pending, &path).context(&path)?;
-    Ok(())
-}
-
-fn allocate_locked(registry: &mut Registry) -> Result<String, CommandError> {
+fn allocate(repo_path: &Path) -> Result<String, CommandError> {
+    let (lock, mut registry) = RegistryLock::load(repo_path)?;
     let domain = ManagedIdDomain(registry.seed);
     let id = ManagedId::from_counter(registry.counter, &domain)
         .ok_or_else(|| user_error("Managed workspace id space is exhausted"))?
         .encoded();
     registry.counter += 1;
-    Ok(id)
-}
-
-fn allocate(repo_path: &Path) -> Result<String, CommandError> {
-    let (lock, mut registry) = RegistryLock::load(repo_path)?;
-    let id = allocate_locked(&mut registry)?;
     lock.store(&registry)?;
     Ok(id)
 }
@@ -183,7 +153,7 @@ fn resolve_id(repo_path: &Path, handle: &str) -> Result<String, CommandError> {
     }
     let domain = ManagedIdDomain(registry.seed);
     match ManagedId::from_prefix(prefix, registry.counter, &domain) {
-        Ok(PrefixResolution::Unique(id)) | Ok(PrefixResolution::Ambiguous { first: id, .. }) => {
+        Ok(PrefixResolution::Unique(id) | PrefixResolution::Ambiguous { first: id, .. }) => {
             Ok(id.encoded())
         }
         Ok(PrefixResolution::NotFound) | Err(_) => Err(user_error(format!(
@@ -286,8 +256,6 @@ pub enum ManagedWorkspaceCommand {
     Resolve(IdArgs),
     /// Idempotently materialize an allocated workspace
     Attach(AttachArgs),
-    /// Adopt a legacy ordinary workspace under a newly allocated managed ID
-    Adopt(AdoptArgs),
     /// Snapshot and delete stale, unlocked materializations
     Gc(GcArgs),
 }
@@ -313,11 +281,6 @@ pub struct AttachArgs {
     external_lease: bool,
 }
 #[derive(clap::Args, Clone, Debug)]
-pub struct AdoptArgs {
-    /// Legacy ordinary workspace name (including old bare 12-character names)
-    name: WorkspaceNameBuf,
-}
-#[derive(clap::Args, Clone, Debug)]
 pub struct GcArgs {
     /// Only collect roots whose mtime is at least this old
     #[arg(long, default_value_t = 0)]
@@ -334,7 +297,6 @@ pub async fn cmd_managed_workspace(
         ManagedWorkspaceCommand::Create(args) => create(ui, command, args).await,
         ManagedWorkspaceCommand::Resolve(args) => resolve(ui, command, args).await,
         ManagedWorkspaceCommand::Attach(args) => attach(ui, command, args).await,
-        ManagedWorkspaceCommand::Adopt(args) => adopt(ui, command, args).await,
         ManagedWorkspaceCommand::Gc(args) => gc(ui, command, args).await,
     }
 }
@@ -396,65 +358,6 @@ async fn attach(
     let id = resolve_id(helper.repo_path(), &args.id)?;
     drop(helper);
     attach_id(ui, command, &id, args.external_lease).await?;
-    let helper = command.workspace_helper(ui).await?;
-    print_record(ui, helper.repo_path(), &id)
-}
-
-async fn adopt(ui: &mut Ui, command: &CommandHelper, args: &AdoptArgs) -> Result<(), CommandError> {
-    let mut helper = command.workspace_helper(ui).await?;
-    let (registry_lock, mut registry) = RegistryLock::load(helper.repo_path())?;
-    let mut adoptions = load_adoptions(helper.repo_path())?;
-    let legacy = args.name.as_str();
-    let id = if let Some(id) = adoptions.get(legacy) {
-        id.clone()
-    } else {
-        let id = allocate_locked(&mut registry)?;
-        registry_lock.store(&registry)?;
-        adoptions.insert(legacy.to_owned(), id.clone());
-        // Persist intent before changing jj state. Retrying the command after
-        // a crash will finish the same adoption instead of allocating again.
-        store_adoptions(helper.repo_path(), &adoptions)?;
-        id
-    };
-    let name = workspace_name(&id);
-    let old_commit = helper.repo().view().get_wc_commit_id(&args.name).cloned();
-    let new_commit = helper.repo().view().get_wc_commit_id(&name).cloned();
-    let commit_id = match (old_commit, new_commit) {
-        (Some(old), Some(new)) if old != new => {
-            return Err(user_error(format!(
-                "Legacy workspace {} and its recorded adoption {} point to different commits",
-                args.name.as_symbol(),
-                name.as_symbol()
-            )));
-        }
-        (Some(commit), _) | (None, Some(commit)) => commit,
-        (None, None) => {
-            return Err(user_error(format!(
-                "No such ordinary workspace: {}",
-                args.name.as_symbol()
-            )));
-        }
-    };
-    let store = SimpleWorkspaceStore::load(helper.repo_path())?;
-    if helper.repo().view().get_wc_commit_id(&args.name).is_some() {
-        let mut tx = helper.start_transaction();
-        tx.repo_mut().set_wc_commit(name.clone(), commit_id)?;
-        tx.repo_mut().remove_wc_commit(&args.name).await?;
-        tx.finish(
-            ui,
-            format!(
-                "adopt workspace {} as {}",
-                args.name.as_symbol(),
-                name.as_symbol()
-            ),
-        )
-        .await?;
-    }
-    // Forget the old checkout only after the repo view durably points the
-    // exact working-copy commit at the managed name.
-    store.forget(&[&args.name])?;
-    drop(registry_lock);
-    attach_id(ui, command, &id, false).await?;
     let helper = command.workspace_helper(ui).await?;
     print_record(ui, helper.repo_path(), &id)
 }

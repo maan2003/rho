@@ -333,11 +333,6 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 
 async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
     rho_agent::db::prepare_agent_db_migration(db).await;
-    anyhow::ensure!(
-        !rho_agent::db::requires_managed_workspace_migration(db),
-        "this database needs the one-shot managed workspace migration; run the real daemon once \
-         because `rho debug migrate` will not mutate repositories referenced by a database copy"
-    );
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();

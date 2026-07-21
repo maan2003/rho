@@ -135,7 +135,6 @@ This document contains the help content for the `jj` command-line program.
 * [`jj workspace managed create`↴](#jj-workspace-managed-create)
 * [`jj workspace managed resolve`↴](#jj-workspace-managed-resolve)
 * [`jj workspace managed attach`↴](#jj-workspace-managed-attach)
-* [`jj workspace managed adopt`↴](#jj-workspace-managed-adopt)
 * [`jj workspace managed gc`↴](#jj-workspace-managed-gc)
 * [`jj workspace rename`↴](#jj-workspace-rename)
 * [`jj workspace root`↴](#jj-workspace-root)
@@ -3848,7 +3847,6 @@ Manage jj-allocated, repository-local workspaces
 * `create` — Allocate and materialize a managed workspace
 * `resolve` — Report stable paths without materializing the workspace
 * `attach` — Idempotently materialize an allocated workspace
-* `adopt` — Adopt a legacy ordinary workspace under a newly allocated managed ID
 * `gc` — Snapshot and delete stale, unlocked materializations
 
 
@@ -3892,18 +3890,6 @@ Idempotently materialize an allocated workspace
 ###### **Options:**
 
 * `--external-lease` — Caller already holds the reported lifetime lock
-
-
-
-## `jj workspace managed adopt`
-
-Adopt a legacy ordinary workspace under a newly allocated managed ID
-
-**Usage:** `jj workspace managed adopt <NAME>`
-
-###### **Arguments:**
-
-* `<NAME>` — Legacy ordinary workspace name (including old bare 12-character names)
 
 
 

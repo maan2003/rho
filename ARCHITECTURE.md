@@ -42,11 +42,6 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `View`. Each repository allocates its own managed workspace id, so a
   multi-repository agent's prompt lists a separate `ws-<id>` handle for every
   workdir.
-  The transition from the former Rho-allocated bare jj workspace names is a
-  temporary one-shot agent-database migration. It invokes jj's managed
-  `adopt` command, which assigns a repository-local ID to the exact existing
-  working-copy commit and forgets the legacy jj workspace name; ordinary
-  workspace opens contain no compatibility fallback.
   Sandbox and ordinary workspaces cannot be mixed in one view.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Rho packages platform-owned skills under

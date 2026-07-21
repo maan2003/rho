@@ -26,8 +26,6 @@ const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
 const AGENTS: TableDefinition<AgentId, Sen<AgentRecord>> = TableDefinition::new("agents");
 const WORKSTREAMS: TableDefinition<WorkstreamId, Sen<WorkstreamRecord>> =
     TableDefinition::new("workstreams");
-/// Superseded by workstreams + labels; read once by migration.
-const LEGACY_TAGS: TableDefinition<TagId, Sen<TagRecord>> = TableDefinition::new("tags");
 const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::new("projects");
 /// Opaque client-owned view configuration (see
 /// [`AgentReadTxnExt::view_config`]).
@@ -35,7 +33,6 @@ const VIEW_CONFIG: TableDefinition<(), Vec<u8>> = TableDefinition::new("view_con
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const MANAGED_WORKSPACE_MIGRATION_FROM: &str = "c4d9a02b";
 const CURRENT_AGENT_DB_FORMAT: &str = "8e72c1a4";
 
 struct AgentDbMigration {
@@ -52,21 +49,7 @@ pub struct MigrationRecoveryPoint {
     pub created_at: UnixMillis,
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: "f3b8d24a",
-        to: MANAGED_WORKSPACE_MIGRATION_FROM,
-        migrate: migrate_tags_to_workstreams,
-    },
-    // AgentPool performs the external jj adoptions and stamps the destination
-    // format directly. This edge keeps the format graph explicit, but must
-    // never be traversed by the synchronous-only migration loop.
-    AgentDbMigration {
-        from: MANAGED_WORKSPACE_MIGRATION_FROM,
-        to: CURRENT_AGENT_DB_FORMAT,
-        migrate: |_| panic!("managed workspace migration must run through AgentPool"),
-    },
-];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -118,45 +101,11 @@ pub struct WorkstreamRecord {
     pub updated_at: UnixMillis,
 }
 
-/// Legacy tag id, read once by [`migrate_tags_to_workstreams`].
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue, Encode, Decode,
-)]
-pub(crate) struct TagId(pub u64);
-
-/// Legacy tag kind, read once by migration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode)]
-enum TagKind {
-    Workstream,
-    WorkstreamGroup,
-    Label,
-}
-
-/// Legacy tag shape, read once by migration. redb identifies value types
-/// by Rust name, so this must stay `TagRecord` until the table is dropped.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-struct TagRecord {
-    name: String,
-    kind: TagKind,
-    parent: Option<TagId>,
-    created_at: UnixMillis,
-    updated_at: UnixMillis,
-    status: Status,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct ProjectRecord {
     pub name: String,
     pub description: String,
     pub created_at: UnixMillis,
-}
-
-/// Legacy pin state, read once by migration; pinning is a "pin" label now.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
-enum Status {
-    #[default]
-    Normal,
-    Pinned,
 }
 
 /// What the user did about an agent's last finished turn. Attention is
@@ -255,76 +204,7 @@ pub async fn prepare_agent_db_migration(db: &rho_db::RhoDb) {
     .await;
 }
 
-/// Advances older database-only migrations to the format immediately before
-/// managed workspace IDs, then reports whether the one-shot jj migration is
-/// required. This is temporary and must run before `init_agent_tables()` can
-/// take the final no-op format hop.
-pub(crate) async fn prepare_managed_workspace_migration(db: &rho_db::RhoDb) -> bool {
-    let read = db.read();
-    let format = read
-        .has_table("format")
-        .then(|| read.open_table(FORMAT).get(&()).map(|v| v.value()))
-        .flatten();
-    drop(read);
-    let Some(mut format) = format else {
-        return false;
-    };
-    if format == CURRENT_AGENT_DB_FORMAT {
-        return false;
-    }
-
-    let mut write = db.write().await;
-    while format != MANAGED_WORKSPACE_MIGRATION_FROM {
-        let Some(migration) = AGENT_DB_MIGRATIONS
-            .iter()
-            .find(|migration| migration.from == format)
-        else {
-            panic!(
-                "this rho agent database was written by an older or different rho version \
-                 (database format {format}, this build expects {CURRENT_AGENT_DB_FORMAT}). \
-                 Update rho one version at a time so migrations can run, or remove \
-                 the local rho database if you do not need the saved agents."
-            );
-        };
-        assert_ne!(
-            migration.to, CURRENT_AGENT_DB_FORMAT,
-            "managed workspace migration was bypassed"
-        );
-        (migration.migrate)(&mut write);
-        format = migration.to.to_owned();
-        write.open_table(FORMAT).insert(&(), &format);
-    }
-    write.commit();
-    true
-}
-
-/// Whether opening this database requires the temporary migration that also
-/// mutates its referenced jj repositories. Snapshot-only migration checks
-/// must refuse this hop rather than stamp copied records with unmigrated IDs.
-pub fn requires_managed_workspace_migration(db: &rho_db::RhoDb) -> bool {
-    let read = db.read();
-    read.has_table("format")
-        && read
-            .open_table(FORMAT)
-            .get(&())
-            .is_some_and(|format| format.value() != CURRENT_AGENT_DB_FORMAT)
-}
-
-pub(crate) async fn finish_managed_workspace_migration(
-    db: &rho_db::RhoDb,
-    workdirs: Vec<(AgentId, Vec<WorkspaceInfo>)>,
-) {
-    let mut write = db.write().await;
-    for (agent_id, workdirs) in workdirs {
-        write.set_agent_workdirs(agent_id, workdirs);
-    }
-    write
-        .open_table(FORMAT)
-        .insert(&(), &CURRENT_AGENT_DB_FORMAT.to_owned());
-    write.commit();
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
     /// The agent's working set: where it works, primary workdir first.
@@ -362,17 +242,6 @@ pub struct AgentRecord {
     /// from this plus live agent state, never stored.
     #[senax(default)]
     pub disposition: AgentDisposition,
-    /// Migration-only stash of the legacy tag fields; never encoded, so it
-    /// is empty once [`migrate_tags_to_workstreams`] has rewritten records.
-    #[senax(skip_encode)]
-    pub(crate) legacy: LegacyAgentFields,
-}
-
-/// The pre-workstream fields of [`AgentRecord`], surfaced to the migration.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct LegacyAgentFields {
-    status: Status,
-    tags: Vec<TagId>,
 }
 
 impl AgentRecord {
@@ -385,65 +254,6 @@ impl AgentRecord {
         self.workdirs
             .first()
             .expect("agent has at least one workdir")
-    }
-}
-
-impl senax_encoder::Decoder for AgentRecord {
-    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
-        /// Accepts both the current shape and the pre-workstream one
-        /// (status/disposition/tags), which lands in `legacy` for the
-        /// migration to convert.
-        #[derive(Decode)]
-        struct EncodedAgentRecord {
-            display_name: Option<String>,
-            workdirs: Vec<WorkspaceInfo>,
-            #[senax(default)]
-            status: Status,
-            created_at: UnixMillis,
-            updated_at: UnixMillis,
-            current_lineage: AgentLineageId,
-            parent_agent: Option<AgentId>,
-            #[senax(default)]
-            spawned_by: AgentSpawnedBy,
-            role: AgentRole,
-            binding: SessionBinding,
-            runtime: AgentRuntime,
-            #[senax(default)]
-            last_user_message: UnixMillis,
-            #[senax(default)]
-            last_user_message_text: String,
-            #[senax(default)]
-            disposition: AgentDisposition,
-            #[senax(default)]
-            tags: Vec<TagId>,
-            #[senax(default)]
-            workstream: WorkstreamId,
-            #[senax(default)]
-            labels: Vec<String>,
-        }
-
-        let encoded = EncodedAgentRecord::decode(reader)?;
-        Ok(Self {
-            display_name: encoded.display_name,
-            workdirs: encoded.workdirs,
-            created_at: encoded.created_at,
-            updated_at: encoded.updated_at,
-            current_lineage: encoded.current_lineage,
-            parent_agent: encoded.parent_agent,
-            spawned_by: encoded.spawned_by,
-            role: encoded.role,
-            binding: encoded.binding,
-            runtime: encoded.runtime,
-            last_user_message: encoded.last_user_message,
-            last_user_message_text: encoded.last_user_message_text,
-            workstream: encoded.workstream,
-            labels: encoded.labels,
-            disposition: encoded.disposition,
-            legacy: LegacyAgentFields {
-                status: encoded.status,
-                tags: encoded.tags,
-            },
-        })
     }
 }
 
@@ -842,7 +652,6 @@ pub trait AgentWriteTxnExt {
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
     fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole);
     fn set_agent_prompt_cache_key(&mut self, agent_id: AgentId, key: PromptCacheKey);
-    fn set_agent_workdirs(&mut self, agent_id: AgentId, workdirs: Vec<WorkspaceInfo>);
 
     fn alloc_agent_id(&mut self) -> AgentId;
 
@@ -937,7 +746,6 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             workstream,
             labels: Vec::new(),
             disposition: AgentDisposition::Done,
-            legacy: LegacyAgentFields::default(),
         };
         self.open_table(AGENTS)
             .insert(&agent_id, SenValue::borrowed(&agent));
@@ -1182,17 +990,6 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
-    fn set_agent_workdirs(&mut self, agent_id: AgentId, workdirs: Vec<WorkspaceInfo>) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent missing")
-            .value()
-            .into_owned();
-        agent.workdirs = workdirs;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-    }
-
     fn alloc_agent_id(&mut self) -> AgentId {
         let domain = AgentIdDomain(machine_seed(self));
         AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
@@ -1374,108 +1171,6 @@ fn edit_labels(labels: &mut Vec<String>, label: &str, add: bool) {
     if add {
         labels.push(label.to_owned());
     }
-}
-
-/// Tags become workstreams + labels: every workstream-kind tag becomes a
-/// workstream record under the same id number; a tag's pinned status and
-/// its parent group become "pin" / "group:<name>" labels; agents keep
-/// their workstream by id, turn their label-kind tags into string labels,
-/// and turn pinned status into a "pin" label. Agents without a workstream
-/// tag (historical orphans) found one named from their display name.
-fn migrate_tags_to_workstreams(write: &mut WriteTxn) {
-    use std::collections::HashMap;
-
-    let tags = write
-        .open_table(LEGACY_TAGS)
-        .iter()
-        .map(|(key, value)| (key.value(), value.value().into_owned()))
-        .collect::<Vec<_>>();
-    let by_id = tags.iter().cloned().collect::<HashMap<_, _>>();
-
-    let mut workstreams = write.open_table(WORKSTREAMS);
-    for (tag_id, tag) in &tags {
-        if tag.kind != TagKind::Workstream {
-            continue;
-        }
-        let mut labels = Vec::new();
-        if let Some(group) = tag.parent.and_then(|parent| by_id.get(&parent)) {
-            labels.push(format!("group:{}", group.name));
-        }
-        if tag.status == Status::Pinned {
-            labels.push("pin".to_owned());
-        }
-        workstreams.insert(
-            &WorkstreamId(tag_id.0),
-            SenValue::borrowed(&WorkstreamRecord {
-                name: tag.name.clone(),
-                labels,
-                created_at: tag.created_at,
-                updated_at: tag.updated_at,
-            }),
-        );
-    }
-    drop(workstreams);
-
-    let mut agents = {
-        let table = write.open_table(AGENTS);
-        table
-            .iter()
-            .map(|(key, value)| (key.value(), value.value().into_owned()))
-            .collect::<Vec<_>>()
-    };
-    let workstream_of = |record: &AgentRecord| {
-        record.legacy.tags.iter().find_map(|tag_id| {
-            (by_id.get(tag_id)?.kind == TagKind::Workstream).then_some(WorkstreamId(tag_id.0))
-        })
-    };
-    // Orphaned subtrees follow their nearest ancestor with a workstream.
-    let direct = agents
-        .iter()
-        .map(|(agent_id, record)| (*agent_id, (record.parent_agent, workstream_of(record))))
-        .collect::<HashMap<_, _>>();
-    let resolve = |mut agent_id: AgentId| {
-        let mut seen = std::collections::HashSet::new();
-        while seen.insert(agent_id) {
-            match direct.get(&agent_id) {
-                Some((_, Some(workstream))) => return Some(*workstream),
-                Some((Some(parent), None)) => agent_id = *parent,
-                _ => break,
-            }
-        }
-        None
-    };
-
-    for (agent_id, record) in &mut agents {
-        record.workstream = match resolve(*agent_id) {
-            Some(workstream) => workstream,
-            None => {
-                let name = record
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| "untitled".to_owned());
-                write.create_workstream(record.created_at, name)
-            }
-        };
-        record.labels = record
-            .legacy
-            .tags
-            .iter()
-            .filter_map(|tag_id| {
-                let tag = by_id.get(tag_id)?;
-                (tag.kind == TagKind::Label).then(|| tag.name.clone())
-            })
-            .collect();
-        if record.legacy.status == Status::Pinned {
-            record.labels.push("pin".to_owned());
-        }
-        record.legacy = LegacyAgentFields::default();
-    }
-    let mut table = write.open_table(AGENTS);
-    for (agent_id, record) in &agents {
-        table.insert(agent_id, SenValue::borrowed(record));
-    }
-    drop(table);
-    write.delete_table("tags");
 }
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {

@@ -111,8 +111,10 @@ impl AgentPool {
         user_environment: UserEnvironment,
     ) -> Arc<Self> {
         crate::db::prepare_agent_db_migration(&db).await;
-        let migrate_workspaces = crate::db::prepare_managed_workspace_migration(&db).await;
-        let pool = Arc::new(Self {
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        write.commit();
+        Arc::new(Self {
             db,
             auth,
             path_overrides,
@@ -123,48 +125,7 @@ impl AgentPool {
             completed_turns: broadcast::channel(64).0,
             accepted_inputs: broadcast::channel(64).0,
             tool_extension_provider: std::sync::RwLock::new(None),
-        });
-        if migrate_workspaces {
-            pool.migrate_legacy_workspaces()
-                .await
-                .expect("migrate legacy jj workspaces");
-        }
-        let mut write = pool.db.write().await;
-        write.init_agent_tables();
-        write.commit();
-        pool
-    }
-
-    /// Temporary one-shot migration from Rho's bare ordinary jj workspace
-    /// names to repository-local managed IDs. The per-run map preserves
-    /// sharing when multiple agent records reference the same workspace;
-    /// jj's adoption journal makes retries use the same destination ID.
-    async fn migrate_legacy_workspaces(&self) -> anyhow::Result<()> {
-        let agents = self.db.read().list_agents();
-        let mut replacements = HashMap::<WorkspaceInfo, WorkspaceInfo>::new();
-        let mut rewritten = Vec::with_capacity(agents.len());
-        for (agent_id, record) in agents {
-            let mut workdirs = Vec::with_capacity(record.workdirs.len());
-            for info in record.workdirs {
-                if let Some(replacement) = replacements.get(&info) {
-                    workdirs.push(replacement.clone());
-                    continue;
-                }
-                let replacement = if info.is_user_checkout() {
-                    info.clone()
-                } else {
-                    self.repo(info.repo())
-                        .await?
-                        .adopt_legacy_workspace_info(&info)
-                        .await?
-                };
-                replacements.insert(info, replacement.clone());
-                workdirs.push(replacement);
-            }
-            rewritten.push((agent_id, workdirs));
-        }
-        crate::db::finish_managed_workspace_migration(&self.db, rewritten).await;
-        Ok(())
+        })
     }
 
     pub fn set_tool_extension_provider(&self, provider: Arc<dyn AgentToolExtensionProvider>) {

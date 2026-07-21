@@ -2767,8 +2767,7 @@ fn resolve_managed_workspace_name(
     };
     let domain = ManagedWorkspaceIdDomain(seed);
     let id = match ManagedWorkspaceId::from_prefix(prefix, counter, &domain) {
-        Ok(PrefixIdResolution::Unique(id))
-        | Ok(PrefixIdResolution::Ambiguous { first: id, .. }) => id,
+        Ok(PrefixIdResolution::Unique(id) | PrefixIdResolution::Ambiguous { first: id, .. }) => id,
         Ok(PrefixIdResolution::NotFound) | Err(_) => return Ok(None),
     };
     Ok(Some(WorkspaceNameBuf::from(format!("ws-{}", id.encoded()))))
