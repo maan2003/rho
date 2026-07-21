@@ -107,7 +107,9 @@ async fn run() -> anyhow::Result<()> {
     // was rewritten through ws-parent.
     let result = tools
         .call(slow_shell_call(
-            "git status --short && git log --oneline | head -2 && git rev-parse --show-toplevel",
+            "status=\"$(git status --short)\" && printf '%s\\n' \"$status\" && \
+             test \"$status\" = \" M file.txt\" && \
+             git log --oneline | head -2 && git rev-parse --show-toplevel",
         ))
         .await;
     println!("git inside namespace:\n{}", result.output);
@@ -129,7 +131,10 @@ async fn run() -> anyhow::Result<()> {
     let result = tools
         .call(slow_shell_call(
             "nix shell nixpkgs#git -c sh -c \
-             'git diff --stat && git commit -am from-git && git log --oneline | head -1'",
+             'git diff --stat && git commit -am from-git && \
+              git ls-files --error-unmatch file.txt && \
+              test \"$(git show HEAD:file.txt)\" = agent && \
+              git log --oneline | head -1'",
         ))
         .await;
     println!(

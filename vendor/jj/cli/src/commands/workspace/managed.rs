@@ -516,6 +516,24 @@ fn create_git_worktree(
             base.hex().as_ref(),
         ],
     )?;
+    // `git worktree add --no-checkout` leaves the new worktree's private
+    // index empty. Populate it without touching the working tree so Git sees
+    // the files subsequently written by jj as changes from HEAD, rather than
+    // as staged deletions plus untracked files.
+    let git_settings = jj_lib::git::GitSettings::from_settings(helper.settings())?;
+    let output = Command::new(&git_settings.executable_path)
+        .args(["-c", "core.fsmonitor=false"])
+        .arg("-C")
+        .arg(root)
+        .args(["read-tree", "HEAD"])
+        .output()
+        .map_err(|err| user_error(format!("Could not execute git: {err}")))?;
+    if !output.status.success() {
+        return Err(user_error(format!(
+            "Failed to initialize Git worktree index: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     Ok(true)
 }
 
