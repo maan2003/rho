@@ -1573,18 +1573,22 @@ mod tests {
 
     #[test]
     fn plain_output_trim_stays_on_utf8_boundaries() {
-        let mut output = PlainOutput::default();
-        output.text = "λ".repeat(SHELL_STATE_CAP / 2 + 1);
-        output.styles.push(ShellStyleSpan {
-            start: 0,
-            end: output.text.len() as u64,
-            style: ShellTextStyle {
-                foreground: Some(ShellColor::Indexed(2)),
-                ..Default::default()
-            },
-        });
-        output.cursor = output.text.len();
-        output.line_start = output.cursor;
+        let text = "λ".repeat(SHELL_STATE_CAP / 2 + 1);
+        let end = text.len();
+        let mut output = PlainOutput {
+            text,
+            styles: vec![ShellStyleSpan {
+                start: 0,
+                end: end as u64,
+                style: ShellTextStyle {
+                    foreground: Some(ShellColor::Indexed(2)),
+                    ..Default::default()
+                },
+            }],
+            cursor: end,
+            line_start: end,
+            ..Default::default()
+        };
         assert!(output.trim());
         assert!(output.text.starts_with(OMITTED));
         assert!(output.text.len() <= OUTPUT_TRIM_TO + OMITTED.len() + 2);
