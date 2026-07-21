@@ -567,7 +567,7 @@ impl ShellModel {
             return;
         };
         let highlights = (!self.display_prompt.is_empty())
-            .then(|| InlayHighlight {
+            .then_some(InlayHighlight {
                 inlay: InlayId::Custom(PROMPT_INLAY_ID),
                 inlay_position: position,
                 range: 0..self.display_prompt.len(),
@@ -790,7 +790,6 @@ fn resolve_output_style(style: ShellTextStyle, cx: &gpui::App) -> HighlightStyle
             thickness: px(1.),
             color: Some(foreground),
         }),
-        ..Default::default()
     }
 }
 
