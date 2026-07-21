@@ -12,10 +12,8 @@ use editor::scroll::AutoscrollStrategy;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
 use futures::StreamExt as _;
 use gpui::prelude::*;
-use gpui::{
-    Context, Entity, FontStyle, FontWeight, HighlightStyle, Subscription, WeakEntity, Window, px,
-};
-use language::{Buffer, BufferEvent, Capability, Point};
+use gpui::{Context, Entity, FontStyle, FontWeight, HighlightStyle, WeakEntity, Window, px};
+use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
 use rho_ui_proto::shell::{
@@ -32,17 +30,12 @@ const PROMPT_INLAY_ID: usize = 0;
 const ANSI_HIGHLIGHT_KEY_BASE: usize = usize::MAX / 2;
 const MAX_RENDERED_STYLE_SPANS: usize = MAX_STYLE_SPANS;
 const MAX_RENDERED_UNIQUE_STYLES: usize = 256;
-// Zed does not lay out custom inlays for a wholly empty multibuffer excerpt.
-// Keep an invisible cell in the writable excerpt so an idle prompt remains
-// visible; it is never sent to the shell.
-const INPUT_SENTINEL: &str = "\u{200b}";
 
 pub struct ShellModel {
     transcript_buffer: Entity<Buffer>,
     input_buffer: Entity<Buffer>,
     multi_buffer: Entity<MultiBuffer>,
     input_end: text::Anchor,
-    transcript_attached: bool,
     transcript_styles: Vec<(StyleClass, Range<text::Anchor>)>,
     output_styles: Vec<(ShellTextStyle, Vec<Range<text::Anchor>>)>,
     output_highlight_slots: usize,
@@ -56,7 +49,6 @@ pub struct ShellModel {
     display_prompt: String,
     shell_state: rho_ui_proto::shell::ShellState,
     _read_task: gpui::Task<()>,
-    _subscriptions: Vec<Subscription>,
 }
 
 impl ShellModel {
@@ -66,13 +58,22 @@ impl ShellModel {
             buffer.set_capability(Capability::Read, cx);
             buffer
         });
-        let input_buffer = cx.new(|cx| Buffer::local(INPUT_SENTINEL, cx));
+        let input_buffer = cx.new(|cx| Buffer::local("", cx));
         let input_end = {
             let buffer = input_buffer.read(cx);
             buffer.anchor_after(buffer.len())
         };
         let multi_buffer = cx.new(|cx| {
             let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
+            // Keep the empty transcript excerpt attached: its separator from
+            // the input excerpt gives the idle prompt inlay a display row.
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(0),
+                transcript_buffer.clone(),
+                [Point::zero()..transcript_buffer.read(cx).max_point()],
+                0,
+                cx,
+            );
             multi_buffer.set_excerpts_for_path(
                 PathKey::sorted(1),
                 input_buffer.clone(),
@@ -88,19 +89,6 @@ impl ShellModel {
             submit,
             control,
         } = channel;
-        let subscriptions = vec![cx.subscribe(&input_buffer, |_, buffer, event, cx| {
-            let has_sentinel = {
-                let buffer = buffer.read(cx);
-                buffer
-                    .text_for_range(0..buffer.len())
-                    .any(|chunk| chunk.contains(INPUT_SENTINEL))
-            };
-            if matches!(event, BufferEvent::Edited { .. }) && !has_sentinel {
-                buffer.update(cx, |buffer, cx| {
-                    buffer.edit([(0..0, INPUT_SENTINEL)], None, cx);
-                });
-            }
-        })];
         let read_task = cx.spawn(async move |this, cx| {
             while let Some(frame) = frames.next().await {
                 let exited = matches!(frame, ShellServerFrame::Exited { .. });
@@ -122,7 +110,6 @@ impl ShellModel {
             input_buffer,
             multi_buffer,
             input_end,
-            transcript_attached: false,
             transcript_styles: Vec::new(),
             output_styles: Vec::new(),
             output_highlight_slots: 0,
@@ -136,7 +123,6 @@ impl ShellModel {
             display_prompt: "> ".to_owned(),
             shell_state: rho_ui_proto::shell::ShellState::default(),
             _read_task: read_task,
-            _subscriptions: subscriptions,
         }
     }
 
@@ -209,7 +195,7 @@ impl ShellModel {
                 self.submitting = true;
                 self.input_buffer.update(cx, |buffer, cx| {
                     let len = buffer.len();
-                    buffer.edit([(0..len, INPUT_SENTINEL)], None, cx);
+                    buffer.edit([(0..len, "")], None, cx);
                 });
                 self.set_prompt("[sending] ", cx);
                 cx.spawn(async move |this, cx| {
@@ -225,18 +211,13 @@ impl ShellModel {
                             model.input_buffer.update(cx, |buffer, cx| {
                                 let draft =
                                     buffer.text_for_range(0..buffer.len()).collect::<String>();
-                                let draft = draft.replace(INPUT_SENTINEL, "");
                                 let restored = if draft.is_empty() {
                                     command
                                 } else {
                                     format!("{command}\n{draft}")
                                 };
                                 let len = buffer.len();
-                                buffer.edit(
-                                    [(0..len, format!("{INPUT_SENTINEL}{restored}"))],
-                                    None,
-                                    cx,
-                                );
+                                buffer.edit([(0..len, restored)], None, cx);
                             });
                             model.mark_disconnected(cx);
                         }
@@ -463,18 +444,6 @@ impl ShellModel {
             transcript.pop();
         }
         self.replace_transcript(0, self.transcript_buffer.read(cx).len(), &transcript, cx);
-        if !transcript.is_empty() && !self.transcript_attached {
-            self.multi_buffer.update(cx, |multi_buffer, cx| {
-                multi_buffer.set_excerpts_for_path(
-                    PathKey::sorted(0),
-                    self.transcript_buffer.clone(),
-                    [Point::zero()..self.transcript_buffer.read(cx).max_point()],
-                    0,
-                    cx,
-                );
-            });
-            self.transcript_attached = true;
-        }
         let buffer = self.transcript_buffer.read(cx);
         self.transcript_styles = styles
             .into_iter()
@@ -541,8 +510,7 @@ impl ShellModel {
 
     fn input_text(&self, cx: &gpui::App) -> String {
         let buffer = self.input_buffer.read(cx);
-        let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
-        text.replace(INPUT_SENTINEL, "")
+        buffer.text_for_range(0..buffer.len()).collect()
     }
 
     fn refresh_prompt(&mut self, cx: &mut Context<Self>) {
@@ -561,8 +529,8 @@ impl ShellModel {
 
     fn apply_prompt_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let input_id = self.input_buffer.read(cx).remote_id();
-        let Some(position) = snapshot.anchor_in_excerpt(text::Anchor::min_for_buffer(input_id))
+        let Some(position) =
+            snapshot.anchor_in_excerpt(self.input_buffer.read(cx).anchor_before(0))
         else {
             return;
         };
