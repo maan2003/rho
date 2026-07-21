@@ -18,18 +18,35 @@ than by running a supervisor, extension protocol, or daemon process graph.
   lazily at first inference. It depends directly on the concrete
   `rho-inference` session.
 - `rho-workspaces` owns checkout materialization and filesystem views. A
-  `Workspace` is one materialized checkout (a jj pool slot, the user's live
-  checkout, a VCS-masked sandbox workspace, or a plain directory). Sandbox
-  workspaces use normal jj pool slots while masking their `.jj` and colocated
-  `.git` metadata from child commands, expose a separate synthetic Git
-  baseline, and install a Landlock filesystem/network policy on every prepared
-  child command. A `View` is one agent's world: a working
+  `Workspace` is one materialized checkout (a stable jj-managed bcachefs
+  subvolume, the user's live checkout, a VCS-masked sandbox workspace, or a
+  plain directory). Managed workspace ids are repository-local prefix ids
+  rendered as `ws-<id>` and allocated by jj from a compact repository-local
+  `(seed, next-counter)` registry; generated IDs are derived rather than
+  stored individually. jj also dictates their stable per-repository paths,
+  rematerializes missing checkouts, and garbage-collects stale materialized
+  paths enumerated by jj's workspace store after snapshotting them. GC never
+  scans the prefix-id counter range. Every live `Workspace`
+  holds a shared lock on its persistent sibling lease file; GC alone requests
+  the nonblocking exclusive lock, so any number of Rho processes can inhibit
+  collection without using the lease as a workspace-ownership mutex.
+  Repository caches retain only weak references, while agents and views own
+  live workspaces. Sandbox workspaces use the same managed checkout
+  lifecycle while masking their `.jj` and colocated `.git` metadata from child
+  commands, expose a separate synthetic Git baseline, and install a Landlock
+  filesystem/network policy on every prepared child command. A `View` is one agent's world: a working
   set of workdir entries, fixed at spawn, realized as a private mount
-  namespace with each entry's slot mounted over its origin path. Entry 0 is
+  namespace with each entry's checkout mounted over its origin path. Entry 0 is
   the primary workdir (default cwd, prompt header).
   Agents joining a workspace share the `Workspace`; each agent has its own
-  `View`. All jj workspaces created for one agent share one workspace id, so
-  the agent's jj workspace name is the same in every repo it forks.
+  `View`. Each repository allocates its own managed workspace id, so a
+  multi-repository agent's prompt lists a separate `ws-<id>` handle for every
+  workdir.
+  The transition from the former Rho-allocated bare jj workspace names is a
+  temporary one-shot agent-database migration. It invokes jj's managed
+  `adopt` command, which assigns a repository-local ID to the exact existing
+  working-copy commit and forgets the legacy jj workspace name; ordinary
+  workspace opens contain no compatibility fallback.
   Sandbox and ordinary workspaces cannot be mixed in one view.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Rho packages platform-owned skills under

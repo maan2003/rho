@@ -18,7 +18,7 @@ pub fn prompt(
         .iter()
         .map(|workspace| WorkdirPrompt {
             path: workspace.repo().to_string(),
-            workspace_name: workspace.info().workspace_name(),
+            workspace_handle: workspace.info().workspace_handle(),
         })
         .collect::<Vec<_>>();
     let (agents_md, skills) = if role.is_pm() {
@@ -177,10 +177,11 @@ pub fn claude_prompt(multi_agent: Option<&MultiAgentTools>, role: AgentRole) -> 
 }
 
 /// One workdir as the prompt renders it: the agent-visible path plus its jj
-/// workspace name (`None` for the user's checkout or a plain directory).
+/// managed workspace handle (`None` for the user's checkout or a plain
+/// directory).
 struct WorkdirPrompt {
     path: String,
-    workspace_name: Option<String>,
+    workspace_handle: Option<String>,
 }
 
 /// Union of every workdir's discovered context: AGENTS.md files deduped by
@@ -372,7 +373,7 @@ Relative paths in commands and patches resolve against this directory.
     if workdirs.len() > 1 {
         out.push_str("\nAdditional workdirs in your working set:\n");
         for workdir in &workdirs[1..] {
-            let binding = match &workdir.workspace_name {
+            let binding = match &workdir.workspace_handle {
                 Some(_) => "your own checkout",
                 None => "the live directory — edits are immediately visible to the user",
             };
@@ -456,7 +457,7 @@ Before finalizing after an interrupt or context compaction, verify your answer a
 #[cfg(test)]
 fn render_multi_agent_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
     let own_workspace = if workdirs.len() == 1 {
-        match &workdirs[0].workspace_name {
+        match &workdirs[0].workspace_handle {
             Some(name) => format!(
                 "Your jj workspace id is `{name}`. In your own workspace, your current \
                  working-copy commit is `@`; other workspaces can refer to that same \
@@ -470,7 +471,7 @@ fn render_multi_agent_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
     } else {
         let mut out = String::from("Your workdirs and their jj workspace handles:\n");
         for workdir in workdirs {
-            match &workdir.workspace_name {
+            match &workdir.workspace_handle {
                 Some(name) => out.push_str(&format!(
                     "- {} — your jj workspace `{name}` (other workspaces address your \
                      working-copy commit there as `{name}@`)\n",
@@ -554,10 +555,10 @@ mod tests {
         assert!(!prompt.contains("name"));
     }
 
-    fn workdir(path: &str, workspace_name: Option<&str>) -> WorkdirPrompt {
+    fn workdir(path: &str, workspace_handle: Option<&str>) -> WorkdirPrompt {
         WorkdirPrompt {
             path: path.to_owned(),
-            workspace_name: workspace_name.map(str::to_owned),
+            workspace_handle: workspace_handle.map(str::to_owned),
         }
     }
 

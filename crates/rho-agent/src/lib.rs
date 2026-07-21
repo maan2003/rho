@@ -526,40 +526,23 @@ pub enum StartWorkdir {
     Existing(Arc<Workspace>),
 }
 
-/// Materializes a new agent's workdirs into checkouts. All `Create` entries
-/// share one freshly allocated workspace id, so the agent's jj workspace
-/// name is the same in every repo it forks.
+/// Materializes a new agent's workdirs. Each jj repository allocates its own
+/// managed workspace id.
 pub(crate) async fn materialize_workdirs(
-    write: &mut rho_db::WriteTxn,
     start: Vec<StartWorkdir>,
 ) -> anyhow::Result<Vec<Arc<Workspace>>> {
     anyhow::ensure!(!start.is_empty(), "an agent needs at least one workdir");
-    let workspace_id = start
-        .iter()
-        .any(|entry| {
-            matches!(
-                entry,
-                StartWorkdir::Create { .. } | StartWorkdir::Sandbox { .. }
-            )
-        })
-        .then(|| write.alloc_workspace_id());
     let mut entries = Vec::with_capacity(start.len());
     for entry in start {
         entries.push(match entry {
             StartWorkdir::Create {
                 repo,
                 parent_revset,
-            } => {
-                let id = workspace_id.expect("allocated for Create entries");
-                repo.create_workspace(id, &parent_revset).await?
-            }
+            } => repo.create_workspace(&parent_revset).await?,
             StartWorkdir::Sandbox {
                 repo,
                 parent_revset,
-            } => {
-                let id = workspace_id.expect("allocated for Sandbox entries");
-                repo.create_sandbox(id, &parent_revset).await?
-            }
+            } => repo.create_sandbox(&parent_revset).await?,
             StartWorkdir::Existing(workspace) => workspace,
         });
     }
@@ -587,14 +570,13 @@ impl Agent {
             .deep_config()
             .ok_or_else(|| anyhow::anyhow!("cannot create Rho runtime for Claude agent mode"))?;
         let model = mode.deep_model().expect("deep config implies a deep model");
-        // One transaction spans id allocation, the jj workspace creation
-        // (the workspace is named after the id), and the record write:
-        // failure anywhere drops the transaction, leaving nothing behind —
-        // not even the id counter bump.
+        // One transaction spans agent id allocation and the record write.
+        // jj owns repository-local managed workspace id allocation; a failed
+        // multi-repo creation may leave an unreachable checkout for jj GC.
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
         let tool_extension = tool_extension.map(|factory| factory(agent_id));
-        let entries = materialize_workdirs(&mut write, start).await?;
+        let entries = materialize_workdirs(start).await?;
         let view = View::new(entries.clone())?;
         let now = UnixMillis::now();
         let next_event = write.create_agent(

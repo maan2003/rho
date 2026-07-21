@@ -40,7 +40,8 @@ pub struct AgentPool {
     user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
     /// One shared handle per repo root: live-workspace sharing (joined
-    /// agents get one checkout + namespace) only holds within one instance.
+    /// agents get one checkout but retain separate View namespaces) only
+    /// holds within one instance.
     repos: Mutex<HashMap<Utf8PathBuf, Arc<Repo>>>,
     /// Fires for every agent created in this pool — including agents spawned
     /// by other agents — so every UI connection can pick them up.
@@ -110,10 +111,8 @@ impl AgentPool {
         user_environment: UserEnvironment,
     ) -> Arc<Self> {
         crate::db::prepare_agent_db_migration(&db).await;
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        write.commit();
-        Arc::new(Self {
+        let migrate_workspaces = crate::db::prepare_managed_workspace_migration(&db).await;
+        let pool = Arc::new(Self {
             db,
             auth,
             path_overrides,
@@ -124,7 +123,48 @@ impl AgentPool {
             completed_turns: broadcast::channel(64).0,
             accepted_inputs: broadcast::channel(64).0,
             tool_extension_provider: std::sync::RwLock::new(None),
-        })
+        });
+        if migrate_workspaces {
+            pool.migrate_legacy_workspaces()
+                .await
+                .expect("migrate legacy jj workspaces");
+        }
+        let mut write = pool.db.write().await;
+        write.init_agent_tables();
+        write.commit();
+        pool
+    }
+
+    /// Temporary one-shot migration from Rho's bare ordinary jj workspace
+    /// names to repository-local managed IDs. The per-run map preserves
+    /// sharing when multiple agent records reference the same workspace;
+    /// jj's adoption journal makes retries use the same destination ID.
+    async fn migrate_legacy_workspaces(&self) -> anyhow::Result<()> {
+        let agents = self.db.read().list_agents();
+        let mut replacements = HashMap::<WorkspaceInfo, WorkspaceInfo>::new();
+        let mut rewritten = Vec::with_capacity(agents.len());
+        for (agent_id, record) in agents {
+            let mut workdirs = Vec::with_capacity(record.workdirs.len());
+            for info in record.workdirs {
+                if let Some(replacement) = replacements.get(&info) {
+                    workdirs.push(replacement.clone());
+                    continue;
+                }
+                let replacement = if info.is_user_checkout() {
+                    info.clone()
+                } else {
+                    self.repo(info.repo())
+                        .await?
+                        .adopt_legacy_workspace_info(&info)
+                        .await?
+                };
+                replacements.insert(info, replacement.clone());
+                workdirs.push(replacement);
+            }
+            rewritten.push((agent_id, workdirs));
+        }
+        crate::db::finish_managed_workspace_migration(&self.db, rewritten).await;
+        Ok(())
     }
 
     pub fn set_tool_extension_provider(&self, provider: Arc<dyn AgentToolExtensionProvider>) {
@@ -343,7 +383,7 @@ impl AgentPool {
                     // checkout currently points at; repos outside the
                     // parent's working set start from trunk.
                     let parent_revset = revset.unwrap_or_else(|| match parent_entry {
-                        Some(info) => match info.workspace_name() {
+                        Some(info) => match info.workspace_handle() {
                             Some(name) => format!("{name}@"),
                             None => "@".to_owned(),
                         },
@@ -371,7 +411,14 @@ impl AgentPool {
         }
         let config = child_role(parent_role, config);
         let (child_id, child) = self
-            .create_with_parent(workstream, config, Some(task_name), start, Some(parent), None)
+            .create_with_parent(
+                workstream,
+                config,
+                Some(task_name),
+                start,
+                Some(parent),
+                None,
+            )
             .await?;
         let parent_label = self.agent_handle(parent);
         child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);
@@ -518,16 +565,18 @@ impl AgentPool {
         View::new(entries)
     }
 
-    fn lazy_view(self: &Arc<Self>, workdirs: Vec<WorkspaceInfo>) -> Arc<Lazy<Arc<View>>> {
+    fn lazy_view(
+        self: &Arc<Self>,
+        _agent_id: AgentId,
+        workdirs: Vec<WorkspaceInfo>,
+    ) -> Arc<Lazy<Arc<View>>> {
         let pool = Arc::downgrade(self);
         Arc::new(Lazy::new(move || {
             let pool = pool.clone();
             let workdirs = workdirs.clone();
             async move {
-                pool.upgrade()
-                    .context("agent pool dropped")?
-                    .materialize_view(&workdirs)
-                    .await
+                let pool = pool.upgrade().context("agent pool dropped")?;
+                pool.materialize_view(&workdirs).await
             }
         }))
     }
@@ -542,7 +591,7 @@ impl AgentPool {
             return Ok((agent_id, agent, false));
         }
         let record = self.db.read().get_agent(agent_id);
-        let view = self.lazy_view(record.workdirs.clone());
+        let view = self.lazy_view(agent_id, record.workdirs.clone());
         let agent = match record.runtime {
             AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load_lazy(
                 self.db.clone(),

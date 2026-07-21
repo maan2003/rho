@@ -68,7 +68,6 @@ pub enum ConnEvent {
         projects: Vec<UiProject>,
         machine_seed: u64,
         agent_counter: u64,
-        workspace_counter: u64,
     },
     WorkstreamCreated(UiWorkstream),
     /// The daemon created an agent this connection asked for. The workstream
@@ -639,7 +638,6 @@ async fn run(
         view_config: _,
         machine_seed,
         agent_counter,
-        workspace_counter,
     } = message
     else {
         anyhow::bail!("rho daemon did not send ready message");
@@ -651,7 +649,6 @@ async fn run(
             projects,
             machine_seed,
             agent_counter,
-            workspace_counter,
         })
         .is_err()
     {
@@ -694,14 +691,12 @@ async fn run(
                 view_config: _,
                 machine_seed,
                 agent_counter,
-                workspace_counter,
             } => Some(ConnEvent::Ready {
                 workstreams,
                 agents,
                 projects,
                 machine_seed,
                 agent_counter,
-                workspace_counter,
             }),
             ServerMessage::WorkstreamCreated { workstream } => {
                 Some(ConnEvent::WorkstreamCreated(workstream))

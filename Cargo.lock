@@ -14187,6 +14187,8 @@ dependencies = [
  "rho-context-config",
  "rustix 1.1.4",
  "senax-encoder",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",

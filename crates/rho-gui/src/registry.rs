@@ -178,9 +178,6 @@ pub struct AgentRegistry {
     /// Last agent id counter, from `Ready`; keys uniform agent label prefix
     /// length.
     agent_counter: u64,
-    /// Last workspace id counter, from `Ready`; keys uniform workspace label
-    /// prefix length just like the generated-agent population does for agents.
-    workspace_counter: u64,
 }
 
 #[derive(Default)]
@@ -350,10 +347,6 @@ impl AgentRegistry {
         self.agent_counter = agent_counter;
     }
 
-    pub fn set_workspace_counter(&mut self, workspace_counter: u64) {
-        self.workspace_counter = workspace_counter;
-    }
-
     pub fn set_data(&mut self, workstreams: Vec<UiWorkstream>, mut agents: Vec<UiAgentSummary>) {
         // The "hide" label folds its carriers exactly like the filed-away
         // disposition; merging here keeps every downstream check uniform.
@@ -507,9 +500,11 @@ impl AgentRegistry {
         let workspace_id = self
             .agent_summary(agent_id)
             .and_then(|agent| agent.workspace.workspace_id())?;
-        let prefix_len =
-            prefix_id::uniform_prefix_len(self.workspace_counter, LABEL_HEADROOM).max(2);
-        Some(format!("ws-{}", &workspace_id.encoded()[..prefix_len]))
+        // Workspace ids are allocated in repository-local domains. Without
+        // that repository's seed and counter the GUI cannot know whether a
+        // short prefix selects this id or an earlier generated match, so keep
+        // the full typed handle here.
+        Some(format!("ws-{}", workspace_id.encoded()))
     }
 
     pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentRole> {
@@ -1567,14 +1562,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_labels_use_uniform_unique_prefixes() {
+    fn workspace_labels_use_full_repository_local_ids() {
         let domain = WorkspaceIdDomain(0);
         let short_workspace = WorkspaceId::from_counter(1, &domain).unwrap();
         let long_workspace = WorkspaceId::from_counter(36 * 36, &domain).unwrap();
 
         let mut registry = AgentRegistry::default();
         registry.set_machine_seed(0);
-        registry.set_workspace_counter(36 * 36);
         set_topics(
             &mut registry,
             vec![topic(
@@ -1590,11 +1584,11 @@ mod tests {
 
         assert_eq!(
             registry.workspace_id_label(agent_id(1)),
-            Some(format!("ws-{}", &short_workspace.encoded()[..3]))
+            Some(format!("ws-{}", short_workspace.encoded()))
         );
         assert_eq!(
             registry.workspace_id_label(agent_id(2)),
-            Some(format!("ws-{}", &long_workspace.encoded()[..3]))
+            Some(format!("ws-{}", long_workspace.encoded()))
         );
         assert_eq!(registry.workspace_id_label(agent_id(3)), None);
     }

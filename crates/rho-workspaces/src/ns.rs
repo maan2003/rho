@@ -46,25 +46,25 @@ pub unsafe fn init_daemon_namespace() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The escape hatch back to the origin repo: slot pointers reference
+/// The escape hatch back to the origin repo: checkout pointers reference
 /// `<origin>/.jj/ws-parent/…`, which must resolve to the origin from *three*
 /// namespaces. On the host and in the daemon's namespace it does via a
 /// symlink in the origin's `.jj` pointing back at the repo itself (so no
 /// mounts, and nothing to re-establish after a daemon restart). In an
-/// agent's namespace the origin path is covered by the slot, so the same
-/// path lands on the slot's plain `.jj/ws-parent` directory — where
-/// [`create_workspace_ns`] binds the real origin.
+/// agent's namespace the origin path is covered by the checkout, so the same
+/// path lands on the checkout's plain `.jj/ws-parent` directory — where
+/// [`create_view_ns`] binds the real origin.
 pub const WS_PARENT: &str = "ws-parent";
 
 pub struct ViewMount {
     pub repo: PathBuf,
-    pub slot: PathBuf,
+    pub checkout: PathBuf,
     pub metadata_masks: Option<(PathBuf, PathBuf)>,
 }
 
 /// Creates the mount namespace for one agent view: a copy of the daemon's
-/// namespace with each entry's slot checkout mounted over its origin repo
-/// path, and each origin bound back in at `.jj/ws-parent` for the slot's
+/// namespace with each entry's managed checkout mounted over its origin repo
+/// path, and each origin bound back in at `.jj/ws-parent` for the checkout's
 /// repo pointers. Runs on a dedicated thread because the thread ends up
 /// permanently inside the new namespace — the returned
 /// `/proc/thread-self/ns/mnt` fd is what keeps it alive after the thread
@@ -75,7 +75,11 @@ pub fn create_view_ns(mounts: Vec<ViewMount>) -> anyhow::Result<OwnedFd> {
         // thread exits immediately after and shares nothing else.
         unsafe { unshare_unsafe(UnshareFlags::NEWNS) }.context("unshare mount namespace")?;
         for mount in &mounts {
-            cover_origin_with_slot(&mount.repo, &mount.slot, mount.metadata_masks.is_none())?;
+            cover_origin_with_checkout(
+                &mount.repo,
+                &mount.checkout,
+                mount.metadata_masks.is_none(),
+            )?;
             if let Some((jj_mask, git_mask)) = &mount.metadata_masks {
                 rustix::mount::mount_bind(jj_mask, mount.repo.join(".jj"))
                     .context("mask sandbox .jj metadata")?;
@@ -94,9 +98,13 @@ pub fn create_view_ns(mounts: Vec<ViewMount>) -> anyhow::Result<OwnedFd> {
 }
 
 /// The per-entry mount dance, in whatever namespace this thread is in:
-/// mount the slot checkout over the origin repo path and bind the origin
-/// back in at the slot's `.jj/ws-parent`.
-fn cover_origin_with_slot(repo: &Path, slot: &Path, bind_origin_back: bool) -> anyhow::Result<()> {
+/// mount the checkout over the origin repo path and bind the origin
+/// back in at the checkout's `.jj/ws-parent`.
+fn cover_origin_with_checkout(
+    repo: &Path,
+    checkout: &Path,
+    bind_origin_back: bool,
+) -> anyhow::Result<()> {
     // Clone both trees before the cover mount hides the origin.
     let clone = |path: &Path| {
         open_tree(
@@ -110,16 +118,16 @@ fn cover_origin_with_slot(repo: &Path, slot: &Path, bind_origin_back: bool) -> a
     let origin_tree = bind_origin_back
         .then(|| clone(repo).context("open repo tree"))
         .transpose()?;
-    let slot_tree = clone(slot).context("open slot tree")?;
+    let checkout_tree = clone(checkout).context("open checkout tree")?;
     move_mount(
-        slot_tree.as_fd(),
+        checkout_tree.as_fd(),
         "",
         CWD,
         repo,
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
     )
-    .context("mount slot over repo path")?;
-    // The path now resolves inside the slot: its empty ws-parent dir.
+    .context("mount checkout over repo path")?;
+    // The path now resolves inside the checkout: its empty ws-parent dir.
     if let Some(origin_tree) = origin_tree {
         move_mount(
             origin_tree.as_fd(),

@@ -424,7 +424,7 @@ async fn spawn_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Res
         .spawn_child(tools.self_id, args.task_name, args.prompt, workdirs, config)
         .await?;
     let child_record = pool.db().read().get_agent(child_id);
-    let workspace_note = match child_record.primary_workdir().workspace_name() {
+    let workspace_note = match child_record.primary_workdir().workspace_handle() {
         Some(workspace) => format!(
             " Its jj workspace is `{workspace}`; inspect its working-copy commit with `jj diff -r \
              '{workspace}@' --stat`."

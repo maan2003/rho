@@ -52,6 +52,11 @@ pub async fn cmd_workspace_forget(
 
     let mut forget_ws = Vec::new();
     for ws in &wss {
+        if super::managed::is_managed_name(workspace_command.repo_path(), ws) {
+            return Err(crate::command_error::user_error(
+                "Managed workspaces cannot be forgotten; use managed GC to remove materializations",
+            ));
+        }
         if workspace_command
             .repo()
             .view()

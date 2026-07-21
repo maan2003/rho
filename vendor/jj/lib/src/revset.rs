@@ -2725,38 +2725,53 @@ impl PartialSymbolResolver for BookmarkResolver {
 
 struct WorkspacePrefixResolver;
 
-struct WorkspaceIdDomain(u64);
+struct ManagedWorkspaceIdDomain(u64);
 
-impl PrefixIdDomain for WorkspaceIdDomain {
-    const KIND: &'static str = "workspace-id";
+impl PrefixIdDomain for ManagedWorkspaceIdDomain {
+    const KIND: &'static str = "managed-workspace-id";
 
     fn machine_seed(&self) -> u64 {
         self.0
     }
 }
 
-type WorkspaceId = PrefixId<WorkspaceIdDomain>;
+type ManagedWorkspaceId = PrefixId<ManagedWorkspaceIdDomain>;
 
-const WORKSPACE_ID_LABEL_HEADROOM: u64 = 200;
-
-fn load_workspace_id_state(repo: &dyn Repo) -> Option<(u64, u64)> {
-    let path = repo
-        .base_repo()
-        .loader()
-        .repo_path()?
-        .join("workspace-id-state");
-    let state = fs::read_to_string(path).ok()?;
-    let mut fields = state.split_whitespace();
-    let seed = fields.next()?.parse().ok()?;
-    let counter = fields.next()?.parse().ok()?;
-    Some((seed, counter))
-}
-
-fn generated_workspace_name(id: WorkspaceId, domain: &WorkspaceIdDomain) -> WorkspaceNameBuf {
-    let counter = id.to_counter(domain);
-    let prefix_len = prefix_id::uniform_prefix_len(counter, WORKSPACE_ID_LABEL_HEADROOM).max(4);
-    let encoded = id.encoded();
-    WorkspaceNameBuf::from(format!("ws-{}", &encoded[..prefix_len]))
+fn resolve_managed_workspace_name(
+    repo: &dyn Repo,
+    symbol: &str,
+) -> Result<Option<WorkspaceNameBuf>, RevsetResolutionError> {
+    let Some(prefix) = symbol
+        .strip_prefix("ws-")
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(repo_path) = repo.base_repo().loader().repo_path() else {
+        return Ok(None);
+    };
+    let Ok(registry) = fs::read_to_string(repo_path.join("managed-workspaces")) else {
+        return Ok(None);
+    };
+    let mut header = registry
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let Some((seed, counter)) = header
+        .next()
+        .and_then(|field| field.parse().ok())
+        .zip(header.next().and_then(|field| field.parse().ok()))
+    else {
+        return Ok(None);
+    };
+    let domain = ManagedWorkspaceIdDomain(seed);
+    let id = match ManagedWorkspaceId::from_prefix(prefix, counter, &domain) {
+        Ok(PrefixIdResolution::Unique(id))
+        | Ok(PrefixIdResolution::Ambiguous { first: id, .. }) => id,
+        Ok(PrefixIdResolution::NotFound) | Err(_) => return Ok(None),
+    };
+    Ok(Some(WorkspaceNameBuf::from(format!("ws-{}", id.encoded()))))
 }
 
 impl PartialSymbolResolver for WorkspacePrefixResolver {
@@ -2765,22 +2780,9 @@ impl PartialSymbolResolver for WorkspacePrefixResolver {
         repo: &dyn Repo,
         symbol: &str,
     ) -> Result<Option<CommitId>, RevsetResolutionError> {
-        let Some(prefix) = symbol
-            .strip_prefix("ws-")
-            .filter(|prefix| !prefix.is_empty())
-        else {
+        let Some(name) = resolve_managed_workspace_name(repo, symbol)? else {
             return Ok(None);
         };
-        let Some((seed, counter)) = load_workspace_id_state(repo) else {
-            return Ok(None);
-        };
-        let domain = WorkspaceIdDomain(seed);
-        let id = match WorkspaceId::from_prefix(prefix, counter, &domain) {
-            Ok(PrefixIdResolution::Unique(id)) => id,
-            Ok(PrefixIdResolution::Ambiguous { first, .. }) => first,
-            Ok(PrefixIdResolution::NotFound) | Err(_) => return Ok(None),
-        };
-        let name = generated_workspace_name(id, &domain);
         Ok(repo.view().get_wc_commit_id(&name).cloned())
     }
 }
@@ -2999,7 +3001,15 @@ fn resolve_commit_ref(
             Ok(vec![commit_id])
         }
         RevsetCommitRef::WorkingCopy(name) => {
-            if let Some(commit_id) = repo.view().get_wc_commit_id(name) {
+            let resolved_name = if repo.view().get_wc_commit_id(name).is_some() {
+                Some(name.clone())
+            } else {
+                resolve_managed_workspace_name(repo, name.as_str())?
+            };
+            if let Some(commit_id) = resolved_name
+                .as_ref()
+                .and_then(|name| repo.view().get_wc_commit_id(name))
+            {
                 Ok(vec![commit_id.clone()])
             } else {
                 Err(RevsetResolutionError::WorkspaceMissingWorkingCopy { name: name.clone() })

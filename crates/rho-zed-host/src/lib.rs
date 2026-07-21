@@ -11,7 +11,7 @@
 //! Language servers: the LSP stores exist and speak the full protocol, but
 //! nothing spawns — the host's settings disable language servers globally.
 //! File IO is plain [`fs::RealFs`] against workspace checkout paths as the
-//! daemon sees them (pool slots); no namespace entry happens here.
+//! daemon sees them (managed checkout paths); no namespace entry happens here.
 
 use std::collections::HashMap;
 use std::sync::Arc;

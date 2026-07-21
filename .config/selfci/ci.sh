@@ -20,6 +20,9 @@ function job_cargo() {
   fi
 
   selfci step start "test"
+  # Workspace tests exercise the bundled jj fork's managed-workspace CLI.
+  # The build step above produced it; prefer that binary over an installed jj.
+  export PATH="${CARGO_TARGET_DIR:-$PWD/target}/debug:$PATH"
   if ! cargo test --locked --workspace; then
     selfci step fail
   fi

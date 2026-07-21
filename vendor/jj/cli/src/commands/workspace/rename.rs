@@ -42,6 +42,9 @@ pub async fn cmd_workspace_rename(
     let mut workspace_command = command.workspace_helper(ui).await?;
 
     let old_name = workspace_command.working_copy().workspace_name().to_owned();
+    if super::managed::is_managed_name(workspace_command.repo_path(), &old_name) {
+        return Err(user_error("Managed workspaces cannot be renamed"));
+    }
     let new_name = &*args.new_workspace_name;
     if new_name == old_name {
         writeln!(ui.status(), "Nothing changed.")?;

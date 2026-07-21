@@ -475,9 +475,6 @@ pub enum ServerMessage {
         /// Last allocated agent-id counter; clients use it for uniform
         /// short-prefix rendering.
         agent_counter: u64,
-        /// Last allocated workspace-id counter; clients use it for the same
-        /// uniform short-prefix rendering as agent ids.
-        workspace_counter: u64,
     },
     Error {
         message: String,
@@ -540,7 +537,7 @@ pub enum ServerMessage {
     /// [`ClientMessage::ChannelOpen`]): the headless project is bound and the
     /// stream now speaks raw envelope frames. `root` is the project root the
     /// client should open worktrees under — the workspace checkout as the
-    /// daemon sees it (a pool slot path, or the repo root for user
+    /// daemon sees it (a managed checkout path, or the repo root for user
     /// checkouts).
     ChannelOpened {
         root: Utf8PathBuf,
@@ -642,7 +639,7 @@ pub struct UiAgentSummary {
     /// profile.
     pub role: AgentRole,
     /// Where the agent works. Clients resolve start targets against this
-    /// themselves: "on top of agent" is the revset `<workspace name>@`, and
+    /// themselves: "on top of agent" is the revset `<ws-id>@`, and
     /// joining sends the info back verbatim.
     pub workspace: WorkspaceInfo,
     /// Attention level at summary time; kept current afterwards by

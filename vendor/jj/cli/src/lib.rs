@@ -55,5 +55,3 @@ pub mod templater;
 pub mod text_util;
 pub mod time_util;
 pub mod ui;
-
-pub mod workspace_pool;

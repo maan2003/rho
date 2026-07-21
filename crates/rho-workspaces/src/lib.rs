@@ -1,36 +1,35 @@
-//! Per-agent working sets of jj workspaces backed by the fork's workspace
-//! pool.
+//! Per-agent working sets of stable jj-managed workspaces.
 //!
 //! An agent's filesystem is a [`View`]: a working set of workdir entries,
 //! fixed at spawn, each binding an origin path to a materialized
-//! [`Workspace`] (a jj pool-slot checkout, the user's live checkout, or a
-//! plain directory). Checkouts live in jj pool slots
-//! (`<repo>/.jj/ws-pool/N`) claimed with `jj workspace add --pool`. The jj
-//! workspace *name* (the workspace id's encoding) is the durable handle —
-//! the repo view's `wc_commit_ids[name]` follows the agent's change across
-//! every operation — while the slot directory is droppable cache that jj
-//! rebinds on attach. With namespaces available, each agent's commands run
-//! in a private per-view mount namespace where every entry's slot is
+//! [`Workspace`] (a jj-managed checkout, the user's live checkout, or a plain
+//! directory). Each managed checkout has a repository-local `ws-` prefix id,
+//! a stable bcachefs subvolume selected by jj, and a shared GC-inhibitor lease
+//! held by Rho. With namespaces available, each agent's commands run in
+//! a private per-view mount namespace where every entry's checkout is
 //! mounted *over its origin repo path*, so the agent sees the real paths:
 //! informative context, working `../` relative references, and
 //! absolute-path-keyed caches (cargo) stay valid.
 //!
-//! Requires the user's jj fork on PATH: every jj command snapshots all
-//! workspaces in one transaction, the same change can be checked out in
-//! multiple workspaces, and the workspace pool commands exist.
+//! Requires the bundled jj fork on PATH. jj owns managed-id allocation,
+//! materialization, recovery, and garbage collection; Rho owns live use.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fs::{File, OpenOptions};
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use prefix_id::{PrefixId, PrefixIdDomain};
+use rustix::fs::FlockOperation;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 
 mod ns;
 mod sandbox;
@@ -38,6 +37,84 @@ mod sandbox;
 pub use ns::init_daemon_namespace;
 
 pub type WorkspaceId = PrefixId<WorkspaceIdDomain>;
+
+fn workspace_handle(id: WorkspaceId) -> String {
+    format!("ws-{}", id.encoded())
+}
+
+#[derive(Debug)]
+struct ManagedWorkspace {
+    id: String,
+    root: Utf8PathBuf,
+    lock: Utf8PathBuf,
+    materialized: bool,
+}
+
+impl ManagedWorkspace {
+    fn id(&self) -> anyhow::Result<WorkspaceId> {
+        let encoded = self
+            .id
+            .strip_prefix("ws-")
+            .context("jj managed workspace id is missing ws- prefix")?;
+        WorkspaceId::from_encoded(encoded).context("jj returned an invalid managed workspace id")
+    }
+}
+
+#[derive(Deserialize)]
+struct ManagedWorkspaceWire {
+    id: String,
+    root: String,
+    lock: String,
+    materialized: bool,
+}
+
+#[derive(Debug)]
+struct WorkspaceLease {
+    file: File,
+    path: Utf8PathBuf,
+}
+
+impl WorkspaceLease {
+    fn acquire(path: &Utf8Path) -> anyhow::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("open workspace lease {path}"))?;
+        match rustix::fs::flock(&file, FlockOperation::NonBlockingLockShared) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                anyhow::bail!("workspace is being garbage-collected; retry: {path}")
+            }
+            Err(error) => return Err(error).with_context(|| format!("lock workspace {path}")),
+        }
+        let lease = Self {
+            file,
+            path: path.to_owned(),
+        };
+        lease.touch()?;
+        Ok(lease)
+    }
+
+    fn touch(&self) -> anyhow::Result<()> {
+        self.file
+            .set_modified(std::time::SystemTime::now())
+            .with_context(|| format!("touch workspace lease {}", self.path))
+    }
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.touch() {
+            eprintln!(
+                "rho-workspaces: touch lease {} on release: {error}",
+                self.path
+            );
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PathOverrides {
@@ -104,14 +181,15 @@ impl PathOverrides {
     }
 }
 
-/// Keys workspace-id encoding with the daemon database's persisted machine
-/// seed. The id is stored as part of [`WorkspaceInfo`] and its encoded form is
-/// the jj workspace name.
+/// Prefix-id family for repository-local jj-managed workspace ids.
+///
+/// jj owns the actual per-repository seed and counter. Rho persists the
+/// resulting encoded id and does not allocate production ids itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkspaceIdDomain(pub u64);
 
 impl PrefixIdDomain for WorkspaceIdDomain {
-    const KIND: &'static str = "workspace-id";
+    const KIND: &'static str = "managed-workspace-id";
 
     fn machine_seed(&self) -> u64 {
         self.0
@@ -125,17 +203,15 @@ pub enum WorkspaceInfo {
     /// The user's own checkout: the agent works directly at the repo path,
     /// no separate checkout and no namespace.
     UserCheckout { repo: Utf8PathBuf },
-    /// A jj workspace named after this workspace id's encoding. It is checked
-    /// out in a pool slot, but that is an implementation detail: the slot
-    /// directory is queried from jj, never stored — it changes across
-    /// detach/attach cycles.
+    /// A stable jj-managed workspace. jj selects and persists its checkout
+    /// path; Rho stores only the repository-local id.
     Workspace {
         repo: Utf8PathBuf,
         #[senax(rename = "name")]
         id: WorkspaceId,
     },
-    /// A jj pool workspace whose original VCS metadata is masked from child
-    /// commands and replaced by a synthetic Git baseline.
+    /// A jj-managed workspace whose original VCS metadata is masked from
+    /// child commands and replaced by a synthetic Git baseline.
     Sandbox { repo: Utf8PathBuf, id: WorkspaceId },
 }
 
@@ -159,9 +235,9 @@ impl WorkspaceInfo {
         }
     }
 
-    pub fn workspace_name(&self) -> Option<String> {
+    pub fn workspace_handle(&self) -> Option<String> {
         match self {
-            Self::Workspace { id, .. } => Some(id.encoded()),
+            Self::Workspace { id, .. } => Some(workspace_handle(*id)),
             Self::UserCheckout { .. } | Self::Sandbox { .. } => None,
         }
     }
@@ -172,9 +248,9 @@ impl WorkspaceInfo {
 }
 
 /// One jj repo the daemon works with — the crate's entry object.
-/// Everything repo-scoped lives here: the jj invocation lock, the live
-/// workspace instances, the once-per-daemon reap of stale attachments, and
-/// the ws-parent pointer plumbing.
+/// Everything repo-scoped lives here: jj invocation serialization, weak live
+/// workspace indexing, one opportunistic managed-workspace GC, and ws-parent
+/// pointer plumbing.
 ///
 /// Hold exactly one instance per repo root (the daemon keeps a dedup map):
 /// agents joining a workspace share one live [`Workspace`] — one checkout —
@@ -193,15 +269,11 @@ pub struct Repo {
     /// on its own; this is simplicity insurance while the fork's
     /// all-workspace snapshot path is young.
     jj_lock: Mutex<()>,
-    /// One live instance per workspace, so agents joining a workspace share
-    /// its checkout, mount namespace, and lazy setup.
-    workspaces: Mutex<HashMap<WorkspaceInfo, Arc<Workspace>>>,
-    /// Set once the stale pool attachments from a previous daemon have been
-    /// released. Attachment is a runtime property: whatever a dead daemon
-    /// left attached is detached — snapshotting first, so mid-turn work from
-    /// a crash lands in its workspace's commit — before this daemon's first
-    /// attach in the repo.
-    reaped: OnceCell<()>,
+    /// Weakly indexes live workspaces, so agents and views remain their strong
+    /// owners while agents joining a workspace share its checkout, mount
+    /// namespace, and lazy setup.
+    workspaces: Mutex<HashMap<WorkspaceInfo, Weak<Workspace>>>,
+    gc_started: AtomicBool,
 }
 
 impl Repo {
@@ -224,7 +296,7 @@ impl Repo {
             user_environment: None,
             jj_lock: Mutex::new(()),
             workspaces: Mutex::new(HashMap::new()),
-            reaped: OnceCell::new(),
+            gc_started: AtomicBool::new(false),
         })
     }
 
@@ -261,7 +333,7 @@ impl Repo {
             user_environment: None,
             jj_lock: Mutex::new(()),
             workspaces: Mutex::new(HashMap::new()),
-            reaped: OnceCell::new(),
+            gc_started: AtomicBool::new(false),
         })
     }
 
@@ -281,28 +353,26 @@ impl Repo {
         self.is_jj
     }
 
-    /// Creates the jj workspace named after `id`'s encoding for a new agent
-    /// in a pool slot with a new change on top of `parent_revset` (resolved
-    /// against this repo, so `@` is the user's checkout and `<id>@` another
-    /// workspace's). A background `pool prepare` keeps warm slots ready for
-    /// later agents.
+    /// Allocates and creates a stable jj-managed workspace on
+    /// `parent_revset`.
     pub async fn create_workspace(
         self: &Arc<Self>,
-        id: WorkspaceId,
         parent_revset: &str,
     ) -> anyhow::Result<Arc<Workspace>> {
         anyhow::ensure!(self.is_jj, "not a jj repository: {}", self.root);
-        let name = id.encoded();
-        let slot = self.attach(&name, Some(parent_revset)).await?;
-        self.warm_pool();
-        self.cache_workspace(self.workspace_info(id), slot).await
+        let (managed, lease) = self.create_managed(parent_revset).await?;
+        let info = self.workspace_info(managed.id()?);
+        let workspace = self
+            .cache_workspace(info, managed.root, Some(lease))
+            .await?;
+        self.collect_stale_workspaces();
+        Ok(workspace)
     }
 
-    /// Creates a jj pool workspace, masks its original VCS metadata from
-    /// child commands, and creates a synthetic Git baseline for them.
+    /// Creates a managed workspace, masks its original VCS metadata from child
+    /// commands, and creates a synthetic Git baseline for them.
     pub async fn create_sandbox(
         self: &Arc<Self>,
-        id: WorkspaceId,
         parent_revset: &str,
     ) -> anyhow::Result<Arc<Workspace>> {
         anyhow::ensure!(
@@ -310,13 +380,15 @@ impl Repo {
             "sandbox source is not a jj repository: {}",
             self.root
         );
+        let (managed, lease) = self.create_managed(parent_revset).await?;
+        let id = managed.id()?;
         let info = WorkspaceInfo::Sandbox {
             repo: self.root.clone(),
             id,
         };
         let base = sandbox_base(&self.root, id)?;
         anyhow::ensure!(!base.exists(), "sandbox already exists: {base}");
-        let slot = self.attach(&id.encoded(), Some(parent_revset)).await?;
+        let checkout = managed.root;
         let result = async {
             for dir in [
                 base.join("home"),
@@ -329,21 +401,23 @@ impl Repo {
             }
             std::fs::write(base.join("masks/.git"), "")
                 .context("create sandbox Git metadata mask")?;
-            self.initialize_sandbox_git(&slot, &base.join("git")).await
+            self.initialize_sandbox_git(&checkout, &base.join("git"))
+                .await
         }
         .await;
         if let Err(error) = result {
             let _ = std::fs::remove_dir_all(&base);
             return Err(error);
         }
-        self.warm_pool();
-        self.cache_workspace(info, slot).await
+        let workspace = self.cache_workspace(info, checkout, Some(lease)).await?;
+        self.collect_stale_workspaces();
+        Ok(workspace)
     }
 
     /// Opens an existing workspace, returning the live shared instance when
-    /// one exists — agents in the same workspace share one checkout and one
-    /// mount namespace. A pool workspace is (re)attached idempotently, so a
-    /// workspace detached earlier is rematerialized into a fresh slot here.
+    /// one exists. Agents may share this checkout while retaining separate
+    /// View mount namespaces. Missing managed subvolumes are rematerialized by
+    /// jj at their stable paths.
     pub async fn open_workspace(
         self: &Arc<Self>,
         id: WorkspaceId,
@@ -351,13 +425,13 @@ impl Repo {
         anyhow::ensure!(self.is_jj, "not a jj repository: {}", self.root);
         let info = self.workspace_info(id);
         let mut workspaces = self.workspaces.lock().await;
-        if let Some(workspace) = workspaces.get(&info) {
-            return Ok(Arc::clone(workspace));
+        if let Some(workspace) = workspaces.get(&info).and_then(Weak::upgrade) {
+            return Ok(workspace);
         }
-        let name = id.encoded();
-        let slot = self.attach(&name, None).await?;
-        let workspace = Arc::new(self.workspace(info.clone(), slot));
-        workspaces.insert(info, Arc::clone(&workspace));
+        let (managed, lease) = self.open_managed(id).await?;
+        let workspace = Arc::new(self.workspace(info.clone(), managed.root, Some(lease)));
+        workspaces.insert(info, Arc::downgrade(&workspace));
+        self.collect_stale_workspaces();
         Ok(workspace)
     }
 
@@ -367,17 +441,19 @@ impl Repo {
             id,
         };
         let mut workspaces = self.workspaces.lock().await;
-        if let Some(workspace) = workspaces.get(&info) {
-            return Ok(Arc::clone(workspace));
+        if let Some(workspace) = workspaces.get(&info).and_then(Weak::upgrade) {
+            return Ok(workspace);
         }
+        let (managed, lease) = self.open_managed(id).await?;
         let base = sandbox_base(&self.root, id)?;
-        let slot = self.attach(&id.encoded(), None).await?;
+        let checkout = managed.root;
         anyhow::ensure!(
             base.join("git/HEAD").is_file(),
             "sandbox Git baseline is missing: {base}"
         );
-        let workspace = Arc::new(self.workspace(info.clone(), slot));
-        workspaces.insert(info, Arc::clone(&workspace));
+        let workspace = Arc::new(self.workspace(info.clone(), checkout, Some(lease)));
+        workspaces.insert(info, Arc::downgrade(&workspace));
+        self.collect_stale_workspaces();
         Ok(workspace)
     }
 
@@ -388,11 +464,11 @@ impl Repo {
             repo: self.root.clone(),
         };
         let mut workspaces = self.workspaces.lock().await;
-        if let Some(workspace) = workspaces.get(&info) {
-            return Ok(Arc::clone(workspace));
+        if let Some(workspace) = workspaces.get(&info).and_then(Weak::upgrade) {
+            return Ok(workspace);
         }
-        let workspace = Arc::new(self.workspace(info.clone(), self.root.clone()));
-        workspaces.insert(info, Arc::clone(&workspace));
+        let workspace = Arc::new(self.workspace(info.clone(), self.root.clone(), None));
+        workspaces.insert(info, Arc::downgrade(&workspace));
         Ok(workspace)
     }
 
@@ -412,51 +488,146 @@ impl Repo {
         }
     }
 
-    /// Checks the workspace out into a pool slot (creating the workspace
-    /// first when `create_revset` is given) and returns the slot directory,
-    /// with its repo pointers rewritten through ws-parent and its flake
-    /// files' mtimes restored for direnv/nix fingerprints.
-    async fn attach(&self, name: &str, create_revset: Option<&str>) -> anyhow::Result<Utf8PathBuf> {
+    async fn create_managed(
+        &self,
+        parent_revset: &str,
+    ) -> anyhow::Result<(ManagedWorkspace, WorkspaceLease)> {
         let _guard = self.jj_lock.lock().await;
-        self.ensure_reaped().await?;
         let mut command = self.jj();
-        match create_revset {
-            Some(revset) => {
-                command
-                    .args(["workspace", "add", "--pool", "--name", name])
-                    .args(["--revision", revset]);
-            }
-            None => {
-                command.args(["workspace", "pool", "attach", name]);
+        command
+            .args(["workspace", "managed", "create", "--revision"])
+            .arg(parent_revset);
+        let managed = run_managed_jj(command)
+            .await
+            .context("create managed jj workspace")?;
+        let lease = WorkspaceLease::acquire(&managed.lock)?;
+        self.prepare_managed_checkout(&managed)?;
+        Ok((managed, lease))
+    }
+
+    /// Opens a managed workspace. Legacy conversion is deliberately excluded:
+    /// it runs once at database migration rather than on ordinary opens.
+    async fn open_managed(
+        &self,
+        id: WorkspaceId,
+    ) -> anyhow::Result<(ManagedWorkspace, WorkspaceLease)> {
+        let _guard = self.jj_lock.lock().await;
+        let handle = workspace_handle(id);
+        let mut resolve = self.jj();
+        resolve.args(["workspace", "managed", "resolve", &handle]);
+        let resolved = run_managed_jj(resolve)
+            .await
+            .context("resolve managed jj workspace")?;
+        let lease = WorkspaceLease::acquire(&resolved.lock)?;
+        let managed = if resolved.materialized && resolved.root.is_dir() {
+            resolved
+        } else {
+            let mut attach = self.jj();
+            attach.args([
+                "workspace",
+                "managed",
+                "attach",
+                "--external-lease",
+                &resolved.id,
+            ]);
+            let attached = run_managed_jj(attach)
+                .await
+                .context("attach managed jj workspace")?;
+            anyhow::ensure!(
+                attached.root == resolved.root && attached.lock == resolved.lock,
+                "jj changed a managed workspace's stable paths"
+            );
+            attached
+        };
+        self.prepare_managed_checkout(&managed)?;
+        Ok((managed, lease))
+    }
+
+    /// Temporary one-shot migration helper. Existing managed IDs pass
+    /// through unchanged; a legacy bare workspace name is adopted by jj while
+    /// preserving its exact working-copy commit.
+    pub async fn adopt_legacy_workspace_info(
+        &self,
+        info: &WorkspaceInfo,
+    ) -> anyhow::Result<WorkspaceInfo> {
+        let Some(id) = info.workspace_id() else {
+            return Ok(info.clone());
+        };
+        let _guard = self.jj_lock.lock().await;
+        let handle = workspace_handle(id);
+        let mut resolve = self.jj();
+        resolve.args(["workspace", "managed", "resolve", &handle]);
+        if run_managed_jj(resolve).await.is_ok() {
+            return Ok(info.clone());
+        }
+
+        let mut adopt = self.jj();
+        adopt.args(["workspace", "managed", "adopt", &id.encoded()]);
+        let managed = run_managed_jj(adopt)
+            .await
+            .context("adopt legacy jj workspace")?;
+        let new_id = managed.id()?;
+        self.prepare_managed_checkout(&managed)?;
+        if matches!(info, WorkspaceInfo::Sandbox { .. }) {
+            let old_base = sandbox_base(&self.root, id)?;
+            let new_base = sandbox_base(&self.root, new_id)?;
+            if old_base.exists() && !new_base.exists() {
+                std::fs::rename(&old_base, &new_base).context("migrate sandbox state directory")?;
             }
         }
-        run_jj(command).await.context("jj workspace attach")?;
-        let slot = self.workspace_root(name).await?;
-        self.rewrite_pointers(&slot)?;
+        Ok(match info {
+            WorkspaceInfo::Workspace { .. } => self.workspace_info(new_id),
+            WorkspaceInfo::Sandbox { .. } => WorkspaceInfo::Sandbox {
+                repo: self.root.clone(),
+                id: new_id,
+            },
+            WorkspaceInfo::UserCheckout { .. } => unreachable!(),
+        })
+    }
+
+    fn prepare_managed_checkout(&self, managed: &ManagedWorkspace) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            managed.materialized && managed.root.is_absolute() && managed.root.is_dir(),
+            "jj reported an invalid managed workspace root: {}",
+            managed.root
+        );
+        anyhow::ensure!(
+            managed.lock.is_absolute(),
+            "jj reported a relative lease path"
+        );
+        self.rewrite_pointers(&managed.root)?;
         for filename in ["flake.nix", "flake.lock", ".envrc"] {
-            let _ = copy_mtime_if_same(self.root().join(filename), slot.join(filename));
+            let _ = copy_mtime_if_same(self.root().join(filename), managed.root.join(filename));
         }
-        Ok(slot)
+        Ok(())
     }
 
     async fn cache_workspace(
         self: &Arc<Self>,
         info: WorkspaceInfo,
-        slot: Utf8PathBuf,
+        checkout: Utf8PathBuf,
+        lease: Option<WorkspaceLease>,
     ) -> anyhow::Result<Arc<Workspace>> {
-        let workspace = Arc::new(self.workspace(info.clone(), slot));
-        self.workspaces
-            .lock()
-            .await
-            .insert(info, Arc::clone(&workspace));
+        let mut workspaces = self.workspaces.lock().await;
+        if let Some(workspace) = workspaces.get(&info).and_then(Weak::upgrade) {
+            return Ok(workspace);
+        }
+        let workspace = Arc::new(self.workspace(info.clone(), checkout, lease));
+        workspaces.insert(info, Arc::downgrade(&workspace));
         Ok(workspace)
     }
 
-    fn workspace(self: &Arc<Self>, info: WorkspaceInfo, slot: Utf8PathBuf) -> Workspace {
+    fn workspace(
+        self: &Arc<Self>,
+        info: WorkspaceInfo,
+        checkout: Utf8PathBuf,
+        lease: Option<WorkspaceLease>,
+    ) -> Workspace {
         Workspace {
             info: info.clone(),
             repo: Arc::clone(self),
-            slot,
+            checkout,
+            _lease: lease,
             context_config: OnceLock::new(),
         }
     }
@@ -473,7 +644,7 @@ impl Repo {
 
     async fn initialize_sandbox_git(
         &self,
-        slot: &Utf8Path,
+        checkout: &Utf8Path,
         git_dir: &Utf8Path,
     ) -> anyhow::Result<()> {
         for args in [
@@ -495,8 +666,8 @@ impl Repo {
             }
             command
                 .env("GIT_DIR", git_dir)
-                .env("GIT_WORK_TREE", slot)
-                .current_dir(slot)
+                .env("GIT_WORK_TREE", checkout)
+                .current_dir(checkout)
                 .args(args);
             let output = command.output().await.context("spawn sandbox git")?;
             anyhow::ensure!(
@@ -512,83 +683,80 @@ impl Repo {
         Ok(())
     }
 
-    /// Once per daemon lifetime, detaches every pool-attached workspace (one
-    /// `jj workspace pool detach --all`) — jj knows which workspaces occupy
-    /// pool slots; rho doesn't enumerate anything. Runs under the jj lock,
-    /// before this daemon's first attach in the repo — later attaches by
-    /// this daemon must not be reaped.
-    async fn ensure_reaped(&self) -> anyhow::Result<()> {
-        self.reaped
-            .get_or_try_init(|| async {
-                let mut command = self.jj();
-                command.args(["workspace", "pool", "detach", "--all"]);
-                run_jj(command)
-                    .await
-                    .context("jj workspace pool detach --all")?;
-                anyhow::Ok(())
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Fire-and-forget `jj workspace pool prepare`: keep a few warm free
-    /// slots (seeded with the default workspace's ignored files) ready for
-    /// the next agents.
-    fn warm_pool(self: &Arc<Self>) {
+    /// Starts one repository-local heartbeat and GC loop after this daemon
+    /// first uses a managed workspace.
+    fn collect_stale_workspaces(self: &Arc<Self>) {
+        if self.gc_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let repo = Arc::clone(self);
         tokio::spawn(async move {
-            let _guard = repo.jj_lock.lock().await;
-            let mut command = repo.jj();
-            command.args(["workspace", "pool", "prepare", "--count", "4"]);
-            if let Err(error) = run_jj(command).await {
-                eprintln!(
-                    "rho-workspaces: pool prepare for {} failed: {error:#}",
-                    repo.root
-                );
+            loop {
+                let live = repo
+                    .workspaces
+                    .lock()
+                    .await
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>();
+                for workspace in live {
+                    if let Some(lease) = &workspace._lease
+                        && let Err(error) = lease.touch()
+                    {
+                        eprintln!(
+                            "rho-workspaces: heartbeat workspace {}: {error:#}",
+                            workspace.repo()
+                        );
+                    }
+                }
+                {
+                    let _guard = repo.jj_lock.lock().await;
+                    let mut command = repo.jj();
+                    command.args([
+                        "workspace",
+                        "managed",
+                        "gc",
+                        "--older-than-seconds",
+                        "86400",
+                    ]);
+                    if let Err(error) = run_jj(command).await {
+                        eprintln!(
+                            "rho-workspaces: managed workspace GC for {} failed: {error:#}",
+                            repo.root
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
             }
         });
     }
 
-    /// The slot directory a workspace is currently attached at, per jj.
-    async fn workspace_root(&self, name: &str) -> anyhow::Result<Utf8PathBuf> {
-        let mut command = self.jj();
-        command.args(["workspace", "root", "--name", name]);
-        let stdout = run_jj(command).await.context("jj workspace root")?;
-        let path = String::from_utf8(stdout).context("workspace root is not valid UTF-8")?;
-        let path = Utf8PathBuf::from(path.trim());
-        anyhow::ensure!(
-            path.is_absolute() && path.is_dir(),
-            "jj reported a bad workspace root: {path}",
-        );
-        Ok(path)
-    }
-
-    /// Redirects the slot's back-references to the origin repo through
+    /// Redirects the checkout's back-references to the origin repo through
     /// `<origin>/.jj/ws-parent`, which resolves in every namespace (the
-    /// origin path itself is covered by the slot mount inside the agent's
+    /// origin path itself is covered by the checkout mount inside the agent's
     /// namespace). Idempotent; runs after every attach since jj recreates
     /// the `.git` worktree pointer each time. Also ensures the origin's
     /// ws-parent symlink, which must exist before the rewritten pointer is
     /// ever read.
-    fn rewrite_pointers(&self, slot: &Utf8Path) -> anyhow::Result<()> {
+    fn rewrite_pointers(&self, checkout: &Utf8Path) -> anyhow::Result<()> {
         ensure_ws_parent_symlink(self.root())?;
         let parent = self.root().join(".jj").join(ns::WS_PARENT);
-        // The slot-side directory the agent namespace binds the origin onto.
-        match std::fs::create_dir(slot.join(".jj").join(ns::WS_PARENT)) {
+        // The checkout-side directory the agent namespace binds the origin onto.
+        match std::fs::create_dir(checkout.join(".jj").join(ns::WS_PARENT)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).context("create slot ws-parent dir"),
+            Err(error) => return Err(error).context("create checkout ws-parent dir"),
         }
 
-        let jj_pointer = slot.join(".jj").join("repo");
+        let jj_pointer = checkout.join(".jj").join("repo");
         let target = parent.join(".jj").join("repo");
         std::fs::write(&jj_pointer, target.as_str())
             .with_context(|| format!("rewrite {jj_pointer}"))?;
 
-        // Git worktree slots get a `gitdir: <origin>/...` file; same
+        // Git worktree checkouts get a `gitdir: <origin>/...` file; same
         // treatment. Replacement is a no-op when the pointer was already
         // rewritten.
-        let git_pointer = slot.join(".git");
+        let git_pointer = checkout.join(".git");
         if git_pointer.is_file() {
             let content =
                 std::fs::read_to_string(&git_pointer).context("read git worktree pointer")?;
@@ -618,7 +786,8 @@ impl Repo {
 pub struct Workspace {
     info: WorkspaceInfo,
     repo: Arc<Repo>,
-    slot: Utf8PathBuf,
+    checkout: Utf8PathBuf,
+    _lease: Option<WorkspaceLease>,
     context_config: OnceLock<Arc<rho_context_config::DiscoveredContext>>,
 }
 
@@ -643,7 +812,7 @@ impl Workspace {
     }
 
     /// The origin repo root — the path agents see and the system prompt
-    /// reports (the slot is mounted over it in the agent's namespace).
+    /// reports (the checkout is mounted over it in the agent's namespace).
     pub fn repo(&self) -> &Utf8Path {
         self.repo.root()
     }
@@ -652,18 +821,18 @@ impl Workspace {
         Arc::clone(self.context_config.get_or_init(|| {
             Arc::new(rho_context_config::DiscoveredContext::discover(
                 self.repo(),
-                self.slot(),
+                self.checkout(),
             ))
         }))
     }
 
     /// The checkout directory in the daemon/host namespace. In-process file
     /// operations (patches) and namespace-less fallback execution use this.
-    pub fn slot(&self) -> &Utf8Path {
-        &self.slot
+    pub fn checkout(&self) -> &Utf8Path {
+        &self.checkout
     }
 
-    /// Whether commands for this workspace need a cover mount (the slot is
+    /// Whether commands for this workspace need a cover mount (the checkout is
     /// not already the origin path).
     fn needs_mount(&self) -> bool {
         !self.is_user_checkout()
@@ -688,7 +857,7 @@ impl Workspace {
 /// One agent's view of the filesystem: a working set of workdir entries
 /// fixed at construction, each binding an origin path to a materialized
 /// [`Workspace`], realized as a private mount namespace with each entry's
-/// slot mounted over its origin path. Entry 0 is the primary workdir: the
+/// checkout mounted over its origin path. Entry 0 is the primary workdir: the
 /// default cwd and the path the system prompt reports.
 ///
 /// The namespace fd is created lazily on the first prepared command that
@@ -707,7 +876,7 @@ pub struct View {
 /// A nonempty working set of workdirs with pairwise-disjoint origin roots,
 /// primary first. The constructor enforces the invariants, so a held
 /// `WorkingSet` is always valid: overlapping roots would shadow each other's
-/// cover mounts (a parent mounted after a child hides the child's slot).
+/// cover mounts (a parent mounted after a child hides the child's checkout).
 #[derive(Debug, Clone)]
 pub struct WorkingSet(Vec<Arc<Workspace>>);
 
@@ -823,7 +992,7 @@ impl View {
                 .env("GIT_WORK_TREE", primary.repo());
             let mut writable = Vec::new();
             for entry in entries {
-                writable.push(entry.slot().as_std_path().to_owned());
+                writable.push(entry.checkout().as_std_path().to_owned());
                 let base = entry.sandbox_base().expect("sandbox has base");
                 writable.extend(
                     ["home", "tmp", "run", "git"]
@@ -869,13 +1038,13 @@ impl View {
     }
 
     /// Maps a path in the agent-visible view (origin paths) to the host path
-    /// where the bytes actually live (slot checkouts), for in-process file
+    /// where the bytes actually live (managed checkouts), for in-process file
     /// operations that do not enter the namespace. Paths outside every entry
     /// are returned unchanged.
     pub fn resolve_host_path(&self, path: &Path) -> PathBuf {
         for entry in self.entries() {
             if let Ok(rel) = path.strip_prefix(entry.repo().as_std_path()) {
-                return entry.slot().as_std_path().join(rel);
+                return entry.checkout().as_std_path().join(rel);
             }
         }
         path.to_owned()
@@ -888,7 +1057,7 @@ impl View {
         if path.is_absolute() {
             for entry in self.entries() {
                 if let Ok(rel) = path.strip_prefix(entry.repo().as_std_path()) {
-                    return sandbox_join(entry.slot().as_std_path(), rel);
+                    return sandbox_join(entry.checkout().as_std_path(), rel);
                 }
             }
             anyhow::bail!(
@@ -896,7 +1065,7 @@ impl View {
                 path.display()
             );
         }
-        sandbox_join(self.entries[0].slot().as_std_path(), path)
+        sandbox_join(self.entries[0].checkout().as_std_path(), path)
     }
 
     /// Commits every jj entry's checkout state into its repo. Called at turn
@@ -935,7 +1104,7 @@ async fn ensure_ns<'ns>(
             .filter(|entry| entry.needs_mount())
             .map(|entry| ns::ViewMount {
                 repo: entry.repo().as_std_path().to_owned(),
-                slot: entry.slot().as_std_path().to_owned(),
+                checkout: entry.checkout().as_std_path().to_owned(),
                 metadata_masks: entry.sandbox_base().map(|base| {
                     (
                         base.join("masks/.jj").into_std_path_buf(),
@@ -995,6 +1164,20 @@ async fn run_jj(mut command: tokio::process::Command) -> anyhow::Result<Vec<u8>>
         );
     }
     Ok(output.stdout)
+}
+
+async fn run_managed_jj(command: tokio::process::Command) -> anyhow::Result<ManagedWorkspace> {
+    let stdout = run_jj(command).await?;
+    let wire: ManagedWorkspaceWire =
+        serde_json::from_slice(&stdout).context("parse managed workspace JSON")?;
+    let root = Utf8PathBuf::from(wire.root);
+    let lock = Utf8PathBuf::from(wire.lock);
+    Ok(ManagedWorkspace {
+        id: wire.id,
+        root,
+        lock,
+        materialized: wire.materialized,
+    })
 }
 
 /// Repo roots must be absolute, existing, UTF-8 jj repo roots. A path inside
@@ -1067,7 +1250,7 @@ pub fn resolve_workdir_root(path: &Path) -> anyhow::Result<(Utf8PathBuf, bool)> 
 }
 
 /// The origin's `.jj/ws-parent -> ..` symlink (back to the repo root — the
-/// target resolves relative to the `.jj` dir holding the link) that slot
+/// target resolves relative to the `.jj` dir holding the link) that checkout
 /// pointers route through (see [`ns::WS_PARENT`]); created once per repo,
 /// idempotent.
 fn ensure_ws_parent_symlink(repo: &Utf8Path) -> anyhow::Result<()> {
@@ -1116,9 +1299,9 @@ fn sandbox_join(root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// Reuses a donor file's timestamps only when the checkout has identical
-/// bytes. Warm pool slots may contain direnv/nix caches keyed by these mtimes;
-/// preserving a timestamp across different contents would make a stale cache
-/// look current.
+/// bytes. Retained managed checkouts may contain direnv/nix caches keyed by
+/// these mtimes; preserving a timestamp across different contents would make a
+/// stale cache look current.
 fn copy_mtime_if_same(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Result<()> {
     let source = source.as_ref();
     let target = target.as_ref();
@@ -1140,11 +1323,36 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    use super::{Repo, WorkspaceId, WorkspaceIdDomain, copy_mtime_if_same, sandbox_join};
+    use super::{
+        Repo, WorkspaceId, WorkspaceIdDomain, copy_mtime_if_same, sandbox_join, workspace_handle,
+    };
+
+    #[tokio::test]
+    async fn repo_cache_weakly_deduplicates_workspaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(
+            Repo::open_plain_with_path_overrides(temp.path(), Default::default()).unwrap(),
+        );
+
+        let (first, second) = tokio::join!(repo.user_checkout(), repo.user_checkout());
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_none());
+
+        let (first, second) = tokio::join!(repo.user_checkout(), repo.user_checkout());
+        assert!(Arc::ptr_eq(&first.unwrap(), &second.unwrap()));
+    }
 
     #[tokio::test]
     async fn creates_provenance_free_git_sandbox() {
-        let temp = tempfile::tempdir().unwrap();
+        // Managed workspaces deliberately require the repository filesystem
+        // to be bcachefs; this checkout is the test's bcachefs fixture.
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let repo = temp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         assert!(
@@ -1169,19 +1377,18 @@ mod tests {
         std::fs::write(repo.join("ignored-secret"), "secret").unwrap();
 
         let repo = Arc::new(Repo::open(&repo).unwrap());
-        let id = WorkspaceId::from_counter(9_876_543, &WorkspaceIdDomain(123)).unwrap();
-        let workspace = repo.create_sandbox(id, "@").await.unwrap();
+        let workspace = repo.create_sandbox("@").await.unwrap();
         assert_eq!(
-            std::fs::read_to_string(workspace.slot().join("tracked")).unwrap(),
+            std::fs::read_to_string(workspace.checkout().join("tracked")).unwrap(),
             "working copy"
         );
-        assert!(!workspace.slot().join("ignored-secret").exists());
-        assert!(workspace.slot().join(".jj").is_dir());
+        assert!(!workspace.checkout().join("ignored-secret").exists());
+        assert!(workspace.checkout().join(".jj").is_dir());
         let sandbox_git = workspace.sandbox_base().unwrap().join("git");
         let commits = std::process::Command::new("git")
             .env("GIT_DIR", &sandbox_git)
-            .env("GIT_WORK_TREE", workspace.slot())
-            .current_dir(workspace.slot())
+            .env("GIT_WORK_TREE", workspace.checkout())
+            .current_dir(workspace.checkout())
             .args(["rev-list", "--count", "HEAD"])
             .output()
             .unwrap();
@@ -1190,8 +1397,8 @@ mod tests {
         assert!(
             std::process::Command::new("git")
                 .env("GIT_DIR", &sandbox_git)
-                .env("GIT_WORK_TREE", workspace.slot())
-                .current_dir(workspace.slot())
+                .env("GIT_WORK_TREE", workspace.checkout())
+                .current_dir(workspace.checkout())
                 .args(["status", "--porcelain"])
                 .output()
                 .unwrap()
@@ -1199,6 +1406,92 @@ mod tests {
                 .is_empty()
         );
         std::fs::remove_dir_all(workspace.sandbox_base().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn adopts_legacy_bare_workspace_id() {
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let repo = temp.path().join("repo");
+        let legacy = temp.path().join("legacy");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(
+            std::process::Command::new("jj")
+                .current_dir(&repo)
+                .args(["git", "init", "--colocate"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo.join("tracked"), "base").unwrap();
+        assert!(
+            std::process::Command::new("jj")
+                .current_dir(&repo)
+                .args(["commit", "-m", "base"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let old_id = WorkspaceId::from_counter(42, &WorkspaceIdDomain(7)).unwrap();
+        assert!(
+            std::process::Command::new("jj")
+                .arg("--repository")
+                .arg(&repo)
+                .args(["workspace", "add", "--name", &old_id.encoded()])
+                .arg(&legacy)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let legacy_commit = std::process::Command::new("jj")
+            .arg("--repository")
+            .arg(&repo)
+            .args([
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("{}@", old_id.encoded()),
+                "-T",
+                "commit_id",
+            ])
+            .output()
+            .unwrap();
+        assert!(legacy_commit.status.success());
+
+        let repo = Arc::new(Repo::open(&repo).unwrap());
+        let old_info = repo.workspace_info(old_id);
+        let new_info = repo.adopt_legacy_workspace_info(&old_info).await.unwrap();
+        let new_id = new_info.workspace_id().unwrap();
+        assert_ne!(new_id, old_id);
+        assert_eq!(new_info.workspace_handle(), Some(workspace_handle(new_id)));
+        let workspace = repo.open_workspace(new_id).await.unwrap();
+        assert!(workspace.checkout().is_dir());
+        let managed_commit = std::process::Command::new("jj")
+            .arg("--repository")
+            .arg(repo.root())
+            .args([
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("{}@", workspace_handle(new_id)),
+                "-T",
+                "commit_id",
+            ])
+            .output()
+            .unwrap();
+        assert!(managed_commit.status.success());
+        assert_eq!(legacy_commit.stdout, managed_commit.stdout);
+        let legacy_lookup = std::process::Command::new("jj")
+            .arg("--repository")
+            .arg(repo.root())
+            .args(["log", "-r", &format!("{}@", old_id.encoded())])
+            .output()
+            .unwrap();
+        assert!(!legacy_lookup.status.success());
+        drop(workspace);
+        assert_eq!(
+            repo.adopt_legacy_workspace_info(&old_info).await.unwrap(),
+            new_info
+        );
     }
 
     #[test]

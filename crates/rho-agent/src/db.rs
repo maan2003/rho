@@ -7,7 +7,7 @@ use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
 pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
-use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
+use rho_workspaces::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 
@@ -29,12 +29,14 @@ const WORKSTREAMS: TableDefinition<WorkstreamId, Sen<WorkstreamRecord>> =
 /// Superseded by workstreams + labels; read once by migration.
 const LEGACY_TAGS: TableDefinition<TagId, Sen<TagRecord>> = TableDefinition::new("tags");
 const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::new("projects");
-/// Opaque client-owned view configuration (see [`AgentReadTxnExt::view_config`]).
+/// Opaque client-owned view configuration (see
+/// [`AgentReadTxnExt::view_config`]).
 const VIEW_CONFIG: TableDefinition<(), Vec<u8>> = TableDefinition::new("view_config");
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "c4d9a02b";
+const MANAGED_WORKSPACE_MIGRATION_FROM: &str = "c4d9a02b";
+const CURRENT_AGENT_DB_FORMAT: &str = "8e72c1a4";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -50,11 +52,21 @@ pub struct MigrationRecoveryPoint {
     pub created_at: UnixMillis,
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "f3b8d24a",
-    to: "c4d9a02b",
-    migrate: migrate_tags_to_workstreams,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: "f3b8d24a",
+        to: MANAGED_WORKSPACE_MIGRATION_FROM,
+        migrate: migrate_tags_to_workstreams,
+    },
+    // AgentPool performs the external jj adoptions and stamps the destination
+    // format directly. This edge keeps the format graph explicit, but must
+    // never be traversed by the synchronous-only migration loop.
+    AgentDbMigration {
+        from: MANAGED_WORKSPACE_MIGRATION_FROM,
+        to: CURRENT_AGENT_DB_FORMAT,
+        migrate: |_| panic!("managed workspace migration must run through AgentPool"),
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -65,7 +77,6 @@ impl CounterKey {
     /// Formerly the topic and then tag id counter; workstreams continue
     /// its sequence.
     pub const LAST_WORKSTREAM_ID: Self = Self(3);
-    pub const LAST_WORKSPACE_ID: Self = Self(4);
 }
 
 pub use rho_core::{AgentId, AgentIdDomain};
@@ -74,8 +85,21 @@ pub use rho_core::{AgentId, AgentIdDomain};
 /// are addressed by their unique name in user-facing contexts, and clients
 /// that need a string render `ws-{n}`.
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue, Encode,
-    Decode, Pack, Unpack,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Key,
+    RedbValue,
+    Encode,
+    Decode,
+    Pack,
+    Unpack,
 )]
 pub struct WorkstreamId(pub u64);
 
@@ -231,14 +255,83 @@ pub async fn prepare_agent_db_migration(db: &rho_db::RhoDb) {
     .await;
 }
 
+/// Advances older database-only migrations to the format immediately before
+/// managed workspace IDs, then reports whether the one-shot jj migration is
+/// required. This is temporary and must run before `init_agent_tables()` can
+/// take the final no-op format hop.
+pub(crate) async fn prepare_managed_workspace_migration(db: &rho_db::RhoDb) -> bool {
+    let read = db.read();
+    let format = read
+        .has_table("format")
+        .then(|| read.open_table(FORMAT).get(&()).map(|v| v.value()))
+        .flatten();
+    drop(read);
+    let Some(mut format) = format else {
+        return false;
+    };
+    if format == CURRENT_AGENT_DB_FORMAT {
+        return false;
+    }
+
+    let mut write = db.write().await;
+    while format != MANAGED_WORKSPACE_MIGRATION_FROM {
+        let Some(migration) = AGENT_DB_MIGRATIONS
+            .iter()
+            .find(|migration| migration.from == format)
+        else {
+            panic!(
+                "this rho agent database was written by an older or different rho version \
+                 (database format {format}, this build expects {CURRENT_AGENT_DB_FORMAT}). \
+                 Update rho one version at a time so migrations can run, or remove \
+                 the local rho database if you do not need the saved agents."
+            );
+        };
+        assert_ne!(
+            migration.to, CURRENT_AGENT_DB_FORMAT,
+            "managed workspace migration was bypassed"
+        );
+        (migration.migrate)(&mut write);
+        format = migration.to.to_owned();
+        write.open_table(FORMAT).insert(&(), &format);
+    }
+    write.commit();
+    true
+}
+
+/// Whether opening this database requires the temporary migration that also
+/// mutates its referenced jj repositories. Snapshot-only migration checks
+/// must refuse this hop rather than stamp copied records with unmigrated IDs.
+pub fn requires_managed_workspace_migration(db: &rho_db::RhoDb) -> bool {
+    let read = db.read();
+    read.has_table("format")
+        && read
+            .open_table(FORMAT)
+            .get(&())
+            .is_some_and(|format| format.value() != CURRENT_AGENT_DB_FORMAT)
+}
+
+pub(crate) async fn finish_managed_workspace_migration(
+    db: &rho_db::RhoDb,
+    workdirs: Vec<(AgentId, Vec<WorkspaceInfo>)>,
+) {
+    let mut write = db.write().await;
+    for (agent_id, workdirs) in workdirs {
+        write.set_agent_workdirs(agent_id, workdirs);
+    }
+    write
+        .open_table(FORMAT)
+        .insert(&(), &CURRENT_AGENT_DB_FORMAT.to_owned());
+    write.commit();
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
     /// The agent's working set: where it works, primary workdir first.
     /// Fixed at spawn — never removed or reordered, because accumulated
-    /// model context assumes the entries stay valid. For pool workspaces the
-    /// jj workspace name is this agent's own workspace id (or the joined
-    /// agent's, for agents sharing a workspace).
+    /// model context assumes the entries stay valid. Managed workspace ids
+    /// are repository-local and allocated by jj; joined agents retain the
+    /// owning agent's id for that repository.
     pub workdirs: Vec<WorkspaceInfo>,
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
@@ -698,7 +791,6 @@ pub trait AgentReadTxnExt {
     /// [`AgentWriteTxnExt::init_agent_tables`] has run.
     fn machine_seed(&self) -> u64;
     fn last_agent_counter(&self) -> u64;
-    fn last_workspace_counter(&self) -> u64;
     fn get_workstream(&self, workstream_id: WorkstreamId) -> WorkstreamRecord;
     fn list_workstreams(&self) -> Vec<(WorkstreamId, WorkstreamRecord)>;
     /// Opaque client-owned view configuration; the daemon stores and
@@ -750,12 +842,9 @@ pub trait AgentWriteTxnExt {
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
     fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole);
     fn set_agent_prompt_cache_key(&mut self, agent_id: AgentId, key: PromptCacheKey);
+    fn set_agent_workdirs(&mut self, agent_id: AgentId, workdirs: Vec<WorkspaceInfo>);
 
     fn alloc_agent_id(&mut self) -> AgentId;
-
-    /// Reserves a fresh jj workspace name. Ids never repeat, so recreated
-    /// workspaces can't collide with forgotten names in the repo view.
-    fn alloc_workspace_id(&mut self) -> WorkspaceId;
 
     fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String);
 
@@ -867,13 +956,6 @@ impl AgentReadTxnExt for ReadTxn {
     fn last_agent_counter(&self) -> u64 {
         self.open_table(COUNTERS)
             .get(&CounterKey::LAST_AGENT_ID)
-            .map(|counter| counter.value())
-            .unwrap_or(0)
-    }
-
-    fn last_workspace_counter(&self) -> u64 {
-        self.open_table(COUNTERS)
-            .get(&CounterKey::LAST_WORKSPACE_ID)
             .map(|counter| counter.value())
             .unwrap_or(0)
     }
@@ -1100,16 +1182,21 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
+    fn set_agent_workdirs(&mut self, agent_id: AgentId, workdirs: Vec<WorkspaceInfo>) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent missing")
+            .value()
+            .into_owned();
+        agent.workdirs = workdirs;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
     fn alloc_agent_id(&mut self) -> AgentId {
         let domain = AgentIdDomain(machine_seed(self));
         AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
             .expect("agent id counter exceeds prefix-id capacity")
-    }
-
-    fn alloc_workspace_id(&mut self) -> WorkspaceId {
-        let domain = WorkspaceIdDomain(machine_seed(self));
-        WorkspaceId::from_counter(next_counter(self, CounterKey::LAST_WORKSPACE_ID), &domain)
-            .expect("workspace id counter exceeds prefix-id capacity")
     }
 
     fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String) {

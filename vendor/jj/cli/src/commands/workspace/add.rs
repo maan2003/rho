@@ -13,25 +13,16 @@
 // limitations under the License.
 
 use std::fs;
-use std::io::ErrorKind;
-use std::io::Write as _;
-use std::path::Path;
-use std::process::Command;
 
 use futures::future::try_join_all;
 use itertools::Itertools as _;
 use jj_lib::commit::CommitIteratorExt as _;
 use jj_lib::file_util;
 use jj_lib::file_util::IoResultExt as _;
-use jj_lib::git;
-use jj_lib::object_id::ObjectId as _;
-use jj_lib::ref_name::WorkspaceName;
 use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::workspace::Workspace;
-use prefix_id::PrefixId;
-use prefix_id::PrefixIdDomain;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
@@ -39,8 +30,6 @@ use crate::cli_util::RevisionArg;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
-use crate::command_error::user_error_with_message;
-use crate::commands::git::maybe_add_gitignore;
 use crate::description_util::add_trailers;
 use crate::description_util::join_message_paragraphs;
 use crate::ui::Ui;
@@ -63,12 +52,8 @@ enum SparseInheritance {
 #[derive(clap::Args, Clone, Debug)]
 pub struct WorkspaceAddArgs {
     /// Where to create the new workspace
-    #[arg(
-        value_hint = clap::ValueHint::DirPath,
-        required_unless_present_any = ["detached", "pool"],
-        conflicts_with_all = ["detached", "pool"]
-    )]
-    destination: Option<String>,
+    #[arg(value_hint = clap::ValueHint::DirPath)]
+    destination: String,
 
     /// A name for the workspace
     ///
@@ -99,28 +84,6 @@ pub struct WorkspaceAddArgs {
     /// How to handle sparse patterns when creating a new workspace.
     #[arg(long, value_enum, default_value_t = SparseInheritance::Copy)]
     sparse_patterns: SparseInheritance,
-
-    /// Create Git worktree metadata so Git commands can run in the new
-    /// workspace.
-    #[arg(long)]
-    git: bool,
-
-    /// Create the workspace without a working-copy directory
-    ///
-    /// The workspace only exists in the repo view, tracking its working-copy
-    /// commit like any other workspace. Materialize it into a directory later
-    /// with `jj workspace pool attach`. If `--name` is omitted, jj generates a
-    /// prefix-id workspace name.
-    #[arg(long, conflicts_with = "pool")]
-    detached: bool,
-
-    /// Create the workspace in a slot of the workspace pool
-    ///
-    /// Equivalent to creating a detached workspace and running `jj workspace
-    /// pool attach` on it. If `--name` is omitted, jj generates a prefix-id
-    /// workspace name.
-    #[arg(long)]
-    pool: bool,
 }
 
 #[instrument(skip_all)]
@@ -129,38 +92,8 @@ pub async fn cmd_workspace_add(
     command: &CommandHelper,
     args: &WorkspaceAddArgs,
 ) -> Result<(), CommandError> {
-    if args.detached || args.pool {
-        let generated_name = args.name.is_none();
-        let workspace_command = command.workspace_helper(ui).await?;
-        let workspace_name = args.name.clone().map(Ok).unwrap_or_else(|| {
-            generate_workspace_name(
-                workspace_command.repo_path(),
-                workspace_command.repo().as_ref(),
-            )
-        })?;
-        drop(workspace_command);
-        create_detached_workspace(
-            ui,
-            command,
-            workspace_name.clone(),
-            &args.revisions,
-            &args.message_paragraphs,
-        )
-        .await?;
-        if args.pool {
-            super::attach::attach_to_pool(ui, command, &workspace_name).await?;
-        }
-        if generated_name {
-            writeln!(ui.stdout(), "{}", workspace_name.as_str())?;
-        }
-        return Ok(());
-    }
-    let destination = args
-        .destination
-        .as_ref()
-        .expect("clap requires destination");
     let old_workspace_command = command.workspace_helper(ui).await?;
-    let destination_path = command.cwd().join(destination);
+    let destination_path = command.cwd().join(&args.destination);
     let workspace_name = if let Some(name) = &args.name {
         name.to_owned()
     } else {
@@ -191,17 +124,6 @@ pub async fn cmd_workspace_add(
 
     let working_copy_factory = command.get_working_copy_factory()?;
     let repo_path = old_workspace_command.repo_path();
-    if args.git {
-        let base_commit_id =
-            git_worktree_base_commit(repo.as_ref(), old_workspace_command.workspace_name())?;
-        create_git_worktree_with_git(
-            command.settings(),
-            repo.as_ref(),
-            &destination_path,
-            &base_commit_id,
-            false,
-        )?;
-    }
     // If we add per-workspace configuration, we'll need to reload settings for
     // the new workspace.
     let (new_workspace, repo) = Workspace::init_workspace_with_existing_repo(
@@ -219,19 +141,16 @@ pub async fn cmd_workspace_add(
     )?;
     // Show a warning if the user passed a path without a separator, since they
     // may have intended the argument to only be the name for the workspace.
-    if !destination.contains(std::path::is_separator) {
+    if !args.destination.contains(std::path::is_separator) {
         writeln!(
             ui.warning_default(),
             r#"Workspace created inside current directory. If this was unintentional, delete the "{}" directory and run `jj workspace forget {name}` to remove it."#,
-            destination,
+            args.destination,
             name = workspace_name.as_symbol()
         )?;
     }
 
     let mut new_workspace_command = command.for_workable_repo(ui, new_workspace, repo)?;
-    if args.git {
-        maybe_add_gitignore(&new_workspace_command)?;
-    }
 
     let sparsity = match args.sparse_patterns {
         SparseInheritance::Full => None,
@@ -314,249 +233,4 @@ pub async fn cmd_workspace_add(
     )
     .await?;
     Ok(())
-}
-
-struct WorkspaceIdDomain(u64);
-
-impl PrefixIdDomain for WorkspaceIdDomain {
-    const KIND: &'static str = "workspace-id";
-
-    fn machine_seed(&self) -> u64 {
-        self.0
-    }
-}
-
-type WorkspaceId = PrefixId<WorkspaceIdDomain>;
-
-const WORKSPACE_ID_LABEL_HEADROOM: u64 = 200;
-
-fn generate_workspace_name(
-    repo_path: &Path,
-    repo: &dyn jj_lib::repo::Repo,
-) -> Result<WorkspaceNameBuf, CommandError> {
-    let state_path = repo_path.join("workspace-id-state");
-    let (seed, mut counter) = load_workspace_id_state(&state_path)?;
-    let domain = WorkspaceIdDomain(seed);
-    let used = repo.view().wc_commit_ids();
-    while counter < prefix_id::CAPACITY {
-        let id = WorkspaceId::from_counter(counter, &domain)
-            .expect("counter is below prefix-id capacity");
-        let prefix_len = prefix_id::uniform_prefix_len(counter, WORKSPACE_ID_LABEL_HEADROOM).max(4);
-        counter += 1;
-        let encoded = id.encoded();
-        let name = WorkspaceNameBuf::from(format!("ws-{}", &encoded[..prefix_len]));
-        if !used.contains_key(&name) {
-            store_workspace_id_state(&state_path, seed, counter)?;
-            return Ok(name);
-        }
-    }
-    Err(user_error("Workspace id space is exhausted"))
-}
-
-fn load_workspace_id_state(path: &Path) -> Result<(u64, u64), CommandError> {
-    match fs::read_to_string(path) {
-        Ok(state) => {
-            let mut fields = state.split_whitespace();
-            let seed = fields
-                .next()
-                .and_then(|field| field.parse().ok())
-                .ok_or_else(|| {
-                    user_error(format!("Malformed workspace id state: {}", path.display()))
-                })?;
-            let counter = fields
-                .next()
-                .and_then(|field| field.parse().ok())
-                .ok_or_else(|| {
-                    user_error(format!("Malformed workspace id state: {}", path.display()))
-                })?;
-            Ok((seed, counter))
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok((rand::random(), 0)),
-        Err(err) => Ok(Err(err).context(path)?),
-    }
-}
-
-fn store_workspace_id_state(path: &Path, seed: u64, counter: u64) -> Result<(), CommandError> {
-    fs::write(path, format!("{seed} {counter}\n")).context(path)?;
-    Ok(())
-}
-
-#[instrument(skip_all)]
-/// Creates a detached workspace: a working-copy commit tracked in the view
-/// without any directory attached to it.
-pub(super) async fn create_detached_workspace(
-    ui: &mut Ui,
-    command: &CommandHelper,
-    workspace_name: jj_lib::ref_name::WorkspaceNameBuf,
-    revisions: &[crate::cli_util::RevisionArg],
-    message_paragraphs: &[String],
-) -> Result<(), CommandError> {
-    let mut workspace_command = command.workspace_helper(ui).await?;
-    if workspace_command
-        .repo()
-        .view()
-        .get_wc_commit_id(&workspace_name)
-        .is_some()
-    {
-        return Err(user_error(format!(
-            "Workspace named '{name}' already exists",
-            name = workspace_name.as_symbol()
-        )));
-    }
-
-    // Resolve parents against the current repo before starting the
-    // transaction; same semantics as the materialized path below.
-    let parent_ids = if revisions.is_empty() {
-        if let Some(old_wc_commit_id) = workspace_command
-            .repo()
-            .view()
-            .get_wc_commit_id(workspace_command.workspace_name())
-        {
-            workspace_command
-                .repo()
-                .store()
-                .get_commit(old_wc_commit_id)?
-                .parent_ids()
-                .to_vec()
-        } else {
-            vec![workspace_command.repo().store().root_commit_id().clone()]
-        }
-    } else {
-        workspace_command
-            .resolve_some_revsets(ui, revisions)
-            .await?
-            .into_iter()
-            .collect_vec()
-    };
-
-    let mut tx = workspace_command.start_transaction();
-    let parents: Vec<_> = parent_ids
-        .iter()
-        .map(|id| tx.repo().store().get_commit(id))
-        .try_collect()?;
-    let tree = merge_commit_trees(tx.repo(), &parents).await?;
-    let mut commit_builder = tx.repo_mut().new_commit(parent_ids, tree).detach();
-    let mut description = join_message_paragraphs(message_paragraphs);
-    if !description.is_empty() {
-        commit_builder.set_description(description);
-        description = add_trailers(ui, &tx, &commit_builder).await?;
-    }
-    commit_builder.set_description(&description);
-    let new_wc_commit = commit_builder.write(tx.repo_mut()).await?;
-    tx.repo_mut()
-        .edit(workspace_name.clone(), &new_wc_commit)
-        .await?;
-    writeln!(
-        ui.status(),
-        "Created detached workspace {name}",
-        name = workspace_name.as_symbol()
-    )?;
-    tx.finish(
-        ui,
-        format!(
-            "create initial working-copy commit in detached workspace {name}",
-            name = workspace_name.as_symbol()
-        ),
-    )
-    .await?;
-    Ok(())
-}
-
-pub(super) fn git_worktree_base_commit(
-    repo: &dyn jj_lib::repo::Repo,
-    workspace_name: &WorkspaceName,
-) -> Result<String, CommandError> {
-    if let Some(commit_id) = repo
-        .view()
-        .git_head_for_workspace(workspace_name)
-        .as_normal()
-    {
-        return Ok(commit_id.hex());
-    }
-    if let Some(wc_commit_id) = repo.view().get_wc_commit_id(workspace_name) {
-        let wc_commit = repo.store().get_commit(wc_commit_id)?;
-        if let Some(parent_id) = wc_commit
-            .parent_ids()
-            .iter()
-            .find(|id| *id != repo.store().root_commit_id())
-        {
-            return Ok(parent_id.hex());
-        }
-    }
-    Err(user_error(
-        "Cannot create a Git worktree because there is no Git commit to initialize it from",
-    ))
-}
-
-/// Runs a Git command against the repo's backing Git repository.
-pub(super) fn run_git_command(
-    settings: &jj_lib::settings::UserSettings,
-    repo: &dyn jj_lib::repo::Repo,
-    args: &[&std::ffi::OsStr],
-) -> Result<(), CommandError> {
-    let git_backend = git::get_git_backend(repo.store())?;
-    let git_settings = git::GitSettings::from_settings(settings)?;
-    let output = Command::new(&git_settings.executable_path)
-        .args(["-c", "core.fsmonitor=false"])
-        .arg("--git-dir")
-        .arg(git_backend.git_repo_path())
-        .args(args)
-        .output()
-        .map_err(|err| {
-            user_error_with_message(
-                format!(
-                    "Could not execute git using '{}'",
-                    git_settings.executable_path.display()
-                ),
-                err,
-            )
-        })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(user_error(format!(
-            "Git command failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim_end()
-        )))
-    }
-}
-
-pub(super) fn create_git_worktree_with_git(
-    settings: &jj_lib::settings::UserSettings,
-    repo: &dyn jj_lib::repo::Repo,
-    destination_path: &Path,
-    base_commit_id: &str,
-    // Required when the destination already exists and is not empty (e.g. a
-    // directory pre-populated with build caches).
-    force: bool,
-) -> Result<(), CommandError> {
-    let git_backend = git::get_git_backend(repo.store())?;
-    let git_settings = git::GitSettings::from_settings(settings)?;
-    let output = Command::new(&git_settings.executable_path)
-        .args(["-c", "core.fsmonitor=false"])
-        .arg("--git-dir")
-        .arg(git_backend.git_repo_path())
-        .args(["worktree", "add", "--detach", "--no-checkout"])
-        .args(force.then_some("--force"))
-        .arg(destination_path)
-        .arg(base_commit_id)
-        .output()
-        .map_err(|err| {
-            user_error_with_message(
-                format!(
-                    "Could not execute git worktree add using '{}'",
-                    git_settings.executable_path.display()
-                ),
-                err,
-            )
-        })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(user_error(format!(
-            "Git failed to create a worktree: {}",
-            String::from_utf8_lossy(&output.stderr).trim_end()
-        ))
-        .hinted("The Jujutsu workspace was not created. Resolve the Git worktree error and retry."))
-    }
 }

@@ -500,12 +500,10 @@ impl Workspace {
                 projects: workdirs,
                 machine_seed,
                 agent_counter,
-                workspace_counter,
             } => {
                 let first_ready = !self.connected;
                 self.registry.set_machine_seed(machine_seed);
                 self.registry.set_agent_counter(agent_counter);
-                self.registry.set_workspace_counter(workspace_counter);
                 self.registry.set_data(workstreams, agents);
                 self.prune_contexts();
                 self.workdirs = workdirs;
@@ -782,7 +780,7 @@ impl Workspace {
 
     /// Interprets the draft's start field (`auto` selects the first available
     /// local `main`, local `master`, or `trunk()`). An agent label resolves to
-    /// the agent's workspace — `<name>@` as a stacking base, or the workspace
+    /// the agent's workspace — `<ws-id>@` as a stacking base, or the workspace
     /// itself for Join; anything else is a revset (stacking only). `user` is
     /// only meaningful for Join — your own checkout. Agent targets carry their
     /// own repo; `workdir` is only needed (and only checked) for the other arms.

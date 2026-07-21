@@ -1147,7 +1147,6 @@ impl AgentRegistry {
             view_config: self.db.read().view_config(),
             machine_seed: self.machine_seed,
             agent_counter: self.db.read().last_agent_counter(),
-            workspace_counter: self.db.read().last_workspace_counter(),
         }
     }
 
@@ -1310,7 +1309,7 @@ impl AgentRegistry {
                     )
                     .await?;
                 let child_record = self.pool.db().read().get_agent(child_id);
-                let workspace_note = match child_record.primary_workdir().workspace_name() {
+                let workspace_note = match child_record.primary_workdir().workspace_handle() {
                     Some(workspace) => format!(
                         " Its jj workspace is `{workspace}`; inspect its working-copy commit with \
                          `jj diff -r '{workspace}@' --stat`."
@@ -3090,7 +3089,7 @@ where
             return Err(error);
         }
     };
-    let root = workspace.slot().to_owned();
+    let root = workspace.checkout().to_owned();
 
     let (to_host_tx, to_host_rx) = futures::channel::mpsc::unbounded();
     let (from_host_tx, mut from_host_rx) = futures::channel::mpsc::unbounded();

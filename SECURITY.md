@@ -50,15 +50,24 @@ AI APIs.
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent
   drops and kills its retained child processes.
-- An agent's working set (its workdirs/mount-namespace view) is version
-  isolation, not access isolation: the namespace redirects entry paths to the
-  agent's checkouts but does not restrict access to the rest of the
-  filesystem. The set is fixed at spawn and persisted on the agent record.
+- An agent's working set (its workdirs/mount-namespace view) is fixed at spawn,
+  persisted on the agent record, and provides version isolation rather than
+  access isolation: the namespace redirects entry paths to the agent's
+  checkouts but does not restrict access to the rest of the filesystem.
+  Isolated jj workdirs are stable bcachefs subvolumes. Each live Rho process
+  holds a shared advisory lock on a persistent sibling lease file; jj's
+  repository-local GC alone requests a nonblocking exclusive lock, rechecks
+  its last-use timestamp, snapshots the working copy, and only then deletes
+  the subvolume.
+  The lock coordinates cooperating Rho/jj processes, not arbitrary same-user
+  filesystem mutation. Managed workspaces require bcachefs; jj invokes the
+  kernel's bcachefs subvolume ioctls directly rather than spawning a mutable
+  executable from PATH.
   Apply-patch translates absolute paths inside any workdir to that workdir's
   checkout, so in-process file writes follow the same redirection as
   namespaced commands.
 - Sandbox workspaces are a narrower, opt-in boundary for native agents. Rho
-  creates a normal isolated jj pool workspace, masks its original `.jj` and
+  creates a normal isolated jj-managed workspace, masks its original `.jj` and
   colocated `.git` metadata in the command mount namespace, and points Git at
   a separate synthetic baseline. Child commands receive a fail-closed Landlock policy: sandbox
   workdirs/home/temp/runtime directories are writable, explicit system and
@@ -432,12 +441,12 @@ Rho follows symlinks with cycle detection for `AGENTS.md` files and does not
 load legacy `~/.agents`, `.agents.local`, or `AGENTS.*.md` variants.
 
 Claude-runtime agents keep Claude Code's `CLAUDE.md` discovery enabled. In
-managed pool workspaces, Rho provides the rendered Rho prompt through a
+managed workspaces, Rho provides the rendered Rho prompt through a
 generated temporary file that is file-bind-mounted over `~/.claude/CLAUDE.md`
 inside the Claude process's private workspace mount namespace. If the bind
 target does not exist, Rho creates an empty `~/.claude/CLAUDE.md` file first.
 Rho does not write the generated prompt into the origin checkout or workspace
-slot, and it removes the generated source file when the Claude process exits or
+checkout, and it removes the generated source file when the Claude process exits or
 is cancelled. Loaded `AGENTS.md` content therefore has the same
 external-provider exposure as other agent prompt text.
 

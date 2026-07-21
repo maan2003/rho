@@ -4,7 +4,7 @@
 //! prost-encoded `proto::Envelope`s between a client-side
 //! [`remote::RemoteClient`] here and a `HeadlessProject` session inside
 //! rho-daemon. Paths in this layer are the daemon's view of the checkout
-//! (pool slot paths) — the origin-path illusion only exists inside agent
+//! (managed checkout paths) — the origin-path illusion only exists inside agent
 //! namespaces and never crosses this wire.
 
 use std::path::PathBuf;

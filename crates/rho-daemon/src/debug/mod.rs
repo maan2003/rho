@@ -148,7 +148,7 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
 
     let db = RhoDb::open(&snapshot.path);
-    migrate_snapshot(&db).await;
+    migrate_snapshot(&db).await?;
     let read = db.read();
     let mut agents = read.list_agents();
     agents.sort_by_key(|(id, _)| *id);
@@ -211,7 +211,7 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
     let db = RhoDb::open(&snapshot.path);
-    migrate_snapshot(&db).await;
+    migrate_snapshot(&db).await?;
     let read = db.read();
     let mut agents = read.list_agents();
     agents.sort_by_key(|(id, _)| *id);
@@ -305,7 +305,7 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
     let db = RhoDb::open(&snapshot.path);
-    migrate_snapshot(&db).await;
+    migrate_snapshot(&db).await?;
 
     let read = db.read();
     let agents = read.list_agents();
@@ -331,11 +331,17 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn migrate_snapshot(db: &RhoDb) {
+async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
     rho_agent::db::prepare_agent_db_migration(db).await;
+    anyhow::ensure!(
+        !rho_agent::db::requires_managed_workspace_migration(db),
+        "this database needs the one-shot managed workspace migration; run the real daemon once \
+         because `rho debug migrate` will not mutate repositories referenced by a database copy"
+    );
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
+    Ok(())
 }
 
 fn disposition_name(disposition: rho_agent::db::AgentDisposition) -> String {
@@ -375,8 +381,12 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
 fn workspace_name(workspace: &WorkspaceInfo) -> String {
     match workspace {
         WorkspaceInfo::UserCheckout { repo } => format!("user-checkout {repo}"),
-        WorkspaceInfo::Workspace { repo, id } => format!("workspace {} in {repo}", id.encoded()),
-        WorkspaceInfo::Sandbox { repo, id } => format!("sandbox {} from {repo}", id.encoded()),
+        WorkspaceInfo::Workspace { repo, id } => {
+            format!("workspace ws-{} in {repo}", id.encoded())
+        }
+        WorkspaceInfo::Sandbox { repo, id } => {
+            format!("sandbox ws-{} from {repo}", id.encoded())
+        }
     }
 }
 

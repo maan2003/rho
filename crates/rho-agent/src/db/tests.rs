@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
-use rho_workspaces::WorkspaceInfo;
+use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 
 use super::*;
 
@@ -389,6 +389,14 @@ async fn migration_turns_tags_into_workstreams_and_labels() {
     }
     write.commit();
 
+    assert!(prepare_managed_workspace_migration(&db).await);
+    let workdirs = db
+        .read()
+        .list_agents()
+        .into_iter()
+        .map(|(agent_id, record)| (agent_id, record.workdirs))
+        .collect();
+    finish_managed_workspace_migration(&db, workdirs).await;
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
@@ -470,6 +478,46 @@ async fn init_agent_tables_stamps_current_db_format() {
     write.init_agent_tables();
     write.commit();
 
+    let format = db.read().open_table(FORMAT).get(&()).unwrap().value();
+    assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
+}
+
+#[tokio::test]
+async fn managed_workspace_migration_finishes_with_records_and_format_together() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let old_workdir = test_workspace();
+    let agent_id;
+    {
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let workstream = write.create_workstream(UnixMs(1), "migration".to_owned());
+        agent_id = write.alloc_agent_id();
+        write.create_agent(
+            UnixMs(1),
+            agent_id,
+            workstream,
+            None,
+            vec![old_workdir.clone()],
+            SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+            test_agent_runtime(),
+            None,
+        );
+        write
+            .open_table(FORMAT)
+            .insert(&(), &MANAGED_WORKSPACE_MIGRATION_FROM.to_owned());
+        write.commit();
+    }
+
+    assert!(prepare_managed_workspace_migration(&db).await);
+    assert_eq!(db.read().get_agent(agent_id).workdirs, [old_workdir]);
+    let replacement = WorkspaceInfo::Workspace {
+        repo: "/home/user/src/rho".into(),
+        id: WorkspaceId::from_counter(9, &WorkspaceIdDomain(4)).unwrap(),
+    };
+    finish_managed_workspace_migration(&db, vec![(agent_id, vec![replacement.clone()])]).await;
+
+    assert_eq!(db.read().get_agent(agent_id).workdirs, [replacement]);
     let format = db.read().open_table(FORMAT).get(&()).unwrap().value();
     assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
 }
