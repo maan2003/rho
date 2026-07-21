@@ -5,7 +5,10 @@
 //! canonical structured state; clients project that state into a read-only
 //! buffer, keep their pending input locally, and submit complete commands.
 
-pub use rho_shell_proto::{MAX_COMMAND_BYTES, command_fits};
+pub use rho_shell_proto::{
+    MAX_ACTIVE_PAGERS, MAX_COMMAND_BYTES, MAX_PAGER_BYTES, MAX_PAGER_LINES, PagerAction,
+    command_fits,
+};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// Maximum structured SGR runs retained for one output stream.
@@ -74,12 +77,24 @@ pub struct ShellExecution {
     pub styles: Vec<ShellStyleSpan>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct ShellPager {
+    pub execution: u64,
+    pub pager: u64,
+    pub page: u64,
+    pub lines: u32,
+    pub bytes: u64,
+}
+
 /// Structured state retained by the daemon independently of GUI rendering.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ShellState {
     pub prompt: String,
     pub cwd: String,
     pub executions: Vec<ShellExecution>,
+    /// Pagers currently waiting for output credit from a client. Kept apart
+    /// from transcript retention so an old execution can be trimmed safely.
+    pub pagers: Vec<ShellPager>,
     /// Sanitized output not attributable to a submitted execution.
     pub terminal_output: String,
     /// Non-default SGR styles over `terminal_output` byte ranges.
@@ -96,6 +111,13 @@ pub enum ShellClientFrame {
     Interrupt,
     /// Send the configured VEOF byte to the active execution PTY.
     Eof,
+    /// Control a pager paused within its originating execution.
+    PagerAction {
+        execution: u64,
+        pager: u64,
+        page: u64,
+        action: PagerAction,
+    },
 }
 
 /// Daemon to client frames after the shell handshake.
@@ -128,6 +150,18 @@ pub enum ShellServerFrame {
         text: String,
         /// Absolute styled byte ranges in the replacement tail.
         styles: Vec<ShellStyleSpan>,
+    },
+    PagerPaused {
+        execution: u64,
+        pager: ShellPager,
+    },
+    PagerResumed {
+        execution: u64,
+        pager: u64,
+    },
+    PagerFinished {
+        execution: u64,
+        pager: u64,
     },
     ExecutionFinished {
         execution: u64,

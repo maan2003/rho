@@ -14078,6 +14078,7 @@ dependencies = [
  "brush-builtins",
  "brush-core",
  "libc",
+ "rand 0.8.7",
  "rho-shell-proto",
  "rustix-openpty",
  "tempfile",

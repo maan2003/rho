@@ -35,7 +35,7 @@ use crate::{
     DashboardReply, GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete,
     MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext,
     PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
-    ShellInterrupt, SubmitPrompt, TaskBoard,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -689,6 +689,16 @@ impl Workspace {
     fn shell_eof(&mut self, _: &ShellEof, _: &mut Window, cx: &mut Context<Self>) {
         if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
             model.clone().update(cx, |model, cx| model.eof(cx));
+        }
+    }
+
+    fn shell_pager_action(
+        &mut self,
+        action: rho_ui_proto::shell::PagerAction,
+        cx: &mut Context<Self>,
+    ) {
+        if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
+            model.update(cx, |model, _| model.pager_action(action));
         }
     }
 
@@ -3478,6 +3488,15 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::submit_prompt))
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::shell_eof))
+            .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
+                this.shell_pager_action(rho_ui_proto::shell::PagerAction::Continue, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShellPagerAll, _, cx| {
+                this.shell_pager_action(rho_ui_proto::shell::PagerAction::Drain, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShellPagerQuit, _, cx| {
+                this.shell_pager_action(rho_ui_proto::shell::PagerAction::Quit, cx);
+            }))
             .on_action(cx.listener(|this, _: &AgentPrevious, window, cx| {
                 this.switch_agent_by_delta(-1, window, cx);
             }))

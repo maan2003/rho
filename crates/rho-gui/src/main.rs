@@ -82,7 +82,10 @@ actions!(
         TerminalScrollTop,
         TerminalScrollBottom,
         ShellInterrupt,
-        ShellEof
+        ShellEof,
+        ShellPagerMore,
+        ShellPagerAll,
+        ShellPagerQuit
     ]
 );
 
@@ -449,6 +452,9 @@ fn bind_rho_key_overrides(cx: &mut App) {
             ShellEof,
             Some("RhoShell > Editor && vim_mode == insert"),
         ),
+        KeyBinding::new("alt-enter", ShellPagerMore, Some("RhoShell > Editor")),
+        KeyBinding::new("alt-a", ShellPagerAll, Some("RhoShell > Editor")),
+        KeyBinding::new("alt-q", ShellPagerQuit, Some("RhoShell > Editor")),
         // Terminal surface, raw mode: every unbound key becomes terminal
         // input, so its few chrome bindings use chords shells don't see
         // anyway. `ctrl-\ ctrl-n` is vim's terminal escape; `ctrl-shift-n`

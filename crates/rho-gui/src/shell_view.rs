@@ -248,6 +248,20 @@ impl ShellModel {
         }
     }
 
+    pub fn pager_action(&self, action: rho_ui_proto::shell::PagerAction) {
+        let Some(pager) = self.shell_state.pagers.last() else {
+            return;
+        };
+        if let Some(control) = &self.control {
+            let _ = control.try_send(ShellClientFrame::PagerAction {
+                execution: pager.execution,
+                pager: pager.pager,
+                page: pager.page,
+                action,
+            });
+        }
+    }
+
     fn apply(&mut self, frame: ShellServerFrame, cx: &mut Context<Self>) {
         match frame {
             // Connection IO consumes acknowledgements to resolve submissions.
@@ -322,6 +336,38 @@ impl ShellModel {
                     self.mark_disconnected(cx);
                     return;
                 }
+            }
+            ShellServerFrame::PagerPaused { execution, pager } => {
+                if pager.execution != execution
+                    || pager.execution == 0
+                    || pager.pager == 0
+                    || pager.page == 0
+                    || pager.bytes == 0
+                    || pager.bytes > rho_ui_proto::shell::MAX_PAGER_BYTES
+                    || pager.lines > rho_ui_proto::shell::MAX_PAGER_LINES
+                {
+                    self.mark_disconnected(cx);
+                    return;
+                }
+                if let Some(existing) = self
+                    .shell_state
+                    .pagers
+                    .iter_mut()
+                    .find(|item| item.execution == execution && item.pager == pager.pager)
+                {
+                    *existing = pager;
+                } else if self.shell_state.pagers.len() < rho_ui_proto::shell::MAX_ACTIVE_PAGERS {
+                    self.shell_state.pagers.push(pager);
+                } else {
+                    self.mark_disconnected(cx);
+                    return;
+                }
+            }
+            ShellServerFrame::PagerResumed { execution, pager }
+            | ShellServerFrame::PagerFinished { execution, pager } => {
+                self.shell_state
+                    .pagers
+                    .retain(|item| item.execution != execution || item.pager != pager);
             }
             ShellServerFrame::ExecutionFinished { execution, status } => {
                 if let Some(block) = self
@@ -437,6 +483,26 @@ impl ShellModel {
                 output_start,
                 &execution.output,
             );
+        }
+        let newest_pager = self.shell_state.pagers.len().saturating_sub(1);
+        for (index, pager) in self.shell_state.pagers.iter().enumerate() {
+            if !transcript.ends_with('\n') {
+                transcript.push('\n');
+            }
+            let start = transcript.len();
+            if index == newest_pager {
+                transcript.push_str(&format!(
+                    "[pager for execution {} paused on page {} after {} lines / {} bytes — Alt-Enter more · Alt-A all · Alt-Q stop]",
+                    pager.execution, pager.page, pager.lines, pager.bytes
+                ));
+            } else {
+                transcript.push_str(&format!(
+                    "[pager for execution {} paused on page {} after {} lines / {} bytes — shortcuts target the newest paused pager]",
+                    pager.execution, pager.page, pager.lines, pager.bytes
+                ));
+            }
+            styles.push((StyleClass::SystemInfo, start..transcript.len()));
+            transcript.push('\n');
         }
         // MultiBuffer places the editable input excerpt on the next row. Do
         // not retain a second trailing newline and create a blank row there.
@@ -564,10 +630,12 @@ impl ShellModel {
     fn apply_transcript_styles_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let mut prompt = Vec::new();
         let mut command = Vec::new();
+        let mut info = Vec::new();
         for (class, range) in &self.transcript_styles {
             match class {
                 StyleClass::ShellPrompt => prompt.push(range.clone()),
                 StyleClass::ShellCommand => command.push(range.clone()),
+                StyleClass::SystemInfo => info.push(range.clone()),
                 _ => {}
             }
         }
@@ -578,6 +646,7 @@ impl ShellModel {
             [
                 (StyleClass::ShellPrompt, prompt.as_slice()),
                 (StyleClass::ShellCommand, command.as_slice()),
+                (StyleClass::SystemInfo, info.as_slice()),
             ],
             cx,
         );
@@ -668,7 +737,19 @@ fn replacement_styles_valid(
 }
 
 fn shell_state_styles_valid(state: &rho_ui_proto::shell::ShellState) -> bool {
-    output_styles_valid(&state.terminal_styles, &state.terminal_output, 0)
+    state.pagers.len() <= rho_ui_proto::shell::MAX_ACTIVE_PAGERS
+        && state.pagers.iter().enumerate().all(|(index, pager)| {
+            pager.execution != 0
+                && pager.pager != 0
+                && pager.page != 0
+                && pager.bytes != 0
+                && pager.bytes <= rho_ui_proto::shell::MAX_PAGER_BYTES
+                && pager.lines <= rho_ui_proto::shell::MAX_PAGER_LINES
+                && !state.pagers[..index].iter().any(|previous| {
+                    previous.execution == pager.execution && previous.pager == pager.pager
+                })
+        })
+        && output_styles_valid(&state.terminal_styles, &state.terminal_output, 0)
         && state
             .executions
             .iter()
@@ -770,6 +851,28 @@ mod tests {
             foreground: Some(ShellColor::Indexed(index)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn shell_snapshot_rejects_invalid_pagers() {
+        let pager = rho_ui_proto::shell::ShellPager {
+            execution: 1,
+            pager: 1,
+            page: 1,
+            lines: 24,
+            bytes: 100,
+        };
+        let mut state = rho_ui_proto::shell::ShellState {
+            pagers: vec![pager.clone()],
+            ..Default::default()
+        };
+        assert!(shell_state_styles_valid(&state));
+
+        state.pagers.push(pager);
+        assert!(!shell_state_styles_valid(&state));
+        state.pagers.truncate(1);
+        state.pagers[0].bytes = rho_ui_proto::shell::MAX_PAGER_BYTES + 1;
+        assert!(!shell_state_styles_valid(&state));
     }
 
     #[test]

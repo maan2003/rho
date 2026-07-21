@@ -316,8 +316,8 @@ AI APIs.
   user with workspace authority, so deliberately malicious same-user code may
   attack other local processes through ordinary operating-system facilities.
   Strong process isolation would require a separate sandbox or identity.
-  `RHO_SHELL` may override the sibling/PATH executable lookup and is therefore
-  trusted daemon-administrator input. `rho-shell` loads Bash-compatible
+  `RHO_SHELL` and `RHO_PAGER` may override sibling/PATH executable lookup and
+  are therefore trusted daemon-administrator input. `rho-shell` loads Bash-compatible
   interactive configuration from Brush, including `~/.bashrc`, `PS1`, and
   `PROMPT_COMMAND`; any configuration or `.envrc` reached from those hooks is
   trusted local code with the same authority. Sandboxed agents remain refused
@@ -338,6 +338,26 @@ AI APIs.
   arbitrary interactive input, `/dev/tty`, persistent job-control terminal
   semantics, a terminal screen, or hidden password entry belong in the raw
   terminal.
+- Pager-aware commands receive `rho-pager` through `PAGER` and `GIT_PAGER`.
+  The sidecar binds one Unix socket below the user-private `XDG_RUNTIME_DIR`
+  and requires both a random shell-lifetime token and a fresh random execution
+  token from the pager's inherited environment. Pager frames are independently
+  capped at 4 KiB, at most 64 connections may be active, and the sidecar maps
+  the execution token to a daemon-assigned execution rather than accepting an
+  execution id from the child. These capabilities prevent accidental or stale
+  cross-shell attribution. An execution token remains valid until its
+  originating PTY controller reaches EOF, allowing delayed background
+  descendants to authenticate but rejecting them once that output scope closes.
+  Pager actions are scoped to `(execution, pager, page)`, and the first valid
+  action for a page wins. These controls are not isolation from deliberately
+  malicious evaluated code or other same-user processes that can obtain its
+  environment.
+  Pager output still traverses the execution PTY and normal sanitizer. The
+  helper pauses after the configured 1–1000 logical lines (24 by default) or a
+  hard 64 KiB byte limit, stops reading so the producer receives pipe
+  backpressure, and fails open to unpaged relay if its control socket
+  disappears. Normal shutdown unlinks the socket; SIGKILL or a crash may leave
+  its unreachable random pathname until `XDG_RUNTIME_DIR` is cleaned.
 - The daemon is the canonical owner of bounded structured `ShellState`: accepted
   command text, prompt/cwd, execution status, and sanitized per-execution output.
   Output ANSI SGR colors and attributes are decoded into bounded structured style

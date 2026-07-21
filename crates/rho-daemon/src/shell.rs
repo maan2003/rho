@@ -8,7 +8,7 @@
 //! Closing a client only detaches it; the shell remains alive until explicitly
 //! closed, it exits, or the daemon stops.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::ops::Range;
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -17,7 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alacritty_terminal::vte::{self, Params, Perform};
 use anyhow::Context as _;
-use rho_shell_proto::{MAX_PROMPT_BYTES, PROTOCOL_VERSION, Request, Response};
+use rho_shell_proto::{
+    MAX_ACTIVE_PAGERS, MAX_PAGER_BYTES, MAX_PAGER_LINES, MAX_PROMPT_BYTES, PROTOCOL_VERSION,
+    PagerAction, Request, Response,
+};
 use rho_ui_proto::AgentId;
 use rho_ui_proto::shell::{
     MAX_STYLE_SPANS, ShellColor, ShellServerFrame, ShellStyleSpan, ShellTextStyle,
@@ -52,6 +55,7 @@ pub struct ShellSpawn {
     /// Shell sidecar launched through the agent View.
     pub program: OsString,
     pub args: Vec<OsString>,
+    pub pager_program: OsString,
 }
 
 pub struct ShellClient {
@@ -119,6 +123,11 @@ pub struct ShellExit {
 pub enum ShellControl {
     Interrupt,
     Eof,
+    Pager {
+        pager: u64,
+        page: u64,
+        action: PagerAction,
+    },
 }
 
 #[derive(Clone)]
@@ -135,6 +144,26 @@ impl ShellControls {
         }
         self.tx
             .send(ScopedShellControl { execution, control })
+            .await
+            .map_err(|_| ())
+    }
+
+    pub async fn pager_action(
+        &self,
+        execution: u64,
+        pager: u64,
+        page: u64,
+        action: PagerAction,
+    ) -> Result<(), ()> {
+        self.tx
+            .send(ScopedShellControl {
+                execution,
+                control: ShellControl::Pager {
+                    pager,
+                    page,
+                    action,
+                },
+            })
             .await
             .map_err(|_| ())
     }
@@ -425,6 +454,54 @@ impl State {
         self.trim_shell_state();
     }
 
+    fn pager_paused(&mut self, execution: u64, pager: u64, page: u64, lines: u32, bytes: u64) {
+        let state = rho_ui_proto::shell::ShellPager {
+            execution,
+            pager,
+            page,
+            lines,
+            bytes,
+        };
+        if let Some(existing) = self
+            .shell
+            .pagers
+            .iter_mut()
+            .find(|item| item.execution == execution && item.pager == pager)
+        {
+            *existing = state.clone();
+        } else {
+            self.shell.pagers.push(state.clone());
+        }
+        self.send_state_frame(ShellServerFrame::PagerPaused {
+            execution,
+            pager: state,
+        });
+    }
+
+    fn pager_resumed(&mut self, execution: u64, pager: u64) {
+        self.remove_pager(execution, pager);
+        self.send_state_frame(ShellServerFrame::PagerResumed { execution, pager });
+    }
+
+    fn pager_finished(&mut self, execution: u64, pager: u64) {
+        self.remove_pager(execution, pager);
+        self.send_state_frame(ShellServerFrame::PagerFinished { execution, pager });
+        self.trim_shell_state();
+    }
+
+    fn remove_pager(&mut self, execution: u64, pager: u64) {
+        self.shell
+            .pagers
+            .retain(|item| item.execution != execution || item.pager != pager);
+    }
+
+    fn pager_is_paused(&self, execution: u64, pager: u64, page: u64) -> bool {
+        self.shell
+            .pagers
+            .iter()
+            .any(|item| item.execution == execution && item.pager == pager && item.page == page)
+    }
+
     fn execution_finished(&mut self, execution: u64, status: i32) {
         if let Some(block) = self
             .shell
@@ -545,7 +622,8 @@ impl State {
     /// Publishes one canonical final state. Stream writers prioritize this
     /// watch value over queued incremental frames, so output congestion can
     /// coalesce but cannot hide process exit.
-    fn finish(&self, status: Option<i32>) {
+    fn finish(&mut self, status: Option<i32>) {
+        self.shell.pagers.clear();
         self.exit_tx.send_replace(Some(Arc::new(ShellExit {
             state: self.shell.clone(),
             status,
@@ -980,8 +1058,8 @@ impl Session {
         command
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
-            .env("PAGER", "cat")
-            .env("GIT_PAGER", "cat")
+            .env("PAGER", &spawn.pager_program)
+            .env("GIT_PAGER", &spawn.pager_program)
             .env("COLUMNS", SHELL_COLS.to_string())
             .env("LINES", SHELL_ROWS.to_string());
         spawn
@@ -1026,6 +1104,7 @@ impl Session {
                 prompt: "> ".into(),
                 cwd: String::new(),
                 executions: Vec::new(),
+                pagers: Vec::new(),
                 terminal_output: String::new(),
                 terminal_styles: Vec::new(),
             },
@@ -1063,6 +1142,9 @@ struct SidecarProtocol {
     pending: VecDeque<u64>,
     current: Option<u64>,
     announced_status: Option<i32>,
+    pagers: HashSet<(u64, u64)>,
+    paused_pagers: HashSet<(u64, u64)>,
+    pager_pages: HashMap<(u64, u64), u64>,
 }
 
 enum SidecarEvent {
@@ -1076,6 +1158,22 @@ enum SidecarEvent {
     Output {
         execution: u64,
         data: Vec<u8>,
+    },
+    PagerStarted,
+    PagerPaused {
+        execution: u64,
+        pager: u64,
+        page: u64,
+        lines: u32,
+        bytes: u64,
+    },
+    PagerResumed {
+        execution: u64,
+        pager: u64,
+    },
+    PagerFinished {
+        execution: u64,
+        pager: u64,
     },
     Finished {
         execution: u64,
@@ -1099,6 +1197,9 @@ impl SidecarProtocol {
             pending: VecDeque::new(),
             current: None,
             announced_status: None,
+            pagers: HashSet::new(),
+            paused_pagers: HashSet::new(),
+            pager_pages: HashMap::new(),
         }
     }
 
@@ -1161,6 +1262,72 @@ impl SidecarProtocol {
                 }
                 Ok(SidecarEvent::Output { execution, data })
             }
+            Response::PagerStarted { execution, pager } => {
+                let key = (execution, pager);
+                let issued = execution > 0 && execution < self.next_execution;
+                let not_waiting_to_start =
+                    !self.pending.iter().any(|pending| *pending == execution);
+                if !issued
+                    || !not_waiting_to_start
+                    || pager == 0
+                    || self.pagers.contains(&key)
+                    || self.pagers.len() >= MAX_ACTIVE_PAGERS
+                {
+                    return Err(());
+                }
+                self.pagers.insert(key);
+                Ok(SidecarEvent::PagerStarted)
+            }
+            Response::PagerPaused {
+                execution,
+                pager,
+                page,
+                lines,
+                bytes,
+            } => {
+                let key = (execution, pager);
+                let issued = execution > 0 && execution < self.next_execution;
+                let not_waiting_to_start =
+                    !self.pending.iter().any(|pending| *pending == execution);
+                let last_page = self.pager_pages.get(&key).copied().unwrap_or(0);
+                if !issued
+                    || !not_waiting_to_start
+                    || pager == 0
+                    || !self.pagers.contains(&key)
+                    || page <= last_page
+                    || bytes == 0
+                    || bytes > MAX_PAGER_BYTES
+                    || lines > MAX_PAGER_LINES
+                    || self.paused_pagers.contains(&key)
+                {
+                    return Err(());
+                }
+                self.paused_pagers.insert(key);
+                self.pager_pages.insert(key, page);
+                Ok(SidecarEvent::PagerPaused {
+                    execution,
+                    pager,
+                    page,
+                    lines,
+                    bytes,
+                })
+            }
+            Response::PagerResumed { execution, pager } => {
+                let key = (execution, pager);
+                if !self.pagers.contains(&key) || !self.paused_pagers.remove(&key) {
+                    return Err(());
+                }
+                Ok(SidecarEvent::PagerResumed { execution, pager })
+            }
+            Response::PagerFinished { execution, pager } => {
+                let key = (execution, pager);
+                if !self.pagers.remove(&key) {
+                    return Err(());
+                }
+                self.paused_pagers.remove(&key);
+                self.pager_pages.remove(&key);
+                Ok(SidecarEvent::PagerFinished { execution, pager })
+            }
             Response::Finished {
                 execution,
                 status,
@@ -1196,6 +1363,9 @@ impl SidecarProtocol {
             Response::Exited { status } if self.current.is_none() && self.pending.is_empty() => {
                 self.exited = true;
                 self.announced_status = Some(status);
+                self.pagers.clear();
+                self.paused_pagers.clear();
+                self.pager_pages.clear();
                 Ok(SidecarEvent::Exited)
             }
             Response::Exited { .. } => Err(()),
@@ -1214,6 +1384,20 @@ fn apply_sidecar_event(state: &mut State, active_execution: &AtomicU64, event: S
             state.started(execution);
         }
         SidecarEvent::Output { execution, data } => state.execution_output(execution, &data),
+        SidecarEvent::PagerStarted => {}
+        SidecarEvent::PagerPaused {
+            execution,
+            pager,
+            page,
+            lines,
+            bytes,
+        } => state.pager_paused(execution, pager, page, lines, bytes),
+        SidecarEvent::PagerResumed { execution, pager } => {
+            state.pager_resumed(execution, pager);
+        }
+        SidecarEvent::PagerFinished { execution, pager } => {
+            state.pager_finished(execution, pager);
+        }
         SidecarEvent::Finished {
             execution,
             status,
@@ -1241,7 +1425,9 @@ fn apply_sidecar_event(state: &mut State, active_execution: &AtomicU64, event: S
                 state.terminal_output(message.as_bytes());
             }
         }
-        SidecarEvent::Exited => {}
+        SidecarEvent::Exited => {
+            state.shell.pagers.clear();
+        }
     }
 }
 
@@ -1349,18 +1535,40 @@ async fn run_session(
                 }
             },
             Some(request) = controls.recv() => {
-                if active_execution.load(Ordering::Acquire) == request.execution {
-                    let request = match request.control {
-                        ShellControl::Interrupt => Request::Interrupt {
+                let request = match request.control {
+                    ShellControl::Interrupt
+                        if active_execution.load(Ordering::Acquire) == request.execution =>
+                    {
+                        Some(Request::Interrupt {
                             execution: request.execution,
-                        },
-                        ShellControl::Eof => Request::Eof {
-                            execution: request.execution,
-                        },
-                    };
-                    if requests_tx.send(request).await.is_err() {
-                        break None;
+                        })
                     }
+                    ShellControl::Eof
+                        if active_execution.load(Ordering::Acquire) == request.execution =>
+                    {
+                        Some(Request::Eof {
+                            execution: request.execution,
+                        })
+                    }
+                    ShellControl::Pager {
+                        pager,
+                        page,
+                        action,
+                    } if state.pager_is_paused(request.execution, pager, page) =>
+                    {
+                        Some(Request::PagerAction {
+                            execution: request.execution,
+                            pager,
+                            page,
+                            action,
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(request) = request
+                    && requests_tx.send(request).await.is_err()
+                {
+                    break None;
                 }
             },
             Some(submission) = submits.recv(), if !closing && queued_submissions.len() < SUBMIT_QUEUE => {
@@ -1502,6 +1710,42 @@ mod tests {
             repo: camino::Utf8PathBuf::from("/repo"),
         };
         assert!(ensure_supported_workdirs(&[checkout]).is_ok());
+    }
+
+    #[test]
+    fn abnormal_exit_clears_paused_pagers_from_final_state() {
+        let (submit_tx, _submit_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (exit_tx, exit_rx) = watch::channel(None);
+        let mut state = State {
+            shell: rho_ui_proto::shell::ShellState {
+                pagers: vec![rho_ui_proto::shell::ShellPager {
+                    execution: 1,
+                    pager: 1,
+                    page: 1,
+                    lines: 24,
+                    bytes: 100,
+                }],
+                ..Default::default()
+            },
+            execution_outputs: HashMap::new(),
+            terminal_output: PlainOutput::default(),
+            clients: Vec::new(),
+            submit: ShellSubmitter {
+                tx: submit_tx,
+                next_execution: Arc::new(std::sync::Mutex::new(1)),
+            },
+            control: ShellControls {
+                tx: control_tx,
+                active_execution: Arc::new(AtomicU64::new(0)),
+            },
+            exit_tx,
+        };
+
+        state.finish(None);
+
+        assert!(state.shell.pagers.is_empty());
+        assert!(exit_rx.borrow().as_ref().unwrap().state.pagers.is_empty());
     }
 
     #[test]
@@ -1663,6 +1907,65 @@ mod tests {
             SidecarEvent::Started { execution } => assert_eq!(execution, 1),
             _ => panic!("expected started event"),
         }
+        assert!(matches!(
+            protocol.receive(Response::PagerStarted {
+                execution: 1,
+                pager: 7,
+            }),
+            Ok(SidecarEvent::PagerStarted)
+        ));
+        assert!(matches!(
+            protocol.receive(Response::PagerPaused {
+                execution: 1,
+                pager: 7,
+                page: 1,
+                lines: 24,
+                bytes: 100,
+            }),
+            Ok(SidecarEvent::PagerPaused {
+                execution: 1,
+                pager: 7,
+                ..
+            })
+        ));
+        assert!(
+            protocol
+                .receive(Response::PagerPaused {
+                    execution: 1,
+                    pager: 7,
+                    page: 1,
+                    lines: 24,
+                    bytes: 100,
+                })
+                .is_err()
+        );
+        assert!(matches!(
+            protocol.receive(Response::PagerResumed {
+                execution: 1,
+                pager: 7,
+            }),
+            Ok(SidecarEvent::PagerResumed { .. })
+        ));
+        for (lines, bytes) in [(MAX_PAGER_LINES + 1, 100), (1, MAX_PAGER_BYTES + 1), (0, 0)] {
+            assert!(
+                protocol
+                    .receive(Response::PagerPaused {
+                        execution: 1,
+                        pager: 7,
+                        page: 2,
+                        lines,
+                        bytes,
+                    })
+                    .is_err()
+            );
+        }
+        assert!(matches!(
+            protocol.receive(Response::PagerFinished {
+                execution: 1,
+                pager: 7,
+            }),
+            Ok(SidecarEvent::PagerFinished { .. })
+        ));
         assert!(
             protocol
                 .receive(Response::Finished {
@@ -1716,6 +2019,7 @@ mod tests {
                 "shell::tests::rho_shell_test_child".into(),
                 "--nocapture".into(),
             ],
+            pager_program: "cat".into(),
         };
         registry.start(agent_id, spawn()).await.unwrap();
         let mut first = registry.attach(agent_id).await.unwrap();
@@ -2152,6 +2456,19 @@ mod tests {
                     .replace_range(start as usize..end as usize, &text);
                 block.styles.retain(|span| span.end <= start);
                 block.styles.extend(styles);
+            }
+            ShellServerFrame::PagerPaused { execution, pager } => {
+                assert_eq!(pager.execution, execution);
+                state
+                    .pagers
+                    .retain(|item| item.execution != execution || item.pager != pager.pager);
+                state.pagers.push(pager);
+            }
+            ShellServerFrame::PagerResumed { execution, pager }
+            | ShellServerFrame::PagerFinished { execution, pager } => {
+                state
+                    .pagers
+                    .retain(|item| item.execution != execution || item.pager != pager);
             }
             ShellServerFrame::ExecutionFinished { execution, status } => {
                 let block = state

@@ -68,7 +68,17 @@ than by running a supervisor, extension protocol, or daemon process graph.
   compete with shell-side state or leak between clients. Command-output SGR
   colors and attributes cross this boundary as bounded structured spans and are
   resolved against the client theme; prompts remain semantic client-themed text,
-  and raw terminal control sequences never reach the editor buffer.
+  and raw terminal control sequences never reach the editor buffer. Commands
+  that opt into `$PAGER` use the sibling `rho-pager` helper. It relays ordinary
+  output through the execution PTY but stops reading its input at bounded page
+  boundaries, applying Unix pipe backpressure to the producer. A private Unix
+  socket advertised through shell- and execution-scoped capability tokens
+  carries only pause and credit actions between the helper and `rho-shell`;
+  canonical pager state then crosses the existing sidecar and UI protocols so
+  detached or newly attached clients observe the same paused execution. Paused
+  pager records are retained independently of transcript blocks, so trimming an
+  old execution cannot make its pager uncontrollable. When several background
+  pagers pause concurrently, GUI shortcuts control the newest pause first.
 - `rho wayland` is an application-agnostic CLI surface for launching and
   controlling programs in isolated headless Sway sessions. It wraps the
   compositor's IPC plus `grim` and `wtype`; the Nix build embeds those tool

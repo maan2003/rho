@@ -2766,6 +2766,20 @@ where
                             break Ok(());
                         }
                     }
+                    Ok(ShellClientFrame::PagerAction {
+                        execution,
+                        pager,
+                        page,
+                        action,
+                    }) => {
+                        if control
+                            .pager_action(execution, pager, page, action)
+                            .await
+                            .is_err()
+                        {
+                            break Ok(());
+                        }
+                    }
                     Err(_) => break Ok(()),
                 }
             }
@@ -2797,6 +2811,7 @@ async fn shell_start(
                 view,
                 program: rho_shell_program(),
                 args: Vec::new(),
+                pager_program: rho_pager_program(),
             },
         )
         .await
@@ -2848,6 +2863,21 @@ fn rho_shell_program() -> std::ffi::OsString {
         }
     }
     "rho-shell".into()
+}
+
+fn rho_pager_program() -> std::ffi::OsString {
+    if let Some(program) = std::env::var_os("RHO_PAGER") {
+        return program;
+    }
+    if let Ok(current) = std::env::current_exe()
+        && let Some(directory) = current.parent()
+    {
+        let sibling = directory.join("rho-pager");
+        if sibling.is_file() {
+            return sibling.into_os_string();
+        }
+    }
+    "rho-pager".into()
 }
 
 /// How a terminal stream's first frame opens its terminal.
