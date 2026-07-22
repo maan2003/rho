@@ -3861,16 +3861,54 @@ impl Render for Workspace {
                     &self.transient,
                     &self.echo,
                 ) {
-                    (Some(pending), _, _, _) => Some(
-                        div()
-                            .key_context("RhoGitApproval")
-                            .track_focus(&self.git_approval_focus)
-                            .child(
-                                bottom_strip(&text_style, cx)
-                                    .child(div().px_2().child(pending.prompt.clone())),
-                            )
-                            .into_any_element(),
-                    ),
+                    (Some(pending), _, _, _) => {
+                        let colors = cx.theme().colors();
+                        let focused = self.git_approval_focus.is_focused(window);
+                        let mut deny = div().flex().flex_row().px_1().child("n deny");
+                        if focused {
+                            deny = deny.bg(colors.element_selected);
+                        } else {
+                            deny = deny.text_color(colors.text_muted);
+                        }
+                        Some(
+                            div()
+                                .key_context("RhoGitApproval")
+                                .track_focus(&self.git_approval_focus)
+                                .child(
+                                    bottom_strip(&text_style, cx)
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .gap_1()
+                                                .px_2()
+                                                .child(
+                                                    div()
+                                                        .font_weight(gpui::FontWeight::BOLD)
+                                                        .text_color(colors.text_accent)
+                                                        .child("Git approval"),
+                                                )
+                                                .child("·")
+                                                .child(pending.prompt.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_4()
+                                                .px_2()
+                                                .child(
+                                                    div()
+                                                        .text_color(colors.text_muted)
+                                                        .child("Y allow"),
+                                                )
+                                                .child(deny),
+                                        ),
+                                )
+                                .into_any_element(),
+                        )
+                    }
                     (None, Some(minibuffer), _, _) => Some(minibuffer.render(&text_style, cx)),
                     (None, None, Some(transient), _) => Some(
                         div()
