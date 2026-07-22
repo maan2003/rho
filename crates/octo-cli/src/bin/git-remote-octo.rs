@@ -816,12 +816,12 @@ mod tests {
 
     #[test]
     fn parses_github_compatibility_remote() {
-        let remote = parse_remote("octo://github.com/acme/library.git").unwrap();
+        let remote = parse_remote("octo://github.com/acme/project-name.git").unwrap();
         assert!(remote.github_http_eligible());
-        assert_eq!(remote.request.repository, "acme/library");
+        assert_eq!(remote.request.repository, "acme/project-name");
         assert_eq!(
             remote.http_url().unwrap(),
-            "http://localhost/git/acme/library.git"
+            "http://localhost/git/acme/project-name.git"
         );
     }
 
@@ -848,9 +848,7 @@ mod tests {
             "octo://git.example/-oProxyCommand=bad",
             "octo://root@github.com/acme/repo",
             "octo://deploy@git.sr.ht/~alice/repo",
-            "octo://git@github.com/acme/project-name",
             "octo://git@git.sr.ht/alice/repo",
-            "octo://git@git.sr.ht/~alice/project-name",
             "https://github.com/acme/repo",
         ] {
             assert!(parse_remote(value).is_err(), "accepted {value}");

@@ -133,7 +133,10 @@ pub fn valid_ssh_repository(host: &str, value: &str) -> bool {
     };
     let mut components = value.split('/');
     let valid = |component: &str| {
-        !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        !matches!(component, "" | "." | "..")
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     };
     components.next().is_some_and(valid)
         && components.next().is_some_and(valid)
@@ -291,12 +294,19 @@ mod git_tests {
     #[test]
     fn validates_allowlisted_repository_shapes() {
         assert!(valid_ssh_repository("github.com", "acme/project"));
+        assert!(valid_ssh_repository(
+            "github.com",
+            "fedibtc/decentralized-federations"
+        ));
+        assert!(valid_ssh_repository("github.com", "acme/project_name"));
+        assert!(valid_ssh_repository("github.com", "acme/.github"));
         assert!(valid_ssh_repository("git.sr.ht", "~alice/project"));
         for (host, repository) in [
-            ("github.com", "acme/project-name"),
-            ("github.com", "acme/project.git"),
+            ("github.com", "acme/.."),
+            ("github.com", "acme/project name"),
+            ("github.com", "acme/project@name"),
             ("git.sr.ht", "alice/project"),
-            ("git.sr.ht", "~alice/project-name"),
+            ("git.sr.ht", "~alice/project:name"),
         ] {
             assert!(!valid_ssh_repository(host, repository));
         }

@@ -140,7 +140,8 @@ AI APIs.
   match the approved plan. Any missing, additional, duplicated, or changed ref
   fails closed without a second prompt or any client-to-OpenSSH bytes. The
   approval and provider claim are one operation with a 60-second deadline. Ref names,
-  repository fields, and prompts use a conservative character set and prompt
+  repository fields, and prompts use components limited to ASCII alphanumeric
+  characters, hyphens, underscores, and periods; prompt
   text replaces control and bidirectional formatting characters. The helper
   and GUI both enforce the same host, user, and repository rules. Push options,
   signed pushes, unknown framing, and unsupported object-id sizes fail closed.

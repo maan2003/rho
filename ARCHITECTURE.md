@@ -258,8 +258,9 @@ SourceHut's `git@git.sr.ht:~USER/REPOSITORY` and equivalent SSH URL are also
 rewritten, but are never PAT-eligible, so both fetches and pushes require GUI
 approval. Explicit `octo://` URLs are restricted to these two hosts, SSH user
 `git`, and normalized two-component repository paths: `OWNER/REPOSITORY` for
-GitHub and `~USER/REPOSITORY` for SourceHut. Repository components are ASCII
-alphanumeric, and an input `.git` suffix is removed before validation. There is
+GitHub and `~USER/REPOSITORY` for SourceHut. Repository components contain ASCII
+alphanumeric characters, hyphens, underscores, and periods; traversal components
+are rejected. An input `.git` suffix is removed before validation. There is
 no failover after an approved GUI claims an operation; retrying starts a fresh
 provider race.
 
