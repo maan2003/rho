@@ -47,5 +47,5 @@ url.workspace = true
 
 [dev-dependencies]
 prost = "0.9"
-rpc = { git = "file:///home/maan2003/src/zed", rev = "4ca9239e36f4" }
+rpc = { git = "https://github.com/maan2003/zed", rev = "4ca9239e36f4" }
 rho-shell.workspace = true
