@@ -431,6 +431,71 @@ mod tests {
     }
 
     #[test]
+    fn parses_command_lifecycle_event() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "command_lifecycle",
+            "command_uuid": "64c38380-e21a-4bff-b116-238ef5b585a6",
+            "state": "queued",
+            "uuid": "002995d7-9296-4ac7-aea8-29671133fe06",
+            "session_id": "98badc56-ce7b-4f69-9e4d-47696fd08dce"
+        }))
+        .unwrap();
+
+        let protocol::ClaudeEvent::CommandLifecycle(message) = event else {
+            panic!("expected command lifecycle event");
+        };
+        assert_eq!(message.command_uuid, "64c38380-e21a-4bff-b116-238ef5b585a6");
+        assert_eq!(message.state, "queued");
+    }
+
+    #[test]
+    fn ignores_unknown_top_level_event() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "future_sdk_event",
+            "payload": {"new": true}
+        }))
+        .unwrap();
+
+        assert!(matches!(event, protocol::ClaudeEvent::Other));
+    }
+
+    #[test]
+    fn rejects_malformed_known_event() {
+        let error = serde_json::from_value::<protocol::ClaudeEvent>(json!({
+            "type": "assistant",
+            "session_id": "00000000-0000-4000-8000-000000000001"
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("missing field `message`"));
+    }
+
+    #[test]
+    fn preserves_tool_result_error_status_during_projection_round_trip() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "command failed",
+                    "is_error": true
+                }]
+            }
+        }))
+        .unwrap();
+        let protocol::ClaudeEvent::User(message) = event else {
+            panic!("expected user event");
+        };
+
+        assert_eq!(
+            serde_json::to_value(message.message.unwrap()).unwrap()["content"][0]["is_error"],
+            true
+        );
+    }
+
+    #[test]
     fn parses_system_compact_boundary_event() {
         let event: protocol::ClaudeEvent = serde_json::from_value(json!({
             "type": "system",

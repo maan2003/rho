@@ -114,12 +114,21 @@ enum InputContent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeEvent {
     Assistant(AssistantMessage),
+    CommandLifecycle(CommandLifecycleMessage),
     ControlResponse(ControlResponseMessage),
     RateLimitEvent,
     Result(ResultMessage),
     System(SystemMessage),
     StreamEvent(StreamEvent),
     User(UserOutputMessage),
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct CommandLifecycleMessage {
+    pub command_uuid: String,
+    pub state: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -178,6 +187,8 @@ pub enum AssistantContent {
         name: String,
         input: Value,
     },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -300,6 +311,8 @@ pub enum MessageStreamEvent {
     Error {
         error: StreamError,
     },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -347,16 +360,30 @@ pub enum StreamContentBlock {
         tool_use_id: String,
         content: Value,
     },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockDelta {
-    TextDelta { text: String },
-    InputJsonDelta { partial_json: String },
-    ThinkingDelta { thinking: String },
-    SignatureDelta { signature: String },
-    CitationsDelta { citation: Value },
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
+    ThinkingDelta {
+        thinking: String,
+    },
+    SignatureDelta {
+        signature: String,
+    },
+    CitationsDelta {
+        citation: Value,
+    },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -408,8 +435,17 @@ pub struct OutputConversationMessage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputContent {
-    Text { text: String },
-    ToolResult { tool_use_id: String, content: Value },
+    Text {
+        text: String,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+    #[serde(other)]
+    Other,
 }
 
 fn deserialize_output_content<'de, D>(deserializer: D) -> Result<Vec<OutputContent>, D::Error>

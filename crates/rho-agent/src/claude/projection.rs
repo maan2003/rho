@@ -47,8 +47,8 @@ pub(super) enum ClaudeStreamItem {
 impl ClaudeStreamItem {
     pub(super) fn from_content_block(
         block: rho_claude::protocol::StreamContentBlock,
-    ) -> anyhow::Result<Self> {
-        Ok(match block {
+    ) -> anyhow::Result<Option<Self>> {
+        Ok(Some(match block {
             rho_claude::protocol::StreamContentBlock::Text { text } => Self::Text(text),
             rho_claude::protocol::StreamContentBlock::Thinking { thinking, .. } => {
                 Self::Thinking(thinking)
@@ -67,7 +67,8 @@ impl ClaudeStreamItem {
             rho_claude::protocol::StreamContentBlock::WebSearchToolResult { content, .. } => {
                 Self::Text(serde_json::to_string(&content)?)
             }
-        })
+            rho_claude::protocol::StreamContentBlock::Other => return Ok(None),
+        }))
     }
 
     pub(super) fn apply_delta(
@@ -97,7 +98,8 @@ impl ClaudeStreamItem {
                 arguments.push_str(&partial_json);
             }
             (_, rho_claude::protocol::ContentBlockDelta::SignatureDelta { .. })
-            | (_, rho_claude::protocol::ContentBlockDelta::CitationsDelta { .. }) => {}
+            | (_, rho_claude::protocol::ContentBlockDelta::CitationsDelta { .. })
+            | (_, rho_claude::protocol::ContentBlockDelta::Other) => {}
             _ => {}
         }
         Ok(())
@@ -394,6 +396,43 @@ mod tests {
         .unwrap();
 
         assert!(user_output_to_block(message).unwrap().is_none());
+    }
+
+    #[test]
+    fn projects_failed_tool_result_as_error() {
+        let message = serde_json::from_value(json!({
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "command failed",
+                    "is_error": true
+                }]
+            }
+        }))
+        .unwrap();
+
+        let block = user_output_to_block(message).unwrap().unwrap();
+        let ContextBlock::ToolResults { results } = block.as_ref() else {
+            panic!("expected tool results");
+        };
+        assert_eq!(results[0].body.status, ToolOutputStatus::Error);
+    }
+
+    #[test]
+    fn ignores_unknown_stream_content_block() {
+        let block = serde_json::from_value(json!({
+            "type": "future_content_block",
+            "payload": "new"
+        }))
+        .unwrap();
+
+        assert!(
+            ClaudeStreamItem::from_content_block(block)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

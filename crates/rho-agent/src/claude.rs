@@ -493,6 +493,7 @@ impl ClaudeLoop {
                     );
                 }
                 rho_claude::ClaudeEvent::ControlResponse(_) => {}
+                rho_claude::ClaudeEvent::Other => {}
                 event => self.handle_event(event).await,
             }
         }
@@ -721,6 +722,64 @@ impl ClaudeLoop {
                 }
             }
             rho_claude::ClaudeEvent::RateLimitEvent => {}
+            rho_claude::ClaudeEvent::CommandLifecycle(message) => {
+                self.handle_command_lifecycle(message);
+            }
+            rho_claude::ClaudeEvent::Other => {}
+        }
+    }
+
+    fn handle_command_lifecycle(&mut self, message: rho_claude::protocol::CommandLifecycleMessage) {
+        match message.state.as_str() {
+            "queued" | "started" => {}
+            "completed" | "cancelled" | "discarded" => {
+                let Some(index) = self
+                    .queued_turns
+                    .iter()
+                    .position(|turn| turn.uuid == message.command_uuid)
+                else {
+                    return;
+                };
+                let turn = self
+                    .queued_turns
+                    .remove(index)
+                    .expect("index came from position");
+
+                if message.state == "completed" {
+                    self.wait_baseline_seq
+                        .store(turn.input_seq, Ordering::Release);
+                    let mut state = self.state.write().expect("poison");
+                    promote_queued_user_message(&mut state, &turn.content);
+                } else {
+                    self.state
+                        .write()
+                        .expect("poison")
+                        .queued_inputs
+                        .remove_first(|queued| match queued {
+                            QueuedItem {
+                                kind: QueuedItemKind::UserMessage { content, .. },
+                                ..
+                            } => **content == *turn.content,
+                            _ => false,
+                        });
+                }
+                self.input_notify.notify_waiters();
+                self.notify.notify_waiters();
+
+                // Claude emits `completed` after the command's result. If a
+                // missing replay echo left this command in our mirror, the
+                // result kept the agent streaming; the lifecycle terminal is
+                // the final authoritative opportunity to settle it.
+                if message.state == "completed" && self.queued_turns.is_empty() {
+                    self.set_kind(AgentStateKind::Idle);
+                }
+            }
+            state => {
+                eprintln!(
+                    "rho-agent: unknown Claude command_lifecycle state {state:?} for {}",
+                    message.command_uuid
+                );
+            }
         }
     }
 
@@ -827,7 +886,9 @@ impl ClaudeLoop {
                 index,
                 content_block,
             } => {
-                let item = ClaudeStreamItem::from_content_block(content_block)?;
+                let Some(item) = ClaudeStreamItem::from_content_block(content_block)? else {
+                    return Ok(());
+                };
                 self.pending_response.apply(
                     index,
                     ContextItemEvent::Update(item.to_streaming_context_item()?),
@@ -868,7 +929,8 @@ impl ClaudeLoop {
                 self.update_context_used();
             }
             rho_claude::protocol::MessageStreamEvent::MessageStop
-            | rho_claude::protocol::MessageStreamEvent::Ping => {}
+            | rho_claude::protocol::MessageStreamEvent::Ping
+            | rho_claude::protocol::MessageStreamEvent::Other => {}
         }
         Ok(())
     }
