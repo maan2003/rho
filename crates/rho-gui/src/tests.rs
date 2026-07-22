@@ -3,11 +3,14 @@
 use editor::Editor;
 use editor::display_map::{Block, DisplayRow};
 use gpui::{App, Entity, Focusable as _, TestAppContext, WindowHandle};
+use multi_buffer::MultiBufferRow;
 use rho_core::UnixMs;
-use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::{
     AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlock, UiBlockDiff, UiBlockUpdate,
     UiBlocksDiff, UiMessagePhase, UiTextDiff, UiTool, UiToolDiff, UiToolStatus,
+};
+use rho_ui_proto::{
+    AgentId, AgentRole, UiAgentSummary, UiAttention, UiWorkstream, WorkspaceInfo, WorkstreamId,
 };
 use settings::SettingsStore;
 
@@ -60,6 +63,79 @@ fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
 
 fn agent(id: u64) -> AgentId {
     AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap()
+}
+
+fn agent_summary(id: u64, parent_agent: Option<AgentId>) -> UiAgentSummary {
+    UiAgentSummary {
+        agent_id: agent(id),
+        parent_agent,
+        role: AgentRole::default(),
+        created_at: UnixMs(id),
+        updated_at: UnixMs(id),
+        workspace: WorkspaceInfo::UserCheckout {
+            repo: "/tmp".into(),
+        },
+        display_name: Some(format!("agent {id}")),
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(id),
+        hidden: false,
+        last_user_message_text: String::new(),
+        workstream: WorkstreamId(1),
+        labels: Vec::new(),
+    }
+}
+
+#[gpui::test]
+fn dashboard_elides_subagents_behind_inline_fold(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let root = agent(1);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                ConnEvent::Ready {
+                    workstreams: vec![UiWorkstream {
+                        workstream_id: WorkstreamId(1),
+                        name: "Fix agent navigation".to_owned(),
+                        labels: Vec::new(),
+                    }],
+                    agents: vec![
+                        agent_summary(1, None),
+                        agent_summary(2, Some(root)),
+                        agent_summary(3, Some(root)),
+                    ],
+                    projects: Vec::new(),
+                    machine_seed: 0,
+                    agent_counter: 3,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("install dashboard agents");
+    cx.run_until_parked();
+
+    let dashboard = workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.dashboard_fold_count(), 1);
+            workspace.dashboard_editor()
+        })
+        .expect("dashboard editor");
+    workspace
+        .update(cx, |_, window, cx| {
+            dashboard.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                assert!(
+                    snapshot
+                        .render_crease_trailer(MultiBufferRow(0), window, cx)
+                        .is_some()
+                );
+                let text = editor.display_text(cx);
+                assert!(!text.contains("agent 2"), "{text:?}");
+                assert!(!text.contains("agent 3"), "{text:?}");
+            });
+        })
+        .expect("inspect folded dashboard");
 }
 
 fn snapshot_frame(state: UiAgentState) -> AgentRemoteFrame {

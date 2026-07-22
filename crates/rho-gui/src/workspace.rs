@@ -33,10 +33,11 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardNewAgent,
-    DashboardReply, GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete,
-    MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext,
-    PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
-    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard,
+    DashboardReply, DashboardToggleSubagents, GitApprovalAllow, GitApprovalDeny, MinibufferCancel,
+    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose,
+    PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup,
+    ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt,
+    TaskBoard,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -1252,12 +1253,9 @@ impl Workspace {
                 Err(error) => Err(anyhow::anyhow!("shell close failed: {error}")),
             };
             let _ = this.update(cx, |this, cx| match result {
-                Ok(()) => this.notice_on(
-                    Some(&agent_id),
-                    "shell closed",
-                    StyleClass::SystemInfo,
-                    cx,
-                ),
+                Ok(()) => {
+                    this.notice_on(Some(&agent_id), "shell closed", StyleClass::SystemInfo, cx)
+                }
                 Err(error) => this.notice_on(
                     Some(&agent_id),
                     &format!("close shell failed: {error:#}"),
@@ -1957,10 +1955,8 @@ impl Workspace {
             match result {
                 Ok(channel) => {
                     let _ = this.update_in(cx, |this, window, cx| {
-                        let model =
-                            cx.new(|cx| crate::shell_view::ShellModel::new(channel, cx));
-                        let editor =
-                            model.update(cx, |model, cx| model.build_editor(window, cx));
+                        let model = cx.new(|cx| crate::shell_view::ShellModel::new(channel, cx));
+                        let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
                         let surface = Self::wrap_surface(
                             key,
                             SurfaceView::Shell { model, editor },
@@ -2250,6 +2246,25 @@ impl Workspace {
         self.models.get(agent_id).cloned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn dashboard_editor(&self) -> Entity<editor::Editor> {
+        self.dashboard.editor().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dashboard.sync(&self.registry, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_fold_count(&self) -> usize {
+        self.dashboard.fold_count()
+    }
+
+    pub(crate) fn toggle_dashboard_subagents(&mut self, parent: AgentId, cx: &mut Context<Self>) {
+        self.dashboard.toggle_subagents_for(parent, cx);
+    }
+
     pub(crate) fn active_agent_model(&self) -> Option<Entity<AgentModel>> {
         self.registry
             .selected_agent()
@@ -2425,9 +2440,7 @@ impl Workspace {
                 let editor = view.read(cx).editor();
                 (editor.focus_handle(cx), editor.entity_id())
             }
-            SurfaceView::Shell { editor, .. } => {
-                (editor.focus_handle(cx), editor.entity_id())
-            }
+            SurfaceView::Shell { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
             SurfaceView::Diff(view) => {
                 let editor = view.read(cx).editor();
                 (editor.focus_handle(cx), editor.entity_id())
@@ -3754,6 +3767,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
                 this.open_new_agent_transient(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardToggleSubagents, _, cx| {
+                this.dashboard.toggle_subagents(cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(

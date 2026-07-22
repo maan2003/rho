@@ -1,6 +1,7 @@
 //! The dashboard: the rail reborn as a real editor buffer — rho's
 //! magit-status. A single-root workstream is one compact row; the uncommon
 //! multi-root workstream becomes a header followed by human-named root rows.
+//! Agent trees stay compact behind inline, independently nested fold trailers.
 //! Generated read-only text lives in a normal editor, so cursor motions and
 //! search come from the editor rather than bespoke list chrome. Acting keys
 //! address the stable root under the cursor: `enter` opens, `r` splices an
@@ -8,19 +9,22 @@
 //! the multibuffer, so refreshes can rearrange excerpts without eating typed
 //! drafts or leaving the cursor attached to a stale line number.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
+use editor::display_map::{Crease, CreaseId, FoldPlaceholder};
 use editor::hover_links::InlayHighlight;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable as _, FontWeight, HighlightStyle, Window};
+use gpui::{App, Context, Entity, Focusable as _, FontWeight, HighlightStyle, MouseButton, Window};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
 use rho_ui_proto::{AgentId, UiAttention, WorkstreamId};
 use text::BufferId;
 use theme::ActiveTheme as _;
+use ui::{Icon, IconName, IconSize};
 
 use crate::registry::{AgentRegistry, Workstream};
 use crate::workspace::Workspace;
@@ -49,6 +53,19 @@ enum LineKey {
     Reply(AgentId),
     /// The inline new-agent draft, at the top of the listing.
     NewDraft,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FoldSpec {
+    parent_agent: AgentId,
+    parent: LineKey,
+    descendants: Vec<LineKey>,
+    descendant_count: usize,
+}
+
+struct ActiveFold {
+    id: CreaseId,
+    spec: FoldSpec,
 }
 
 /// What the line under the cursor refers to; the object of every
@@ -94,6 +111,11 @@ pub struct Dashboard {
     lamp_ids: Vec<InlayId>,
     /// Reply placeholder inlays currently spliced in.
     placeholder_ids: Vec<InlayId>,
+    /// Inline Zed crease trailers that control projected descendant rows.
+    folds: HashMap<AgentId, ActiveFold>,
+    /// Expansion state keyed by stable parent identity and shared with the
+    /// clickable crease trailers that request dashboard regeneration.
+    expanded_folds: Arc<Mutex<HashSet<AgentId>>>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the per-line excerpts seamless.
@@ -102,8 +124,7 @@ pub struct Dashboard {
 
 impl Dashboard {
     pub fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
-        let multi_buffer =
-            cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
+        let multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::Full {
@@ -134,6 +155,8 @@ impl Dashboard {
             pending_cursor: None,
             lamp_ids: Vec::new(),
             placeholder_ids: Vec::new(),
+            folds: HashMap::new(),
+            expanded_folds: Arc::new(Mutex::new(HashSet::new())),
             headers_disabled: std::collections::HashSet::new(),
         }
     }
@@ -160,6 +183,11 @@ impl Dashboard {
 
     pub fn editor(&self) -> &Entity<Editor> {
         &self.editor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fold_count(&self) -> usize {
+        self.folds.len()
     }
 
     pub fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
@@ -231,6 +259,14 @@ impl Dashboard {
         let key = LineKey::Agent(agent_id);
         self.pending_cursor = Some(if self.buffers.contains_key(&key) {
             key
+        } else if let Some(parent) = self
+            .folds
+            .values()
+            .filter(|fold| fold.spec.descendants.contains(&key))
+            .min_by_key(|fold| fold.spec.descendant_count)
+            .map(|fold| fold.spec.parent.clone())
+        {
+            parent
         } else {
             LineKey::Stream(workstream_id)
         });
@@ -260,7 +296,11 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let lines = generate(registry);
+        let expanded = self
+            .expanded_folds
+            .lock()
+            .map_or_else(|_| HashSet::new(), |expanded| expanded.clone());
+        let lines = visible_lines(generate(registry), &expanded);
 
         // Empty reply drafts the cursor has left are dead weight; drop them.
         let cursor_key = self.cursor_key(cx);
@@ -406,9 +446,111 @@ impl Dashboard {
             self.move_cursor_to(&key, window, cx);
         }
 
+        self.apply_folds(&lines, order_changed, cx);
         self.apply_highlights(&lines, cx);
         self.apply_lamps(&lines, cx);
         self.apply_reply_chrome(registry, cx);
+    }
+
+    fn apply_folds(&mut self, lines: &[Line], excerpts_rebuilt: bool, cx: &mut Context<Workspace>) {
+        let desired = lines
+            .iter()
+            .filter_map(|line| line.fold.clone())
+            .map(|fold| (fold.parent_agent, fold))
+            .collect::<HashMap<_, _>>();
+
+        let stale = self
+            .folds
+            .iter()
+            .filter(|(agent_id, active)| {
+                excerpts_rebuilt || desired.get(agent_id) != Some(&active.spec)
+            })
+            .map(|(agent_id, active)| (*agent_id, active.id))
+            .collect::<Vec<_>>();
+        if !stale.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_creases(stale.iter().map(|(_, id)| *id), cx);
+            });
+            for (agent_id, _) in stale {
+                self.folds.remove(&agent_id);
+            }
+        }
+
+        for (agent_id, spec) in desired {
+            if self.folds.contains_key(&agent_id) {
+                continue;
+            }
+            let Some(parent) = self.buffers.get(&spec.parent) else {
+                continue;
+            };
+            let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+            let parent_snapshot = parent.read(cx).snapshot();
+            let Some(start) = snapshot.anchor_in_excerpt(parent_snapshot.anchor_before(0)) else {
+                continue;
+            };
+            let crease = self.agent_crease(
+                spec.parent_agent,
+                spec.descendant_count,
+                start..start,
+                cx.weak_entity(),
+            );
+            let id = self
+                .editor
+                .update(cx, |editor, cx| editor.insert_creases([crease], cx)[0]);
+            self.folds.insert(agent_id, ActiveFold { id, spec });
+        }
+    }
+
+    fn agent_crease(
+        &self,
+        parent_agent: AgentId,
+        descendant_count: usize,
+        range: Range<multi_buffer::Anchor>,
+        workspace: gpui::WeakEntity<Workspace>,
+    ) -> Crease<multi_buffer::Anchor> {
+        let label = if descendant_count == 1 {
+            "1 subagent".to_owned()
+        } else {
+            format!("{descendant_count} subagents")
+        };
+        let expanded_folds = self.expanded_folds.clone();
+        Crease::inline(
+            range,
+            FoldPlaceholder::default(),
+            |_row, _folded, _toggle, _window, _cx| gpui::Empty,
+            move |_row, _folded, _window, _cx| {
+                let expanded = expanded_folds
+                    .lock()
+                    .is_ok_and(|expanded| expanded.contains(&parent_agent));
+                let workspace = workspace.clone();
+                gpui::div()
+                    .id(format!("dashboard-subagents-{}", parent_agent.encoded()))
+                    .cursor_pointer()
+                    .ml_1()
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall),
+                    )
+                    .child(label.clone())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, _window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.toggle_dashboard_subagents(parent_agent, cx);
+                            })
+                            .ok();
+                        cx.stop_propagation();
+                    })
+                    .into_any()
+            },
+        )
     }
 
     /// Places the cursor at the start of a key's buffer.
@@ -458,6 +600,39 @@ impl Dashboard {
         self.targets.get(&key).cloned()
     }
 
+    pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let parent = match self.cursor_target(cx) {
+            Some(RowTarget::Stream {
+                root: Some(agent_id),
+                ..
+            })
+            | Some(RowTarget::Agent(agent_id)) => agent_id,
+            _ => return false,
+        };
+        self.toggle_subagents_for(parent, cx)
+    }
+
+    pub(crate) fn toggle_subagents_for(
+        &mut self,
+        parent: AgentId,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let Some(parent_key) = self.folds.get(&parent).map(|fold| fold.spec.parent.clone()) else {
+            return false;
+        };
+        if let Ok(mut expanded) = self.expanded_folds.lock()
+            && !expanded.remove(&parent)
+        {
+            expanded.insert(parent);
+        } else {
+            // The branch is collapsing. Keep the cursor and preview attached
+            // to its parent instead of whichever excerpt takes the old slot.
+            self.pending_cursor = Some(parent_key);
+        }
+        cx.notify();
+        true
+    }
+
     fn apply_highlights(&self, lines: &[Line], cx: &mut Context<Workspace>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let mut by_class: Vec<(DashClass, Vec<Range<multi_buffer::Anchor>>)> = DashClass::ALL
@@ -481,9 +656,7 @@ impl Dashboard {
                 else {
                     continue;
                 };
-                if let Some((_, ranges)) =
-                    by_class.iter_mut().find(|(entry, _)| entry == class)
-                {
+                if let Some((_, ranges)) = by_class.iter_mut().find(|(entry, _)| entry == class) {
                     ranges.push(start..end);
                 }
             }
@@ -570,9 +743,7 @@ impl Dashboard {
             .chain(
                 self.new_draft
                     .as_ref()
-                    .map(|(_, _, summary)| {
-                        (LineKey::NewDraft, format!("new agent · {summary}…"))
-                    }),
+                    .map(|(_, _, summary)| (LineKey::NewDraft, format!("new agent · {summary}…"))),
             );
         for (index, (key, placeholder)) in drafts.enumerate() {
             let Some(buffer) = self.buffers.get(&key) else {
@@ -594,12 +765,35 @@ impl Dashboard {
             if buffer.is_empty() {
                 // Right-biased like the transcript's prompt placeholder, so
                 // the cursor renders before the hint, not after it.
-                let Some(position) =
-                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(0))
+                let Some(position) = snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(0))
                 else {
                     continue;
                 };
                 let inlay = Inlay::custom(PLACEHOLDER_ID_BASE + index, position, placeholder);
+                self.placeholder_ids.push(inlay.id);
+                inlays.push(inlay);
+            } else if let LineKey::Reply(agent_id) = key
+                && !self.targets.iter().any(|(line_key, target)| {
+                    !matches!(line_key, LineKey::Reply(_))
+                        && matches!(
+                            target,
+                            RowTarget::Agent(target_id)
+                                | RowTarget::Stream {
+                                    root: Some(target_id),
+                                    ..
+                                } if *target_id == agent_id
+                        )
+                })
+            {
+                let Some(position) = snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(0))
+                else {
+                    continue;
+                };
+                let inlay = Inlay::custom(
+                    PLACEHOLDER_ID_BASE + index,
+                    position,
+                    format!("reply to {} · ", registry.agent_human_name(agent_id)),
+                );
                 self.placeholder_ids.push(inlay.id);
                 inlays.push(inlay);
             } else if key == LineKey::NewDraft
@@ -771,6 +965,7 @@ struct Line {
     spans: Vec<(DashClass, Range<usize>)>,
     lamp: Option<UiAttention>,
     target: RowTarget,
+    fold: Option<FoldSpec>,
 }
 
 impl Line {
@@ -781,6 +976,7 @@ impl Line {
             spans: Vec::new(),
             lamp: None,
             target,
+            fold: None,
         }
     }
 
@@ -826,37 +1022,106 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
     lines
 }
 
+fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
+    let hidden = lines
+        .iter()
+        .filter_map(|line| line.fold.as_ref())
+        .filter(|fold| !expanded.contains(&fold.parent_agent))
+        .flat_map(|fold| fold.descendants.iter().cloned())
+        .collect::<HashSet<_>>();
+    lines
+        .into_iter()
+        .filter(|line| !hidden.contains(&line.key))
+        .collect()
+}
+
 /// A workstream is flat in the common single-root case. Multiple roots make
 /// the container meaningful, so it becomes a header followed by explicit,
-/// human-named root rows. Descendants contribute attention to their root but
-/// never replace the stable target under the cursor.
+/// human-named root rows. Every descendant is a normal actionable agent row;
+/// inline editor creases collapse each contiguous subtree onto its parent.
 fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Vec<Line> {
-    let roots = registry.ordered_workstream_roots(topic);
-    let attention = |root: AgentId| registry.root_attention(topic, root);
+    let tree = registry.ordered_workstream_tree(topic);
+    let roots = tree
+        .iter()
+        .filter(|(_, depth)| *depth == 0)
+        .map(|(agent, _)| *agent)
+        .collect::<Vec<_>>();
+    let attention = |root: AgentId| {
+        let Some(index) = tree.iter().position(|(agent, _)| agent.agent_id == root) else {
+            return UiAttention::Quiet;
+        };
+        let end = tree[index + 1..]
+            .iter()
+            .position(|(_, depth)| *depth == 0)
+            .map_or(tree.len(), |offset| index + 1 + offset);
+        tree[index..end]
+            .iter()
+            .map(|(agent, _)| registry.attention(agent.agent_id))
+            .max()
+            .unwrap_or_default()
+    };
     let aggregate = roots
         .iter()
         .map(|root| attention(root.agent_id))
         .max()
         .unwrap_or(UiAttention::Quiet);
 
-    match roots.as_slice() {
-        [root] => vec![workstream_line(
+    if roots.is_empty() {
+        return vec![workstream_line(topic, grouped, None, aggregate)];
+    }
+
+    let singleton = roots.len() == 1;
+    let mut lines = if singleton {
+        vec![workstream_line(
             topic,
             grouped,
-            Some(root.agent_id),
-            attention(root.agent_id),
-        )],
-        [] => vec![workstream_line(topic, grouped, None, aggregate)],
-        _ => {
-            let mut lines = vec![workstream_line(topic, grouped, None, aggregate)];
-            lines.extend(
-                roots
-                    .into_iter()
-                    .map(|root| root_line(root, grouped, attention(root.agent_id), registry)),
-            );
-            lines
+            Some(roots[0].agent_id),
+            attention(roots[0].agent_id),
+        )]
+    } else {
+        vec![workstream_line(topic, grouped, None, aggregate)]
+    };
+    let mut agent_line_indexes = Vec::with_capacity(tree.len());
+    for (index, (agent, depth)) in tree.iter().enumerate() {
+        if singleton && index == 0 {
+            agent_line_indexes.push(0);
+            continue;
         }
+        let row_depth = if singleton { *depth } else { depth + 1 };
+        agent_line_indexes.push(lines.len());
+        lines.push(agent_line(
+            agent,
+            grouped,
+            row_depth,
+            if *depth == 0 {
+                attention(agent.agent_id)
+            } else {
+                registry.attention(agent.agent_id)
+            },
+            registry,
+        ));
     }
+
+    for (index, (agent, depth)) in tree.iter().enumerate() {
+        let subtree_end = tree[index + 1..]
+            .iter()
+            .position(|(_, candidate_depth)| candidate_depth <= depth)
+            .map_or(tree.len(), |offset| index + 1 + offset);
+        if subtree_end == index + 1 {
+            continue;
+        }
+        let parent_line = agent_line_indexes[index];
+        lines[parent_line].fold = Some(FoldSpec {
+            parent_agent: agent.agent_id,
+            parent: lines[parent_line].key.clone(),
+            descendants: agent_line_indexes[index + 1..subtree_end]
+                .iter()
+                .map(|line| lines[*line].key.clone())
+                .collect(),
+            descendant_count: subtree_end - index - 1,
+        });
+    }
+    lines
 }
 
 fn workstream_line(
@@ -897,17 +1162,23 @@ fn workstream_line(
     line
 }
 
-fn root_line(
-    root: &rho_ui_proto::UiAgentSummary,
+fn agent_line(
+    agent: &rho_ui_proto::UiAgentSummary,
     grouped: bool,
+    depth: usize,
     attention: UiAttention,
     registry: &AgentRegistry,
 ) -> Line {
-    let mut line = Line::new(LineKey::Agent(root.agent_id), RowTarget::Agent(root.agent_id));
-    line.span(None, |text| text.push_str(if grouped { "    " } else { "  " }));
+    let mut line = Line::new(
+        LineKey::Agent(agent.agent_id),
+        RowTarget::Agent(agent.agent_id),
+    );
+    line.span(None, |text| {
+        text.push_str(&"  ".repeat(depth + usize::from(grouped)))
+    });
     let class = (attention >= UiAttention::Pending).then_some(DashClass::Urgent);
     line.span(class, |text| {
-        text.push_str(&registry.agent_human_name(root.agent_id))
+        text.push_str(&registry.agent_human_name(agent.agent_id))
     });
     if attention > UiAttention::Quiet {
         line.lamp = Some(attention);
@@ -1104,7 +1375,7 @@ mod tests {
         registry.set_attention(child_id, UiAttention::NeedsInput);
 
         let lines = generate(&registry);
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         assert!(lines[0].text.contains("topic"));
         assert_eq!(lines[0].key, LineKey::Stream(WorkstreamId(1)));
         assert_eq!(lines[0].lamp, Some(UiAttention::NeedsInput));
@@ -1116,6 +1387,120 @@ mod tests {
             }
             if agent_id == root_id
         ));
+        assert_eq!(lines[1].target, RowTarget::Agent(child_id));
+        assert_eq!(lines[1].lamp, Some(UiAttention::NeedsInput));
+        assert_eq!(
+            lines[0].fold,
+            Some(FoldSpec {
+                parent_agent: root_id,
+                parent: LineKey::Stream(WorkstreamId(1)),
+                descendants: vec![LineKey::Agent(child_id)],
+                descendant_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn visible_child_of_hidden_parent_keeps_its_attention() {
+        let mut parent = agent(1, Status::Normal, 10);
+        parent.hidden = true;
+        let mut child = agent(2, Status::Normal, 10);
+        child.parent_agent = Some(parent.agent_id);
+        child.attention = UiAttention::NeedsInput;
+        let topic = topic(Status::Normal, vec![parent, child]);
+        let mut registry = AgentRegistry::default();
+        install(&mut registry, &topic);
+
+        let lines = generate(&registry);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].lamp, Some(UiAttention::NeedsInput));
+    }
+
+    #[test]
+    fn multiple_roots_and_nested_subagents_get_independent_folds() {
+        let mut first = agent(1, Status::Normal, 10);
+        first.display_name = Some("First root".to_owned());
+        let first_id = first.agent_id;
+        let mut child = agent(2, Status::Normal, 10);
+        child.parent_agent = Some(first_id);
+        child.display_name = Some("Child".to_owned());
+        let child_id = child.agent_id;
+        let mut grandchild = agent(3, Status::Normal, 10);
+        grandchild.parent_agent = Some(child_id);
+        grandchild.display_name = Some("Grandchild".to_owned());
+        let grandchild_id = grandchild.agent_id;
+        let mut second = agent(4, Status::Normal, 10);
+        second.display_name = Some("Second root".to_owned());
+        let second_id = second.agent_id;
+        let mut second_child = agent(5, Status::Normal, 10);
+        second_child.parent_agent = Some(second_id);
+        second_child.display_name = Some("Second child".to_owned());
+        let second_child_id = second_child.agent_id;
+        let topic = topic(
+            Status::Normal,
+            vec![first, grandchild, second_child, child, second],
+        );
+        let mut registry = AgentRegistry::default();
+        install(&mut registry, &topic);
+
+        let lines = generate(&registry);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "topic",
+                "  Second root",
+                "    Second child",
+                "  First root",
+                "    Child",
+                "      Grandchild",
+            ]
+        );
+        let fold = |agent_id| {
+            lines
+                .iter()
+                .find_map(|line| {
+                    line.fold
+                        .as_ref()
+                        .filter(|fold| fold.parent_agent == agent_id)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            fold(second_id).descendants,
+            [LineKey::Agent(second_child_id)]
+        );
+        assert_eq!(fold(second_id).descendant_count, 1);
+        assert_eq!(
+            fold(first_id).descendants,
+            [LineKey::Agent(child_id), LineKey::Agent(grandchild_id)]
+        );
+        assert_eq!(fold(first_id).descendant_count, 2);
+        assert_eq!(fold(child_id).descendants, [LineKey::Agent(grandchild_id)]);
+        assert_eq!(fold(child_id).descendant_count, 1);
+
+        let collapsed = visible_lines(generate(&registry), &HashSet::new());
+        assert_eq!(
+            collapsed
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["topic", "  Second root", "  First root"]
+        );
+
+        let expanded = visible_lines(generate(&registry), &HashSet::from([first_id]));
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["topic", "  Second root", "  First root", "    Child"]
+        );
+
+        let expanded = visible_lines(generate(&registry), &HashSet::from([first_id, child_id]));
+        assert!(expanded.iter().any(|line| line.text == "      Grandchild"));
     }
 
     #[test]

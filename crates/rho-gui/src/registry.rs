@@ -921,6 +921,50 @@ impl AgentRegistry {
             .unwrap_or_default()
     }
 
+    /// Every visible agent in one workstream, ordered as a parent-before-child
+    /// tree. The depth is relative to the root agent; roots have depth zero.
+    pub(crate) fn ordered_workstream_tree<'a>(
+        &self,
+        workstream: &'a Workstream,
+    ) -> Vec<(&'a UiAgentSummary, usize)> {
+        let state = TopicRailState::new(self, workstream);
+        let ordered = self.order_topic_agents_with_state(
+            &state,
+            workstream
+                .agents
+                .iter()
+                .filter(|agent| !agent.hidden)
+                .collect(),
+        );
+        let visible = ordered
+            .iter()
+            .map(|agent| agent.agent_id)
+            .collect::<BTreeSet<_>>();
+        ordered
+            .into_iter()
+            .map(|agent| {
+                let mut depth = 0;
+                let mut cursor = agent.agent_id;
+                let mut seen = BTreeSet::new();
+                while seen.insert(cursor) {
+                    let Some(parent) = state
+                        .by_id
+                        .get(&cursor)
+                        .and_then(|agent| agent.parent_agent)
+                    else {
+                        break;
+                    };
+                    if !visible.contains(&parent) {
+                        break;
+                    }
+                    depth += 1;
+                    cursor = parent;
+                }
+                (agent, depth)
+            })
+            .collect()
+    }
+
     /// Attention displayed for one dashboard root, including its visible
     /// descendants. This is also the signal used to place the root and its
     /// containing workstream in their coarse active cohorts.

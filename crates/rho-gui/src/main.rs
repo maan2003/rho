@@ -54,6 +54,7 @@ actions!(
         AgentDone,
         DashboardNewAgent,
         DashboardReply,
+        DashboardToggleSubagents,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
@@ -537,6 +538,7 @@ fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("r", DashboardReply, Some(context)),
             KeyBinding::new("d", AgentDone, Some(context)),
             KeyBinding::new("n", DashboardNewAgent, Some(context)),
+            KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
         ]);
     }
 }
