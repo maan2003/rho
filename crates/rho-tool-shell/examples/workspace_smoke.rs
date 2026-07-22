@@ -39,6 +39,17 @@ fn jj(repo: &std::path::Path, args: &[&str]) {
     );
 }
 
+fn jj_has_file(checkout: &std::path::Path, path: &str) -> bool {
+    std::process::Command::new("jj")
+        .current_dir(checkout)
+        .arg("--ignore-working-copy")
+        .args(["file", "show", "-r", "@", path])
+        .output()
+        .expect("run jj file show")
+        .status
+        .success()
+}
+
 fn main() -> anyhow::Result<()> {
     // SAFETY: top of main, single-threaded.
     unsafe { rho_workspaces::init_daemon_namespace() }?;
@@ -226,6 +237,9 @@ async fn run() -> anyhow::Result<()> {
     let wb = repo_handle.create_workspace("@").await?;
     let agent_a_id = wa.info().workspace_id().unwrap();
     let agent_b_id = wb.info().workspace_id().unwrap();
+    let wc = repo_handle
+        .create_workspace(&format!("ws-{}@", agent_a_id.encoded()))
+        .await?;
     let tools_a = ShellTools::new(Duration::from_secs(30), View::new(vec![Arc::clone(&wa)])?);
 
     // (1) Snapshot from OUTSIDE (origin jj): the user's edit follows down
@@ -257,9 +271,9 @@ async fn run() -> anyhow::Result<()> {
     );
     println!("outside snapshot: parent following + sibling isolation: ok");
 
-    // (2) Snapshot from INSIDE an agent namespace: the agent's own jj must
-    // load the user's workspace and the sibling checkout through
-    // namespace-local paths.
+    // (2) Snapshot from INSIDE an agent namespace: ancestors are outside the
+    // agent workspace's snapshot cone, so an unsnapshotted user edit does not
+    // flow down into the agent.
     std::fs::write(repo.join("u2.txt"), "user\n")?;
     let result = tools_a.call(shell_call("jj st")).await;
     assert!(
@@ -268,30 +282,30 @@ async fn run() -> anyhow::Result<()> {
         result.output
     );
     assert!(
-        wa.checkout().join("u2.txt").exists(),
-        "user edit followed from inside the namespace"
+        !wa.checkout().join("u2.txt").exists(),
+        "agent snapshot must not inspect its dirty ancestor"
     );
-    println!("inside-namespace snapshot: ok");
+    println!("inside-namespace snapshot excludes ancestors: ok");
 
-    // (3) Snapshot from inside a managed checkout on the host: the sibling's
-    // dirty file gets committed into its change.
+    // (3) The Rho turn-boundary path selects the agent checkout itself. It
+    // snapshots that workspace and its descendant, but not its sibling.
     std::fs::write(wa.checkout().join("d.txt"), "dee\n")?;
-    let output = std::process::Command::new("jj")
-        .current_dir(wb.checkout())
-        .args(["log", "--no-graph", "-r"])
-        .arg(format!("ws-{}@", agent_a_id.encoded()))
-        .args(["-T", "diff.files().len()"])
-        .output()?;
+    std::fs::write(wb.checkout().join("sibling.txt"), "sib\n")?;
+    std::fs::write(wc.checkout().join("child.txt"), "child\n")?;
+    wa.snapshot().await?;
     assert!(
-        output.status.success(),
-        "host-side jj in sibling checkout: {}",
-        String::from_utf8_lossy(&output.stderr)
+        jj_has_file(wa.checkout().as_std_path(), "d.txt"),
+        "turn boundary snapshots the current agent workspace"
     );
     assert!(
-        !String::from_utf8_lossy(&output.stdout).trim().is_empty(),
-        "sibling checkout snapshotted when running jj from another checkout"
+        jj_has_file(wc.checkout().as_std_path(), "child.txt"),
+        "turn boundary snapshots descendant workspaces"
     );
-    println!("host-side in-checkout snapshot: ok");
+    assert!(
+        !jj_has_file(wb.checkout().as_std_path(), "sibling.txt"),
+        "turn boundary excludes sibling workspaces"
+    );
+    println!("turn-boundary descendant snapshot cone: ok");
 
     // ---- daemon restart: stable reopen ----
     // A fresh Repo handle reuses the same managed path. Other live managed

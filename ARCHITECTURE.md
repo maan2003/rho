@@ -26,7 +26,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   stored individually. jj also dictates their stable per-repository paths,
   rematerializes missing checkouts, and garbage-collects stale materialized
   paths enumerated by jj's workspace store after snapshotting them. GC never
-  scans the prefix-id counter range. Every live `Workspace`
+  scans the prefix-id counter range. Snapshotting is commit-cone scoped: jj
+  snapshots the command workspace, workspaces sharing its working-copy commit,
+  and materialized descendant workspaces, but not ancestors or siblings.
+  Turn-boundary snapshots run `jj util snapshot` from the specific workspace
+  checkout so the correct cone is selected. Every live `Workspace`
   holds a shared lock on its persistent sibling lease file; GC alone requests
   the nonblocking exclusive lock, so any number of Rho processes can inhibit
   collection without using the lease as a workspace-ownership mutex.

@@ -477,24 +477,25 @@ impl CommandHelper {
     ) -> Result<(WorkspaceCommandHelper, SnapshotStats), CommandError> {
         let mut workspace_command = self.workspace_helper_no_snapshot(ui).await?;
 
-        let (workspace_command, stats) =
-            match workspace_command.maybe_snapshot_all_workspaces(ui).await {
-                Ok(stats) => (workspace_command, stats),
-                Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
-                Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
-                    let auto_update_stale =
-                        self.settings().get_bool("snapshot.auto-update-stale")?;
-                    if !auto_update_stale {
-                        return Err(err);
-                    }
-
-                    // We detected the working copy was stale and the client is configured to
-                    // auto-update-stale, so let's do that now. We need to do it up here, not at a
-                    // lower level (e.g. inside snapshot_working_copy()) to avoid recursive locking
-                    // of the working copy.
-                    self.recover_stale_working_copy(ui).await?
+        let (workspace_command, stats) = match workspace_command
+            .maybe_snapshot_workspace_descendants(ui)
+            .await
+        {
+            Ok(stats) => (workspace_command, stats),
+            Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
+            Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
+                let auto_update_stale = self.settings().get_bool("snapshot.auto-update-stale")?;
+                if !auto_update_stale {
+                    return Err(err);
                 }
-            };
+
+                // We detected the working copy was stale and the client is configured to
+                // auto-update-stale, so let's do that now. We need to do it up here, not at a
+                // lower level (e.g. inside snapshot_working_copy()) to avoid recursive locking
+                // of the working copy.
+                self.recover_stale_working_copy(ui).await?
+            }
+        };
 
         Ok((workspace_command, stats))
     }
@@ -1413,7 +1414,7 @@ impl WorkspaceCommandHelper {
         }))
     }
 
-    async fn maybe_snapshot_all_workspaces(
+    async fn maybe_snapshot_workspace_descendants(
         &mut self,
         ui: &Ui,
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
@@ -1437,20 +1438,34 @@ impl WorkspaceCommandHelper {
         }
 
         let current_workspace_name = self.workspace_name().to_owned();
+        let current_wc_commit_id = self
+            .get_wc_commit_id()
+            .expect("current workspace should have a working-copy commit")
+            .clone();
         let mut current_snapshot = self.snapshot_working_copy_for_transaction(ui).await?;
         let current_stats = current_snapshot
             .as_ref()
             .map(|snapshot| snapshot.stats.clone())
             .unwrap_or_default();
         let mut secondary_snapshots = Vec::new();
-        let workspace_names = self
-            .repo()
-            .view()
-            .wc_commit_ids()
-            .keys()
-            .filter(|name| name.as_str() != current_workspace_name.as_str())
-            .cloned()
-            .collect_vec();
+        // Scope the batch to the current commit cone. Workspaces sharing the
+        // current commit must stay grouped so their filesystem changes merge
+        // into the same rewritten working-copy commit.
+        let mut workspace_names = Vec::new();
+        for (workspace_name, wc_commit_id) in self.repo().view().wc_commit_ids() {
+            if workspace_name.as_str() == current_workspace_name.as_str() {
+                continue;
+            }
+            if wc_commit_id == &current_wc_commit_id
+                || self
+                    .repo()
+                    .index()
+                    .is_ancestor(&current_wc_commit_id, wc_commit_id)
+                    .map_err(snapshot_command_error)?
+            {
+                workspace_names.push(workspace_name.clone());
+            }
+        }
         for workspace_name in workspace_names {
             let repo = self.repo().clone();
             let Some(mut workspace_command) = self
@@ -1626,7 +1641,7 @@ impl WorkspaceCommandHelper {
     pub async fn maybe_snapshot(&mut self, ui: &Ui) -> Result<bool, CommandError> {
         let op_id_before = self.repo().op_id().clone();
         let stats = self
-            .maybe_snapshot_all_workspaces(ui)
+            .maybe_snapshot_workspace_descendants(ui)
             .await
             .map_err(|err| err.into_command_error())?;
         print_snapshot_stats(ui, &stats, self.env().path_converter())?;

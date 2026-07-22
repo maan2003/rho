@@ -515,7 +515,7 @@ fn test_workspaces_snapshot_updates_child_git_head() -> TestResult {
     let old_child_git_head = git_head(&child_dir)?;
     main_dir.write_file("parent-file", "contents\n");
 
-    child_dir.run_jj(["status"]).success();
+    main_dir.run_jj(["status"]).success();
 
     let expected_git_head = child_dir
         .run_jj([
@@ -772,6 +772,79 @@ fn test_workspace_add_override_path_in_store() {
 
 /// Test making changes to the working copy in a workspace as it gets rewritten
 /// from another workspace
+#[test]
+fn test_workspaces_snapshot_current_descendants_only() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let child_dir = test_env.work_dir("child");
+    let sibling_dir = test_env.work_dir("sibling");
+    let grandchild_dir = test_env.work_dir("grandchild");
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "child", "../child", "-r", "@"])
+        .success();
+    main_dir
+        .run_jj([
+            "workspace",
+            "add",
+            "--name",
+            "sibling",
+            "../sibling",
+            "-r",
+            "@",
+        ])
+        .success();
+    child_dir
+        .run_jj([
+            "workspace",
+            "add",
+            "--name",
+            "grandchild",
+            "../grandchild",
+            "-r",
+            "@",
+        ])
+        .success();
+
+    main_dir.write_file("ancestor", "ancestor\n");
+    child_dir.write_file("current", "current\n");
+    sibling_dir.write_file("sibling", "sibling\n");
+    grandchild_dir.write_file("descendant", "descendant\n");
+    child_dir.run_jj(["util", "snapshot"]).success();
+
+    let show = |revision, path| {
+        main_dir.run_jj([
+            "--ignore-working-copy",
+            "file",
+            "show",
+            "-r",
+            revision,
+            path,
+        ])
+    };
+    insta::assert_snapshot!(show("default@", "ancestor"), @"
+    ------- stderr -------
+    Error: No such path: ancestor
+    [EOF]
+    [exit status: 1]
+    ");
+    insta::assert_snapshot!(show("child@", "current"), @"
+    current
+    [EOF]
+    ");
+    insta::assert_snapshot!(show("sibling@", "sibling"), @"
+    ------- stderr -------
+    Error: No such path: sibling
+    [EOF]
+    [exit status: 1]
+    ");
+    insta::assert_snapshot!(show("grandchild@", "descendant"), @"
+    descendant
+    [EOF]
+    ");
+}
+
 #[test]
 fn test_workspaces_conflicting_edits() {
     let test_env = TestEnvironment::default();
@@ -1062,8 +1135,9 @@ fn test_workspaces_updated_by_other_with_changes_in_working_copy_automatic() {
     ");
 
     // The first working copy was already updated on disk when the `squash`
-    // command snapshotted all workspaces, so no staleness arises: the
-    // modification lands directly in the updated working-copy commit.
+    // command snapshotted its descendant workspace too, so no staleness
+    // arises: the modification lands directly in the updated working-copy
+    // commit.
     secondary_dir.write_file("file", "modified contents\n");
     let output = secondary_dir.run_jj(["describe", "-m", "modified"]);
     insta::assert_snapshot!(output, @r"
@@ -1073,9 +1147,9 @@ fn test_workspaces_updated_by_other_with_changes_in_working_copy_automatic() {
     [EOF]
     ");
 
-    // The operation log stays linear: every command snapshots all workspaces,
-    // so the secondary working copy never falls behind and no reconciliation
-    // is needed.
+    // The operation log stays linear: commands in the main workspace snapshot
+    // its descendants, so the secondary working copy never falls behind and
+    // no reconciliation is needed.
     let output = main_dir.run_jj(["op", "log", "-Tdescription"]);
     insta::assert_snapshot!(output, @"
     @  describe commit 2207ea20e15f0bdcfe5ce93dc4af246322fd8623
@@ -1368,7 +1442,7 @@ fn test_workspaces_unpublished_operation_same_tree() {
 }
 
 #[test]
-fn test_workspaces_snapshot_secondary_from_primary() {
+fn test_workspaces_snapshot_excludes_sibling() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "main"]).success();
     let main_dir = test_env.work_dir("main");
@@ -1397,10 +1471,7 @@ fn test_workspaces_snapshot_secondary_from_primary() {
         "second@",
         "--name-only",
     ]);
-    insta::assert_snapshot!(output, @"
-    secondary-file
-    [EOF]
-    ");
+    insta::assert_snapshot!(output, @"");
 }
 
 #[test]
@@ -1485,7 +1556,7 @@ fn test_workspaces_snapshot_child_working_copy_commit() {
     ]);
     insta::assert_snapshot!(output, @"
     @  snapshot working copies
-    ○  create initial working-copy commit in workspace child
+    ○  snapshot working copies
     [EOF]
     ");
     let output = main_dir.run_jj([
@@ -1506,8 +1577,8 @@ fn test_workspaces_snapshot_child_working_copy_commit() {
     [EOF]
     ");
     insta::assert_snapshot!(get_log_output(&main_dir), @r#"
-    ○  821b59fb2a52 child@
-    @  367a3aaf76ca default@
+    ○  49ca0e5571df child@
+    @  42879de08f12 default@
     ○  b2ce97c22272 "base"
     ◆  000000000000
     [EOF]

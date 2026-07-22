@@ -267,7 +267,7 @@ pub struct Repo {
     user_environment: Option<UserEnvironment>,
     /// Serializes jj invocations. jj's op log makes concurrent commands safe
     /// on its own; this is simplicity insurance while the fork's
-    /// all-workspace snapshot path is young.
+    /// descendant-workspace snapshot path is young.
     jj_lock: Mutex<()>,
     /// Weakly indexes live workspaces, so agents and views remain their strong
     /// owners while agents joining a workspace share its checkout, mount
@@ -795,17 +795,22 @@ impl Workspace {
         !self.is_user_checkout()
     }
 
-    /// Commits the checkout's current file state into the repo (any jj
-    /// command snapshots all workspaces under the fork). Called at turn
-    /// boundaries so the user's own jj view follows the agent's work.
+    /// Commits the checkout's current file state and its descendant workspace
+    /// states into the repo. Called at turn boundaries so the user's own jj
+    /// view follows the agent's work.
     /// A no-op for plain (non-jj) directory workdirs.
     pub async fn snapshot(&self) -> anyhow::Result<()> {
         if !self.repo.is_jj {
             return Ok(());
         }
         let _guard = self.repo.jj_lock.lock().await;
-        let mut command = self.repo.jj();
-        command.args(["workspace", "list"]);
+        let mut command = tokio::process::Command::new("jj");
+        if let Some(environment) = &self.repo.user_environment {
+            environment.apply(&mut command);
+        }
+        command
+            .current_dir(&self.checkout)
+            .args(["util", "snapshot"]);
         run_jj(command).await.context("jj snapshot")?;
         Ok(())
     }
