@@ -14,7 +14,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
-use gpui::{Context, Entity, Focusable as _, Task, Window, div, px};
+use gpui::{App, Context, Entity, Focusable as _, Task, Window, div, px};
 use rho_core::ContentPart;
 use rho_ui_proto::{
     AdvisorIntelligence, AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery,
@@ -171,10 +171,10 @@ pub struct Workspace {
     transient_stack: Vec<crate::transient::Transient>,
     transient_focus: gpui::FocusHandle,
     git_approval_focus: gpui::FocusHandle,
-    /// Where focus lived when the leader chord began — the dashboard or a
-    /// pane. Transient actions run against (and closing returns to) that
-    /// origin, so `space a d` from home mode stays in home mode.
-    transient_origin: Option<gpui::FocusHandle>,
+    /// Focus beneath the single modal overlay. Transients, minibuffers, and
+    /// Git approval hand this target between them so borrowing keyboard
+    /// focus never changes dashboard/work mode.
+    overlay_return_focus: Option<gpui::FocusHandle>,
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
@@ -321,7 +321,7 @@ impl Workspace {
             transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
             git_approval_focus: cx.focus_handle(),
-            transient_origin: None,
+            overlay_return_focus: None,
             echo: None,
             pending_git_approval: None,
             _event_task: event_task,
@@ -611,7 +611,7 @@ impl Workspace {
                     false
                 };
                 if had_git_approval {
-                    self.focus_active_surface(window, cx);
+                    self.finish_overlay_focus(window, cx);
                 }
                 self.connected = false;
                 self.awaiting_draft_agent = false;
@@ -650,6 +650,7 @@ impl Workspace {
                     prompt,
                     response,
                 });
+                self.capture_overlay_focus(window, cx);
                 window.focus(&self.git_approval_focus, cx);
                 self.echo = None;
                 cx.notify();
@@ -663,7 +664,7 @@ impl Workspace {
                     if let Some(pending) = self.pending_git_approval.take() {
                         let _ = pending.response.send(GitApprovalDecision::Done);
                     }
-                    self.focus_active_surface(window, cx);
+                    self.finish_overlay_focus(window, cx);
                     cx.notify();
                 }
             }
@@ -2261,6 +2262,11 @@ impl Workspace {
         self.dashboard.fold_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_dashboard_mode(&self, window: &Window, cx: &App) -> bool {
+        self.dashboard_mode(window, cx)
+    }
+
     pub(crate) fn active_agent_model(&self) -> Option<Entity<AgentModel>> {
         self.registry
             .selected_agent()
@@ -2306,15 +2312,26 @@ impl Workspace {
             })
     }
 
-    /// Moves gpui focus to the focused pane's surface.
-    fn focus_active_surface(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn active_surface_focus(&self, cx: &App) -> gpui::FocusHandle {
         match &self.active_tree().focused().surface.view {
-            SurfaceView::Draft { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
-            SurfaceView::Transcript { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
-            SurfaceView::File(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
-            SurfaceView::Shell { editor, .. } => window.focus(&editor.focus_handle(cx), cx),
-            SurfaceView::Diff(view) => window.focus(&view.read(cx).editor().focus_handle(cx), cx),
-            SurfaceView::Terminal(view) => window.focus(&view.read(cx).focus_handle(cx), cx),
+            SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
+            SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
+            SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
+            SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
+            SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
+            SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
+        }
+    }
+
+    /// Moves gpui focus to the focused pane's surface. If a modal overlay
+    /// owns the keyboard, update where it will return instead of stealing
+    /// focus from it.
+    fn focus_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.active_surface_focus(cx);
+        if self.has_modal_overlay() {
+            self.overlay_return_focus = Some(handle);
+        } else {
+            window.focus(&handle, cx);
         }
     }
 
@@ -2538,14 +2555,14 @@ impl Workspace {
         };
         minibuffer.accept_selected(window, cx);
         let (input, on_submit) = minibuffer.into_submission(cx);
-        self.focus_active_surface(window, cx);
+        self.finish_overlay_focus(window, cx);
         on_submit(self, input, window, cx);
         cx.notify();
     }
 
     fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.minibuffer.take().is_some() {
-            self.focus_active_surface(window, cx);
+            self.finish_overlay_focus(window, cx);
             cx.notify();
         }
     }
@@ -2558,7 +2575,7 @@ impl Workspace {
     ) {
         if let Some(pending) = self.pending_git_approval.take() {
             let _ = pending.response.send(decision);
-            self.focus_active_surface(window, cx);
+            self.finish_overlay_focus(window, cx);
             cx.notify();
         }
     }
@@ -2573,6 +2590,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.capture_overlay_focus(window, cx);
         let text_style = self
             .active_editor(cx)
             .update(cx, |editor, cx| editor.style(cx).text.clone());
@@ -2592,29 +2610,40 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.capture_overlay_focus(window, cx);
         transient.retain_applicable(self);
         self.transient = Some(transient);
         self.minibuffer = None;
         self.echo = None;
-        // Capture the chain's origin on first open; submenu reopens see
-        // focus already restored to that origin and re-capture the same.
-        if !self.transient_focus.is_focused(window) {
-            self.transient_origin = window.focused(cx);
-        }
         window.focus(&self.transient_focus, cx);
         cx.notify();
     }
 
-    /// Returns focus to where it was when the leader chord began, falling
-    /// back to the active surface.
-    fn restore_transient_origin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.transient_origin.clone() {
+    fn has_modal_overlay(&self) -> bool {
+        self.minibuffer.is_some() || self.transient.is_some() || self.pending_git_approval.is_some()
+    }
+
+    /// Captures normal focus on the first overlay in a chain. Replacements
+    /// such as transient -> minibuffer inherit the original target.
+    fn capture_overlay_focus(&mut self, window: &Window, cx: &App) {
+        if self.overlay_return_focus.is_none() {
+            self.overlay_return_focus = window.focused(cx);
+        }
+    }
+
+    fn restore_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.overlay_return_focus.clone() {
             Some(handle) => {
                 window.focus(&handle, cx);
                 cx.notify();
             }
             None => self.focus_active_surface(window, cx),
         }
+    }
+
+    fn finish_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_overlay_focus(window, cx);
+        self.overlay_return_focus = None;
     }
 
     /// Clears the menu without touching focus.
@@ -2626,8 +2655,7 @@ impl Workspace {
     fn close_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.transient.is_some() {
             self.drop_transient();
-            self.restore_transient_origin(window, cx);
-            self.transient_origin = None;
+            self.finish_overlay_focus(window, cx);
             cx.notify();
         }
     }
@@ -2674,7 +2702,7 @@ impl Workspace {
                 // Restore focus to the chord's origin first so the action
                 // sees normal focus (and a dashboard chord stays home);
                 // submenus and prompts re-take the strip themselves.
-                self.restore_transient_origin(window, cx);
+                self.restore_overlay_focus(window, cx);
                 run(self, window, cx);
                 if self.transient.is_some() {
                     // The action opened a submenu: its parent waits under
@@ -2682,7 +2710,9 @@ impl Workspace {
                     self.transient_stack.extend(parent);
                 } else {
                     self.transient_stack.clear();
-                    self.transient_origin = None;
+                    if !self.has_modal_overlay() {
+                        self.overlay_return_focus = None;
+                    }
                 }
                 cx.notify();
             }
@@ -3320,12 +3350,9 @@ impl Workspace {
         // Home mode: the dashboard owns the keyboard, so it owns the frame;
         // the panes are its preview. With nothing selected there is
         // nothing to preview — the dashboard takes the whole frame.
-        // An open leader chord parks focus on the transient handle; the
-        // frame stays in the mode the chord began in.
-        let dashboard_handle = self.dashboard.focus_handle(cx);
-        let home = dashboard_handle.is_focused(window)
-            || (self.transient_focus.is_focused(window)
-                && self.transient_origin.as_ref() == Some(&dashboard_handle));
+        // Modal overlays borrow keyboard focus; the frame stays in the mode
+        // recorded beneath the overlay for its whole replacement chain.
+        let home = self.dashboard_mode(window, cx);
         self.sync_diff_visibility(!home, cx);
         let show_panes = !home || self.registry.selected_agent().is_some();
         let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
@@ -3424,6 +3451,11 @@ impl Workspace {
             .children(rail)
             .children(panes)
             .into_any_element()
+    }
+
+    fn dashboard_mode(&self, window: &Window, cx: &App) -> bool {
+        let dashboard = self.dashboard.focus_handle(cx);
+        dashboard.is_focused(window) || self.overlay_return_focus.as_ref() == Some(&dashboard)
     }
 
     /// Hidden surfaces stay alive as editor buffers, but they must not turn

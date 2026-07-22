@@ -60,6 +60,80 @@ fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     cx.add_window(|window, cx| Workspace::new(target, window, cx))
 }
 
+#[gpui::test]
+fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.is_dashboard_mode(window, cx));
+            workspace.open_transient(crate::transient::root_menu(), window, cx);
+        })
+        .expect("open dashboard transient");
+    cx.simulate_keystrokes(*workspace, "p r");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(
+                workspace.is_dashboard_mode(window, cx),
+                "transient-to-minibuffer handoff should remain in dashboard mode"
+            );
+        })
+        .expect("inspect dashboard prompt");
+    cx.dispatch_action(*workspace, crate::MinibufferCancel);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.is_dashboard_mode(window, cx));
+            workspace.prompt_workstream(crate::workspace::WorkstreamPrompt::Rename, window, cx);
+        })
+        .expect("open dashboard prompt");
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.is_dashboard_mode(window, cx));
+            let (response, _decision) = tokio::sync::oneshot::channel();
+            workspace.handle_event(
+                ConnEvent::GitTransportApproval {
+                    request_id: 1,
+                    prompt: "approve dashboard Git operation".to_owned(),
+                    response,
+                },
+                window,
+                cx,
+            );
+            assert!(workspace.is_dashboard_mode(window, cx));
+        })
+        .expect("open dashboard Git approval");
+    cx.dispatch_action(*workspace, crate::GitApprovalDeny);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.is_dashboard_mode(window, cx));
+            workspace.select_agent(None, window, cx);
+            assert!(!workspace.is_dashboard_mode(window, cx));
+            workspace.prompt_workstream(crate::workspace::WorkstreamPrompt::Rename, window, cx);
+            assert!(!workspace.is_dashboard_mode(window, cx));
+        })
+        .expect("open surface prompt");
+    cx.dispatch_action(*workspace, crate::MinibufferCancel);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(!workspace.is_dashboard_mode(window, cx));
+            let (response, _decision) = tokio::sync::oneshot::channel();
+            workspace.handle_event(
+                ConnEvent::GitTransportApproval {
+                    request_id: 2,
+                    prompt: "approve surface Git operation".to_owned(),
+                    response,
+                },
+                window,
+                cx,
+            );
+            assert!(!workspace.is_dashboard_mode(window, cx));
+            workspace.handle_event(ConnEvent::GitTransportDone { request_id: 2 }, window, cx);
+            assert!(!workspace.is_dashboard_mode(window, cx));
+        })
+        .expect("inspect restored surface mode");
+}
+
 fn agent(id: u64) -> AgentId {
     AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap()
 }
