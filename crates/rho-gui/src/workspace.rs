@@ -2261,10 +2261,6 @@ impl Workspace {
         self.dashboard.fold_count()
     }
 
-    pub(crate) fn toggle_dashboard_subagents(&mut self, parent: AgentId, cx: &mut Context<Self>) {
-        self.dashboard.toggle_subagents_for(parent, cx);
-    }
-
     pub(crate) fn active_agent_model(&self) -> Option<Entity<AgentModel>> {
         self.registry
             .selected_agent()

@@ -3,7 +3,6 @@
 use editor::Editor;
 use editor::display_map::{Block, DisplayRow};
 use gpui::{App, Entity, Focusable as _, TestAppContext, WindowHandle};
-use multi_buffer::MultiBufferRow;
 use rho_core::UnixMs;
 use rho_ui_proto::remote::{
     AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlock, UiBlockDiff, UiBlockUpdate,
@@ -122,15 +121,10 @@ fn dashboard_elides_subagents_behind_inline_fold(cx: &mut TestAppContext) {
         })
         .expect("dashboard editor");
     workspace
-        .update(cx, |_, window, cx| {
+        .update(cx, |_, _, cx| {
             dashboard.update(cx, |editor, cx| {
-                let snapshot = editor.snapshot(window, cx);
-                assert!(
-                    snapshot
-                        .render_crease_trailer(MultiBufferRow(0), window, cx)
-                        .is_some()
-                );
                 let text = editor.display_text(cx);
+                assert!(text.contains("Fix agent navigation ›"), "{text:?}");
                 assert!(!text.contains("agent 2"), "{text:?}");
                 assert!(!text.contains("agent 3"), "{text:?}");
             });

@@ -1,7 +1,7 @@
 //! The dashboard: the rail reborn as a real editor buffer — rho's
 //! magit-status. A single-root workstream is one compact row; the uncommon
 //! multi-root workstream becomes a header followed by human-named root rows.
-//! Agent trees stay compact behind inline, independently nested fold trailers.
+//! Agent trees stay compact behind independently nested disclosure markers.
 //! Generated read-only text lives in a normal editor, so cursor motions and
 //! search come from the editor rather than bespoke list chrome. Acting keys
 //! address the stable root under the cursor: `enter` opens, `r` splices an
@@ -13,18 +13,16 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use editor::display_map::{Crease, CreaseId, FoldPlaceholder};
 use editor::hover_links::InlayHighlight;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable as _, FontWeight, HighlightStyle, MouseButton, Window};
+use gpui::{App, Context, Entity, Focusable as _, FontWeight, HighlightStyle, Window};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
 use rho_ui_proto::{AgentId, UiAttention, WorkstreamId};
 use text::BufferId;
 use theme::ActiveTheme as _;
-use ui::{Icon, IconName, IconSize};
 
 use crate::registry::{AgentRegistry, Workstream};
 use crate::workspace::Workspace;
@@ -61,11 +59,6 @@ struct FoldSpec {
     parent: LineKey,
     descendants: Vec<LineKey>,
     descendant_count: usize,
-}
-
-struct ActiveFold {
-    id: CreaseId,
-    spec: FoldSpec,
 }
 
 /// What the line under the cursor refers to; the object of every
@@ -111,10 +104,9 @@ pub struct Dashboard {
     lamp_ids: Vec<InlayId>,
     /// Reply placeholder inlays currently spliced in.
     placeholder_ids: Vec<InlayId>,
-    /// Inline Zed crease trailers that control projected descendant rows.
-    folds: HashMap<AgentId, ActiveFold>,
-    /// Expansion state keyed by stable parent identity and shared with the
-    /// clickable crease trailers that request dashboard regeneration.
+    /// Projected descendant rows keyed by their stable parent identity.
+    folds: HashMap<AgentId, FoldSpec>,
+    /// Expansion state keyed by stable parent identity.
     expanded_folds: Arc<Mutex<HashSet<AgentId>>>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
@@ -262,9 +254,9 @@ impl Dashboard {
         } else if let Some(parent) = self
             .folds
             .values()
-            .filter(|fold| fold.spec.descendants.contains(&key))
-            .min_by_key(|fold| fold.spec.descendant_count)
-            .map(|fold| fold.spec.parent.clone())
+            .filter(|fold| fold.descendants.contains(&key))
+            .min_by_key(|fold| fold.descendant_count)
+            .map(|fold| fold.parent.clone())
         {
             parent
         } else {
@@ -300,7 +292,16 @@ impl Dashboard {
             .expanded_folds
             .lock()
             .map_or_else(|_| HashSet::new(), |expanded| expanded.clone());
-        let lines = visible_lines(generate(registry), &expanded);
+        let mut lines = visible_lines(generate(registry), &expanded);
+        for line in &mut lines {
+            if line
+                .fold
+                .as_ref()
+                .is_some_and(|fold| !expanded.contains(&fold.parent_agent))
+            {
+                line.span(Some(DashClass::Muted), |text| text.push_str(" ›"));
+            }
+        }
 
         // Empty reply drafts the cursor has left are dead weight; drop them.
         let cursor_key = self.cursor_key(cx);
@@ -446,102 +447,18 @@ impl Dashboard {
             self.move_cursor_to(&key, window, cx);
         }
 
-        self.apply_folds(&lines, order_changed, cx);
+        self.apply_folds(&lines);
         self.apply_highlights(&lines, cx);
         self.apply_lamps(&lines, cx);
         self.apply_reply_chrome(registry, cx);
     }
 
-    fn apply_folds(&mut self, lines: &[Line], excerpts_rebuilt: bool, cx: &mut Context<Workspace>) {
-        let desired = lines
+    fn apply_folds(&mut self, lines: &[Line]) {
+        self.folds = lines
             .iter()
             .filter_map(|line| line.fold.clone())
             .map(|fold| (fold.parent_agent, fold))
             .collect::<HashMap<_, _>>();
-
-        let stale = self
-            .folds
-            .iter()
-            .filter(|(agent_id, active)| {
-                excerpts_rebuilt || desired.get(agent_id) != Some(&active.spec)
-            })
-            .map(|(agent_id, active)| (*agent_id, active.id))
-            .collect::<Vec<_>>();
-        if !stale.is_empty() {
-            self.editor.update(cx, |editor, cx| {
-                editor.remove_creases(stale.iter().map(|(_, id)| *id), cx);
-            });
-            for (agent_id, _) in stale {
-                self.folds.remove(&agent_id);
-            }
-        }
-
-        for (agent_id, spec) in desired {
-            if self.folds.contains_key(&agent_id) {
-                continue;
-            }
-            let Some(parent) = self.buffers.get(&spec.parent) else {
-                continue;
-            };
-            let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-            let parent_snapshot = parent.read(cx).snapshot();
-            // The disclosure belongs in the row's trailing chrome, after the
-            // title, rather than looking like part of its indentation.
-            let Some(position) =
-                snapshot.anchor_in_excerpt(parent_snapshot.anchor_after(parent_snapshot.len()))
-            else {
-                continue;
-            };
-            let crease = self.agent_crease(spec.parent_agent, position..position, cx.weak_entity());
-            let id = self
-                .editor
-                .update(cx, |editor, cx| editor.insert_creases([crease], cx)[0]);
-            self.folds.insert(agent_id, ActiveFold { id, spec });
-        }
-    }
-
-    fn agent_crease(
-        &self,
-        parent_agent: AgentId,
-        range: Range<multi_buffer::Anchor>,
-        workspace: gpui::WeakEntity<Workspace>,
-    ) -> Crease<multi_buffer::Anchor> {
-        let expanded_folds = self.expanded_folds.clone();
-        Crease::inline(
-            range,
-            FoldPlaceholder::default(),
-            |_row, _folded, _toggle, _window, _cx| gpui::Empty,
-            move |_row, _folded, _window, _cx| {
-                let expanded = expanded_folds
-                    .lock()
-                    .is_ok_and(|expanded| expanded.contains(&parent_agent));
-                let workspace = workspace.clone();
-                gpui::div()
-                    .id(format!("dashboard-subagents-{}", parent_agent.encoded()))
-                    .cursor_pointer()
-                    .ml_1()
-                    .flex()
-                    .items_center()
-                    .child(
-                        Icon::new(if expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(IconSize::XSmall),
-                    )
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(move |_, _window, cx| {
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.toggle_dashboard_subagents(parent_agent, cx);
-                            })
-                            .ok();
-                        cx.stop_propagation();
-                    })
-                    .into_any()
-            },
-        )
     }
 
     /// Places the cursor at the start of a key's buffer.
@@ -608,7 +525,7 @@ impl Dashboard {
         parent: AgentId,
         cx: &mut Context<Workspace>,
     ) -> bool {
-        let Some(parent_key) = self.folds.get(&parent).map(|fold| fold.spec.parent.clone()) else {
+        let Some(parent_key) = self.folds.get(&parent).map(|fold| fold.parent.clone()) else {
             return false;
         };
         if let Ok(mut expanded) = self.expanded_folds.lock()
