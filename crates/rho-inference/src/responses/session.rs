@@ -162,12 +162,12 @@ impl ResponsesConfig {
 
     fn title() -> Self {
         Self {
-            model: ResponsesModel::Gpt54Mini,
+            model: ResponsesModel::Gpt56Luna,
             auto_compaction: None,
             reasoning_context: ReasoningContext::CurrentTurn,
             effort: ResponsesEffort::Medium,
             text_verbosity: TextVerbosity::Low,
-            service_tier: ServiceTier::Normal,
+            service_tier: ServiceTier::Priority,
         }
     }
 }
@@ -178,7 +178,6 @@ pub(crate) enum ResponsesModel {
     Gpt56Sol,
     Gpt56Luna,
     Gpt56Terra,
-    Gpt54Mini,
     #[cfg(test)]
     Test(String),
 }
@@ -207,7 +206,6 @@ impl ResponsesModel {
             Self::Gpt56Sol => "gpt-5.6-sol",
             Self::Gpt56Luna => "gpt-5.6-luna",
             Self::Gpt56Terra => "gpt-5.6-terra",
-            Self::Gpt54Mini => "gpt-5.4-mini",
             #[cfg(test)]
             Self::Test(model) => model,
         }
@@ -220,7 +218,7 @@ impl ResponsesModel {
     pub(crate) fn use_responses_lite(&self) -> bool {
         match self {
             Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra => true,
-            Self::Gpt55 | Self::Gpt54Mini => false,
+            Self::Gpt55 => false,
             #[cfg(test)]
             Self::Test(_) => false,
         }
@@ -232,7 +230,7 @@ impl ResponsesModel {
                 context_window: 372_000,
                 auto_compact_token_limit: 280_000,
             },
-            Self::Gpt55 | Self::Gpt54Mini => ResponsesModelInfo {
+            Self::Gpt55 => ResponsesModelInfo {
                 context_window: 272_000,
                 auto_compact_token_limit: 232_560,
             },
