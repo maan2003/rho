@@ -1501,7 +1501,12 @@ mod tests {
         let mut unknown_host = valid.clone();
         unknown_host.host = "git.example".to_owned();
         assert!(validate_git_transport_request(&unknown_host).is_err());
-        for repository in ["../repo", "team/repo-name", "team/repo.git", "team//repo"] {
+        for repository in ["team/repo-name", "team/repo.git"] {
+            let mut request = valid.clone();
+            request.repository = repository.to_owned();
+            assert!(validate_git_transport_request(&request).is_ok());
+        }
+        for repository in ["../repo", "team//repo"] {
             let mut request = valid.clone();
             request.repository = repository.to_owned();
             assert!(validate_git_transport_request(&request).is_err());

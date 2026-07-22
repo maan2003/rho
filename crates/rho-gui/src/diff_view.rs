@@ -571,10 +571,11 @@ impl Render for DiffView {
             .child(
                 div()
                     .flex_none()
-                    .px(px(10.))
-                    .py(px(4.))
+                    .px(px(12.))
+                    .py(px(5.))
                     .border_b_1()
                     .border_color(colors.border_variant)
+                    .bg(colors.editor_subheader_background)
                     .text_color(colors.text_muted)
                     .child(self.model.read(cx).status().to_owned()),
             )
@@ -590,8 +591,9 @@ fn build_editor(
 ) -> Entity<editor::Editor> {
     cx.new(|cx| {
         let mut editor = editor::Editor::for_multibuffer(multibuffer, Some(project), window, cx);
-        crate::editor_config::configure_file(&mut editor, window, cx);
+        crate::editor_config::configure_diff(&mut editor, window, cx);
         editor.start_temporary_diff_override();
+        editor.disable_diagnostics(cx);
         editor.set_expand_all_diff_hunks(cx);
         editor.set_render_diff_hunks_as_unstaged(true, cx);
         editor.set_render_diff_hunk_controls(
@@ -613,10 +615,9 @@ fn diff_path_key(path: &Utf8Path) -> PathKey {
 
 fn status_text(prepared: &PreparedDiff) -> String {
     let short = &prepared.snapshot.commit_id[..prepared.snapshot.commit_id.len().min(12)];
-    let mut parts = vec![format!(
-        "{} changed files · jj {short}",
-        prepared.snapshot.files.len()
-    )];
+    let count = prepared.snapshot.files.len();
+    let noun = if count == 1 { "file" } else { "files" };
+    let mut parts = vec![format!("Changes · {count} {noun} · jj {short}")];
     if prepared.omitted != 0 {
         parts.push(format!("{} non-text/oversized omitted", prepared.omitted));
     }

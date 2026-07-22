@@ -47,3 +47,15 @@ pub fn configure_file(editor: &mut Editor, window: &mut Window, cx: &mut Context
     editor.set_show_edit_predictions(Some(false), window, cx);
     editor.disable_expand_excerpt_buttons(cx);
 }
+
+/// Chrome for a multi-file review surface. Diff rows need more orientation
+/// than an ordinary rho file buffer: line numbers, a stable content inset,
+/// and scrollbars make hunk and file boundaries legible.
+pub fn configure_diff(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    configure_file(editor, window, cx);
+    editor.set_show_gutter(true, cx);
+    editor.set_show_line_numbers(true, cx);
+    editor.set_show_vertical_scrollbar(true, cx);
+    editor.set_show_horizontal_scrollbar(true, cx);
+    editor.set_offset_content(true, cx);
+}

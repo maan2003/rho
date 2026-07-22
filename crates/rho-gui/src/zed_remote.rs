@@ -32,7 +32,7 @@ use remote::{
 use rho_ui_proto::WorkspaceInfo;
 use rpc::ErrorExt as _;
 use rpc::proto::Envelope;
-use theme::ActiveTheme as _;
+use theme::{ActiveTheme as _, GlobalTheme};
 use util::paths::{PathStyle, RemotePathBuf};
 
 use crate::connection::{Connection, ZedChannel};
@@ -373,16 +373,8 @@ fn project_deps(
         let client = Client::new(Arc::new(clock::RealSystemClock), http, cx);
         let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
         Project::init(&client, cx);
-        let languages = Arc::new(language::LanguageRegistry::new(
-            cx.background_executor().clone(),
-        ));
         let fs: Arc<dyn fs::Fs> = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
-        languages::init(
-            languages.clone(),
-            fs.clone(),
-            node_runtime::NodeRuntime::unavailable(),
-            cx,
-        );
+        let languages = init_language_registry(fs.clone(), cx);
         cx.set_global(RemoteProjectDeps {
             client,
             user_store,
@@ -397,6 +389,25 @@ fn project_deps(
         deps.languages.clone(),
         deps.fs.clone(),
     )
+}
+
+fn init_language_registry(fs: Arc<dyn fs::Fs>, cx: &mut App) -> Arc<language::LanguageRegistry> {
+    let languages = Arc::new(language::LanguageRegistry::new(
+        cx.background_executor().clone(),
+    ));
+    languages.set_theme(cx.theme().clone());
+    languages::init(
+        languages.clone(),
+        fs,
+        node_runtime::NodeRuntime::unavailable(),
+        cx,
+    );
+    cx.observe_global::<GlobalTheme>({
+        let languages = languages.clone();
+        move |cx| languages.set_theme(cx.theme().clone())
+    })
+    .detach();
+    languages
 }
 
 /// The transport: envelopes ride a dedicated stream to the daemon. There is
@@ -561,4 +572,36 @@ impl RemoteClientDelegate for NoopDelegate {
     }
 
     fn set_status(&self, _status: Option<&str>, _cx: &mut AsyncApp) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use gpui::TestAppContext;
+    use settings::SettingsStore;
+    use text::Rope;
+
+    use super::init_language_registry;
+
+    #[gpui::test]
+    async fn bundled_languages_receive_the_active_syntax_theme(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::new(cx, crate::rho_assets::RHO_DEFAULT_SETTINGS);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let languages = cx.update(|cx| {
+            let fs: std::sync::Arc<dyn fs::Fs> =
+                std::sync::Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
+            init_language_registry(fs, cx)
+        });
+        let markdown = languages
+            .load_language_for_file_path(Path::new("README.md"))
+            .await
+            .expect("load bundled Markdown grammar");
+        let source = Rope::from("# heading\n\n**strong**\n");
+
+        assert!(!markdown.highlight_text(&source, 0..source.len()).is_empty());
+    }
 }
