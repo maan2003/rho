@@ -259,6 +259,7 @@ impl ResponsesRequest {
             }),
             reasoning: Some(ReasoningRequest {
                 context: match config.reasoning_context {
+                    #[cfg(test)]
                     ReasoningContext::CurrentTurn => "current_turn",
                     ReasoningContext::AllTurns => "all_turns",
                 },

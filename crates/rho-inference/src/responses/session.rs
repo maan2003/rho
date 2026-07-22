@@ -164,7 +164,7 @@ impl ResponsesConfig {
         Self {
             model: ResponsesModel::Gpt56Luna,
             auto_compaction: None,
-            reasoning_context: ReasoningContext::CurrentTurn,
+            reasoning_context: ReasoningContext::AllTurns,
             effort: ResponsesEffort::Medium,
             text_verbosity: TextVerbosity::Low,
             service_tier: ServiceTier::Priority,
@@ -277,6 +277,7 @@ pub(crate) enum TextVerbosity {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ReasoningContext {
+    #[cfg(test)]
     CurrentTurn,
     AllTurns,
 }

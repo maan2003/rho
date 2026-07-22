@@ -21,6 +21,10 @@ fn title_session_uses_luna_fast_profile() {
     let session = InferenceSession::new_title(auth, PromptCacheKey::generate());
 
     assert_eq!(session.responses_config.model, ResponsesModel::Gpt56Luna);
+    assert_eq!(
+        session.responses_config.reasoning_context,
+        ReasoningContext::AllTurns
+    );
     assert_eq!(session.responses_config.effort, ResponsesEffort::Medium);
     assert_eq!(session.responses_config.text_verbosity, TextVerbosity::Low);
     assert_eq!(session.responses_config.service_tier, ServiceTier::Priority);
