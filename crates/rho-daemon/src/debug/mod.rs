@@ -163,6 +163,9 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
         if let Some(name) = &agent.display_name {
             writeln!(output, "  name: {name}")?;
         }
+        if let Some(parent) = agent.parent_agent {
+            writeln!(output, "  parent: {parent:?}")?;
+        }
         writeln!(output, "  workstream: {:?}", agent.workstream)?;
         if !agent.labels.is_empty() {
             writeln!(output, "  labels: {}", agent.labels.join(", "))?;

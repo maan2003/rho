@@ -928,12 +928,29 @@ impl AgentRegistry {
         workstream: &'a Workstream,
     ) -> Vec<(&'a UiAgentSummary, usize)> {
         let state = TopicRailState::new(self, workstream);
+        let visible_through_ancestors = |agent: &&UiAgentSummary| {
+            let mut cursor = agent.agent_id;
+            let mut seen = BTreeSet::new();
+            while seen.insert(cursor) {
+                let Some(current) = state.by_id.get(&cursor) else {
+                    break;
+                };
+                if current.hidden {
+                    return false;
+                }
+                let Some(parent) = current.parent_agent else {
+                    break;
+                };
+                cursor = parent;
+            }
+            true
+        };
         let ordered = self.order_topic_agents_with_state(
             &state,
             workstream
                 .agents
                 .iter()
-                .filter(|agent| !agent.hidden)
+                .filter(visible_through_ancestors)
                 .collect(),
         );
         let visible = ordered

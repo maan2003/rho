@@ -32,12 +32,12 @@ use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
-    AgentDone, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardNewAgent,
-    DashboardReply, DashboardToggleSubagents, GitApprovalAllow, GitApprovalDeny, MinibufferCancel,
-    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose,
-    PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen, RoleCycle, RoleCycleGroup,
-    ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt,
-    TaskBoard,
+    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious,
+    DashboardNewAgent, DashboardReply, DashboardToggleSubagents, GitApprovalAllow, GitApprovalDeny,
+    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
+    PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen,
+    RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
+    ShellPagerQuit, SubmitPrompt, TaskBoard,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -3743,24 +3743,10 @@ impl Render for Workspace {
                 this.jump_to_attention(window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentDone, window, cx| {
-                // Escalating: a first press acknowledges the turn; pressing
-                // again on an already-quiet agent files it away.
-                let selected = this.registry.selected_agent().copied();
-                let quiet = selected.is_some_and(|agent_id| {
-                    this.registry.attention(agent_id) == rho_ui_proto::UiAttention::Quiet
-                });
-                let disposition = if quiet {
-                    rho_ui_proto::AgentDisposition::Hidden
-                } else {
-                    rho_ui_proto::AgentDisposition::Done
-                };
-                this.set_agent_disposition(None, "done", disposition, cx);
-                if quiet {
-                    // From the dashboard this is triage: the row goes away
-                    // but the cursor stays home.
-                    let in_dashboard = this.dashboard.focus_handle(cx).is_focused(window);
-                    this.select_agent_inner(None, !in_dashboard, window, cx);
-                }
+                this.cmd_agent_done(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AgentHide, window, cx| {
+                this.cmd_agent_done(true, window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardReply, window, cx| {
                 this.dashboard_reply(window, cx);

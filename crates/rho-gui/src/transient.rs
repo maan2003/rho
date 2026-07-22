@@ -352,7 +352,7 @@ fn agent_menu() -> Transient {
         .item("d", "done", |workspace, window, cx| {
             workspace.cmd_agent_done(false, window, cx);
         })
-        .item("shift-d", "done+hide", |workspace, window, cx| {
+        .item("shift-d", "hide", |workspace, window, cx| {
             workspace.cmd_agent_done(true, window, cx);
         })
         .item("s", "snooze…", |workspace, window, cx| {

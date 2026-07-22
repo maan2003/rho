@@ -485,15 +485,14 @@ impl Dashboard {
             };
             let snapshot = self.multi_buffer.read(cx).snapshot(cx);
             let parent_snapshot = parent.read(cx).snapshot();
-            let Some(start) = snapshot.anchor_in_excerpt(parent_snapshot.anchor_before(0)) else {
+            // The disclosure belongs in the row's trailing chrome, after the
+            // title, rather than looking like part of its indentation.
+            let Some(position) =
+                snapshot.anchor_in_excerpt(parent_snapshot.anchor_after(parent_snapshot.len()))
+            else {
                 continue;
             };
-            let crease = self.agent_crease(
-                spec.parent_agent,
-                spec.descendant_count,
-                start..start,
-                cx.weak_entity(),
-            );
+            let crease = self.agent_crease(spec.parent_agent, position..position, cx.weak_entity());
             let id = self
                 .editor
                 .update(cx, |editor, cx| editor.insert_creases([crease], cx)[0]);
@@ -504,15 +503,9 @@ impl Dashboard {
     fn agent_crease(
         &self,
         parent_agent: AgentId,
-        descendant_count: usize,
         range: Range<multi_buffer::Anchor>,
         workspace: gpui::WeakEntity<Workspace>,
     ) -> Crease<multi_buffer::Anchor> {
-        let label = if descendant_count == 1 {
-            "1 subagent".to_owned()
-        } else {
-            format!("{descendant_count} subagents")
-        };
         let expanded_folds = self.expanded_folds.clone();
         Crease::inline(
             range,
@@ -529,7 +522,6 @@ impl Dashboard {
                     .ml_1()
                     .flex()
                     .items_center()
-                    .gap_0p5()
                     .child(
                         Icon::new(if expanded {
                             IconName::ChevronDown
@@ -538,7 +530,6 @@ impl Dashboard {
                         })
                         .size(IconSize::XSmall),
                     )
-                    .child(label.clone())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(move |_, _window, cx| {
                         workspace
@@ -1401,19 +1392,28 @@ mod tests {
     }
 
     #[test]
-    fn visible_child_of_hidden_parent_keeps_its_attention() {
+    fn descendant_of_hidden_parent_does_not_become_a_root() {
         let mut parent = agent(1, Status::Normal, 10);
         parent.hidden = true;
         let mut child = agent(2, Status::Normal, 10);
         child.parent_agent = Some(parent.agent_id);
         child.attention = UiAttention::NeedsInput;
-        let topic = topic(Status::Normal, vec![parent, child]);
+        let root = agent(3, Status::Normal, 10);
+        let root_id = root.agent_id;
+        let topic = topic(Status::Normal, vec![parent, child, root]);
         let mut registry = AgentRegistry::default();
         install(&mut registry, &topic);
 
         let lines = generate(&registry);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].lamp, Some(UiAttention::NeedsInput));
+        assert_eq!(lines[0].lamp, None);
+        assert!(matches!(
+            lines[0].target,
+            RowTarget::Stream {
+                root: Some(agent_id),
+                ..
+            } if agent_id == root_id
+        ));
     }
 
     #[test]

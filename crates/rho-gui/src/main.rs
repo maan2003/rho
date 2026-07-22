@@ -52,6 +52,7 @@ actions!(
         AgentNew,
         AgentJumpAttention,
         AgentDone,
+        AgentHide,
         DashboardNewAgent,
         DashboardReply,
         DashboardToggleSubagents,
@@ -537,6 +538,7 @@ fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("r", DashboardReply, Some(context)),
             KeyBinding::new("d", AgentDone, Some(context)),
+            KeyBinding::new("shift-d", AgentHide, Some(context)),
             KeyBinding::new("n", DashboardNewAgent, Some(context)),
             KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
         ]);
