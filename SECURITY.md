@@ -505,10 +505,14 @@ rejected. Interrupt remains role-specific and separately validated.
 
 Spawned Engineers always receive isolated jj workspaces; the model cannot opt
 them into a shared jj checkout. Plain directories cannot be isolated and remain
-shared. Advisors intentionally join their caller's workdirs and keep shell and
-patch tools for read-oriented investigation and scratch experiments. They may
-message other agents and wait for replies, but cannot spawn or interrupt, and
-are instructed not to implement changes.
+shared for ordinary agents. Spawn revsets are resolved and snapshotted from the
+parent's corresponding workspace, not the user's root checkout. Sandboxed
+parents create sandboxed owned workdirs even for repositories outside their
+working set; sharing an outside ordinary checkout or spawning into a plain
+directory is refused. Advisors intentionally join their caller's workdirs and
+keep shell and patch tools for read-oriented investigation and scratch
+experiments. They may message other agents and wait for replies, but cannot
+spawn or interrupt, and are instructed not to implement changes.
 
 ## Skills
 

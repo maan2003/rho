@@ -320,6 +320,7 @@ impl AgentPool {
         } else {
             workdirs
         };
+        let parent_is_sandboxed = parent_workdirs[0].is_sandbox();
         let mut start = Vec::with_capacity(workdirs.len());
         for entry in workdirs {
             let repo = self.repo(&entry.repo).await?;
@@ -327,33 +328,22 @@ impl AgentPool {
                 .iter()
                 .find(|info| info.repo() == repo.root());
             start.push(match entry.checkout {
-                SpawnCheckout::Own { revset }
-                    if matches!(parent_entry, Some(WorkspaceInfo::Sandbox { .. })) =>
-                {
-                    let parent_revset = revset.unwrap_or_else(|| match parent_entry {
-                        Some(WorkspaceInfo::Sandbox { id, .. }) => format!("{}@", id.encoded()),
-                        _ => unreachable!("guard requires sandbox parent"),
-                    });
-                    StartWorkdir::Sandbox {
-                        repo,
-                        parent_revset,
-                    }
-                }
                 SpawnCheckout::Own { revset } if repo.is_jj() => {
                     // The child's change forks off whatever the parent's
                     // checkout currently points at; repos outside the
                     // parent's working set start from trunk.
-                    let parent_revset = revset.unwrap_or_else(|| match parent_entry {
-                        Some(info) => match info.workspace_handle() {
-                            Some(name) => format!("{name}@"),
-                            None => "@".to_owned(),
-                        },
-                        None => "trunk()".to_owned(),
-                    });
-                    StartWorkdir::Create {
-                        repo,
-                        parent_revset,
-                    }
+                    let parent_revset = revset
+                        .unwrap_or_else(|| parent_entry.map_or("trunk()", |_| "@").to_owned());
+                    let source = match parent_entry {
+                        Some(info) => self.open_workspace(info).await?,
+                        None => repo.user_checkout().await?,
+                    };
+                    let workspace = if parent_is_sandboxed {
+                        repo.create_sandbox_from(&source, &parent_revset).await?
+                    } else {
+                        repo.create_workspace_from(&source, &parent_revset).await?
+                    };
+                    StartWorkdir::Existing(workspace)
                 }
                 SpawnCheckout::Own { revset } => {
                     anyhow::ensure!(
@@ -361,13 +351,25 @@ impl AgentPool {
                         "revset is only supported inside a jj repository: {}",
                         repo.root()
                     );
+                    anyhow::ensure!(
+                        !parent_is_sandboxed,
+                        "sandboxed Engineers cannot spawn into plain directories: {}",
+                        repo.root()
+                    );
                     // Plain directories have no workspaces to create.
                     StartWorkdir::Existing(repo.user_checkout().await?)
                 }
-                SpawnCheckout::Shared => match parent_entry {
-                    Some(info) => StartWorkdir::Existing(self.open_workspace(info).await?),
-                    None => StartWorkdir::Existing(repo.user_checkout().await?),
-                },
+                SpawnCheckout::Shared => {
+                    anyhow::ensure!(
+                        !parent_is_sandboxed || parent_entry.is_some_and(WorkspaceInfo::is_sandbox),
+                        "sandboxed Engineers cannot share an ordinary checkout: {}",
+                        repo.root()
+                    );
+                    match parent_entry {
+                        Some(info) => StartWorkdir::Existing(self.open_workspace(info).await?),
+                        None => StartWorkdir::Existing(repo.user_checkout().await?),
+                    }
+                }
             });
         }
         let config = child_role(parent_role, config);

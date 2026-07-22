@@ -160,7 +160,11 @@ wait against `AgentPool`. The MCP server must not reach into `rho-core` or
 provider crates.
 
 Collaboration creation is role-specific while communication is shared.
-`spawn_engineer` always gives jj-backed workdirs isolated child workspaces;
+`spawn_engineer` always gives jj-backed workdirs isolated child workspaces.
+Explicit child revsets resolve in the parent's corresponding workspace context
+(or the user checkout for a repository outside the parent's working set), so
+workspace-relative symbols and snapshot scope follow the spawning agent.
+Sandboxed parents create only sandboxed child workdirs;
 detailed delegation and integration guidance lives in the
 `delegate-engineering` skill rather than every Engineer prompt. Engineers can
 use `ask_advisor` to create an advisory session; PMs cannot. `message_agent` is

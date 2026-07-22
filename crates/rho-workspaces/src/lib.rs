@@ -369,8 +369,26 @@ impl Repo {
         self: &Arc<Self>,
         parent_revset: &str,
     ) -> anyhow::Result<Arc<Workspace>> {
+        self.create_workspace_in(parent_revset, None).await
+    }
+
+    /// Allocates and creates a stable jj-managed workspace, resolving
+    /// `parent_revset` in `source`'s workspace context.
+    pub async fn create_workspace_from(
+        self: &Arc<Self>,
+        source: &Workspace,
+        parent_revset: &str,
+    ) -> anyhow::Result<Arc<Workspace>> {
+        self.create_workspace_in(parent_revset, Some(source)).await
+    }
+
+    async fn create_workspace_in(
+        self: &Arc<Self>,
+        parent_revset: &str,
+        source: Option<&Workspace>,
+    ) -> anyhow::Result<Arc<Workspace>> {
         anyhow::ensure!(self.is_jj, "not a jj repository: {}", self.root);
-        let (managed, lease) = self.create_managed(parent_revset).await?;
+        let (managed, lease) = self.create_managed(parent_revset, source).await?;
         let info = self.workspace_info(managed.id()?);
         let workspace = self
             .cache_workspace(info, managed.root, Some(lease))
@@ -385,12 +403,30 @@ impl Repo {
         self: &Arc<Self>,
         parent_revset: &str,
     ) -> anyhow::Result<Arc<Workspace>> {
+        self.create_sandbox_in(parent_revset, None).await
+    }
+
+    /// Creates a sandbox workspace, resolving `parent_revset` in `source`'s
+    /// workspace context.
+    pub async fn create_sandbox_from(
+        self: &Arc<Self>,
+        source: &Workspace,
+        parent_revset: &str,
+    ) -> anyhow::Result<Arc<Workspace>> {
+        self.create_sandbox_in(parent_revset, Some(source)).await
+    }
+
+    async fn create_sandbox_in(
+        self: &Arc<Self>,
+        parent_revset: &str,
+        source: Option<&Workspace>,
+    ) -> anyhow::Result<Arc<Workspace>> {
         anyhow::ensure!(
             self.is_jj,
             "sandbox source is not a jj repository: {}",
             self.root
         );
-        let (managed, lease) = self.create_managed(parent_revset).await?;
+        let (managed, lease) = self.create_managed(parent_revset, source).await?;
         let id = managed.id()?;
         let info = WorkspaceInfo::Sandbox {
             repo: self.root.clone(),
@@ -501,9 +537,21 @@ impl Repo {
     async fn create_managed(
         &self,
         parent_revset: &str,
+        source: Option<&Workspace>,
     ) -> anyhow::Result<(ManagedWorkspace, WorkspaceLease)> {
+        if let Some(source) = source {
+            anyhow::ensure!(
+                source.repo() == self.root,
+                "revset source {} is not in repository {}",
+                source.repo(),
+                self.root
+            );
+        }
         let _guard = self.jj_lock.lock().await;
-        let mut command = self.jj();
+        let mut command = match source {
+            Some(source) => self.jj_in(source.checkout()),
+            None => self.jj(),
+        };
         command
             .args(["workspace", "managed", "create", "--revision"])
             .arg(parent_revset);
@@ -606,6 +654,17 @@ impl Repo {
             environment.apply(&mut command);
         }
         command.arg("--repository").arg(&self.root);
+        command
+    }
+
+    /// A jj command whose workspace-relative symbols and snapshot scope come
+    /// from the checkout at `workspace`.
+    fn jj_in(&self, workspace: &Utf8Path) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("jj");
+        if let Some(environment) = &self.user_environment {
+            environment.apply(&mut command);
+        }
+        command.current_dir(workspace);
         command
     }
 
@@ -1393,6 +1452,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_workspace_revsets_use_source_workspace_context() {
+        // Managed workspaces deliberately require the repository filesystem
+        // to be bcachefs; this checkout is the test's bcachefs fixture.
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let repo_path = temp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        assert!(
+            std::process::Command::new("jj")
+                .current_dir(&repo_path)
+                .args(["git", "init", "--no-colocate"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo_path.join("source"), "root").unwrap();
+
+        let repo = Arc::new(Repo::open(&repo_path).unwrap());
+        let parent = repo.create_workspace("@").await.unwrap();
+        std::fs::write(parent.checkout().join("source"), "parent").unwrap();
+
+        let child = repo.create_workspace_from(&parent, "@").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(child.checkout().join("source")).unwrap(),
+            "parent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_path.join("source")).unwrap(),
+            "root"
+        );
+
+        let child_of_parent_parent = repo.create_workspace_from(&parent, "@-").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(child_of_parent_parent.checkout().join("source")).unwrap(),
+            "root"
+        );
+    }
+
+    #[tokio::test]
     async fn diff_snapshot_persists_live_text_but_only_sends_parent_text() {
         let temp = tempfile::tempdir().unwrap();
         let repo_path = temp.path().join("repo");
@@ -1543,6 +1640,13 @@ mod tests {
                 .stdout
                 .is_empty()
         );
+        std::fs::write(workspace.checkout().join("tracked"), "sandbox parent").unwrap();
+        let child = repo.create_sandbox_from(&workspace, "@").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(child.checkout().join("tracked")).unwrap(),
+            "sandbox parent"
+        );
+        std::fs::remove_dir_all(child.sandbox_base().unwrap()).unwrap();
         std::fs::remove_dir_all(workspace.sandbox_base().unwrap()).unwrap();
     }
 
