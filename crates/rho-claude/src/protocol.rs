@@ -43,8 +43,17 @@ impl Model {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Session {
-    New { session_id: Uuid },
-    Resume { session_id: Uuid },
+    New {
+        session_id: Uuid,
+    },
+    Resume {
+        session_id: Uuid,
+    },
+    Fork {
+        session_id: Uuid,
+        source_session_id: Uuid,
+        resume_at: Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -141,6 +150,7 @@ pub struct ControlResponse {
     pub request_id: String,
     pub subtype: String,
     pub error: Option<String>,
+    pub response: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -221,6 +231,12 @@ pub enum ResultSubtype {
     rename_all_fields = "camelCase"
 )]
 pub enum SystemMessage {
+    Init {
+        #[serde(alias = "session_id")]
+        session_id: Option<Uuid>,
+        uuid: Option<String>,
+        capabilities: Option<Vec<String>>,
+    },
     ApiError {
         #[serde(alias = "session_id")]
         session_id: Option<Uuid>,
@@ -258,6 +274,12 @@ pub enum SystemMessage {
         uuid: Option<String>,
         content: Option<String>,
         level: Option<String>,
+    },
+    SessionStateChanged {
+        #[serde(alias = "session_id")]
+        session_id: Option<Uuid>,
+        uuid: Option<String>,
+        state: Option<String>,
     },
     TurnDuration {
         #[serde(alias = "session_id")]

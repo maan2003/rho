@@ -86,6 +86,17 @@ impl ClaudeCodeOptions {
                 args.push("--resume".to_owned());
                 args.push(session_id.to_string());
             }
+            Session::Fork {
+                session_id,
+                source_session_id,
+                resume_at,
+            } => {
+                args.push("--resume".to_owned());
+                args.push(source_session_id.to_string());
+                args.push("--fork-session".to_owned());
+                args.push(format!("--resume-session-at={resume_at}"));
+                args.push(format!("--session-id={session_id}"));
+            }
         }
         args
     }
@@ -165,16 +176,34 @@ impl ClaudeCode {
     }
 
     pub async fn apply_effort(&mut self, effort: Effort) -> Result<String> {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        self.write_json(&serde_json::json!({
-            "type": "control_request",
-            "request_id": request_id,
-            "request": {
+        self.write_control_request(serde_json::json!({
                 "subtype": "apply_flag_settings",
                 "settings": {
                     "effortLevel": effort.as_arg(),
                 },
-            },
+        }))
+        .await
+    }
+
+    pub async fn interrupt(&mut self) -> Result<String> {
+        self.write_control_request(serde_json::json!({"subtype": "interrupt"}))
+            .await
+    }
+
+    pub async fn cancel_async_message(&mut self, message_uuid: &str) -> Result<String> {
+        self.write_control_request(serde_json::json!({
+            "subtype": "cancel_async_message",
+            "message_uuid": message_uuid,
+        }))
+        .await
+    }
+
+    async fn write_control_request(&mut self, request: serde_json::Value) -> Result<String> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.write_json(&serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": request,
         }))
         .await?;
         Ok(request_id)
@@ -272,6 +301,36 @@ mod tests {
                 "--session-id",
                 "00000000-0000-4000-8000-000000000000",
             ]
+        );
+    }
+
+    #[test]
+    fn builds_fork_at_message_args() {
+        let mut options = ClaudeCodeOptions::new(
+            "/tmp/project",
+            Model::Sonnet,
+            Effort::Medium,
+            uuid::uuid!("00000000-0000-4000-8000-000000000002"),
+        );
+        options.session = Session::Fork {
+            session_id: uuid::uuid!("00000000-0000-4000-8000-000000000002"),
+            source_session_id: uuid::uuid!("00000000-0000-4000-8000-000000000001"),
+            resume_at: uuid::uuid!("00000000-0000-4000-8000-000000000003"),
+        };
+
+        let args = options.args();
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--resume", "00000000-0000-4000-8000-000000000001"])
+        );
+        assert!(args.iter().any(|arg| arg == "--fork-session"));
+        assert!(
+            args.iter()
+                .any(|arg| { arg == "--resume-session-at=00000000-0000-4000-8000-000000000003" })
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--session-id=00000000-0000-4000-8000-000000000002")
         );
     }
 
@@ -408,6 +467,27 @@ mod tests {
         assert_eq!(message.response.request_id, "request-1");
         assert_eq!(message.response.subtype, "success");
         assert_eq!(message.response.error, None);
+        assert_eq!(message.response.response, None);
+    }
+
+    #[test]
+    fn parses_interrupt_receipt() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "control_response",
+            "response": {
+                "request_id": "request-1",
+                "subtype": "success",
+                "response": {"still_queued": ["prompt-2"]}
+            }
+        }))
+        .unwrap();
+        let protocol::ClaudeEvent::ControlResponse(message) = event else {
+            panic!("expected control response event");
+        };
+        assert_eq!(
+            message.response.response.unwrap()["still_queued"][0],
+            "prompt-2"
+        );
     }
 
     #[test]
@@ -526,6 +606,36 @@ mod tests {
 
     #[test]
     fn parses_observed_system_subtypes() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "00000000-0000-4000-8000-000000000001",
+            "capabilities": ["interrupt_receipt_v1"]
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            protocol::ClaudeEvent::System(protocol::SystemMessage::Init {
+                session_id: Some(_),
+                ..
+            })
+        ));
+
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "system",
+            "subtype": "session_state_changed",
+            "state": "idle",
+            "session_id": "00000000-0000-4000-8000-000000000001"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            protocol::ClaudeEvent::System(protocol::SystemMessage::SessionStateChanged {
+                state: Some(state),
+                ..
+            }) if state == "idle"
+        ));
+
         let event: protocol::ClaudeEvent = serde_json::from_value(json!({
             "type": "system",
             "subtype": "turn_duration",

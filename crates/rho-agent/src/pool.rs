@@ -743,7 +743,7 @@ impl RunningAgent {
     pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
         match self {
             Self::Rho(agent) => agent.rewind(turns).await,
-            Self::Claude(_) => anyhow::bail!("rewind is only available for Rho agents"),
+            Self::Claude(agent) => agent.rewind(turns).await,
         }
     }
 

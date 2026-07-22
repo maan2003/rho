@@ -159,6 +159,16 @@ daemon, and the daemon executes parent-scoped spawn, agent mail, interrupt, and
 wait against `AgentPool`. The MCP server must not reach into `rho-core` or
 provider crates.
 
+Claude turn cancellation uses Claude Code's streaming control protocol and
+keeps a healthy child process alive; queued Rho-authored messages are cancelled
+by UUID, with a bounded fallback that fully terminates the child before another
+process may resume the session. Message-only rewind never restores workspace
+files. It records a pending fork from the selected assistant UUID, projects the
+truncated transcript immediately, and keeps the old session authoritative in
+the database until Claude has durably materialized the fork. A crash-safe
+pending descriptor reconstructs that view on load and rotates away from any
+partial destination transcript before retrying.
+
 Collaboration creation is role-specific while communication is shared.
 `spawn_engineer` always gives jj-backed workdirs isolated child workspaces.
 Explicit child revsets resolve in the parent's corresponding workspace context

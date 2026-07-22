@@ -479,8 +479,11 @@ generated temporary file that is file-bind-mounted over `~/.claude/CLAUDE.md`
 inside the Claude process's private workspace mount namespace. If the bind
 target does not exist, Rho creates an empty `~/.claude/CLAUDE.md` file first.
 Rho does not write the generated prompt into the origin checkout or workspace
-checkout, and it removes the generated source file when the Claude process exits or
-is cancelled. Loaded `AGENTS.md` content therefore has the same
+checkout, and it removes the generated source file when the Claude process exits.
+A successful soft turn cancellation keeps the process and its private prompt
+mount alive for later turns; a failed cancellation terminates the process and
+removes the file. Loaded
+`AGENTS.md` content therefore has the same
 external-provider exposure as other agent prompt text.
 
 Registered project paths and descriptions are included in PM prompts and are

@@ -221,6 +221,11 @@ pub struct AgentRecord {
     pub role: AgentRole,
     pub(crate) binding: SessionBinding,
     pub runtime: AgentRuntime,
+    /// A message-only Claude rewind whose destination transcript has not yet
+    /// been durably materialized and verified. The old runtime remains
+    /// authoritative until then.
+    #[senax(default)]
+    pub claude_rewind: Option<ClaudeRewind>,
     /// When the user last sent this agent a message; rail recency seed.
     /// Turn ends raise attention but leave this alone — replying is the
     /// engagement signal, finishing is the agent's schedule.
@@ -261,6 +266,13 @@ impl AgentRecord {
 pub enum AgentRuntime {
     Rho { prompt_cache_key: PromptCacheKey },
     Claude { session_id: Uuid },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct ClaudeRewind {
+    pub source_session_id: Uuid,
+    pub session_id: Uuid,
+    pub resume_at: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
@@ -652,6 +664,8 @@ pub trait AgentWriteTxnExt {
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
     fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole);
     fn set_agent_prompt_cache_key(&mut self, agent_id: AgentId, key: PromptCacheKey);
+    fn set_agent_claude_rewind(&mut self, agent_id: AgentId, rewind: Option<ClaudeRewind>);
+    fn complete_agent_claude_rewind(&mut self, agent_id: AgentId, session_id: Uuid);
 
     fn alloc_agent_id(&mut self) -> AgentId;
 
@@ -741,6 +755,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             role: mode.agent_role(),
             binding: mode,
             runtime,
+            claude_rewind: None,
             last_user_message: now,
             last_user_message_text: String::new(),
             workstream,
@@ -987,6 +1002,29 @@ impl AgentWriteTxnExt for WriteTxn {
         agent.runtime = AgentRuntime::Rho {
             prompt_cache_key: key,
         };
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
+    fn set_agent_claude_rewind(&mut self, agent_id: AgentId, rewind: Option<ClaudeRewind>) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent missing")
+            .value()
+            .into_owned();
+        agent.claude_rewind = rewind;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
+    fn complete_agent_claude_rewind(&mut self, agent_id: AgentId, session_id: Uuid) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent missing")
+            .value()
+            .into_owned();
+        agent.runtime = AgentRuntime::Claude { session_id };
+        agent.claude_rewind = None;
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 

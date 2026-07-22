@@ -143,6 +143,47 @@ fn test_agent_runtime() -> AgentRuntime {
 }
 
 #[tokio::test]
+async fn claude_rewind_descriptor_round_trips_and_completes() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let source_session_id = uuid::uuid!("00000000-0000-4000-8000-000000000001");
+    let session_id = uuid::uuid!("00000000-0000-4000-8000-000000000002");
+    let resume_at = uuid::uuid!("00000000-0000-4000-8000-000000000003");
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let workstream = write.create_workstream(UnixMs(1), "team".to_owned());
+    let agent_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        agent_id,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        AgentRuntime::Claude {
+            session_id: source_session_id,
+        },
+        None,
+    );
+    let rewind = ClaudeRewind {
+        source_session_id,
+        session_id,
+        resume_at: Some(resume_at),
+    };
+    write.set_agent_claude_rewind(agent_id, Some(rewind.clone()));
+    write.commit();
+
+    assert_eq!(db.read().get_agent(agent_id).claude_rewind, Some(rewind));
+
+    let mut write = db.write().await;
+    write.complete_agent_claude_rewind(agent_id, session_id);
+    write.commit();
+    let record = db.read().get_agent(agent_id);
+    assert_eq!(record.runtime, AgentRuntime::Claude { session_id });
+    assert_eq!(record.claude_rewind, None);
+}
+
+#[tokio::test]
 async fn workstream_names_are_uniquified_by_suffix() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));

@@ -391,6 +391,68 @@ pub fn last_assistant_usage(messages: &[SessionMessage]) -> Option<crate::protoc
         .find_map(|message| serde_json::from_value(message.message.get("usage")?.clone()).ok())
 }
 
+/// Returns the visible transcript prefix before the selected user turn and
+/// the assistant UUID Claude should resume from. `None` as the UUID means the
+/// first user turn was selected and the replacement session should be fresh.
+pub fn rewind_session_messages(
+    messages: &[SessionMessage],
+    turns: u32,
+) -> Option<(Vec<SessionMessage>, Option<Uuid>)> {
+    if turns == 0 {
+        return None;
+    }
+    let user_positions = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| is_user_prompt(message).then_some(index))
+        .collect::<Vec<_>>();
+    if user_positions.is_empty() {
+        return None;
+    }
+    let selected = user_positions[user_positions.len().saturating_sub(turns as usize)];
+    let resume = messages[..selected]
+        .iter()
+        .rposition(|message| message.kind == SessionMessageKind::Assistant);
+    match resume {
+        Some(index) => Some((messages[..=index].to_vec(), Some(messages[index].uuid))),
+        None => Some((Vec::new(), None)),
+    }
+}
+
+pub fn session_messages_through_assistant(
+    messages: &[SessionMessage],
+    assistant_uuid: Uuid,
+) -> Option<Vec<SessionMessage>> {
+    let index = messages.iter().position(|message| {
+        message.kind == SessionMessageKind::Assistant && message.uuid == assistant_uuid
+    })?;
+    Some(messages[..=index].to_vec())
+}
+
+fn is_user_prompt(message: &SessionMessage) -> bool {
+    if message.kind != SessionMessageKind::User {
+        return false;
+    }
+    match message.message.get("content") {
+        Some(Value::String(text)) => !is_auxiliary_user_text(text),
+        Some(Value::Array(content)) => content.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("text")
+                && part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !is_auxiliary_user_text(text))
+        }),
+        _ => false,
+    }
+}
+
+fn is_auxiliary_user_text(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("<command-name>")
+        || text.starts_with("<local-command-stdout>")
+        || text.starts_with("<task-notification>")
+}
+
 fn latest_context_used(entries: &[TranscriptEntry]) -> Option<u64> {
     entries
         .iter()
@@ -503,6 +565,65 @@ mod tests {
 
         let usage = last_assistant_usage(&messages).expect("usage present");
         assert_eq!(usage.context_total(), 60_303);
+    }
+
+    #[test]
+    fn rewinds_user_turns_without_counting_tool_results() {
+        let user_one = uuid::uuid!("00000000-0000-4000-8000-00000000000a");
+        let assistant_one = uuid::uuid!("00000000-0000-4000-8000-00000000000b");
+        let tool_result = uuid::uuid!("00000000-0000-4000-8000-00000000000c");
+        let assistant_two = uuid::uuid!("00000000-0000-4000-8000-00000000000d");
+        let user_two = uuid::uuid!("00000000-0000-4000-8000-00000000000e");
+        let command = uuid::uuid!("00000000-0000-4000-8000-00000000000f");
+        let notification = uuid::uuid!("00000000-0000-4000-8000-000000000010");
+
+        let mut first = entry(TranscriptEntryKind::User, user_one, None);
+        first.message = json!({"role": "user", "content": [{"type": "text", "text": "one"}]});
+        let mut response = entry(
+            TranscriptEntryKind::Assistant,
+            assistant_one,
+            Some(user_one),
+        );
+        response.message = json!({"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]});
+        let mut result = entry(TranscriptEntryKind::User, tool_result, Some(assistant_one));
+        result.message = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]});
+        let mut final_response = entry(
+            TranscriptEntryKind::Assistant,
+            assistant_two,
+            Some(tool_result),
+        );
+        final_response.message =
+            json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]});
+        let mut command_entry = entry(TranscriptEntryKind::User, command, Some(assistant_two));
+        command_entry.message =
+            json!({"role": "user", "content": "<command-name>/compact</command-name>"});
+        let mut notification_entry = entry(TranscriptEntryKind::User, notification, Some(command));
+        notification_entry.message = json!({"role": "user", "content": "<task-notification><status>completed</status></task-notification>"});
+        let mut second = entry(TranscriptEntryKind::User, user_two, Some(notification));
+        second.message = json!({"role": "user", "content": [{"type": "text", "text": "two"}]});
+        let messages = session_messages(
+            vec![
+                first,
+                response,
+                result,
+                final_response,
+                command_entry,
+                notification_entry,
+                second,
+            ],
+            SessionMessagesOptions::default(),
+        );
+
+        let (one_turn, resume_at) = rewind_session_messages(&messages, 1).unwrap();
+        assert_eq!(resume_at, Some(assistant_two));
+        assert_eq!(
+            one_turn.last().map(|message| message.uuid),
+            Some(assistant_two)
+        );
+
+        let (all_turns, resume_at) = rewind_session_messages(&messages, 2).unwrap();
+        assert!(all_turns.is_empty());
+        assert_eq!(resume_at, None);
     }
 
     #[test]
