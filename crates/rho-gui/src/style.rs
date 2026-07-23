@@ -99,7 +99,7 @@ impl StyleClass {
             Self::StatusError => (colors.terminal_ansi_red.into(), false),
             Self::StatusCancelled => (colors.terminal_ansi_yellow.into(), false),
             Self::Time => (colors.text_muted.into(), false),
-            Self::AgentMessage => (colors.text.into(), false),
+            Self::AgentMessage => (agent_message_color(cx), false),
             Self::AgentLabel => (agent_message_color(cx), false),
             Self::ShellPrompt => (colors.terminal_ansi_green.into(), false),
             Self::ShellCommand => (colors.text_accent.into(), false),
