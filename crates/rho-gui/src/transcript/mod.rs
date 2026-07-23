@@ -88,6 +88,12 @@ struct BlockRecord {
     styles: Vec<(StyleClass, Range<Anchor>)>,
 }
 
+type PlacedSpans = (
+    Vec<Range<Anchor>>,
+    Option<InlayRecord>,
+    Option<(StyleClass, Range<Anchor>)>,
+);
+
 struct UserMessageGutter;
 struct AgentMessageGutter;
 
@@ -692,11 +698,7 @@ fn append_spans(
     buffer: &mut Buffer,
     cx: &mut Context<Buffer>,
     rendered: &RenderedBlock,
-) -> (
-    Vec<Range<Anchor>>,
-    Option<InlayRecord>,
-    Option<(StyleClass, Range<Anchor>)>,
-) {
+) -> PlacedSpans {
     let start = buffer.len();
     let text = rendered
         .spans
@@ -714,11 +716,7 @@ fn spans_for_rendered(
     buffer: &Buffer,
     start: usize,
     rendered: &RenderedBlock,
-) -> (
-    Vec<Range<Anchor>>,
-    Option<InlayRecord>,
-    Option<(StyleClass, Range<Anchor>)>,
-) {
+) -> PlacedSpans {
     let mut ranges = Vec::with_capacity(rendered.spans.len());
     let mut inlay = None;
     let mut gutter = None;
