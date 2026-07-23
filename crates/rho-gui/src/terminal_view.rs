@@ -529,23 +529,82 @@ pub(crate) fn terminal_indexed_color(index: u8, colors: &theme::ThemeColors) -> 
         13 => colors.terminal_ansi_bright_magenta,
         14 => colors.terminal_ansi_bright_cyan,
         15 => colors.terminal_ansi_bright_white,
-        // xterm 6×6×6 color cube.
+        // Preserve xterm's 6×6×6 coordinates, but derive the cube from the
+        // theme's bright ANSI corners instead of bypassing the theme with
+        // fixed sRGB values.
         16..=231 => {
             let index = index - 16;
-            let component = |value: u8| if value == 0 { 0 } else { value * 40 + 55 };
-            return terminal_rgb_color(
-                component(index / 36),
-                component(index / 6 % 6),
-                component(index % 6),
-            );
+            let corners = [
+                colors.terminal_ansi_black,
+                colors.terminal_ansi_bright_red,
+                colors.terminal_ansi_bright_green,
+                colors.terminal_ansi_bright_yellow,
+                colors.terminal_ansi_bright_blue,
+                colors.terminal_ansi_bright_magenta,
+                colors.terminal_ansi_bright_cyan,
+                colors.terminal_ansi_bright_white,
+            ]
+            .map(color_to_rgba);
+            return cube_color(corners, index / 36, index / 6 % 6, index % 6).into();
         }
-        // Grayscale ramp.
+        // Keep grayscale theme-relative too, with bright black as its middle
+        // anchor rather than a fixed xterm gray.
         232..=255 => {
-            let level = (index - 232) * 10 + 8;
-            return terminal_rgb_color(level, level, level);
+            let t = f32::from(index - 232) / 23.0;
+            let black = color_to_rgba(colors.terminal_ansi_black);
+            let gray = color_to_rgba(colors.terminal_ansi_bright_black);
+            let white = color_to_rgba(colors.terminal_ansi_bright_white);
+            return grayscale_color(black, gray, white, t).into();
         }
     };
     named.into()
+}
+
+fn color_to_rgba(color: gpui::Color) -> gpui::Rgba {
+    let color: Hsla = color.into();
+    color.into()
+}
+
+fn cube_color(corners: [gpui::Rgba; 8], red: u8, green: u8, blue: u8) -> gpui::Rgba {
+    let component = |value: u8| {
+        if value == 0 {
+            0.0
+        } else {
+            f32::from(value * 40 + 55) / 255.0
+        }
+    };
+    let red = component(red);
+    let green = component(green);
+    let blue = component(blue);
+    let black_red = mix_rgba(corners[0], corners[1], red);
+    let green_yellow = mix_rgba(corners[2], corners[3], red);
+    let blue_magenta = mix_rgba(corners[4], corners[5], red);
+    let cyan_white = mix_rgba(corners[6], corners[7], red);
+    let dark = mix_rgba(black_red, green_yellow, green);
+    let light = mix_rgba(blue_magenta, cyan_white, green);
+    mix_rgba(dark, light, blue)
+}
+
+fn mix_rgba(from: gpui::Rgba, to: gpui::Rgba, amount: f32) -> gpui::Rgba {
+    gpui::Rgba {
+        r: from.r + (to.r - from.r) * amount,
+        g: from.g + (to.g - from.g) * amount,
+        b: from.b + (to.b - from.b) * amount,
+        a: from.a + (to.a - from.a) * amount,
+    }
+}
+
+fn grayscale_color(
+    black: gpui::Rgba,
+    gray: gpui::Rgba,
+    white: gpui::Rgba,
+    amount: f32,
+) -> gpui::Rgba {
+    if amount <= 0.5 {
+        mix_rgba(black, gray, amount * 2.0)
+    } else {
+        mix_rgba(gray, white, (amount - 0.5) * 2.0)
+    }
 }
 
 pub(crate) fn terminal_rgb_color(r: u8, g: u8, b: u8) -> Hsla {
@@ -693,4 +752,56 @@ fn probably_produces_bytes(ks: &TermKeystroke) -> bool {
             | "pagedown"
     ) || (ks.key.len() >= 2 && ks.key.starts_with('f') && ks.key[1..].parse::<u8>().is_ok())
         || ((ks.ctrl || ks.alt) && ks.key.is_ascii() && ks.key.len() == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgba(red: f32, green: f32, blue: f32) -> gpui::Rgba {
+        gpui::Rgba {
+            r: red,
+            g: green,
+            b: blue,
+            a: 1.0,
+        }
+    }
+
+    fn assert_rgba_eq(actual: gpui::Rgba, expected: gpui::Rgba) {
+        assert!((actual.r - expected.r).abs() < f32::EPSILON);
+        assert!((actual.g - expected.g).abs() < f32::EPSILON);
+        assert!((actual.b - expected.b).abs() < f32::EPSILON);
+        assert!((actual.a - expected.a).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn extended_cube_uses_themed_color_corners() {
+        let corners = [
+            rgba(0.0, 0.0, 0.0),
+            rgba(1.0, 0.0, 0.0),
+            rgba(0.0, 1.0, 0.0),
+            rgba(1.0, 1.0, 0.0),
+            rgba(0.0, 0.0, 1.0),
+            rgba(1.0, 0.0, 1.0),
+            rgba(0.0, 1.0, 1.0),
+            rgba(1.0, 1.0, 1.0),
+        ];
+        assert_rgba_eq(cube_color(corners, 0, 0, 0), corners[0]);
+        assert_rgba_eq(cube_color(corners, 5, 0, 0), corners[1]);
+        assert_rgba_eq(cube_color(corners, 0, 5, 0), corners[2]);
+        assert_rgba_eq(cube_color(corners, 5, 5, 5), corners[7]);
+
+        let level = 95.0 / 255.0;
+        assert_rgba_eq(cube_color(corners, 1, 0, 0), rgba(level, 0.0, 0.0));
+    }
+
+    #[test]
+    fn extended_grayscale_passes_through_theme_anchors() {
+        let black = rgba(0.1, 0.2, 0.3);
+        let gray = rgba(0.4, 0.5, 0.6);
+        let white = rgba(0.7, 0.8, 0.9);
+        assert_rgba_eq(grayscale_color(black, gray, white, 0.0), black);
+        assert_rgba_eq(grayscale_color(black, gray, white, 0.5), gray);
+        assert_rgba_eq(grayscale_color(black, gray, white, 1.0), white);
+    }
 }
