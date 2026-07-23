@@ -344,6 +344,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     );
     agents.resume_platform_integrations();
     spawn_chatgpt_quota_poller(quota_auth_name, agents.db.clone(), agents.events.clone());
+    spawn_claude_quota_poller(agents.db.clone(), agents.events.clone());
 
     if let Some((secret, iroh_auth)) = iroh {
         let mut transport = iroh::endpoint::QuicTransportConfig::builder()
@@ -2140,6 +2141,32 @@ fn spawn_chatgpt_quota_poller(
                 let changed = write.record_quota_observation(QuotaObservationRecord {
                     provider: QuotaProvider::ChatGpt,
                     model: QuotaModel::GPT,
+                    observed_at: rho_core::UnixMs::now(),
+                    used_percent: usage.used_percent.clamp(0.0, 100.0).round() as u8,
+                    reset_at_unix: Some(usage.reset_at_unix),
+                });
+                write.commit();
+                if changed {
+                    let _ = events.send(ServerMessage::QuotaUsage {
+                        summaries: quota_summaries(&db),
+                    });
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10 * 60)).await;
+        }
+    });
+}
+
+fn spawn_claude_quota_poller(db: RhoDb, events: broadcast::Sender<ServerMessage>) {
+    tokio::spawn(async move {
+        loop {
+            if let Ok(Ok(Some(usage))) =
+                tokio::task::spawn_blocking(rho_claude::claude_fable_weekly_usage).await
+            {
+                let mut write = db.write().await;
+                let changed = write.record_quota_observation(QuotaObservationRecord {
+                    provider: QuotaProvider::Claude,
+                    model: QuotaModel::FABLE,
                     observed_at: rho_core::UnixMs::now(),
                     used_percent: usage.used_percent.clamp(0.0, 100.0).round() as u8,
                     reset_at_unix: Some(usage.reset_at_unix),
