@@ -7,7 +7,7 @@ use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
 pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
-use rho_workspaces::{WorkspaceId, WorkspaceInfo};
+use rho_workspaces::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 
@@ -49,61 +49,7 @@ pub struct MigrationRecoveryPoint {
     pub created_at: UnixMillis,
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "8e72c1a4",
-    to: CURRENT_AGENT_DB_FORMAT,
-    migrate: migrate_fast_rustc_workspaces,
-}];
-
-const FAST_RUSTC_REPO: &str = "/home/maan2003/src/rust-analyzer";
-const FAST_RUSTC_WORKSPACE_REPLACEMENTS: &[(&str, &str)] = &[
-    ("p619e3rb4dwq", "k2cqgpljw02d"),
-    ("d0dn3rw17tdv", "szzu0k07bnm2"),
-    ("koooj5n1l7bn", "iiww3g7k8sz3"),
-    ("sig7qxr40ofu", "qhebgd5vo11d"),
-    ("41joc9ye0gmp", "m0ylcrgylsh6"),
-    ("cc4hzr7u33mm", "nmwyfkoq7vse"),
-    ("j6r1ij9tu9c6", "3f7woj7aos61"),
-];
-
-fn migrate_fast_rustc_workspaces(write: &mut WriteTxn) {
-    let replacements = FAST_RUSTC_WORKSPACE_REPLACEMENTS
-        .iter()
-        .map(|&(old, new)| {
-            (
-                WorkspaceId::from_encoded(old).expect("valid old workspace id"),
-                WorkspaceId::from_encoded(new).expect("valid replacement workspace id"),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut agents = write.open_table(AGENTS);
-    let records = agents
-        .iter()
-        .map(|(id, record)| (id.value(), record.value().into_owned()))
-        .collect::<Vec<_>>();
-
-    for (agent_id, mut record) in records {
-        let mut changed = false;
-        for workdir in &mut record.workdirs {
-            let (repo, id) = match workdir {
-                WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id } => {
-                    (repo, id)
-                }
-                WorkspaceInfo::UserCheckout { .. } => continue,
-            };
-            if repo.as_str() != FAST_RUSTC_REPO {
-                continue;
-            }
-            if let Some((_, replacement)) = replacements.iter().find(|(old, _)| old == id) {
-                *id = *replacement;
-                changed = true;
-            }
-        }
-        if changed {
-            agents.insert(&agent_id, SenValue::borrowed(&record));
-        }
-    }
-}
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
