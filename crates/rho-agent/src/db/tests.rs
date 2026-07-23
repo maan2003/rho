@@ -14,7 +14,7 @@ async fn quota_history_deduplicates_unchanged_samples() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let sample = QuotaObservationRecord {
         provider: QuotaProvider::ChatGpt,
-        model: "gpt".to_owned(),
+        model: QuotaModel::GPT,
         observed_at: UnixMs(1),
         used_percent: 20,
         reset_at_unix: Some(100),
@@ -29,14 +29,40 @@ async fn quota_history_deduplicates_unchanged_samples() {
     assert!(write.record_quota_observation(QuotaObservationRecord {
         observed_at: UnixMs(3),
         used_percent: 21,
+        ..sample.clone()
+    }));
+    assert!(write.record_quota_observation(QuotaObservationRecord {
+        observed_at: UnixMs(4),
+        used_percent: 22,
+        ..sample.clone()
+    }));
+    assert!(write.record_quota_observation(QuotaObservationRecord {
+        model: QuotaModel::FABLE,
+        observed_at: UnixMs(3),
+        used_percent: 40,
         ..sample
     }));
     write.commit();
 
-    let history = db.read().quota_observations();
-    assert_eq!(history.len(), 2);
+    let history = db
+        .read()
+        .quota_observations(QuotaModel::GPT, UnixMs(0));
+    assert_eq!(history.len(), 3);
     assert_eq!(history[0].used_percent, 20);
-    assert_eq!(history[1].used_percent, 21);
+    assert_eq!(history[2].used_percent, 22);
+
+    // A bounded reverse read returns only the horizon and one baseline,
+    // without crossing into another model's key range.
+    let recent = db
+        .read()
+        .quota_observations(QuotaModel::GPT, UnixMs(4));
+    assert_eq!(
+        recent
+            .iter()
+            .map(|sample| sample.observed_at)
+            .collect::<Vec<_>>(),
+        vec![UnixMs(3), UnixMs(4)]
+    );
 }
 
 #[test]

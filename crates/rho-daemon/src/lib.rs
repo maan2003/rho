@@ -10,7 +10,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use rho_agent::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _,
-    QuotaObservationRecord, QuotaProvider, WorkstreamId,
+    QuotaModel, QuotaObservationRecord, QuotaProvider, WorkstreamId,
 };
 use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
@@ -2034,6 +2034,11 @@ fn spawn_attention_watcher(
             if state.quota_observation != last_quota {
                 last_quota = state.quota_observation.clone();
                 if let Some(observation) = &state.quota_observation {
+                    let model = match observation.model.as_str() {
+                        "gpt" => QuotaModel::GPT,
+                        "fable" => QuotaModel::FABLE,
+                        _ => continue,
+                    };
                     let provider = match observation.provider {
                         rho_agent::QuotaProvider::ChatGpt => QuotaProvider::ChatGpt,
                         rho_agent::QuotaProvider::Claude => QuotaProvider::Claude,
@@ -2041,7 +2046,7 @@ fn spawn_attention_watcher(
                     let mut write = db.write().await;
                     let changed = write.record_quota_observation(QuotaObservationRecord {
                         provider,
-                        model: observation.model.clone(),
+                        model,
                         observed_at: observation.observed_at,
                         used_percent: observation.used_percent,
                         reset_at_unix: observation.reset_at_unix,
@@ -2086,18 +2091,17 @@ fn spawn_attention_watcher(
 }
 
 fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
-    let observations = db.read().quota_observations();
     let now = rho_core::UnixMs::now().0;
-    ["gpt", "fable"]
+    let since = rho_core::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
+    let read = db.read();
+    [QuotaModel::GPT, QuotaModel::FABLE]
         .into_iter()
         .filter_map(|model| {
-            let samples = observations
-                .iter()
-                .filter(|sample| sample.model == model)
-                .collect::<Vec<_>>();
+            let observations = read.quota_observations(model, since);
+            let samples = observations.iter().collect::<Vec<_>>();
             let latest = samples.last()?;
             Some(QuotaSummary {
-                model: model.to_owned(),
+                model: model.name().to_owned(),
                 remaining_percent: 100u8.saturating_sub(latest.used_percent),
                 burn_10m: quota_burn(&samples, now, 10 * 60 * 1_000),
                 burn_2h: quota_burn(&samples, now, 2 * 60 * 60 * 1_000),
@@ -2135,7 +2139,7 @@ fn spawn_chatgpt_quota_poller(
                 let mut write = db.write().await;
                 let changed = write.record_quota_observation(QuotaObservationRecord {
                     provider: QuotaProvider::ChatGpt,
-                    model: "gpt".to_owned(),
+                    model: QuotaModel::GPT,
                     observed_at: rho_core::UnixMs::now(),
                     used_percent: usage.used_percent.clamp(0.0, 100.0).round() as u8,
                     reset_at_unix: Some(usage.reset_at_unix),
@@ -3377,7 +3381,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::Arc;
 
-    use rho_agent::db::{QuotaObservationRecord, QuotaProvider};
+    use rho_agent::db::{QuotaModel, QuotaObservationRecord, QuotaProvider};
     use rho_agent::{AgentState, AgentStateKind, InputQueues};
     use rho_core::{
         ContentPart, ContextBlock, InferenceResponseItem, MessagePhase, UnknownProviderSpecificData,
@@ -3394,7 +3398,7 @@ mod tests {
     fn quota_burn_skips_resets_and_sums_across_epochs() {
         let sample = |at, used_percent, reset_at_unix| QuotaObservationRecord {
             provider: QuotaProvider::ChatGpt,
-            model: "gpt".to_owned(),
+            model: QuotaModel::GPT,
             observed_at: rho_core::UnixMs(at),
             used_percent,
             reset_at_unix,

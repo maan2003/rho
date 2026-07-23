@@ -30,8 +30,8 @@ const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::n
 /// Opaque client-owned view configuration (see
 /// [`AgentReadTxnExt::view_config`]).
 const VIEW_CONFIG: TableDefinition<(), Vec<u8>> = TableDefinition::new("view_config");
-const QUOTA_OBSERVATIONS: TableDefinition<u64, Sen<QuotaObservationRecord>> =
-    TableDefinition::new("quota_observations");
+const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
+    TableDefinition::new("quota_observations_by_model_time");
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
@@ -62,7 +62,30 @@ impl CounterKey {
     /// Formerly the topic and then tag id counter; workstreams continue
     /// its sequence.
     pub const LAST_WORKSTREAM_ID: Self = Self(3);
-    pub const LAST_QUOTA_OBSERVATION: Self = Self(4);
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue, Encode, Decode,
+)]
+pub struct QuotaModel(u8);
+
+impl QuotaModel {
+    pub const GPT: Self = Self(1);
+    pub const FABLE: Self = Self(2);
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::GPT => "gpt",
+            Self::FABLE => "fable",
+            _ => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
+struct QuotaObservationKey {
+    model: QuotaModel,
+    observed_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -74,7 +97,7 @@ pub enum QuotaProvider {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct QuotaObservationRecord {
     pub provider: QuotaProvider,
-    pub model: String,
+    pub model: QuotaModel,
     pub observed_at: UnixMillis,
     pub used_percent: u8,
     pub reset_at_unix: Option<i64>,
@@ -644,7 +667,12 @@ pub trait AgentReadTxnExt {
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
-    fn quota_observations(&self) -> Vec<QuotaObservationRecord>;
+    /// Samples for one model, bounded to the horizon plus its preceding baseline.
+    fn quota_observations(
+        &self,
+        model: QuotaModel,
+        since: UnixMillis,
+    ) -> Vec<QuotaObservationRecord>;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -900,11 +928,34 @@ impl AgentReadTxnExt for ReadTxn {
         (next, events)
     }
 
-    fn quota_observations(&self) -> Vec<QuotaObservationRecord> {
-        self.open_table(QUOTA_OBSERVATIONS)
-            .iter()
-            .map(|(_, value)| value.value().into_owned())
-            .collect()
+    fn quota_observations(
+        &self,
+        model: QuotaModel,
+        since: UnixMillis,
+    ) -> Vec<QuotaObservationRecord> {
+        let table = self.open_table(QUOTA_OBSERVATIONS);
+        let mut observations = Vec::new();
+        for (_, value) in table
+            .range(
+                QuotaObservationKey {
+                    model,
+                    observed_at: 0,
+                }..=QuotaObservationKey {
+                    model,
+                    observed_at: u64::MAX,
+                },
+            )
+            .rev()
+        {
+            let observation = value.value().into_owned();
+            let before_horizon = observation.observed_at < since;
+            observations.push(observation);
+            if before_horizon {
+                break;
+            }
+        }
+        observations.reverse();
+        observations
     }
 }
 
@@ -1151,22 +1202,34 @@ impl AgentWriteTxnExt for WriteTxn {
     }
 
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool {
+        let key = QuotaObservationKey {
+            model: observation.model,
+            observed_at: observation.observed_at.0,
+        };
         let unchanged = self
             .open_table(QUOTA_OBSERVATIONS)
-            .iter()
+            .range(
+                QuotaObservationKey {
+                    model: observation.model,
+                    observed_at: 0,
+                }..=QuotaObservationKey {
+                    model: observation.model,
+                    observed_at: u64::MAX,
+                },
+            )
             .rev()
+            .next()
             .map(|(_, value)| value.value().into_owned())
-            .find(|old| old.provider == observation.provider && old.model == observation.model)
             .is_some_and(|old| {
-                old.used_percent == observation.used_percent
+                old.provider == observation.provider
+                    && old.used_percent == observation.used_percent
                     && old.reset_at_unix == observation.reset_at_unix
             });
         if unchanged {
             return false;
         }
-        let id = next_counter(self, CounterKey::LAST_QUOTA_OBSERVATION);
         self.open_table(QUOTA_OBSERVATIONS)
-            .insert(&id, SenValue::borrowed(&observation));
+            .insert(&key, SenValue::borrowed(&observation));
         true
     }
 }
