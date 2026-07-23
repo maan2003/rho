@@ -8,35 +8,35 @@
       "name": "Rho OKSolar P3",
       "style": {
         "background.appearance": "opaque",
-        "background": "oklch(27.4% 0.050 219.6)",
-        "surface.background": "oklch(27.4% 0.050 219.6)",
-        "elevated_surface.background": "oklch(32.1% 0.053 219.6)",
-        "border": "oklch(32.1% 0.053 219.6)",
-        "border.variant": "oklch(32.1% 0.053 219.6)",
+        "background": "oklch(20.0% 0.035 219.6)",
+        "surface.background": "oklch(20.0% 0.035 219.6)",
+        "elevated_surface.background": "oklch(25.0% 0.045 219.6)",
+        "border": "oklch(25.0% 0.045 219.6)",
+        "border.variant": "oklch(25.0% 0.045 219.6)",
         "border.focused": "oklch(71.8% 0.170 244.8)",
-        "text": "oklch(71.8% 0.017 198.0)",
+        "text": "oklch(80.0% 0.000 0.0)",
         "text.muted": "oklch(53.5% 0.029 219.6)",
         "text.placeholder": "oklch(53.5% 0.029 219.6)",
         "text.accent": "oklch(71.8% 0.170 244.8)",
-        "icon": "oklch(71.8% 0.017 198.0)",
+        "icon": "oklch(80.0% 0.000 0.0)",
         "icon.muted": "oklch(53.5% 0.029 219.6)",
-        "element.background": "oklch(32.1% 0.053 219.6)",
-        "element.hover": "oklch(37.0% 0.050 219.6)",
-        "element.active": "oklch(41.0% 0.045 219.6)",
-        "element.selected": "oklch(41.0% 0.045 219.6)",
-        "ghost_element.hover": "oklch(32.1% 0.053 219.6)",
-        "ghost_element.active": "oklch(37.0% 0.050 219.6)",
-        "ghost_element.selected": "oklch(37.0% 0.050 219.6)",
-        "editor.background": "oklch(27.4% 0.050 219.6)",
-        "editor.foreground": "oklch(71.8% 0.017 198.0)",
-        "editor.gutter.background": "oklch(27.4% 0.050 219.6)",
-        "editor.subheader.background": "oklch(32.1% 0.053 219.6)",
-        "editor.active_line.background": "oklch(32.1% 0.053 219.6)",
-        "editor.highlighted_line.background": "oklch(37.0% 0.050 219.6)",
+        "element.background": "oklch(25.0% 0.045 219.6)",
+        "element.hover": "oklch(29.0% 0.045 219.6)",
+        "element.active": "oklch(33.0% 0.045 219.6)",
+        "element.selected": "oklch(33.0% 0.045 219.6)",
+        "ghost_element.hover": "oklch(25.0% 0.045 219.6)",
+        "ghost_element.active": "oklch(29.0% 0.045 219.6)",
+        "ghost_element.selected": "oklch(29.0% 0.045 219.6)",
+        "editor.background": "oklch(20.0% 0.035 219.6)",
+        "editor.foreground": "oklch(80.0% 0.000 0.0)",
+        "editor.gutter.background": "oklch(20.0% 0.035 219.6)",
+        "editor.subheader.background": "oklch(25.0% 0.045 219.6)",
+        "editor.active_line.background": "oklch(25.0% 0.045 219.6)",
+        "editor.highlighted_line.background": "oklch(29.0% 0.045 219.6)",
         "search.match_background": "oklch(63.1% 0.145 86.4 / 0.25)",
-        "panel.background": "oklch(27.4% 0.050 219.6)",
+        "panel.background": "oklch(20.0% 0.035 219.6)",
         "pane.focused_border": "oklch(53.5% 0.029 219.6)",
-        "pane_group.border": "oklch(32.1% 0.053 219.6)",
+        "pane_group.border": "oklch(25.0% 0.045 219.6)",
         "created": "oklch(63.1% 0.168 118.8)",
         "modified": "oklch(63.1% 0.145 86.4)",
         "deleted": "oklch(63.1% 0.260 21.6)",
@@ -48,9 +48,9 @@
         "hint": "oklch(53.5% 0.029 219.6)",
         "players": [
           {
-            "cursor": "oklch(71.8% 0.030 198.0)",
-            "background": "oklch(71.8% 0.030 198.0)",
-            "selection": "oklch(71.8% 0.170 244.8 / 0.25)"
+            "cursor": "oklch(93.4% 0.031 90.0)",
+            "background": "oklch(93.4% 0.031 90.0)",
+            "selection": "oklch(78.0% 0.130 244.8 / 0.35)"
           }
         ],
         "syntax": {
@@ -94,10 +94,10 @@
             "color": "oklch(63.1% 0.145 86.4)"
           },
           "property": {
-            "color": "oklch(71.8% 0.017 198.0)"
+            "color": "oklch(80.0% 0.000 0.0)"
           },
           "variable": {
-            "color": "oklch(71.8% 0.017 198.0)"
+            "color": "oklch(80.0% 0.000 0.0)"
           },
           "label": {
             "color": "oklch(63.1% 0.185 50.4)"
@@ -106,7 +106,7 @@
             "color": "oklch(63.1% 0.140 187.2)"
           },
           "namespace": {
-            "color": "oklch(71.8% 0.017 198.0)"
+            "color": "oklch(80.0% 0.000 0.0)"
           },
           "enum": {
             "color": "oklch(63.1% 0.145 86.4)"
@@ -115,13 +115,13 @@
             "color": "oklch(63.1% 0.185 50.4)"
           },
           "punctuation": {
-            "color": "oklch(71.8% 0.017 198.0)"
+            "color": "oklch(80.0% 0.000 0.0)"
           },
           "embedded": {
-            "color": "oklch(71.8% 0.017 198.0)"
+            "color": "oklch(80.0% 0.000 0.0)"
           },
           "primary": {
-            "color": "oklch(71.8% 0.030 198.0)"
+            "color": "oklch(80.0% 0.000 0.0)"
           },
           "hint": {
             "color": "oklch(53.5% 0.029 219.6)"
@@ -163,27 +163,27 @@
             "font_weight": 700
           }
         },
-        "terminal.background": "oklch(27.4% 0.050 219.6)",
-        "terminal.foreground": "oklch(71.8% 0.017 198.0)",
+        "terminal.background": "oklch(20.0% 0.035 219.6)",
+        "terminal.foreground": "oklch(80.0% 0.000 0.0)",
         "terminal.bright_foreground": "oklch(93.4% 0.031 90.0)",
         "terminal.dim_foreground": "oklch(53.5% 0.029 219.6)",
-        "terminal.ansi.background": "oklch(27.4% 0.050 219.6)",
-        "terminal.ansi.black": "oklch(27.4% 0.050 219.6)",
+        "terminal.ansi.background": "oklch(20.0% 0.035 219.6)",
+        "terminal.ansi.black": "oklch(27.3% 0.030 210.0)",
         "terminal.ansi.red": "oklch(63.1% 0.260 21.6)",
         "terminal.ansi.green": "oklch(63.1% 0.168 118.8)",
         "terminal.ansi.yellow": "oklch(63.1% 0.145 86.4)",
         "terminal.ansi.blue": "oklch(63.1% 0.195 244.8)",
         "terminal.ansi.magenta": "oklch(63.1% 0.260 349.2)",
         "terminal.ansi.cyan": "oklch(63.1% 0.140 187.2)",
-        "terminal.ansi.white": "oklch(71.8% 0.017 198.0)",
+        "terminal.ansi.white": "oklch(94.0% 0.020 118.8)",
         "terminal.ansi.bright_black": "oklch(53.5% 0.029 219.6)",
-        "terminal.ansi.bright_red": "oklch(71.8% 0.220 21.6)",
-        "terminal.ansi.bright_green": "oklch(71.8% 0.190 118.8)",
-        "terminal.ansi.bright_yellow": "oklch(71.8% 0.165 86.4)",
-        "terminal.ansi.bright_blue": "oklch(71.8% 0.165 244.8)",
-        "terminal.ansi.bright_magenta": "oklch(71.8% 0.260 349.2)",
-        "terminal.ansi.bright_cyan": "oklch(71.8% 0.165 187.2)",
-        "terminal.ansi.bright_white": "oklch(93.4% 0.031 90.0)"
+        "terminal.ansi.bright_red": "oklch(78.0% 0.160 21.6)",
+        "terminal.ansi.bright_green": "oklch(78.0% 0.200 118.8)",
+        "terminal.ansi.bright_yellow": "oklch(78.0% 0.180 86.4)",
+        "terminal.ansi.bright_blue": "oklch(78.0% 0.130 244.8)",
+        "terminal.ansi.bright_magenta": "oklch(78.0% 0.200 349.2)",
+        "terminal.ansi.bright_cyan": "oklch(78.0% 0.180 187.2)",
+        "terminal.ansi.bright_white": "oklch(100.0% 0.000 0.0)"
       }
     }
   ]
