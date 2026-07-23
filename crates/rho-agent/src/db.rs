@@ -1217,8 +1217,7 @@ impl AgentWriteTxnExt for WriteTxn {
                     observed_at: u64::MAX,
                 },
             )
-            .rev()
-            .next()
+            .next_back()
             .map(|(_, value)| value.value().into_owned())
             .is_some_and(|old| {
                 old.provider == observation.provider
