@@ -305,6 +305,60 @@ fn agent_db_migrations_eventually_reach_current_format() {
     }
 }
 
+#[tokio::test]
+async fn fast_rustc_workspace_migration_rebinds_matching_agents() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let old = WorkspaceId::from_encoded("d0dn3rw17tdv").unwrap();
+    let replacement = WorkspaceId::from_encoded("szzu0k07bnm2").unwrap();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let workstream = write.create_workstream(UnixMs(1), "fast-rustc".to_owned());
+    let affected = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        affected,
+        workstream,
+        None,
+        vec![WorkspaceInfo::Workspace {
+            repo: FAST_RUSTC_REPO.into(),
+            id: old,
+        }],
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        None,
+    );
+    let unrelated = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        unrelated,
+        workstream,
+        None,
+        vec![WorkspaceInfo::Workspace {
+            repo: "/home/user/src/other".into(),
+            id: old,
+        }],
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        None,
+    );
+    write.open_table(FORMAT).insert(&(), &"8e72c1a4".to_owned());
+    write.commit();
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    assert_eq!(
+        db.read().get_agent(affected).workdirs[0].workspace_id(),
+        Some(replacement)
+    );
+    assert_eq!(
+        db.read().get_agent(unrelated).workdirs[0].workspace_id(),
+        Some(old)
+    );
+}
+
 #[test]
 fn deep_default_uses_default_deep_config() {
     assert_eq!(
