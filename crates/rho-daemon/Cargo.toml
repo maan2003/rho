@@ -17,6 +17,7 @@ futures.workspace = true
 iroh = { workspace = true, features = ["qlog", "tls-aws-lc-rs"] }
 json-stream.workspace = true
 libc.workspace = true
+notify.workspace = true
 noq-proto.workspace = true
 octo-server.workspace = true
 octo-types.workspace = true
@@ -36,11 +37,11 @@ rho-ui-proto.workspace = true
 rho-visualizations.workspace = true
 rho-webui-messages.workspace = true
 rho-workspaces.workspace = true
-rho-zed-host.workspace = true
 rustix-openpty.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
@@ -50,7 +51,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
-prost = "0.9"
-rpc = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 rho-shell.workspace = true
 senax-encoder.workspace = true

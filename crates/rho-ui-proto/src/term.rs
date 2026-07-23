@@ -1,7 +1,7 @@
 //! Wire vocabulary for daemon-owned terminals.
 //!
 //! A terminal stream is dedicated by a [`crate::ClientMessage::TerminalOpen`]
-//! first frame (like zed channels); after the
+//! first frame (like workspace file channels); after the
 //! [`crate::ServerMessage::TerminalOpened`] handshake the stream carries senax
 //! frames of [`TermClientFrame`] and [`TermServerFrame`].
 //!

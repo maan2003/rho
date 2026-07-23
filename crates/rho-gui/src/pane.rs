@@ -19,7 +19,8 @@ pub enum SurfaceKey {
     Draft,
     /// An agent's conversation (transcript + prompt).
     Transcript(AgentId),
-    /// A file from an agent's workspace, editable over the zed channel.
+    /// A file from an agent's workspace, editable over its workspace file
+    /// channel.
     File {
         agent_id: AgentId,
         path: Utf8PathBuf,

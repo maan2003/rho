@@ -365,39 +365,43 @@ is a static Leptos/wasm app (`webui/` at the
 repo root, its own cargo workspace, hostable anywhere) that connects as an
 iroh client from the browser.
 
-Native GUI file and diff surfaces share one remote Zed `Project` per workspace,
-and therefore one buffer identity, dirty state, and reload stream per path. The
-daemon's headless Zed host owns filesystem watching and serialized saves;
-its worktree events both update/reload Zed buffers and invalidate the live diff.
-That host configures Zed's worktree reader with an 8 MiB per-file limit, which
-is enforced while reading as well as by the metadata preflight for initial
-opens, watcher/manual reloads, and binary loads.
+Native GUI file and diff surfaces share one GUI-local remote-workspace registry
+per workspace, and therefore one Zed `language::Buffer` identity and dirty state
+per relative path. A dedicated rho-native file channel carries only bounded
+open/reload/save requests and coalesced filesystem notifications; editor edits
+and undo history never cross the wire. The daemon scopes every operation to the
+checkout directory descriptor, uses opaque content revisions for checked saves,
+and enforces an 8 MiB per-file limit on reads, writes, and conflict payloads.
+Clean buffers reload after watcher events, dirty buffers retain their local text
+until checked save reports a conflict, and watcher overflow asks the GUI to
+rescan every open path. Syntax parsing remains GUI-local; the daemon runs no
+headless GPUI/Zed project.
 A diff refresh is a semantic barrier, not a second watcher snapshot: the daemon
 persists the requested jj workspace/descendant closure and returns a bounded
 manifest containing the exact operation and working-copy commit, parent-side
 text, and bounded target type/size/mode descriptors. Current-side text is
-deliberately omitted and always comes from the live Zed buffer. The GUI unions
+deliberately omitted and always comes from the live GUI buffer. The GUI unions
 dirty shared-buffer paths into each manifest request so unsaved-only files get
 their immutable parent side and survive reconciliation. Conditional one-shot
 requests suppress unchanged manifests when that dirty-path set is stable.
 
 Each diff surface has one shared GUI `DiffModel`; split panes create independent
 editors over its multibuffer. Stable repository-path keys and subscriptions to
-buffers, buffer diffs, and worktree events let refreshes reconcile paths and
-recalculate hunks without replacing the surface. Manifest invalidations are
-lazy: a hidden diff stays subscribed to its retained Zed project but cannot
+buffers, buffer diffs, and workspace-file events let refreshes reconcile paths
+and recalculate hunks without replacing the surface. Manifest invalidations are
+lazy: a hidden diff stays subscribed to its retained file channel but cannot
 start a jj manifest request. Returning it to an active pane coalesces all hidden
 changes into one refresh; a request already started while visible may finish
 after it becomes hidden.
 
-The headless Zed server owns save conflict detection. Checked saves use a
-distinct RPC, are serialized per server buffer, and compare current path
-existence and exact mtime with the buffer's last saved/reloaded baseline just
-before writing. Rho's stateless save helper only renders the authoritative
-modified/created/deleted result: overwrite or recreation uses Zed's legacy
-unchecked save only after explicit confirmation, while discard reloads through
-Zed. Focus loss does not save because arbitrary external writers can still race
-the metadata check and write.
+The daemon file channel owns save conflict detection. GUI saves are serialized
+per path and checked against the content revision from the last open, reload, or
+save. Writes use a same-directory durable temporary file, revalidate the target,
+atomically replace it while preserving its mode, and verify the installed
+revision. The GUI renders modified/deleted results: overwrite or recreation omits
+the revision only after explicit confirmation, while discard reloads the daemon
+contents into the same buffer entity. Focus loss does not save because arbitrary
+external writers can still race the content check and write.
 
 Rho imports iroh as a managed jj subtree and patches its `noq` transport
 dependencies to vendored copies. The local extensions preserve strict stream

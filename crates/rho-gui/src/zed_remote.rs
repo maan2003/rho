@@ -1,126 +1,524 @@
-//! Remote zed projects over the daemon connection.
+//! Daemon-backed workspace files using rho's bounded file protocol.
 //!
-//! Each opened workspace gets its own ui-proto channel; the channel carries
-//! prost-encoded `proto::Envelope`s between a client-side
-//! [`remote::RemoteClient`] here and a `HeadlessProject` session inside
-//! rho-daemon. Paths in this layer are the daemon's view of the checkout
-//! (managed checkout paths) — the origin-path illusion only exists inside agent
-//! namespaces and never crosses this wire.
+//! Buffers and unsaved edits live only in the GUI. The daemon owns disk IO,
+//! checked-save revisions, and workspace-scoped filesystem notifications.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use camino::Utf8PathBuf;
-use client::{Client, UserStore};
-use collections::HashSet;
-use editor::Editor;
-use futures::channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
+use futures::StreamExt as _;
+use futures::channel::mpsc::Sender;
 use futures::channel::oneshot;
-use futures::{FutureExt as _, StreamExt as _, select_biased};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, PromptLevel, Render, Styled as _, Task, Window, div,
+    ParentElement as _, PromptLevel, Render, Styled as _, Subscription, Task, WeakEntity, Window,
+    div,
 };
-use project::{Project, ProjectPath};
-use prost::Message as _;
-use remote::{
-    CommandTemplate, ConnectionIdentifier, CustomConnectionOptions, RemoteClient,
-    RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions,
+use language::{Buffer, BufferEvent, Capability};
+use rho_ui_proto::{
+    FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceInfo, WorkspaceServerFrame,
 };
-use rho_ui_proto::WorkspaceInfo;
-use rpc::ErrorExt as _;
-use rpc::proto::Envelope;
 use theme::{ActiveTheme as _, GlobalTheme};
-use util::paths::{PathStyle, RemotePathBuf};
 
-use crate::connection::{Connection, ZedChannel};
+use crate::connection::{Connection, WorkspaceChannel};
 
-/// Opens a zed channel for `workspace` and builds a remote [`Project`] over
-/// it. Returns the project together with the workspace's checkout root as
-/// the daemon sees it; worktrees are opened by absolute paths under it.
+#[derive(Clone, Copy, Debug)]
+pub enum RemoteProjectEvent {
+    FilesChanged,
+    BufferEdited,
+}
+
+pub struct RemoteProjectState {
+    outgoing: Sender<WorkspaceClientFrame>,
+    next_request_id: u64,
+    pending: HashMap<u64, Pending>,
+    saving: std::collections::HashSet<Utf8PathBuf>,
+    buffers: HashMap<Utf8PathBuf, OpenBuffer>,
+    languages: Arc<language::LanguageRegistry>,
+    _incoming: Task<()>,
+}
+
+struct OpenBuffer {
+    buffer: WeakEntity<Buffer>,
+    revision: Vec<u8>,
+    utf8_bom: bool,
+    deleted: bool,
+    reload_generation: u64,
+    _subscription: Subscription,
+}
+
+enum Pending {
+    Read(oneshot::Sender<FileReadResult>),
+    Save {
+        path: Utf8PathBuf,
+        tx: oneshot::Sender<FileSaveResult>,
+    },
+}
+
+impl gpui::EventEmitter<RemoteProjectEvent> for RemoteProjectState {}
+
+impl RemoteProjectState {
+    pub fn opened_buffers(&self, _cx: &App) -> Vec<(Utf8PathBuf, Entity<Buffer>)> {
+        self.buffers
+            .iter()
+            .filter_map(|(path, entry)| entry.buffer.upgrade().map(|buffer| (path.clone(), buffer)))
+            .collect()
+    }
+
+    fn existing_buffer(&self, path: &Utf8PathBuf) -> Option<Entity<Buffer>> {
+        self.buffers.get(path)?.buffer.upgrade()
+    }
+
+    fn path_for_buffer(&self, needle: &Entity<Buffer>) -> Option<Utf8PathBuf> {
+        self.buffers.iter().find_map(|(path, entry)| {
+            entry
+                .buffer
+                .upgrade()
+                .filter(|buffer| buffer == needle)
+                .map(|_| path.clone())
+        })
+    }
+
+    fn next_request(&mut self) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        id
+    }
+
+    fn read(&mut self, path: Utf8PathBuf, reload: bool) -> oneshot::Receiver<FileReadResult> {
+        let request_id = self.next_request();
+        let (tx, rx) = oneshot::channel();
+        self.pending.insert(request_id, Pending::Read(tx));
+        let frame = if reload {
+            WorkspaceClientFrame::Reload { request_id, path }
+        } else {
+            WorkspaceClientFrame::Open { request_id, path }
+        };
+        if self.outgoing.try_send(frame).is_err()
+            && let Some(Pending::Read(tx)) = self.pending.remove(&request_id)
+        {
+            let _ = tx.send(FileReadResult::Error("workspace channel closed".into()));
+        }
+        rx
+    }
+
+    fn begin_reload(&mut self, path: Utf8PathBuf) -> (u64, oneshot::Receiver<FileReadResult>) {
+        let generation = if let Some(entry) = self.buffers.get_mut(&path) {
+            entry.reload_generation = entry.reload_generation.wrapping_add(1);
+            entry.reload_generation
+        } else {
+            0
+        };
+        (generation, self.read(path, true))
+    }
+
+    fn save(
+        &mut self,
+        path: Utf8PathBuf,
+        revision: Vec<u8>,
+        contents: Vec<u8>,
+        overwrite: bool,
+    ) -> oneshot::Receiver<FileSaveResult> {
+        let request_id = self.next_request();
+        let (tx, rx) = oneshot::channel();
+        if !self.saving.insert(path.clone()) {
+            let _ = tx.send(FileSaveResult::Error("save already in progress".into()));
+            return rx;
+        }
+        self.pending.insert(
+            request_id,
+            Pending::Save {
+                path: path.clone(),
+                tx,
+            },
+        );
+        let frame = if overwrite {
+            WorkspaceClientFrame::Overwrite {
+                request_id,
+                path,
+                contents,
+            }
+        } else {
+            WorkspaceClientFrame::Save {
+                request_id,
+                path,
+                revision,
+                contents,
+            }
+        };
+        if self.outgoing.try_send(frame).is_err()
+            && let Some(Pending::Save { path, tx }) = self.pending.remove(&request_id)
+        {
+            self.saving.remove(&path);
+            let _ = tx.send(FileSaveResult::Error("workspace channel closed".into()));
+        }
+        rx
+    }
+
+    fn handle_frame(&mut self, frame: WorkspaceServerFrame, cx: &mut Context<Self>) {
+        match frame {
+            WorkspaceServerFrame::Opened {
+                request_id, result, ..
+            }
+            | WorkspaceServerFrame::Reloaded {
+                request_id, result, ..
+            } => {
+                if let Some(Pending::Read(tx)) = self.pending.remove(&request_id) {
+                    let _ = tx.send(result);
+                }
+            }
+            WorkspaceServerFrame::Saved {
+                request_id, result, ..
+            } => {
+                if let Some(Pending::Save { path, tx }) = self.pending.remove(&request_id) {
+                    self.saving.remove(&path);
+                    let _ = tx.send(result);
+                }
+            }
+            WorkspaceServerFrame::Changed { paths, rescan } => {
+                cx.emit(RemoteProjectEvent::FilesChanged);
+                let paths = if rescan {
+                    self.buffers.keys().cloned().collect::<Vec<_>>()
+                } else {
+                    paths
+                };
+                let paths = paths
+                    .into_iter()
+                    .filter(|path| self.existing_buffer(path).is_some())
+                    .collect::<Vec<_>>();
+                let this = cx.entity().downgrade();
+                cx.spawn(async move |_, cx| reload_changed(this, paths, cx).await)
+                    .detach();
+            }
+        }
+    }
+
+    fn disconnected(&mut self, cx: &mut Context<Self>) {
+        self.outgoing.close_channel();
+        for (_, pending) in self.pending.drain() {
+            match pending {
+                Pending::Read(tx) => {
+                    let _ = tx.send(FileReadResult::Error("workspace channel closed".into()));
+                }
+                Pending::Save { tx, .. } => {
+                    let _ = tx.send(FileSaveResult::Error("workspace channel closed".into()));
+                }
+            }
+        }
+        for entry in self.buffers.values() {
+            if let Some(buffer) = entry.buffer.upgrade() {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_capability(Capability::ReadOnly, cx)
+                });
+            }
+        }
+        cx.emit(RemoteProjectEvent::FilesChanged);
+    }
+
+    fn install_buffer(
+        &mut self,
+        path: Utf8PathBuf,
+        buffer: Entity<Buffer>,
+        revision: Vec<u8>,
+        utf8_bom: bool,
+        deleted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription = cx.subscribe(&buffer, |_, _, event, cx| {
+            if matches!(event, BufferEvent::Edited { .. }) {
+                cx.emit(RemoteProjectEvent::BufferEdited);
+            }
+        });
+        self.buffers.insert(
+            path,
+            OpenBuffer {
+                buffer: buffer.downgrade(),
+                revision,
+                utf8_bom,
+                deleted,
+                reload_generation: 0,
+                _subscription: subscription,
+            },
+        );
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteProject {
+    pub state: Entity<RemoteProjectState>,
+}
+
 pub fn open_remote_project(
     connection: &Connection,
     workspace: WorkspaceInfo,
     cx: &mut App,
 ) -> Task<Result<RemoteProject>> {
-    let name = workspace_label(&workspace);
     let channel_task = connection.open_channel(workspace, cx);
     cx.spawn(async move |cx| {
-        let ZedChannel {
-            root,
+        let WorkspaceChannel {
             outgoing,
-            incoming,
-        } = channel_task.await.context("channel dial task failed")??;
-        // Kept alive with the connection: dropping it would tell RemoteClient
-        // the user cancelled the connection attempt.
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let remote_connection = Arc::new(RhoRemoteConnection {
-            name,
-            outgoing,
-            incoming: Mutex::new(Some(incoming)),
-            killed: AtomicBool::new(false),
-            _cancel: cancel_tx,
-        });
-        let remote_client = cx
-            .update(|cx| {
-                RemoteClient::new(
-                    ConnectionIdentifier::setup(),
-                    remote_connection,
-                    cancel_rx,
-                    Arc::new(NoopDelegate),
-                    cx,
-                )
-            })
-            .await?
-            .context("remote client connection was cancelled")?;
-        let project = cx.update(|cx| {
-            let (client, user_store, languages, fs) = project_deps(cx);
-            Project::remote(
-                remote_client,
-                client,
-                node_runtime::NodeRuntime::unavailable(),
-                user_store,
+            mut incoming,
+        } = channel_task
+            .await
+            .context("workspace channel dial task failed")??;
+        let languages = cx.update(language_registry);
+        let state = cx.update(|cx| {
+            cx.new(|_| RemoteProjectState {
+                outgoing,
+                next_request_id: 1,
+                pending: HashMap::new(),
+                saving: std::collections::HashSet::new(),
+                buffers: HashMap::new(),
                 languages,
-                fs,
-                false,
-                cx,
-            )
+                _incoming: Task::ready(()),
+            })
         });
-        Ok(RemoteProject { project, root })
+        let weak = state.downgrade();
+        let task = cx.spawn(async move |cx| {
+            while let Some(frame) = incoming.next().await {
+                if weak
+                    .update(cx, |state, cx| state.handle_frame(frame, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = weak.update(cx, |state, cx| state.disconnected(cx));
+        });
+        state.update(cx, |state, _| state._incoming = task);
+        Ok(RemoteProject { state })
     })
 }
 
-/// One live remote Zed project for a materialized Rho workspace. File and
-/// diff surfaces share this value so the same path has one buffer identity and
-/// dirty state throughout the GUI.
-#[derive(Clone)]
-pub struct RemoteProject {
-    pub project: Entity<Project>,
-    pub root: Utf8PathBuf,
+pub async fn open_file_buffer(
+    remote: &RemoteProject,
+    path: Utf8PathBuf,
+    cx: &mut AsyncApp,
+) -> Result<Entity<Buffer>> {
+    let path = normalized_path(path)?;
+    if let Some(buffer) = cx.update(|cx| remote.state.read(cx).existing_buffer(&path)) {
+        return Ok(buffer);
+    }
+    let response = cx.update(|cx| {
+        remote
+            .state
+            .update(cx, |state, _| state.read(path.clone(), false))
+    });
+    let response = response.await.context("workspace channel closed")?;
+    let (text, revision, utf8_bom, deleted) = match response {
+        FileReadResult::File { contents, revision } => {
+            let (text, utf8_bom) = decode_utf8(contents, &path)?;
+            (text, revision, utf8_bom, false)
+        }
+        FileReadResult::Deleted => (String::new(), Vec::new(), false, true),
+        FileReadResult::Error(error) => return Err(anyhow!(error)),
+    };
+
+    let languages = cx.update(|cx| remote.state.read(cx).languages.clone());
+    let buffer = cx.update(|cx| {
+        remote.state.update(cx, |state, cx| {
+            if let Some(buffer) = state.existing_buffer(&path) {
+                return buffer;
+            }
+            let buffer = cx.new(|cx| {
+                let buffer = Buffer::local(text, cx);
+                buffer.set_language_registry(languages.clone());
+                buffer
+            });
+            state.install_buffer(
+                path.clone(),
+                buffer.clone(),
+                revision,
+                utf8_bom,
+                deleted,
+                cx,
+            );
+            buffer
+        })
+    });
+
+    // Close the read/install watcher race with one fresh generation-gated
+    // read now that the path is registered for notifications.
+    let (generation, reload) = cx.update(|cx| {
+        remote
+            .state
+            .update(cx, |state, _| state.begin_reload(path.clone()))
+    });
+    if let Ok(result) = reload.await {
+        apply_reload_result(&remote.state, &path, generation, result, None, cx);
+    }
+
+    if let Ok(language) = languages
+        .load_language_for_file_path(path.as_std_path())
+        .await
+    {
+        buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+    }
+    Ok(buffer)
+}
+
+pub async fn opened_dirty_file_buffer(
+    remote: &RemoteProject,
+    path: Utf8PathBuf,
+    cx: &mut AsyncApp,
+) -> Result<Option<Entity<Buffer>>> {
+    let path = normalized_path(path)?;
+    Ok(cx.update(|cx| {
+        remote
+            .state
+            .read(cx)
+            .existing_buffer(&path)
+            .filter(|buffer| buffer.read(cx).is_dirty())
+    }))
+}
+
+async fn reload_changed(
+    state: WeakEntity<RemoteProjectState>,
+    paths: Vec<Utf8PathBuf>,
+    cx: &mut AsyncApp,
+) {
+    for path in paths {
+        let Ok((generation, rx)) = state.update(cx, |state, _| state.begin_reload(path.clone()))
+        else {
+            return;
+        };
+        let Ok(result) = rx.await else { return };
+        let Some(state) = state.upgrade() else { return };
+        apply_reload_result(&state, &path, generation, result, None, cx);
+    }
+}
+
+fn apply_reload_result(
+    state: &Entity<RemoteProjectState>,
+    path: &Utf8PathBuf,
+    generation: u64,
+    result: FileReadResult,
+    force_if_version: Option<clock::Global>,
+    cx: &mut AsyncApp,
+) {
+    let decoded = match result {
+        FileReadResult::File { contents, revision } => match decode_utf8(contents, path) {
+            Ok((text, bom)) => Some((text, revision, bom)),
+            Err(error) => {
+                tracing::warn!(%path, %error, "reload workspace file");
+                return;
+            }
+        },
+        FileReadResult::Deleted => None,
+        FileReadResult::Error(error) => {
+            tracing::warn!(%path, %error, "reload workspace file");
+            return;
+        }
+    };
+    state.update(cx, |state, cx| {
+        let Some(entry) = state.buffers.get_mut(path) else {
+            return;
+        };
+        if entry.reload_generation != generation {
+            return;
+        }
+        let Some(buffer) = entry.buffer.upgrade() else {
+            return;
+        };
+        let force = force_if_version.is_some();
+        if let Some(version) = force_if_version {
+            if buffer.read(cx).version() != version {
+                buffer.update(cx, |buffer, _| buffer.set_conflict());
+                cx.emit(RemoteProjectEvent::BufferEdited);
+                cx.notify();
+                return;
+            }
+        } else if buffer.read(cx).is_dirty() {
+            buffer.update(cx, |buffer, _| buffer.set_conflict());
+            cx.emit(RemoteProjectEvent::BufferEdited);
+            cx.notify();
+            return;
+        }
+
+        match decoded {
+            Some((text, revision, utf8_bom)) => {
+                if !force && !entry.deleted && entry.revision == revision {
+                    return;
+                }
+                let line_ending = text::LineEnding::detect(&text);
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_text(text, cx);
+                    // `did_reload` does not clear an explicit conflict. Mark
+                    // the newly installed version saved first so accepting a
+                    // reload does not leave the buffer permanently dirty.
+                    buffer.did_save(buffer.version().clone(), None, cx);
+                    buffer.did_reload(buffer.version().clone(), line_ending, None, cx);
+                });
+                entry.revision = revision;
+                entry.utf8_bom = utf8_bom;
+                entry.deleted = false;
+            }
+            None => {
+                if !entry.deleted {
+                    buffer.update(cx, |buffer, _| buffer.set_conflict());
+                    entry.deleted = true;
+                    cx.emit(RemoteProjectEvent::BufferEdited);
+                    cx.notify();
+                }
+            }
+        }
+    });
+}
+
+fn normalized_path(path: Utf8PathBuf) -> Result<Utf8PathBuf> {
+    let mut normalized = Utf8PathBuf::new();
+    for component in path.components() {
+        let camino::Utf8Component::Normal(component) = component else {
+            return Err(anyhow!(
+                "workspace file path must be normalized and relative: {path}"
+            ));
+        };
+        normalized.push(component);
+    }
+    if normalized.as_str() != path.as_str() || normalized.as_str().is_empty() {
+        return Err(anyhow!(
+            "workspace file path must be normalized and relative: {path}"
+        ));
+    }
+    Ok(path)
+}
+
+struct SavedBuffer {
+    path: Utf8PathBuf,
+    buffer: Entity<Buffer>,
+    version: clock::Global,
+    contents: Vec<u8>,
+    result: FileSaveResult,
 }
 
 pub fn save_buffers(
-    project: Entity<Project>,
-    buffers: impl IntoIterator<Item = Entity<language::Buffer>>,
+    remote: RemoteProject,
+    buffers: impl IntoIterator<Item = Entity<Buffer>>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let buffers = buffers
-        .into_iter()
-        .filter(|buffer| {
-            let buffer = buffer.read(cx);
-            buffer.file().is_some() && buffer.is_dirty()
-        })
-        .collect::<Vec<_>>();
     let saves = buffers
         .into_iter()
-        .map(|buffer| {
-            let save = project.update(cx, |project, cx| {
-                project.save_buffer_checked(buffer.clone(), cx)
-            });
-            (buffer, save)
+        .filter_map(|buffer| {
+            let state = remote.state.read(cx);
+            let path = state.path_for_buffer(&buffer)?;
+            let entry = state.buffers.get(&path)?;
+            let buffer_read = buffer.read(cx);
+            buffer_read.is_dirty().then(|| {
+                (
+                    path,
+                    buffer.clone(),
+                    buffer_read.version().clone(),
+                    encode_buffer(
+                        buffer_read.text(),
+                        buffer_read.line_ending(),
+                        entry.utf8_bom,
+                    ),
+                    entry.revision.clone(),
+                )
+            })
         })
         .collect::<Vec<_>>();
     if saves.is_empty() {
@@ -129,33 +527,46 @@ pub fn save_buffers(
 
     window
         .spawn(cx, async move |cx| {
-            let results = futures::future::join_all(
-                saves
-                    .into_iter()
-                    .map(|(buffer, save)| async move { (buffer, save.await) }),
-            )
-            .await;
-            let mut conflicted = HashSet::default();
-            let mut deleted = HashSet::default();
-            for (buffer, result) in results {
-                match result {
-                    Ok(()) => {}
-                    Err(error) if error.error_code() == rpc::ErrorCode::SaveConflict => {
-                        match error.error_tag("kind") {
-                            Some("deleted") => {
-                                deleted.insert(buffer);
-                            }
-                            Some("modified" | "created") => {
-                                conflicted.insert(buffer);
-                            }
-                            kind => tracing::error!(?kind, %error, "unknown save conflict"),
-                        }
+            let mut results = Vec::new();
+            for (path, buffer, version, contents, revision) in saves {
+                let rx = remote
+                    .state
+                    .update(cx, |state, _| {
+                        state.save(path.clone(), revision, contents.clone(), false)
+                    });
+                let result = rx
+                    .await
+                    .unwrap_or_else(|_| FileSaveResult::Error("workspace channel closed".into()));
+                results.push(SavedBuffer {
+                    path,
+                    buffer,
+                    version,
+                    contents,
+                    result,
+                });
+            }
+
+            let mut conflicts = Vec::new();
+            let mut deleted = Vec::new();
+            for mut save in results {
+                match std::mem::replace(
+                    &mut save.result,
+                    FileSaveResult::Error("save response consumed".into()),
+                ) {
+                    FileSaveResult::Saved { revision } => {
+                        mark_saved(&remote, &save, revision, cx);
                     }
-                    Err(error) => tracing::error!("save buffer: {error:#}"),
+                    FileSaveResult::Conflict { contents, revision } => {
+                        conflicts.push((save, contents, revision));
+                    }
+                    FileSaveResult::Deleted => deleted.push(save),
+                    FileSaveResult::Error(error) => {
+                        tracing::error!(path = %save.path, %error, "save buffer")
+                    }
                 }
             }
 
-            if !conflicted.is_empty() {
+            if !conflicts.is_empty() {
                 let answer = cx.update(|window, cx| {
                     window.prompt(
                         PromptLevel::Warning,
@@ -166,21 +577,56 @@ pub fn save_buffers(
                     )
                 })?;
                 match answer.await {
-                    Ok(0) => project
-                        .update(cx, |project, cx| project.save_buffers(conflicted, cx))
-                        .await
-                        .map_err(|error| tracing::error!("overwrite buffers: {error:#}"))
-                        .ok(),
-                    Ok(1) => project
-                        .update(cx, |project, cx| {
-                            project.reload_buffers(conflicted, true, cx)
-                        })
-                        .await
-                        .map_err(|error| tracing::error!("reload buffers: {error:#}"))
-                        .ok()
-                        .map(|_| ()),
-                    _ => None,
-                };
+                    Ok(0) => {
+                        for (mut save, _, _) in conflicts {
+                            let (contents, version) = cx.update(|_, cx| {
+                                let buffer = save.buffer.read(cx);
+                                let bom = remote
+                                    .state
+                                    .read(cx)
+                                    .buffers
+                                    .get(&save.path)
+                                    .is_some_and(|entry| entry.utf8_bom);
+                                (
+                                    encode_buffer(buffer.text(), buffer.line_ending(), bom),
+                                    buffer.version().clone(),
+                                )
+                            })?;
+                            save.contents = contents.clone();
+                            save.version = version;
+                            let rx = remote.state.update(cx, |state, _| {
+                                state.save(save.path.clone(), Vec::new(), contents, true)
+                            });
+                            if let Ok(FileSaveResult::Saved { revision }) = rx.await {
+                                mark_saved(&remote, &save, revision, cx);
+                            }
+                        }
+                    }
+                    Ok(1) => {
+                        for (save, _, _) in conflicts {
+                            let (generation, reload, version) = cx.update(|_, cx| {
+                                let version = save.buffer.read(cx).version().clone();
+                                let (generation, reload) = remote
+                                    .state
+                                    .update(cx, |state, _| {
+                                        state.begin_reload(save.path.clone())
+                                    });
+                                (generation, reload, version)
+                            })?;
+                            if let Ok(result) = reload.await {
+                                apply_reload_result(
+                                    &remote.state,
+                                    &save.path,
+                                    generation,
+                                    result,
+                                    Some(version),
+                                    cx,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
 
             if !deleted.is_empty() {
@@ -194,11 +640,29 @@ pub fn save_buffers(
                     )
                 })?;
                 if answer.await == Ok(0) {
-                    project
-                        .update(cx, |project, cx| project.save_buffers(deleted, cx))
-                        .await
-                        .map_err(|error| tracing::error!("recreate buffers: {error:#}"))
-                        .ok();
+                    for mut save in deleted {
+                        let (contents, version) = cx.update(|_, cx| {
+                            let buffer = save.buffer.read(cx);
+                            let bom = remote
+                                .state
+                                .read(cx)
+                                .buffers
+                                .get(&save.path)
+                                .is_some_and(|entry| entry.utf8_bom);
+                            (
+                                encode_buffer(buffer.text(), buffer.line_ending(), bom),
+                                buffer.version().clone(),
+                            )
+                        })?;
+                        save.contents = contents.clone();
+                        save.version = version;
+                        let rx = remote.state.update(cx, |state, _| {
+                            state.save(save.path.clone(), Vec::new(), contents, true)
+                        });
+                        if let Ok(FileSaveResult::Saved { revision }) = rx.await {
+                            mark_saved(&remote, &save, revision, cx);
+                        }
+                    }
                 }
             }
             anyhow::Ok(())
@@ -206,117 +670,85 @@ pub fn save_buffers(
         .detach();
 }
 
-/// Opens `path` (relative to the workspace root, or absolute) in an existing
-/// remote project.
-pub async fn open_file_buffer(
-    remote: &RemoteProject,
-    path: Utf8PathBuf,
-    cx: &mut AsyncApp,
-) -> Result<Entity<language::Buffer>> {
-    let project_path = remote_project_path(remote, path, cx).await?;
-    let project = remote.project.clone();
-    let buffer = cx
-        .update(|cx| project.update(cx, |project, cx| project.open_buffer(project_path, cx)))
-        .await?;
-    Ok(buffer)
+fn mark_saved(remote: &RemoteProject, save: &SavedBuffer, revision: Vec<u8>, cx: &mut AsyncApp) {
+    remote.state.update(cx, |state, cx| {
+        if let Some(entry) = state.buffers.get_mut(&save.path) {
+            entry.revision = revision;
+            entry.deleted = false;
+            entry.reload_generation = entry.reload_generation.wrapping_add(1);
+        }
+        save.buffer.update(cx, |buffer, cx| {
+            buffer.did_save(save.version.clone(), None, cx)
+        });
+    });
 }
 
-/// Returns the already-open buffer for `path` without creating a new file.
-/// This is used for deleted diff entries so a dirty buffer survives an
-/// external deletion, while an unopened deletion remains read-only.
-pub async fn opened_dirty_file_buffer(
-    remote: &RemoteProject,
-    path: Utf8PathBuf,
-    cx: &mut AsyncApp,
-) -> Result<Option<Entity<language::Buffer>>> {
-    let project_path = remote_project_path(remote, path, cx).await?;
-    Ok(cx.update(|cx| {
-        remote
-            .project
-            .read(cx)
-            .opened_buffers(cx)
-            .into_iter()
-            .find(|buffer| {
-                let buffer = buffer.read(cx);
-                buffer.is_dirty()
-                    && buffer.file().is_some_and(|file| {
-                        file.worktree_id(cx) == project_path.worktree_id
-                            && file.path() == &project_path.path
-                    })
-            })
-    }))
+fn decode_utf8(mut contents: Vec<u8>, path: &Utf8PathBuf) -> Result<(String, bool)> {
+    let bom = contents.starts_with(&[0xef, 0xbb, 0xbf]);
+    if bom {
+        contents.drain(..3);
+    }
+    String::from_utf8(contents)
+        .map(|text| (text, bom))
+        .with_context(|| format!("file is not valid UTF-8: {path}"))
 }
 
-async fn remote_project_path(
-    remote: &RemoteProject,
-    path: Utf8PathBuf,
-    cx: &mut AsyncApp,
-) -> Result<ProjectPath> {
-    let rel_path = if path.is_absolute() {
-        path.strip_prefix(&remote.root)
-            .with_context(|| format!("file {path} is outside workspace {}", remote.root))?
-            .to_owned()
+fn encode_buffer(text: String, line_ending: text::LineEnding, bom: bool) -> Vec<u8> {
+    let mut contents = Vec::with_capacity(text.len() + usize::from(bom) * 3);
+    if bom {
+        contents.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+    }
+    if line_ending == text::LineEnding::Windows {
+        for part in text.split_inclusive('\n') {
+            if let Some(line) = part.strip_suffix('\n') {
+                contents.extend_from_slice(line.as_bytes());
+                contents.extend_from_slice(b"\r\n");
+            } else {
+                contents.extend_from_slice(part.as_bytes());
+            }
+        }
     } else {
-        path
-    };
-    let rel_path = util::rel_path::RelPath::new(rel_path.as_std_path(), PathStyle::local())?
-        .into_owned()
-        .into();
-    let project = remote.project.clone();
-    let (worktree, _) = cx
-        .update(|cx| {
-            project.update(cx, |project, cx| {
-                project.find_or_create_worktree(remote.root.as_std_path(), true, cx)
-            })
-        })
-        .await?;
-    Ok(ProjectPath {
-        worktree_id: worktree.read_with(cx, |worktree, _| worktree.id()),
-        path: rel_path,
-    })
+        contents.extend_from_slice(text.as_bytes());
+    }
+    contents
 }
 
-/// A single remote buffer, shown as a surface in the pane tree. The view
-/// owns the whole remote stack — dropping it drops the editor, project,
-/// remote client, and daemon channel in one chain.
 pub struct FileView {
-    editor: Entity<Editor>,
-    project: Entity<Project>,
-    buffer: Entity<language::Buffer>,
+    remote: RemoteProject,
+    editor: Entity<editor::Editor>,
+    buffer: Entity<Buffer>,
 }
 
 impl FileView {
     pub fn new(
-        project: Entity<Project>,
-        buffer: Entity<language::Buffer>,
+        remote: RemoteProject,
+        buffer: Entity<Buffer>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| {
-            let mut editor = Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx);
+            let mut editor = editor::Editor::for_buffer(buffer.clone(), None, window, cx);
             crate::editor_config::configure_file(&mut editor, window, cx);
             editor
         });
         Self {
+            remote,
             editor,
-            project,
             buffer,
         }
     }
 
-    pub fn editor(&self) -> &Entity<Editor> {
+    pub fn editor(&self) -> &Entity<editor::Editor> {
         &self.editor
     }
 
-    /// The shared content behind this view; a split builds a sibling view
-    /// (its own editor, cursor, scroll) over the same pair.
-    pub fn shared_content(&self) -> (Entity<Project>, Entity<language::Buffer>) {
-        (self.project.clone(), self.buffer.clone())
+    pub fn shared_content(&self) -> (RemoteProject, Entity<Buffer>) {
+        (self.remote.clone(), self.buffer.clone())
     }
 
-    fn save(&mut self, _: &crate::FileSave, _window: &mut Window, cx: &mut Context<Self>) {
+    fn save(&mut self, _: &crate::FileSave, window: &mut Window, cx: &mut Context<Self>) {
         let buffers = self.editor.read(cx).buffer().read(cx).all_buffers();
-        save_buffers(self.project.clone(), buffers, _window, cx);
+        save_buffers(self.remote.clone(), buffers, window, cx);
     }
 }
 
@@ -332,276 +764,64 @@ impl Render for FileView {
     }
 }
 
-fn workspace_label(workspace: &WorkspaceInfo) -> String {
-    match workspace {
-        WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id } => {
-            format!("{repo}#{}", id.encoded())
-        }
-        WorkspaceInfo::UserCheckout { repo } => format!("{repo}#user"),
-    }
-}
+struct RemoteLanguageRegistry(Arc<language::LanguageRegistry>);
+impl gpui::Global for RemoteLanguageRegistry {}
 
-/// Dependencies shared by every remote project in this process: the
-/// client/user-store pair zed's project layer wants (they never talk to
-/// collab — the http client is blocked), plus one language registry with
-/// the bundled grammars so remote buffers get detection and syntax
-/// highlighting. Language servers stay on the daemon side; the registry
-/// here only ever parses.
-struct RemoteProjectDeps {
-    client: Arc<Client>,
-    user_store: Entity<UserStore>,
-    languages: Arc<language::LanguageRegistry>,
-    fs: Arc<dyn fs::Fs>,
-}
-
-impl gpui::Global for RemoteProjectDeps {}
-
-fn project_deps(
-    cx: &mut App,
-) -> (
-    Arc<Client>,
-    Entity<UserStore>,
-    Arc<language::LanguageRegistry>,
-    Arc<dyn fs::Fs>,
-) {
-    if !cx.has_global::<RemoteProjectDeps>() {
-        let http = Arc::new(http_client::HttpClientWithUrl::new(
-            Arc::new(http_client::BlockedHttpClient),
-            "http://127.0.0.1",
-            None,
-        ));
-        let client = Client::new(Arc::new(clock::RealSystemClock), http, cx);
-        let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
-        Project::init(&client, cx);
+fn language_registry(cx: &mut App) -> Arc<language::LanguageRegistry> {
+    if !cx.has_global::<RemoteLanguageRegistry>() {
         let fs: Arc<dyn fs::Fs> = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
-        let languages = init_language_registry(fs.clone(), cx);
-        cx.set_global(RemoteProjectDeps {
-            client,
-            user_store,
-            languages,
+        let languages = Arc::new(language::LanguageRegistry::new(
+            cx.background_executor().clone(),
+        ));
+        languages.set_theme(cx.theme().clone());
+        languages::init(
+            languages.clone(),
             fs,
-        });
-    }
-    let deps = cx.global::<RemoteProjectDeps>();
-    (
-        deps.client.clone(),
-        deps.user_store.clone(),
-        deps.languages.clone(),
-        deps.fs.clone(),
-    )
-}
-
-fn init_language_registry(fs: Arc<dyn fs::Fs>, cx: &mut App) -> Arc<language::LanguageRegistry> {
-    let languages = Arc::new(language::LanguageRegistry::new(
-        cx.background_executor().clone(),
-    ));
-    languages.set_theme(cx.theme().clone());
-    languages::init(
-        languages.clone(),
-        fs,
-        node_runtime::NodeRuntime::unavailable(),
-        cx,
-    );
-    cx.observe_global::<GlobalTheme>({
-        let languages = languages.clone();
-        move |cx| languages.set_theme(cx.theme().clone())
-    })
-    .detach();
-    languages
-}
-
-/// The transport: envelopes ride a dedicated stream to the daemon. There is
-/// no process to launch or binary to upload, so most of the trait is inert.
-struct RhoRemoteConnection {
-    name: String,
-    /// Dropping this half-closes the stream; the daemon tears the headless
-    /// project session down on EOF.
-    outgoing: UnboundedSender<Vec<u8>>,
-    /// Taken by the first (only) `start_proxy` call; reconnecting over a
-    /// dead daemon channel is not possible.
-    incoming: Mutex<Option<UnboundedReceiver<Vec<u8>>>>,
-    killed: AtomicBool,
-    _cancel: oneshot::Sender<()>,
-}
-
-#[async_trait::async_trait(?Send)]
-impl RemoteConnection for RhoRemoteConnection {
-    fn start_proxy(
-        &self,
-        _unique_identifier: String,
-        _reconnect: bool,
-        incoming_tx: UnboundedSender<Envelope>,
-        mut outgoing_rx: UnboundedReceiver<Envelope>,
-        mut connection_activity_tx: Sender<()>,
-        _delegate: Arc<dyn RemoteClientDelegate>,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<i32>> {
-        let Some(mut incoming) = self.incoming.lock().unwrap().take() else {
-            return Task::ready(Err(anyhow!(
-                "rho zed channels cannot reconnect; reopen the workspace instead"
-            )));
-        };
-        let outgoing = self.outgoing.clone();
-        cx.background_spawn(async move {
-            loop {
-                select_biased! {
-                    bytes = incoming.next().fuse() => {
-                        // Stream end = the daemon side is gone (session
-                        // teardown or lost connection).
-                        let Some(bytes) = bytes else { return Ok(1) };
-                        connection_activity_tx.try_send(()).ok();
-                        let envelope = Envelope::decode(bytes.as_slice())
-                            .context("bad envelope from daemon")?;
-                        if incoming_tx.unbounded_send(envelope).is_err() {
-                            return Ok(0);
-                        }
-                    }
-                    envelope = outgoing_rx.next().fuse() => {
-                        let Some(envelope) = envelope else { return Ok(0) };
-                        if outgoing.unbounded_send(envelope.encode_to_vec()).is_err() {
-                            return Ok(1);
-                        }
-                    }
-                }
-            }
+            node_runtime::NodeRuntime::unavailable(),
+            cx,
+        );
+        cx.observe_global::<GlobalTheme>({
+            let languages = languages.clone();
+            move |cx| languages.set_theme(cx.theme().clone())
         })
+        .detach();
+        cx.set_global(RemoteLanguageRegistry(languages));
     }
-
-    fn upload_directory(
-        &self,
-        _src_path: PathBuf,
-        _dest_path: RemotePathBuf,
-        _cx: &App,
-    ) -> Task<Result<()>> {
-        Task::ready(Ok(()))
-    }
-
-    async fn kill(&self) -> Result<()> {
-        self.killed.store(true, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn has_been_killed(&self) -> bool {
-        self.killed.load(Ordering::Relaxed)
-    }
-
-    fn build_command(
-        &self,
-        _program: Option<String>,
-        _args: &[String],
-        _env: &collections::HashMap<String, String>,
-        _working_dir: Option<String>,
-        _port_forward: Option<(u16, String, u16)>,
-        _interactive: remote::Interactive,
-    ) -> Result<CommandTemplate> {
-        Err(anyhow!("rho zed channels do not run remote commands"))
-    }
-
-    fn build_forward_ports_command(
-        &self,
-        _forwards: Vec<(u16, String, u16)>,
-    ) -> Result<CommandTemplate> {
-        Err(anyhow!("rho zed channels do not forward ports"))
-    }
-
-    fn connection_options(&self) -> RemoteConnectionOptions {
-        RemoteConnectionOptions::Custom(CustomConnectionOptions {
-            name: self.name.clone(),
-        })
-    }
-
-    fn path_style(&self) -> PathStyle {
-        PathStyle::Posix
-    }
-
-    fn remote_platform(&self) -> remote::RemotePlatform {
-        remote::RemotePlatform {
-            os: remote::RemoteOs::Linux,
-            arch: remote::RemoteArch::X86_64,
-        }
-    }
-
-    fn remote_os_version(&self) -> Option<String> {
-        None
-    }
-
-    fn shell(&self) -> String {
-        "sh".to_owned()
-    }
-
-    fn default_system_shell(&self) -> String {
-        "sh".to_owned()
-    }
-
-    fn has_wsl_interop(&self) -> bool {
-        false
-    }
-}
-
-/// The remote server is in-process and needs no passwords, downloads, or
-/// status UI.
-struct NoopDelegate;
-
-impl RemoteClientDelegate for NoopDelegate {
-    fn ask_password(
-        &self,
-        _prompt: String,
-        _sender: oneshot::Sender<askpass::EncryptedPassword>,
-        _cx: &mut AsyncApp,
-    ) {
-    }
-
-    fn download_server_binary_locally(
-        &self,
-        _platform: remote::RemotePlatform,
-        _release_channel: release_channel::ReleaseChannel,
-        _version: Option<semver::Version>,
-        _cx: &mut AsyncApp,
-    ) -> Task<Result<PathBuf>> {
-        Task::ready(Err(anyhow!("rho zed channels have no server binary")))
-    }
-
-    fn get_download_url(
-        &self,
-        _platform: remote::RemotePlatform,
-        _release_channel: release_channel::ReleaseChannel,
-        _version: Option<semver::Version>,
-        _cx: &mut AsyncApp,
-    ) -> Task<Result<Option<String>>> {
-        Task::ready(Ok(None))
-    }
-
-    fn set_status(&self, _status: Option<&str>, _cx: &mut AsyncApp) {}
+    cx.global::<RemoteLanguageRegistry>().0.clone()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use camino::Utf8PathBuf;
 
-    use gpui::TestAppContext;
-    use settings::SettingsStore;
-    use text::Rope;
+    use super::{decode_utf8, encode_buffer, normalized_path};
 
-    use super::init_language_registry;
+    #[test]
+    fn workspace_paths_are_relative_and_normalized() {
+        assert!(normalized_path(Utf8PathBuf::from("src/main.rs")).is_ok());
+        assert!(normalized_path(Utf8PathBuf::from("../secret")).is_err());
+        assert!(normalized_path(Utf8PathBuf::from("/etc/passwd")).is_err());
+        assert!(normalized_path(Utf8PathBuf::from("src/./main.rs")).is_err());
+    }
 
-    #[gpui::test]
-    async fn bundled_languages_receive_the_active_syntax_theme(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let store = SettingsStore::new(cx, crate::rho_assets::RHO_DEFAULT_SETTINGS);
-            cx.set_global(store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
-        let languages = cx.update(|cx| {
-            let fs: std::sync::Arc<dyn fs::Fs> =
-                std::sync::Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
-            init_language_registry(fs, cx)
-        });
-        let markdown = languages
-            .load_language_for_file_path(Path::new("README.md"))
-            .await
-            .expect("load bundled Markdown grammar");
-        let source = Rope::from("# heading\n\n**strong**\n");
+    #[test]
+    fn utf8_bom_and_crlf_round_trip() {
+        let path = Utf8PathBuf::from("file.txt");
+        let (text, bom) = decode_utf8(b"\xef\xbb\xbffirst\r\nsecond\r\n".to_vec(), &path).unwrap();
+        assert!(bom);
+        assert_eq!(text, "first\r\nsecond\r\n");
+        assert_eq!(
+            encode_buffer(
+                "first\nsecond\n".to_owned(),
+                text::LineEnding::Windows,
+                true
+            ),
+            b"\xef\xbb\xbffirst\r\nsecond\r\n"
+        );
+    }
 
-        assert!(!markdown.highlight_text(&source, 0..source.len()).is_empty());
+    #[test]
+    fn invalid_utf8_is_rejected() {
+        assert!(decode_utf8(vec![0xff], &Utf8PathBuf::from("bad.txt")).is_err());
     }
 }

@@ -203,18 +203,17 @@ impl DiffModel {
             multibuffer.set_all_diff_hunks_expanded(cx);
             multibuffer
         });
-        let project_subscription =
-            cx.subscribe(&remote.project, |this, _, event, cx| match event {
-                project::Event::WorktreeUpdatedEntries(_, _) => this.schedule_refresh(cx),
-                project::Event::BufferEdited { .. }
-                    if dirty_paths(&this.remote, cx)
-                        .iter()
-                        .any(|path| !this.entries.contains_key(path)) =>
-                {
-                    this.schedule_refresh(cx)
-                }
-                _ => {}
-            });
+        let project_subscription = cx.subscribe(&remote.state, |this, _, event, cx| match event {
+            crate::zed_remote::RemoteProjectEvent::FilesChanged => this.schedule_refresh(cx),
+            crate::zed_remote::RemoteProjectEvent::BufferEdited
+                if dirty_paths(&this.remote, cx)
+                    .iter()
+                    .any(|path| !this.entries.contains_key(path)) =>
+            {
+                this.schedule_refresh(cx)
+            }
+            _ => {}
+        });
         let mut model = Self {
             remote,
             client,
@@ -241,8 +240,8 @@ impl DiffModel {
         self.multibuffer.clone()
     }
 
-    pub fn project(&self) -> Entity<project::Project> {
-        self.remote.project.clone()
+    pub fn remote(&self) -> RemoteProject {
+        self.remote.clone()
     }
 
     pub fn status(&self) -> &str {
@@ -507,11 +506,11 @@ pub struct DiffView {
 
 impl DiffView {
     pub fn new(model: Entity<DiffModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (multibuffer, project) = {
+        let multibuffer = {
             let model = model.read(cx);
-            (model.multibuffer(), model.project())
+            model.multibuffer()
         };
-        let editor = build_editor(multibuffer, project, window, cx);
+        let editor = build_editor(multibuffer, window, cx);
         let model_changed = cx.observe(&model, |_, _, cx| cx.notify());
         Self {
             editor,
@@ -530,27 +529,22 @@ impl DiffView {
 
     fn save(&mut self, _: &crate::FileSave, window: &mut Window, cx: &mut Context<Self>) {
         let buffers = self.editor.read(cx).buffer().read(cx).all_buffers();
-        crate::zed_remote::save_buffers(self.model.read(cx).project(), buffers, window, cx);
+        crate::zed_remote::save_buffers(self.model.read(cx).remote(), buffers, window, cx);
     }
 }
 
 /// Sorted repository paths for every dirty buffer already owned by the shared
-/// Zed project. These paths are unioned into the jj manifest so unsaved-only
-/// edits appear and survive reconciliation.
+/// remote workspace. These paths are unioned into the jj manifest so
+/// unsaved-only edits appear and survive reconciliation.
 pub fn dirty_paths(remote: &RemoteProject, cx: &App) -> Vec<Utf8PathBuf> {
     let mut paths = remote
-        .project
+        .state
         .read(cx)
         .opened_buffers(cx)
         .into_iter()
-        .filter_map(|buffer| {
+        .filter_map(|(path, buffer)| {
             let buffer = buffer.read(cx);
-            if !buffer.is_dirty() {
-                return None;
-            }
-            buffer
-                .file()
-                .map(|file| Utf8PathBuf::from(file.path().as_unix_str()))
+            buffer.is_dirty().then_some(path)
         })
         .collect::<Vec<_>>();
     paths.sort();
@@ -585,12 +579,11 @@ impl Render for DiffView {
 
 fn build_editor(
     multibuffer: Entity<MultiBuffer>,
-    project: Entity<project::Project>,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<editor::Editor> {
     cx.new(|cx| {
-        let mut editor = editor::Editor::for_multibuffer(multibuffer, Some(project), window, cx);
+        let mut editor = editor::Editor::for_multibuffer(multibuffer, None, window, cx);
         crate::editor_config::configure_diff(&mut editor, window, cx);
         editor.start_temporary_diff_override();
         editor.disable_diagnostics(cx);

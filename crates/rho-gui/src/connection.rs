@@ -117,20 +117,14 @@ pub enum GitApprovalDecision {
     Done,
 }
 
-/// One open zed channel: a dedicated stream to the daemon carrying raw
-/// prost-envelope frames after the handshake. Dropping `outgoing` half-closes
-/// the stream; the daemon tears the headless project session down on EOF.
-pub struct ZedChannel {
-    /// The project root to open worktrees under (the daemon's view of the
-    /// workspace checkout).
-    pub root: Utf8PathBuf,
-    /// prost-encoded envelopes, GUI → headless project.
-    pub outgoing: futures_mpsc::UnboundedSender<Vec<u8>>,
-    /// prost-encoded envelopes, headless project → GUI.
-    pub incoming: futures_mpsc::UnboundedReceiver<Vec<u8>>,
+/// One workspace file channel. Dropping `outgoing` half-closes the stream and
+/// tears down its daemon-side watcher.
+pub struct WorkspaceChannel {
+    pub outgoing: futures_mpsc::Sender<rho_ui_proto::WorkspaceClientFrame>,
+    pub incoming: futures_mpsc::Receiver<rho_ui_proto::WorkspaceServerFrame>,
 }
 
-/// How to dial an extra stream to the daemon for a zed channel: locally a
+/// How to dial an extra workspace-file stream to the daemon: locally a
 /// second Unix connection, remotely another bi-stream on the already
 /// authenticated iroh connection. Set by the IO task once connected.
 #[derive(Clone)]
@@ -142,7 +136,7 @@ pub(crate) enum ChannelDialer {
 async fn dial_channel(
     dialer: ChannelDialer,
     workspace: WorkspaceInfo,
-) -> anyhow::Result<ZedChannel> {
+) -> anyhow::Result<WorkspaceChannel> {
     let mut stream = match dialer {
         ChannelDialer::Unix(socket_path) => {
             let client = Client::connect(&socket_path)
@@ -154,35 +148,45 @@ async fn dial_channel(
             let (send, recv) = connection
                 .open_bi()
                 .await
-                .context("open iroh zed-channel stream")?;
+                .context("open iroh workspace-file stream")?;
             Box::new(tokio::io::join(recv, send)) as Box<dyn AsyncStream>
         }
     };
     write_frame(&mut stream, &ClientMessage::ChannelOpen { workspace }).await?;
     let reply: ServerMessage = read_frame(&mut stream).await?;
-    let root = match reply {
-        ServerMessage::ChannelOpened { root } => root,
+    match reply {
+        ServerMessage::ChannelOpened => {}
         ServerMessage::ChannelClosed { reason } => {
-            anyhow::bail!("daemon refused zed channel: {reason}")
+            anyhow::bail!("daemon refused workspace file channel: {reason}")
         }
         _ => anyhow::bail!("unexpected reply to ChannelOpen"),
-    };
+    }
 
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let (incoming_tx, incoming_rx) = futures_mpsc::unbounded();
-    let (outgoing_tx, mut outgoing_rx) = futures_mpsc::unbounded::<Vec<u8>>();
+    let (mut incoming_tx, incoming_rx) = futures_mpsc::channel(32);
+    let (outgoing_tx, mut outgoing_rx) =
+        futures_mpsc::channel::<rho_ui_proto::WorkspaceClientFrame>(16);
     tokio::spawn(async move {
-        while let Ok(Some(payload)) = rho_ui_proto::read_raw_frame(&mut reader).await {
-            if incoming_tx.unbounded_send(payload).is_err() {
+        while let Ok(frame) = rho_ui_proto::read_frame_limited(
+            &mut reader,
+            rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+        )
+        .await
+        {
+            if incoming_tx.send(frame).await.is_err() {
                 break;
             }
         }
     });
     tokio::spawn(async move {
-        while let Some(payload) = outgoing_rx.next().await {
-            if rho_ui_proto::write_raw_frame(&mut writer, &payload)
-                .await
-                .is_err()
+        while let Some(frame) = outgoing_rx.next().await {
+            if rho_ui_proto::write_frame_limited(
+                &mut writer,
+                &frame,
+                rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+            )
+            .await
+            .is_err()
             {
                 break;
             }
@@ -190,8 +194,7 @@ async fn dial_channel(
         // Half-close so the daemon sees EOF and tears the session down.
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
     });
-    Ok(ZedChannel {
-        root,
+    Ok(WorkspaceChannel {
         outgoing: outgoing_tx,
         incoming: incoming_rx,
     })
@@ -726,13 +729,13 @@ impl Connection {
         })
     }
 
-    /// Dials a dedicated stream for a zed channel onto `workspace` and runs
+    /// Dials a dedicated workspace file stream and runs
     /// the handshake.
     pub fn open_channel(
         &self,
         workspace: WorkspaceInfo,
         cx: &App,
-    ) -> Task<Result<anyhow::Result<ZedChannel>, gpui_tokio::JoinError>> {
+    ) -> Task<Result<anyhow::Result<WorkspaceChannel>, gpui_tokio::JoinError>> {
         let dialer = self.dialer.lock().unwrap().clone();
         Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
@@ -1055,7 +1058,7 @@ async fn run(
             | ServerMessage::GitTransportRefused { .. }
             | ServerMessage::GitTransportPolicy { .. } => None,
             // Dedicated-stream handshake replies never belong to the UI session.
-            ServerMessage::ChannelOpened { .. }
+            ServerMessage::ChannelOpened
             | ServerMessage::ChannelClosed { .. }
             | ServerMessage::TerminalOpened { .. }
             | ServerMessage::TerminalRefused { .. }

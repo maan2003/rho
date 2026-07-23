@@ -37,6 +37,7 @@ mod realtime;
 mod shell;
 mod terminal;
 mod webui;
+mod workspace_channel;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
@@ -496,7 +497,7 @@ async fn load_or_create_iroh_secret(db: &RhoDb) -> anyhow::Result<iroh::SecretKe
 }
 
 /// Authenticates every iroh connection on its first bi-stream, then serves one
-/// full UI control session plus any number of zed-channel bi-streams on
+/// full UI control session plus any number of workspace-channel bi-streams on
 /// [`rho_ui_proto::IROH_ALPN`], the web UI JSON protocol on
 /// [`rho_webui_messages::ALPN`]. Unapproved connections never reach either
 /// application handler.
@@ -555,7 +556,7 @@ async fn run_iroh_listener(
                             let first =
                                 read_frame_counted::<_, ClientMessage>(&mut recv, Some(&counters))
                                     .await?;
-                            // Dedicated streams (zed channels, shells,
+                            // Dedicated streams (workspace files, shells,
                             // terminals, one-shot queries) are not the UI control
                             // session and must not claim it.
                             let dedicated = matches!(
@@ -993,10 +994,6 @@ struct AgentRegistry {
     events: broadcast::Sender<ServerMessage>,
     /// Enrollment/trust for iroh clients; `None` unless `--iroh` is set.
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
-    /// The in-process zed host (headless gpui thread), spawned lazily on the
-    /// first channel open so daemons that never serve an editing client
-    /// never start it.
-    zed_host: std::sync::OnceLock<rho_zed_host::ZedHost>,
     /// Daemon-owned Comint-style shell sessions, one per agent.
     shells: Arc<shell::ShellRegistry>,
     /// Daemon-owned terminal sessions, keyed per agent.
@@ -1046,7 +1043,6 @@ impl AgentRegistry {
             platform_secrets,
             events: broadcast::channel(1024).0,
             iroh_auth,
-            zed_host: std::sync::OnceLock::new(),
             shells: Arc::new(shell::ShellRegistry::default()),
             terminals: Arc::new(terminal::TerminalRegistry::default()),
             user_environment,
@@ -1106,10 +1102,6 @@ impl AgentRegistry {
             agent_id,
             attention: attention_level(kind.as_ref(), disposition),
         });
-    }
-
-    fn zed_host(&self) -> &rho_zed_host::ZedHost {
-        self.zed_host.get_or_init(rho_zed_host::ZedHost::spawn)
     }
 
     fn ui_workstreams(&self) -> Vec<UiWorkstream> {
@@ -1714,7 +1706,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // The first client frame chooses the stream's protocol: `ChannelOpen`
-    // dedicates the whole stream to one zed channel, anything else starts a
+    // dedicates the whole stream to one workspace channel, anything else starts a
     // normal UI session (every UI client speaks first — Subscribe or a
     // command — so waiting here never deadlocks).
     let mut reader = reader;
@@ -1723,7 +1715,7 @@ where
         None => read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await?,
     };
     if let ClientMessage::ChannelOpen { workspace } = first {
-        return serve_zed_channel(agents, reader, writer, workspace).await;
+        return serve_workspace_channel(agents, reader, writer, workspace).await;
     }
     if let ClientMessage::RealtimeOpen { offer_sdp } = first {
         return realtime::serve(agents, reader, writer, offer_sdp).await;
@@ -3416,10 +3408,8 @@ where
     write_frame(&mut writer, &ServerMessage::TerminalList { terminals }).await
 }
 
-/// Serves a stream dedicated to one zed channel: binds a headless project
-/// session, replies `ChannelOpened { root }`, then pumps raw envelope frames
-/// both ways until either side closes. Stream teardown is session teardown.
-async fn serve_zed_channel<R, W>(
+/// Serves a bounded typed file channel rooted in one workspace checkout.
+async fn serve_workspace_channel<R, W>(
     agents: Arc<AgentRegistry>,
     mut reader: R,
     mut writer: W,
@@ -3442,44 +3432,88 @@ where
             return Err(error);
         }
     };
-    let root = workspace.checkout().to_owned();
-
-    let (to_host_tx, to_host_rx) = futures::channel::mpsc::unbounded();
-    let (from_host_tx, mut from_host_rx) = futures::channel::mpsc::unbounded();
-    let session_id = agents
-        .zed_host()
-        .open_session(rho_zed_host::SessionStreams {
-            incoming: to_host_rx,
-            outgoing: from_host_tx,
-        });
-
-    write_frame(&mut writer, &ServerMessage::ChannelOpened { root }).await?;
-
-    let writer_task = tokio::spawn(async move {
-        while let Some(payload) = from_host_rx.next().await {
-            if rho_ui_proto::write_raw_frame(&mut writer, &payload)
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    let result = loop {
-        match rho_ui_proto::read_raw_frame(&mut reader).await {
-            Ok(Some(payload)) => {
-                if to_host_tx.unbounded_send(payload).is_err() {
-                    break Ok(());
-                }
-            }
-            Ok(None) => break Ok(()),
-            Err(error) => break Err(error),
+    let files = match workspace_channel::WorkspaceFiles::open(workspace.checkout().to_owned()) {
+        Ok(files) => Arc::new(files),
+        Err(error) => {
+            let _ = write_frame(
+                &mut writer,
+                &ServerMessage::ChannelClosed {
+                    reason: format!("{error:#}"),
+                },
+            )
+            .await;
+            return Err(error);
         }
     };
-    agents.zed_host().close_session(session_id);
-    writer_task.abort();
-    result
+    let (_watcher, mut changes, changes_overflowed) = match files.watcher() {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            let _ = write_frame(
+                &mut writer,
+                &ServerMessage::ChannelClosed {
+                    reason: format!("watch workspace: {error:#}"),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    write_frame(&mut writer, &ServerMessage::ChannelOpened).await?;
+
+    use rho_ui_proto::workspace::{WorkspaceClientFrame, WorkspaceServerFrame};
+    loop {
+        tokio::select! {
+            frame = rho_ui_proto::read_frame_limited::<_, WorkspaceClientFrame>(
+                &mut reader,
+                rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+            ) => {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) if error.chain().any(|cause| {
+                        cause.downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
+                    }) => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                let response = match frame {
+                    WorkspaceClientFrame::Open { request_id, path } => {
+                        let result = files.read(path.clone()).await;
+                        WorkspaceServerFrame::Opened { request_id, path, result }
+                    }
+                    WorkspaceClientFrame::Reload { request_id, path } => {
+                        let result = files.read(path.clone()).await;
+                        WorkspaceServerFrame::Reloaded { request_id, path, result }
+                    }
+                    WorkspaceClientFrame::Save { request_id, path, revision, contents } => {
+                        let result = files.save(path.clone(), Some(revision), contents).await;
+                        WorkspaceServerFrame::Saved { request_id, path, result }
+                    }
+                    WorkspaceClientFrame::Overwrite { request_id, path, contents } => {
+                        let result = files.save(path.clone(), None, contents).await;
+                        WorkspaceServerFrame::Saved { request_id, path, result }
+                    }
+                };
+                rho_ui_proto::write_frame_limited(
+                    &mut writer,
+                    &response,
+                    rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                )
+                .await?;
+            }
+            Some(first) = changes.recv() => {
+                let (paths, explicit_rescan) =
+                    workspace_channel::drain_changes(first, &mut changes);
+                let overflowed = changes_overflowed.swap(false, Ordering::AcqRel);
+                let rescan = explicit_rescan || overflowed;
+                rho_ui_proto::write_frame_limited(
+                    &mut writer,
+                    &WorkspaceServerFrame::Changed { paths, rescan },
+                    rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                )
+                .await?;
+            }
+        }
+    }
 }
 fn subscribe_agent(
     agent_id: AgentId,

@@ -122,8 +122,10 @@ pub struct Workspace {
     /// Weak project cache keyed by daemon-side workspace identity. Artifact
     /// surfaces hold the strong references; when the last file/diff closes,
     /// the remote channel and cache entry naturally expire.
-    remote_projects:
-        HashMap<rho_ui_proto::WorkspaceInfo, (gpui::WeakEntity<project::Project>, Utf8PathBuf)>,
+    remote_projects: HashMap<
+        rho_ui_proto::WorkspaceInfo,
+        gpui::WeakEntity<crate::zed_remote::RemoteProjectState>,
+    >,
     pending_diff_loads: HashMap<AgentId, Task<()>>,
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
@@ -165,7 +167,7 @@ pub struct Workspace {
     /// opened in a context lives here for the context's lifetime,
     /// regardless of what its panes currently display. Panes are
     /// viewports over this list — covering or closing one never loses a
-    /// file or terminal; the views (and any zed channel behind them)
+    /// file or terminal; the views (and any workspace file channel behind them)
     /// release when the context itself closes.
     surfaces: HashMap<ContextId, Vec<Surface>>,
     /// Always present in `contexts` (the draft context never closes).
@@ -406,7 +408,7 @@ impl Workspace {
     }
 
     /// Drops trees for tasks that no longer exist; their views (and any
-    /// zed channels behind them) release with them.
+    /// workspace file channels behind them) release with them.
     fn prune_contexts(&mut self) {
         let live = self
             .registry
@@ -2120,8 +2122,8 @@ impl Workspace {
         tree.focused_mut().show(surface);
     }
 
-    /// `:open`: reuses the agent workspace's remote Zed project and shows the
-    /// file surface in the main pane.
+    /// `:open`: reuses the agent workspace's remote buffer registry and shows
+    /// the file surface in the main pane.
     fn open_file_surface(
         &mut self,
         agent_id: AgentId,
@@ -2166,7 +2168,7 @@ impl Workspace {
             match result {
                 Ok((project, buffer)) => {
                     let _ = this.update_in(cx, |this, window, cx| {
-                        let view = cx.new(|cx| FileView::new(project.project, buffer, window, cx));
+                        let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
                         let surface = Self::wrap_surface(key, SurfaceView::File(view), window, cx);
                         this.display_surface(surface);
                         this.focus_active_surface(window, cx);
@@ -2238,9 +2240,9 @@ impl Workspace {
         &mut self,
         workspace: &rho_ui_proto::WorkspaceInfo,
     ) -> Option<RemoteProject> {
-        let (project, root) = self.remote_projects.get(workspace)?.clone();
-        match project.upgrade() {
-            Some(project) => Some(RemoteProject { project, root }),
+        let state = self.remote_projects.get(workspace)?.clone();
+        match state.upgrade() {
+            Some(state) => Some(RemoteProject { state }),
             _ => {
                 self.remote_projects.remove(workspace);
                 None
@@ -2257,12 +2259,12 @@ impl Workspace {
             return existing;
         }
         self.remote_projects
-            .insert(workspace, (opened.project.downgrade(), opened.root.clone()));
+            .insert(workspace, opened.state.downgrade());
         opened
     }
 
     /// Persists the agent's jj working-copy snapshot, then projects its
-    /// parent-side manifest over the workspace's shared live Zed buffers.
+    /// parent-side manifest over the workspace's shared live buffers.
     /// Reopening refreshes the existing shared model.
     fn open_diff_surface(
         &mut self,

@@ -26,7 +26,9 @@ pub mod remote;
 pub mod server;
 pub mod shell;
 pub mod term;
+pub mod workspace;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+pub use workspace::{FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceServerFrame};
 
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
@@ -216,13 +218,13 @@ pub enum ClientMessage {
     ChangePromptCacheKey {
         agent_id: AgentId,
     },
-    /// Dedicates this whole stream to a zed-remote channel: sent as the
+    /// Dedicates this whole stream to workspace file access: sent as the
     /// *first* message on a fresh stream (a new iroh bi-stream or Unix
     /// connection), never inside a UI session. The daemon binds a headless
-    /// project and replies [`ServerMessage::ChannelOpened`]; after that
-    /// handshake the stream carries raw frames ([`read_raw_frame`]) holding
-    /// prost-encoded zed proto envelopes. Closing the stream closes the
-    /// channel.
+    /// workspace and replies [`ServerMessage::ChannelOpened`]; after that
+    /// handshake the stream carries [`workspace::WorkspaceClientFrame`] and
+    /// [`workspace::WorkspaceServerFrame`] values. Closing the stream closes
+    /// the channel and its filesystem watcher.
     ChannelOpen {
         workspace: WorkspaceInfo,
     },
@@ -585,16 +587,10 @@ pub enum ServerMessage {
         data: Vec<u8>,
         is_error: bool,
     },
-    /// Handshake reply on a zed-channel stream (see
-    /// [`ClientMessage::ChannelOpen`]): the headless project is bound and the
-    /// stream now speaks raw envelope frames. `root` is the project root the
-    /// client should open worktrees under — the workspace checkout as the
-    /// daemon sees it (a managed checkout path, or the repo root for user
-    /// checkouts).
-    ChannelOpened {
-        root: Utf8PathBuf,
-    },
-    /// Handshake refusal on a zed-channel stream; the daemon closes the
+    /// Handshake reply on a workspace-channel stream (see
+    /// [`ClientMessage::ChannelOpen`]).
+    ChannelOpened,
+    /// Handshake refusal on a workspace-channel stream; the daemon closes the
     /// stream after sending it.
     ChannelClosed {
         reason: String,
@@ -884,6 +880,56 @@ where
     read_frame_counted(reader, None).await
 }
 
+/// Read and decode one frame with a protocol-specific bound smaller than the
+/// global UI-frame ceiling.
+pub async fn read_frame_limited<R, T>(reader: &mut R, max_len: usize) -> anyhow::Result<T>
+where
+    R: AsyncRead + Unpin,
+    T: Unpacker,
+{
+    let len = reader.read_u32_le().await.context("read frame length")? as usize;
+    if len > max_len {
+        bail!("protocol frame length {len} exceeds {max_len}");
+    }
+    let mut payload = vec![0; len];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .context("read frame payload")?;
+    let mut payload = payload.as_slice();
+    senax_encoder::unpack(&mut payload).context("unpack protocol frame")
+}
+
+/// Encode and write one frame with a protocol-specific bound smaller than the
+/// global UI-frame ceiling.
+pub async fn write_frame_limited<W, T>(
+    writer: &mut W,
+    value: &T,
+    max_len: usize,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Packer,
+{
+    let payload = senax_encoder::pack(value).context("pack protocol frame")?;
+    if payload.len() > max_len {
+        bail!("protocol frame length {} exceeds {max_len}", payload.len());
+    }
+    let len: u32 = payload
+        .len()
+        .try_into()
+        .context("protocol frame too large")?;
+    writer
+        .write_u32_le(len)
+        .await
+        .context("write frame length")?;
+    writer
+        .write_all(&payload)
+        .await
+        .context("write frame payload")?;
+    writer.flush().await.context("flush frame")
+}
+
 /// Read and decode one length-prefixed senax frame, recording bytes on
 /// successful completion when counters are supplied.
 pub async fn read_frame_counted<R, T>(
@@ -916,8 +962,7 @@ fn frame_wire_len(payload_len: usize) -> u64 {
     FRAME_LEN_BYTES + payload_len as u64
 }
 
-/// Write one length-prefixed raw frame (no senax encoding): the framing used
-/// by zed-channel streams after the [`ClientMessage::ChannelOpen`] handshake.
+/// Write one length-prefixed raw frame (no senax encoding).
 pub async fn write_raw_frame<W>(writer: &mut W, payload: &[u8]) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -939,7 +984,7 @@ where
 }
 
 /// Read one length-prefixed raw frame; `Ok(None)` on clean EOF at a frame
-/// boundary (the peer closed the channel).
+/// boundary.
 pub async fn read_raw_frame<R>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,

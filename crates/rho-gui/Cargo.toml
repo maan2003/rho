@@ -13,13 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-askpass = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 assets = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 buffer_diff.workspace = true
-async-trait = "0.1"
 camino.workspace = true
 clap.workspace = true
-client = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 clock = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 collections = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 command_palette = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
@@ -36,7 +33,6 @@ gpui_platform = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e",
   "wayland",
 ] }
 gpui_tokio = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-http_client = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 json-stream.workspace = true
 language = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 languages = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e", features = ["load-grammars"] }
@@ -45,9 +41,7 @@ prefix-id = { workspace = true, features = ["redb"] }
 node_runtime = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 octo-types.workspace = true
 project = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-prost = "0.9"
 release_channel = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-remote = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 rho-core.workspace = true
 rho-iroh-auth.workspace = true
 rho-profiling.workspace = true
@@ -62,7 +56,6 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
   "playback",
   "wav",
 ] }
-rpc = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 rustc-hash = "2.1.0"
 search = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
 semver = { version = "1.0", features = ["serde"] }
