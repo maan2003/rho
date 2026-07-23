@@ -3301,7 +3301,8 @@ impl Workspace {
         }
         div()
             .w_full()
-            .h(px(40.))
+            .h(px(60.))
+            .pb(px(20.))
             .flex()
             .items_center()
             .gap(px(10.))
