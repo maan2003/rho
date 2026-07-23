@@ -526,6 +526,7 @@ impl Workspace {
         commit: &Commit,
     ) -> Result<CheckoutStats, CheckoutError> {
         let mut locked_ws = self.start_working_copy_mutation().await?;
+        let new_tree = commit.tree();
         // Check if the current working-copy commit has changed on disk compared to what
         // the caller expected. It's safe to check out another commit
         // regardless, but it's probably not what  the caller wanted, so we let
@@ -533,6 +534,14 @@ impl Workspace {
         if let Some(old_tree) = old_tree
             && old_tree.tree_ids_and_labels()
                 != locked_ws.locked_wc().old_tree().tree_ids_and_labels()
+            // A concurrent checkout may already have materialized the state we
+            // intend to write. Treat that as an idempotent success only if it
+            // belongs to the same repository operation. Tree equality alone
+            // doesn't establish that the workspace points to the same commit
+            // or view.
+            && !(new_tree.tree_ids_and_labels()
+                == locked_ws.locked_wc().old_tree().tree_ids_and_labels()
+                && locked_ws.locked_wc().old_operation_id() == &operation_id)
         {
             return Err(CheckoutError::ConcurrentCheckout);
         }

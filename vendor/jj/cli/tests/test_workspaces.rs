@@ -874,6 +874,38 @@ fn test_workspaces_snapshot_current_descendants_only() {
 }
 
 #[test]
+fn test_workspaces_unaffected_checkout_state_is_not_updated() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+    main_dir
+        .run_jj([
+            "workspace",
+            "add",
+            "--name",
+            "secondary",
+            "../secondary",
+            "-r",
+            "root()",
+        ])
+        .success();
+
+    let checkout_state_path = secondary_dir.root().join(".jj/working_copy/checkout");
+    let checkout_state_before = std::fs::read(&checkout_state_path).unwrap();
+
+    // This changes repository metadata but neither workspace's target commit.
+    main_dir
+        .run_jj(["bookmark", "create", "marker", "-r", "root()"])
+        .success();
+
+    assert_eq!(
+        std::fs::read(checkout_state_path).unwrap(),
+        checkout_state_before
+    );
+}
+
+#[test]
 fn test_workspaces_conflicting_edits() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "main"]).success();

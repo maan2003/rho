@@ -2625,6 +2625,12 @@ to the current parents may contain changes from multiple commits.
             let Some(new_wc_commit_id) = new_repo.view().get_wc_commit_id(&workspace_name) else {
                 continue;
             };
+            if maybe_old_wc_commit
+                .as_ref()
+                .is_some_and(|commit| commit.id() == new_wc_commit_id)
+            {
+                continue;
+            }
             let new_wc_commit = new_repo.store().get_commit(new_wc_commit_id)?;
             if workspace_name.as_str() == self.workspace_name().as_str() {
                 self.update_working_copy(ui, maybe_old_wc_commit.as_ref(), &new_wc_commit)

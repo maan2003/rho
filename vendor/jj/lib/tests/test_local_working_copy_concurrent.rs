@@ -16,6 +16,7 @@ use std::cmp::max;
 use std::thread;
 
 use assert_matches::assert_matches;
+use jj_lib::op_store::OperationId;
 use jj_lib::repo::Repo as _;
 use jj_lib::working_copy::CheckoutError;
 use jj_lib::workspace::Workspace;
@@ -84,6 +85,90 @@ fn test_concurrent_checkout() -> TestResult {
         &default_working_copy_factories(),
     )?;
     assert_tree_eq!(*ws3.working_copy().tree()?, tree2);
+    Ok(())
+}
+
+#[test]
+fn test_concurrent_checkout_to_same_tree() -> TestResult {
+    // A checkout based on stale state should succeed if another process has
+    // already materialized the intended tree.
+    let settings = testutils::user_settings();
+    let mut test_workspace1 = TestWorkspace::init_with_settings(&settings);
+    let repo = test_workspace1.repo.clone();
+    let workspace1_root = test_workspace1.workspace.workspace_root().to_owned();
+
+    let tree1 = testutils::create_random_tree(&repo);
+    let tree2 = testutils::create_random_tree(&repo);
+    let commit1 = commit_with_tree(repo.store(), tree1.clone());
+    let commit2 = commit_with_tree(repo.store(), tree2.clone());
+
+    let ws1 = &mut test_workspace1.workspace;
+    ws1.check_out(repo.op_id().clone(), None, &commit1)
+        .block_on()?;
+
+    {
+        let mut ws2 = Workspace::load(
+            &settings,
+            &workspace1_root,
+            &test_workspace1.env.default_store_factories(),
+            &default_working_copy_factories(),
+        )?;
+        let ws2_repo = ws2.repo_loader().load_at(repo.operation()).block_on()?;
+        let commit2 = ws2_repo.store().get_commit(commit2.id())?;
+        ws2.check_out(ws2_repo.op_id().clone(), Some(&tree1), &commit2)
+            .block_on()?;
+    }
+
+    let stats = ws1
+        .check_out(repo.op_id().clone(), Some(&tree1), &commit2)
+        .block_on()?;
+    assert_eq!(stats, Default::default());
+
+    let ws3 = Workspace::load(
+        &settings,
+        &workspace1_root,
+        &test_workspace1.env.default_store_factories(),
+        &default_working_copy_factories(),
+    )?;
+    assert_tree_eq!(*ws3.working_copy().tree()?, tree2);
+    Ok(())
+}
+
+#[test]
+fn test_concurrent_checkout_to_same_tree_from_different_operation() -> TestResult {
+    // Identical trees aren't sufficient for convergence if the checkout is
+    // associated with a different repository view.
+    let settings = testutils::user_settings();
+    let mut test_workspace1 = TestWorkspace::init_with_settings(&settings);
+    let repo = test_workspace1.repo.clone();
+    let workspace1_root = test_workspace1.workspace.workspace_root().to_owned();
+
+    let tree1 = testutils::create_random_tree(&repo);
+    let tree2 = testutils::create_random_tree(&repo);
+    let commit1 = commit_with_tree(repo.store(), tree1.clone());
+    let commit2 = commit_with_tree(repo.store(), tree2);
+    let ws1 = &mut test_workspace1.workspace;
+    ws1.check_out(repo.op_id().clone(), None, &commit1)
+        .block_on()?;
+
+    {
+        let mut ws2 = Workspace::load(
+            &settings,
+            &workspace1_root,
+            &test_workspace1.env.default_store_factories(),
+            &default_working_copy_factories(),
+        )?;
+        let ws2_repo = ws2.repo_loader().load_at(repo.operation()).block_on()?;
+        let commit2 = ws2_repo.store().get_commit(commit2.id())?;
+        ws2.check_out(OperationId::new(vec![1]), Some(&tree1), &commit2)
+            .block_on()?;
+    }
+
+    assert_matches!(
+        ws1.check_out(repo.op_id().clone(), Some(&tree1), &commit2)
+            .block_on(),
+        Err(CheckoutError::ConcurrentCheckout)
+    );
     Ok(())
 }
 
