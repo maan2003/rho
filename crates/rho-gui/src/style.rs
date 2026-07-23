@@ -128,6 +128,10 @@ pub fn user_prompt_gutter_color(cx: &App) -> Hsla {
     cx.theme().colors().text_accent.into()
 }
 
+pub fn agent_message_gutter_color(cx: &App) -> Hsla {
+    cx.theme().colors().terminal_ansi_magenta.into()
+}
+
 pub fn cwd_chip_style(cx: &App) -> HighlightStyle {
     HighlightStyle {
         color: Some(cx.theme().colors().terminal_foreground.into()),

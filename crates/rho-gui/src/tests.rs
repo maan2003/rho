@@ -286,6 +286,13 @@ fn user(text: &str) -> UiBlock {
     }
 }
 
+fn agent_message(sender: AgentId, text: &str) -> UiBlock {
+    UiBlock::AgentMessage {
+        sender,
+        text: text.to_owned(),
+    }
+}
+
 fn assistant(text: &str, phase: Option<UiMessagePhase>) -> UiBlock {
     UiBlock::AssistantMessage {
         text: text.to_owned(),
@@ -366,6 +373,33 @@ fn user_messages_render_with_turn_gaps_and_gutters(cx: &mut TestAppContext) {
     assert!(
         gutter_highlights.len() >= 2,
         "user messages should render gutter highlights: {gutter_highlights:?}"
+    );
+}
+
+#[gpui::test]
+fn agent_messages_use_their_text_color_in_the_gutter(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("local"), agent_message(agent(2), "remote")],
+            Vec::new(),
+        )),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    let gutter_highlights = workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.all_gutter_highlights(window, cx))
+        })
+        .expect("read gutters");
+    assert!(gutter_highlights.len() >= 2);
+    assert!(
+        gutter_highlights
+            .iter()
+            .any(|(_, color)| *color != gutter_highlights[0].1)
     );
 }
 

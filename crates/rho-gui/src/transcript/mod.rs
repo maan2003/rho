@@ -83,12 +83,13 @@ struct BlockRecord {
     kind: BlockKind,
     visible: bool,
     text: String,
-    gutter: Option<Range<Anchor>>,
+    gutter: Option<(StyleClass, Range<Anchor>)>,
     inlay: Option<InlayRecord>,
     styles: Vec<(StyleClass, Range<Anchor>)>,
 }
 
 struct UserMessageGutter;
+struct AgentMessageGutter;
 
 /// The document excerpt's tail policy. Replacing an excerpt gives it a
 /// new id (invalidating every anchor into it), so the tail changes shape
@@ -495,12 +496,29 @@ impl TranscriptModel {
                 let snapshot = multi_buffer.read(cx).snapshot(cx);
                 let ranges = ranges
                     .iter()
-                    .filter_map(|range| excerpt_range(&snapshot, range))
+                    .filter_map(|(class, range)| {
+                        excerpt_range(&snapshot, range).map(|range| (*class, range))
+                    })
                     .collect::<Vec<_>>();
+                let user_ranges: Vec<_> = ranges
+                    .iter()
+                    .filter(|(class, _)| *class == StyleClass::UserMessage)
+                    .map(|(_, range)| range.clone())
+                    .collect();
+                let agent_ranges: Vec<_> = ranges
+                    .iter()
+                    .filter(|(class, _)| *class == StyleClass::AgentMessage)
+                    .map(|(_, range)| range.clone())
+                    .collect();
                 editor.update(cx, |editor, cx| {
                     editor.highlight_gutter::<UserMessageGutter>(
-                        ranges,
+                        user_ranges,
                         crate::style::user_prompt_gutter_color,
+                        cx,
+                    );
+                    editor.highlight_gutter::<AgentMessageGutter>(
+                        agent_ranges,
+                        crate::style::agent_message_gutter_color,
                         cx,
                     );
                 });
@@ -677,7 +695,7 @@ fn append_spans(
 ) -> (
     Vec<Range<Anchor>>,
     Option<InlayRecord>,
-    Option<Range<Anchor>>,
+    Option<(StyleClass, Range<Anchor>)>,
 ) {
     let start = buffer.len();
     let text = rendered
@@ -699,7 +717,7 @@ fn spans_for_rendered(
 ) -> (
     Vec<Range<Anchor>>,
     Option<InlayRecord>,
-    Option<Range<Anchor>>,
+    Option<(StyleClass, Range<Anchor>)>,
 ) {
     let mut ranges = Vec::with_capacity(rendered.spans.len());
     let mut inlay = None;
@@ -713,7 +731,10 @@ fn spans_for_rendered(
         }
         if rendered.gutter_span == Some(index) {
             let trimmed = span.text.trim_end_matches('\n').len();
-            gutter = Some(buffer.anchor_before(offset)..buffer.anchor_before(offset + trimmed));
+            gutter = Some((
+                span.class,
+                buffer.anchor_before(offset)..buffer.anchor_before(offset + trimmed),
+            ));
         }
         ranges.push(range);
         offset = end;
