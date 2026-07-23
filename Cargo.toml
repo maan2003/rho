@@ -60,7 +60,6 @@ base64 = "0.22"
 bytes = "1"
 buffer_diff = { git = "https://github.com/maan2003/zed", rev = "4ca9239e36f4" }
 camino = "1"
-chrono = "0.4"
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 deno_core = "0.407"

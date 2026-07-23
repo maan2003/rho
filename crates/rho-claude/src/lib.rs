@@ -25,74 +25,6 @@ const CLAUDE_AGENT_SDK_VERSION: &str = "0.3.201";
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW: &str = "320000";
 const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
-const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ClaudeWeeklyUsage {
-    pub used_percent: f64,
-    pub reset_at_unix: i64,
-}
-
-/// Fetches the active model-scoped Fable weekly allowance used by Claude Code.
-pub fn claude_fable_weekly_usage() -> Result<Option<ClaudeWeeklyUsage>> {
-    let credentials_path = dirs::home_dir()
-        .context("home directory not available")?
-        .join(".claude/.credentials.json");
-    let credentials: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&credentials_path)
-            .with_context(|| format!("reading {}", credentials_path.display()))?,
-    )
-    .context("parsing Claude credentials")?;
-    let access_token = credentials
-        .pointer("/claudeAiOauth/accessToken")
-        .and_then(serde_json::Value::as_str)
-        .context("Claude OAuth access token missing")?;
-    let response = reqwest::blocking::Client::new()
-        .get(CLAUDE_USAGE_URL)
-        .bearer_auth(access_token)
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(30))
-        .send()
-        .context("fetching Claude usage")?
-        .error_for_status()
-        .context("fetching Claude usage")?
-        .json::<serde_json::Value>()
-        .context("decoding Claude usage")?;
-    fable_weekly_usage_from_json(&response)
-}
-
-fn fable_weekly_usage_from_json(value: &serde_json::Value) -> Result<Option<ClaudeWeeklyUsage>> {
-    let Some(limit) = value
-        .get("limits")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|limit| {
-            limit.get("kind").and_then(serde_json::Value::as_str) == Some("weekly_scoped")
-                && limit
-                    .pointer("/scope/model/display_name")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("Fable")
-        })
-    else {
-        return Ok(None);
-    };
-    let used_percent = limit
-        .get("percent")
-        .and_then(serde_json::Value::as_f64)
-        .context("Fable weekly utilization missing")?;
-    let reset_at = limit
-        .get("resets_at")
-        .and_then(serde_json::Value::as_str)
-        .context("Fable weekly reset missing")?;
-    let reset_at_unix = chrono::DateTime::parse_from_rfc3339(reset_at)
-        .context("invalid Fable weekly reset")?
-        .timestamp();
-    Ok(Some(ClaudeWeeklyUsage {
-        used_percent,
-        reset_at_unix,
-    }))
-}
 
 #[derive(Clone, Debug)]
 pub struct ClaudeCodeOptions {
@@ -598,30 +530,6 @@ mod tests {
             Some("seven_day_fable")
         );
         assert_eq!(event.rate_limit_info.utilization, Some(0.496));
-    }
-
-    #[test]
-    fn parses_model_scoped_fable_weekly_usage() {
-        let usage = fable_weekly_usage_from_json(&json!({
-            "limits": [
-                {
-                    "kind": "weekly_all",
-                    "percent": 34,
-                    "resets_at": "2026-07-28T16:59:59Z",
-                    "scope": null
-                },
-                {
-                    "kind": "weekly_scoped",
-                    "percent": 67,
-                    "resets_at": "2026-07-28T16:59:59Z",
-                    "scope": { "model": { "display_name": "Fable" } }
-                }
-            ]
-        }))
-        .unwrap()
-        .unwrap();
-        assert_eq!(usage.used_percent, 67.0);
-        assert_eq!(usage.reset_at_unix, 1_785_257_999);
     }
 
     #[test]
