@@ -143,6 +143,7 @@ pub struct Workspace {
     /// (bad working directory, say) never loses the message.
     awaiting_draft_agent: bool,
     connected: bool,
+    chatgpt_usage: Option<(f64, i64)>,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
@@ -310,6 +311,7 @@ impl Workspace {
             new_agent_draft: None,
             awaiting_draft_agent: false,
             connected: false,
+            chatgpt_usage: None,
             duration_timer: None,
             chime: Chime::default(),
             contexts: HashMap::new(),
@@ -584,6 +586,13 @@ impl Workspace {
                 {
                     self.chime.play();
                 }
+                cx.notify();
+            }
+            ConnEvent::ChatGptUsage {
+                used_percent,
+                reset_at_unix,
+            } => {
+                self.chatgpt_usage = Some((used_percent, reset_at_unix));
                 cx.notify();
             }
             ConnEvent::TurnCancelled => {
@@ -3265,7 +3274,16 @@ impl Workspace {
             (waiting, 0) => format!("{waiting} waiting on you"),
             (waiting, working) => format!("{waiting} waiting on you · {working} working"),
         };
-        div()
+        let usage = self.chatgpt_usage.map(|(used_percent, reset_at_unix)| {
+            let used_percent = used_percent.clamp(0.0, 100.0);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_secs() as f64;
+            let days = ((reset_at_unix as f64 - now).max(0.0)) / 86_400.0;
+            format!("usage: {used_percent:.0}% · {days:.1} days")
+        });
+        let header = div()
             .w_full()
             .flex()
             .flex_col()
@@ -3277,8 +3295,19 @@ impl Workspace {
                 div()
                     .text_color(text_style.color.opacity(0.55))
                     .child(summary),
-            )
-            .into_any_element()
+            );
+        if let Some(usage) = usage {
+            header
+                .child(
+                    div()
+                        .pt(px(5.))
+                        .text_color(text_style.color.opacity(0.7))
+                        .child(usage),
+                )
+                .into_any_element()
+        } else {
+            header.into_any_element()
+        }
     }
 
     /// The preview sheet's bottom bar: the previewed agent's name and the

@@ -2125,6 +2125,22 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::Pong);
             Ok(Refresh::None)
         }
+        ClientMessage::ChatGptUsage => {
+            let outgoing_tx = outgoing_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(Ok(Some(usage))) = tokio::task::spawn_blocking(|| {
+                    rho_inference::chatgpt_weekly_usage("default")
+                })
+                .await
+                {
+                    let _ = outgoing_tx.send(ServerMessage::ChatGptUsage {
+                        used_percent: usage.used_percent,
+                        reset_at_unix: usage.reset_at_unix,
+                    });
+                }
+            });
+            Ok(Refresh::None)
+        }
         ClientMessage::ShellStart { request_id, agent } => {
             let agents = Arc::clone(agents);
             let outgoing_tx = outgoing_tx.clone();

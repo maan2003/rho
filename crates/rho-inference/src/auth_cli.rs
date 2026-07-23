@@ -299,6 +299,41 @@ fn print_rate_limits(name: impl AsRef<str>) -> Result<()> {
     Ok(())
 }
 
+/// The account-wide weekly Codex allowance reported by ChatGPT.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChatGptUsage {
+    pub used_percent: f64,
+    pub reset_at_unix: i64,
+}
+
+/// Fetches the weekly window for an OAuth namespace. Accounts which do not
+/// report a weekly window return `None`.
+pub fn chatgpt_weekly_usage(name: impl AsRef<str>) -> Result<Option<ChatGptUsage>> {
+    let auth = InferenceAuth::named(name)?;
+    let resolved = auth.resolve().context("resolving OAuth credentials")?;
+    let status = fetch_rate_limit_status(&resolved.bearer_token, resolved.account_id.as_deref())
+        .context("fetching ChatGPT rate limits")?;
+    let Some(window) = status
+        .rate_limit
+        .as_ref()
+        .and_then(|rate_limit| rate_limit.secondary_window.as_ref())
+    else {
+        return Ok(None);
+    };
+    if !window.used_percent.is_finite() {
+        return Ok(None);
+    }
+    let reset_at_unix = window.reset_at.or_else(|| {
+        window
+            .reset_after_seconds
+            .map(|seconds| now_secs().saturating_add(seconds))
+    });
+    Ok(reset_at_unix.map(|reset_at_unix| ChatGptUsage {
+        used_percent: window.used_percent,
+        reset_at_unix,
+    }))
+}
+
 fn fetch_rate_limit_status(
     bearer_token: &str,
     account_id: Option<&str>,

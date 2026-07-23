@@ -320,6 +320,8 @@ pub enum ClientMessage {
         /// snapshot. The daemon supplies their immutable parent side.
         include_paths: Vec<Utf8PathBuf>,
     },
+    /// Requests the daemon account's weekly ChatGPT Codex allowance.
+    ChatGptUsage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -637,6 +639,10 @@ pub enum ServerMessage {
     },
     DiffRefused {
         reason: String,
+    },
+    ChatGptUsage {
+        used_percent: f64,
+        reset_at_unix: i64,
     },
 }
 

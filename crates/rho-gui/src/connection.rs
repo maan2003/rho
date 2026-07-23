@@ -89,6 +89,10 @@ pub enum ConnEvent {
         agent_id: AgentId,
         attention: rho_ui_proto::UiAttention,
     },
+    ChatGptUsage {
+        used_percent: f64,
+        reset_at_unix: i64,
+    },
     ServerError(String),
     Disconnected(String),
     GitTransportApproval {
@@ -727,6 +731,8 @@ async fn run(
         return Ok(());
     }
 
+    write_frame(&mut stream, &ClientMessage::ChatGptUsage).await?;
+
     write_frame(&mut stream, &ClientMessage::GitTransportRegister).await?;
 
     let agent_stream_task = agent_connection.map(|connection| {
@@ -740,9 +746,22 @@ async fn run(
 
     let (mut reader, mut writer) = tokio::io::split(stream);
     let writer_task = tokio::spawn(async move {
-        while let Some(message) = commands.next().await {
-            if write_frame(&mut writer, &message).await.is_err() {
-                break;
+        let mut usage_refresh = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+        // The initial request was sent above; skip the interval's immediate tick.
+        usage_refresh.tick().await;
+        loop {
+            tokio::select! {
+                message = commands.next() => {
+                    let Some(message) = message else { break };
+                    if write_frame(&mut writer, &message).await.is_err() {
+                        break;
+                    }
+                }
+                _ = usage_refresh.tick() => {
+                    if write_frame(&mut writer, &ClientMessage::ChatGptUsage).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -795,6 +814,13 @@ async fn run(
                 attention,
             }),
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
+            ServerMessage::ChatGptUsage {
+                used_percent,
+                reset_at_unix,
+            } => Some(ConnEvent::ChatGptUsage {
+                used_percent,
+                reset_at_unix,
+            }),
             ServerMessage::GitTransportRequested {
                 request_id,
                 provider_id,
