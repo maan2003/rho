@@ -210,6 +210,18 @@ fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
             frame => panic!("unexpected frame before pager pause: {frame:?}"),
         }
     };
+    // Pager control and PTY output use independent relay threads. The pager
+    // flushes the page before announcing the pause, but the control frame can
+    // still reach the protocol writer before the PTY relay's output frame.
+    while !paged.ends_with(b"24\r\n") {
+        match read(&mut control) {
+            Response::Output {
+                execution: 16,
+                data,
+            } => paged.extend(data),
+            frame => panic!("unexpected frame while draining paused page: {frame:?}"),
+        }
+    }
     assert!(paged.ends_with(b"24\r\n"), "{paged:?}");
     write(
         &mut control,
