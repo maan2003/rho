@@ -93,6 +93,7 @@ pub enum ConnEvent {
         used_percent: f64,
         reset_at_unix: i64,
     },
+    QuotaUsage(Vec<rho_ui_proto::QuotaSummary>),
     ServerError(String),
     Disconnected(String),
     GitTransportApproval {
@@ -821,6 +822,7 @@ async fn run(
                 used_percent,
                 reset_at_unix,
             }),
+            ServerMessage::QuotaUsage { summaries } => Some(ConnEvent::QuotaUsage(summaries)),
             ServerMessage::GitTransportRequested {
                 request_id,
                 provider_id,

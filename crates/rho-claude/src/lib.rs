@@ -507,7 +507,29 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(matches!(event, protocol::ClaudeEvent::RateLimitEvent));
+        assert!(matches!(event, protocol::ClaudeEvent::RateLimitEvent(_)));
+    }
+
+    #[test]
+    fn parses_rate_limit_utilization() {
+        let event: protocol::ClaudeEvent = serde_json::from_value(json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "resetsAt": 1783173000,
+                "rateLimitType": "seven_day_fable",
+                "utilization": 0.496
+            }
+        }))
+        .unwrap();
+        let protocol::ClaudeEvent::RateLimitEvent(event) = event else {
+            panic!("expected rate limit event");
+        };
+        assert_eq!(
+            event.rate_limit_info.rate_limit_type.as_deref(),
+            Some("seven_day_fable")
+        );
+        assert_eq!(event.rate_limit_info.utilization, Some(0.496));
     }
 
     #[test]

@@ -1,7 +1,6 @@
 //! rho-gui: a native GUI attached to a running rho daemon.
 
 mod agent_view;
-mod banner;
 mod chime;
 mod commands;
 mod connection;

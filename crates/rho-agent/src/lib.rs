@@ -178,6 +178,23 @@ pub struct AgentState {
     /// transcript (Claude runtime); `None` until the agent's first response
     /// reports usage.
     pub context_used: Option<u64>,
+    /// Latest weekly provider quota observation seen by this runtime.
+    pub quota_observation: Option<QuotaObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotaObservation {
+    pub provider: QuotaProvider,
+    pub model: String,
+    pub observed_at: rho_core::UnixMs,
+    pub used_percent: u8,
+    pub reset_at_unix: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuotaProvider {
+    ChatGpt,
+    Claude,
 }
 
 /// One input waiting in the agent's queue. Persisted verbatim inside
@@ -744,6 +761,7 @@ impl Agent {
             queued_inputs: restored.queued_inputs,
             kind: restored.kind,
             context_used: restored.context_used,
+            quota_observation: None,
         }));
         let notify = Arc::new(Notify::new());
         let agent_loop = AgentLoop {
@@ -1340,6 +1358,19 @@ impl AgentLoop {
 
                     match update {
                         InferenceEvent::RequestSent | InferenceEvent::StreamingStarted => {
+                            state.kind = AgentStateKind::ApiStreaming {
+                                pending_response,
+                                previous_attempt,
+                            };
+                        }
+                        InferenceEvent::Quota { used_percent, reset_at_unix } => {
+                            state.quota_observation = Some(QuotaObservation {
+                                provider: QuotaProvider::ChatGpt,
+                                model: "gpt".to_owned(),
+                                observed_at: rho_core::UnixMs::now(),
+                                used_percent,
+                                reset_at_unix,
+                            });
                             state.kind = AgentStateKind::ApiStreaming {
                                 pending_response,
                                 previous_attempt,
@@ -2310,6 +2341,7 @@ mod tests {
                 waiting: None,
             },
             context_used: None,
+            quota_observation: None,
         }
     }
 
@@ -2399,6 +2431,7 @@ mod tests {
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: Some(232_560),
+            quota_observation: None,
         };
         assert!(should_auto_compact(&state, Some(232_560)));
         assert!(!should_auto_compact(&state, Some(232_561)));

@@ -9,7 +9,8 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use rho_agent::db::{
-    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _, WorkstreamId,
+    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _,
+    QuotaObservationRecord, QuotaProvider, WorkstreamId,
 };
 use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
@@ -20,9 +21,9 @@ use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
-    McpAgentToolResponse, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
-    UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, read_frame_counted, write_frame,
-    write_frame_counted,
+    McpAgentToolResponse, QuotaSummary, ServerMessage, StartMode, UiAgentSummary, UiAttention,
+    UiProject, UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, read_frame_counted,
+    write_frame, write_frame_counted,
 };
 use tokio::sync::{
     Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot, watch,
@@ -295,6 +296,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // any code still depending on process cwd fails loudly.
     let _ = std::env::set_current_dir("/var/empty").or_else(|_| std::env::set_current_dir("/"));
 
+    let quota_auth_name = args.auth.clone();
     let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).context("create socket directory")?;
@@ -341,6 +343,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .await?,
     );
     agents.resume_platform_integrations();
+    spawn_chatgpt_quota_poller(quota_auth_name, agents.db.clone(), agents.events.clone());
 
     if let Some((secret, iroh_auth)) = iroh {
         let mut transport = iroh::endpoint::QuicTransportConfig::builder()
@@ -2026,7 +2029,31 @@ fn spawn_attention_watcher(
         let mut was_working = is_working(&initial_state.kind);
         let mut last_reported_response_count = inference_response_count(&initial_state);
         let mut last_sent = None;
+        let mut last_quota = None;
         while let Some(state) = changes.next().await {
+            if state.quota_observation != last_quota {
+                last_quota = state.quota_observation.clone();
+                if let Some(observation) = &state.quota_observation {
+                    let provider = match observation.provider {
+                        rho_agent::QuotaProvider::ChatGpt => QuotaProvider::ChatGpt,
+                        rho_agent::QuotaProvider::Claude => QuotaProvider::Claude,
+                    };
+                    let mut write = db.write().await;
+                    let changed = write.record_quota_observation(QuotaObservationRecord {
+                        provider,
+                        model: observation.model.clone(),
+                        observed_at: observation.observed_at,
+                        used_percent: observation.used_percent,
+                        reset_at_unix: observation.reset_at_unix,
+                    });
+                    write.commit();
+                    if changed {
+                        let _ = events.send(ServerMessage::QuotaUsage {
+                            summaries: quota_summaries(&db),
+                        });
+                    }
+                }
+            }
             let working = is_working(&state.kind);
             if !working && was_working && !is_child {
                 let mut write = db.write().await;
@@ -2054,6 +2081,73 @@ fn spawn_attention_watcher(
                 });
                 last_sent = Some(attention);
             }
+        }
+    });
+}
+
+fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
+    let observations = db.read().quota_observations();
+    let now = rho_core::UnixMs::now().0;
+    ["gpt", "fable"]
+        .into_iter()
+        .filter_map(|model| {
+            let samples = observations
+                .iter()
+                .filter(|sample| sample.model == model)
+                .collect::<Vec<_>>();
+            let latest = samples.last()?;
+            Some(QuotaSummary {
+                model: model.to_owned(),
+                remaining_percent: 100u8.saturating_sub(latest.used_percent),
+                burn_10m: quota_burn(&samples, now, 10 * 60 * 1_000),
+                burn_2h: quota_burn(&samples, now, 2 * 60 * 60 * 1_000),
+                burn_1d: quota_burn(&samples, now, 24 * 60 * 60 * 1_000),
+                burn_3d: quota_burn(&samples, now, 3 * 24 * 60 * 60 * 1_000),
+                reset_at_unix: latest.reset_at_unix,
+            })
+        })
+        .collect()
+}
+
+fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -> u16 {
+    samples
+        .windows(2)
+        .filter(|pair| pair[1].observed_at.0 >= now.saturating_sub(duration_ms))
+        // A changed reset target starts a new epoch. A downward utilization
+        // jump with unchanged metadata is also naturally skipped below.
+        .filter(|pair| pair[0].reset_at_unix == pair[1].reset_at_unix)
+        .map(|pair| pair[1].used_percent.saturating_sub(pair[0].used_percent) as u16)
+        .sum()
+}
+
+fn spawn_chatgpt_quota_poller(
+    auth_name: String,
+    db: RhoDb,
+    events: broadcast::Sender<ServerMessage>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let auth_name = auth_name.clone();
+            if let Ok(Ok(Some(usage))) =
+                tokio::task::spawn_blocking(move || rho_inference::chatgpt_weekly_usage(auth_name))
+                    .await
+            {
+                let mut write = db.write().await;
+                let changed = write.record_quota_observation(QuotaObservationRecord {
+                    provider: QuotaProvider::ChatGpt,
+                    model: "gpt".to_owned(),
+                    observed_at: rho_core::UnixMs::now(),
+                    used_percent: usage.used_percent.clamp(0.0, 100.0).round() as u8,
+                    reset_at_unix: Some(usage.reset_at_unix),
+                });
+                write.commit();
+                if changed {
+                    let _ = events.send(ServerMessage::QuotaUsage {
+                        summaries: quota_summaries(&db),
+                    });
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10 * 60)).await;
         }
     });
 }
@@ -2126,18 +2220,8 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::ChatGptUsage => {
-            let outgoing_tx = outgoing_tx.clone();
-            tokio::spawn(async move {
-                if let Ok(Ok(Some(usage))) = tokio::task::spawn_blocking(|| {
-                    rho_inference::chatgpt_weekly_usage("default")
-                })
-                .await
-                {
-                    let _ = outgoing_tx.send(ServerMessage::ChatGptUsage {
-                        used_percent: usage.used_percent,
-                        reset_at_unix: usage.reset_at_unix,
-                    });
-                }
+            let _ = outgoing_tx.send(ServerMessage::QuotaUsage {
+                summaries: quota_summaries(&agents.db),
             });
             Ok(Refresh::None)
         }
@@ -3293,6 +3377,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::Arc;
 
+    use rho_agent::db::{QuotaObservationRecord, QuotaProvider};
     use rho_agent::{AgentState, AgentStateKind, InputQueues};
     use rho_core::{
         ContentPart, ContextBlock, InferenceResponseItem, MessagePhase, UnknownProviderSpecificData,
@@ -3302,8 +3387,29 @@ mod tests {
 
     use super::{
         GitProviderClaim, GitTransportBroker, configure_octo_git_transport,
-        inference_response_count, latest_final_response, load_or_create_iroh_secret,
+        inference_response_count, latest_final_response, load_or_create_iroh_secret, quota_burn,
     };
+
+    #[test]
+    fn quota_burn_skips_resets_and_sums_across_epochs() {
+        let sample = |at, used_percent, reset_at_unix| QuotaObservationRecord {
+            provider: QuotaProvider::ChatGpt,
+            model: "gpt".to_owned(),
+            observed_at: rho_core::UnixMs(at),
+            used_percent,
+            reset_at_unix,
+        };
+        let records = [
+            sample(0, 10, Some(100)),
+            sample(100, 15, Some(100)),
+            sample(200, 3, Some(100)),
+            sample(300, 6, Some(100)),
+            sample(400, 9, Some(200)),
+        ];
+        let samples = records.iter().collect::<Vec<_>>();
+        assert_eq!(quota_burn(&samples, 400, 1_000), 8);
+        assert_eq!(quota_burn(&samples, 400, 150), 3);
+    }
 
     fn environment_value<'a>(
         environment: &'a [(OsString, OsString)],
@@ -3517,6 +3623,7 @@ mod tests {
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
+            quota_observation: None,
         }
     }
 

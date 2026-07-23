@@ -14,7 +14,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable as _, Task, Window, div, px};
+use gpui::{App, Context, Entity, Focusable as _, Task, Window, div, px, svg};
 use rho_core::ContentPart;
 use rho_ui_proto::{
     AdvisorIntelligence, AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery,
@@ -143,7 +143,7 @@ pub struct Workspace {
     /// (bad working directory, say) never loses the message.
     awaiting_draft_agent: bool,
     connected: bool,
-    chatgpt_usage: Option<(f64, i64)>,
+    quota_summaries: Vec<rho_ui_proto::QuotaSummary>,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
@@ -311,7 +311,7 @@ impl Workspace {
             new_agent_draft: None,
             awaiting_draft_agent: false,
             connected: false,
-            chatgpt_usage: None,
+            quota_summaries: Vec::new(),
             duration_timer: None,
             chime: Chime::default(),
             contexts: HashMap::new(),
@@ -592,7 +592,20 @@ impl Workspace {
                 used_percent,
                 reset_at_unix,
             } => {
-                self.chatgpt_usage = Some((used_percent, reset_at_unix));
+                self.quota_summaries = vec![rho_ui_proto::QuotaSummary {
+                    model: "gpt".to_owned(),
+                    remaining_percent: 100u8
+                        .saturating_sub(used_percent.clamp(0.0, 100.0).round() as u8),
+                    burn_10m: 0,
+                    burn_2h: 0,
+                    burn_1d: 0,
+                    burn_3d: 0,
+                    reset_at_unix: Some(reset_at_unix),
+                }];
+                cx.notify();
+            }
+            ConnEvent::QuotaUsage(summaries) => {
+                self.quota_summaries = summaries;
                 cx.notify();
             }
             ConnEvent::TurnCancelled => {
@@ -2959,6 +2972,11 @@ impl Workspace {
         );
     }
 
+    pub(crate) fn open_usage_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let summaries = self.quota_summaries.clone();
+        self.open_transient(crate::transient::usage_menu(&summaries), window, cx);
+    }
+
     pub(crate) fn prompt_new_agent_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
             let needle = input.trim().to_lowercase();
@@ -3245,69 +3263,67 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The home-mode masthead: a centered title and a one-line attention
-    /// summary, so the dashboard reads as a place rather than a sidebar.
+    /// The dashboard-only two-line masthead.
     fn render_dashboard_header(
         &self,
         text_style: &gpui::TextStyle,
-        _cx: &Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui::AnyElement {
-        let mut waiting = 0usize;
-        let mut working = 0usize;
-        for workstream in self.registry.workstreams() {
-            if workstream.hidden {
-                continue;
+        let colors = cx.theme().colors();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs() as f64;
+        let mut stats = div().flex().items_center().gap(px(6.));
+        for (index, summary) in self.quota_summaries.iter().enumerate() {
+            if index > 0 {
+                stats = stats.child(div().text_color(text_style.color.opacity(0.55)).child("·"));
             }
-            for agent_id in workstream.agent_ids() {
-                match self.registry.attention(agent_id) {
-                    rho_ui_proto::UiAttention::NeedsInput | rho_ui_proto::UiAttention::Pending => {
-                        waiting += 1;
-                    }
-                    rho_ui_proto::UiAttention::Working => working += 1,
-                    rho_ui_proto::UiAttention::Quiet => {}
-                }
-            }
-        }
-        let summary = match (waiting, working) {
-            (0, 0) => "all quiet".to_owned(),
-            (0, working) => format!("{working} working"),
-            (waiting, 0) => format!("{waiting} waiting on you"),
-            (waiting, working) => format!("{waiting} waiting on you · {working} working"),
-        };
-        let usage = self.chatgpt_usage.map(|(used_percent, reset_at_unix)| {
-            let used_percent = used_percent.clamp(0.0, 100.0);
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_secs() as f64;
-            let days = ((reset_at_unix as f64 - now).max(0.0)) / 86_400.0;
-            format!("usage: {used_percent:.0}% · {days:.1} days")
-        });
-        let header = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(10.))
-            .pb(px(26.))
-            .child(div().font_weight(gpui::FontWeight::BOLD).child("rho"))
-            .child(
-                div()
-                    .text_color(text_style.color.opacity(0.55))
-                    .child(summary),
-            );
-        if let Some(usage) = usage {
-            header
+            let days = summary
+                .reset_at_unix
+                .map(|reset| ((reset as f64 - now).max(0.0)) / 86_400.0)
+                .unwrap_or(0.0);
+            let provider_color = if summary.model == "fable" {
+                colors.terminal_ansi_magenta
+            } else {
+                colors.terminal_ansi_cyan
+            };
+            stats = stats
                 .child(
                     div()
-                        .pt(px(5.))
-                        .text_color(text_style.color.opacity(0.7))
-                        .child(usage),
+                        .text_color(provider_color)
+                        .child(summary.model.clone()),
                 )
-                .into_any_element()
-        } else {
-            header.into_any_element()
+                .child(format!(
+                    "{}% −{}% {:.1}d",
+                    summary.remaining_percent, summary.burn_2h, days
+                ));
         }
+        div()
+            .w_full()
+            .h(px(40.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(
+                svg()
+                    .path("icons/rho.svg")
+                    .w(px(31.))
+                    .h_full()
+                    .text_color(colors.text_accent),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(div().font_weight(gpui::FontWeight::BOLD).child("rho"))
+                    .child(
+                        div()
+                            .text_color(text_style.color.opacity(0.75))
+                            .child(stats),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The preview sheet's bottom bar: the previewed agent's name and the

@@ -30,6 +30,8 @@ const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::n
 /// Opaque client-owned view configuration (see
 /// [`AgentReadTxnExt::view_config`]).
 const VIEW_CONFIG: TableDefinition<(), Vec<u8>> = TableDefinition::new("view_config");
+const QUOTA_OBSERVATIONS: TableDefinition<u64, Sen<QuotaObservationRecord>> =
+    TableDefinition::new("quota_observations");
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
@@ -60,6 +62,22 @@ impl CounterKey {
     /// Formerly the topic and then tag id counter; workstreams continue
     /// its sequence.
     pub const LAST_WORKSTREAM_ID: Self = Self(3);
+    pub const LAST_QUOTA_OBSERVATION: Self = Self(4);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum QuotaProvider {
+    ChatGpt,
+    Claude,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct QuotaObservationRecord {
+    pub provider: QuotaProvider,
+    pub model: String,
+    pub observed_at: UnixMillis,
+    pub used_percent: u8,
+    pub reset_at_unix: Option<i64>,
 }
 
 pub use rho_core::{AgentId, AgentIdDomain};
@@ -626,6 +644,7 @@ pub trait AgentReadTxnExt {
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
+    fn quota_observations(&self) -> Vec<QuotaObservationRecord>;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -696,6 +715,8 @@ pub trait AgentWriteTxnExt {
     fn delete_workstream(&mut self, workstream_id: WorkstreamId);
 
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
+    /// Records a changed whole-percentage weekly quota sample.
+    fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -878,6 +899,13 @@ impl AgentReadTxnExt for ReadTxn {
         }
         (next, events)
     }
+
+    fn quota_observations(&self) -> Vec<QuotaObservationRecord> {
+        self.open_table(QUOTA_OBSERVATIONS)
+            .iter()
+            .map(|(_, value)| value.value().into_owned())
+            .collect()
+    }
 }
 
 impl AgentWriteTxnExt for WriteTxn {
@@ -894,6 +922,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(WORKSTREAMS);
         self.open_table(PROJECTS);
         self.open_table(VIEW_CONFIG);
+        self.open_table(QUOTA_OBSERVATIONS);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
@@ -1119,6 +1148,26 @@ impl AgentWriteTxnExt for WriteTxn {
         agent.updated_at = now;
         agents.insert(&agent_id, SenValue::borrowed(&agent));
         AgentEventPos::root(lineage_id)
+    }
+
+    fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool {
+        let unchanged = self
+            .open_table(QUOTA_OBSERVATIONS)
+            .iter()
+            .rev()
+            .map(|(_, value)| value.value().into_owned())
+            .find(|old| old.provider == observation.provider && old.model == observation.model)
+            .is_some_and(|old| {
+                old.used_percent == observation.used_percent
+                    && old.reset_at_unix == observation.reset_at_unix
+            });
+        if unchanged {
+            return false;
+        }
+        let id = next_counter(self, CounterKey::LAST_QUOTA_OBSERVATION);
+        self.open_table(QUOTA_OBSERVATIONS)
+            .insert(&id, SenValue::borrowed(&observation));
+        true
     }
 }
 

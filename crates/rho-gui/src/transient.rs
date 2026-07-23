@@ -271,7 +271,27 @@ pub fn root_menu() -> Transient {
         .item("v", "version", |workspace, _, cx| {
             workspace.cmd_version(cx);
         })
+        .item("u", "usage", |workspace, window, cx| {
+            workspace.open_usage_transient(window, cx);
+        })
         .item("q", "quit", |_, _, cx| cx.quit())
+}
+
+pub fn usage_menu(summaries: &[rho_ui_proto::QuotaSummary]) -> Transient {
+    let mut menu = Transient::new("usage");
+    for summary in summaries {
+        let key = if summary.model == "fable" { "f" } else { "g" };
+        let value = format!(
+            "{}% remaining · 10m −{}% · 2h −{}% · 1d −{}% · 3d −{}%",
+            summary.remaining_percent,
+            summary.burn_10m,
+            summary.burn_2h,
+            summary.burn_1d,
+            summary.burn_3d
+        );
+        menu = menu.infix(key, summary.model.clone(), value, |_, _, _| {});
+    }
+    menu
 }
 
 pub fn new_agent_menu(project: String, workspace: String, role: String) -> Transient {

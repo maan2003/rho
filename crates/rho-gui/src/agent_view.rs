@@ -202,7 +202,6 @@ impl AgentModel {
             });
         }
 
-        crate::banner::insert(&editor, &self.multi_buffer, cx);
         self.transcript
             .attach(&editor, crate::workspace::now_ms(), cx);
         self.editors.push(editor.downgrade());

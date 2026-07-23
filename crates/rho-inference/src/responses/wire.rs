@@ -764,6 +764,23 @@ impl ResponseState {
         let mut updates = Vec::new();
         let index = output_index(event);
         match event["type"].as_str().unwrap_or_default() {
+            "codex.rate_limits" => {
+                if let Some(window) = event
+                    .get("rate_limits")
+                    .and_then(|limits| limits.get("secondary"))
+                    && window
+                        .get("window_minutes")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|minutes| minutes.abs_diff(7 * 24 * 60) <= 7 * 24 * 3)
+                    && let Some(used_percent) = window.get("used_percent").and_then(Value::as_f64)
+                    && used_percent.is_finite()
+                {
+                    updates.push(InferenceEvent::Quota {
+                        used_percent: used_percent.clamp(0.0, 100.0).round() as u8,
+                        reset_at_unix: window.get("reset_at").and_then(Value::as_i64),
+                    });
+                }
+            }
             "response.output_item.added" => {
                 if let Some(item) = event.get("item")
                     && let Some(builder) = builder_from_added(item)?
@@ -1104,5 +1121,47 @@ fn usage_from_event(event: &Value) -> Option<TokenUsage> {
             cached_input_tokens,
             output_tokens,
         })
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn emits_weekly_quota_from_codex_rate_limit_event() {
+        let event = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "secondary": {
+                    "used_percent": 28.2,
+                    "window_minutes": 10080,
+                    "reset_at": 1_783_173_000
+                }
+            }
+        });
+        let (_, updates) = ResponseState::new().apply_event(&event).unwrap();
+        assert!(matches!(
+            updates.as_slice(),
+            [InferenceEvent::Quota {
+                used_percent: 28,
+                reset_at_unix: Some(1_783_173_000)
+            }]
+        ));
+    }
+
+    #[test]
+    fn ignores_non_weekly_quota_window() {
+        let event = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "secondary": {
+                    "used_percent": 28,
+                    "window_minutes": 300
+                }
+            }
+        });
+        let (_, updates) = ResponseState::new().apply_event(&event).unwrap();
+        assert!(updates.is_empty());
     }
 }

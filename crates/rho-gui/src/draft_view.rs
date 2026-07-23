@@ -200,7 +200,6 @@ impl DraftModel {
             editor
         });
 
-        crate::banner::insert(&editor, &self.multi_buffer, cx);
         self.editors.push(editor.downgrade());
         self.insert_workdir_label_to(&editor, cx);
         self.insert_role_label_to(&editor, cx);

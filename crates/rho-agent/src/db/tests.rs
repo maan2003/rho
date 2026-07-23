@@ -8,6 +8,37 @@ use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 
 use super::*;
 
+#[tokio::test]
+async fn quota_history_deduplicates_unchanged_samples() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let sample = QuotaObservationRecord {
+        provider: QuotaProvider::ChatGpt,
+        model: "gpt".to_owned(),
+        observed_at: UnixMs(1),
+        used_percent: 20,
+        reset_at_unix: Some(100),
+    };
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    assert!(write.record_quota_observation(sample.clone()));
+    assert!(!write.record_quota_observation(QuotaObservationRecord {
+        observed_at: UnixMs(2),
+        ..sample.clone()
+    }));
+    assert!(write.record_quota_observation(QuotaObservationRecord {
+        observed_at: UnixMs(3),
+        used_percent: 21,
+        ..sample
+    }));
+    write.commit();
+
+    let history = db.read().quota_observations();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].used_percent, 20);
+    assert_eq!(history[1].used_percent, 21);
+}
+
 #[test]
 fn agent_role_resolves_opinionated_bindings() {
     let profile = |intelligence| {

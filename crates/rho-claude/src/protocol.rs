@@ -125,13 +125,26 @@ pub enum ClaudeEvent {
     Assistant(AssistantMessage),
     CommandLifecycle(CommandLifecycleMessage),
     ControlResponse(ControlResponseMessage),
-    RateLimitEvent,
+    RateLimitEvent(RateLimitEvent),
     Result(ResultMessage),
     System(SystemMessage),
     StreamEvent(StreamEvent),
     User(UserOutputMessage),
     #[serde(other)]
     Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct RateLimitEvent {
+    pub rate_limit_info: RateLimitInfo,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitInfo {
+    pub rate_limit_type: Option<String>,
+    pub resets_at: Option<i64>,
+    pub utilization: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]

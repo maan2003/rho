@@ -644,6 +644,20 @@ pub enum ServerMessage {
         used_percent: f64,
         reset_at_unix: i64,
     },
+    QuotaUsage {
+        summaries: Vec<QuotaSummary>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaSummary {
+    pub model: String,
+    pub remaining_percent: u8,
+    pub burn_10m: u16,
+    pub burn_2h: u16,
+    pub burn_1d: u16,
+    pub burn_3d: u16,
+    pub reset_at_unix: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

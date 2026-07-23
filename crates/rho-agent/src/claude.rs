@@ -96,6 +96,7 @@ impl ClaudeAgent {
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
+            quota_observation: None,
         };
         Ok((
             agent_id,
@@ -221,6 +222,7 @@ impl ClaudeAgent {
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used,
+            quota_observation: None,
         };
         Ok(Self::new(
             db,
@@ -1089,7 +1091,31 @@ impl ClaudeLoop {
                     self.fail(error);
                 }
             }
-            rho_claude::ClaudeEvent::RateLimitEvent => {}
+            rho_claude::ClaudeEvent::RateLimitEvent(event) => {
+                let info = event.rate_limit_info;
+                if info
+                    .rate_limit_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.contains("seven_day"))
+                    && let Some(utilization) = info.utilization
+                    && utilization.is_finite()
+                {
+                    let model = match self.model {
+                        Model::Fable => "fable",
+                        Model::Opus => "opus",
+                        Model::Sonnet => "sonnet",
+                    };
+                    self.state.write().expect("poison").quota_observation =
+                        Some(crate::QuotaObservation {
+                            provider: crate::QuotaProvider::Claude,
+                            model: model.to_owned(),
+                            observed_at: rho_core::UnixMs::now(),
+                            used_percent: (utilization.clamp(0.0, 1.0) * 100.0).round() as u8,
+                            reset_at_unix: info.resets_at,
+                        });
+                    self.notify.notify_waiters();
+                }
+            }
             rho_claude::ClaudeEvent::CommandLifecycle(message) => {
                 self.handle_command_lifecycle(message);
             }
@@ -1441,6 +1467,7 @@ mod tests {
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
+            quota_observation: None,
         };
         state.queued_inputs.push(QueuedItem {
             kind: QueuedItemKind::UserMessage {

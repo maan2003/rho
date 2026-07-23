@@ -57,7 +57,9 @@ pub async fn generate_title(auth: InferenceAuth, user_message: &str) -> anyhow::
             InferenceEvent::TemporaryFailure { .. } => {
                 pending = PendingInferenceResponse::default();
             }
-            InferenceEvent::RequestSent | InferenceEvent::StreamingStarted => {}
+            InferenceEvent::RequestSent
+            | InferenceEvent::StreamingStarted
+            | InferenceEvent::Quota { .. } => {}
         }
     };
     let text = items
