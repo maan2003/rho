@@ -48,7 +48,7 @@
         "hint": "oklch(56.0% 0.012 100)",
         "players": [
           {
-            "cursor": "oklch(72.0% 0.110 105)",
+            "cursor": "oklch(74.0% 0.010 100)",
             "background": "oklch(93.4% 0.031 90.0)",
             "selection": "oklch(68.0% 0.040 105 / 0.20)"
           }
@@ -133,7 +133,7 @@
             "color": "oklch(63.1% 0.145 86.4)"
           },
           "text.literal": {
-            "color": "oklch(72.0% 0.050 90)"
+            "color": "oklch(76.0% 0.075 90)"
           },
           "strikethrough": {
             "color": "oklch(56.0% 0.012 100)"
