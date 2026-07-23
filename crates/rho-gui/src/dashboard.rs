@@ -576,10 +576,9 @@ impl Dashboard {
         });
     }
 
-    /// Splices the attention lamps in as ` ●` inlays at each row's end —
-    /// state chrome the cursor never lands on — and colors them per level.
+    /// Splices status indicators at each row's end — state chrome the cursor
+    /// never lands on — and distinguishes activity from attention by shape.
     fn apply_lamps(&mut self, lines: &[Line], cx: &mut Context<Workspace>) {
-        const LAMP_TEXT: &str = " ●";
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let to_remove = std::mem::take(&mut self.lamp_ids);
         let mut inlays = Vec::new();
@@ -595,6 +594,7 @@ impl Dashboard {
             let Some(class) = line.lamp.and_then(DashClass::lamp) else {
                 continue;
             };
+            let indicator = class.indicator();
             let Some(buffer) = self.buffers.get(&line.key) else {
                 continue;
             };
@@ -604,12 +604,12 @@ impl Dashboard {
             else {
                 continue;
             };
-            let inlay = Inlay::custom(index, position, LAMP_TEXT);
+            let inlay = Inlay::custom(index, position, indicator);
             if let Some((_, highlights)) = by_class.iter_mut().find(|(entry, _)| *entry == class) {
                 highlights.push(InlayHighlight {
                     inlay: inlay.id,
                     inlay_position: position,
-                    range: 0..LAMP_TEXT.len(),
+                    range: 0..indicator.len(),
                 });
             }
             self.lamp_ids.push(inlay.id);
@@ -619,9 +619,8 @@ impl Dashboard {
             editor.splice_inlays(&to_remove, inlays, cx);
             for (class, highlights) in by_class {
                 // `highlight_inlays` only ever inserts per inlay id; without
-                // the clear, a lamp that was once Working keeps its old entry
-                // under the Working key and stays cyan after the attention
-                // moves on.
+                // the clear, an indicator that changes state keeps its old
+                // highlight entry after the attention moves on.
                 editor.clear_highlights(class.lamp_key(), cx);
                 if !highlights.is_empty() {
                     editor.highlight_inlays(class.lamp_key(), highlights, class.style(cx), cx);
@@ -773,7 +772,7 @@ impl DashClass {
         let colors = cx.theme().colors();
         let color = match self {
             DashClass::Muted => colors.text_muted,
-            DashClass::Working => colors.terminal_ansi_cyan,
+            DashClass::Working => colors.text_muted,
             DashClass::Pending => colors.terminal_ansi_yellow,
             DashClass::NeedsInput => colors.terminal_ansi_red,
             DashClass::Urgent => return HighlightStyle::default(),
@@ -790,6 +789,15 @@ impl DashClass {
             UiAttention::Working => Some(DashClass::Working),
             UiAttention::Pending => Some(DashClass::Pending),
             UiAttention::NeedsInput => Some(DashClass::NeedsInput),
+        }
+    }
+
+    fn indicator(self) -> &'static str {
+        match self {
+            DashClass::Working => " …",
+            DashClass::Pending => " ●",
+            DashClass::NeedsInput => " ◆",
+            DashClass::Muted | DashClass::Urgent => "",
         }
     }
 }

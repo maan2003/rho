@@ -97,7 +97,7 @@ impl StyleClass {
             Self::StatusError => (colors.terminal_ansi_red.into(), false),
             Self::StatusCancelled => (colors.terminal_ansi_yellow.into(), false),
             Self::Time => (colors.text_muted.into(), false),
-            Self::AgentMessage => (colors.terminal_ansi_magenta.into(), false),
+            Self::AgentMessage => (agent_message_color(cx), false),
             Self::ShellPrompt => (colors.terminal_ansi_green.into(), false),
             Self::ShellCommand => (colors.text_accent.into(), false),
             Self::Syntax(id) => {
@@ -130,7 +130,15 @@ pub fn user_prompt_gutter_color(cx: &App) -> Hsla {
 }
 
 pub fn agent_message_gutter_color(cx: &App) -> Hsla {
-    cx.theme().colors().terminal_ansi_magenta.into()
+    agent_message_color(cx)
+}
+
+fn agent_message_color(cx: &App) -> Hsla {
+    cx.theme()
+        .colors()
+        .terminal_ansi_yellow
+        .opacity(0.75)
+        .into()
 }
 
 pub fn cwd_chip_style(cx: &App) -> HighlightStyle {

@@ -13,11 +13,11 @@
         "elevated_surface.background": "oklch(27.4% 0.020 150)",
         "border": "oklch(27.4% 0.020 150)",
         "border.variant": "oklch(27.4% 0.020 150)",
-        "border.focused": "oklch(71.8% 0.170 244.8)",
+        "border.focused": "oklch(71.8% 0.120 125)",
         "text": "oklch(70.0% 0.010 150)",
         "text.muted": "oklch(53.5% 0.012 150)",
         "text.placeholder": "oklch(53.5% 0.012 150)",
-        "text.accent": "oklch(71.8% 0.075 244.8)",
+        "text.accent": "oklch(71.8% 0.075 125)",
         "icon": "oklch(70.0% 0.010 150)",
         "icon.muted": "oklch(53.5% 0.012 150)",
         "element.background": "oklch(27.4% 0.020 150)",
@@ -39,9 +39,9 @@
         "pane_group.border": "oklch(27.4% 0.020 150)",
         "created": "oklch(63.1% 0.168 118.8)",
         "modified": "oklch(63.1% 0.145 86.4)",
-        "deleted": "oklch(63.1% 0.260 21.6)",
+        "deleted": "oklch(63.1% 0.160 21.6)",
         "conflict": "oklch(63.1% 0.120 50.4)",
-        "error": "oklch(63.1% 0.260 21.6)",
+        "error": "oklch(63.1% 0.160 21.6)",
         "warning": "oklch(63.1% 0.145 86.4)",
         "info": "oklch(63.1% 0.195 244.8)",
         "success": "oklch(63.1% 0.168 118.8)",
@@ -50,7 +50,7 @@
           {
             "cursor": "oklch(70.0% 0.010 150)",
             "background": "oklch(93.4% 0.031 90.0)",
-            "selection": "oklch(78.0% 0.130 244.8 / 0.35)"
+            "selection": "oklch(78.0% 0.080 125 / 0.30)"
           }
         ],
         "syntax": {
@@ -73,7 +73,7 @@
             "color": "oklch(63.1% 0.260 349.2)"
           },
           "operator": {
-            "color": "oklch(63.1% 0.260 21.6)"
+            "color": "oklch(63.1% 0.160 21.6)"
           },
           "preproc": {
             "color": "oklch(63.1% 0.120 50.4)"
@@ -133,7 +133,7 @@
             "color": "oklch(63.1% 0.145 86.4)"
           },
           "text.literal": {
-            "color": "oklch(63.1% 0.168 118.8)"
+            "color": "oklch(68.0% 0.045 95)"
           },
           "strikethrough": {
             "color": "oklch(53.5% 0.012 150)"
@@ -148,14 +148,13 @@
             "color": "oklch(63.1% 0.168 118.8)"
           },
           "diff.minus": {
-            "color": "oklch(63.1% 0.260 21.6)"
+            "color": "oklch(63.1% 0.160 21.6)"
           },
           "predictive": {
             "color": "oklch(53.5% 0.012 150)",
             "font_style": "italic"
           },
           "emphasis": {
-            "color": "oklch(63.1% 0.140 187.2)",
             "font_style": "italic"
           },
           "emphasis.strong": {
@@ -168,7 +167,7 @@
         "terminal.dim_foreground": "oklch(53.5% 0.012 150)",
         "terminal.ansi.background": "oklch(18.85% 0.018 150)",
         "terminal.ansi.black": "oklch(27.3% 0.020 150)",
-        "terminal.ansi.red": "oklch(63.1% 0.260 21.6)",
+        "terminal.ansi.red": "oklch(63.1% 0.160 21.6)",
         "terminal.ansi.green": "oklch(63.1% 0.168 118.8)",
         "terminal.ansi.yellow": "oklch(63.1% 0.145 86.4)",
         "terminal.ansi.blue": "oklch(63.1% 0.195 244.8)",
