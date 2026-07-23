@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use editor::hover_links::InlayHighlight;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable as _, FontWeight, HighlightStyle, Window};
+use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
@@ -737,7 +737,7 @@ enum DashClass {
     Working,
     Pending,
     NeedsInput,
-    /// Attention at pending or above: the title asks for the eye.
+    /// Attention at pending or above. The adjacent lamp carries the emphasis.
     Urgent,
 }
 
@@ -776,12 +776,7 @@ impl DashClass {
             DashClass::Working => colors.terminal_ansi_cyan,
             DashClass::Pending => colors.terminal_ansi_yellow,
             DashClass::NeedsInput => colors.terminal_ansi_red,
-            DashClass::Urgent => {
-                return HighlightStyle {
-                    font_weight: Some(FontWeight::BOLD),
-                    ..HighlightStyle::default()
-                };
-            }
+            DashClass::Urgent => return HighlightStyle::default(),
         };
         HighlightStyle {
             color: Some(color.into()),

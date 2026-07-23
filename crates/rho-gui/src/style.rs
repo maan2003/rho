@@ -89,15 +89,16 @@ impl StyleClass {
             Self::SystemInfo => (colors.text_muted.into(), false),
             Self::SystemImportant => (colors.terminal_ansi_yellow.into(), true),
             Self::Disconnect => (colors.terminal_ansi_red.into(), false),
-            Self::ToolName => (colors.terminal_ansi_yellow.into(), false),
-            Self::ToolShell | Self::ToolDetail => (hint_color(cx), false),
+            Self::ToolName | Self::ToolShell | Self::ToolDetail => {
+                (colors.text_muted.into(), false)
+            }
             Self::StatusRunning => (colors.terminal_ansi_cyan.into(), false),
             Self::StatusOk => (colors.terminal_ansi_green.into(), false),
             Self::StatusError => (colors.terminal_ansi_red.into(), false),
             Self::StatusCancelled => (colors.terminal_ansi_yellow.into(), false),
             Self::Time => (colors.text_muted.into(), false),
             Self::AgentMessage => (colors.terminal_ansi_magenta.into(), false),
-            Self::ShellPrompt => (colors.terminal_ansi_green.into(), true),
+            Self::ShellPrompt => (colors.terminal_ansi_green.into(), false),
             Self::ShellCommand => (colors.text_accent.into(), false),
             Self::Syntax(id) => {
                 return cx
@@ -142,7 +143,6 @@ pub fn cwd_chip_style(cx: &App) -> HighlightStyle {
 pub fn workspace_chip_style(cx: &App) -> HighlightStyle {
     HighlightStyle {
         color: Some(cx.theme().colors().terminal_ansi_green.into()),
-        font_weight: Some(FontWeight::BOLD),
         ..HighlightStyle::default()
     }
 }
@@ -162,7 +162,6 @@ pub fn role_chip_style(family: RoleFamily, cx: &App) -> HighlightStyle {
     };
     HighlightStyle {
         color: Some(color.into()),
-        font_weight: Some(FontWeight::BOLD),
         ..HighlightStyle::default()
     }
 }

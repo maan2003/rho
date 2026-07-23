@@ -40,7 +40,7 @@
         "created": "oklch(63.1% 0.168 118.8)",
         "modified": "oklch(63.1% 0.145 86.4)",
         "deleted": "oklch(63.1% 0.260 21.6)",
-        "conflict": "oklch(63.1% 0.185 50.4)",
+        "conflict": "oklch(63.1% 0.120 50.4)",
         "error": "oklch(63.1% 0.260 21.6)",
         "warning": "oklch(63.1% 0.145 86.4)",
         "info": "oklch(63.1% 0.195 244.8)",
@@ -76,7 +76,7 @@
             "color": "oklch(63.1% 0.260 21.6)"
           },
           "preproc": {
-            "color": "oklch(63.1% 0.185 50.4)"
+            "color": "oklch(63.1% 0.120 50.4)"
           },
           "type": {
             "color": "oklch(63.1% 0.145 86.4)"
@@ -100,7 +100,7 @@
             "color": "oklch(70.0% 0.000 0.0)"
           },
           "label": {
-            "color": "oklch(63.1% 0.185 50.4)"
+            "color": "oklch(63.1% 0.120 50.4)"
           },
           "lifetime": {
             "color": "oklch(63.1% 0.140 187.2)"
@@ -112,7 +112,7 @@
             "color": "oklch(63.1% 0.145 86.4)"
           },
           "variant": {
-            "color": "oklch(63.1% 0.185 50.4)"
+            "color": "oklch(63.1% 0.120 50.4)"
           },
           "punctuation": {
             "color": "oklch(70.0% 0.000 0.0)"
@@ -159,7 +159,6 @@
             "font_style": "italic"
           },
           "emphasis.strong": {
-            "color": "oklch(63.1% 0.185 50.4)",
             "font_weight": 700
           }
         },
