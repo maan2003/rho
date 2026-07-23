@@ -1,0 +1,190 @@
+{
+  "$schema": "https://zed.dev/schema/themes/v0.2.0.json",
+  "author": "Maan2003, based on OKSolar by Zack Voase",
+  "name": "Rho OKSolar P3",
+  "themes": [
+    {
+      "appearance": "dark",
+      "name": "Rho OKSolar P3",
+      "style": {
+        "background.appearance": "opaque",
+        "background": "oklch(27.4% 0.050 219.6)",
+        "surface.background": "oklch(27.4% 0.050 219.6)",
+        "elevated_surface.background": "oklch(32.1% 0.053 219.6)",
+        "border": "oklch(32.1% 0.053 219.6)",
+        "border.variant": "oklch(32.1% 0.053 219.6)",
+        "border.focused": "oklch(71.8% 0.170 244.8)",
+        "text": "oklch(71.8% 0.017 198.0)",
+        "text.muted": "oklch(53.5% 0.029 219.6)",
+        "text.placeholder": "oklch(53.5% 0.029 219.6)",
+        "text.accent": "oklch(71.8% 0.170 244.8)",
+        "icon": "oklch(71.8% 0.017 198.0)",
+        "icon.muted": "oklch(53.5% 0.029 219.6)",
+        "element.background": "oklch(32.1% 0.053 219.6)",
+        "element.hover": "oklch(37.0% 0.050 219.6)",
+        "element.active": "oklch(41.0% 0.045 219.6)",
+        "element.selected": "oklch(41.0% 0.045 219.6)",
+        "ghost_element.hover": "oklch(32.1% 0.053 219.6)",
+        "ghost_element.active": "oklch(37.0% 0.050 219.6)",
+        "ghost_element.selected": "oklch(37.0% 0.050 219.6)",
+        "editor.background": "oklch(27.4% 0.050 219.6)",
+        "editor.foreground": "oklch(71.8% 0.017 198.0)",
+        "editor.gutter.background": "oklch(27.4% 0.050 219.6)",
+        "editor.subheader.background": "oklch(32.1% 0.053 219.6)",
+        "editor.active_line.background": "oklch(32.1% 0.053 219.6)",
+        "editor.highlighted_line.background": "oklch(37.0% 0.050 219.6)",
+        "search.match_background": "oklch(63.1% 0.145 86.4 / 0.25)",
+        "panel.background": "oklch(27.4% 0.050 219.6)",
+        "pane.focused_border": "oklch(53.5% 0.029 219.6)",
+        "pane_group.border": "oklch(32.1% 0.053 219.6)",
+        "created": "oklch(63.1% 0.168 118.8)",
+        "modified": "oklch(63.1% 0.145 86.4)",
+        "deleted": "oklch(63.1% 0.260 21.6)",
+        "conflict": "oklch(63.1% 0.185 50.4)",
+        "error": "oklch(63.1% 0.260 21.6)",
+        "warning": "oklch(63.1% 0.145 86.4)",
+        "info": "oklch(63.1% 0.195 244.8)",
+        "success": "oklch(63.1% 0.168 118.8)",
+        "hint": "oklch(53.5% 0.029 219.6)",
+        "players": [
+          {
+            "cursor": "oklch(71.8% 0.030 198.0)",
+            "background": "oklch(71.8% 0.030 198.0)",
+            "selection": "oklch(71.8% 0.170 244.8 / 0.25)"
+          }
+        ],
+        "syntax": {
+          "comment": {
+            "color": "oklch(53.5% 0.029 219.6)"
+          },
+          "string": {
+            "color": "oklch(63.1% 0.168 118.8)"
+          },
+          "number": {
+            "color": "oklch(63.1% 0.180 280.8)"
+          },
+          "boolean": {
+            "color": "oklch(63.1% 0.260 349.2)"
+          },
+          "constant": {
+            "color": "oklch(63.1% 0.180 280.8)"
+          },
+          "keyword": {
+            "color": "oklch(63.1% 0.260 349.2)"
+          },
+          "operator": {
+            "color": "oklch(63.1% 0.260 21.6)"
+          },
+          "preproc": {
+            "color": "oklch(63.1% 0.185 50.4)"
+          },
+          "type": {
+            "color": "oklch(63.1% 0.145 86.4)"
+          },
+          "constructor": {
+            "color": "oklch(63.1% 0.145 86.4)"
+          },
+          "function": {
+            "color": "oklch(63.1% 0.195 244.8)"
+          },
+          "tag": {
+            "color": "oklch(63.1% 0.260 349.2)"
+          },
+          "attribute": {
+            "color": "oklch(63.1% 0.145 86.4)"
+          },
+          "property": {
+            "color": "oklch(71.8% 0.017 198.0)"
+          },
+          "variable": {
+            "color": "oklch(71.8% 0.017 198.0)"
+          },
+          "label": {
+            "color": "oklch(63.1% 0.185 50.4)"
+          },
+          "lifetime": {
+            "color": "oklch(63.1% 0.140 187.2)"
+          },
+          "namespace": {
+            "color": "oklch(71.8% 0.017 198.0)"
+          },
+          "enum": {
+            "color": "oklch(63.1% 0.145 86.4)"
+          },
+          "variant": {
+            "color": "oklch(63.1% 0.185 50.4)"
+          },
+          "punctuation": {
+            "color": "oklch(71.8% 0.017 198.0)"
+          },
+          "embedded": {
+            "color": "oklch(71.8% 0.017 198.0)"
+          },
+          "primary": {
+            "color": "oklch(71.8% 0.030 198.0)"
+          },
+          "hint": {
+            "color": "oklch(53.5% 0.029 219.6)"
+          },
+          "selector": {
+            "color": "oklch(63.1% 0.168 118.8)"
+          },
+          "title": {
+            "color": "oklch(63.1% 0.145 86.4)"
+          },
+          "text.literal": {
+            "color": "oklch(63.1% 0.168 118.8)"
+          },
+          "strikethrough": {
+            "color": "oklch(53.5% 0.029 219.6)"
+          },
+          "link_text": {
+            "color": "oklch(63.1% 0.195 244.8)"
+          },
+          "link_uri": {
+            "color": "oklch(63.1% 0.140 187.2)"
+          },
+          "diff.plus": {
+            "color": "oklch(63.1% 0.168 118.8)"
+          },
+          "diff.minus": {
+            "color": "oklch(63.1% 0.260 21.6)"
+          },
+          "predictive": {
+            "color": "oklch(53.5% 0.029 219.6)",
+            "font_style": "italic"
+          },
+          "emphasis": {
+            "color": "oklch(63.1% 0.140 187.2)",
+            "font_style": "italic"
+          },
+          "emphasis.strong": {
+            "color": "oklch(63.1% 0.185 50.4)",
+            "font_weight": 700
+          }
+        },
+        "terminal.background": "oklch(27.4% 0.050 219.6)",
+        "terminal.foreground": "oklch(71.8% 0.017 198.0)",
+        "terminal.bright_foreground": "oklch(93.4% 0.031 90.0)",
+        "terminal.dim_foreground": "oklch(53.5% 0.029 219.6)",
+        "terminal.ansi.background": "oklch(27.4% 0.050 219.6)",
+        "terminal.ansi.black": "oklch(27.4% 0.050 219.6)",
+        "terminal.ansi.red": "oklch(63.1% 0.260 21.6)",
+        "terminal.ansi.green": "oklch(63.1% 0.168 118.8)",
+        "terminal.ansi.yellow": "oklch(63.1% 0.145 86.4)",
+        "terminal.ansi.blue": "oklch(63.1% 0.195 244.8)",
+        "terminal.ansi.magenta": "oklch(63.1% 0.260 349.2)",
+        "terminal.ansi.cyan": "oklch(63.1% 0.140 187.2)",
+        "terminal.ansi.white": "oklch(71.8% 0.017 198.0)",
+        "terminal.ansi.bright_black": "oklch(53.5% 0.029 219.6)",
+        "terminal.ansi.bright_red": "oklch(71.8% 0.220 21.6)",
+        "terminal.ansi.bright_green": "oklch(71.8% 0.190 118.8)",
+        "terminal.ansi.bright_yellow": "oklch(71.8% 0.165 86.4)",
+        "terminal.ansi.bright_blue": "oklch(71.8% 0.165 244.8)",
+        "terminal.ansi.bright_magenta": "oklch(71.8% 0.260 349.2)",
+        "terminal.ansi.bright_cyan": "oklch(71.8% 0.165 187.2)",
+        "terminal.ansi.bright_white": "oklch(93.4% 0.031 90.0)"
+      }
+    }
+  ]
+}

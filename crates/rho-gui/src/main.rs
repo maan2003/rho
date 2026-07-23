@@ -547,6 +547,12 @@ fn bind_rho_key_overrides(cx: &mut App) {
 
 const DEFAULT_SETTINGS: &str = r#"// Rho GUI user settings. Values here override bundled defaults.
 {
+  "theme": "Rho OKSolar P3"
+}
+"#;
+
+const LEGACY_DEFAULT_SETTINGS: &str = r#"// Rho GUI user settings. Values here override bundled defaults.
+{
   "theme": "Rho Monokai P3"
 }
 "#;
@@ -558,6 +564,12 @@ fn settings_path() -> Result<PathBuf> {
 
 fn load_or_create_settings(path: &Path) -> Result<String> {
     match fs::read_to_string(path) {
+        Ok(settings) if settings == LEGACY_DEFAULT_SETTINGS => {
+            fs::write(path, DEFAULT_SETTINGS).with_context(|| {
+                format!("failed to update default settings at {}", path.display())
+            })?;
+            Ok(DEFAULT_SETTINGS.to_owned())
+        }
         Ok(settings) => Ok(settings),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
