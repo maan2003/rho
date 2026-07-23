@@ -828,6 +828,7 @@ mod tests {
                 previous_attempt: None,
             },
             context_used: None,
+            quota_observation: None,
         }
     }
 
@@ -865,6 +866,7 @@ mod tests {
                 error: Arc::new(message.to_owned()),
             }),
             context_used: None,
+            quota_observation: None,
         }
     }
 
@@ -883,6 +885,7 @@ mod tests {
             queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
+            quota_observation: None,
         }
     }
 
@@ -917,6 +920,7 @@ mod tests {
             queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
+            quota_observation: None,
         }
     }
 
@@ -950,6 +954,7 @@ mod tests {
                 waiting: None,
             },
             context_used: None,
+            quota_observation: None,
         }
     }
 
