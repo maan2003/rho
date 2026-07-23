@@ -32,6 +32,7 @@ pub enum StyleClass {
     StatusCancelled,
     Time,
     AgentMessage,
+    AgentLabel,
     ShellPrompt,
     ShellCommand,
     /// Tree-sitter highlight, by syntax-theme index (see
@@ -71,6 +72,7 @@ impl StyleClass {
             Self::AgentMessage => 13,
             Self::ShellPrompt => 14,
             Self::ShellCommand => 15,
+            Self::AgentLabel => 16,
             Self::Syntax(id) => SYNTAX_KEY_BASE + id as usize,
         };
         let region_bit = match region {
@@ -97,7 +99,8 @@ impl StyleClass {
             Self::StatusError => (colors.terminal_ansi_red.into(), false),
             Self::StatusCancelled => (colors.terminal_ansi_yellow.into(), false),
             Self::Time => (colors.text_muted.into(), false),
-            Self::AgentMessage => (agent_message_color(cx), false),
+            Self::AgentMessage => (colors.text.into(), false),
+            Self::AgentLabel => (agent_message_color(cx), false),
             Self::ShellPrompt => (colors.terminal_ansi_green.into(), false),
             Self::ShellCommand => (colors.text_accent.into(), false),
             Self::Syntax(id) => {
@@ -134,11 +137,7 @@ pub fn agent_message_gutter_color(cx: &App) -> Hsla {
 }
 
 fn agent_message_color(cx: &App) -> Hsla {
-    cx.theme()
-        .colors()
-        .terminal_ansi_yellow
-        .opacity(0.75)
-        .into()
+    cx.theme().colors().terminal_ansi_cyan.into()
 }
 
 pub fn cwd_chip_style(cx: &App) -> HighlightStyle {

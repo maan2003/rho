@@ -773,8 +773,8 @@ impl DashClass {
         let color = match self {
             DashClass::Muted => colors.text_muted,
             DashClass::Working => colors.text_muted,
-            DashClass::Pending => colors.terminal_ansi_yellow,
-            DashClass::NeedsInput => colors.terminal_ansi_red,
+            DashClass::Pending => colors.text_accent.opacity(0.65),
+            DashClass::NeedsInput => colors.text_accent,
             DashClass::Urgent => return HighlightStyle::default(),
         };
         HighlightStyle {

@@ -158,7 +158,7 @@ pub fn render_block_with_agent_labels(
             spans.extend(separator(prev, kind));
             spans.push(Span::new(
                 format!("from {}\n", agent_label(*sender)),
-                StyleClass::SystemInfo,
+                StyleClass::AgentLabel,
             ));
             gutter_span = Some(spans.len());
             spans.push(Span::new(format!("{text}\n\n"), StyleClass::AgentMessage));
@@ -175,7 +175,7 @@ pub fn render_block_with_agent_labels(
             if let Some(sender) = sender {
                 spans.push(Span::new(
                     format!("from {}\n", agent_label(*sender)),
-                    StyleClass::SystemInfo,
+                    StyleClass::AgentLabel,
                 ));
             }
             gutter_span = Some(spans.len());
