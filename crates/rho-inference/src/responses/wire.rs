@@ -767,11 +767,15 @@ impl ResponseState {
             "codex.rate_limits" => {
                 if let Some(window) = event
                     .get("rate_limits")
-                    .and_then(|limits| limits.get("secondary"))
-                    && window
-                        .get("window_minutes")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|minutes| minutes.abs_diff(7 * 24 * 60) <= 7 * 24 * 3)
+                    .into_iter()
+                    .flat_map(|limits| [limits.get("primary"), limits.get("secondary")])
+                    .flatten()
+                    .find(|window| {
+                        window
+                            .get("window_minutes")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|minutes| minutes.abs_diff(7 * 24 * 60) <= 7 * 24 * 3)
+                    })
                     && let Some(used_percent) = window.get("used_percent").and_then(Value::as_f64)
                     && used_percent.is_finite()
                 {
@@ -1133,7 +1137,7 @@ mod quota_tests {
         let event = serde_json::json!({
             "type": "codex.rate_limits",
             "rate_limits": {
-                "secondary": {
+                "primary": {
                     "used_percent": 28.2,
                     "window_minutes": 10080,
                     "reset_at": 1_783_173_000

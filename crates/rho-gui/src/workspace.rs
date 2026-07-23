@@ -3306,11 +3306,12 @@ impl Workspace {
             .items_center()
             .gap(px(10.))
             .child(
-                svg()
-                    .path("icons/rho.svg")
-                    .w(px(31.))
-                    .h_full()
-                    .text_color(colors.text_accent),
+                div().w(px(40.)).h_full().p(px(4.)).child(
+                    svg()
+                        .path("icons/rho.svg")
+                        .size_full()
+                        .text_color(colors.text_accent),
+                ),
             )
             .child(
                 div()

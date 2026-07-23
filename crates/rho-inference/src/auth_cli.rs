@@ -313,10 +313,7 @@ pub fn chatgpt_weekly_usage(name: impl AsRef<str>) -> Result<Option<ChatGptUsage
     let resolved = auth.resolve().context("resolving OAuth credentials")?;
     let status = fetch_rate_limit_status(&resolved.bearer_token, resolved.account_id.as_deref())
         .context("fetching ChatGPT rate limits")?;
-    let Some(window) = status
-        .rate_limit
-        .as_ref()
-        .and_then(|rate_limit| rate_limit.secondary_window.as_ref())
+    let Some(window) = status.rate_limit.as_ref().and_then(weekly_window)
     else {
         return Ok(None);
     };
@@ -332,6 +329,18 @@ pub fn chatgpt_weekly_usage(name: impl AsRef<str>) -> Result<Option<ChatGptUsage
         used_percent: window.used_percent,
         reset_at_unix,
     }))
+}
+
+fn weekly_window(rate_limit: &RateLimitDetails) -> Option<&RateLimitWindow> {
+    rate_limit
+        .primary_window
+        .iter()
+        .chain(rate_limit.secondary_window.iter())
+        .find(|window| {
+            window
+                .limit_window_seconds
+                .is_some_and(|seconds| seconds.abs_diff(7 * 24 * 60 * 60) <= 7 * 24 * 60 * 3)
+        })
 }
 
 fn fetch_rate_limit_status(
@@ -441,4 +450,30 @@ struct AdditionalRateLimit {
 #[derive(Debug, Deserialize)]
 struct RateLimitResetCredits {
     available_count: i64,
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn finds_weekly_window_regardless_of_position() {
+        let window = |seconds| RateLimitWindow {
+            used_percent: 32.0,
+            limit_window_seconds: Some(seconds),
+            reset_after_seconds: None,
+            reset_at: Some(123),
+        };
+        let primary = RateLimitDetails {
+            primary_window: Some(window(7 * 24 * 60 * 60)),
+            secondary_window: Some(window(5 * 60 * 60)),
+        };
+        assert_eq!(weekly_window(&primary).unwrap().reset_at, Some(123));
+
+        let secondary = RateLimitDetails {
+            primary_window: Some(window(5 * 60 * 60)),
+            secondary_window: Some(window(7 * 24 * 60 * 60)),
+        };
+        assert_eq!(weekly_window(&secondary).unwrap().reset_at, Some(123));
+    }
 }
