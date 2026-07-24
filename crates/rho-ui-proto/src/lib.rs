@@ -657,6 +657,7 @@ pub enum ServerMessage {
     },
     AgentUsage {
         agent_id: AgentId,
+        model: String,
         buckets: Vec<AgentUsageBucket>,
         total: AgentUsageBucket,
     },

@@ -148,6 +148,7 @@ pub struct Workspace {
     agent_usage: HashMap<
         rho_ui_proto::AgentId,
         (
+            String,
             Vec<rho_ui_proto::AgentUsageBucket>,
             rho_ui_proto::AgentUsageBucket,
         ),
@@ -633,19 +634,21 @@ impl Workspace {
             }
             ConnEvent::AgentUsage {
                 agent_id,
+                model,
                 buckets,
                 total,
             } => {
                 self.agent_usage
-                    .insert(agent_id, (buckets.clone(), total.clone()));
+                    .insert(agent_id, (model.clone(), buckets.clone(), total.clone()));
                 if self
                     .transient
                     .as_ref()
-                    .is_some_and(|transient| transient.title() == "agent usage")
+                    .is_some_and(|transient| transient.title() == "agent cost")
                     && self.active_usage_agent == Some(agent_id)
                 {
                     self.transient = Some(crate::transient::agent_usage_menu(
                         self.registry.agent_display_label(agent_id),
+                        model,
                         buckets,
                         total,
                     ));
@@ -3044,10 +3047,11 @@ impl Workspace {
             agent_id,
             since_ms: now_ms().saturating_sub(7 * 24 * 60 * 60 * 1_000),
         });
-        let (buckets, total) = self.agent_usage.get(&agent_id).cloned().unwrap_or_default();
+        let (model, buckets, total) = self.agent_usage.get(&agent_id).cloned().unwrap_or_default();
         self.open_transient(
             crate::transient::agent_usage_menu(
                 self.registry.agent_display_label(agent_id),
+                model,
                 buckets,
                 total,
             ),
@@ -3070,7 +3074,7 @@ impl Workspace {
                 }
             },
         );
-        self.open_prompt("agent usage:", complete, on_submit, window, cx);
+        self.open_prompt("agent cost:", complete, on_submit, window, cx);
     }
 
     pub(crate) fn prompt_new_agent_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {

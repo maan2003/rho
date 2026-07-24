@@ -9,8 +9,8 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use rho_agent::db::{
-    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _, QuotaModel,
-    QuotaObservationRecord, QuotaProvider, WorkstreamId,
+    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime,
+    AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider, WorkstreamId,
 };
 use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
@@ -2279,6 +2279,10 @@ async fn handle_message(
         ClientMessage::AgentUsage { agent_id, since_ms } => {
             agents.pool.flush_agent_usage(Some(agent_id)).await;
             let read = agents.db.read();
+            let model = match read.get_agent(agent_id).runtime {
+                AgentRuntime::Rho { .. } => "gpt-5.6-sol",
+                AgentRuntime::Claude { .. } => "claude-fable-5",
+            };
             let buckets = read
                 .agent_usage(agent_id, rho_core::UnixMs(since_ms))
                 .into_iter()
@@ -2287,6 +2291,7 @@ async fn handle_message(
             let total = ui_agent_usage_bucket(read.agent_usage_total(agent_id));
             let _ = outgoing_tx.send(ServerMessage::AgentUsage {
                 agent_id,
+                model: model.to_owned(),
                 buckets,
                 total,
             });

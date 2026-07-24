@@ -42,6 +42,7 @@ pub struct Transient {
     quota_usage: Option<Vec<rho_ui_proto::QuotaSeries>>,
     agent_usage: Option<(
         String,
+        String,
         Vec<rho_ui_proto::AgentUsageBucket>,
         rho_ui_proto::AgentUsageBucket,
     )>,
@@ -218,27 +219,22 @@ impl Transient {
                 )
                 .into_any_element();
         }
-        if let Some((label, buckets, total)) = &self.agent_usage {
+        if let Some((label, model, buckets, total)) = &self.agent_usage {
             let buckets = buckets.clone();
+            let model = model.clone();
             let line: Hsla = colors.terminal_ansi_cyan.into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
-            let total_tokens = total.input_tokens
-                + total.cache_read_tokens
-                + total.cache_write_tokens
-                + total.output_tokens;
+            let total_cost = agent_bucket_cost_usd(total, model.as_str());
             return bottom_strip(text_style, cx)
                 .child(
                     div()
                         .px_2()
                         .font_weight(gpui::FontWeight::BOLD)
-                        .child(format!("usage · {label}")),
+                        .child(format!("cost · {label}")),
                 )
                 .child(div().px_2().text_color(muted).child(format!(
-                    "{total_tokens} tokens · {} requests · input {} · cache {} · output {}{}",
+                    "${total_cost:.2} estimated API cost · {} requests · {model}{}",
                     total.requests,
-                    total.input_tokens,
-                    total.cache_read_tokens + total.cache_write_tokens,
-                    total.output_tokens,
                     if total.approximate {
                         " · includes approximate backfill"
                     } else {
@@ -250,7 +246,7 @@ impl Transient {
                         div()
                             .w(px(832.))
                             .h(px(240.))
-                            .child(agent_usage_chart(buckets, line, grid)),
+                            .child(agent_usage_chart(buckets, model, line, grid)),
                     ),
                 )
                 .into_any_element();
@@ -399,7 +395,7 @@ pub fn usage_root_menu() -> Transient {
         .item_when(
             Workspace::has_selected_agent,
             "a",
-            "current agent tokens",
+            "current agent cost",
             |workspace, window, cx| workspace.open_agent_usage_transient(window, cx),
         )
         .item("s", "agent by handle…", |workspace, window, cx| {
@@ -415,11 +411,12 @@ pub fn usage_menu(series: Vec<rho_ui_proto::QuotaSeries>) -> Transient {
 
 pub fn agent_usage_menu(
     label: String,
+    model: String,
     buckets: Vec<rho_ui_proto::AgentUsageBucket>,
     total: rho_ui_proto::AgentUsageBucket,
 ) -> Transient {
-    let mut menu = Transient::new("agent usage");
-    menu.agent_usage = Some((label, buckets, total));
+    let mut menu = Transient::new("agent cost");
+    menu.agent_usage = Some((label, model, buckets, total));
     menu
 }
 
@@ -498,6 +495,7 @@ fn paint_usage_segment(points: &[Point<Pixels>], color: Hsla, window: &mut Windo
 
 fn agent_usage_chart(
     buckets: Vec<rho_ui_proto::AgentUsageBucket>,
+    model: String,
     line: Hsla,
     grid: Hsla,
 ) -> impl IntoElement {
@@ -513,25 +511,25 @@ fn agent_usage_chart(
                     window.paint_path(path, grid);
                 }
             }
-            let max = buckets
+            let window_total = buckets
                 .iter()
-                .map(agent_bucket_tokens)
-                .max()
-                .unwrap_or(1)
-                .max(1);
+                .map(|bucket| agent_bucket_cost_usd(bucket, &model))
+                .sum::<f64>()
+                .max(f64::EPSILON);
             let now = crate::workspace::now_ms();
             let start = now.saturating_sub(7 * 24 * 60 * 60 * 1_000);
-            let points = buckets
-                .iter()
-                .map(|bucket| {
+            let mut cumulative = 0.0;
+            let points = std::iter::once(point(bounds.origin.x, bounds.bottom()))
+                .chain(buckets.iter().map(|bucket| {
+                    cumulative += agent_bucket_cost_usd(bucket, &model);
                     let x = bucket.bucket_start_ms.saturating_sub(start) as f64
                         / now.saturating_sub(start).max(1) as f64;
-                    let y = 1.0 - agent_bucket_tokens(bucket) as f64 / max as f64;
+                    let y = 1.0 - cumulative / window_total;
                     point(
                         bounds.origin.x + bounds.size.width * x.clamp(0.0, 1.0) as f32,
                         bounds.origin.y + bounds.size.height * y as f32,
                     )
-                })
+                }))
                 .collect::<Vec<_>>();
             paint_usage_segment(&points, line, window);
         },
@@ -539,11 +537,16 @@ fn agent_usage_chart(
     .size_full()
 }
 
-fn agent_bucket_tokens(bucket: &rho_ui_proto::AgentUsageBucket) -> u64 {
-    bucket.input_tokens
-        + bucket.cache_read_tokens
-        + bucket.cache_write_tokens
-        + bucket.output_tokens
+fn agent_bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &str) -> f64 {
+    let (input, cache_read, cache_write, output) = match model {
+        "claude-fable-5" => (10.0, 1.0, 12.5, 50.0),
+        _ => (5.0, 0.5, 6.25, 30.0),
+    };
+    (bucket.input_tokens as f64 * input
+        + bucket.cache_read_tokens as f64 * cache_read
+        + bucket.cache_write_tokens as f64 * cache_write
+        + bucket.output_tokens as f64 * output)
+        / 1_000_000.0
 }
 
 pub fn new_agent_menu(project: String, workspace: String, role: String) -> Transient {
@@ -692,4 +695,22 @@ fn workstream_menu() -> Transient {
         .item("m", "merge into…", |workspace, window, cx| {
             workspace.prompt_workstream(WorkstreamPrompt::Merge, window, cx);
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_cost_uses_provider_cache_rates() {
+        let usage = rho_ui_proto::AgentUsageBucket {
+            input_tokens: 1_000_000,
+            cache_read_tokens: 1_000_000,
+            cache_write_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(agent_bucket_cost_usd(&usage, "claude-fable-5"), 73.5);
+        assert_eq!(agent_bucket_cost_usd(&usage, "gpt-5.6-sol"), 41.75);
+    }
 }

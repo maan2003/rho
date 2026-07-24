@@ -97,6 +97,7 @@ pub enum ConnEvent {
     QuotaHistory(Vec<rho_ui_proto::QuotaSeries>),
     AgentUsage {
         agent_id: rho_ui_proto::AgentId,
+        model: String,
         buckets: Vec<rho_ui_proto::AgentUsageBucket>,
         total: rho_ui_proto::AgentUsageBucket,
     },
@@ -832,10 +833,12 @@ async fn run(
             ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series)),
             ServerMessage::AgentUsage {
                 agent_id,
+                model,
                 buckets,
                 total,
             } => Some(ConnEvent::AgentUsage {
                 agent_id,
+                model,
                 buckets,
                 total,
             }),
