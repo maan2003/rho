@@ -42,6 +42,7 @@ pub struct Transient {
     items: Vec<TransientItem>,
     quota_usage: Option<Vec<rho_ui_proto::QuotaSeries>>,
     global_usage: Option<Vec<rho_ui_proto::AgentUsageSeries>>,
+    usage_days: u64,
 }
 
 impl Transient {
@@ -51,6 +52,7 @@ impl Transient {
             items: Vec::new(),
             quota_usage: None,
             global_usage: None,
+            usage_days: 7,
         }
     }
 
@@ -155,6 +157,7 @@ impl Transient {
         let value_color = colors.terminal_ansi_green;
         if let Some(series) = &self.quota_usage {
             let series = series.clone();
+            let days = self.usage_days;
             let gpt: Hsla = colors.terminal_ansi_cyan.into();
             let fable: Hsla = rgb(0xd97757).into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
@@ -163,7 +166,7 @@ impl Transient {
                     div()
                         .px_2()
                         .font_weight(gpui::FontWeight::BOLD)
-                        .child("usage · last 7 days"),
+                        .child(format!("rate limit · last {days} days")),
                 )
                 .child(
                     div()
@@ -199,7 +202,7 @@ impl Transient {
                                         div()
                                             .w(px(832.))
                                             .h(px(240.))
-                                            .child(usage_chart(series, gpt, fable, grid)),
+                                            .child(usage_chart(series, days, gpt, fable, grid)),
                                     )
                                     .child(
                                         div()
@@ -207,7 +210,7 @@ impl Transient {
                                             .flex()
                                             .w(px(832.))
                                             .justify_between()
-                                            .child("−7d")
+                                            .child(format!("−{days}d"))
                                             .child("now"),
                                     ),
                             ),
@@ -217,11 +220,12 @@ impl Transient {
         }
         if let Some(series) = &self.global_usage {
             let series = series.clone();
+            let days = self.usage_days;
             let gpt: Hsla = colors.terminal_ansi_cyan.into();
             let claude: Hsla = rgb(0xd97757).into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
             let now = crate::workspace::now_ms();
-            let since = now.saturating_sub(7 * 24 * 60 * 60 * 1_000);
+            let since = now.saturating_sub(days * 24 * 60 * 60 * 1_000);
             let gpt_cost = provider_cost(&series, "gpt", since);
             let claude_cost = provider_cost(&series, "claude", since);
             let total_cost = gpt_cost + claude_cost;
@@ -241,7 +245,7 @@ impl Transient {
                     div()
                         .px_2()
                         .font_weight(gpui::FontWeight::BOLD)
-                        .child("model cost · last 7 days"),
+                        .child(format!("model cost · last {days} days")),
                 )
                 .child(div().px_2().text_color(muted).child(format!(
                     "${total_cost:.2} estimated API cost · {requests} requests{}",
@@ -287,18 +291,16 @@ impl Transient {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(
-                                        div().w(px(832.)).h(px(220.)).child(global_usage_chart(
-                                            series, now, gpt, claude, grid,
-                                        )),
-                                    )
+                                    .child(div().w(px(832.)).h(px(220.)).child(global_usage_chart(
+                                        series, now, days, gpt, claude, grid,
+                                    )))
                                     .child(
                                         div()
                                             .mt_1()
                                             .flex()
                                             .w(px(832.))
                                             .justify_between()
-                                            .child("−7d")
+                                            .child(format!("−{days}d"))
                                             .child("now"),
                                     ),
                             ),
@@ -444,28 +446,41 @@ pub fn root_menu() -> Transient {
 
 pub fn usage_root_menu() -> Transient {
     Transient::new("usage")
-        .item("q", "provider quota", |workspace, window, cx| {
-            workspace.open_usage_transient(window, cx);
+        .item("r", "rate limit · 7d", |workspace, window, cx| {
+            workspace.open_usage_transient(7, window, cx);
         })
-        .item("c", "model cost", |workspace, window, cx| {
-            workspace.open_global_usage_transient(window, cx);
+        .item(
+            "shift-r",
+            "rate limit · 30d",
+            |workspace, window, cx| {
+                workspace.open_usage_transient(30, window, cx);
+            },
+        )
+        .item("c", "model cost · 7d", |workspace, window, cx| {
+            workspace.open_global_usage_transient(7, window, cx);
+        })
+        .item("shift-c", "model cost · 30d", |workspace, window, cx| {
+            workspace.open_global_usage_transient(30, window, cx);
         })
 }
 
-pub fn usage_menu(series: Vec<rho_ui_proto::QuotaSeries>) -> Transient {
-    let mut menu = Transient::new("provider quota");
+pub fn usage_menu(series: Vec<rho_ui_proto::QuotaSeries>, days: u64) -> Transient {
+    let mut menu = Transient::new("rate limit");
     menu.quota_usage = Some(series);
+    menu.usage_days = days;
     menu
 }
 
-pub fn global_usage_menu(series: Vec<rho_ui_proto::AgentUsageSeries>) -> Transient {
+pub fn global_usage_menu(series: Vec<rho_ui_proto::AgentUsageSeries>, days: u64) -> Transient {
     let mut menu = Transient::new("model cost");
     menu.global_usage = Some(series);
+    menu.usage_days = days;
     menu
 }
 
 fn usage_chart(
     series: Vec<rho_ui_proto::QuotaSeries>,
+    days: u64,
     gpt: Hsla,
     fable: Hsla,
     grid: Hsla,
@@ -485,7 +500,7 @@ fn usage_chart(
             }
 
             let now = crate::workspace::now_ms();
-            let start = now.saturating_sub(7 * 24 * 60 * 60 * 1_000);
+            let start = now.saturating_sub(days * 24 * 60 * 60 * 1_000);
             for model in &series {
                 let color = if model.model == "fable" { fable } else { gpt };
                 let mut segment = Vec::new();
@@ -622,6 +637,7 @@ fn pchip_endpoint(width: f64, adjacent_width: f64, secant: f64, adjacent: f64) -
 fn global_usage_chart(
     series: Vec<rho_ui_proto::AgentUsageSeries>,
     now: u64,
+    days: u64,
     gpt: Hsla,
     claude: Hsla,
     grid: Hsla,
@@ -630,8 +646,8 @@ fn global_usage_chart(
         move |_, _, _| {},
         move |bounds, _, window, _| {
             const BUCKET_MS: u64 = 5 * 60 * 1_000;
-            const WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-            let start = now.saturating_sub(WINDOW_MS);
+            let window_ms = days * 24 * 60 * 60 * 1_000;
+            let start = now.saturating_sub(window_ms);
             let mut costs = HashMap::<u64, (f64, f64)>::new();
             for provider in &series {
                 for bucket in &provider.buckets {
@@ -654,7 +670,7 @@ fn global_usage_chart(
                 .sum::<f64>()
                 .max(f64::EPSILON);
             let to_point = |at: u64, value: f64| {
-                let x = at.saturating_sub(start) as f64 / WINDOW_MS as f64;
+                let x = at.saturating_sub(start) as f64 / window_ms as f64;
                 let y = 1.0 - value / max;
                 point(
                     bounds.origin.x + bounds.size.width * x.clamp(0.0, 1.0) as f32,
@@ -720,8 +736,9 @@ fn global_usage_chart(
                     window,
                 );
             }
-            for day in 1..7 {
-                let x = bounds.origin.x + bounds.size.width * (day as f32 / 7.0);
+            let vertical_steps = if days <= 7 { days } else { 6 };
+            for step in 1..vertical_steps {
+                let x = bounds.origin.x + bounds.size.width * (step as f32 / vertical_steps as f32);
                 paint_grid_line(
                     point(x, bounds.origin.y),
                     point(x, bounds.bottom()),

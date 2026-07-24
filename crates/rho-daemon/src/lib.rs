@@ -2133,7 +2133,7 @@ fn ui_agent_usage_bucket(bucket: rho_agent::db::AgentUsageBucket) -> UiAgentUsag
 
 fn quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
     let now = rho_core::UnixMs::now().0;
-    let since = rho_core::UnixMs(now.saturating_sub(7 * 24 * 60 * 60 * 1_000));
+    let since = rho_core::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
     let read = db.read();
     [QuotaModel::GPT, QuotaModel::FABLE]
         .into_iter()

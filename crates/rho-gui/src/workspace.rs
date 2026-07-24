@@ -145,7 +145,9 @@ pub struct Workspace {
     connected: bool,
     quota_summaries: Vec<rho_ui_proto::QuotaSummary>,
     quota_history: Vec<rho_ui_proto::QuotaSeries>,
+    quota_history_days: u64,
     global_usage: Vec<rho_ui_proto::AgentUsageSeries>,
+    global_usage_days: u64,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
@@ -315,7 +317,9 @@ impl Workspace {
             connected: false,
             quota_summaries: Vec::new(),
             quota_history: Vec::new(),
+            quota_history_days: 7,
             global_usage: Vec::new(),
+            global_usage_days: 7,
             duration_timer: None,
             chime: Chime::default(),
             contexts: HashMap::new(),
@@ -617,9 +621,12 @@ impl Workspace {
                 if self
                     .transient
                     .as_ref()
-                    .is_some_and(|transient| transient.title() == "provider quota")
+                    .is_some_and(|transient| transient.title() == "rate limit")
                 {
-                    self.transient = Some(crate::transient::usage_menu(self.quota_history.clone()));
+                    self.transient = Some(crate::transient::usage_menu(
+                        self.quota_history.clone(),
+                        self.quota_history_days,
+                    ));
                 }
                 cx.notify();
             }
@@ -632,6 +639,7 @@ impl Workspace {
                 {
                     self.transient = Some(crate::transient::global_usage_menu(
                         self.global_usage.clone(),
+                        self.global_usage_days,
                     ));
                 }
                 cx.notify();
@@ -3000,22 +3008,30 @@ impl Workspace {
         );
     }
 
-    pub(crate) fn open_usage_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_usage_transient(
+        &mut self,
+        days: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.quota_history_days = days;
         self.connection.send(ClientMessage::QuotaHistory);
         let history = self.quota_history.clone();
-        self.open_transient(crate::transient::usage_menu(history), window, cx);
+        self.open_transient(crate::transient::usage_menu(history, days), window, cx);
     }
 
     pub(crate) fn open_global_usage_transient(
         &mut self,
+        days: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.global_usage_days = days;
         self.connection.send(ClientMessage::GlobalUsage {
-            since_ms: now_ms().saturating_sub(7 * 24 * 60 * 60 * 1_000),
+            since_ms: now_ms().saturating_sub(30 * 24 * 60 * 60 * 1_000),
         });
         self.open_transient(
-            crate::transient::global_usage_menu(self.global_usage.clone()),
+            crate::transient::global_usage_menu(self.global_usage.clone(), days),
             window,
             cx,
         );
