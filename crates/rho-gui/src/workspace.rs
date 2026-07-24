@@ -3371,7 +3371,7 @@ impl Workspace {
             .items_center()
             .gap(px(10.))
             .child(
-                div().w(px(40.)).h_full().p(px(4.)).child(
+                div().w(px(40.)).h_full().p(px(4.)).pt(px(6.)).child(
                     svg()
                         .path("icons/rho.svg")
                         .size_full()
