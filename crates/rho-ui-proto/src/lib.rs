@@ -647,6 +647,9 @@ pub enum ServerMessage {
     QuotaUsage {
         summaries: Vec<QuotaSummary>,
     },
+    QuotaHistory {
+        series: Vec<QuotaSeries>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -657,6 +660,19 @@ pub struct QuotaSummary {
     pub burn_2h: u16,
     pub burn_1d: u16,
     pub burn_3d: u16,
+    pub reset_at_unix: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaSeries {
+    pub model: String,
+    pub points: Vec<QuotaPoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaPoint {
+    pub observed_at_ms: u64,
+    pub remaining_percent: u8,
     pub reset_at_unix: Option<i64>,
 }
 

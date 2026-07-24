@@ -10,7 +10,10 @@
 use std::rc::Rc;
 
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Keystroke, Window, div};
+use gpui::{
+    AnyElement, Context, Hsla, Keystroke, PathBuilder, Pixels, Point, Window, canvas, div, point,
+    px,
+};
 use theme::ActiveTheme as _;
 
 use crate::minibuffer::bottom_strip;
@@ -36,6 +39,7 @@ pub struct TransientItem {
 pub struct Transient {
     title: &'static str,
     items: Vec<TransientItem>,
+    usage: Option<Vec<rho_ui_proto::QuotaSeries>>,
 }
 
 impl Transient {
@@ -43,6 +47,7 @@ impl Transient {
         Self {
             title,
             items: Vec::new(),
+            usage: None,
         }
     }
 
@@ -141,6 +146,68 @@ impl Transient {
         let accent = colors.text_accent;
         let muted = colors.text_muted;
         let value_color = colors.terminal_ansi_green;
+        if let Some(series) = &self.usage {
+            let series = series.clone();
+            let gpt: Hsla = colors.terminal_ansi_cyan.into();
+            let fable: Hsla = colors.terminal_ansi_magenta.into();
+            let grid: Hsla = colors.text_muted.opacity(0.22).into();
+            return bottom_strip(text_style, cx)
+                .child(
+                    div()
+                        .px_2()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child("usage · last 7 days"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .px_2()
+                        .child(div().text_color(gpt).child("gpt"))
+                        .child(div().text_color(fable).child("fable")),
+                )
+                .child(
+                    div().px_2().pb_1().child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(
+                                div()
+                                    .flex()
+                                    .h(px(240.))
+                                    .w(px(36.))
+                                    .flex_col()
+                                    .justify_between()
+                                    .child("100%")
+                                    .child("50%")
+                                    .child("0%"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .w(px(832.))
+                                            .h(px(240.))
+                                            .child(usage_chart(series, gpt, fable, grid)),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .flex()
+                                            .w(px(832.))
+                                            .justify_between()
+                                            .child("−7d")
+                                            .child("now"),
+                                    ),
+                            ),
+                    ),
+                )
+                .into_any_element();
+        }
         let columns = self.items.chunks(COLUMN_ROWS).map(|chunk| {
             div().flex().flex_col().children(chunk.iter().map(|item| {
                 let mut row = div()
@@ -277,21 +344,83 @@ pub fn root_menu() -> Transient {
         .item("q", "quit", |_, _, cx| cx.quit())
 }
 
-pub fn usage_menu(summaries: &[rho_ui_proto::QuotaSummary]) -> Transient {
+pub fn usage_menu(series: Vec<rho_ui_proto::QuotaSeries>) -> Transient {
     let mut menu = Transient::new("usage");
-    for summary in summaries {
-        let key = if summary.model == "fable" { "f" } else { "g" };
-        let value = format!(
-            "{}% remaining · 10m −{}% · 2h −{}% · 1d −{}% · 3d −{}%",
-            summary.remaining_percent,
-            summary.burn_10m,
-            summary.burn_2h,
-            summary.burn_1d,
-            summary.burn_3d
-        );
-        menu = menu.infix(key, summary.model.clone(), value, |_, _, _| {});
-    }
+    menu.usage = Some(series);
     menu
+}
+
+fn usage_chart(
+    series: Vec<rho_ui_proto::QuotaSeries>,
+    gpt: Hsla,
+    fable: Hsla,
+    grid: Hsla,
+) -> impl IntoElement {
+    canvas(
+        move |_, _, _| {},
+        move |bounds, _, window, _| {
+            let pixels_per_percent = bounds.size.height / 100.0;
+            for percent in (0..=100).step_by(10) {
+                let y = bounds.origin.y + pixels_per_percent * (100.0 - percent as f32);
+                let mut builder = PathBuilder::stroke(px(1.));
+                builder.move_to(point(bounds.origin.x, y));
+                builder.line_to(point(bounds.right(), y));
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, grid);
+                }
+            }
+
+            let now = crate::workspace::now_ms();
+            let start = now.saturating_sub(7 * 24 * 60 * 60 * 1_000);
+            for model in &series {
+                let color = if model.model == "fable" { fable } else { gpt };
+                let mut segment = Vec::new();
+                let mut previous: Option<&rho_ui_proto::QuotaPoint> = None;
+                for sample in &model.points {
+                    let reset = previous.is_some_and(|old| {
+                        let reset_time_changed = match (old.reset_at_unix, sample.reset_at_unix) {
+                            (Some(old), Some(new)) => old.abs_diff(new) > 60,
+                            (None, None) => false,
+                            _ => true,
+                        };
+                        reset_time_changed || sample.remaining_percent > old.remaining_percent
+                    });
+                    if reset {
+                        paint_usage_segment(&segment, color, window);
+                        segment.clear();
+                    }
+                    let elapsed = sample.observed_at_ms.saturating_sub(start);
+                    let x_ratio = (elapsed as f64 / (now.saturating_sub(start).max(1)) as f64)
+                        .clamp(0.0, 1.0) as f32;
+                    segment.push(point(
+                        bounds.origin.x + bounds.size.width * x_ratio,
+                        bounds.origin.y
+                            + pixels_per_percent * (100.0 - f32::from(sample.remaining_percent)),
+                    ));
+                    previous = Some(sample);
+                }
+                paint_usage_segment(&segment, color, window);
+            }
+        },
+    )
+    .size_full()
+}
+
+fn paint_usage_segment(points: &[Point<Pixels>], color: Hsla, window: &mut Window) {
+    let Some(first) = points.first().copied() else {
+        return;
+    };
+    let mut builder = PathBuilder::stroke(px(2.));
+    builder.move_to(first);
+    for pair in points.windows(2) {
+        let from = pair[0];
+        let to = pair[1];
+        let mid_x = from.x + (to.x - from.x) / 2.0;
+        builder.cubic_bezier_to(to, point(mid_x, from.y), point(mid_x, to.y));
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
 }
 
 pub fn new_agent_menu(project: String, workspace: String, role: String) -> Transient {

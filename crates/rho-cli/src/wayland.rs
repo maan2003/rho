@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_OUTPUT_WIDTH: u32 = 2560;
+const DEFAULT_OUTPUT_HEIGHT: u32 = 1664;
+const DEFAULT_OUTPUT_SCALE: u32 = 2;
 const SWAY: &str = match option_env!("RHO_WAYLAND_SWAY") {
     Some(path) => path,
     None => "sway",
@@ -50,10 +53,12 @@ pub(crate) struct WaylandArgs {
 enum DriverCommand {
     /// Start a headless compositor, optionally followed by an application.
     Start {
-        #[arg(long, default_value_t = 1440)]
+        #[arg(long, default_value_t = DEFAULT_OUTPUT_WIDTH)]
         width: u32,
-        #[arg(long, default_value_t = 900)]
+        #[arg(long, default_value_t = DEFAULT_OUTPUT_HEIGHT)]
         height: u32,
+        #[arg(long, default_value_t = DEFAULT_OUTPUT_SCALE)]
+        scale: u32,
         /// Application and arguments to launch in the Wayland session.
         #[arg(last = true)]
         command: Vec<OsString>,
@@ -111,6 +116,8 @@ struct Session {
     output: String,
     width: u32,
     height: u32,
+    #[serde(default = "default_output_scale")]
+    scale: u32,
     compositor: ProcessIdentity,
     application: Option<ProcessIdentity>,
 }
@@ -128,6 +135,9 @@ struct StartResult<'a> {
     output: &'a str,
     width: u32,
     height: u32,
+    scale: u32,
+    logical_width: u32,
+    logical_height: u32,
     compositor_pid: u32,
     application_pid: Option<u32>,
 }
@@ -139,6 +149,9 @@ struct StatusResult<'a> {
     output: &'a str,
     width: u32,
     height: u32,
+    scale: u32,
+    logical_width: u32,
+    logical_height: u32,
     compositor_running: bool,
     application_running: Option<bool>,
 }
@@ -155,8 +168,9 @@ pub(crate) fn run(args: WaylandArgs) -> Result<()> {
         DriverCommand::Start {
             width,
             height,
+            scale,
             command,
-        } => start(&args.session, &root, width, height, command),
+        } => start(&args.session, &root, width, height, scale, command),
         DriverCommand::Status => status(&root),
         DriverCommand::Tree => {
             let session = load_live_session(&root)?;
@@ -210,9 +224,19 @@ fn validate_session_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn start(name: &str, root: &Path, width: u32, height: u32, command: Vec<OsString>) -> Result<()> {
+fn start(
+    name: &str,
+    root: &Path,
+    width: u32,
+    height: u32,
+    scale: u32,
+    command: Vec<OsString>,
+) -> Result<()> {
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
         bail!("output dimensions must be between 1 and 16384 pixels");
+    }
+    if !(1..=4).contains(&scale) {
+        bail!("output scale must be between 1 and 4");
     }
     if root.exists() {
         if load_session(root)
@@ -233,7 +257,7 @@ fn start(name: &str, root: &Path, width: u32, height: u32, command: Vec<OsString
     fs::write(
         &config_path,
         format!(
-            "output * mode {width}x{height}@60Hz\n\
+            "output * mode {width}x{height}@60Hz scale {scale}\n\
              seat seat0 fallback enable\n\
              focus_follows_mouse no\n\
              default_border none\n\
@@ -307,6 +331,7 @@ fn start(name: &str, root: &Path, width: u32, height: u32, command: Vec<OsString
         output,
         width,
         height,
+        scale,
         compositor,
         application,
     };
@@ -319,6 +344,9 @@ fn start(name: &str, root: &Path, width: u32, height: u32, command: Vec<OsString
             output: &session.output,
             width,
             height,
+            scale,
+            logical_width: width / scale,
+            logical_height: height / scale,
             compositor_pid: session.compositor.pid,
             application_pid: session.application.map(|process| process.pid),
         })?
@@ -400,6 +428,9 @@ fn status(root: &Path) -> Result<()> {
             output: &session.output,
             width: session.width,
             height: session.height,
+            scale: session.scale,
+            logical_width: session.width / session.scale,
+            logical_height: session.height / session.scale,
             compositor_running: process_is_running(session.compositor),
             application_running: session.application.map(process_is_running),
         })?
@@ -432,20 +463,29 @@ fn screenshot(root: &Path, output: &Path) -> Result<()> {
             "output": output,
             "width": session.width,
             "height": session.height,
+            "scale": session.scale,
+            "logical_width": session.width / session.scale,
+            "logical_height": session.height / session.scale,
         })
     );
     Ok(())
 }
 
 fn move_pointer(session: &Session, x: i32, y: i32) -> Result<()> {
-    if x < 0 || y < 0 || x >= session.width as i32 || y >= session.height as i32 {
+    let logical_width = session.width / session.scale;
+    let logical_height = session.height / session.scale;
+    if x < 0 || y < 0 || x >= logical_width as i32 || y >= logical_height as i32 {
         bail!(
             "coordinates ({x}, {y}) are outside {}x{} output",
-            session.width,
-            session.height
+            logical_width,
+            logical_height
         );
     }
     sway_command(session, &format!("seat seat0 cursor set {x} {y}"))
+}
+
+const fn default_output_scale() -> u32 {
+    1
 }
 
 fn sway_command(session: &Session, command: &str) -> Result<()> {

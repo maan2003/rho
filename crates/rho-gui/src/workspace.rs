@@ -144,6 +144,7 @@ pub struct Workspace {
     awaiting_draft_agent: bool,
     connected: bool,
     quota_summaries: Vec<rho_ui_proto::QuotaSummary>,
+    quota_history: Vec<rho_ui_proto::QuotaSeries>,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
@@ -312,6 +313,7 @@ impl Workspace {
             awaiting_draft_agent: false,
             connected: false,
             quota_summaries: Vec::new(),
+            quota_history: Vec::new(),
             duration_timer: None,
             chime: Chime::default(),
             contexts: HashMap::new(),
@@ -606,6 +608,10 @@ impl Workspace {
             }
             ConnEvent::QuotaUsage(summaries) => {
                 self.quota_summaries = summaries;
+                cx.notify();
+            }
+            ConnEvent::QuotaHistory(series) => {
+                self.quota_history = series;
                 cx.notify();
             }
             ConnEvent::TurnCancelled => {
@@ -2973,8 +2979,8 @@ impl Workspace {
     }
 
     pub(crate) fn open_usage_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let summaries = self.quota_summaries.clone();
-        self.open_transient(crate::transient::usage_menu(&summaries), window, cx);
+        let history = self.quota_history.clone();
+        self.open_transient(crate::transient::usage_menu(history), window, cx);
     }
 
     pub(crate) fn prompt_new_agent_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {

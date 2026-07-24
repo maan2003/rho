@@ -13,8 +13,12 @@ session.
 Start the application as trailing arguments after `--`:
 
 ```bash
-rho wayland --session gui start --width 1440 --height 900 -- APPLICATION ARG...
+rho wayland --session gui start -- APPLICATION ARG...
 ```
+
+The default output matches a 13-inch MacBook display: 2560×1664 physical
+pixels at 2× scale (1280×832 logical pixels). Override `--width`, `--height`,
+or `--scale` when a test needs different geometry.
 
 For `rho-gui`, preserve the daemon socket path before the driver gives the GUI
 its private `XDG_RUNTIME_DIR`, and pass the socket explicitly:

@@ -94,6 +94,7 @@ pub enum ConnEvent {
         reset_at_unix: i64,
     },
     QuotaUsage(Vec<rho_ui_proto::QuotaSummary>),
+    QuotaHistory(Vec<rho_ui_proto::QuotaSeries>),
     ServerError(String),
     Disconnected(String),
     GitTransportApproval {
@@ -823,6 +824,7 @@ async fn run(
                 reset_at_unix,
             }),
             ServerMessage::QuotaUsage { summaries } => Some(ConnEvent::QuotaUsage(summaries)),
+            ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series)),
             ServerMessage::GitTransportRequested {
                 request_id,
                 provider_id,
