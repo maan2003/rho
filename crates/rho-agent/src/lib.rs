@@ -30,6 +30,7 @@ use crate::multi_agent_tools::MultiAgentTools;
 use crate::pool::AgentInputAccepted;
 
 mod claude;
+#[cfg(feature = "code-mode")]
 mod code_mode;
 pub mod db;
 mod lazy;
@@ -37,6 +38,11 @@ pub mod multi_agent_tools;
 pub mod pool;
 pub mod system_prompt;
 pub mod title;
+
+#[cfg(feature = "code-mode")]
+type CodeModeSession = rho_code_mode::CodeModeSession;
+#[cfg(not(feature = "code-mode"))]
+struct CodeModeSession;
 
 /// A small, host-provided tool surface for a specific agent.
 ///
@@ -72,20 +78,15 @@ pub fn render_agent_surface(
     let profile = binding
         .deep_config()
         .ok_or_else(|| anyhow::anyhow!("role has no inference profile"))?;
+    let code_mode = cfg!(feature = "code-mode") && profile.code_mode;
     let shell_tools = ShellTools::new(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         Arc::clone(&view),
     );
     let agent_tools_enabled = true;
     Ok(RenderedAgentSurface {
-        system_prompt: system_prompt::prompt(view.as_ref(), None, profile.code_mode, role, &[]),
-        tools: agent_tool_specs(
-            &shell_tools,
-            agent_tools_enabled,
-            profile.code_mode,
-            role,
-            None,
-        ),
+        system_prompt: system_prompt::prompt(view.as_ref(), None, code_mode, role, &[]),
+        tools: agent_tool_specs(&shell_tools, agent_tools_enabled, code_mode, role, None),
     })
 }
 
@@ -710,7 +711,7 @@ impl Agent {
     ) -> Self {
         // Role policy wins over persisted profiles created before PM code mode
         // was disabled.
-        let code_mode_enabled = config.code_mode && !role.is_pm();
+        let code_mode_enabled = cfg!(feature = "code-mode") && config.code_mode && !role.is_pm();
         let web_search = WebSearchTools::new(auth.clone(), agent_id.encoded().to_owned());
         let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
         let multi_agent = pool
@@ -907,8 +908,9 @@ fn arm_wait(
 }
 
 /// Runs one `exec` or `wait` call against the code-mode session.
+#[cfg(feature = "code-mode")]
 async fn code_mode_tool_body(
-    session: &rho_code_mode::CodeModeSession,
+    session: &CodeModeSession,
     call: &ToolCall,
     context: ToolExecutionContext,
 ) -> ToolOutput {
@@ -948,10 +950,13 @@ fn agent_tool_specs(
     role: db::AgentRole,
     tool_extension: Option<&Arc<dyn AgentToolExtension>>,
 ) -> Arc<[ToolSpec]> {
+    #[cfg(feature = "code-mode")]
     if code_mode {
         return code_mode::tool_specs(shell_tools, multi_agent.then_some(role), tool_extension)
             .into();
     }
+    #[cfg(not(feature = "code-mode"))]
+    let _ = code_mode;
     let mut specs = if role.is_pm() {
         Vec::new()
     } else {
@@ -969,6 +974,7 @@ fn agent_tool_specs(
 
 /// Starts the code-mode V8 session when enabled; on failure the agent falls
 /// back to the direct tool surface rather than dying.
+#[cfg(feature = "code-mode")]
 fn start_code_mode(
     enabled: bool,
     shell_tools: &ShellTools,
@@ -976,7 +982,7 @@ fn start_code_mode(
     tool_extension: Option<&Arc<dyn AgentToolExtension>>,
     web_search: &WebSearchTools,
     control: mpsc::UnboundedSender<AgentControl>,
-) -> Option<Arc<rho_code_mode::CodeModeSession>> {
+) -> Option<Arc<CodeModeSession>> {
     if !enabled {
         return None;
     }
@@ -993,6 +999,18 @@ fn start_code_mode(
             None
         }
     }
+}
+
+#[cfg(not(feature = "code-mode"))]
+fn start_code_mode(
+    _enabled: bool,
+    _shell_tools: &ShellTools,
+    _multi_agent: Option<&MultiAgentTools>,
+    _tool_extension: Option<&Arc<dyn AgentToolExtension>>,
+    _web_search: &WebSearchTools,
+    _control: mpsc::UnboundedSender<AgentControl>,
+) -> Option<Arc<CodeModeSession>> {
+    None
 }
 
 struct AgentPersistence {
@@ -1013,6 +1031,7 @@ enum AgentControl {
     },
     /// An extra output for an in-flight tool call (code-mode `notify(...)`).
     /// Dropped when no turn is active, matching Codex.
+    #[cfg(feature = "code-mode")]
     ToolUpdate(ToolUpdate),
     SetDeepConfig(InferenceProfile, InferenceModel),
     ChangePromptCacheKey(PromptCacheKey),
@@ -1057,7 +1076,8 @@ struct ExecutionContext {
     web_search: WebSearchTools,
     model: Arc<str>,
     tool_specs: Arc<[ToolSpec]>,
-    code_mode: Option<Arc<rho_code_mode::CodeModeSession>>,
+    #[cfg(feature = "code-mode")]
+    code_mode: Option<Arc<CodeModeSession>>,
 }
 
 impl ExecutionContext {
@@ -1109,6 +1129,7 @@ impl ExecutionContext {
             web_search,
             model: Arc::from(model.as_str()),
             tool_specs,
+            #[cfg(feature = "code-mode")]
             code_mode,
         }
     }
@@ -1184,6 +1205,7 @@ impl AgentLoop {
                             }
                             self.maybe_resolve_wait(&mut state).await;
                         }
+                        #[cfg(feature = "code-mode")]
                         AgentControl::ToolUpdate(update) => {
                             // Only meaningful mid-turn: the call it annotates
                             // must reach the provider in this turn's timeline.
@@ -1586,6 +1608,7 @@ impl AgentLoop {
                                         // to the V8 session; `wait` means the
                                         // cell wait there, so the multi-agent
                                         // wait arm below never sees it.
+                                        #[cfg(feature = "code-mode")]
                                         if let Some(session) = &execution.code_mode
                                             && (call.name.as_str()
                                                 == rho_code_mode::EXEC_TOOL_NAME
@@ -1843,17 +1866,25 @@ impl AgentLoop {
     /// observed cell to yield so the tool batch can finish and the queued input
     /// can enter the next request promptly.
     fn yield_code_mode_wait_for_queued(&self, state: &AgentState) {
-        let Some(session) = self
-            .execution
-            .get_if_ready()
-            .and_then(|execution| execution.code_mode.as_ref())
-        else {
-            return;
-        };
-        if !should_yield_code_mode_wait_for_queued(state) {
+        #[cfg(not(feature = "code-mode"))]
+        {
+            let _ = state;
             return;
         }
-        session.request_yield();
+        #[cfg(feature = "code-mode")]
+        {
+            let Some(session) = self
+                .execution
+                .get_if_ready()
+                .and_then(|execution| execution.code_mode.as_ref())
+            else {
+                return;
+            };
+            if !should_yield_code_mode_wait_for_queued(state) {
+                return;
+            }
+            session.request_yield();
+        }
     }
 
     /// Move queued inputs into model context at a delivery boundary.
@@ -2047,6 +2078,7 @@ fn has_unanswered_tool_calls(blocks: &[Arc<ContextBlock>]) -> bool {
     !outstanding.is_empty()
 }
 
+#[cfg(feature = "code-mode")]
 fn should_yield_code_mode_wait_for_queued(state: &AgentState) -> bool {
     let AgentStateKind::ToolCalling { previews, .. } = &state.kind else {
         return false;

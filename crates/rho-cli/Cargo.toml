@@ -14,7 +14,7 @@ dirs.workspace = true
 jj-cli.workspace = true
 libc.workspace = true
 prefix-id.workspace = true
-rho-agent.workspace = true
+rho-agent = { workspace = true, features = ["code-mode"] }
 rho-ci.workspace = true
 rho-daemon.workspace = true
 rho-inference.workspace = true

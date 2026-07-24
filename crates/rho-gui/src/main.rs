@@ -188,7 +188,11 @@ fn init_tracing() {
 }
 
 fn run() -> Result<()> {
-    rho_daemon::install_crypto_provider()?;
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .map_err(|_| anyhow::anyhow!("failed to install the AWS-LC rustls crypto provider"))?;
+    }
     let args = Args::parse();
     let profiler = args
         .cpu_profile
@@ -379,7 +383,7 @@ fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
         });
     }
     Ok(AttachTarget::Unix(
-        args.socket.unwrap_or(rho_daemon::default_socket_path()?),
+        args.socket.unwrap_or(rho_ui_proto::socket_path()?),
     ))
 }
 

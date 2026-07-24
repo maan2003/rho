@@ -153,7 +153,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   trait implemented by the assembling harness. Each cell retains the immutable
   tool execution context from the `exec` call that created it, so nested tools
   cannot observe a later turn's context; the crate depends only on `rho-core`
-  vocabulary.
+  vocabulary. `rho-agent` exposes code mode as an optional runtime feature:
+  daemon-side assemblers enable it, while `rho-ui-proto` disables it so native
+  clients can share agent identifiers and wire-state projection without
+  linking V8.
 
 Claude Code MCP support follows the same boundary: `rho-claude` knows how to
 set per-agent MCP environment, but the MCP server that exposes Rho multi-agent

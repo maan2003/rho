@@ -16,7 +16,7 @@ octo-types.workspace = true
 redb.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
-rho-agent.workspace = true
+rho-agent = { workspace = true, features = ["code-mode"] }
 rustls.workspace = true
 rho-db.workspace = true
 senax-encoder.workspace = true

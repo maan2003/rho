@@ -49,11 +49,11 @@ prost = "0.9"
 release_channel = { git = "https://github.com/maan2003/zed", rev = "4ca9239e36f4" }
 remote = { git = "https://github.com/maan2003/zed", rev = "4ca9239e36f4" }
 rho-core.workspace = true
-rho-daemon.workspace = true
 rho-iroh-auth.workspace = true
 rho-profiling.workspace = true
 rho-realtime.workspace = true
 rho-ui-proto.workspace = true
+rustls.workspace = true
 senax-encoder.workspace = true
 # Same revision the zed fork pins, so a future switch to its `audio` crate
 # shares one rodio build.

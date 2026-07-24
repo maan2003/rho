@@ -70,6 +70,7 @@ impl MultiAgentTools {
             .spawned_by
     }
 
+    #[cfg(feature = "code-mode")]
     pub(crate) fn role(&self) -> AgentRole {
         self.pool()
             .expect("multi-agent tools require a live agent pool")

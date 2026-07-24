@@ -17,7 +17,7 @@ libc.workspace = true
 reqwest.workspace = true
 redb.workspace = true
 rustls.workspace = true
-rho-agent.workspace = true
+rho-agent = { workspace = true, features = ["code-mode"] }
 rho-core.workspace = true
 rho-db.workspace = true
 senax-encoder.workspace = true
