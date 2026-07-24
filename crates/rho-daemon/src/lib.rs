@@ -9,7 +9,7 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use rho_agent::db::{
-    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime,
+    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentUsageProvider,
     AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider, WorkstreamId,
 };
 use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent};
@@ -20,10 +20,11 @@ use rho_inference::InferenceAuth;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    AgentUsageBucket as UiAgentUsageBucket, ClientMessage, JoinTarget, LandLeaseHolder, LandStatus,
-    McpAgentToolRequest, McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary,
-    ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject, UiWorkstream, WorkspaceInfo,
-    WorkstreamTarget, read_frame, read_frame_counted, write_frame, write_frame_counted,
+    AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, ClientMessage, JoinTarget,
+    LandLeaseHolder, LandStatus, McpAgentToolRequest, McpAgentToolResponse, QuotaPoint,
+    QuotaSeries, QuotaSummary, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
+    UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, read_frame_counted, write_frame,
+    write_frame_counted,
 };
 use tokio::sync::{
     Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot, watch,
@@ -2295,6 +2296,26 @@ async fn handle_message(
                 buckets,
                 total,
             });
+            Ok(Refresh::None)
+        }
+        ClientMessage::GlobalUsage { since_ms } => {
+            agents.pool.flush_agent_usage(None).await;
+            let usage = agents
+                .db
+                .read()
+                .global_agent_usage(rho_core::UnixMs(since_ms));
+            let series = [AgentUsageProvider::GPT, AgentUsageProvider::CLAUDE]
+                .into_iter()
+                .map(|provider| AgentUsageSeries {
+                    provider: provider.name().to_owned(),
+                    buckets: usage
+                        .iter()
+                        .filter(|(candidate, _)| *candidate == provider)
+                        .map(|(_, bucket)| ui_agent_usage_bucket(bucket.clone()))
+                        .collect(),
+                })
+                .collect();
+            let _ = outgoing_tx.send(ServerMessage::GlobalUsage { series });
             Ok(Refresh::None)
         }
         ClientMessage::ShellStart { request_id, agent } => {

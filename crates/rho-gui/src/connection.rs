@@ -95,12 +95,7 @@ pub enum ConnEvent {
     },
     QuotaUsage(Vec<rho_ui_proto::QuotaSummary>),
     QuotaHistory(Vec<rho_ui_proto::QuotaSeries>),
-    AgentUsage {
-        agent_id: rho_ui_proto::AgentId,
-        model: String,
-        buckets: Vec<rho_ui_proto::AgentUsageBucket>,
-        total: rho_ui_proto::AgentUsageBucket,
-    },
+    GlobalUsage(Vec<rho_ui_proto::AgentUsageSeries>),
     ServerError(String),
     Disconnected(String),
     GitTransportApproval {
@@ -831,17 +826,8 @@ async fn run(
             }),
             ServerMessage::QuotaUsage { summaries } => Some(ConnEvent::QuotaUsage(summaries)),
             ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series)),
-            ServerMessage::AgentUsage {
-                agent_id,
-                model,
-                buckets,
-                total,
-            } => Some(ConnEvent::AgentUsage {
-                agent_id,
-                model,
-                buckets,
-                total,
-            }),
+            ServerMessage::AgentUsage { .. } => None,
+            ServerMessage::GlobalUsage { series } => Some(ConnEvent::GlobalUsage(series)),
             ServerMessage::GitTransportRequested {
                 request_id,
                 provider_id,

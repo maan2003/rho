@@ -145,15 +145,7 @@ pub struct Workspace {
     connected: bool,
     quota_summaries: Vec<rho_ui_proto::QuotaSummary>,
     quota_history: Vec<rho_ui_proto::QuotaSeries>,
-    agent_usage: HashMap<
-        rho_ui_proto::AgentId,
-        (
-            String,
-            Vec<rho_ui_proto::AgentUsageBucket>,
-            rho_ui_proto::AgentUsageBucket,
-        ),
-    >,
-    active_usage_agent: Option<rho_ui_proto::AgentId>,
+    global_usage: Vec<rho_ui_proto::AgentUsageSeries>,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
@@ -323,8 +315,7 @@ impl Workspace {
             connected: false,
             quota_summaries: Vec::new(),
             quota_history: Vec::new(),
-            agent_usage: HashMap::new(),
-            active_usage_agent: None,
+            global_usage: Vec::new(),
             duration_timer: None,
             chime: Chime::default(),
             contexts: HashMap::new(),
@@ -632,25 +623,15 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            ConnEvent::AgentUsage {
-                agent_id,
-                model,
-                buckets,
-                total,
-            } => {
-                self.agent_usage
-                    .insert(agent_id, (model.clone(), buckets.clone(), total.clone()));
+            ConnEvent::GlobalUsage(series) => {
+                self.global_usage = series;
                 if self
                     .transient
                     .as_ref()
-                    .is_some_and(|transient| transient.title() == "agent cost")
-                    && self.active_usage_agent == Some(agent_id)
+                    .is_some_and(|transient| transient.title() == "model cost")
                 {
-                    self.transient = Some(crate::transient::agent_usage_menu(
-                        self.registry.agent_display_label(agent_id),
-                        model,
-                        buckets,
-                        total,
+                    self.transient = Some(crate::transient::global_usage_menu(
+                        self.global_usage.clone(),
                     ));
                 }
                 cx.notify();
@@ -3025,56 +3006,19 @@ impl Workspace {
         self.open_transient(crate::transient::usage_menu(history), window, cx);
     }
 
-    pub(crate) fn open_agent_usage_transient(
+    pub(crate) fn open_global_usage_transient(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_id) = self.registry.selected_agent().copied() else {
-            return;
-        };
-        self.open_agent_usage_for(agent_id, window, cx);
-    }
-
-    fn open_agent_usage_for(
-        &mut self,
-        agent_id: rho_ui_proto::AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.active_usage_agent = Some(agent_id);
-        self.connection.send(ClientMessage::AgentUsage {
-            agent_id,
+        self.connection.send(ClientMessage::GlobalUsage {
             since_ms: now_ms().saturating_sub(7 * 24 * 60 * 60 * 1_000),
         });
-        let (model, buckets, total) = self.agent_usage.get(&agent_id).cloned().unwrap_or_default();
         self.open_transient(
-            crate::transient::agent_usage_menu(
-                self.registry.agent_display_label(agent_id),
-                model,
-                buckets,
-                total,
-            ),
+            crate::transient::global_usage_menu(self.global_usage.clone()),
             window,
             cx,
         );
-    }
-
-    pub(crate) fn prompt_agent_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| {
-            Vec::<crate::commands::Candidate>::new()
-        });
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                if let Some(agent_id) = workspace.registry.agent_by_label(input.trim()) {
-                    workspace.open_agent_usage_for(agent_id, window, cx);
-                }
-            },
-        );
-        self.open_prompt("agent cost:", complete, on_submit, window, cx);
     }
 
     pub(crate) fn prompt_new_agent_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3383,16 +3327,20 @@ impl Workspace {
                 .reset_at_unix
                 .map(|reset| ((reset as f64 - now).max(0.0)) / 86_400.0)
                 .unwrap_or(0.0);
-            let provider_color = if summary.model == "fable" {
-                colors.terminal_ansi_magenta
+            let provider_color: gpui::Hsla = if summary.model == "fable" {
+                gpui::rgb(0xd97757).into()
             } else {
-                colors.terminal_ansi_cyan
+                colors.terminal_ansi_cyan.into()
             };
             stats = stats
                 .child(
                     div()
                         .text_color(provider_color)
-                        .child(summary.model.clone()),
+                        .child(if summary.model == "fable" {
+                            "claude".to_owned()
+                        } else {
+                            summary.model.clone()
+                        }),
                 )
                 .child(format!(
                     "{}% −{}% {:.1}d",

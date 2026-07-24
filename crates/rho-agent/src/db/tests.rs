@@ -15,6 +15,19 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     let mut write = db.write().await;
     write.init_agent_tables();
     let agent_id = write.alloc_agent_id();
+    let workstream = write.create_workstream(UnixMs(1), "usage".to_owned());
+    write.create_agent(
+        UnixMs(1),
+        agent_id,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesSol(InferenceProfile::default()),
+        AgentRuntime::Rho {
+            prompt_cache_key: PromptCacheKey::generate(),
+        },
+        None,
+    );
     let first = AgentUsageBucket {
         bucket_start_ms: AGENT_USAGE_BUCKET_MS,
         input_tokens: 10,
@@ -26,6 +39,22 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     };
     write.add_agent_usage(agent_id, &first);
     write.add_agent_usage(agent_id, &first);
+    let claude_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        claude_id,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ClaudeFable {
+            effort: ClaudeEffort::High,
+        },
+        AgentRuntime::Claude {
+            session_id: uuid::Uuid::new_v4(),
+        },
+        None,
+    );
+    write.add_agent_usage(claude_id, &first);
     write.commit();
 
     let read = db.read();
@@ -34,6 +63,12 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     assert_eq!(buckets[0].input_tokens, 20);
     assert_eq!(buckets[0].requests, 2);
     assert_eq!(read.agent_usage_total(agent_id).output_tokens, 80);
+    let global = read.global_agent_usage(UnixMs(0));
+    assert_eq!(global.len(), 2);
+    assert_eq!(global[0].0, AgentUsageProvider::GPT);
+    assert_eq!(global[0].1.output_tokens, 80);
+    assert_eq!(global[1].0, AgentUsageProvider::CLAUDE);
+    assert_eq!(global[1].1.output_tokens, 40);
 }
 
 #[tokio::test]
@@ -98,6 +133,10 @@ async fn native_usage_backfill_reads_completed_debug_responses() {
     assert_eq!(bucket.cache_write_tokens, 10);
     assert_eq!(bucket.output_tokens, 20);
     assert_eq!(bucket.requests, 1);
+    let global = read.global_agent_usage(UnixMs(0));
+    assert_eq!(global.len(), 1);
+    assert_eq!(global[0].0, AgentUsageProvider::GPT);
+    assert_eq!(global[0].1.input_tokens, 30);
 }
 
 #[tokio::test]

@@ -327,6 +327,9 @@ pub enum ClientMessage {
         agent_id: AgentId,
         since_ms: u64,
     },
+    GlobalUsage {
+        since_ms: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -661,6 +664,9 @@ pub enum ServerMessage {
         buckets: Vec<AgentUsageBucket>,
         total: AgentUsageBucket,
     },
+    GlobalUsage {
+        series: Vec<AgentUsageSeries>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -696,6 +702,12 @@ pub struct AgentUsageBucket {
     pub output_tokens: u64,
     pub requests: u64,
     pub approximate: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct AgentUsageSeries {
+    pub provider: String,
+    pub buckets: Vec<AgentUsageBucket>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -1089,6 +1101,24 @@ mod tests {
                 reply: Some("inline:9:v1".into()),
                 body: "addressed".into(),
             },
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn global_usage_response_round_trips() {
+        let message = ServerMessage::GlobalUsage {
+            series: vec![AgentUsageSeries {
+                provider: "claude".to_owned(),
+                buckets: vec![AgentUsageBucket {
+                    bucket_start_ms: 300_000,
+                    input_tokens: 10,
+                    ..AgentUsageBucket::default()
+                }],
+            }],
         };
         let bytes = senax_encoder::pack(&message).unwrap();
         let mut slice: &[u8] = &bytes;

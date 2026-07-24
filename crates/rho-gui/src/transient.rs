@@ -7,12 +7,13 @@
 //! for toggles. There is no textual command grammar — commands are Rust
 //! values, the menus are how fingers reach them.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
     AnyElement, Context, Hsla, Keystroke, PathBuilder, Pixels, Point, Window, canvas, div, point,
-    px,
+    px, rgb,
 };
 use theme::ActiveTheme as _;
 
@@ -40,12 +41,7 @@ pub struct Transient {
     title: &'static str,
     items: Vec<TransientItem>,
     quota_usage: Option<Vec<rho_ui_proto::QuotaSeries>>,
-    agent_usage: Option<(
-        String,
-        String,
-        Vec<rho_ui_proto::AgentUsageBucket>,
-        rho_ui_proto::AgentUsageBucket,
-    )>,
+    global_usage: Option<Vec<rho_ui_proto::AgentUsageSeries>>,
 }
 
 impl Transient {
@@ -54,7 +50,7 @@ impl Transient {
             title,
             items: Vec::new(),
             quota_usage: None,
-            agent_usage: None,
+            global_usage: None,
         }
     }
 
@@ -160,7 +156,7 @@ impl Transient {
         if let Some(series) = &self.quota_usage {
             let series = series.clone();
             let gpt: Hsla = colors.terminal_ansi_cyan.into();
-            let fable: Hsla = colors.terminal_ansi_magenta.into();
+            let fable: Hsla = rgb(0xd97757).into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
             return bottom_strip(text_style, cx)
                 .child(
@@ -175,7 +171,7 @@ impl Transient {
                         .gap_4()
                         .px_2()
                         .child(div().text_color(gpt).child("gpt"))
-                        .child(div().text_color(fable).child("fable")),
+                        .child(div().text_color(fable).child("claude")),
                 )
                 .child(
                     div().px_2().pb_1().child(
@@ -219,34 +215,92 @@ impl Transient {
                 )
                 .into_any_element();
         }
-        if let Some((label, model, buckets, total)) = &self.agent_usage {
-            let buckets = buckets.clone();
-            let model = model.clone();
-            let line: Hsla = colors.terminal_ansi_cyan.into();
+        if let Some(series) = &self.global_usage {
+            let series = series.clone();
+            let gpt: Hsla = colors.terminal_ansi_cyan.into();
+            let claude: Hsla = rgb(0xd97757).into();
+            let line: Hsla = colors.text_accent.into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
-            let total_cost = agent_bucket_cost_usd(total, model.as_str());
+            let now = crate::workspace::now_ms();
+            let since = now.saturating_sub(7 * 24 * 60 * 60 * 1_000);
+            let gpt_cost = provider_cost(&series, "gpt", since);
+            let claude_cost = provider_cost(&series, "claude", since);
+            let total_cost = gpt_cost + claude_cost;
+            let requests = series
+                .iter()
+                .flat_map(|series| &series.buckets)
+                .filter(|bucket| bucket.bucket_start_ms >= since)
+                .map(|bucket| bucket.requests)
+                .sum::<u64>();
+            let approximate = series
+                .iter()
+                .flat_map(|series| &series.buckets)
+                .filter(|bucket| bucket.bucket_start_ms >= since)
+                .any(|bucket| bucket.approximate);
             return bottom_strip(text_style, cx)
                 .child(
                     div()
                         .px_2()
                         .font_weight(gpui::FontWeight::BOLD)
-                        .child(format!("cost · {label}")),
+                        .child("model cost · last 7 days"),
                 )
                 .child(div().px_2().text_color(muted).child(format!(
-                    "${total_cost:.2} estimated API cost · {} requests · {model}{}",
-                    total.requests,
-                    if total.approximate {
+                    "${total_cost:.2} estimated API cost · {requests} requests{}",
+                    if approximate {
                         " · includes approximate backfill"
                     } else {
                         ""
                     }
                 )))
                 .child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .px_2()
+                        .child(
+                            div()
+                                .text_color(claude)
+                                .child(format!("claude ${claude_cost:.2}")),
+                        )
+                        .child(div().text_color(gpt).child(format!("gpt ${gpt_cost:.2}"))),
+                )
+                .child(
                     div().px_2().pb_1().child(
                         div()
-                            .w(px(832.))
-                            .h(px(240.))
-                            .child(agent_usage_chart(buckets, model, line, grid)),
+                            .flex()
+                            .items_start()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(
+                                div()
+                                    .h(px(220.))
+                                    .w(px(64.))
+                                    .pr_2()
+                                    .flex()
+                                    .flex_col()
+                                    .items_end()
+                                    .justify_between()
+                                    .child(format!("${total_cost:.2}"))
+                                    .child(format!("${:.2}", total_cost / 2.0))
+                                    .child("$0"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().w(px(832.)).h(px(220.)).child(global_usage_chart(
+                                        series, now, gpt, claude, line, grid,
+                                    )))
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .flex()
+                                            .w(px(832.))
+                                            .justify_between()
+                                            .child("−7d")
+                                            .child("now"),
+                                    ),
+                            ),
                     ),
                 )
                 .into_any_element();
@@ -392,14 +446,8 @@ pub fn usage_root_menu() -> Transient {
         .item("q", "provider quota", |workspace, window, cx| {
             workspace.open_usage_transient(window, cx);
         })
-        .item_when(
-            Workspace::has_selected_agent,
-            "a",
-            "current agent cost",
-            |workspace, window, cx| workspace.open_agent_usage_transient(window, cx),
-        )
-        .item("s", "agent by handle…", |workspace, window, cx| {
-            workspace.prompt_agent_usage(window, cx);
+        .item("c", "model cost", |workspace, window, cx| {
+            workspace.open_global_usage_transient(window, cx);
         })
 }
 
@@ -409,14 +457,9 @@ pub fn usage_menu(series: Vec<rho_ui_proto::QuotaSeries>) -> Transient {
     menu
 }
 
-pub fn agent_usage_menu(
-    label: String,
-    model: String,
-    buckets: Vec<rho_ui_proto::AgentUsageBucket>,
-    total: rho_ui_proto::AgentUsageBucket,
-) -> Transient {
-    let mut menu = Transient::new("agent cost");
-    menu.agent_usage = Some((label, model, buckets, total));
+pub fn global_usage_menu(series: Vec<rho_ui_proto::AgentUsageSeries>) -> Transient {
+    let mut menu = Transient::new("model cost");
+    menu.global_usage = Some(series);
     menu
 }
 
@@ -477,69 +520,261 @@ fn usage_chart(
 }
 
 fn paint_usage_segment(points: &[Point<Pixels>], color: Hsla, window: &mut Window) {
+    let points = points
+        .iter()
+        .copied()
+        .fold(Vec::<Point<Pixels>>::new(), |mut points, point| {
+            if let Some(previous) = points.last_mut()
+                && point.x <= previous.x
+            {
+                *previous = point;
+            } else {
+                points.push(point);
+            }
+            points
+        });
     let Some(first) = points.first().copied() else {
         return;
     };
     let mut builder = PathBuilder::stroke(px(2.));
     builder.move_to(first);
-    for pair in points.windows(2) {
-        let from = pair[0];
-        let to = pair[1];
-        let mid_x = from.x + (to.x - from.x) / 2.0;
-        builder.cubic_bezier_to(to, point(mid_x, from.y), point(mid_x, to.y));
+    if points.len() == 2 {
+        builder.line_to(points[1]);
+    } else if points.len() > 2 {
+        let xs = points
+            .iter()
+            .map(|point| f64::from(point.x))
+            .collect::<Vec<_>>();
+        let ys = points
+            .iter()
+            .map(|point| f64::from(point.y))
+            .collect::<Vec<_>>();
+        let slopes = pchip_slopes(&xs, &ys);
+        for (index, pair) in points.windows(2).enumerate() {
+            let to = pair[1];
+            let width = xs[index + 1] - xs[index];
+            builder.cubic_bezier_to(
+                to,
+                point(
+                    px((xs[index] + width / 3.0) as f32),
+                    px((ys[index] + slopes[index] * width / 3.0) as f32),
+                ),
+                point(
+                    px((xs[index + 1] - width / 3.0) as f32),
+                    px((ys[index + 1] - slopes[index + 1] * width / 3.0) as f32),
+                ),
+            );
+        }
     }
     if let Ok(path) = builder.build() {
         window.paint_path(path, color);
     }
 }
 
-fn agent_usage_chart(
-    buckets: Vec<rho_ui_proto::AgentUsageBucket>,
-    model: String,
-    line: Hsla,
+fn pchip_slopes(xs: &[f64], ys: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(xs.len(), ys.len());
+    debug_assert!(xs.len() >= 3);
+    let widths = xs
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect::<Vec<_>>();
+    let secants = ys
+        .windows(2)
+        .zip(&widths)
+        .map(|(pair, width)| (pair[1] - pair[0]) / width)
+        .collect::<Vec<_>>();
+    let mut slopes = vec![0.0; xs.len()];
+    slopes[0] = pchip_endpoint(widths[0], widths[1], secants[0], secants[1]);
+    for index in 1..xs.len() - 1 {
+        let before = secants[index - 1];
+        let after = secants[index];
+        if before == 0.0 || after == 0.0 || before.signum() != after.signum() {
+            slopes[index] = 0.0;
+        } else {
+            let before_weight = 2.0 * widths[index] + widths[index - 1];
+            let after_weight = widths[index] + 2.0 * widths[index - 1];
+            slopes[index] =
+                (before_weight + after_weight) / (before_weight / before + after_weight / after);
+        }
+    }
+    let last = widths.len() - 1;
+    slopes[xs.len() - 1] = pchip_endpoint(
+        widths[last],
+        widths[last - 1],
+        secants[last],
+        secants[last - 1],
+    );
+    slopes
+}
+
+fn pchip_endpoint(width: f64, adjacent_width: f64, secant: f64, adjacent: f64) -> f64 {
+    let mut slope =
+        ((2.0 * width + adjacent_width) * secant - width * adjacent) / (width + adjacent_width);
+    if slope.signum() != secant.signum() {
+        slope = 0.0;
+    } else if secant.signum() != adjacent.signum() && slope.abs() > 3.0 * secant.abs() {
+        slope = 3.0 * secant;
+    }
+    slope
+}
+
+fn global_usage_chart(
+    series: Vec<rho_ui_proto::AgentUsageSeries>,
+    now: u64,
+    gpt: Hsla,
+    claude: Hsla,
+    total_line: Hsla,
     grid: Hsla,
 ) -> impl IntoElement {
     canvas(
         move |_, _, _| {},
         move |bounds, _, window, _| {
-            for step in 0..=4 {
-                let y = bounds.origin.y + bounds.size.height * (step as f32 / 4.0);
-                let mut builder = PathBuilder::stroke(px(1.));
-                builder.move_to(point(bounds.origin.x, y));
-                builder.line_to(point(bounds.right(), y));
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, grid);
+            const BUCKET_MS: u64 = 5 * 60 * 1_000;
+            const WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+            let start = now.saturating_sub(WINDOW_MS);
+            let mut costs = HashMap::<u64, (f64, f64)>::new();
+            for provider in &series {
+                for bucket in &provider.buckets {
+                    if bucket.bucket_start_ms < start {
+                        continue;
+                    }
+                    let entry = costs.entry(bucket.bucket_start_ms).or_default();
+                    let cost = bucket_cost_usd(bucket, &provider.provider);
+                    if provider.provider == "claude" {
+                        entry.1 += cost;
+                    } else {
+                        entry.0 += cost;
+                    }
                 }
             }
-            let window_total = buckets
-                .iter()
-                .map(|bucket| agent_bucket_cost_usd(bucket, &model))
+
+            let max = costs
+                .values()
+                .map(|(gpt, claude)| gpt + claude)
                 .sum::<f64>()
                 .max(f64::EPSILON);
-            let now = crate::workspace::now_ms();
-            let start = now.saturating_sub(7 * 24 * 60 * 60 * 1_000);
-            let mut cumulative = 0.0;
-            let points = std::iter::once(point(bounds.origin.x, bounds.bottom()))
-                .chain(buckets.iter().map(|bucket| {
-                    cumulative += agent_bucket_cost_usd(bucket, &model);
-                    let x = bucket.bucket_start_ms.saturating_sub(start) as f64
-                        / now.saturating_sub(start).max(1) as f64;
-                    let y = 1.0 - cumulative / window_total;
-                    point(
-                        bounds.origin.x + bounds.size.width * x.clamp(0.0, 1.0) as f32,
-                        bounds.origin.y + bounds.size.height * y as f32,
-                    )
-                }))
-                .collect::<Vec<_>>();
-            paint_usage_segment(&points, line, window);
+            let to_point = |at: u64, value: f64| {
+                let x = at.saturating_sub(start) as f64 / WINDOW_MS as f64;
+                let y = 1.0 - value / max;
+                point(
+                    bounds.origin.x + bounds.size.width * x.clamp(0.0, 1.0) as f32,
+                    bounds.origin.y + bounds.size.height * y.clamp(0.0, 1.0) as f32,
+                )
+            };
+            let mut claude_total = 0.0;
+            let mut gpt_total = 0.0;
+            let mut points = vec![(
+                to_point(start, claude_total),
+                to_point(start, claude_total + gpt_total),
+            )];
+            let mut bucket_start = start.div_ceil(BUCKET_MS) * BUCKET_MS;
+            while bucket_start <= now {
+                points.push((
+                    to_point(bucket_start, claude_total),
+                    to_point(bucket_start, claude_total + gpt_total),
+                ));
+                if let Some((gpt_cost, claude_cost)) = costs.get(&bucket_start) {
+                    gpt_total += gpt_cost;
+                    claude_total += claude_cost;
+                }
+                let end = bucket_start.saturating_add(BUCKET_MS).min(now);
+                points.push((
+                    to_point(end, claude_total),
+                    to_point(end, claude_total + gpt_total),
+                ));
+                bucket_start = bucket_start.saturating_add(BUCKET_MS);
+            }
+
+            let mut claude_area = PathBuilder::fill();
+            claude_area.move_to(point(bounds.origin.x, bounds.bottom()));
+            for (point, _) in &points {
+                claude_area.line_to(*point);
+            }
+            claude_area.line_to(point(bounds.right(), bounds.bottom()));
+            claude_area.close();
+            if let Ok(path) = claude_area.build() {
+                window.paint_path(path, claude.opacity(0.72));
+            }
+
+            let mut gpt_area = PathBuilder::fill();
+            if let Some((_, first)) = points.first() {
+                gpt_area.move_to(*first);
+            }
+            for (_, point) in &points[1..] {
+                gpt_area.line_to(*point);
+            }
+            for (point, _) in points.iter().rev() {
+                gpt_area.line_to(*point);
+            }
+            gpt_area.close();
+            if let Ok(path) = gpt_area.build() {
+                window.paint_path(path, gpt.opacity(0.72));
+            }
+
+            for step in 0..=4 {
+                let y = bounds.origin.y + bounds.size.height * (step as f32 / 4.0);
+                paint_grid_line(
+                    point(bounds.origin.x, y),
+                    point(bounds.right(), y),
+                    grid,
+                    window,
+                );
+            }
+            for day in 1..7 {
+                let x = bounds.origin.x + bounds.size.width * (day as f32 / 7.0);
+                paint_grid_line(
+                    point(x, bounds.origin.y),
+                    point(x, bounds.bottom()),
+                    grid,
+                    window,
+                );
+            }
+            paint_polyline(
+                &points.iter().map(|(_, point)| *point).collect::<Vec<_>>(),
+                total_line,
+                window,
+            );
         },
     )
     .size_full()
 }
 
-fn agent_bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &str) -> f64 {
-    let (input, cache_read, cache_write, output) = match model {
-        "claude-fable-5" => (10.0, 1.0, 12.5, 50.0),
+fn paint_grid_line(from: Point<Pixels>, to: Point<Pixels>, color: Hsla, window: &mut Window) {
+    let mut builder = PathBuilder::stroke(px(1.));
+    builder.move_to(from);
+    builder.line_to(to);
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+fn paint_polyline(points: &[Point<Pixels>], color: Hsla, window: &mut Window) {
+    let Some(first) = points.first() else {
+        return;
+    };
+    let mut builder = PathBuilder::stroke(px(2.));
+    builder.move_to(*first);
+    for point in &points[1..] {
+        builder.line_to(*point);
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+fn provider_cost(series: &[rho_ui_proto::AgentUsageSeries], provider: &str, since: u64) -> f64 {
+    series
+        .iter()
+        .filter(|series| series.provider == provider)
+        .flat_map(|series| &series.buckets)
+        .filter(|bucket| bucket.bucket_start_ms >= since)
+        .map(|bucket| bucket_cost_usd(bucket, provider))
+        .sum()
+}
+
+fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, provider: &str) -> f64 {
+    let (input, cache_read, cache_write, output) = match provider {
+        "claude" => (10.0, 1.0, 12.5, 50.0),
         _ => (5.0, 0.5, 6.25, 30.0),
     };
     (bucket.input_tokens as f64 * input
@@ -702,7 +937,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_cost_uses_provider_cache_rates() {
+    fn model_cost_uses_provider_cache_rates() {
         let usage = rho_ui_proto::AgentUsageBucket {
             input_tokens: 1_000_000,
             cache_read_tokens: 1_000_000,
@@ -710,7 +945,33 @@ mod tests {
             output_tokens: 1_000_000,
             ..Default::default()
         };
-        assert_eq!(agent_bucket_cost_usd(&usage, "claude-fable-5"), 73.5);
-        assert_eq!(agent_bucket_cost_usd(&usage, "gpt-5.6-sol"), 41.75);
+        assert_eq!(bucket_cost_usd(&usage, "claude"), 73.5);
+        assert_eq!(bucket_cost_usd(&usage, "gpt"), 41.75);
+    }
+
+    #[test]
+    fn pchip_preserves_linear_slope() {
+        assert_eq!(
+            pchip_slopes(&[0.0, 2.0, 5.0], &[1.0, 3.0, 6.0]),
+            vec![1.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn pchip_monotone_samples_do_not_overshoot() {
+        let xs = [0.0, 1.0, 4.0, 10.0];
+        let ys = [0.0, 2.0, 3.0, 8.0];
+        let slopes = pchip_slopes(&xs, &ys);
+        for index in 0..xs.len() - 1 {
+            let width = xs[index + 1] - xs[index];
+            for step in 0..=100 {
+                let t = f64::from(step) / 100.0;
+                let value = (2.0 * t.powi(3) - 3.0 * t.powi(2) + 1.0) * ys[index]
+                    + (t.powi(3) - 2.0 * t.powi(2) + t) * width * slopes[index]
+                    + (-2.0 * t.powi(3) + 3.0 * t.powi(2)) * ys[index + 1]
+                    + (t.powi(3) - t.powi(2)) * width * slopes[index + 1];
+                assert!(value >= ys[index] && value <= ys[index + 1]);
+            }
+        }
     }
 }

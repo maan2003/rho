@@ -36,10 +36,12 @@ const AGENT_USAGE_BUCKETS: TableDefinition<AgentUsageKey, Sen<AgentUsageBucket>>
     TableDefinition::new("agent_usage_by_agent_time");
 const AGENT_USAGE_TOTALS: TableDefinition<AgentId, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_totals");
+const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBucket>> =
+    TableDefinition::new("agent_usage_by_time_provider");
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "a61e39c4";
+const CURRENT_AGENT_DB_FORMAT: &str = "d93b71e4";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -55,11 +57,18 @@ pub struct MigrationRecoveryPoint {
     pub created_at: UnixMillis,
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "f12a7c9d",
-    to: "a61e39c4",
-    migrate: |_| {},
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: "f12a7c9d",
+        to: "a61e39c4",
+        migrate: |_| {},
+    },
+    AgentDbMigration {
+        from: "a61e39c4",
+        to: "d93b71e4",
+        migrate: rebuild_global_agent_usage,
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -117,6 +126,28 @@ struct AgentUsageKey {
     bucket_start_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue, Encode, Decode)]
+pub struct AgentUsageProvider(u8);
+
+impl AgentUsageProvider {
+    pub const GPT: Self = Self(1);
+    pub const CLAUDE: Self = Self(2);
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::GPT => "gpt",
+            Self::CLAUDE => "claude",
+            _ => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
+struct GlobalAgentUsageKey {
+    bucket_start_ms: u64,
+    provider: AgentUsageProvider,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct AgentUsageBucket {
     pub bucket_start_ms: u64,
@@ -141,6 +172,58 @@ impl AgentUsageBucket {
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.requests = self.requests.saturating_add(other.requests);
         self.approximate |= other.approximate;
+    }
+}
+
+fn usage_provider(runtime: &AgentRuntime) -> AgentUsageProvider {
+    match runtime {
+        AgentRuntime::Rho { .. } => AgentUsageProvider::GPT,
+        AgentRuntime::Claude { .. } => AgentUsageProvider::CLAUDE,
+    }
+}
+
+fn add_global_agent_usage(
+    write: &mut WriteTxn,
+    provider: AgentUsageProvider,
+    bucket: &AgentUsageBucket,
+) {
+    let key = GlobalAgentUsageKey {
+        bucket_start_ms: bucket.bucket_start_ms,
+        provider,
+    };
+    let mut table = write.open_table(GLOBAL_AGENT_USAGE);
+    let mut merged = table
+        .get(&key)
+        .map(|value| value.value().into_owned())
+        .unwrap_or_else(|| AgentUsageBucket {
+            bucket_start_ms: bucket.bucket_start_ms,
+            ..AgentUsageBucket::default()
+        });
+    merged.add(bucket);
+    table.insert(&key, SenValue::borrowed(&merged));
+}
+
+fn rebuild_global_agent_usage(write: &mut WriteTxn) {
+    write.delete_table("agent_usage_by_time_provider");
+    let providers = write
+        .open_table(AGENTS)
+        .iter()
+        .map(|(agent_id, record)| {
+            (
+                agent_id.value(),
+                usage_provider(&record.value().as_ref().runtime),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let buckets = write
+        .open_table(AGENT_USAGE_BUCKETS)
+        .iter()
+        .map(|(key, bucket)| (key.value(), bucket.value().into_owned()))
+        .collect::<Vec<_>>();
+    for (key, bucket) in buckets {
+        if let Some(provider) = providers.get(&key.agent_id) {
+            add_global_agent_usage(write, *provider, &bucket);
+        }
     }
 }
 
@@ -899,6 +982,7 @@ pub trait AgentReadTxnExt {
     ) -> Vec<QuotaObservationRecord>;
     fn agent_usage(&self, agent_id: AgentId, since: UnixMillis) -> Vec<AgentUsageBucket>;
     fn agent_usage_total(&self, agent_id: AgentId) -> AgentUsageBucket;
+    fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageProvider, AgentUsageBucket)>;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1210,6 +1294,21 @@ impl AgentReadTxnExt for ReadTxn {
             .map(|value| value.value().into_owned())
             .unwrap_or_default()
     }
+
+    fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageProvider, AgentUsageBucket)> {
+        self.open_table(GLOBAL_AGENT_USAGE)
+            .range(
+                GlobalAgentUsageKey {
+                    bucket_start_ms: since.0,
+                    provider: AgentUsageProvider::GPT,
+                }..=GlobalAgentUsageKey {
+                    bucket_start_ms: u64::MAX,
+                    provider: AgentUsageProvider::CLAUDE,
+                },
+            )
+            .map(|(key, value)| (key.value().provider, value.value().into_owned()))
+            .collect()
+    }
 }
 
 impl AgentWriteTxnExt for WriteTxn {
@@ -1229,6 +1328,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(QUOTA_OBSERVATIONS);
         self.open_table(AGENT_USAGE_BUCKETS);
         self.open_table(AGENT_USAGE_TOTALS);
+        self.open_table(GLOBAL_AGENT_USAGE);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
@@ -1512,6 +1612,14 @@ impl AgentWriteTxnExt for WriteTxn {
         total.add(bucket);
         total.bucket_start_ms = 0;
         totals.insert(&agent_id, SenValue::borrowed(&total));
+        drop(totals);
+
+        let provider = self
+            .open_table(AGENTS)
+            .get(&agent_id)
+            .map(|record| usage_provider(&record.value().as_ref().runtime))
+            .expect("usage agent missing");
+        add_global_agent_usage(self, provider, bucket);
     }
 
     fn replace_agent_usage(
