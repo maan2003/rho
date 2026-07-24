@@ -15,6 +15,7 @@ use media::Sample;
 use opus_rs::{Application, OpusDecoder, OpusEncoder};
 use rho_inference::ResolvedOAuth;
 use rodio::microphone::MicrophoneBuilder;
+use rodio::source::UniformSourceIterator;
 use rodio::{ChannelCount, DeviceSinkBuilder, MixerDeviceSink, SampleRate, Source as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -625,21 +626,24 @@ fn start_microphone(
     let microphone = MicrophoneBuilder::new()
         .default_device()?
         .default_config()?
-        .prefer_sample_rates([rodio::nz!(48_000)])
-        .prefer_channel_counts([rodio::nz!(1)])
+        .prefer_sample_rates([
+            rodio::nz!(48_000),
+            rodio::nz!(96_000),
+            rodio::nz!(44_100),
+            rodio::nz!(16_000),
+        ])
+        .prefer_channel_counts([rodio::nz!(1), rodio::nz!(2)])
+        .prefer_buffer_sizes(512..)
         .open_stream()?;
     let sample_rate = microphone.sample_rate().get();
-    let channels = microphone.channels().get() as usize;
+    let channels = microphone.channels().get();
     tracing::info!(sample_rate, channels, "opened realtime microphone");
-    anyhow::ensure!(
-        sample_rate == SAMPLE_RATE,
-        "microphone does not support 48 kHz audio"
-    );
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
     std::thread::Builder::new()
         .name("rho-realtime-microphone".to_owned())
         .spawn(move || {
-            let mut microphone = microphone;
+            let mut microphone =
+                UniformSourceIterator::new(microphone, rodio::nz!(1), rodio::nz!(48_000));
             let mut encoder = match OpusEncoder::new(SAMPLE_RATE as i32, 1, Application::Voip) {
                 Ok(encoder) => encoder,
                 Err(error) => {
@@ -653,16 +657,11 @@ fn start_microphone(
             loop {
                 let mut frame = Vec::with_capacity(FRAME_SAMPLES);
                 for _ in 0..FRAME_SAMPLES {
-                    let mut mixed = 0.0_f32;
-                    for _ in 0..channels {
-                        let Some(sample) = microphone.next() else {
-                            tracing::warn!(packet_count, "realtime microphone stream ended");
-                            return;
-                        };
-                        mixed += sample;
-                    }
-                    let sample = (mixed / channels as f32).clamp(-1.0, 1.0);
-                    frame.push(sample);
+                    let Some(sample) = microphone.next() else {
+                        tracing::warn!(packet_count, "realtime microphone stream ended");
+                        return;
+                    };
+                    frame.push(sample.clamp(-1.0, 1.0));
                 }
                 let mut packet = vec![0_u8; 4_000];
                 let packet_len = match encoder.encode(&frame, FRAME_SAMPLES, &mut packet) {
