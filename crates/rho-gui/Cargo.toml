@@ -52,6 +52,7 @@ rho-core.workspace = true
 rho-daemon.workspace = true
 rho-iroh-auth.workspace = true
 rho-profiling.workspace = true
+rho-realtime.workspace = true
 rho-ui-proto.workspace = true
 senax-encoder.workspace = true
 # Same revision the zed fork pins, so a future switch to its `audio` crate

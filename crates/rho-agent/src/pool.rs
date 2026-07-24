@@ -83,6 +83,36 @@ pub struct AgentInputAccepted {
     pub source_id: Option<InputSourceId>,
 }
 
+/// One agent used as the execution backend for another agent runtime.
+///
+/// The caller owns provider-specific request correlation. This handle only
+/// supplies generic agent input and structured final-output delivery.
+pub struct DelegationBackend {
+    agent_id: AgentId,
+    agent: RunningAgent,
+    source_id: InputSourceId,
+    completed: broadcast::Receiver<AgentTurnCompleted>,
+}
+
+impl DelegationBackend {
+    pub fn submit(&self, text: String) {
+        self.agent.send_user_message_with_source(
+            text,
+            MessageDelivery::Immediate,
+            Some(self.source_id),
+        );
+    }
+
+    pub async fn next_final(&mut self) -> anyhow::Result<String> {
+        loop {
+            let completed = self.completed.recv().await?;
+            if completed.agent_id == self.agent_id {
+                return Ok(completed.final_answer);
+            }
+        }
+    }
+}
+
 /// One entry of a spawned child's working set.
 pub struct SpawnWorkdir {
     /// Absolute path anywhere inside the repository (or plain directory).
@@ -166,6 +196,21 @@ impl AgentPool {
 
     pub fn subscribe_accepted_inputs(&self) -> broadcast::Receiver<AgentInputAccepted> {
         self.accepted_inputs.subscribe()
+    }
+
+    /// Load an agent as a generic delegated-work backend.
+    pub async fn delegation_backend(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+    ) -> anyhow::Result<DelegationBackend> {
+        let completed = self.subscribe_completed_turns();
+        let (_, agent, _) = self.load(agent_id).await?;
+        Ok(DelegationBackend {
+            agent_id,
+            agent,
+            source_id: InputSourceId::fresh_internal(),
+            completed,
+        })
     }
 
     pub fn publish_completed_turn(&self, completed: AgentTurnCompleted) {

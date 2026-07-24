@@ -31,6 +31,7 @@ use tokio::sync::{
 };
 
 pub mod debug;
+mod realtime;
 mod shell;
 mod terminal;
 mod webui;
@@ -556,6 +557,7 @@ async fn run_iroh_listener(
                             let dedicated = matches!(
                                 &first,
                                 ClientMessage::ChannelOpen { .. }
+                                    | ClientMessage::RealtimeOpen { .. }
                                     | ClientMessage::DiffSnapshot { .. }
                                     | ClientMessage::TerminalCreate { .. }
                                     | ClientMessage::TerminalAttach { .. }
@@ -584,6 +586,7 @@ async fn run_iroh_listener(
                                 ClientMessage::TerminalCreate { .. }
                                     | ClientMessage::TerminalAttach { .. }
                                     | ClientMessage::ShellAttach { .. }
+                                    | ClientMessage::RealtimeOpen { .. }
                             ) {
                                 send.set_priority(50)
                                     .context("set iroh interactive stream priority")?;
@@ -1685,6 +1688,9 @@ where
     };
     if let ClientMessage::ChannelOpen { workspace } = first {
         return serve_zed_channel(agents, reader, writer, workspace).await;
+    }
+    if let ClientMessage::RealtimeOpen { offer_sdp } = first {
+        return realtime::serve(agents, reader, writer, offer_sdp).await;
     }
     if let ClientMessage::DiffSnapshot {
         workspace,
@@ -2812,6 +2818,9 @@ async fn handle_message(
         ClientMessage::ChannelOpen { .. } => {
             anyhow::bail!("ChannelOpen must be the first frame on a dedicated stream")
         }
+        ClientMessage::RealtimeOpen { .. } => {
+            anyhow::bail!("RealtimeOpen must be the first frame on a dedicated stream")
+        }
         ClientMessage::DiffSnapshot { .. }
         | ClientMessage::TerminalCreate { .. }
         | ClientMessage::TerminalAttach { .. }
@@ -3463,9 +3472,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::Arc;
 
-    use rho_agent::db::{
-        AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider,
-    };
+    use rho_agent::db::{AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider};
     use rho_agent::{AgentState, AgentStateKind, InputQueues};
     use rho_core::{
         ContentPart, ContextBlock, InferenceResponseItem, MessagePhase, UnknownProviderSpecificData,
@@ -3518,10 +3525,7 @@ mod tests {
         write.commit();
 
         let history = quota_history(&db);
-        let gpt = history
-            .iter()
-            .find(|series| series.model == "gpt")
-            .unwrap();
+        let gpt = history.iter().find(|series| series.model == "gpt").unwrap();
         assert_eq!(gpt.points.len(), 5);
         assert_eq!(
             gpt.points

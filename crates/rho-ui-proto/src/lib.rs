@@ -22,6 +22,7 @@ pub use rho_workspaces::{
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 pub mod client;
+pub mod realtime;
 pub mod remote;
 pub mod server;
 pub mod shell;
@@ -221,6 +222,13 @@ pub enum ClientMessage {
     /// channel.
     ChannelOpen {
         workspace: WorkspaceInfo,
+    },
+    /// Opens a dedicated realtime stream. After
+    /// [`ServerMessage::RealtimeOpened`] the stream carries
+    /// [`realtime::RealtimeClientFrame`] and
+    /// [`realtime::RealtimeServerFrame`] values until either side closes it.
+    RealtimeOpen {
+        offer_sdp: String,
     },
     /// Selects the high-weight agent state stream on an iroh connection.
     /// Ignored on transports that carry agent state in the control session.
@@ -570,6 +578,12 @@ pub enum ServerMessage {
     /// Handshake refusal on a zed-channel stream; the daemon closes the
     /// stream after sending it.
     ChannelClosed {
+        reason: String,
+    },
+    RealtimeOpened {
+        answer_sdp: String,
+    },
+    RealtimeRefused {
         reason: String,
     },
     /// First frame on a daemon-opened iroh unidirectional stream. Every later

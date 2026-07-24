@@ -435,32 +435,29 @@ current workdir and prints the resulting prompt and model-facing Rho tool
 specifications. Its output may contain repository instructions and user skill
 metadata; it performs no inference and creates no agent or workspace.
 
-## Realtime voice provider (`rho-voice`)
+## Realtime voice provider (`rho-realtime`)
 
-- `rho-voice` is a client for the xAI realtime voice WebSocket (Grok Voice
-  Agent API). Server events are remote, semi-trusted input: parsing is
-  defensive, unknown event types are preserved rather than rejected, and
-  malformed payloads (bad base64 audio, missing fields) are errors, never
-  panics.
-- Authentication is OAuth-only: rho copies the Grok CLI login from
-  `~/.grok/auth.json` into its own state auth file on first voice use, then
-  refreshes through `auth.x.ai`. OAuth bearer tokens are never printed.
-- The daemon runs at most one voice session, started only by an explicit
-  client `VoiceStart` (`:voice` in the GUI) because microphone audio leaves
-  the machine (to xAI) and sessions are billed per minute. The session stops
-  on client request, on disconnect of the owning connection, and
-  automatically after five minutes without detected speech.
-- Voice tool calls are provider-controlled input executed against the agent
-  registry; the tool surface is limited to the same operations UI clients
-  already have (list/status/send/create/cancel/rename/move/archive), name
-  resolution reports ambiguity instead of guessing, and tool errors are
-  returned to the model as text, never panics.
-- GUI audio: mic capture and playback ride the existing UI socket as raw
-  PCM frames; the capture thread stops when the session ends or the
-  connection channel closes.
-- Bounded waits: socket reads take a per-event timeout, keepalive pings run
-  every 25 seconds, and the smoke binary bounds its whole run by a
-  per-event timeout.
+- Voice starts only after an explicit native-GUI action because microphone
+  audio leaves the machine. `rho-realtime` captures and plays audio locally;
+  encoded media flows directly between the GUI-owned WebRTC peer and ChatGPT,
+  never through the daemon. Dropping the GUI session closes its data channel,
+  peer connection, microphone task, and playback sink.
+- The OAuth bearer token remains daemon-side. The GUI sends a bounded SDP
+  offer over a dedicated authenticated UI stream; the daemon resolves the
+  existing ChatGPT OAuth credential and calls the realtime signaling endpoint.
+  Only the bounded SDP answer returns to the GUI.
+- Provider data-channel messages are remote, semi-trusted input. The realtime
+  crate accepts text messages no larger than 1 MiB, decodes them into tagged
+  Rust types, ignores unknown top-level events, and reports malformed known
+  events without panicking. Provider commands are constructed from typed
+  values and delegation context is split on UTF-8 boundaries into at most
+  500-byte chunks.
+- The GUI, not the daemon, owns provider delegation policy. A typed
+  `DelegateRequest` event is explicitly mapped to the currently selected
+  agent. The dedicated stream carries only typed generic request ids, agent
+  ids, text, completion text, and errors; the daemon does not receive media or
+  provider event payloads. Only one delegated request is active per realtime
+  stream, preventing ambiguous completion routing.
 
 ## AGENTS.md
 

@@ -118,11 +118,16 @@ than by running a supervisor, extension protocol, or daemon process graph.
   protocol as untrusted: it assigns execution ids, retains accepted command
   text, validates response ordering and bounds, sanitizes output, and exposes
   only canonical structured state to clients.
-- `rho-voice` is a provider-protocol crate outside the inference contract: it
-  speaks the xAI realtime voice WebSocket (audio streams, voice tool calls)
-  and deliberately never touches `rho-core` transcript vocabulary. Voice is a
-  control surface over agents, assembled by the daemon, not an inference
-  provider.
+- `rho-realtime` is a provider-protocol crate outside the text inference
+  contract. It owns native WebRTC, microphone/playback, and the typed realtime
+  provider protocol, and exposes a `RealtimeSession` whose public event stream
+  includes `RealtimeEvent::DelegateRequest`. The native GUI owns that session:
+  it handles delegate requests by selecting an agent backend and returning the
+  completed work to the session. The daemon does not interpret provider events
+  or choose delegation policy; it resolves OAuth and exchanges SDP through a
+  dedicated stream, then executes the GUI's typed generic agent requests.
+  Media flows directly between the GUI and provider and never traverses the
+  daemon or `rho-core` transcript vocabulary.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
   execution.
 - `rho-profiling` owns the thin opt-in profiling lifecycle shared by the

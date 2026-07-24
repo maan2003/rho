@@ -37,7 +37,7 @@ use crate::{
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
     PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen,
     RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
-    ShellPagerQuit, SubmitPrompt, TaskBoard,
+    ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -184,6 +184,7 @@ pub struct Workspace {
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
     pending_git_approval: Option<PendingGitApproval>,
+    realtime_task: Option<Task<()>>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
 }
@@ -334,6 +335,7 @@ impl Workspace {
             overlay_return_focus: None,
             echo: None,
             pending_git_approval: None,
+            realtime_task: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
         };
@@ -752,6 +754,38 @@ impl Workspace {
         if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
             model.clone().update(cx, |model, _| model.interrupt());
         }
+    }
+
+    fn toggle_voice(&mut self, _: &VoiceToggle, _: &mut Window, cx: &mut Context<Self>) {
+        if self.realtime_task.take().is_some() {
+            self.notice_on(None, "realtime voice stopped", StyleClass::SystemInfo, cx);
+            return;
+        }
+        let Some(delegate_agent) = self.registry.selected_agent().copied() else {
+            self.notice_on(
+                None,
+                "select an agent before starting realtime voice",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let task = self.connection.start_native_realtime(delegate_agent, cx);
+        self.notice_on(None, "starting realtime voice…", StyleClass::SystemInfo, cx);
+        self.realtime_task = Some(cx.spawn(async move |this, cx| {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!("realtime task failed: {error}")),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.realtime_task = None;
+                let message = match result {
+                    Ok(()) => "realtime voice ended".to_owned(),
+                    Err(error) => format!("realtime voice failed: {error:#}"),
+                };
+                this.notice_on(None, &message, StyleClass::SystemInfo, cx);
+            });
+        }));
     }
 
     fn shell_eof(&mut self, _: &ShellEof, _: &mut Window, cx: &mut Context<Self>) {
@@ -3859,6 +3893,7 @@ impl Render for Workspace {
             .key_context("RhoGui")
             .on_action(cx.listener(Self::submit_prompt))
             .on_action(cx.listener(Self::shell_interrupt))
+            .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(Self::shell_eof))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
                 this.shell_pager_action(rho_ui_proto::shell::PagerAction::Continue, cx);

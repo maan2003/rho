@@ -4,22 +4,23 @@ mod agent_view;
 mod chime;
 mod commands;
 mod connection;
+mod dashboard;
 mod diff_view;
 mod draft_view;
 mod editor_config;
 mod highlights;
 mod minibuffer;
+mod native_realtime;
 mod pane;
 mod registry;
-mod shell_view;
 mod render;
 mod rho_assets;
+mod shell_view;
 mod store;
 mod style;
 mod terminal_view;
 #[cfg(test)]
 mod tests;
-mod dashboard;
 mod transcript;
 mod transient;
 mod workspace;
@@ -87,7 +88,8 @@ actions!(
         ShellEof,
         ShellPagerMore,
         ShellPagerAll,
-        ShellPagerQuit
+        ShellPagerQuit,
+        VoiceToggle
     ]
 );
 
@@ -426,6 +428,7 @@ fn bind_rho_key_overrides(cx: &mut App) {
         // so a root-level `RhoGui` binding would lose while typing.
         KeyBinding::new("ctrl-shift-j", AgentJumpAttention, Some("RhoGui > Editor")),
         KeyBinding::new("ctrl-shift-d", AgentDone, Some("RhoGui > Editor")),
+        KeyBinding::new("ctrl-shift-m", VoiceToggle, Some("RhoGui > Editor")),
         KeyBinding::new(
             "tab",
             RoleCycle,

@@ -132,7 +132,7 @@ pub struct ZedChannel {
 /// second Unix connection, remotely another bi-stream on the already
 /// authenticated iroh connection. Set by the IO task once connected.
 #[derive(Clone)]
-enum ChannelDialer {
+pub(crate) enum ChannelDialer {
     Unix(PathBuf),
     Iroh(iroh::endpoint::Connection),
 }
@@ -215,6 +215,48 @@ pub struct ShellChannel {
 pub struct ShellSubmission {
     pub command: String,
     pub accepted: tokio::sync::oneshot::Sender<u64>,
+}
+
+pub struct RealtimeChannel {
+    pub answer_sdp: String,
+    pub requests: futures_mpsc::UnboundedSender<rho_ui_proto::realtime::RealtimeClientFrame>,
+    pub replies: futures_mpsc::UnboundedReceiver<rho_ui_proto::realtime::RealtimeServerFrame>,
+}
+
+pub(crate) async fn dial_realtime(
+    dialer: ChannelDialer,
+    offer_sdp: String,
+) -> anyhow::Result<RealtimeChannel> {
+    let mut stream = dial_stream(dialer).await?;
+    write_frame(&mut stream, &ClientMessage::RealtimeOpen { offer_sdp }).await?;
+    let answer_sdp = match read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::RealtimeOpened { answer_sdp } => answer_sdp,
+        ServerMessage::RealtimeRefused { reason } => anyhow::bail!("{reason}"),
+        _ => anyhow::bail!("unexpected reply to RealtimeOpen"),
+    };
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (request_tx, mut request_rx) = futures_mpsc::unbounded();
+    let (reply_tx, reply_rx) = futures_mpsc::unbounded();
+    tokio::spawn(async move {
+        while let Some(frame) = request_rx.next().await {
+            if write_frame(&mut writer, &frame).await.is_err() {
+                break;
+            }
+        }
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    });
+    tokio::spawn(async move {
+        while let Ok(frame) = read_frame(&mut reader).await {
+            if reply_tx.unbounded_send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(RealtimeChannel {
+        answer_sdp,
+        requests: request_tx,
+        replies: reply_rx,
+    })
 }
 
 enum ShellControlReply {
@@ -644,6 +686,18 @@ impl Connection {
             dial_channel(dialer, workspace).await
         })
     }
+
+    pub fn start_native_realtime(
+        &self,
+        delegate_agent: AgentId,
+        cx: &App,
+    ) -> Task<Result<anyhow::Result<()>, gpui_tokio::JoinError>> {
+        let dialer = self.dialer.lock().unwrap().clone();
+        Tokio::spawn(cx, async move {
+            let dialer = dialer.context("not connected to rho-daemon")?;
+            crate::native_realtime::run(dialer, delegate_agent).await
+        })
+    }
 }
 
 pub fn spawn(
@@ -922,6 +976,8 @@ async fn run(
             | ServerMessage::DiffSnapshot { .. }
             | ServerMessage::DiffUnchanged { .. }
             | ServerMessage::DiffRefused { .. }
+            | ServerMessage::RealtimeOpened { .. }
+            | ServerMessage::RealtimeRefused { .. }
             | ServerMessage::AgentStreamOpened { .. } => None,
         };
         if let Some(event) = event
