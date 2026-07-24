@@ -356,6 +356,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
     use rho_agent::db::{AgentRole, EngineerIntelligence};
     match config {
         AgentRole::PM | AgentRole::WorkflowPM { .. } => "pm".to_owned(),
+        AgentRole::Iris => "iris".to_owned(),
         AgentRole::Advisor { intelligence } => format!(
             "advisor {}",
             match intelligence {

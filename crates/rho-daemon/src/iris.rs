@@ -1,0 +1,645 @@
+//! Daemon-global Iris coordinator and its typed fleet-control tools.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Weak};
+
+use futures::future::BoxFuture;
+use rho_agent::db::{
+    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _,
+    EngineerIntelligence,
+};
+use rho_agent::iris_tools::IrisToolHost;
+use rho_agent::pool::{AgentAssistantItemCompleted, AgentTurnCompleted, RunningAgent};
+use rho_agent::{InputSourceId, MessageDelivery};
+use rho_core::{MessagePhase, ToolCall, ToolOutput, ToolOutputStatus};
+use rho_ui_proto::{StartMode, WorkstreamTarget};
+use serde::Deserialize;
+use tokio::sync::broadcast;
+
+use crate::AgentRegistry;
+
+const IRIS_LABEL: &str = rho_agent::iris_tools::LABEL;
+pub(crate) struct IrisBackend {
+    agent_id: AgentId,
+    agent: RunningAgent,
+    source_id: InputSourceId,
+    completed_items: broadcast::Receiver<AgentAssistantItemCompleted>,
+    completed_turns: broadcast::Receiver<AgentTurnCompleted>,
+    streamed_final: String,
+}
+
+pub(crate) enum IrisBackendEvent {
+    Item { phase: MessagePhase, text: String },
+    Completed { remaining_final: String },
+}
+
+impl IrisBackend {
+    pub(crate) fn submit(
+        &self,
+        text: String,
+        transcript_delta: &str,
+        context_agent: Option<AgentId>,
+        transcript_tail: bool,
+    ) {
+        let context = context_agent
+            .map(|agent_id| format!("\nGUI context agent: {}\n", agent_id.encoded()))
+            .unwrap_or_default();
+        let transcript = if transcript_delta.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<transcript_delta>{}</transcript_delta>\n",
+                escape_xml(transcript_delta)
+            )
+        };
+        let source = if transcript_tail {
+            "<source>transcript_tail_flush</source>\n"
+        } else {
+            ""
+        };
+        self.agent.send_user_message_with_source(
+            format!(
+                "<iris_voice_request>{context}{source}<transcript>{}</transcript>\n{transcript}</iris_voice_request>",
+                escape_xml(&text)
+            ),
+            MessageDelivery::Immediate,
+            Some(self.source_id),
+        );
+    }
+
+    pub(crate) async fn next_event(&mut self) -> anyhow::Result<IrisBackendEvent> {
+        loop {
+            tokio::select! {
+                item = self.completed_items.recv() => {
+                    let item = item?;
+                    if item.agent_id != self.agent_id || item.text.is_empty() {
+                        continue;
+                    }
+                    if item.phase == MessagePhase::FinalAnswer {
+                        if !self.streamed_final.is_empty() {
+                            self.streamed_final.push('\n');
+                        }
+                        self.streamed_final.push_str(&item.text);
+                    }
+                    return Ok(IrisBackendEvent::Item {
+                        phase: item.phase,
+                        text: item.text,
+                    });
+                }
+                completed = self.completed_turns.recv() => {
+                    let completed = completed?;
+                    if completed.agent_id != self.agent_id {
+                        continue;
+                    }
+                    let remaining_final = completed
+                        .final_answer
+                        .strip_prefix(&self.streamed_final)
+                        .unwrap_or(&completed.final_answer)
+                        .to_owned();
+                    self.streamed_final.clear();
+                    return Ok(IrisBackendEvent::Completed { remaining_final });
+                }
+            }
+        }
+    }
+}
+
+impl AgentRegistry {
+    pub(crate) fn install_iris_tool_host(self: &Arc<Self>) {
+        self.pool.set_iris_tool_host(Arc::new(IrisTools {
+            registry: Arc::downgrade(self),
+        }));
+    }
+
+    pub(crate) async fn iris_startup_context(&self) -> String {
+        let workstreams = self
+            .ui_workstreams()
+            .into_iter()
+            .map(|workstream| (workstream.workstream_id, workstream.name))
+            .collect::<BTreeMap<_, _>>();
+        let kinds = self.agent_state_kinds().await;
+        let mut lines = self
+            .ui_agents(&kinds)
+            .into_iter()
+            .filter(|agent| !agent.hidden && !agent.labels.iter().any(|label| label == IRIS_LABEL))
+            .map(|agent| {
+                format!(
+                    "{} | {} | {} | {:?}",
+                    self.display_agent_id(agent.agent_id),
+                    agent.display_name.unwrap_or_else(|| "unnamed".to_owned()),
+                    workstreams
+                        .get(&agent.workstream)
+                        .map(String::as_str)
+                        .unwrap_or("unknown"),
+                    agent.attention,
+                )
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return "No visible agents are currently registered.".to_owned();
+        }
+        lines.insert(
+            0,
+            "Visible agents: handle | name | workstream | attention".to_owned(),
+        );
+        let mut context = lines.join("\n");
+        let mut end = context.len().min(16 * 1024);
+        while !context.is_char_boundary(end) {
+            end -= 1;
+        }
+        context.truncate(end);
+        context
+    }
+
+    pub(crate) async fn iris_backend(
+        self: &Arc<Self>,
+        context_agent: Option<AgentId>,
+    ) -> anyhow::Result<IrisBackend> {
+        self.install_iris_tool_host();
+        let completed_items = self.pool.subscribe_completed_assistant_items();
+        let completed_turns = self.pool.subscribe_completed_turns();
+        let agent_id = self.ensure_iris(context_agent).await?;
+        let (_, agent, _) = self.pool.load(agent_id).await?;
+        Ok(IrisBackend {
+            agent_id,
+            agent,
+            source_id: InputSourceId::fresh_internal(),
+            completed_items,
+            completed_turns,
+            streamed_final: String::new(),
+        })
+    }
+
+    async fn ensure_iris(
+        self: &Arc<Self>,
+        context_agent: Option<AgentId>,
+    ) -> anyhow::Result<AgentId> {
+        let mut active = self.iris_agent.lock().await;
+        if let Some(agent_id) = *active {
+            return Ok(agent_id);
+        }
+
+        let existing = self
+            .db
+            .read()
+            .list_agents()
+            .into_iter()
+            .find(|(_, record)| {
+                record.role == AgentRole::Iris
+                    || record.labels.iter().any(|label| label == IRIS_LABEL)
+            })
+            .map(|(agent_id, _)| agent_id);
+        let agent_id = if let Some(agent_id) = existing {
+            if self.db.read().get_agent(agent_id).role != AgentRole::Iris {
+                let mut write = self.db.write().await;
+                write.set_agent_role(agent_id, AgentRole::Iris);
+                write.commit();
+            }
+            self.pool.load(agent_id).await?;
+            agent_id
+        } else {
+            let source = {
+                let read = self.db.read();
+                context_agent
+                    .filter(|agent_id| read.list_agents().iter().any(|(id, _)| id == agent_id))
+                    .map(|agent_id| read.get_agent(agent_id).primary_workdir().clone())
+                    .or_else(|| {
+                        read.list_agents()
+                            .into_iter()
+                            .find(|(_, record)| {
+                                !record.labels.iter().any(|label| label == IRIS_LABEL)
+                            })
+                            .map(|(_, record)| record.primary_workdir().clone())
+                    })
+            };
+
+            let workstream = self.create_workstream("iris".to_owned()).await;
+            let workspace = match source {
+                Some(source) => self.pool.open_workspace(&source).await?,
+                None => {
+                    let project = self
+                        .projects()
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("Iris needs a registered project or existing agent to establish its coordinator view"))?;
+                    self.pool.repo(&project.path).await?.user_checkout().await?
+                }
+            };
+            let (agent_id, _) = self
+                .pool
+                .create(
+                    workstream.workstream_id,
+                    AgentRole::Iris,
+                    Some("Iris".to_owned()),
+                    vec![rho_agent::StartWorkdir::Existing(workspace)],
+                )
+                .await?;
+            let mut write = self.db.write().await;
+            write.agent_label(rho_core::UnixMs::now(), agent_id, IRIS_LABEL, true);
+            write.set_agent_disposition(agent_id, AgentDisposition::Hidden);
+            write.commit();
+            agent_id
+        };
+        *active = Some(agent_id);
+        Ok(agent_id)
+    }
+}
+
+struct IrisTools {
+    registry: Weak<AgentRegistry>,
+}
+
+impl IrisToolHost for IrisTools {
+    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
+        let registry = self.registry.clone();
+        Box::pin(async move {
+            let Some(registry) = registry.upgrade() else {
+                return tool_error("Iris control plane is no longer available");
+            };
+            match call_iris_tool(&registry, call).await {
+                Ok(output) => tool_ok(output),
+                Err(error) => tool_error(error.to_string()),
+            }
+        })
+    }
+}
+
+async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow::Result<String> {
+    match call.name.as_str() {
+        "iris_list_agents" => {
+            let kinds = registry.agent_state_kinds().await;
+            let workstreams = registry
+                .ui_workstreams()
+                .into_iter()
+                .map(|workstream| (workstream.workstream_id, workstream.name))
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut lines = Vec::new();
+            for agent in registry
+                .ui_agents(&kinds)
+                .into_iter()
+                .filter(|agent| !agent.labels.iter().any(|label| label == IRIS_LABEL))
+            {
+                lines.push(format!(
+                    "{} | {} | {} | {:?} | {}",
+                    registry.display_agent_id(agent.agent_id),
+                    agent.display_name.unwrap_or_else(|| "unnamed".to_owned()),
+                    workstreams
+                        .get(&agent.workstream)
+                        .map(String::as_str)
+                        .unwrap_or("unknown"),
+                    agent.attention,
+                    agent.last_user_message_text
+                ));
+            }
+            Ok(if lines.is_empty() {
+                "No agents.".to_owned()
+            } else {
+                lines.join("\n")
+            })
+        }
+        "iris_list_workstreams" => {
+            let read = registry.db.read();
+            let agents = read.list_agents();
+            let lines = read
+                .list_workstreams()
+                .into_iter()
+                .filter(|(_, workstream)| workstream.name != "iris")
+                .map(|(id, workstream)| {
+                    let members = agents
+                        .iter()
+                        .filter(|(_, agent)| {
+                            agent.workstream == id
+                                && !agent.labels.iter().any(|label| label == IRIS_LABEL)
+                        })
+                        .map(|(agent_id, _)| registry.display_agent_id(*agent_id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{} | {}", workstream.name, members)
+                })
+                .collect::<Vec<_>>();
+            Ok(if lines.is_empty() {
+                "No workstreams.".to_owned()
+            } else {
+                lines.join("\n")
+            })
+        }
+        "iris_start_agent" => {
+            let args: StartAgentArgs = parse(&call)?;
+            anyhow::ensure!(!args.prompt.trim().is_empty(), "prompt must not be empty");
+            let projects = registry.projects();
+            let project = match args.project.as_deref() {
+                Some(needle) => projects
+                    .iter()
+                    .find(|project| project.name == needle || project.path.as_str() == needle)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("unknown project {needle}"))?,
+                None if projects.len() == 1 => projects[0].clone(),
+                None => anyhow::bail!(
+                    "project is required when zero or multiple projects are registered"
+                ),
+            };
+            let workstream = match args.workstream {
+                Some(name) => match registry
+                    .ui_workstreams()
+                    .into_iter()
+                    .find(|workstream| workstream.name == name)
+                {
+                    Some(workstream) => workstream,
+                    None => registry.create_workstream(name).await,
+                },
+                None => {
+                    registry
+                        .create_workstream(
+                            args.task_name
+                                .clone()
+                                .unwrap_or_else(|| provisional_name(&args.prompt)),
+                        )
+                        .await
+                }
+            };
+            let role = parse_role(args.role.as_deref().unwrap_or("eng"))?;
+            let (agent_id, agent) = registry
+                .create(
+                    workstream.workstream_id,
+                    role,
+                    StartMode::NewOn {
+                        repo: project.path,
+                        revset: "trunk()".to_owned(),
+                    },
+                )
+                .await?;
+            agent.send_user_message(args.prompt.clone(), MessageDelivery::NextRequest);
+            {
+                let mut write = registry.db.write().await;
+                write.record_agent_user_message(rho_core::UnixMs::now(), agent_id, &args.prompt);
+                if let Some(name) = args.task_name {
+                    write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, name);
+                }
+                write.commit();
+            }
+            refresh_clients(registry).await;
+            Ok(format!(
+                "Started {} in workstream {}.",
+                registry.display_agent_id(agent_id),
+                workstream.name
+            ))
+        }
+        "iris_send_agent" => {
+            let args: SendAgentArgs = parse(&call)?;
+            anyhow::ensure!(!args.message.trim().is_empty(), "message must not be empty");
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            anyhow::ensure!(
+                !is_iris(registry, agent_id),
+                "cannot message Iris through a fleet tool"
+            );
+            let (_, agent, _) = registry.pool.load(agent_id).await?;
+            let delivery = match args.delivery.as_deref() {
+                None | Some("immediate") => MessageDelivery::Immediate,
+                Some("next_turn") => MessageDelivery::NextTurn,
+                Some(other) => anyhow::bail!("unknown delivery {other}"),
+            };
+            agent.send_user_message_with_source(
+                args.message.clone(),
+                delivery,
+                Some(InputSourceId::fresh_internal()),
+            );
+            let mut write = registry.db.write().await;
+            write.record_agent_user_message(rho_core::UnixMs::now(), agent_id, &args.message);
+            write.commit();
+            refresh_clients(registry).await;
+            Ok(format!("Sent to {}.", registry.display_agent_id(agent_id)))
+        }
+        "iris_cancel_agent" => {
+            let args: TargetArgs = parse(&call)?;
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            let (_, agent, _) = registry.pool.load(agent_id).await?;
+            agent.cancel();
+            Ok(format!(
+                "Cancelled {}'s current turn.",
+                registry.display_agent_id(agent_id)
+            ))
+        }
+        "iris_continue_agent" => {
+            let args: TargetArgs = parse(&call)?;
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            let (_, agent, _) = registry.pool.load(agent_id).await?;
+            agent.continue_unfinished();
+            Ok(format!(
+                "Continued {}.",
+                registry.display_agent_id(agent_id)
+            ))
+        }
+        "iris_rename_agent" => {
+            let args: RenameArgs = parse(&call)?;
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            registry.rename_agent(agent_id, args.name.clone()).await?;
+            refresh_clients(registry).await;
+            Ok(format!("Renamed agent to {}.", args.name))
+        }
+        "iris_move_agent" => {
+            let args: MoveArgs = parse(&call)?;
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            registry
+                .move_agent(agent_id, WorkstreamTarget::Named(args.workstream.clone()))
+                .await?;
+            refresh_clients(registry).await;
+            Ok(format!(
+                "Moved {} to {}.",
+                registry.display_agent_id(agent_id),
+                args.workstream
+            ))
+        }
+        "iris_set_agent_visibility" => {
+            let args: VisibilityArgs = parse(&call)?;
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            registry
+                .set_disposition(
+                    agent_id,
+                    if args.hidden {
+                        AgentDisposition::Hidden
+                    } else {
+                        AgentDisposition::Done
+                    },
+                )
+                .await;
+            refresh_clients(registry).await;
+            Ok(format!(
+                "{} {}.",
+                registry.display_agent_id(agent_id),
+                if args.hidden { "hidden" } else { "shown" }
+            ))
+        }
+        "iris_rename_workstream" => {
+            let args: RenameWorkstreamArgs = parse(&call)?;
+            let workstream = registry
+                .ui_workstreams()
+                .into_iter()
+                .find(|workstream| workstream.name == args.workstream)
+                .ok_or_else(|| anyhow::anyhow!("unknown workstream {}", args.workstream))?;
+            registry
+                .rename_workstream(workstream.workstream_id, args.name.clone())
+                .await?;
+            refresh_clients(registry).await;
+            Ok(format!("Renamed workstream to {}.", args.name))
+        }
+        other => anyhow::bail!("unsupported Iris tool {other}"),
+    }
+}
+
+async fn refresh_clients(registry: &AgentRegistry) {
+    let _ = registry.events.send(registry.ready_message().await);
+}
+
+fn escape_xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn is_iris(registry: &AgentRegistry, agent_id: AgentId) -> bool {
+    let agent = registry.db.read().get_agent(agent_id);
+    agent.role == AgentRole::Iris || agent.labels.iter().any(|label| label == IRIS_LABEL)
+}
+
+fn parse<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> anyhow::Result<T> {
+    serde_json::from_str(&call.arguments).map_err(Into::into)
+}
+
+fn tool_ok(output: String) -> ToolOutput {
+    ToolOutput {
+        output: Arc::new(output),
+        status: ToolOutputStatus::Success,
+    }
+}
+
+fn tool_error(error: impl Into<String>) -> ToolOutput {
+    ToolOutput {
+        output: Arc::new(error.into()),
+        status: ToolOutputStatus::Error,
+    }
+}
+
+fn provisional_name(prompt: &str) -> String {
+    prompt
+        .lines()
+        .next()
+        .unwrap_or("voice task")
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_role(role: &str) -> anyhow::Result<AgentRole> {
+    Ok(match role {
+        "eng-mini" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Mini,
+        },
+        "eng-low" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Low,
+        },
+        "eng" => AgentRole::default(),
+        "eng-high" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+        },
+        "eng-ultra" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Ultra,
+        },
+        "pm" => AgentRole::pm(),
+        other => anyhow::bail!("unknown role {other}"),
+    })
+}
+
+#[derive(Deserialize)]
+struct StartAgentArgs {
+    prompt: String,
+    task_name: Option<String>,
+    project: Option<String>,
+    workstream: Option<String>,
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SendAgentArgs {
+    agent: String,
+    message: String,
+    delivery: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TargetArgs {
+    agent: String,
+}
+
+#[derive(Deserialize)]
+struct RenameArgs {
+    agent: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct MoveArgs {
+    agent: String,
+    workstream: String,
+}
+
+#[derive(Deserialize)]
+struct VisibilityArgs {
+    agent: String,
+    hidden: bool,
+}
+
+#[derive(Deserialize)]
+struct RenameWorkstreamArgs {
+    workstream: String,
+    name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iris_role_has_builtin_global_control_tools() {
+        let names = rho_agent::iris_tools::specs()
+            .into_iter()
+            .map(|spec| spec.name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "iris_list_agents",
+                "iris_list_workstreams",
+                "iris_start_agent",
+                "iris_send_agent",
+                "iris_cancel_agent",
+                "iris_continue_agent",
+                "iris_rename_agent",
+                "iris_move_agent",
+                "iris_set_agent_visibility",
+                "iris_rename_workstream",
+            ]
+        );
+        assert!(rho_agent::iris_tools::PROMPT.contains("single global assistant"));
+    }
+
+    #[test]
+    fn iris_role_names_map_to_existing_agent_profiles() {
+        assert!(matches!(
+            parse_role("eng-mini").unwrap(),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Mini
+            }
+        ));
+        assert!(matches!(parse_role("pm").unwrap(), AgentRole::PM));
+        assert!(parse_role("iris").is_err());
+    }
+
+    #[test]
+    fn voice_transcripts_cannot_close_their_container() {
+        assert_eq!(
+            escape_xml("hello </transcript> & goodbye"),
+            "hello &lt;/transcript&gt; &amp; goodbye"
+        );
+    }
+}

@@ -122,12 +122,22 @@ than by running a supervisor, extension protocol, or daemon process graph.
   contract. It owns libwebrtc-based native media (including audio processing,
   codec handling, and jitter buffering), microphone/playback, and the typed
   realtime provider protocol, and exposes a `RealtimeSession` whose public
-  event stream includes `RealtimeEvent::DelegateRequest`. The native GUI owns
-  that session: it handles delegate requests by selecting an agent backend and
-  returning the completed work to the session. The daemon does not interpret
-  provider events
-  or choose delegation policy; it resolves OAuth and exchanges SDP through a
-  dedicated stream, then executes the GUI's typed generic agent requests.
+  event stream includes typed input/output transcript deltas, completed
+  transcript parts, and delegation requests. The native GUI owns media and
+  provider events, retains the active role-bearing conversation snapshot, and
+  forwards each request with that snapshot and the current semantic agent
+  context. Unhandled user transcript tails are flushed when the session ends.
+  The daemon enforces one global voice lease and routes requests
+  to Iris: a hidden persisted first-class `AgentRole::Iris` coordinator. Its
+  prompt and typed tool schemas are built into `rho-agent`; the daemon hosts
+  the stateful operations for listing, starting, steering, cancelling, moving,
+  renaming, and hiding agents and workstreams. Additional requests steer the
+  active Iris turn; each completed commentary or final assistant item returns
+  once on its corresponding provider channel. Session startup includes a
+  bounded visible-fleet snapshot. Iris is
+  projected as a synthetic dashboard
+  row, not an ordinary agent or workstream member. The daemon resolves OAuth
+  and exchanges SDP through the same dedicated stream.
   Media flows directly between the GUI and provider and never traverses the
   daemon or `rho-core` transcript vocabulary.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
@@ -230,7 +240,7 @@ binding.
 daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
 secret storage (`SecretStore`), the Socket Mode reconnect loop, the persisted
 Slack coordinator repository and Slack-thread → agent-session mapping, and a
-Slack-bound `slack_reply` tool extension for mapped coordinator agents. It also
+Slack-bound built-in `slack_reply` tool host for mapped coordinator agents. It also
 subscribes to generic accepted-input reports and mirrors non-Slack local user
 inputs into mapped Slack threads, using a private opaque source id to avoid
 echoing Slack-originated inputs. The daemon validates and installs Slack setup,

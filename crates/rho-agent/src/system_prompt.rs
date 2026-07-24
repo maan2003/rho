@@ -13,6 +13,9 @@ pub fn prompt(
     role: AgentRole,
     projects: &[(camino::Utf8PathBuf, String)],
 ) -> Arc<str> {
+    if role == AgentRole::Iris {
+        return crate::iris_tools::PROMPT.into();
+    }
     let entries = view.entries();
     let workdirs = entries
         .iter()
@@ -114,6 +117,7 @@ request.
         AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => "",
         AgentRole::PM | AgentRole::WorkflowPM { .. } => "",
         AgentRole::Advisor { .. } => ADVISOR_PROMPT,
+        AgentRole::Iris => unreachable!("Iris prompt returned above"),
     };
     let environment = render_environment_prompt(&workdirs);
     if role.is_pm() {
@@ -172,6 +176,7 @@ pub fn claude_prompt(multi_agent: Option<&MultiAgentTools>, role: AgentRole) -> 
         | AgentRole::PM
         | AgentRole::WorkflowPM { .. } => "",
         AgentRole::Advisor { .. } => ADVISOR_PROMPT,
+        AgentRole::Iris => crate::iris_tools::PROMPT,
     };
     format!("{team}{role_prompt}{workflow}").into()
 }

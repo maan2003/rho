@@ -14,16 +14,15 @@ use rho_web_search::WebSearchTools;
 use tokio::sync::mpsc;
 
 use crate::multi_agent_tools::{self, MultiAgentTools};
-use crate::{AgentControl, AgentToolExtension, ToolUpdate};
+use crate::{AgentControl, ToolUpdate};
 
 /// The model-facing tool surface: `exec` (whose description embeds the nested
 /// tools' TypeScript docs) and `wait`.
 pub(crate) fn tool_specs(
     shell_tools: &ShellTools,
     role: Option<crate::db::AgentRole>,
-    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
 ) -> Vec<ToolSpec> {
-    let nested = nested_tools(shell_tools, role, tool_extension);
+    let nested = nested_tools(shell_tools, role);
     let documented = nested
         .iter()
         .filter(|tool| {
@@ -45,11 +44,7 @@ pub(crate) fn tool_specs(
 
 /// Tools reachable from scripts. `wait_agent` is distinct from code mode's
 /// model-facing `wait`, which observes a yielded JavaScript cell.
-fn nested_tools(
-    shell_tools: &ShellTools,
-    role: Option<crate::db::AgentRole>,
-    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
-) -> Vec<NestedTool> {
+fn nested_tools(shell_tools: &ShellTools, role: Option<crate::db::AgentRole>) -> Vec<NestedTool> {
     let mut specs = if role.is_some_and(crate::db::AgentRole::is_pm) {
         Vec::new()
     } else {
@@ -57,9 +52,6 @@ fn nested_tools(
     };
     if let Some(role) = role {
         specs.extend(multi_agent_tools::agent_tool_specs(role));
-    }
-    if let Some(extension) = tool_extension {
-        specs.extend(extension.specs());
     }
     specs.push(rho_web_search::web_search_spec());
     specs
@@ -77,7 +69,6 @@ fn nested_tools(
 struct Dispatcher {
     shell_tools: ShellTools,
     multi_agent: Option<MultiAgentTools>,
-    tool_extension: Option<Arc<dyn AgentToolExtension>>,
     web_search: WebSearchTools,
     /// Nested calls run on the agent's runtime, not the code-mode thread's
     /// current-thread runtime: agent tools spawn tasks (sub-agent loops) that
@@ -98,24 +89,11 @@ impl ToolDispatcher for Dispatcher {
         let agent_tools = multi_agent_tools::is_agent_tool(call.name.as_str())
             .then(|| self.multi_agent.clone())
             .flatten();
-        let extension = self.tool_extension.as_ref().and_then(|extension| {
-            extension
-                .specs()
-                .iter()
-                .any(|spec| spec.name == call.name)
-                .then(|| Arc::clone(extension))
-        });
         let web_search = (call.name.as_str() == rho_web_search::WEB_SEARCH_TOOL_NAME)
             .then(|| self.web_search.clone());
         let task = self.runtime.spawn(async move {
             if let Some(web_search) = web_search {
                 let output = web_search.call(call, context).await;
-                NestedToolOutput {
-                    value: serde_json::Value::String(output.output.as_ref().clone()),
-                    status: output.status,
-                }
-            } else if let Some(extension) = extension {
-                let output = extension.call(call).await;
                 NestedToolOutput {
                     value: serde_json::Value::String(output.output.as_ref().clone()),
                     status: output.status,
@@ -166,39 +144,28 @@ impl ToolDispatcher for Dispatcher {
 pub(crate) fn start_session(
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
-    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
     web_search: &WebSearchTools,
     control: mpsc::UnboundedSender<AgentControl>,
 ) -> Result<CodeModeSession, String> {
     let dispatcher = Arc::new(Dispatcher {
         shell_tools: shell_tools.clone(),
         multi_agent: multi_agent.cloned(),
-        tool_extension: tool_extension.cloned(),
         web_search: web_search.clone(),
         runtime: tokio::runtime::Handle::current(),
         control,
     });
     CodeModeSession::new(
-        nested_tools(
-            shell_tools,
-            multi_agent.map(MultiAgentTools::role),
-            tool_extension,
-        ),
+        nested_tools(shell_tools, multi_agent.map(MultiAgentTools::role)),
         dispatcher,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use futures::future::BoxFuture;
-    use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
     use rho_tool_shell::ShellTools;
     use rho_workspaces::PathOverrides;
-
-    use crate::AgentToolExtension;
 
     fn shell_tools() -> ShellTools {
         ShellTools::in_directory(
@@ -210,7 +177,7 @@ mod tests {
 
     #[test]
     fn code_mode_surface_is_exec_and_wait_with_nested_docs() {
-        let specs = super::tool_specs(&shell_tools(), Some(crate::db::AgentRole::default()), None);
+        let specs = super::tool_specs(&shell_tools(), Some(crate::db::AgentRole::default()));
         let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
         assert_eq!(names, ["exec", "wait"]);
         // Optional Engineer team-management declarations live in its skill.
@@ -228,7 +195,7 @@ mod tests {
 
     #[test]
     fn pm_always_sees_engineer_management_declarations() {
-        let specs = super::tool_specs(&shell_tools(), Some(crate::db::AgentRole::pm()), None);
+        let specs = super::tool_specs(&shell_tools(), Some(crate::db::AgentRole::pm()));
         let exec = &specs[0].description;
         for name in ["spawn_engineer", "message_agent", "interrupt_engineer"] {
             assert!(exec.contains(name), "missing {name}: {exec}");
@@ -242,44 +209,7 @@ mod tests {
 
     #[test]
     fn without_pool_no_agent_tools_are_nested() {
-        let specs = super::tool_specs(&shell_tools(), None, None);
+        let specs = super::tool_specs(&shell_tools(), None);
         assert!(!specs[0].description.contains("spawn_engineer"));
-    }
-
-    struct TestExtension;
-
-    impl AgentToolExtension for TestExtension {
-        fn specs(&self) -> Vec<ToolSpec> {
-            vec![ToolSpec {
-                name: ToolName::try_from("platform_reply").unwrap(),
-                tool_type: ToolType::Function,
-                description: "Reply on the mapped platform thread.".to_owned(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": { "text": { "type": "string" } },
-                    "required": ["text"]
-                }),
-                format: None,
-            }]
-        }
-
-        fn call(&self, _call: ToolCall) -> BoxFuture<'static, ToolOutput> {
-            Box::pin(std::future::ready(ToolOutput {
-                output: Arc::new("ok".to_owned()),
-                status: ToolOutputStatus::Success,
-            }))
-        }
-    }
-
-    #[test]
-    fn code_mode_nests_tool_extension_docs() {
-        let extension: Arc<dyn AgentToolExtension> = Arc::new(TestExtension);
-        let specs = super::tool_specs(&shell_tools(), None, Some(&extension));
-        let exec = &specs[0].description;
-        assert!(exec.contains("platform_reply"), "{exec}");
-        assert!(
-            exec.contains("Reply on the mapped platform thread."),
-            "{exec}"
-        );
     }
 }

@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -166,6 +167,8 @@ pub struct Workspace {
     /// The dashboard: the rail as a real editor buffer, ambient chrome
     /// beside the active tree.
     dashboard: crate::dashboard::Dashboard,
+    /// Read-only document shown when the synthetic Iris row is targeted.
+    iris_preview: Entity<editor::Editor>,
     /// The completing-read strip at the bottom of the window, when open.
     minibuffer: Option<Minibuffer>,
     /// An open transient menu in the bottom strip; captures the keyboard
@@ -185,6 +188,11 @@ pub struct Workspace {
     echo: Option<Echo>,
     pending_git_approval: Option<PendingGitApproval>,
     realtime_task: Option<Task<()>>,
+    realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    iris_muted: bool,
+    /// Current semantic agent context sampled by Iris when each utterance
+    /// delegates. Shared with the long-lived realtime task.
+    iris_context_agent: Arc<Mutex<Option<AgentId>>>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
 }
@@ -288,6 +296,17 @@ impl Workspace {
         });
 
         let dashboard = crate::dashboard::Dashboard::new(window, cx);
+        let iris_buffer = cx.new(|cx| {
+            let mut buffer = language::Buffer::local("iris\n\nlistening", cx);
+            buffer.set_capability(language::Capability::Read, cx);
+            buffer
+        });
+        let iris_preview = cx.new(|cx| {
+            let mut editor = editor::Editor::for_buffer(iris_buffer, None, window, cx);
+            crate::editor_config::configure(&mut editor, window, cx);
+            editor.set_read_only(true);
+            editor
+        });
         // The preview follows the dashboard cursor: any local selection
         // change while the dashboard is focused re-aims the panes.
         let dashboard_subscription = cx.subscribe_in(
@@ -327,6 +346,7 @@ impl Workspace {
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             dashboard,
+            iris_preview,
             minibuffer: None,
             transient: None,
             transient_stack: Vec::new(),
@@ -336,6 +356,9 @@ impl Workspace {
             echo: None,
             pending_git_approval: None,
             realtime_task: None,
+            realtime_stop: None,
+            iris_muted: false,
+            iris_context_agent: Arc::new(Mutex::new(None)),
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
         };
@@ -538,6 +561,9 @@ impl Workspace {
                     self.seed_draft(false, window, cx);
                 }
                 self.update_statuses(cx);
+                if first_ready && self.realtime_task.is_none() {
+                    self.cmd_voice(window, cx);
+                }
                 cx.notify();
             }
             ConnEvent::WorkstreamCreated(workstream) => {
@@ -756,34 +782,53 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn cmd_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_voice(&VoiceToggle, window, cx);
+    }
+
     fn toggle_voice(&mut self, _: &VoiceToggle, _: &mut Window, cx: &mut Context<Self>) {
-        if self.realtime_task.take().is_some() {
-            self.notice_on(None, "realtime voice stopped", StyleClass::SystemInfo, cx);
+        if self.realtime_task.is_some() {
+            self.iris_muted = true;
+            if let Some(stop) = self.realtime_stop.take() {
+                let _ = stop.send(());
+            }
+            self.notice_on(None, "muting Iris…", StyleClass::SystemInfo, cx);
             return;
         }
-        let Some(delegate_agent) = self.registry.selected_agent().copied() else {
-            self.notice_on(
-                None,
-                "select an agent before starting realtime voice",
-                StyleClass::SystemInfo,
-                cx,
-            );
+        self.iris_muted = false;
+        self.start_iris(cx);
+    }
+
+    fn start_iris(&mut self, cx: &mut Context<Self>) {
+        if self.realtime_task.is_some() {
             return;
-        };
-        let task = self.connection.start_native_realtime(delegate_agent, cx);
-        self.notice_on(None, "starting realtime voice…", StyleClass::SystemInfo, cx);
+        }
+        let context_agent = Arc::clone(&self.iris_context_agent);
+        let (stop, stop_rx) = tokio::sync::oneshot::channel();
+        let task = self
+            .connection
+            .start_native_realtime(context_agent, stop_rx, cx);
+        self.realtime_stop = Some(stop);
+        self.notice_on(None, "starting Iris…", StyleClass::SystemInfo, cx);
         self.realtime_task = Some(cx.spawn(async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
                 Err(error) => Err(anyhow::anyhow!("realtime task failed: {error}")),
             };
+            if result.is_err() {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+            }
             let _ = this.update(cx, |this, cx| {
                 this.realtime_task = None;
+                this.realtime_stop = None;
                 let message = match result {
-                    Ok(()) => "realtime voice ended".to_owned(),
-                    Err(error) => format!("realtime voice failed: {error:#}"),
+                    Ok(()) => "Iris stopped listening".to_owned(),
+                    Err(error) => format!("Iris failed: {error:#}"),
                 };
                 this.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                if this.connected && !this.iris_muted {
+                    this.start_iris(cx);
+                }
             });
         }));
     }
@@ -1686,6 +1731,10 @@ impl Workspace {
             self.focus_active_surface(window, cx);
         }
         self.connection.focus_agent(agent_id);
+        *self
+            .iris_context_agent
+            .lock()
+            .expect("Iris context mutex poisoned") = agent_id;
         self.ensure_duration_timer(cx);
         cx.notify();
     }
@@ -1699,6 +1748,7 @@ impl Workspace {
             return;
         }
         match self.dashboard.cursor_target(cx) {
+            Some(RowTarget::Iris) => cx.notify(),
             // A reply draft previews its addressee, same as the row above it.
             Some(
                 RowTarget::Stream {
@@ -2588,6 +2638,10 @@ impl Workspace {
             // Files keep whatever agent context was current.
             SurfaceKey::File { .. } => {}
         }
+        *self
+            .iris_context_agent
+            .lock()
+            .expect("Iris context mutex poisoned") = self.registry.selected_agent().copied();
         cx.notify();
     }
 
@@ -3214,6 +3268,7 @@ impl Workspace {
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(cx) {
+            Some(RowTarget::Iris) => self.cmd_voice(window, cx),
             Some(RowTarget::Stream {
                 root: Some(agent_id),
                 ..
@@ -3475,12 +3530,16 @@ impl Workspace {
         )
     }
 
-    /// The selected agent's document preview editor, built on first use.
+    /// The Iris document or selected agent preview editor.
     fn selected_preview_editor(
         &mut self,
+        iris: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<editor::Editor>> {
+        if iris {
+            return Some(self.iris_preview.clone());
+        }
         let agent_id = self.registry.selected_agent().copied()?;
         let model = self.models.get(&agent_id)?.clone();
         Some(model.update(cx, |model, cx| model.preview_editor(window, cx)))
@@ -3498,16 +3557,21 @@ impl Workspace {
         // Modal overlays borrow keyboard focus; the frame stays in the mode
         // recorded beneath the overlay for its whole replacement chain.
         let home = self.dashboard_mode(window, cx);
+        let iris = home
+            && matches!(
+                self.dashboard.cursor_target(cx),
+                Some(crate::dashboard::RowTarget::Iris)
+            );
         self.sync_diff_visibility(!home, cx);
-        let show_panes = !home || self.registry.selected_agent().is_some();
+        let show_panes = !home || iris || self.registry.selected_agent().is_some();
         let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
-        let preview_bar = home
+        let preview_bar = (home && !iris)
             .then(|| self.render_preview_bar(text_style, cx))
             .flatten();
         let preview = home
-            .then(|| self.selected_preview_editor(window, cx))
+            .then(|| self.selected_preview_editor(iris, window, cx))
             .flatten()
             .map(|editor| div().size_full().overflow_hidden().child(editor));
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
@@ -3830,6 +3894,7 @@ fn cycle_agent_role_text(current: &str) -> &'static str {
         } => "pm",
         AgentRole::Advisor { .. } => "eng",
         AgentRole::PM | AgentRole::WorkflowPM { .. } => "eng-mini",
+        AgentRole::Iris => "eng-mini",
     }
 }
 
@@ -3842,6 +3907,10 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
     match config {
         AgentRole::PM | AgentRole::WorkflowPM { .. } => RoleLabel {
             text: "pm".to_owned(),
+            family: RoleFamily::Deep,
+        },
+        AgentRole::Iris => RoleLabel {
+            text: "iris".to_owned(),
             family: RoleFamily::Deep,
         },
         AgentRole::Advisor { intelligence } => RoleLabel {

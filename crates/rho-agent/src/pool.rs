@@ -23,10 +23,7 @@ use crate::db::{
     InferenceModel, InferenceProfile, SessionBinding, WorkstreamId,
 };
 use crate::lazy::Lazy;
-use crate::{
-    Agent, AgentInputId, AgentState, AgentToolExtension, AgentToolExtensionFactory, InputSourceId,
-    MessageDelivery, StartWorkdir,
-};
+use crate::{Agent, AgentInputId, AgentState, InputSourceId, MessageDelivery, StartWorkdir};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -48,14 +45,13 @@ pub struct AgentPool {
     created: broadcast::Sender<AgentCreated>,
     /// Fires when a loaded agent completes a turn with a final answer.
     completed_turns: broadcast::Sender<AgentTurnCompleted>,
+    /// Fires once for each fully-finished assistant message item.
+    completed_assistant_items: broadcast::Sender<AgentAssistantItemCompleted>,
     /// Fires after a user input has been durably accepted into an agent log.
     accepted_inputs: broadcast::Sender<AgentInputAccepted>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
-    tool_extension_provider: std::sync::RwLock<Option<Arc<dyn AgentToolExtensionProvider>>>,
-}
-
-pub trait AgentToolExtensionProvider: Send + Sync + 'static {
-    fn tool_extension(&self, agent_id: AgentId) -> Option<Arc<dyn AgentToolExtension>>;
+    iris_tool_host: std::sync::RwLock<Option<crate::iris_tools::SharedIrisToolHost>>,
+    slack_tool_host: std::sync::RwLock<Option<crate::slack_tools::SharedSlackToolHost>>,
 }
 
 /// Broadcast when any agent is created in the pool.
@@ -71,6 +67,13 @@ pub struct AgentCreated {
 pub struct AgentTurnCompleted {
     pub agent_id: AgentId,
     pub final_answer: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentAssistantItemCompleted {
+    pub agent_id: AgentId,
+    pub phase: rho_core::MessagePhase,
+    pub text: String,
 }
 
 /// Broadcast when a user input is accepted into an agent.
@@ -154,9 +157,11 @@ impl AgentPool {
             repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
             completed_turns: broadcast::channel(64).0,
+            completed_assistant_items: broadcast::channel(64).0,
             accepted_inputs: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
-            tool_extension_provider: std::sync::RwLock::new(None),
+            iris_tool_host: std::sync::RwLock::new(None),
+            slack_tool_host: std::sync::RwLock::new(None),
         });
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
@@ -174,16 +179,20 @@ impl AgentPool {
         pool
     }
 
-    pub fn set_tool_extension_provider(&self, provider: Arc<dyn AgentToolExtensionProvider>) {
-        *self.tool_extension_provider.write().expect("poison") = Some(provider);
+    pub fn set_iris_tool_host(&self, host: crate::iris_tools::SharedIrisToolHost) {
+        *self.iris_tool_host.write().expect("poison") = Some(host);
     }
 
-    fn tool_extension_for(&self, agent_id: AgentId) -> Option<Arc<dyn AgentToolExtension>> {
-        self.tool_extension_provider
-            .read()
-            .expect("poison")
-            .as_ref()
-            .and_then(|provider| provider.tool_extension(agent_id))
+    pub(crate) fn iris_tool_host(&self) -> Option<crate::iris_tools::SharedIrisToolHost> {
+        self.iris_tool_host.read().expect("poison").clone()
+    }
+
+    pub fn set_slack_tool_host(&self, host: crate::slack_tools::SharedSlackToolHost) {
+        *self.slack_tool_host.write().expect("poison") = Some(host);
+    }
+
+    pub(crate) fn slack_tool_host(&self) -> Option<crate::slack_tools::SharedSlackToolHost> {
+        self.slack_tool_host.read().expect("poison").clone()
     }
 
     pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {
@@ -192,6 +201,12 @@ impl AgentPool {
 
     pub fn subscribe_completed_turns(&self) -> broadcast::Receiver<AgentTurnCompleted> {
         self.completed_turns.subscribe()
+    }
+
+    pub fn subscribe_completed_assistant_items(
+        &self,
+    ) -> broadcast::Receiver<AgentAssistantItemCompleted> {
+        self.completed_assistant_items.subscribe()
     }
 
     pub fn subscribe_accepted_inputs(&self) -> broadcast::Receiver<AgentInputAccepted> {
@@ -215,6 +230,10 @@ impl AgentPool {
 
     pub fn publish_completed_turn(&self, completed: AgentTurnCompleted) {
         let _ = self.completed_turns.send(completed);
+    }
+
+    pub(crate) fn publish_completed_assistant_item(&self, item: AgentAssistantItemCompleted) {
+        let _ = self.completed_assistant_items.send(item);
     }
 
     pub fn publish_accepted_input(&self, accepted: AgentInputAccepted) {
@@ -290,7 +309,14 @@ impl AgentPool {
             .read()
             .list_agents()
             .into_iter()
-            .filter(|(_, agent)| agent.disposition != AgentDisposition::Hidden)
+            .filter(|(_, agent)| {
+                agent.role != AgentRole::Iris
+                    && !agent
+                        .labels
+                        .iter()
+                        .any(|label| label == crate::iris_tools::LABEL)
+                    && agent.disposition != AgentDisposition::Hidden
+            })
             .map(|(agent_id, _)| agent_id)
             .collect()
     }
@@ -306,27 +332,8 @@ impl AgentPool {
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        self.create_with_parent(workstream, config, display_name, start, None, None)
+        self.create_with_parent(workstream, config, display_name, start, None)
             .await
-    }
-
-    pub async fn create_with_tool_extension(
-        self: &Arc<Self>,
-        workstream: WorkstreamId,
-        config: AgentRole,
-        display_name: Option<String>,
-        start: Vec<StartWorkdir>,
-        tool_extension: AgentToolExtensionFactory,
-    ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        self.create_with_parent(
-            workstream,
-            config,
-            display_name,
-            start,
-            None,
-            Some(tool_extension),
-        )
-        .await
     }
 
     async fn create_with_parent(
@@ -336,7 +343,6 @@ impl AgentPool {
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         parent: Option<AgentId>,
-        tool_extension: Option<AgentToolExtensionFactory>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let mode = config.session_profile()?;
         let (agent_id, agent) = match mode {
@@ -357,7 +363,6 @@ impl AgentPool {
                     start,
                     parent,
                     Arc::downgrade(self),
-                    tool_extension,
                 )
                 .await?;
                 (agent_id, RunningAgent::Rho(agent))
@@ -380,11 +385,13 @@ impl AgentPool {
             }
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
-        let _ = self.created.send(AgentCreated {
-            workstream,
-            agent_id,
-            agent: agent.clone(),
-        });
+        if config != AgentRole::Iris {
+            let _ = self.created.send(AgentCreated {
+                workstream,
+                agent_id,
+                agent: agent.clone(),
+            });
+        }
         Ok((agent_id, agent))
     }
 
@@ -470,14 +477,7 @@ impl AgentPool {
         }
         let config = child_role(parent_role, config);
         let (child_id, child) = self
-            .create_with_parent(
-                workstream,
-                config,
-                Some(task_name),
-                start,
-                Some(parent),
-                None,
-            )
+            .create_with_parent(workstream, config, Some(task_name), start, Some(parent))
             .await?;
         let parent_label = self.agent_handle(parent);
         child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);
@@ -658,7 +658,6 @@ impl AgentPool {
                 agent_id,
                 view,
                 Arc::downgrade(self),
-                self.tool_extension_for(agent_id),
             )),
             AgentRuntime::Claude { .. } => {
                 let agent =

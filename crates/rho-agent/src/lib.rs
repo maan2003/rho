@@ -8,10 +8,10 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt};
 use rho_core::{
-    ApplyPatchMetadata, ContentPart, ContextBlock, InferenceEvent, InferenceRequest,
-    InferenceResponseItem, PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId,
-    ToolExecutionContext, ToolOutput, ToolOutputStatus, ToolResult, ToolResultMetadata, ToolSpec,
-    ToolUpdate, UnixMs,
+    ApplyPatchMetadata, ContentPart, ContextBlock, ContextItemEvent, InferenceEvent,
+    InferenceRequest, InferenceResponseItem, PendingInferenceResponse, ProviderResponseId,
+    StreamingContextItem, StreamingContextItemState, ToolCall, ToolCallId, ToolExecutionContext,
+    ToolOutput, ToolOutputStatus, ToolResult, ToolResultMetadata, ToolSpec, ToolUpdate, UnixMs,
 };
 use rho_db::RhoDb;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
@@ -27,15 +27,17 @@ use crate::db::{
 };
 use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
-use crate::pool::AgentInputAccepted;
+use crate::pool::{AgentAssistantItemCompleted, AgentInputAccepted, AgentTurnCompleted};
 
 mod claude;
 #[cfg(feature = "code-mode")]
 mod code_mode;
 pub mod db;
+pub mod iris_tools;
 mod lazy;
 pub mod multi_agent_tools;
 pub mod pool;
+pub mod slack_tools;
 pub mod system_prompt;
 pub mod title;
 
@@ -44,21 +46,8 @@ type CodeModeSession = rho_code_mode::CodeModeSession;
 #[cfg(not(feature = "code-mode"))]
 struct CodeModeSession;
 
-/// A small, host-provided tool surface for a specific agent.
-///
-/// Higher-level integrations can attach model-facing tools without making
-/// `rho-agent` depend on the integration crate. Tool names must not collide
-/// with built-in tools.
-pub trait AgentToolExtension: Send + Sync + 'static {
-    fn specs(&self) -> Vec<ToolSpec>;
-    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput>;
-}
-
-pub type AgentToolExtensionFactory =
-    Arc<dyn Fn(AgentId) -> Arc<dyn AgentToolExtension> + Send + Sync + 'static>;
-
 /// Model-facing prompt and top-level tools for a newly created role. Dynamic
-/// agent identity/team text and host-provided tool extensions are omitted.
+/// agent identity/team text and stateful integration hosts are omitted.
 pub struct RenderedAgentSurface {
     pub system_prompt: Arc<str>,
     pub tools: Arc<[ToolSpec]>,
@@ -86,7 +75,7 @@ pub fn render_agent_surface(
     let agent_tools_enabled = true;
     Ok(RenderedAgentSurface {
         system_prompt: system_prompt::prompt(view.as_ref(), None, code_mode, role, &[]),
-        tools: agent_tool_specs(&shell_tools, agent_tools_enabled, code_mode, role, None),
+        tools: agent_tool_specs(&shell_tools, agent_tools_enabled, code_mode, role, false),
     })
 }
 
@@ -581,7 +570,6 @@ impl Agent {
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
         // multi-agent tools are not offered.
         pool: std::sync::Weak<pool::AgentPool>,
-        tool_extension: Option<AgentToolExtensionFactory>,
     ) -> anyhow::Result<(AgentId, Self)> {
         let prompt_cache_key = PromptCacheKey::generate();
         let config = mode
@@ -593,7 +581,6 @@ impl Agent {
         // multi-repo creation may leave an unreachable checkout for jj GC.
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let tool_extension = tool_extension.map(|factory| factory(agent_id));
         let entries = materialize_workdirs(start).await?;
         let view = View::new(entries.clone())?;
         let now = UnixMillis::now();
@@ -624,7 +611,6 @@ impl Agent {
             Arc::new(Lazy::ready(view)),
             parent,
             pool,
-            tool_extension,
             RestoredAgent::default(),
         );
         Ok((agent_id, agent))
@@ -636,16 +622,8 @@ impl Agent {
         agent_id: AgentId,
         view: Arc<View>,
         pool: std::sync::Weak<pool::AgentPool>,
-        tool_extension: Option<Arc<dyn AgentToolExtension>>,
     ) -> Self {
-        Self::load_lazy(
-            db,
-            auth,
-            agent_id,
-            Arc::new(Lazy::ready(view)),
-            pool,
-            tool_extension,
-        )
+        Self::load_lazy(db, auth, agent_id, Arc::new(Lazy::ready(view)), pool)
     }
 
     pub(crate) fn load_lazy(
@@ -656,7 +634,6 @@ impl Agent {
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
         // multi-agent tools are not offered.
         pool: std::sync::Weak<pool::AgentPool>,
-        tool_extension: Option<Arc<dyn AgentToolExtension>>,
     ) -> Self {
         let record = db.read().get_agent(agent_id);
         let (next_event, events) = db.read().agent_events(agent_id);
@@ -686,7 +663,6 @@ impl Agent {
             view,
             record.parent_agent,
             pool,
-            tool_extension,
             restored,
         )
     }
@@ -706,7 +682,6 @@ impl Agent {
         view: Arc<Lazy<Arc<View>>>,
         parent: Option<AgentId>,
         pool: std::sync::Weak<pool::AgentPool>,
-        tool_extension: Option<Arc<dyn AgentToolExtension>>,
         restored: RestoredAgent,
     ) -> Self {
         // Role policy wins over persisted profiles created before PM code mode
@@ -714,8 +689,15 @@ impl Agent {
         let code_mode_enabled = cfg!(feature = "code-mode") && config.code_mode && !role.is_pm();
         let web_search = WebSearchTools::new(auth.clone(), agent_id.encoded().to_owned());
         let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
-        let multi_agent = pool
-            .upgrade()
+        let iris_tools = (role == db::AgentRole::Iris).then(|| {
+            pool.upgrade()
+                .and_then(|pool| pool.iris_tool_host())
+                .expect("Iris role requires the daemon Iris tool host")
+        });
+        let slack_tools = pool.upgrade().and_then(|pool| pool.slack_tool_host());
+        let multi_agent = (role != db::AgentRole::Iris)
+            .then(|| pool.upgrade())
+            .flatten()
             .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
         let agent_tools_enabled = true;
         let projects = db
@@ -729,14 +711,14 @@ impl Agent {
         let execution = Arc::new(Lazy::new({
             let view = Arc::clone(&view);
             let multi_agent = multi_agent.clone();
-            let tool_extension = tool_extension.clone();
             let web_search = web_search.clone();
+            let slack_tools = slack_tools.clone();
             let control = control.clone();
             move || {
                 let view = Arc::clone(&view);
                 let multi_agent = multi_agent.clone();
-                let tool_extension = tool_extension.clone();
                 let web_search = web_search.clone();
+                let slack_tools = slack_tools.clone();
                 let control = control.clone();
                 let projects = projects.clone();
                 async move {
@@ -750,7 +732,9 @@ impl Agent {
                         code_mode_enabled,
                         agent_tools_enabled,
                         multi_agent.as_ref(),
-                        tool_extension.as_ref(),
+                        slack_tools
+                            .as_ref()
+                            .is_some_and(|host| host.has_agent(agent_id)),
                         &projects,
                         control,
                     ))
@@ -780,7 +764,8 @@ impl Agent {
             },
             multi_agent,
             agent_tools_enabled,
-            tool_extension,
+            iris_tools,
+            slack_tools,
             pool_events,
         };
         tokio::spawn(agent_loop.run());
@@ -948,12 +933,14 @@ fn agent_tool_specs(
     multi_agent: bool,
     code_mode: bool,
     role: db::AgentRole,
-    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
+    slack_tools: bool,
 ) -> Arc<[ToolSpec]> {
+    if role == db::AgentRole::Iris {
+        return iris_tools::specs().into();
+    }
     #[cfg(feature = "code-mode")]
     if code_mode {
-        return code_mode::tool_specs(shell_tools, multi_agent.then_some(role), tool_extension)
-            .into();
+        return code_mode::tool_specs(shell_tools, multi_agent.then_some(role)).into();
     }
     #[cfg(not(feature = "code-mode"))]
     let _ = code_mode;
@@ -965,8 +952,8 @@ fn agent_tool_specs(
     if multi_agent {
         specs.extend(multi_agent_tools::agent_tool_specs(role));
     }
-    if let Some(extension) = tool_extension {
-        specs.extend(extension.specs());
+    if slack_tools {
+        specs.push(slack_tools::spec());
     }
     specs.push(rho_web_search::web_search_spec());
     specs.into()
@@ -979,20 +966,13 @@ fn start_code_mode(
     enabled: bool,
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
-    tool_extension: Option<&Arc<dyn AgentToolExtension>>,
     web_search: &WebSearchTools,
     control: mpsc::UnboundedSender<AgentControl>,
 ) -> Option<Arc<CodeModeSession>> {
     if !enabled {
         return None;
     }
-    match code_mode::start_session(
-        shell_tools,
-        multi_agent,
-        tool_extension,
-        web_search,
-        control,
-    ) {
+    match code_mode::start_session(shell_tools, multi_agent, web_search, control) {
         Ok(session) => Some(Arc::new(session)),
         Err(error) => {
             eprintln!("rho-agent: code mode unavailable, using direct tools: {error}");
@@ -1006,7 +986,6 @@ fn start_code_mode(
     _enabled: bool,
     _shell_tools: &ShellTools,
     _multi_agent: Option<&MultiAgentTools>,
-    _tool_extension: Option<&Arc<dyn AgentToolExtension>>,
     _web_search: &WebSearchTools,
     _control: mpsc::UnboundedSender<AgentControl>,
 ) -> Option<Arc<CodeModeSession>> {
@@ -1064,8 +1043,9 @@ struct AgentLoop {
     /// False for Advisor: retain parent-mail/team identity without exposing or
     /// dispatching agent-management tools.
     agent_tools_enabled: bool,
-    /// Integration-provided tools bound to this agent.
-    tool_extension: Option<Arc<dyn AgentToolExtension>>,
+    /// Stateful host for the built-in Iris role's global control tools.
+    iris_tools: Option<iris_tools::SharedIrisToolHost>,
+    slack_tools: Option<slack_tools::SharedSlackToolHost>,
     pool_events: std::sync::Weak<pool::AgentPool>,
 }
 
@@ -1091,7 +1071,7 @@ impl ExecutionContext {
         code_mode_enabled: bool,
         agent_tools_enabled: bool,
         multi_agent: Option<&MultiAgentTools>,
-        tool_extension: Option<&Arc<dyn AgentToolExtension>>,
+        slack_tools: bool,
         projects: &[(camino::Utf8PathBuf, String)],
         control: mpsc::UnboundedSender<AgentControl>,
     ) -> Self {
@@ -1104,7 +1084,6 @@ impl ExecutionContext {
             code_mode_enabled,
             &shell_tools,
             agent_tools_enabled.then_some(()).and(multi_agent),
-            tool_extension,
             &web_search,
             control,
         );
@@ -1113,7 +1092,7 @@ impl ExecutionContext {
             multi_agent.is_some() && agent_tools_enabled,
             code_mode.is_some(),
             role,
-            tool_extension,
+            slack_tools,
         );
         let system_prompt = system_prompt::prompt(
             view.as_ref(),
@@ -1399,7 +1378,23 @@ impl AgentLoop {
                             };
                         }
                         InferenceEvent::ContextItem { index, event } => {
+                            let finished = matches!(&event, ContextItemEvent::Finish);
                             pending_response.apply(index, event);
+                            if finished
+                                && let Some((phase, text)) = completed_assistant_item(
+                                    &pending_response,
+                                    index,
+                                )
+                                && let Some(pool) = self.pool_events.upgrade()
+                            {
+                                pool.publish_completed_assistant_item(
+                                    AgentAssistantItemCompleted {
+                                        agent_id: self.persistence.agent_id,
+                                        phase,
+                                        text,
+                                    },
+                                );
+                            }
                             state.kind = AgentStateKind::ApiStreaming {
                                 pending_response,
                                 previous_attempt,
@@ -1531,6 +1526,12 @@ impl AgentLoop {
                                     // mail the result to the parent so it can
                                     // react.
                                     let final_text = final_text.unwrap_or_default();
+                                    if let Some(pool) = self.pool_events.upgrade() {
+                                        pool.publish_completed_turn(AgentTurnCompleted {
+                                            agent_id: self.persistence.agent_id,
+                                            final_answer: final_text.clone(),
+                                        });
+                                    }
                                     self.mail_parent(
                                         if final_text.is_empty() {
                                             "(turn finished with no text response)".to_owned()
@@ -1660,22 +1661,31 @@ impl AgentLoop {
                                             && multi_agent_tools::is_agent_tool(call.name.as_str()))
                                             .then(|| self.multi_agent.clone())
                                             .flatten();
-                                        let extension = self.tool_extension.as_ref().and_then(|extension| {
-                                            extension
-                                                .specs()
-                                                .iter()
-                                                .any(|spec| spec.name == call.name)
-                                                .then(|| Arc::clone(extension))
-                                        });
+                                        let iris_tools = iris_tools::is_tool(call.name.as_str())
+                                            .then(|| self.iris_tools.clone())
+                                            .flatten();
+                                        let iris_role = self.iris_tools.is_some();
+                                        let slack_tools = (call.name.as_str()
+                                            == slack_tools::REPLY_TOOL_NAME)
+                                            .then(|| self.slack_tools.clone())
+                                            .flatten();
+                                        let agent_id = self.persistence.agent_id;
                                         self.pending_tools.push(Box::pin(async move {
                                             let call_id = call.id.clone();
                                             let tool_type = call.tool_type;
                                             let (body, metadata) = if let Some(web_search) = web_search {
                                                 (web_search.call(call, context).await, None)
-                                            } else if let Some(extension) = extension {
-                                                (extension.call(call).await, None)
+                                            } else if let Some(iris_tools) = iris_tools {
+                                                (iris_tools.call(call).await, None)
+                                            } else if let Some(slack_tools) = slack_tools {
+                                                (slack_tools.call(agent_id, call).await, None)
                                             } else if let Some(tools) = agent_tools {
                                                 (multi_agent_tools::call_agent_tool(tools, call).await, None)
+                                            } else if iris_role {
+                                                (ToolOutput {
+                                                    output: Arc::new("unsupported Iris tool".to_owned()),
+                                                    status: ToolOutputStatus::Error,
+                                                }, None)
                                             } else {
                                                 let output =
                                                     shell_tools.call_with_metadata(call).await;
@@ -1869,7 +1879,6 @@ impl AgentLoop {
         #[cfg(not(feature = "code-mode"))]
         {
             let _ = state;
-            return;
         }
         #[cfg(feature = "code-mode")]
         {
@@ -2094,6 +2103,28 @@ fn should_yield_code_mode_wait_for_queued(state: &AgentState) -> bool {
 
 /// The turn's answer for reporting to a parent agent: final-channel text,
 /// falling back to all assistant text when the model skipped phases.
+fn completed_assistant_item(
+    response: &PendingInferenceResponse,
+    index: usize,
+) -> Option<(rho_core::MessagePhase, String)> {
+    let StreamingContextItemState::Finished(StreamingContextItem::AssistantMessage {
+        content,
+        phase,
+        ..
+    }) = response.items.get(index)?
+    else {
+        return None;
+    };
+    Some((
+        phase.unwrap_or(rho_core::MessagePhase::FinalAnswer),
+        content
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
+}
+
 pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
     let text_of = |want_final: bool| {
         items

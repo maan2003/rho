@@ -879,6 +879,8 @@ pub enum AgentRole {
     WorkflowPM {
         workflow: AgentWorkflow,
     },
+    /// Built-in hidden coordinator for Rho's global Iris voice surface.
+    Iris,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -926,11 +928,13 @@ impl AgentRole {
     pub fn workflow(self) -> AgentWorkflow {
         match self {
             Self::WorkflowEngineer { workflow, .. } | Self::WorkflowPM { workflow } => workflow,
-            Self::Engineer { .. } | Self::PM | Self::Advisor { .. } => AgentWorkflow::Default,
+            Self::Engineer { .. } | Self::PM | Self::Advisor { .. } | Self::Iris => {
+                AgentWorkflow::Default
+            }
         }
     }
     pub fn is_pm(self) -> bool {
-        matches!(self, Self::PM | Self::WorkflowPM { .. })
+        matches!(self, Self::PM | Self::WorkflowPM { .. } | Self::Iris)
     }
 
     pub fn is_engineer(self) -> bool {
@@ -941,6 +945,7 @@ impl AgentRole {
             Self::Engineer { .. } | Self::WorkflowEngineer { .. } => "eng",
             Self::PM | Self::WorkflowPM { .. } => "pm",
             Self::Advisor { .. } => "adv",
+            Self::Iris => "iris",
         }
     }
 
@@ -957,6 +962,11 @@ impl AgentRole {
                     ..deep(ReasoningEffort::Low)
                 })
             }
+            AgentRole::Iris => SessionBinding::ResponsesTerra(InferenceProfile {
+                effort: ReasoningEffort::Medium,
+                fast_mode: true,
+                code_mode: false,
+            }),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
             }
@@ -1305,7 +1315,9 @@ impl AgentProfileWriteTxnExt for WriteTxn {
                 .into_owned()
                 .role
             {
-                AgentRole::PM | AgentRole::WorkflowPM { .. } => AgentSpawnedBy::PM,
+                AgentRole::PM | AgentRole::WorkflowPM { .. } | AgentRole::Iris => {
+                    AgentSpawnedBy::PM
+                }
                 AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => {
                     AgentSpawnedBy::Engineer
                 }

@@ -31,6 +31,7 @@ use tokio::sync::{
 };
 
 pub mod debug;
+mod iris;
 mod realtime;
 mod shell;
 mod terminal;
@@ -344,6 +345,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         )
         .await?,
     );
+    agents.install_iris_tool_host();
     agents.resume_platform_integrations();
     spawn_chatgpt_quota_poller(quota_auth_name, agents.db.clone(), agents.events.clone());
 
@@ -998,6 +1000,11 @@ struct AgentRegistry {
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_workspaces::UserEnvironment,
     git_transport: GitTransportBroker,
+    /// The hidden persisted coordinator backing the single global Iris
+    /// surface. It is loaded lazily on the first delegated voice request.
+    iris_agent: Mutex<Option<AgentId>>,
+    /// At most one GUI owns microphone/playback for Iris at a time.
+    iris_voice_lease: Arc<TokioMutex<()>>,
 }
 
 impl AgentRegistry {
@@ -1038,6 +1045,8 @@ impl AgentRegistry {
             terminals: Arc::new(terminal::TerminalRegistry::default()),
             user_environment,
             git_transport: GitTransportBroker::default(),
+            iris_agent: Mutex::new(None),
+            iris_voice_lease: Arc::new(TokioMutex::new(())),
         };
         registry.pool.load_non_hidden_agents().await;
         Ok(registry)
@@ -1098,10 +1107,24 @@ impl AgentRegistry {
     }
 
     fn ui_workstreams(&self) -> Vec<UiWorkstream> {
-        let mut records = self.db.read().list_workstreams();
+        let read = self.db.read();
+        let iris_workstreams = read
+            .list_agents()
+            .into_iter()
+            .filter(|(_, agent)| {
+                agent.role == AgentRole::Iris
+                    || agent
+                        .labels
+                        .iter()
+                        .any(|label| label == rho_agent::iris_tools::LABEL)
+            })
+            .map(|(_, agent)| agent.workstream)
+            .collect::<HashSet<_>>();
+        let mut records = read.list_workstreams();
         records.sort_by_key(|(_, workstream)| workstream.created_at);
         records
             .into_iter()
+            .filter(|(workstream_id, _)| !iris_workstreams.contains(workstream_id))
             .map(|(workstream_id, workstream)| UiWorkstream {
                 workstream_id,
                 name: workstream.name,
@@ -1115,6 +1138,13 @@ impl AgentRegistry {
         records.sort_by_key(|(_, agent)| agent.created_at);
         records
             .into_iter()
+            .filter(|(_, agent)| {
+                agent.role != AgentRole::Iris
+                    && !agent
+                        .labels
+                        .iter()
+                        .any(|label| label == rho_agent::iris_tools::LABEL)
+            })
             .map(|(agent_id, agent)| UiAgentSummary {
                 agent_id,
                 parent_agent: agent.parent_agent,
@@ -2031,6 +2061,7 @@ fn spawn_attention_watcher(
     agent: RunningAgent,
 ) {
     tokio::spawn(async move {
+        let runtime_publishes_completion = matches!(&agent, RunningAgent::Rho(_));
         let is_child = db.read().get_agent(agent_id).parent_agent.is_some();
         let changes = agent.subscribe();
         futures::pin_mut!(changes);
@@ -2079,6 +2110,7 @@ fn spawn_attention_watcher(
             }
             if !working
                 && was_working
+                && !runtime_publishes_completion
                 && let Some((response_count, final_answer)) = latest_final_response(&state)
                 && response_count > last_reported_response_count
             {

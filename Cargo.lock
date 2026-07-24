@@ -14305,6 +14305,7 @@ dependencies = [
  "prefix-id",
  "prost 0.9.0",
  "redb",
+ "reqwest 0.12.28",
  "rho-agent",
  "rho-claude",
  "rho-core",
@@ -14313,7 +14314,6 @@ dependencies = [
  "rho-iroh-auth",
  "rho-pr-monitor",
  "rho-profiling",
- "rho-realtime",
  "rho-shell",
  "rho-shell-proto",
  "rho-slack",
@@ -14330,6 +14330,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -14491,14 +14492,11 @@ dependencies = [
  "anyhow",
  "futures 0.3.33",
  "libwebrtc",
- "reqwest 0.12.28",
- "rho-inference",
  "rodio",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]

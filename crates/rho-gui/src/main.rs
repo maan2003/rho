@@ -432,7 +432,6 @@ fn bind_rho_key_overrides(cx: &mut App) {
         // so a root-level `RhoGui` binding would lose while typing.
         KeyBinding::new("ctrl-shift-j", AgentJumpAttention, Some("RhoGui > Editor")),
         KeyBinding::new("ctrl-shift-d", AgentDone, Some("RhoGui > Editor")),
-        KeyBinding::new("ctrl-shift-m", VoiceToggle, Some("RhoGui > Editor")),
         KeyBinding::new(
             "tab",
             RoleCycle,

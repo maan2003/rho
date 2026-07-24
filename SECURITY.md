@@ -437,8 +437,11 @@ metadata; it performs no inference and creates no agent or workspace.
 
 ## Realtime voice provider (`rho-realtime`)
 
-- Voice starts only after an explicit native-GUI action because microphone
-  audio leaves the machine. `rho-realtime` captures and plays audio locally;
+- The native GUI starts Iris after its first daemon-ready snapshot, so
+  microphone audio begins leaving the machine without a separate per-launch
+  action. The always-visible `iris · listening` dashboard row communicates
+  that policy, and `Space m` stops or restarts the session. `rho-realtime`
+  captures and plays audio locally;
   encoded media flows directly between the GUI-owned WebRTC peer and ChatGPT,
   never through the daemon. Dropping the GUI session closes its data channel,
   peer connection, microphone task, and playback sink.
@@ -447,17 +450,29 @@ metadata; it performs no inference and creates no agent or workspace.
   existing ChatGPT OAuth credential and calls the realtime signaling endpoint.
   Only the bounded SDP answer returns to the GUI.
 - Provider data-channel messages are remote, semi-trusted input. The realtime
-  crate accepts text messages no larger than 1 MiB, decodes them into tagged
-  Rust types, ignores unknown top-level events, and reports malformed known
-  events without panicking. Provider commands are constructed from typed
-  values and delegation context is split on UTF-8 boundaries into at most
-  500-byte chunks.
-- The GUI, not the daemon, owns provider delegation policy. A typed
-  `DelegateRequest` event is explicitly mapped to the currently selected
-  agent. The dedicated stream carries only typed generic request ids, agent
-  ids, text, completion text, and errors; the daemon does not receive media or
-  provider event payloads. Only one delegated request is active per realtime
-  stream, preventing ambiguous completion routing.
+  crate accepts text messages no larger than 1 MiB, decodes delegation and
+  input/output transcript delta/done events into tagged Rust types, ignores
+  unknown top-level events, and reports malformed known events without
+  panicking. Provider commands are constructed from typed values and
+  delegation context is split on UTF-8 boundaries into at most 500-byte
+  chunks.
+- The GUI owns provider event parsing and attaches its current selected agent
+  only as semantic context. At signaling time the daemon also supplies a
+  bounded 16 KiB snapshot containing visible agent handles, names, workstreams,
+  and attention states; it excludes repository contents and agent transcript
+  text. The daemon admits one global Iris media lease and routes typed delegate
+  text plus the active role-bearing conversation snapshot to a hidden persisted
+  `AgentRole::Iris` coordinator. `rho-agent` gives that role only its built-in
+  Iris schemas—no shell, repository, web-search, Slack, or parent-scoped agent
+  tools—and dispatches them to the daemon's bounded typed fleet-control host.
+  The dedicated stream carries only request ids,
+  optional context agent ids, transcript snapshots and tails, phase-tagged
+  completed response items, completion text, and errors; the daemon does not receive
+  media or raw provider event payloads. Only one backend turn is active per
+  realtime stream; later delegated requests steer it and receive an immediate
+  acknowledgement instead of being rejected. Each completed commentary or
+  final assistant item is forwarded as one phase-tagged message, capped at
+  16 KiB per active handoff.
 
 ## AGENTS.md
 

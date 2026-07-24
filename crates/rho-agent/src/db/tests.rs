@@ -341,6 +341,16 @@ fn agent_role_resolves_opinionated_bindings() {
             ..
         })
     ));
+    assert!(matches!(
+        AgentRole::Iris.session_profile().unwrap(),
+        SessionBinding::ResponsesTerra(InferenceProfile {
+            effort: ReasoningEffort::Medium,
+            fast_mode: true,
+            code_mode: false,
+        })
+    ));
+    assert!(AgentRole::Iris.is_pm());
+    assert_eq!(AgentRole::Iris.handle_prefix(), "iris");
 }
 
 use crate::{MessageDelivery, MessageSender, QueuedItem, QueuedItemKind};

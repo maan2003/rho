@@ -383,6 +383,13 @@ pub fn root_menu() -> Transient {
         .item("n", "new agent", |workspace, window, cx| {
             workspace.open_new_agent_transient(window, cx);
         })
+        .item(
+            "m",
+            "iris microphone · listening",
+            |workspace, window, cx| {
+                workspace.cmd_voice(window, cx);
+            },
+        )
         .item_when(
             Workspace::has_selected_agent,
             "a",
@@ -449,13 +456,9 @@ pub fn usage_root_menu() -> Transient {
         .item("r", "rate limit · 7d", |workspace, window, cx| {
             workspace.open_usage_transient(7, window, cx);
         })
-        .item(
-            "shift-r",
-            "rate limit · 30d",
-            |workspace, window, cx| {
-                workspace.open_usage_transient(30, window, cx);
-            },
-        )
+        .item("shift-r", "rate limit · 30d", |workspace, window, cx| {
+            workspace.open_usage_transient(30, window, cx);
+        })
         .item("c", "model cost · 7d", |workspace, window, cx| {
             workspace.open_global_usage_transient(7, window, cx);
         })

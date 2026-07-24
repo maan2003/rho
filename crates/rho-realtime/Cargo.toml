@@ -10,8 +10,6 @@ rust-version.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 libwebrtc.workspace = true
-reqwest.workspace = true
-rho-inference.workspace = true
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = [
   "playback",
   "recording",
@@ -20,4 +18,3 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-uuid.workspace = true

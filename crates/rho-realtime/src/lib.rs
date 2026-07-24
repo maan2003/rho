@@ -24,7 +24,6 @@ use libwebrtc::peer_connection_factory::{
     ContinualGatheringPolicy, IceServer, PeerConnectionFactory, RtcConfiguration,
 };
 use libwebrtc::session_description::{SdpType, SessionDescription};
-use rho_inference::ResolvedOAuth;
 use rodio::microphone::MicrophoneBuilder;
 use rodio::source::UniformSourceIterator;
 use rodio::{ChannelCount, DeviceSinkBuilder, MixerDeviceSink, SampleRate, Source as _};
@@ -37,8 +36,6 @@ const FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 100;
 const MAX_PROVIDER_EVENT_BYTES: usize = 1024 * 1024;
 const CONTEXT_APPEND_MAX_BYTES: usize = 500;
 const MAX_SDP_BYTES: usize = 256 * 1024;
-const CALL_URL: &str =
-    "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SdpOffer(String);
@@ -82,133 +79,12 @@ fn validate_sdp(value: &str, kind: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Exchange a native WebRTC offer using a daemon-resolved OAuth credential.
-/// Keeping credential resolution outside this crate lets GUI clients signal
-/// through a local or remote daemon without receiving the bearer token.
-pub async fn create_call(
-    credential: ResolvedOAuth,
-    offer_sdp: SdpOffer,
-) -> anyhow::Result<SdpAnswer> {
-    let account_id = credential
-        .account_id
-        .context("realtime requires a ChatGPT account id")?;
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let body = CreateCallRequest {
-        sdp: offer_sdp.into_string(),
-        session: CreateCallSession {
-            model: RealtimeModel::GptLive1BoulderAlpha,
-            instructions: "You are Rho's realtime voice interface. Be concise. Delegate work that \
-                           needs tools or durable agent state to the client."
-                .to_owned(),
-            audio: SessionAudio {
-                output: AudioOutput { voice: Voice::Cove },
-            },
-            delegation: SessionDelegation {
-                delegation_type: SessionDelegationType::Client,
-            },
-        },
-    };
-    let mut response = reqwest::Client::new()
-        .post(CALL_URL)
-        .bearer_auth(credential.bearer_token)
-        .header("chatgpt-account-id", account_id)
-        .header("openai-alpha", "quicksilver=v2")
-        .header("x-session-id", &session_id)
-        .header("session-id", &session_id)
-        .header("thread-id", uuid::Uuid::new_v4().to_string())
-        .header("x-codex-installation-id", uuid::Uuid::new_v4().to_string())
-        .header("originator", "rho_gui")
-        .header("user-agent", "rho-gui")
-        .json(&body)
-        .send()
-        .await
-        .context("create realtime WebRTC call")?;
-    let status = response.status();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("read realtime call response")?
-    {
-        anyhow::ensure!(
-            bytes.len().saturating_add(chunk.len()) <= MAX_SDP_BYTES,
-            "realtime call response is too large"
-        );
-        bytes.extend_from_slice(&chunk);
-    }
-    if !status.is_success() {
-        let detail = serde_json::from_slice::<ApiErrorEnvelope>(&bytes)
-            .ok()
-            .map(|response| response.error.message)
-            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).chars().take(500).collect());
-        anyhow::bail!("realtime call creation failed with {status}: {detail}");
-    }
-    let answer = String::from_utf8(bytes).context("decode realtime SDP answer")?;
-    SdpAnswer::try_from(answer).context("provider returned an invalid SDP answer")
-}
-
-#[derive(Serialize)]
-struct CreateCallRequest {
-    sdp: String,
-    session: CreateCallSession,
-}
-
-#[derive(Serialize)]
-struct CreateCallSession {
-    model: RealtimeModel,
-    instructions: String,
-    audio: SessionAudio,
-    delegation: SessionDelegation,
-}
-
-#[derive(Serialize)]
-enum RealtimeModel {
-    #[serde(rename = "gpt-live-1-boulder-alpha")]
-    GptLive1BoulderAlpha,
-}
-
-#[derive(Serialize)]
-struct SessionAudio {
-    output: AudioOutput,
-}
-
-#[derive(Serialize)]
-struct AudioOutput {
-    voice: Voice,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Voice {
-    Cove,
-}
-
-#[derive(Serialize)]
-struct SessionDelegation {
-    #[serde(rename = "type")]
-    delegation_type: SessionDelegationType,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum SessionDelegationType {
-    Client,
-}
-
-#[derive(Deserialize)]
-struct ApiErrorEnvelope {
-    error: ApiError,
-}
-
-#[derive(Deserialize)]
-struct ApiError {
-    message: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegateRequest {
     pub id: DelegateRequestId,
     pub text: String,
+    /// Role-bearing conversation snapshot captured when delegation occurred.
+    pub transcript_delta: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,15 +93,104 @@ pub struct DelegateRequestId(String);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RealtimeEvent {
     DelegateRequest(DelegateRequest),
+    TranscriptDelta { role: TranscriptRole, delta: String },
+    TranscriptDone { role: TranscriptRole, text: String },
     Error(String),
     Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranscriptRole {
+    User,
+    Assistant,
+}
+
+#[derive(Default)]
+struct TranscriptState {
+    entries: Vec<(TranscriptRole, String)>,
+    open_role: Option<TranscriptRole>,
+}
+
+const MAX_TRANSCRIPT_CONTEXT_BYTES: usize = 16 * 1024;
+
+impl TranscriptState {
+    fn delta(&mut self, role: TranscriptRole, delta: &str) {
+        if self.open_role == Some(role)
+            && let Some((_, text)) = self.entries.last_mut()
+        {
+            text.push_str(delta);
+        } else {
+            self.entries.push((role, delta.to_owned()));
+            self.open_role = Some(role);
+        }
+        self.bound();
+    }
+
+    fn done(&mut self, role: TranscriptRole, text: &str) {
+        if self.open_role == Some(role)
+            && let Some((_, last_text)) = self.entries.last_mut()
+        {
+            *last_text = text.to_owned();
+        } else {
+            self.entries.push((role, text.to_owned()));
+        }
+        self.open_role = None;
+        self.bound();
+    }
+
+    fn take_snapshot(&mut self) -> String {
+        self.open_role = None;
+        std::mem::take(&mut self.entries)
+            .iter()
+            .map(|(role, text)| {
+                format!(
+                    "{}: {}",
+                    match role {
+                        TranscriptRole::User => "user",
+                        TranscriptRole::Assistant => "assistant",
+                    },
+                    text
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn take_tail(&mut self) -> Option<String> {
+        let tail = self.take_snapshot();
+        (!tail.trim().is_empty()).then_some(tail)
+    }
+
+    fn bound(&mut self) {
+        while self
+            .entries
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>()
+            > MAX_TRANSCRIPT_CONTEXT_BYTES
+            && self.entries.len() > 1
+        {
+            self.entries.remove(0);
+        }
+        if let Some((_, text)) = self.entries.first_mut()
+            && text.len() > MAX_TRANSCRIPT_CONTEXT_BYTES
+        {
+            let mut start = text.len() - MAX_TRANSCRIPT_CONTEXT_BYTES;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            *text = format!("…{}", &text[start..]);
+        }
+    }
 }
 
 pub struct RealtimeSession {
     peer: PeerConnection,
     data_channel: DataChannel,
     events: mpsc::Receiver<RealtimeEvent>,
+    transcript_events: mpsc::Receiver<RealtimeEvent>,
     microphone_task: tokio::task::JoinHandle<()>,
+    transcript: Arc<Mutex<TranscriptState>>,
     _output: MixerDeviceSink,
 }
 
@@ -357,6 +322,9 @@ impl RealtimeSession {
             .context("parse realtime SDP answer")?;
 
         let (event_tx, event_rx) = mpsc::channel(64);
+        let (transcript_tx, transcript_rx) = mpsc::channel(64);
+        let transcript = Arc::new(Mutex::new(TranscriptState::default()));
+        let provider_transcript = Arc::clone(&transcript);
         let provider_events = event_tx.clone();
         data_channel.on_message(Some(Box::new(move |message| {
             tracing::debug!(
@@ -382,11 +350,85 @@ impl RealtimeSession {
                     } else if text.is_empty() {
                         RealtimeEvent::Error("realtime delegation text is empty".to_owned())
                     } else {
+                        let transcript_delta = provider_transcript
+                            .lock()
+                            .map(|mut transcript| transcript.take_snapshot())
+                            .unwrap_or_default();
                         RealtimeEvent::DelegateRequest(DelegateRequest {
                             id: DelegateRequestId(item.id),
                             text,
+                            transcript_delta,
                         })
                     }
+                }
+                Ok(ProviderEvent::InputTranscriptDelta { delta })
+                | Ok(ProviderEvent::InputAudioTranscriptDelta { delta })
+                | Ok(ProviderEvent::InputTranscriptAdded {
+                    item: TranscriptItem { text: delta },
+                }) => {
+                    if let Ok(mut transcript) = provider_transcript.lock() {
+                        transcript.delta(TranscriptRole::User, &delta);
+                    }
+                    let event = RealtimeEvent::TranscriptDelta {
+                        role: TranscriptRole::User,
+                        delta,
+                    };
+                    let _ = transcript_tx.try_send(event);
+                    return;
+                }
+                Ok(ProviderEvent::InputTranscriptMarked { transcript: text })
+                | Ok(ProviderEvent::InputAudioTranscriptDone { transcript: text }) => {
+                    if let Ok(mut transcript) = provider_transcript.lock() {
+                        transcript.done(TranscriptRole::User, &text);
+                    }
+                    let event = RealtimeEvent::TranscriptDone {
+                        role: TranscriptRole::User,
+                        text,
+                    };
+                    let _ = transcript_tx.try_send(event);
+                    return;
+                }
+                Ok(ProviderEvent::OutputTranscriptDelta { delta })
+                | Ok(ProviderEvent::OutputTextDelta { delta })
+                | Ok(ProviderEvent::OutputAudioTranscriptDelta { delta })
+                | Ok(ProviderEvent::OutputTranscriptAdded {
+                    item: TranscriptItem { text: delta },
+                }) => {
+                    if let Ok(mut transcript) = provider_transcript.lock() {
+                        transcript.delta(TranscriptRole::Assistant, &delta);
+                    }
+                    let event = RealtimeEvent::TranscriptDelta {
+                        role: TranscriptRole::Assistant,
+                        delta,
+                    };
+                    let _ = transcript_tx.try_send(event);
+                    return;
+                }
+                Ok(ProviderEvent::OutputTextDone { text })
+                | Ok(ProviderEvent::OutputAudioTranscriptDone { transcript: text }) => {
+                    if let Ok(mut transcript) = provider_transcript.lock() {
+                        transcript.done(TranscriptRole::Assistant, &text);
+                    }
+                    let event = RealtimeEvent::TranscriptDone {
+                        role: TranscriptRole::Assistant,
+                        text,
+                    };
+                    let _ = transcript_tx.try_send(event);
+                    return;
+                }
+                Ok(ProviderEvent::TurnDone { turn }) => {
+                    let role = match turn.role {
+                        TranscriptRoleWire::User => TranscriptRole::User,
+                        TranscriptRoleWire::Assistant => TranscriptRole::Assistant,
+                    };
+                    if let Ok(mut transcript) = provider_transcript.lock() {
+                        transcript.done(role, &turn.transcript);
+                    }
+                    let _ = transcript_tx.try_send(RealtimeEvent::TranscriptDone {
+                        role,
+                        text: turn.transcript,
+                    });
+                    return;
                 }
                 Ok(ProviderEvent::Error { message, error }) => {
                     let (message, code) = match error {
@@ -461,13 +503,19 @@ impl RealtimeSession {
             peer,
             data_channel,
             events: event_rx,
+            transcript_events: transcript_rx,
             microphone_task,
+            transcript,
             _output: output,
         })
     }
 
     pub async fn next_event(&mut self) -> Option<RealtimeEvent> {
-        self.events.recv().await
+        tokio::select! {
+            biased;
+            event = self.events.recv() => event,
+            event = self.transcript_events.recv() => event,
+        }
     }
 
     pub async fn resolve_delegate(
@@ -475,10 +523,23 @@ impl RealtimeSession {
         request_id: DelegateRequestId,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.resolve_delegate_chunk(request_id, DelegateResponseChannel::Speakable, text)
+            .await
+    }
+
+    pub async fn resolve_delegate_chunk(
+        &self,
+        request_id: DelegateRequestId,
+        channel: DelegateResponseChannel,
+        text: &str,
+    ) -> anyhow::Result<()> {
         for chunk in utf8_chunks(text, CONTEXT_APPEND_MAX_BYTES) {
             let command = ProviderCommand::DelegationContextAppend {
                 delegation_item_id: request_id.0.clone(),
-                channel: DelegationChannel::Speakable,
+                channel: match channel {
+                    DelegateResponseChannel::Commentary => DelegationChannel::Commentary,
+                    DelegateResponseChannel::Speakable => DelegationChannel::Speakable,
+                },
                 content: vec![ProviderCommandContent::InputText {
                     text: chunk.to_owned(),
                 }],
@@ -487,6 +548,19 @@ impl RealtimeSession {
         }
         Ok(())
     }
+
+    pub fn take_transcript_tail(&self) -> Option<String> {
+        self.transcript
+            .lock()
+            .ok()
+            .and_then(|mut transcript| transcript.take_tail())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelegateResponseChannel {
+    Commentary,
+    Speakable,
 }
 
 impl Drop for RealtimeSession {
@@ -502,6 +576,30 @@ impl Drop for RealtimeSession {
 enum ProviderEvent {
     #[serde(rename = "delegation.created")]
     DelegationCreated { item: DelegationItem },
+    #[serde(rename = "conversation.input_transcript.delta")]
+    InputTranscriptDelta { delta: String },
+    #[serde(rename = "conversation.item.input_audio_transcription.delta")]
+    InputAudioTranscriptDelta { delta: String },
+    #[serde(rename = "conversation.input_transcript.turn_marked")]
+    InputTranscriptMarked { transcript: String },
+    #[serde(rename = "conversation.item.input_audio_transcription.completed")]
+    InputAudioTranscriptDone { transcript: String },
+    #[serde(rename = "input_transcript.added")]
+    InputTranscriptAdded { item: TranscriptItem },
+    #[serde(rename = "conversation.output_transcript.delta")]
+    OutputTranscriptDelta { delta: String },
+    #[serde(rename = "response.output_text.delta")]
+    OutputTextDelta { delta: String },
+    #[serde(rename = "response.output_audio_transcript.delta")]
+    OutputAudioTranscriptDelta { delta: String },
+    #[serde(rename = "response.output_text.done")]
+    OutputTextDone { text: String },
+    #[serde(rename = "response.output_audio_transcript.done")]
+    OutputAudioTranscriptDone { transcript: String },
+    #[serde(rename = "output_transcript.added")]
+    OutputTranscriptAdded { item: TranscriptItem },
+    #[serde(rename = "turn.done")]
+    TurnDone { turn: TranscriptTurn },
     #[serde(rename = "error")]
     Error {
         #[serde(default)]
@@ -511,6 +609,24 @@ enum ProviderEvent {
     },
     #[serde(other)]
     Other,
+}
+
+#[derive(Deserialize)]
+struct TranscriptItem {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct TranscriptTurn {
+    role: TranscriptRoleWire,
+    transcript: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TranscriptRoleWire {
+    User,
+    Assistant,
 }
 
 #[derive(Deserialize)]
@@ -581,6 +697,7 @@ impl ProviderCommand {
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DelegationChannel {
+    Commentary,
     Speakable,
 }
 
@@ -771,6 +888,59 @@ mod tests {
                 ..
             } if code == "bad_audio" && message == "Invalid audio"
         ));
+    }
+
+    #[test]
+    fn frameless_transcript_chunks_and_turn_completion_decode() {
+        let added = ProviderEvent::from_json(
+            br#"{"type":"input_transcript.added","item":{"text":"hello "}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            added,
+            ProviderEvent::InputTranscriptAdded {
+                item: TranscriptItem { text }
+            } if text == "hello "
+        ));
+        let done = ProviderEvent::from_json(
+            br#"{"type":"turn.done","turn":{"role":"user","transcript":"hello world"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            done,
+            ProviderEvent::TurnDone {
+                turn: TranscriptTurn {
+                    role: TranscriptRoleWire::User,
+                    transcript
+                }
+            } if transcript == "hello world"
+        ));
+    }
+
+    #[test]
+    fn transcript_snapshots_are_incremental_and_preserve_turn_boundaries() {
+        let mut transcript = TranscriptState::default();
+        transcript.delta(TranscriptRole::User, "hello ");
+        transcript.delta(TranscriptRole::User, "world");
+        transcript.done(TranscriptRole::User, "hello world");
+        transcript.delta(TranscriptRole::User, "second turn");
+        assert_eq!(
+            transcript.take_snapshot(),
+            "user: hello world\nuser: second turn"
+        );
+        assert_eq!(transcript.take_snapshot(), "");
+        transcript.delta(TranscriptRole::Assistant, "done");
+        assert_eq!(transcript.take_tail().as_deref(), Some("assistant: done"));
+    }
+
+    #[test]
+    fn transcript_context_is_bounded() {
+        let mut transcript = TranscriptState::default();
+        transcript.delta(
+            TranscriptRole::User,
+            &"x".repeat(MAX_TRANSCRIPT_CONTEXT_BYTES * 2),
+        );
+        assert!(transcript.take_snapshot().len() <= MAX_TRANSCRIPT_CONTEXT_BYTES + 16);
     }
 
     #[test]

@@ -44,6 +44,7 @@ const DRAFT_TEXT_KEY: HighlightKey =
 /// following their key, not their line number.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LineKey {
+    Iris,
     Group(String),
     Stream(WorkstreamId),
     Agent(AgentId),
@@ -65,6 +66,8 @@ struct FoldSpec {
 /// dashboard command.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowTarget {
+    /// The client-local Iris voice surface.
+    Iris,
     /// Group headers and other inert lines.
     None,
     Stream {
@@ -292,7 +295,7 @@ impl Dashboard {
             .expanded_folds
             .lock()
             .map_or_else(|_| HashSet::new(), |expanded| expanded.clone());
-        let mut lines = visible_lines(generate(registry), &expanded);
+        let mut lines = visible_lines(generate_dashboard(registry), &expanded);
         for line in &mut lines {
             if line
                 .fold
@@ -933,6 +936,12 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
     lines
 }
 
+fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
+    let mut iris = Line::new(LineKey::Iris, RowTarget::Iris);
+    iris.text.push_str("iris · listening");
+    std::iter::once(iris).chain(generate(registry)).collect()
+}
+
 fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
     let hidden = lines
         .iter()
@@ -1190,6 +1199,19 @@ mod tests {
                 } => format!("fold({folded_count},{expanded})"),
             })
             .collect()
+    }
+
+    #[test]
+    fn iris_is_the_first_dashboard_target() {
+        let topic = topic(Status::Normal, vec![agent(1, Status::Normal, 10)]);
+        let mut registry = AgentRegistry::default();
+        install(&mut registry, &topic);
+
+        let lines = generate_dashboard(&registry);
+        assert_eq!(lines[0].key, LineKey::Iris);
+        assert_eq!(lines[0].text, "iris · listening");
+        assert_eq!(lines[0].target, RowTarget::Iris);
+        assert!(matches!(lines[1].target, RowTarget::Stream { .. }));
     }
 
     fn split_agents<'a>(

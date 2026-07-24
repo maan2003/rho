@@ -25,9 +25,8 @@ pub fn hello(
     agents: &[UiAgentSummary],
     projects: &[UiProject],
 ) -> ToBrowser {
-    let agent_hidden = |agent: &UiAgentSummary| {
-        agent.hidden || agent.labels.iter().any(|label| label == "hide")
-    };
+    let agent_hidden =
+        |agent: &UiAgentSummary| agent.hidden || agent.labels.iter().any(|label| label == "hide");
     ToBrowser::Hello {
         topics: workstreams
             .iter()
@@ -175,6 +174,7 @@ fn truncate(mut text: String, limit: usize) -> String {
 fn role_label(config: AgentRole) -> &'static str {
     match config {
         AgentRole::PM | AgentRole::WorkflowPM { .. } => "pm",
+        AgentRole::Iris => "iris",
         AgentRole::Advisor {
             intelligence: rho_ui_proto::AdvisorIntelligence::Medium,
         } => "advisor",

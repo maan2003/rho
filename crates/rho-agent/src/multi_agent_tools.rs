@@ -143,6 +143,7 @@ pub fn agent_tool_specs(role: AgentRole) -> Vec<ToolSpec> {
             interrupt_engineer_spec(),
         ],
         AgentRole::Advisor { .. } => vec![message_agent_spec(), wait_spec()],
+        AgentRole::Iris => Vec::new(),
     }
 }
 
