@@ -41,7 +41,8 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "d93b71e4";
+const CURRENT_AGENT_DB_FORMAT: &str = "f3b7fb40";
+const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
     from: &'static str,
@@ -67,6 +68,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         from: "a61e39c4",
         to: "d93b71e4",
         migrate: rebuild_global_agent_usage,
+    },
+    AgentDbMigration {
+        from: "d93b71e4",
+        to: "f3b7fb40",
+        migrate: compact_quota_observations,
     },
 ];
 
@@ -224,6 +230,37 @@ fn rebuild_global_agent_usage(write: &mut WriteTxn) {
         if let Some(provider) = providers.get(&key.agent_id) {
             add_global_agent_usage(write, *provider, &bucket);
         }
+    }
+}
+
+fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservationRecord) -> bool {
+    old.provider == new.provider
+        && old.model == new.model
+        && old.used_percent == new.used_percent
+        && match (old.reset_at_unix, new.reset_at_unix) {
+            (Some(old), Some(new)) => old.abs_diff(new) <= QUOTA_RESET_JITTER_SECONDS,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn compact_quota_observations(write: &mut WriteTxn) {
+    let mut previous = None;
+    let mut redundant = Vec::new();
+    let mut observations = write.open_table(QUOTA_OBSERVATIONS);
+    for (key, value) in observations.iter() {
+        let observation = value.value().into_owned();
+        if previous
+            .as_ref()
+            .is_some_and(|old| quota_observation_unchanged(old, &observation))
+        {
+            redundant.push(key.value());
+        } else {
+            previous = Some(observation);
+        }
+    }
+    for key in redundant {
+        observations.remove(&key);
     }
 }
 
@@ -1574,11 +1611,7 @@ impl AgentWriteTxnExt for WriteTxn {
             )
             .next_back()
             .map(|(_, value)| value.value().into_owned())
-            .is_some_and(|old| {
-                old.provider == observation.provider
-                    && old.used_percent == observation.used_percent
-                    && old.reset_at_unix == observation.reset_at_unix
-            });
+            .is_some_and(|old| quota_observation_unchanged(&old, &observation));
         if unchanged {
             return false;
         }

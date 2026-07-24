@@ -157,6 +157,16 @@ async fn quota_history_deduplicates_unchanged_samples() {
         observed_at: UnixMs(2),
         ..sample.clone()
     }));
+    assert!(!write.record_quota_observation(QuotaObservationRecord {
+        observed_at: UnixMs(2),
+        reset_at_unix: Some(101),
+        ..sample.clone()
+    }));
+    assert!(!write.record_quota_observation(QuotaObservationRecord {
+        observed_at: UnixMs(2),
+        reset_at_unix: Some(99),
+        ..sample.clone()
+    }));
     assert!(write.record_quota_observation(QuotaObservationRecord {
         observed_at: UnixMs(3),
         used_percent: 21,
@@ -487,6 +497,58 @@ fn agent_db_migrations_eventually_reach_current_format() {
             format = next.to;
         }
     }
+}
+
+#[tokio::test]
+async fn quota_observation_migration_compacts_reset_jitter() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.open_table(FORMAT).insert(&(), &"d93b71e4".to_owned());
+    let mut observations = write.open_table(QUOTA_OBSERVATIONS);
+    for (observed_at, used_percent, reset_at_unix) in [
+        (1, 20, 100),
+        (2, 20, 101),
+        (3, 20, 99),
+        (4, 21, 99),
+        (5, 21, 500),
+    ] {
+        let record = QuotaObservationRecord {
+            provider: QuotaProvider::ChatGpt,
+            model: QuotaModel::GPT,
+            observed_at: UnixMs(observed_at),
+            used_percent,
+            reset_at_unix: Some(reset_at_unix),
+        };
+        observations.insert(
+            &QuotaObservationKey {
+                model: record.model,
+                observed_at,
+            },
+            SenValue::borrowed(&record),
+        );
+    }
+    drop(observations);
+
+    write.init_agent_tables();
+    write.commit();
+
+    let history = db.read().quota_observations(QuotaModel::GPT, UnixMs(0));
+    assert_eq!(
+        history
+            .iter()
+            .map(|sample| (
+                sample.observed_at,
+                sample.used_percent,
+                sample.reset_at_unix
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (UnixMs(1), 20, Some(100)),
+            (UnixMs(4), 21, Some(99)),
+            (UnixMs(5), 21, Some(500)),
+        ]
+    );
 }
 
 #[test]
