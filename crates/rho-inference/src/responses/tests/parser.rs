@@ -100,6 +100,7 @@ fn streaming_parser_emits_context_item_events() {
         Some(TokenUsage {
             input_tokens: 2,
             cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
             output_tokens: 3,
         })
     );
@@ -190,6 +191,7 @@ fn captures_response_id_and_usage() {
         Some(TokenUsage {
             input_tokens: 10,
             cached_input_tokens: 4,
+            cache_write_input_tokens: 0,
             output_tokens: 7,
         })
     );

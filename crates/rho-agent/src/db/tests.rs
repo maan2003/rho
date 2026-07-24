@@ -9,6 +9,98 @@ use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 use super::*;
 
 #[tokio::test]
+async fn agent_usage_accumulates_in_five_minute_buckets() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = write.alloc_agent_id();
+    let first = AgentUsageBucket {
+        bucket_start_ms: AGENT_USAGE_BUCKET_MS,
+        input_tokens: 10,
+        cache_read_tokens: 20,
+        cache_write_tokens: 30,
+        output_tokens: 40,
+        requests: 1,
+        approximate: false,
+    };
+    write.add_agent_usage(agent_id, &first);
+    write.add_agent_usage(agent_id, &first);
+    write.commit();
+
+    let read = db.read();
+    let buckets = read.agent_usage(agent_id, UnixMs(0));
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].input_tokens, 20);
+    assert_eq!(buckets[0].requests, 2);
+    assert_eq!(read.agent_usage_total(agent_id).output_tokens, 80);
+}
+
+#[tokio::test]
+async fn native_usage_backfill_reads_completed_debug_responses() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let prompt_cache_key = PromptCacheKey::generate();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let workstream = write.create_workstream(UnixMs(1), "usage".to_owned());
+    let agent_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        agent_id,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        AgentRuntime::Rho { prompt_cache_key },
+        None,
+    );
+    write.commit();
+
+    let debug_dir = temp.path().join("debug");
+    std::fs::create_dir(&debug_dir).unwrap();
+    std::fs::write(
+        debug_dir.join(format!(
+            "{}-0001-response.json",
+            prompt_cache_key.debug_file_stem()
+        )),
+        serde_json::to_vec(&serde_json::json!({
+            "raw_events": [{
+                "type": "response.completed",
+                "response": {"usage": {
+                    "input_tokens": 100,
+                    "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 10},
+                    "output_tokens": 20
+                }}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut write = db.write().await;
+    write.open_table(FORMAT).insert(&(), &"f12a7c9d".to_owned());
+    write.commit();
+    prepare_agent_db_migration_with_debug_dir(&db, Some(debug_dir)).await;
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(
+        read.open_table(FORMAT).get(&()).unwrap().value(),
+        CURRENT_AGENT_DB_FORMAT
+    );
+    let buckets = read.agent_usage(agent_id, UnixMs(0));
+    let bucket = buckets.first().unwrap();
+    assert_eq!(bucket.input_tokens, 30);
+    assert_eq!(bucket.cache_read_tokens, 60);
+    assert_eq!(bucket.cache_write_tokens, 10);
+    assert_eq!(bucket.output_tokens, 20);
+    assert_eq!(bucket.requests, 1);
+}
+
+#[tokio::test]
 async fn quota_history_deduplicates_unchanged_samples() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -44,18 +136,14 @@ async fn quota_history_deduplicates_unchanged_samples() {
     }));
     write.commit();
 
-    let history = db
-        .read()
-        .quota_observations(QuotaModel::GPT, UnixMs(0));
+    let history = db.read().quota_observations(QuotaModel::GPT, UnixMs(0));
     assert_eq!(history.len(), 3);
     assert_eq!(history[0].used_percent, 20);
     assert_eq!(history[2].used_percent, 22);
 
     // A bounded reverse read returns only the horizon and one baseline,
     // without crossing into another model's key range.
-    let recent = db
-        .read()
-        .quota_observations(QuotaModel::GPT, UnixMs(4));
+    let recent = db.read().quota_observations(QuotaModel::GPT, UnixMs(4));
     assert_eq!(
         recent
             .iter()

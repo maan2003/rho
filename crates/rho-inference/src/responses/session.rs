@@ -63,7 +63,7 @@ impl PromptCacheKey {
         uuid::Uuid::from_bytes(bytes)
     }
 
-    fn debug_file_stem(self) -> String {
+    pub fn debug_file_stem(self) -> String {
         let mut stem = String::with_capacity(self.0.len() * 2);
         for byte in self.0 {
             use std::fmt::Write as _;

@@ -32,10 +32,14 @@ const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::n
 const VIEW_CONFIG: TableDefinition<(), Vec<u8>> = TableDefinition::new("view_config");
 const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
     TableDefinition::new("quota_observations_by_model_time");
+const AGENT_USAGE_BUCKETS: TableDefinition<AgentUsageKey, Sen<AgentUsageBucket>> =
+    TableDefinition::new("agent_usage_by_agent_time");
+const AGENT_USAGE_TOTALS: TableDefinition<AgentId, Sen<AgentUsageBucket>> =
+    TableDefinition::new("agent_usage_totals");
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "f12a7c9d";
+const CURRENT_AGENT_DB_FORMAT: &str = "a61e39c4";
 
 struct AgentDbMigration {
     from: &'static str,
@@ -51,7 +55,11 @@ pub struct MigrationRecoveryPoint {
     pub created_at: UnixMillis,
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "f12a7c9d",
+    to: "a61e39c4",
+    migrate: |_| {},
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -64,9 +72,7 @@ impl CounterKey {
     pub const LAST_WORKSTREAM_ID: Self = Self(3);
 }
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue, Encode, Decode,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue, Encode, Decode)]
 pub struct QuotaModel(u8);
 
 impl QuotaModel {
@@ -101,6 +107,41 @@ pub struct QuotaObservationRecord {
     pub observed_at: UnixMillis,
     pub used_percent: u8,
     pub reset_at_unix: Option<i64>,
+}
+
+pub const AGENT_USAGE_BUCKET_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
+struct AgentUsageKey {
+    agent_id: AgentId,
+    bucket_start_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct AgentUsageBucket {
+    pub bucket_start_ms: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub requests: u64,
+    #[senax(default)]
+    pub approximate: bool,
+}
+
+impl AgentUsageBucket {
+    pub fn add(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.requests = self.requests.saturating_add(other.requests);
+        self.approximate |= other.approximate;
+    }
 }
 
 pub use rho_core::{AgentId, AgentIdDomain};
@@ -212,6 +253,14 @@ pub fn migration_recovery_point(db: &rho_db::RhoDb) -> Option<MigrationRecoveryP
 }
 
 pub async fn prepare_agent_db_migration(db: &rho_db::RhoDb) {
+    let debug_dir = dirs::state_dir().map(|dir| dir.join("rho/debug/provider-requests"));
+    prepare_agent_db_migration_with_debug_dir(db, debug_dir).await;
+}
+
+async fn prepare_agent_db_migration_with_debug_dir(
+    db: &rho_db::RhoDb,
+    debug_dir: Option<std::path::PathBuf>,
+) {
     let from_format = {
         let read = db.read();
         read.has_table("format")
@@ -226,23 +275,197 @@ pub async fn prepare_agent_db_migration(db: &rho_db::RhoDb) {
     let Some(from_format) = from_format else {
         return;
     };
-    if migration_recovery_point(db).is_some_and(|point| {
+    let recovery_ready = migration_recovery_point(db).is_some_and(|point| {
         point.from_format == from_format && point.to_format == CURRENT_AGENT_DB_FORMAT
-    }) {
-        return;
+    });
+    if !recovery_ready {
+        db.persistent_savepoint(|write, savepoint_id| {
+            let point = MigrationRecoveryPoint {
+                savepoint_id,
+                from_format: from_format.clone(),
+                to_format: CURRENT_AGENT_DB_FORMAT.to_owned(),
+                created_at: UnixMillis::now(),
+            };
+            write
+                .open_table(MIGRATION_RECOVERY)
+                .insert(&(), SenValue::borrowed(&point));
+        })
+        .await;
     }
-    db.persistent_savepoint(|write, savepoint_id| {
-        let point = MigrationRecoveryPoint {
-            savepoint_id,
-            from_format,
-            to_format: CURRENT_AGENT_DB_FORMAT.to_owned(),
-            created_at: UnixMillis::now(),
-        };
-        write
-            .open_table(MIGRATION_RECOVERY)
-            .insert(&(), SenValue::borrowed(&point));
-    })
+    if from_format == "f12a7c9d" {
+        eprintln!("rho-agent: backfilling per-agent token usage");
+        let buckets = backfill_agent_usage(db, debug_dir).await;
+        eprintln!(
+            "rho-agent: writing {} five-minute token-usage buckets",
+            buckets.len()
+        );
+        let mut write = db.write().await;
+        write.replace_agent_usage(&buckets);
+        write.commit();
+    }
+}
+
+async fn backfill_agent_usage(
+    db: &rho_db::RhoDb,
+    debug_dir: Option<std::path::PathBuf>,
+) -> std::collections::HashMap<(AgentId, u64), AgentUsageBucket> {
+    use futures::StreamExt as _;
+
+    let agents = db.read().list_agents();
+    let mut prompt_keys = std::collections::HashMap::<String, Vec<AgentId>>::new();
+    let mut claude_sessions = Vec::new();
+    for (agent_id, record) in agents {
+        match record.runtime {
+            AgentRuntime::Rho { prompt_cache_key } => prompt_keys
+                .entry(prompt_cache_key.debug_file_stem())
+                .or_default()
+                .push(agent_id),
+            AgentRuntime::Claude { session_id } => claude_sessions.push((
+                agent_id,
+                session_id,
+                record.primary_workdir().repo().to_owned(),
+            )),
+        }
+    }
+    let prompt_keys = prompt_keys
+        .into_iter()
+        .filter_map(|(key, agents)| (agents.len() == 1).then_some((key, agents[0])))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut paths = Vec::new();
+    if let Some(dir) = debug_dir
+        && let Ok(mut entries) = tokio::fs::read_dir(dir).await
+    {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with("-response.json")
+                && name
+                    .get(..16)
+                    .is_some_and(|prefix| prompt_keys.contains_key(prefix))
+            {
+                paths.push(entry.path());
+            }
+        }
+    }
+
+    let native = futures::stream::iter(paths.into_iter().map(|path| {
+        let prompt_keys = &prompt_keys;
+        async move {
+            let name = path.file_name()?.to_string_lossy();
+            let agent_id = *prompt_keys.get(name.get(..16)?)?;
+            let bytes = tokio::fs::read(&path).await.ok()?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let response = value["raw_events"]
+                .as_array()?
+                .iter()
+                .rev()
+                .find(|event| event["type"] == "response.completed")?
+                .get("response")?;
+            let usage = response.get("usage")?;
+            let input = usage["input_tokens"].as_u64()?;
+            let cache_read = usage["input_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0);
+            let cache_write = usage["input_tokens_details"]["cache_write_tokens"]
+                .as_u64()
+                .unwrap_or(0);
+            let completed_at: u64 = tokio::fs::metadata(&path)
+                .await
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis()
+                .try_into()
+                .ok()?;
+            Some((
+                agent_id,
+                AgentUsageBucket {
+                    bucket_start_ms: completed_at / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS,
+                    input_tokens: input.saturating_sub(cache_read).saturating_sub(cache_write),
+                    cache_read_tokens: cache_read,
+                    cache_write_tokens: cache_write,
+                    output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+                    requests: 1,
+                    approximate: false,
+                },
+            ))
+        }
+    }))
+    .buffer_unordered(32)
+    .filter_map(async move |value| value)
+    .collect::<Vec<_>>()
     .await;
+
+    let claude = futures::stream::iter(claude_sessions.into_iter().map(
+        |(agent_id, session_id, repo)| async move {
+            let messages = rho_claude::read_session_messages_by_id(
+                session_id,
+                &repo,
+                rho_claude::SessionMessagesOptions::default(),
+            )
+            .await
+            .ok()?;
+            Some((agent_id, messages))
+        },
+    ))
+    .buffer_unordered(16)
+    .filter_map(async move |value| value)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut buckets = std::collections::HashMap::<(AgentId, u64), AgentUsageBucket>::new();
+    for (agent_id, bucket) in native {
+        buckets
+            .entry((agent_id, bucket.bucket_start_ms))
+            .or_insert_with(|| AgentUsageBucket {
+                bucket_start_ms: bucket.bucket_start_ms,
+                ..AgentUsageBucket::default()
+            })
+            .add(&bucket);
+    }
+    for (agent_id, messages) in claude {
+        for message in messages {
+            if message.kind != rho_claude::SessionMessageKind::Assistant {
+                continue;
+            }
+            let Some(timestamp) = message.timestamp.as_deref().and_then(parse_rfc3339_millis)
+            else {
+                continue;
+            };
+            let Ok(usage) = serde_json::from_value::<rho_claude::protocol::TokenUsage>(
+                message.message.get("usage").cloned().unwrap_or_default(),
+            ) else {
+                continue;
+            };
+            let bucket_start_ms = timestamp / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS;
+            let bucket = AgentUsageBucket {
+                bucket_start_ms,
+                input_tokens: usage.input_tokens.unwrap_or(0),
+                cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                output_tokens: usage.output_tokens.unwrap_or(0),
+                requests: 1,
+                approximate: true,
+            };
+            buckets
+                .entry((agent_id, bucket_start_ms))
+                .or_insert_with(|| AgentUsageBucket {
+                    bucket_start_ms,
+                    ..AgentUsageBucket::default()
+                })
+                .add(&bucket);
+        }
+    }
+    buckets
+}
+
+fn parse_rfc3339_millis(timestamp: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()?
+        .timestamp_millis()
+        .try_into()
+        .ok()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -667,12 +890,15 @@ pub trait AgentReadTxnExt {
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
-    /// Samples for one model, bounded to the horizon plus its preceding baseline.
+    /// Samples for one model, bounded to the horizon plus its preceding
+    /// baseline.
     fn quota_observations(
         &self,
         model: QuotaModel,
         since: UnixMillis,
     ) -> Vec<QuotaObservationRecord>;
+    fn agent_usage(&self, agent_id: AgentId, since: UnixMillis) -> Vec<AgentUsageBucket>;
+    fn agent_usage_total(&self, agent_id: AgentId) -> AgentUsageBucket;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -745,6 +971,11 @@ pub trait AgentWriteTxnExt {
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
     /// Records a changed whole-percentage weekly quota sample.
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool;
+    fn add_agent_usage(&mut self, agent_id: AgentId, bucket: &AgentUsageBucket);
+    fn replace_agent_usage(
+        &mut self,
+        buckets: &std::collections::HashMap<(AgentId, u64), AgentUsageBucket>,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -957,6 +1188,28 @@ impl AgentReadTxnExt for ReadTxn {
         observations.reverse();
         observations
     }
+
+    fn agent_usage(&self, agent_id: AgentId, since: UnixMillis) -> Vec<AgentUsageBucket> {
+        self.open_table(AGENT_USAGE_BUCKETS)
+            .range(
+                AgentUsageKey {
+                    agent_id,
+                    bucket_start_ms: since.0,
+                }..=AgentUsageKey {
+                    agent_id,
+                    bucket_start_ms: u64::MAX,
+                },
+            )
+            .map(|(_, value)| value.value().into_owned())
+            .collect()
+    }
+
+    fn agent_usage_total(&self, agent_id: AgentId) -> AgentUsageBucket {
+        self.open_table(AGENT_USAGE_TOTALS)
+            .get(&agent_id)
+            .map(|value| value.value().into_owned())
+            .unwrap_or_default()
+    }
 }
 
 impl AgentWriteTxnExt for WriteTxn {
@@ -974,6 +1227,8 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(PROJECTS);
         self.open_table(VIEW_CONFIG);
         self.open_table(QUOTA_OBSERVATIONS);
+        self.open_table(AGENT_USAGE_BUCKETS);
+        self.open_table(AGENT_USAGE_TOTALS);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
@@ -1230,6 +1485,74 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(QUOTA_OBSERVATIONS)
             .insert(&key, SenValue::borrowed(&observation));
         true
+    }
+
+    fn add_agent_usage(&mut self, agent_id: AgentId, bucket: &AgentUsageBucket) {
+        let key = AgentUsageKey {
+            agent_id,
+            bucket_start_ms: bucket.bucket_start_ms,
+        };
+        let mut buckets = self.open_table(AGENT_USAGE_BUCKETS);
+        let mut merged = buckets
+            .get(&key)
+            .map(|value| value.value().into_owned())
+            .unwrap_or_else(|| AgentUsageBucket {
+                bucket_start_ms: bucket.bucket_start_ms,
+                ..AgentUsageBucket::default()
+            });
+        merged.add(bucket);
+        buckets.insert(&key, SenValue::borrowed(&merged));
+        drop(buckets);
+
+        let mut totals = self.open_table(AGENT_USAGE_TOTALS);
+        let mut total = totals
+            .get(&agent_id)
+            .map(|value| value.value().into_owned())
+            .unwrap_or_default();
+        total.add(bucket);
+        total.bucket_start_ms = 0;
+        totals.insert(&agent_id, SenValue::borrowed(&total));
+    }
+
+    fn replace_agent_usage(
+        &mut self,
+        replacement: &std::collections::HashMap<(AgentId, u64), AgentUsageBucket>,
+    ) {
+        let mut buckets = self.open_table(AGENT_USAGE_BUCKETS);
+        let old_keys = buckets
+            .iter()
+            .map(|(key, _)| key.value())
+            .collect::<Vec<_>>();
+        for key in old_keys {
+            buckets.remove(&key);
+        }
+        for ((agent_id, bucket_start_ms), bucket) in replacement {
+            buckets.insert(
+                &AgentUsageKey {
+                    agent_id: *agent_id,
+                    bucket_start_ms: *bucket_start_ms,
+                },
+                SenValue::borrowed(bucket),
+            );
+        }
+        drop(buckets);
+
+        let mut by_agent = std::collections::HashMap::<AgentId, AgentUsageBucket>::new();
+        for ((agent_id, _), bucket) in replacement {
+            by_agent.entry(*agent_id).or_default().add(bucket);
+        }
+        let mut totals = self.open_table(AGENT_USAGE_TOTALS);
+        let old_agents = totals
+            .iter()
+            .map(|(key, _)| key.value())
+            .collect::<Vec<_>>();
+        for agent_id in old_agents {
+            totals.remove(&agent_id);
+        }
+        for (agent_id, mut total) in by_agent {
+            total.bucket_start_ms = 0;
+            totals.insert(&agent_id, SenValue::borrowed(&total));
+        }
     }
 }
 

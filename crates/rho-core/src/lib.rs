@@ -491,6 +491,7 @@ pub enum InferenceEvent {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
 }
 

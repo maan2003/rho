@@ -1472,6 +1472,25 @@ impl AgentLoop {
                                     context_used,
                                 })
                                 .await;
+                                if let Some(usage) = &usage
+                                    && let Some(pool) = self.pool_events.upgrade()
+                                {
+                                    pool.record_agent_usage(
+                                        self.persistence.agent_id,
+                                        db::AgentUsageBucket {
+                                            input_tokens: usage
+                                                .input_tokens
+                                                .saturating_sub(usage.cached_input_tokens)
+                                                .saturating_sub(usage.cache_write_input_tokens),
+                                            cache_read_tokens: usage.cached_input_tokens,
+                                            cache_write_tokens: usage.cache_write_input_tokens,
+                                            output_tokens: usage.output_tokens,
+                                            requests: 1,
+                                            ..db::AgentUsageBucket::default()
+                                        },
+                                    )
+                                    .await;
+                                }
                                 state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
                                     items,
                                     provider_response_id,

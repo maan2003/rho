@@ -18,9 +18,9 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
 use crate::db::{
-    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWorkflow,
-    AgentWriteTxnExt as _, EngineerIntelligence, InferenceModel, InferenceProfile, SessionBinding,
-    WorkstreamId,
+    AGENT_USAGE_BUCKET_MS, AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole,
+    AgentRuntime, AgentUsageBucket, AgentWorkflow, AgentWriteTxnExt as _, EngineerIntelligence,
+    InferenceModel, InferenceProfile, SessionBinding, WorkstreamId,
 };
 use crate::lazy::Lazy;
 use crate::{
@@ -50,6 +50,7 @@ pub struct AgentPool {
     completed_turns: broadcast::Sender<AgentTurnCompleted>,
     /// Fires after a user input has been durably accepted into an agent log.
     accepted_inputs: broadcast::Sender<AgentInputAccepted>,
+    usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
     tool_extension_provider: std::sync::RwLock<Option<Arc<dyn AgentToolExtensionProvider>>>,
 }
 
@@ -114,7 +115,7 @@ impl AgentPool {
         let mut write = db.write().await;
         write.init_agent_tables();
         write.commit();
-        Arc::new(Self {
+        let pool = Arc::new(Self {
             db,
             auth,
             path_overrides,
@@ -124,8 +125,23 @@ impl AgentPool {
             created: broadcast::channel(64).0,
             completed_turns: broadcast::channel(64).0,
             accepted_inputs: broadcast::channel(64).0,
+            usage: Mutex::new(HashMap::new()),
             tool_extension_provider: std::sync::RwLock::new(None),
-        })
+        });
+        let weak = Arc::downgrade(&pool);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(AGENT_USAGE_BUCKET_MS));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(pool) = weak.upgrade() else {
+                    break;
+                };
+                pool.flush_agent_usage(None).await;
+            }
+        });
+        pool
     }
 
     pub fn set_tool_extension_provider(&self, provider: Arc<dyn AgentToolExtensionProvider>) {
@@ -162,6 +178,41 @@ impl AgentPool {
 
     pub fn db(&self) -> &RhoDb {
         &self.db
+    }
+
+    pub async fn record_agent_usage(&self, agent_id: AgentId, mut usage: AgentUsageBucket) {
+        let now = rho_core::UnixMs::now().0;
+        usage.bucket_start_ms = now / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS;
+        let mut pending = self.usage.lock().await;
+        pending
+            .entry((agent_id, usage.bucket_start_ms))
+            .or_insert_with(|| AgentUsageBucket {
+                bucket_start_ms: usage.bucket_start_ms,
+                ..AgentUsageBucket::default()
+            })
+            .add(&usage);
+    }
+
+    pub async fn flush_agent_usage(&self, only: Option<AgentId>) {
+        let drained = {
+            let mut pending = self.usage.lock().await;
+            let keys = pending
+                .keys()
+                .filter(|(agent_id, _)| only.is_none_or(|only| only == *agent_id))
+                .copied()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| pending.remove(&key).map(|usage| (key.0, usage)))
+                .collect::<Vec<_>>()
+        };
+        if drained.is_empty() {
+            return;
+        }
+        let mut write = self.db.write().await;
+        for (agent_id, usage) in &drained {
+            write.add_agent_usage(*agent_id, usage);
+        }
+        write.commit();
     }
 
     pub fn auth(&self) -> &InferenceAuth {

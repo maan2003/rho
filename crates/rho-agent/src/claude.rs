@@ -1087,8 +1087,26 @@ impl ClaudeLoop {
                 }
             }
             rho_claude::ClaudeEvent::StreamEvent(event) => {
+                let message_stopped = matches!(
+                    &event.event,
+                    rho_claude::protocol::MessageStreamEvent::MessageStop
+                );
                 if let Err(error) = self.handle_stream_event(event.event) {
                     self.fail(error);
+                } else if message_stopped
+                    && let Some(usage) = self.turn_usage.take()
+                    && let Some(multi_agent) = &self.multi_agent
+                {
+                    multi_agent
+                        .record_usage(crate::db::AgentUsageBucket {
+                            input_tokens: usage.input_tokens.unwrap_or(0),
+                            cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                            cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                            output_tokens: usage.output_tokens.unwrap_or(0),
+                            requests: 1,
+                            ..crate::db::AgentUsageBucket::default()
+                        })
+                        .await;
                 }
             }
             rho_claude::ClaudeEvent::RateLimitEvent(event) => {

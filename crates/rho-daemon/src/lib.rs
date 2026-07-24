@@ -20,10 +20,10 @@ use rho_inference::InferenceAuth;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
-    McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary, ServerMessage, StartMode,
-    UiAgentSummary, UiAttention, UiProject, UiWorkstream, WorkspaceInfo, WorkstreamTarget,
-    read_frame, read_frame_counted, write_frame, write_frame_counted,
+    AgentUsageBucket as UiAgentUsageBucket, ClientMessage, JoinTarget, LandLeaseHolder, LandStatus,
+    McpAgentToolRequest, McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary,
+    ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject, UiWorkstream, WorkspaceInfo,
+    WorkstreamTarget, read_frame, read_frame_counted, write_frame, write_frame_counted,
 };
 use tokio::sync::{
     Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot, watch,
@@ -428,12 +428,14 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             && accepted_connection
             && active_connections.load(Ordering::Relaxed) == 0
         {
+            agents.pool.flush_agent_usage(None).await;
             return Ok(());
         }
 
         tokio::select! {
             result = &mut shutdown => {
                 result?;
+                agents.pool.flush_agent_usage(None).await;
                 return Ok(());
             }
             connection = server.accept() => {
@@ -2056,17 +2058,17 @@ fn spawn_attention_watcher(
                         let _ = events.send(ServerMessage::QuotaUsage {
                             summaries: quota_summaries(&db),
                         });
-                        let _ = events.send(ServerMessage::QuotaHistory {
-                            series: quota_history(&db),
-                        });
                     }
                 }
             }
             let working = is_working(&state.kind);
-            if !working && was_working && !is_child {
-                let mut write = db.write().await;
-                write.record_agent_turn_end(agent_id);
-                write.commit();
+            if !working && was_working {
+                pool.flush_agent_usage(Some(agent_id)).await;
+                if !is_child {
+                    let mut write = db.write().await;
+                    write.record_agent_turn_end(agent_id);
+                    write.commit();
+                }
             }
             if !working
                 && was_working
@@ -2114,6 +2116,18 @@ fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
             })
         })
         .collect()
+}
+
+fn ui_agent_usage_bucket(bucket: rho_agent::db::AgentUsageBucket) -> UiAgentUsageBucket {
+    UiAgentUsageBucket {
+        bucket_start_ms: bucket.bucket_start_ms,
+        input_tokens: bucket.input_tokens,
+        cache_read_tokens: bucket.cache_read_tokens,
+        cache_write_tokens: bucket.cache_write_tokens,
+        output_tokens: bucket.output_tokens,
+        requests: bucket.requests,
+        approximate: bucket.approximate,
+    }
 }
 
 fn quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
@@ -2175,9 +2189,6 @@ fn spawn_chatgpt_quota_poller(
                 if changed {
                     let _ = events.send(ServerMessage::QuotaUsage {
                         summaries: quota_summaries(&db),
-                    });
-                    let _ = events.send(ServerMessage::QuotaHistory {
-                        series: quota_history(&db),
                     });
                 }
             }
@@ -2257,8 +2268,27 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::QuotaUsage {
                 summaries: quota_summaries(&agents.db),
             });
+            Ok(Refresh::None)
+        }
+        ClientMessage::QuotaHistory => {
             let _ = outgoing_tx.send(ServerMessage::QuotaHistory {
                 series: quota_history(&agents.db),
+            });
+            Ok(Refresh::None)
+        }
+        ClientMessage::AgentUsage { agent_id, since_ms } => {
+            agents.pool.flush_agent_usage(Some(agent_id)).await;
+            let read = agents.db.read();
+            let buckets = read
+                .agent_usage(agent_id, rho_core::UnixMs(since_ms))
+                .into_iter()
+                .map(ui_agent_usage_bucket)
+                .collect();
+            let total = ui_agent_usage_bucket(read.agent_usage_total(agent_id));
+            let _ = outgoing_tx.send(ServerMessage::AgentUsage {
+                agent_id,
+                buckets,
+                total,
             });
             Ok(Refresh::None)
         }

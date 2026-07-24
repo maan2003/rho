@@ -55,6 +55,12 @@ impl MultiAgentTools {
         self.parent
     }
 
+    pub(crate) async fn record_usage(&self, usage: crate::db::AgentUsageBucket) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.record_agent_usage(self.self_id, usage).await;
+        }
+    }
+
     pub(crate) fn spawned_by(&self) -> crate::db::AgentSpawnedBy {
         self.pool()
             .expect("multi-agent tools require a live agent pool")

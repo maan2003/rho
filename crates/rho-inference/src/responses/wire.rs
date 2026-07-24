@@ -1116,13 +1116,21 @@ fn usage_from_event(event: &Value) -> Option<TokenUsage> {
     let cached_input_tokens = usage["input_tokens_details"]["cached_tokens"]
         .as_u64()
         .unwrap_or(0);
+    let cache_write_input_tokens = usage["input_tokens_details"]["cache_write_tokens"]
+        .as_u64()
+        .unwrap_or(0);
     let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
-    if input_tokens == 0 && cached_input_tokens == 0 && output_tokens == 0 {
+    if input_tokens == 0
+        && cached_input_tokens == 0
+        && cache_write_input_tokens == 0
+        && output_tokens == 0
+    {
         None
     } else {
         Some(TokenUsage {
             input_tokens,
             cached_input_tokens,
+            cache_write_input_tokens,
             output_tokens,
         })
     }

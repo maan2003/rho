@@ -145,6 +145,14 @@ pub struct Workspace {
     connected: bool,
     quota_summaries: Vec<rho_ui_proto::QuotaSummary>,
     quota_history: Vec<rho_ui_proto::QuotaSeries>,
+    agent_usage: HashMap<
+        rho_ui_proto::AgentId,
+        (
+            Vec<rho_ui_proto::AgentUsageBucket>,
+            rho_ui_proto::AgentUsageBucket,
+        ),
+    >,
+    active_usage_agent: Option<rho_ui_proto::AgentId>,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
@@ -314,6 +322,8 @@ impl Workspace {
             connected: false,
             quota_summaries: Vec::new(),
             quota_history: Vec::new(),
+            agent_usage: HashMap::new(),
+            active_usage_agent: None,
             duration_timer: None,
             chime: Chime::default(),
             contexts: HashMap::new(),
@@ -612,6 +622,34 @@ impl Workspace {
             }
             ConnEvent::QuotaHistory(series) => {
                 self.quota_history = series;
+                if self
+                    .transient
+                    .as_ref()
+                    .is_some_and(|transient| transient.title() == "provider quota")
+                {
+                    self.transient = Some(crate::transient::usage_menu(self.quota_history.clone()));
+                }
+                cx.notify();
+            }
+            ConnEvent::AgentUsage {
+                agent_id,
+                buckets,
+                total,
+            } => {
+                self.agent_usage
+                    .insert(agent_id, (buckets.clone(), total.clone()));
+                if self
+                    .transient
+                    .as_ref()
+                    .is_some_and(|transient| transient.title() == "agent usage")
+                    && self.active_usage_agent == Some(agent_id)
+                {
+                    self.transient = Some(crate::transient::agent_usage_menu(
+                        self.registry.agent_display_label(agent_id),
+                        buckets,
+                        total,
+                    ));
+                }
                 cx.notify();
             }
             ConnEvent::TurnCancelled => {
@@ -2979,8 +3017,60 @@ impl Workspace {
     }
 
     pub(crate) fn open_usage_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.connection.send(ClientMessage::QuotaHistory);
         let history = self.quota_history.clone();
         self.open_transient(crate::transient::usage_menu(history), window, cx);
+    }
+
+    pub(crate) fn open_agent_usage_transient(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = self.registry.selected_agent().copied() else {
+            return;
+        };
+        self.open_agent_usage_for(agent_id, window, cx);
+    }
+
+    fn open_agent_usage_for(
+        &mut self,
+        agent_id: rho_ui_proto::AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_usage_agent = Some(agent_id);
+        self.connection.send(ClientMessage::AgentUsage {
+            agent_id,
+            since_ms: now_ms().saturating_sub(7 * 24 * 60 * 60 * 1_000),
+        });
+        let (buckets, total) = self.agent_usage.get(&agent_id).cloned().unwrap_or_default();
+        self.open_transient(
+            crate::transient::agent_usage_menu(
+                self.registry.agent_display_label(agent_id),
+                buckets,
+                total,
+            ),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn prompt_agent_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| {
+            Vec::<crate::commands::Candidate>::new()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if let Some(agent_id) = workspace.registry.agent_by_label(input.trim()) {
+                    workspace.open_agent_usage_for(agent_id, window, cx);
+                }
+            },
+        );
+        self.open_prompt("agent usage:", complete, on_submit, window, cx);
     }
 
     pub(crate) fn prompt_new_agent_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {

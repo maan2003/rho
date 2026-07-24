@@ -11,6 +11,7 @@ anyhow.workspace = true
 async-stream.workspace = true
 bytes = "1"
 camino.workspace = true
+chrono = "0.4"
 dirs.workspace = true
 futures.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }

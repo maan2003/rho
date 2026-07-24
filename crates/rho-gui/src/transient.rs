@@ -39,7 +39,12 @@ pub struct TransientItem {
 pub struct Transient {
     title: &'static str,
     items: Vec<TransientItem>,
-    usage: Option<Vec<rho_ui_proto::QuotaSeries>>,
+    quota_usage: Option<Vec<rho_ui_proto::QuotaSeries>>,
+    agent_usage: Option<(
+        String,
+        Vec<rho_ui_proto::AgentUsageBucket>,
+        rho_ui_proto::AgentUsageBucket,
+    )>,
 }
 
 impl Transient {
@@ -47,8 +52,13 @@ impl Transient {
         Self {
             title,
             items: Vec::new(),
-            usage: None,
+            quota_usage: None,
+            agent_usage: None,
         }
+    }
+
+    pub fn title(&self) -> &'static str {
+        self.title
     }
 
     fn push(
@@ -146,7 +156,7 @@ impl Transient {
         let accent = colors.text_accent;
         let muted = colors.text_muted;
         let value_color = colors.terminal_ansi_green;
-        if let Some(series) = &self.usage {
+        if let Some(series) = &self.quota_usage {
             let series = series.clone();
             let gpt: Hsla = colors.terminal_ansi_cyan.into();
             let fable: Hsla = colors.terminal_ansi_magenta.into();
@@ -204,6 +214,43 @@ impl Transient {
                                             .child("now"),
                                     ),
                             ),
+                    ),
+                )
+                .into_any_element();
+        }
+        if let Some((label, buckets, total)) = &self.agent_usage {
+            let buckets = buckets.clone();
+            let line: Hsla = colors.terminal_ansi_cyan.into();
+            let grid: Hsla = colors.text_muted.opacity(0.22).into();
+            let total_tokens = total.input_tokens
+                + total.cache_read_tokens
+                + total.cache_write_tokens
+                + total.output_tokens;
+            return bottom_strip(text_style, cx)
+                .child(
+                    div()
+                        .px_2()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child(format!("usage · {label}")),
+                )
+                .child(div().px_2().text_color(muted).child(format!(
+                    "{total_tokens} tokens · {} requests · input {} · cache {} · output {}{}",
+                    total.requests,
+                    total.input_tokens,
+                    total.cache_read_tokens + total.cache_write_tokens,
+                    total.output_tokens,
+                    if total.approximate {
+                        " · includes approximate backfill"
+                    } else {
+                        ""
+                    }
+                )))
+                .child(
+                    div().px_2().pb_1().child(
+                        div()
+                            .w(px(832.))
+                            .h(px(240.))
+                            .child(agent_usage_chart(buckets, line, grid)),
                     ),
                 )
                 .into_any_element();
@@ -338,15 +385,41 @@ pub fn root_menu() -> Transient {
         .item("v", "version", |workspace, _, cx| {
             workspace.cmd_version(cx);
         })
-        .item("u", "usage", |workspace, window, cx| {
-            workspace.open_usage_transient(window, cx);
+        .item("u", "usage…", |workspace, window, cx| {
+            workspace.open_transient(usage_root_menu(), window, cx);
         })
         .item("q", "quit", |_, _, cx| cx.quit())
 }
 
+pub fn usage_root_menu() -> Transient {
+    Transient::new("usage")
+        .item("q", "provider quota", |workspace, window, cx| {
+            workspace.open_usage_transient(window, cx);
+        })
+        .item_when(
+            Workspace::has_selected_agent,
+            "a",
+            "current agent tokens",
+            |workspace, window, cx| workspace.open_agent_usage_transient(window, cx),
+        )
+        .item("s", "agent by handle…", |workspace, window, cx| {
+            workspace.prompt_agent_usage(window, cx);
+        })
+}
+
 pub fn usage_menu(series: Vec<rho_ui_proto::QuotaSeries>) -> Transient {
-    let mut menu = Transient::new("usage");
-    menu.usage = Some(series);
+    let mut menu = Transient::new("provider quota");
+    menu.quota_usage = Some(series);
+    menu
+}
+
+pub fn agent_usage_menu(
+    label: String,
+    buckets: Vec<rho_ui_proto::AgentUsageBucket>,
+    total: rho_ui_proto::AgentUsageBucket,
+) -> Transient {
+    let mut menu = Transient::new("agent usage");
+    menu.agent_usage = Some((label, buckets, total));
     menu
 }
 
@@ -421,6 +494,56 @@ fn paint_usage_segment(points: &[Point<Pixels>], color: Hsla, window: &mut Windo
     if let Ok(path) = builder.build() {
         window.paint_path(path, color);
     }
+}
+
+fn agent_usage_chart(
+    buckets: Vec<rho_ui_proto::AgentUsageBucket>,
+    line: Hsla,
+    grid: Hsla,
+) -> impl IntoElement {
+    canvas(
+        move |_, _, _| {},
+        move |bounds, _, window, _| {
+            for step in 0..=4 {
+                let y = bounds.origin.y + bounds.size.height * (step as f32 / 4.0);
+                let mut builder = PathBuilder::stroke(px(1.));
+                builder.move_to(point(bounds.origin.x, y));
+                builder.line_to(point(bounds.right(), y));
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, grid);
+                }
+            }
+            let max = buckets
+                .iter()
+                .map(agent_bucket_tokens)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let now = crate::workspace::now_ms();
+            let start = now.saturating_sub(7 * 24 * 60 * 60 * 1_000);
+            let points = buckets
+                .iter()
+                .map(|bucket| {
+                    let x = bucket.bucket_start_ms.saturating_sub(start) as f64
+                        / now.saturating_sub(start).max(1) as f64;
+                    let y = 1.0 - agent_bucket_tokens(bucket) as f64 / max as f64;
+                    point(
+                        bounds.origin.x + bounds.size.width * x.clamp(0.0, 1.0) as f32,
+                        bounds.origin.y + bounds.size.height * y as f32,
+                    )
+                })
+                .collect::<Vec<_>>();
+            paint_usage_segment(&points, line, window);
+        },
+    )
+    .size_full()
+}
+
+fn agent_bucket_tokens(bucket: &rho_ui_proto::AgentUsageBucket) -> u64 {
+    bucket.input_tokens
+        + bucket.cache_read_tokens
+        + bucket.cache_write_tokens
+        + bucket.output_tokens
 }
 
 pub fn new_agent_menu(project: String, workspace: String, role: String) -> Transient {

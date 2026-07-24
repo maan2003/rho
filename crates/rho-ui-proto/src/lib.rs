@@ -322,6 +322,11 @@ pub enum ClientMessage {
     },
     /// Requests the daemon account's weekly ChatGPT Codex allowance.
     ChatGptUsage,
+    QuotaHistory,
+    AgentUsage {
+        agent_id: AgentId,
+        since_ms: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -650,6 +655,11 @@ pub enum ServerMessage {
     QuotaHistory {
         series: Vec<QuotaSeries>,
     },
+    AgentUsage {
+        agent_id: AgentId,
+        buckets: Vec<AgentUsageBucket>,
+        total: AgentUsageBucket,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -674,6 +684,17 @@ pub struct QuotaPoint {
     pub observed_at_ms: u64,
     pub remaining_percent: u8,
     pub reset_at_unix: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct AgentUsageBucket {
+    pub bucket_start_ms: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub requests: u64,
+    pub approximate: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
