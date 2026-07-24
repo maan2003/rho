@@ -219,7 +219,6 @@ impl Transient {
             let series = series.clone();
             let gpt: Hsla = colors.terminal_ansi_cyan.into();
             let claude: Hsla = rgb(0xd97757).into();
-            let line: Hsla = colors.text_accent.into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
             let now = crate::workspace::now_ms();
             let since = now.saturating_sub(7 * 24 * 60 * 60 * 1_000);
@@ -288,9 +287,11 @@ impl Transient {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(div().w(px(832.)).h(px(220.)).child(global_usage_chart(
-                                        series, now, gpt, claude, line, grid,
-                                    )))
+                                    .child(
+                                        div().w(px(832.)).h(px(220.)).child(global_usage_chart(
+                                            series, now, gpt, claude, grid,
+                                        )),
+                                    )
                                     .child(
                                         div()
                                             .mt_1()
@@ -623,7 +624,6 @@ fn global_usage_chart(
     now: u64,
     gpt: Hsla,
     claude: Hsla,
-    total_line: Hsla,
     grid: Hsla,
 ) -> impl IntoElement {
     canvas(
@@ -729,11 +729,6 @@ fn global_usage_chart(
                     window,
                 );
             }
-            paint_polyline(
-                &points.iter().map(|(_, point)| *point).collect::<Vec<_>>(),
-                total_line,
-                window,
-            );
         },
     )
     .size_full()
@@ -743,20 +738,6 @@ fn paint_grid_line(from: Point<Pixels>, to: Point<Pixels>, color: Hsla, window: 
     let mut builder = PathBuilder::stroke(px(1.));
     builder.move_to(from);
     builder.line_to(to);
-    if let Ok(path) = builder.build() {
-        window.paint_path(path, color);
-    }
-}
-
-fn paint_polyline(points: &[Point<Pixels>], color: Hsla, window: &mut Window) {
-    let Some(first) = points.first() else {
-        return;
-    };
-    let mut builder = PathBuilder::stroke(px(2.));
-    builder.move_to(*first);
-    for point in &points[1..] {
-        builder.line_to(*point);
-    }
     if let Ok(path) = builder.build() {
         window.paint_path(path, color);
     }

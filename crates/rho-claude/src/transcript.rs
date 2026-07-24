@@ -24,6 +24,12 @@ pub struct SessionMessage {
     pub timestamp: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionUsageSample {
+    pub timestamp: Option<String>,
+    pub usage: crate::protocol::TokenUsage,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionMessageKind {
     User,
@@ -43,6 +49,7 @@ struct TranscriptEntry {
     parent_uuid: Option<Uuid>,
     #[serde(default)]
     message: Value,
+    request_id: Option<String>,
     timestamp: Option<String>,
     #[serde(alias = "parent_tool_use_id")]
     parent_tool_use_id: Option<String>,
@@ -173,6 +180,64 @@ pub async fn read_session_messages_by_id(
         return Ok(Vec::new());
     };
     read_session_messages(&transcript_path, options).await
+}
+
+/// Reads every recorded assistant usage snapshot, including forked and
+/// sidechain entries that are intentionally omitted from the visible chat.
+pub async fn read_session_usage_by_id(
+    session_id: Uuid,
+    cwd: &Utf8Path,
+) -> Result<Vec<SessionUsageSample>> {
+    let Some(transcript_path) = find_session_transcript(session_id, cwd).await? else {
+        return Ok(Vec::new());
+    };
+    let entries = read_transcript_entries(&transcript_path).await?;
+    Ok(session_usage(entries))
+}
+
+fn session_usage(entries: Vec<TranscriptEntry>) -> Vec<SessionUsageSample> {
+    let mut requests = HashMap::<String, SessionUsageSample>::new();
+    for entry in entries {
+        if entry.kind != TranscriptEntryKind::Assistant {
+            continue;
+        }
+        let Some(request_id) = entry.request_id.or_else(|| {
+            entry
+                .message
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }) else {
+            continue;
+        };
+        let Ok(usage) =
+            serde_json::from_value(entry.message.get("usage").cloned().unwrap_or_default())
+        else {
+            continue;
+        };
+        requests
+            .entry(request_id)
+            .and_modify(|sample| {
+                sample.timestamp = sample.timestamp.take().max(entry.timestamp.clone());
+                merge_max_usage(&mut sample.usage, &usage);
+            })
+            .or_insert(SessionUsageSample {
+                timestamp: entry.timestamp,
+                usage,
+            });
+    }
+    requests.into_values().collect()
+}
+
+fn merge_max_usage(base: &mut crate::protocol::TokenUsage, update: &crate::protocol::TokenUsage) {
+    base.input_tokens = base.input_tokens.max(update.input_tokens);
+    base.output_tokens = base.output_tokens.max(update.output_tokens);
+    base.cache_creation_input_tokens = base
+        .cache_creation_input_tokens
+        .max(update.cache_creation_input_tokens);
+    base.cache_read_input_tokens = base
+        .cache_read_input_tokens
+        .max(update.cache_read_input_tokens);
 }
 
 pub async fn read_session_context_used_by_id(
@@ -509,6 +574,7 @@ mod tests {
             session_id: Some(uuid::uuid!("00000000-0000-4000-8000-000000000001")),
             parent_uuid,
             message: json!({"role": "user", "content": "hello"}),
+            request_id: None,
             timestamp: None,
             parent_tool_use_id: None,
             is_meta: None,
@@ -537,6 +603,39 @@ mod tests {
         });
 
         assert_eq!(latest_context_used(&[assistant, compact]), Some(7));
+    }
+
+    #[test]
+    fn usage_includes_assistant_entries_outside_visible_chain() {
+        let root = uuid::uuid!("00000000-0000-4000-8000-00000000000a");
+        let branch = uuid::uuid!("00000000-0000-4000-8000-00000000000b");
+        let latest = uuid::uuid!("00000000-0000-4000-8000-00000000000c");
+        let snapshot = uuid::uuid!("00000000-0000-4000-8000-00000000000d");
+        let root = entry(TranscriptEntryKind::User, root, None);
+        let mut branch = entry(TranscriptEntryKind::Assistant, branch, root.uuid);
+        branch.is_sidechain = Some(true);
+        branch.request_id = Some("request-branch".to_owned());
+        branch.timestamp = Some("2026-07-02T08:24:49Z".to_owned());
+        branch.message = json!({"usage": {"input_tokens": 10, "output_tokens": 5}});
+        let mut latest = entry(TranscriptEntryKind::Assistant, latest, root.uuid);
+        latest.request_id = Some("request-latest".to_owned());
+        latest.timestamp = Some("2026-07-02T08:24:50Z".to_owned());
+        latest.message = json!({"usage": {"input_tokens": 20, "output_tokens": 7}});
+        let mut snapshot = entry(TranscriptEntryKind::Assistant, snapshot, latest.uuid);
+        snapshot.request_id = Some("request-latest".to_owned());
+        snapshot.timestamp = Some("2026-07-02T08:24:51Z".to_owned());
+        snapshot.message = json!({"usage": {"input_tokens": 25, "output_tokens": 9}});
+
+        let usage = session_usage(vec![root, branch, latest, snapshot]);
+
+        assert_eq!(usage.len(), 2);
+        assert_eq!(
+            usage
+                .iter()
+                .map(|sample| sample.usage.input_tokens.unwrap_or(0))
+                .sum::<u64>(),
+            35
+        );
     }
 
     #[test]

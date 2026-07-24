@@ -100,14 +100,24 @@ async fn native_usage_backfill_reads_completed_debug_responses() {
             prompt_cache_key.debug_file_stem()
         )),
         serde_json::to_vec(&serde_json::json!({
-            "raw_events": [{
-                "type": "response.completed",
-                "response": {"usage": {
-                    "input_tokens": 100,
-                    "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 10},
-                    "output_tokens": 20
-                }}
-            }]
+            "raw_events": [
+                {
+                    "type": "codex.rate_limits",
+                    "rate_limits": {"primary": {
+                        "used_percent": 28.2,
+                        "window_minutes": 10080,
+                        "reset_at": 1_783_173_000
+                    }}
+                },
+                {
+                    "type": "response.completed",
+                    "response": {"usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 10},
+                        "output_tokens": 20
+                    }}
+                }
+            ]
         }))
         .unwrap(),
     )
@@ -137,6 +147,44 @@ async fn native_usage_backfill_reads_completed_debug_responses() {
     assert_eq!(global.len(), 1);
     assert_eq!(global[0].0, AgentUsageProvider::GPT);
     assert_eq!(global[0].1.input_tokens, 30);
+    let quota = read.quota_observations(QuotaModel::GPT, UnixMs(0));
+    assert_eq!(quota.len(), 1);
+    assert_eq!(quota[0].used_percent, 28);
+    assert_eq!(quota[0].reset_at_unix, Some(1_783_173_000));
+}
+
+#[tokio::test]
+async fn claude_usage_backfill_accumulates_usage_samples() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = write.alloc_agent_id();
+    let messages = [(10, 20), (12, 25)]
+        .into_iter()
+        .map(
+            |(input_tokens, output_tokens)| rho_claude::SessionUsageSample {
+                timestamp: Some("2026-07-02T08:24:50Z".to_owned()),
+                usage: rho_claude::protocol::TokenUsage {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(output_tokens),
+                    cache_creation_input_tokens: Some(30),
+                    cache_read_input_tokens: Some(40),
+                },
+            },
+        )
+        .collect();
+    let mut buckets = std::collections::HashMap::new();
+
+    add_claude_usage(agent_id, messages, &mut buckets);
+
+    let bucket = buckets.values().next().unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(bucket.input_tokens, 22);
+    assert_eq!(bucket.output_tokens, 45);
+    assert_eq!(bucket.cache_write_tokens, 60);
+    assert_eq!(bucket.cache_read_tokens, 80);
+    assert_eq!(bucket.requests, 2);
 }
 
 #[tokio::test]
