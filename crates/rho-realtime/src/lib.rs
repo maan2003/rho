@@ -20,7 +20,9 @@ use libwebrtc::peer_connection::{
     IceGatheringState, OfferOptions, PeerConnection, PeerConnectionState,
 };
 use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt as _;
-use libwebrtc::peer_connection_factory::{IceServer, PeerConnectionFactory, RtcConfiguration};
+use libwebrtc::peer_connection_factory::{
+    ContinualGatheringPolicy, IceServer, PeerConnectionFactory, RtcConfiguration,
+};
 use libwebrtc::session_description::{SdpType, SessionDescription};
 use rho_inference::ResolvedOAuth;
 use rodio::microphone::MicrophoneBuilder;
@@ -243,6 +245,7 @@ impl RealtimeSession {
                 username: String::new(),
                 password: String::new(),
             }],
+            continual_gathering_policy: ContinualGatheringPolicy::GatherOnce,
             ..Default::default()
         })?;
         let audio_source = NativeAudioSource::new(
