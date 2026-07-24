@@ -388,6 +388,21 @@ impl RealtimeSession {
                         })
                     }
                 }
+                Ok(ProviderEvent::Error { message, error }) => {
+                    let (message, code) = match error {
+                        Some(error) => (error.message, error.code),
+                        None => (
+                            message.unwrap_or_else(|| {
+                                "realtime provider reported an error".to_owned()
+                            }),
+                            None,
+                        ),
+                    };
+                    RealtimeEvent::Error(match code {
+                        Some(code) => format!("{message} ({code})"),
+                        None => message,
+                    })
+                }
                 Ok(ProviderEvent::Other) => return,
                 Err(error) => RealtimeEvent::Error(error.to_string()),
             };
@@ -487,8 +502,22 @@ impl Drop for RealtimeSession {
 enum ProviderEvent {
     #[serde(rename = "delegation.created")]
     DelegationCreated { item: DelegationItem },
+    #[serde(rename = "error")]
+    Error {
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        error: Option<ProviderError>,
+    },
     #[serde(other)]
     Other,
+}
+
+#[derive(Deserialize)]
+struct ProviderError {
+    message: String,
+    #[serde(default)]
+    code: Option<String>,
 }
 
 impl ProviderEvent {
@@ -727,6 +756,21 @@ mod tests {
     fn decodes_delegate_request() {
         let event = ProviderEvent::from_json(br#"{"type":"delegation.created","item":{"type":"delegation","target":"client","id":"d1","content":[{"type":"input_text","text":"do it"}]}}"#).unwrap();
         assert!(matches!(event, ProviderEvent::DelegationCreated { .. }));
+    }
+
+    #[test]
+    fn decodes_provider_error() {
+        let event = ProviderEvent::from_json(
+            br#"{"type":"error","error":{"code":"bad_audio","message":"Invalid audio"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            ProviderEvent::Error {
+                error: Some(ProviderError { code: Some(code), message }),
+                ..
+            } if code == "bad_audio" && message == "Invalid audio"
+        ));
     }
 
     #[test]
