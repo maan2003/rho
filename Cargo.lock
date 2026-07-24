@@ -14446,6 +14446,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "uuid",
  "webrtc",
  "webrtc-media",

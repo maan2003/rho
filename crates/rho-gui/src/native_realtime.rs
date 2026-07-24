@@ -9,6 +9,7 @@ use rho_ui_proto::realtime::{RealtimeClientFrame, RealtimeRequestId, RealtimeSer
 use crate::connection::{ChannelDialer, dial_realtime};
 
 pub(crate) async fn run(dialer: ChannelDialer, delegate_agent: AgentId) -> anyhow::Result<()> {
+    tracing::info!(?delegate_agent, "starting native realtime client session");
     let (channel_tx, channel_rx) = tokio::sync::oneshot::channel();
     let mut session = RealtimeSession::connect(move |offer_sdp| async move {
         let channel = dial_realtime(dialer, offer_sdp.into_string()).await?;
@@ -20,11 +21,13 @@ pub(crate) async fn run(dialer: ChannelDialer, delegate_agent: AgentId) -> anyho
     })
     .await?;
     let mut channel = channel_rx.await?;
+    tracing::info!("native realtime client session established");
     let mut next_request_id = 1_u64;
 
     while let Some(event) = session.next_event().await {
         match event {
             RealtimeEvent::DelegateRequest(request) => {
+                tracing::info!("received realtime delegation request");
                 let request_id = RealtimeRequestId(next_request_id);
                 next_request_id = next_request_id.wrapping_add(1).max(1);
                 channel
@@ -39,6 +42,7 @@ pub(crate) async fn run(dialer: ChannelDialer, delegate_agent: AgentId) -> anyho
                         request_id: completed_id,
                         text,
                     }) if completed_id == request_id => {
+                        tracing::info!(?request_id, "realtime delegation completed");
                         session.resolve_delegate(request.id, &text).await?;
                     }
                     Some(RealtimeServerFrame::Delegated { .. }) => {
@@ -51,8 +55,12 @@ pub(crate) async fn run(dialer: ChannelDialer, delegate_agent: AgentId) -> anyho
                 }
             }
             RealtimeEvent::Error(error) => bail!("realtime provider error: {error}"),
-            RealtimeEvent::Closed => break,
+            RealtimeEvent::Closed => {
+                tracing::info!("native realtime peer closed");
+                break;
+            }
         }
     }
+    tracing::info!("native realtime client session ended");
     Ok(())
 }
