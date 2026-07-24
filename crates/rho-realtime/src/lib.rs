@@ -311,6 +311,21 @@ impl RealtimeSession {
         peer.on_ice_connection_state_change(Some(Box::new(|state| {
             tracing::info!(?state, "realtime ICE connection state changed");
         })));
+        peer.on_ice_candidate_error(Some(Box::new(|error| {
+            tracing::warn!(
+                url = %error.url,
+                error_code = error.error_code,
+                error_text = %error.error_text,
+                "realtime ICE candidate error"
+            );
+        })));
+        let ice_candidates = Arc::new(Mutex::new(Vec::new()));
+        let gathered_candidates = ice_candidates.clone();
+        peer.on_ice_candidate(Some(Box::new(move |candidate| {
+            if let Ok(mut candidates) = gathered_candidates.lock() {
+                candidates.push((candidate.sdp_mline_index(), candidate.candidate()));
+            }
+        })));
 
         let offer = peer
             .create_offer(OfferOptions {
@@ -318,16 +333,17 @@ impl RealtimeSession {
                 ..Default::default()
             })
             .await?;
+        let offer_sdp = offer.to_string();
         peer.set_local_description(offer).await?;
         tracing::info!("waiting for realtime ICE candidate gathering");
         tokio::time::timeout(Duration::from_secs(10), ice_rx)
             .await
             .context("timed out gathering realtime ICE candidates")??;
-        let offer_sdp = SdpOffer::try_from(
-            peer.current_local_description()
-                .context("WebRTC peer has no local description")?
-                .to_string(),
-        )?;
+        let ice_candidates = ice_candidates
+            .lock()
+            .map_err(|_| anyhow::anyhow!("realtime ICE candidate collector was poisoned"))?
+            .clone();
+        let offer_sdp = SdpOffer::try_from(add_ice_candidates(&offer_sdp, &ice_candidates)?)?;
         tracing::info!(
             offer_bytes = offer_sdp.0.len(),
             "realtime ICE gathering complete; signaling offer"
@@ -560,6 +576,45 @@ fn utf8_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
     chunks
 }
 
+fn add_ice_candidates(sdp: &str, candidates: &[(i32, String)]) -> anyhow::Result<String> {
+    let media_count = sdp.lines().filter(|line| line.starts_with("m=")).count();
+    for (index, candidate) in candidates {
+        anyhow::ensure!(
+            *index >= 0 && (*index as usize) < media_count,
+            "ICE candidate refers to invalid media section {index}"
+        );
+        anyhow::ensure!(candidate.starts_with("candidate:"), "invalid ICE candidate");
+    }
+
+    let mut completed = String::with_capacity(sdp.len() + candidates.len() * 128);
+    let mut media_index = None;
+    let append_candidates = |completed: &mut String, media_index: usize| {
+        for (_, candidate) in candidates
+            .iter()
+            .filter(|(index, _)| *index as usize == media_index)
+        {
+            completed.push_str("a=");
+            completed.push_str(candidate.trim_end_matches(['\r', '\n']));
+            completed.push_str("\r\n");
+        }
+        completed.push_str("a=end-of-candidates\r\n");
+    };
+    for line in sdp.lines() {
+        if line.starts_with("m=") {
+            if let Some(index) = media_index {
+                append_candidates(&mut completed, index);
+            }
+            media_index = Some(media_index.map_or(0, |index| index + 1));
+        }
+        completed.push_str(line.trim_end_matches('\r'));
+        completed.push_str("\r\n");
+    }
+    if let Some(index) = media_index {
+        append_candidates(&mut completed, index);
+    }
+    Ok(completed)
+}
+
 fn start_microphone(source: NativeAudioSource) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let microphone = MicrophoneBuilder::new()
         .default_device()?
@@ -704,6 +759,23 @@ mod tests {
                 .map(|s| s.len())
                 .collect::<Vec<_>>(),
             [499, 2]
+        );
+    }
+
+    #[test]
+    fn adds_gathered_ice_candidates_to_their_media_sections() {
+        let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\n";
+        let completed = add_ice_candidates(
+            sdp,
+            &[
+                (1, "candidate:data 1 udp 1 127.0.0.1 2 typ host".to_owned()),
+                (0, "candidate:audio 1 udp 1 127.0.0.1 1 typ host".to_owned()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            completed,
+            "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=candidate:audio 1 udp 1 127.0.0.1 1 typ host\r\na=end-of-candidates\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\na=candidate:data 1 udp 1 127.0.0.1 2 typ host\r\na=end-of-candidates\r\n"
         );
     }
 
