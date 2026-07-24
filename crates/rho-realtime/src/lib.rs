@@ -464,9 +464,10 @@ impl RealtimeSession {
         tracing::info!("opening realtime audio output");
         let mut output =
             DeviceSinkBuilder::open_default_sink().context("open realtime audio output")?;
+        tracing::info!("realtime audio output opened; installing playback source");
         output.log_on_drop(false);
         output.mixer().add(RealtimePlayback::new(playback_rx));
-        tracing::info!("realtime audio output opened; waiting for data channel");
+        tracing::info!("realtime playback source installed; waiting for data channel");
         match tokio::time::timeout(Duration::from_secs(15), open_rx).await {
             Ok(result) => result.context("realtime data channel closed before opening")?,
             Err(error) => {
@@ -729,7 +730,11 @@ impl Iterator for RealtimePlayback {
             if let Some(sample) = self.buffered.pop_front() {
                 return Some(sample);
             }
-            self.buffered.extend(self.receiver.recv().ok()?);
+            match self.receiver.try_recv() {
+                Ok(samples) => self.buffered.extend(samples),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Some(0.0),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            }
         }
     }
 }
@@ -790,5 +795,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             [499, 2]
         );
+    }
+
+    #[test]
+    fn playback_emits_silence_without_blocking() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut playback = RealtimePlayback::new(rx);
+        assert_eq!(playback.next(), Some(0.0));
+        tx.send(vec![0.25, -0.5]).unwrap();
+        assert_eq!(playback.next(), Some(0.25));
+        assert_eq!(playback.next(), Some(-0.5));
+        assert_eq!(playback.next(), Some(0.0));
+        drop(tx);
+        assert_eq!(playback.next(), None);
     }
 }
