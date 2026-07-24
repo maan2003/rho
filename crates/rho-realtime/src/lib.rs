@@ -5,35 +5,32 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use bytes::Bytes;
-use interceptor::registry::Registry;
-use media::Sample;
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use futures::StreamExt as _;
+use libwebrtc::audio_frame::AudioFrame;
+use libwebrtc::audio_source::AudioSourceOptions;
+use libwebrtc::audio_source::native::NativeAudioSource;
+use libwebrtc::audio_stream::native::NativeAudioStream;
+use libwebrtc::data_channel::{DataChannel, DataChannelInit, DataChannelState};
+use libwebrtc::media_stream_track::MediaStreamTrack;
+use libwebrtc::peer_connection::{
+    IceGatheringState, OfferOptions, PeerConnection, PeerConnectionState,
+};
+use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt as _;
+use libwebrtc::peer_connection_factory::{IceServer, PeerConnectionFactory, RtcConfiguration};
+use libwebrtc::session_description::{SdpType, SessionDescription};
 use rho_inference::ResolvedOAuth;
 use rodio::microphone::MicrophoneBuilder;
 use rodio::source::UniformSourceIterator;
 use rodio::{ChannelCount, DeviceSinkBuilder, MixerDeviceSink, SampleRate, Source as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use webrtc::api::APIBuilder;
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_OPUS, MediaEngine};
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-use webrtc::track::track_local::TrackLocal;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 const SAMPLE_RATE: u32 = 48_000;
+const CHANNELS: u32 = 1;
 const FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 100;
 const MAX_PROVIDER_EVENT_BYTES: usize = 1024 * 1024;
 const CONTEXT_APPEND_MAX_BYTES: usize = 500;
@@ -223,8 +220,8 @@ pub enum RealtimeEvent {
 }
 
 pub struct RealtimeSession {
-    peer: Arc<RTCPeerConnection>,
-    data_channel: Arc<RTCDataChannel>,
+    peer: PeerConnection,
+    data_channel: DataChannel,
     events: mpsc::Receiver<RealtimeEvent>,
     microphone_task: tokio::task::JoinHandle<()>,
     _output: MixerDeviceSink,
@@ -238,140 +235,95 @@ impl RealtimeSession {
         S: FnOnce(SdpOffer) -> F,
         F: Future<Output = anyhow::Result<SdpAnswer>>,
     {
-        tracing::info!("creating realtime WebRTC peer");
-        let mut media_engine = MediaEngine::default();
-        media_engine.register_default_codecs()?;
-        let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
-        let api = APIBuilder::new()
-            .with_media_engine(media_engine)
-            .with_interceptor_registry(registry)
-            .build();
-        let peer = Arc::new(
-            api.new_peer_connection(RTCConfiguration {
-                ice_servers: vec![RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })
-            .await?,
-        );
-        let audio_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                clock_rate: SAMPLE_RATE,
-                channels: 2,
-                sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
-                ..Default::default()
+        tracing::info!("creating libwebrtc realtime peer");
+        let factory = PeerConnectionFactory::default();
+        let peer = factory.create_peer_connection(RtcConfiguration {
+            ice_servers: vec![IceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                username: String::new(),
+                password: String::new(),
+            }],
+            ..Default::default()
+        })?;
+        let audio_source = NativeAudioSource::new(
+            AudioSourceOptions {
+                echo_cancellation: true,
+                noise_suppression: true,
+                auto_gain_control: true,
             },
-            "rho-microphone".to_owned(),
-            "rho-realtime".to_owned(),
-        ));
-        peer.add_track(audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
-            .await?;
-        let data_channel = peer.create_data_channel("oai-events", None).await?;
+            SAMPLE_RATE,
+            CHANNELS,
+            100,
+        );
+        let audio_track = factory.create_audio_track("rho-microphone", audio_source.clone());
+        peer.add_track(audio_track.into(), &["rho-realtime"])?;
+        let data_channel = peer.create_data_channel("oai-events", DataChannelInit::default())?;
         tracing::info!(label = "oai-events", "created realtime data channel");
 
-        peer.on_ice_gathering_state_change(Box::new(|state| {
-            Box::pin(async move {
-                tracing::info!(?state, "realtime ICE gathering state changed");
-            })
-        }));
-        peer.on_ice_connection_state_change(Box::new(|state| {
-            Box::pin(async move {
-                tracing::info!(?state, "realtime ICE connection state changed");
-            })
-        }));
-
         let (playback_tx, playback_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
-        peer.on_track(Box::new(move |track, _, _| {
+        let runtime = tokio::runtime::Handle::current();
+        peer.on_track(Some(Box::new(move |event| {
+            let MediaStreamTrack::Audio(track) = event.track else {
+                return;
+            };
             let playback_tx = playback_tx.clone();
-            Box::pin(async move {
-                let codec = track.codec();
-                tracing::info!(
-                    track_id = %track.id(),
-                    stream_id = %track.stream_id(),
-                    kind = ?track.kind(),
-                    mime_type = %codec.capability.mime_type,
-                    clock_rate = codec.capability.clock_rate,
-                    channels = codec.capability.channels,
-                    "received realtime remote track"
-                );
-                let mut mono = OpusDecoder::new(SAMPLE_RATE as i32, 1).ok();
-                let mut stereo = OpusDecoder::new(SAMPLE_RATE as i32, 2).ok();
-                let mut packet_count = 0_u64;
-                let mut decode_error_count = 0_u64;
-                loop {
-                    let packet = match track.read_rtp().await {
-                        Ok((packet, _)) => packet,
-                        Err(error) => {
-                            tracing::warn!(%error, packet_count, "realtime remote RTP track ended");
-                            break;
-                        }
-                    };
-                    packet_count += 1;
-                    if packet_count == 1 || packet_count.is_multiple_of(500) {
+            runtime.spawn(async move {
+                tracing::info!("received realtime remote audio track");
+                let mut stream = NativeAudioStream::new(track, SAMPLE_RATE as i32, CHANNELS as i32);
+                let mut frame_count = 0_u64;
+                while let Some(frame) = stream.next().await {
+                    frame_count += 1;
+                    if frame_count == 1 || frame_count.is_multiple_of(500) {
                         tracing::debug!(
-                            packet_count,
-                            payload_bytes = packet.payload.len(),
-                            "received realtime audio RTP"
+                            frame_count,
+                            samples = frame.data.len(),
+                            "received decoded realtime audio"
                         );
                     }
-                    let mut decoded = vec![0.0_f32; 5760 * 2];
-                    let samples = mono
-                        .as_mut()
-                        .and_then(|decoder| {
-                            decoder.decode(&packet.payload, 5760, &mut decoded).ok()
-                        })
-                        .map(|samples| (samples, 1))
-                        .or_else(|| {
-                            stereo.as_mut().and_then(|decoder| {
-                                decoder
-                                    .decode(&packet.payload, 5760, &mut decoded)
-                                    .ok()
-                                    .map(|samples| (samples, 2))
-                            })
-                        });
-                    let Some((samples, channels)) = samples else {
-                        decode_error_count += 1;
-                        if decode_error_count == 1 || decode_error_count.is_multiple_of(100) {
-                            tracing::warn!(
-                                decode_error_count,
-                                packet_count,
-                                "failed to decode realtime Opus packet"
-                            );
-                        }
-                        continue;
-                    };
-                    let playback = if channels == 1 {
-                        decoded.truncate(samples);
-                        decoded
-                    } else {
-                        decoded[..samples * 2]
-                            .chunks_exact(2)
-                            .map(|pair| (pair[0] + pair[1]) * 0.5)
-                            .collect()
-                    };
+                    let playback = frame
+                        .data
+                        .iter()
+                        .map(|sample| *sample as f32 / i16::MAX as f32)
+                        .collect();
                     match playback_tx.try_send(playback) {
                         Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                     }
                 }
-            })
-        }));
+                tracing::info!(frame_count, "realtime remote audio track ended");
+            });
+        })));
 
-        let offer = peer.create_offer(None).await?;
-        let mut gathering_complete = peer.gathering_complete_promise().await;
+        let (ice_tx, ice_rx) = oneshot::channel();
+        let ice_tx = Arc::new(Mutex::new(Some(ice_tx)));
+        peer.on_ice_gathering_state_change(Some(Box::new(move |state| {
+            tracing::info!(?state, "realtime ICE gathering state changed");
+            if state == IceGatheringState::Complete
+                && let Ok(mut sender) = ice_tx.lock()
+                && let Some(sender) = sender.take()
+            {
+                let _ = sender.send(());
+            }
+        })));
+        peer.on_ice_connection_state_change(Some(Box::new(|state| {
+            tracing::info!(?state, "realtime ICE connection state changed");
+        })));
+
+        let offer = peer
+            .create_offer(OfferOptions {
+                offer_to_receive_audio: true,
+                ..Default::default()
+            })
+            .await?;
         peer.set_local_description(offer).await?;
         tracing::info!("waiting for realtime ICE candidate gathering");
-        tokio::time::timeout(Duration::from_secs(10), gathering_complete.recv())
+        tokio::time::timeout(Duration::from_secs(10), ice_rx)
             .await
-            .context("timed out gathering realtime ICE candidates")?;
+            .context("timed out gathering realtime ICE candidates")??;
         let offer_sdp = SdpOffer::try_from(
-            peer.local_description()
-                .await
+            peer.current_local_description()
                 .context("WebRTC peer has no local description")?
-                .sdp,
+                .to_string(),
         )?;
         tracing::info!(
             offer_bytes = offer_sdp.0.len(),
@@ -382,82 +334,73 @@ impl RealtimeSession {
             answer_bytes = answer_sdp.0.len(),
             "received realtime signaling answer"
         );
-        let answer =
-            RTCSessionDescription::answer(answer_sdp.0).context("parse realtime SDP answer")?;
+        let answer = SessionDescription::parse(&answer_sdp.0, SdpType::Answer)
+            .context("parse realtime SDP answer")?;
 
         let (event_tx, event_rx) = mpsc::channel(64);
         let provider_events = event_tx.clone();
-        data_channel.on_message(Box::new(move |message: DataChannelMessage| {
-            let provider_events = provider_events.clone();
-            Box::pin(async move {
-                tracing::debug!(
-                    bytes = message.data.len(),
-                    is_string = message.is_string,
-                    "received realtime data-channel message"
-                );
-                if !message.is_string {
-                    return;
-                }
-                let event = match ProviderEvent::from_json(&message.data) {
-                    Ok(ProviderEvent::DelegationCreated { item }) => {
-                        let text = item
-                            .content
-                            .into_iter()
-                            .filter_map(|part| match part {
-                                DelegationContent::InputText { text } => Some(text),
-                                DelegationContent::Unsupported => None,
-                            })
-                            .collect::<String>();
-                        if item.id.is_empty() {
-                            RealtimeEvent::Error("realtime delegation id is empty".to_owned())
-                        } else if text.is_empty() {
-                            RealtimeEvent::Error("realtime delegation text is empty".to_owned())
-                        } else {
-                            RealtimeEvent::DelegateRequest(DelegateRequest {
-                                id: DelegateRequestId(item.id),
-                                text,
-                            })
-                        }
+        data_channel.on_message(Some(Box::new(move |message| {
+            tracing::debug!(
+                bytes = message.data.len(),
+                binary = message.binary,
+                "received realtime data-channel message"
+            );
+            if message.binary {
+                return;
+            }
+            let event = match ProviderEvent::from_json(message.data) {
+                Ok(ProviderEvent::DelegationCreated { item }) => {
+                    let text = item
+                        .content
+                        .into_iter()
+                        .filter_map(|part| match part {
+                            DelegationContent::InputText { text } => Some(text),
+                            DelegationContent::Unsupported => None,
+                        })
+                        .collect::<String>();
+                    if item.id.is_empty() {
+                        RealtimeEvent::Error("realtime delegation id is empty".to_owned())
+                    } else if text.is_empty() {
+                        RealtimeEvent::Error("realtime delegation text is empty".to_owned())
+                    } else {
+                        RealtimeEvent::DelegateRequest(DelegateRequest {
+                            id: DelegateRequestId(item.id),
+                            text,
+                        })
                     }
-                    Ok(ProviderEvent::Other) => return,
-                    Err(error) => RealtimeEvent::Error(error.to_string()),
-                };
-                let _ = provider_events.try_send(event);
-            })
-        }));
+                }
+                Ok(ProviderEvent::Other) => return,
+                Err(error) => RealtimeEvent::Error(error.to_string()),
+            };
+            let _ = provider_events.try_send(event);
+        })));
         let (open_tx, open_rx) = oneshot::channel();
-        let open_tx = Arc::new(std::sync::Mutex::new(Some(open_tx)));
-        data_channel.on_open(Box::new(move || {
-            let open_tx = open_tx.clone();
-            Box::pin(async move {
-                tracing::info!(label = "oai-events", "realtime data channel opened");
-                if let Some(sender) = open_tx.lock().unwrap().take() {
-                    let _ = sender.send(());
-                }
-            })
-        }));
-        data_channel.on_close(Box::new(|| {
-            Box::pin(async move {
-                tracing::info!(label = "oai-events", "realtime data channel closed");
-            })
-        }));
-        data_channel.on_error(Box::new(|error| {
-            Box::pin(async move {
-                tracing::warn!(%error, label = "oai-events", "realtime data channel error");
-            })
-        }));
-        peer.on_peer_connection_state_change(Box::new(move |state| {
-            let event_tx = event_tx.clone();
-            Box::pin(async move {
-                tracing::info!(?state, "realtime peer connection state changed");
-                if matches!(
-                    state,
-                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-                ) {
-                    let _ = event_tx.try_send(RealtimeEvent::Closed);
-                }
-            })
-        }));
+        let open_tx = Arc::new(Mutex::new(Some(open_tx)));
+        let channel_events = event_tx.clone();
+        data_channel.on_state_change(Some(Box::new(move |state| {
+            tracing::info!(
+                ?state,
+                label = "oai-events",
+                "realtime data channel state changed"
+            );
+            if state == DataChannelState::Open
+                && let Ok(mut sender) = open_tx.lock()
+                && let Some(sender) = sender.take()
+            {
+                let _ = sender.send(());
+            } else if state == DataChannelState::Closed {
+                let _ = channel_events.try_send(RealtimeEvent::Closed);
+            }
+        })));
+        peer.on_connection_state_change(Some(Box::new(move |state| {
+            tracing::info!(?state, "realtime peer connection state changed");
+            if matches!(
+                state,
+                PeerConnectionState::Failed | PeerConnectionState::Closed
+            ) {
+                let _ = event_tx.try_send(RealtimeEvent::Closed);
+            }
+        })));
         tracing::info!("setting realtime remote description");
         peer.set_remote_description(answer).await?;
         tracing::info!("set realtime remote description");
@@ -477,7 +420,7 @@ impl RealtimeSession {
             }
         }
         tracing::info!("starting realtime microphone");
-        let microphone_task = start_microphone(audio_track)?;
+        let microphone_task = start_microphone(audio_source)?;
         tracing::info!("realtime session connected and microphone started");
 
         Ok(Self {
@@ -506,9 +449,7 @@ impl RealtimeSession {
                     text: chunk.to_owned(),
                 }],
             };
-            self.data_channel
-                .send(&Bytes::from(command.to_json()?))
-                .await?;
+            self.data_channel.send(&command.to_json()?, false)?;
         }
         Ok(())
     }
@@ -517,12 +458,8 @@ impl RealtimeSession {
 impl Drop for RealtimeSession {
     fn drop(&mut self) {
         self.microphone_task.abort();
-        let peer = self.peer.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = peer.close().await;
-            });
-        }
+        self.data_channel.close();
+        self.peer.close();
     }
 }
 
@@ -620,9 +557,7 @@ fn utf8_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
     chunks
 }
 
-fn start_microphone(
-    track: Arc<TrackLocalStaticSample>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+fn start_microphone(source: NativeAudioSource) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let microphone = MicrophoneBuilder::new()
         .default_device()?
         .default_config()?
@@ -638,69 +573,42 @@ fn start_microphone(
     let sample_rate = microphone.sample_rate().get();
     let channels = microphone.channels().get();
     tracing::info!(sample_rate, channels, "opened realtime microphone");
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
+    let (tx, mut rx) = mpsc::channel::<Vec<i16>>(16);
     std::thread::Builder::new()
         .name("rho-realtime-microphone".to_owned())
         .spawn(move || {
             let mut microphone =
                 UniformSourceIterator::new(microphone, rodio::nz!(1), rodio::nz!(48_000));
-            let mut encoder = match OpusEncoder::new(SAMPLE_RATE as i32, 1, Application::Voip) {
-                Ok(encoder) => encoder,
-                Err(error) => {
-                    tracing::warn!(?error, "failed to create realtime Opus encoder");
-                    return;
-                }
-            };
-            encoder.bitrate_bps = 24_000;
-            encoder.use_inband_fec = true;
-            let mut packet_count = 0_u64;
+            let mut frame_count = 0_u64;
             loop {
                 let mut frame = Vec::with_capacity(FRAME_SAMPLES);
                 for _ in 0..FRAME_SAMPLES {
                     let Some(sample) = microphone.next() else {
-                        tracing::warn!(packet_count, "realtime microphone stream ended");
+                        tracing::warn!(frame_count, "realtime microphone stream ended");
                         return;
                     };
-                    frame.push(sample.clamp(-1.0, 1.0));
+                    frame.push((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
                 }
-                let mut packet = vec![0_u8; 4_000];
-                let packet_len = match encoder.encode(&frame, FRAME_SAMPLES, &mut packet) {
-                    Ok(packet_len) => packet_len,
-                    Err(error) => {
-                        tracing::warn!(
-                            ?error,
-                            packet_count,
-                            "failed to encode realtime microphone audio"
-                        );
-                        return;
-                    }
-                };
-                packet.truncate(packet_len);
-                packet_count += 1;
-                if packet_count == 1 || packet_count.is_multiple_of(500) {
-                    tracing::debug!(
-                        packet_count,
-                        packet_bytes = packet_len,
-                        "encoded realtime microphone audio"
-                    );
+                frame_count += 1;
+                if frame_count == 1 || frame_count.is_multiple_of(500) {
+                    tracing::debug!(frame_count, "captured realtime microphone audio");
                 }
-                if tx.blocking_send(packet).is_err() {
-                    tracing::debug!(packet_count, "realtime microphone sender closed");
+                if tx.blocking_send(frame).is_err() {
+                    tracing::debug!(frame_count, "realtime microphone sender closed");
                     return;
                 }
             }
         })?;
     Ok(tokio::spawn(async move {
-        while let Some(packet) = rx.recv().await {
-            if let Err(error) = track
-                .write_sample(&Sample {
-                    data: Bytes::from(packet),
-                    duration: Duration::from_millis(10),
-                    ..Default::default()
-                })
-                .await
-            {
-                tracing::warn!(%error, "failed to write realtime microphone sample");
+        while let Some(samples) = rx.recv().await {
+            let frame = AudioFrame {
+                data: samples.into(),
+                sample_rate: SAMPLE_RATE,
+                num_channels: CHANNELS,
+                samples_per_channel: FRAME_SAMPLES as u32,
+            };
+            if let Err(error) = source.capture_frame(&frame).await {
+                tracing::warn!(?error, "failed to capture realtime microphone frame");
                 break;
             }
         }
