@@ -67,6 +67,25 @@
           };
         };
         rustyV8Archive = rustyV8Archives.${system};
+        webrtcPrebuilts = {
+          x86_64-linux = pkgs.fetchzip {
+            url = "https://github.com/zed-industries/livekit-rust-sdks/releases/download/webrtc-0001d84-4/webrtc-linux-x64-release.zip";
+            sha256 = "0hlv1p6fi1lgfdyq8q49gghbqbqnq50icrw7i25g2qwqmpf2jyi7";
+          };
+          aarch64-linux = pkgs.fetchzip {
+            url = "https://github.com/zed-industries/livekit-rust-sdks/releases/download/webrtc-0001d84-4/webrtc-linux-arm64-release.zip";
+            sha256 = "07dvljd51w6gaw0s9wy853fgzdszh2jb393x5rcdmvvlck8mbf01";
+          };
+          x86_64-darwin = pkgs.fetchzip {
+            url = "https://github.com/zed-industries/livekit-rust-sdks/releases/download/webrtc-0001d84-4/webrtc-mac-x64-release.zip";
+            sha256 = "01zi72i6nvk0lx92g747160bxv4lla908z9y9f8v9i2mwiqky8qd";
+          };
+          aarch64-darwin = pkgs.fetchzip {
+            url = "https://github.com/zed-industries/livekit-rust-sdks/releases/download/webrtc-0001d84-4/webrtc-mac-arm64-release.zip";
+            sha256 = "0mlcgqyd9b29cp70c73xwkaydid7n4i9xd3zpcx10ccrlnlzc3ds";
+          };
+        };
+        webrtcPrebuilt = webrtcPrebuilts.${system};
         selfciPkg = selfci.packages.${system}.default;
         selfciMq = selfci.packages.${system}.mq;
 
@@ -183,6 +202,7 @@
               env.RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
               env.RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
               env.RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
+              env.LK_CUSTOM_WEBRTC = webrtcPrebuilt;
               env.RUSTY_V8_ARCHIVE = rustyV8Archive;
               postPatch = ''
                 # Brush denies warnings, but the root lockfile can select a
