@@ -128,6 +128,11 @@ pub struct Workspace {
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
+    /// Markdown parsed off the main thread for agents the user has not
+    /// opened, newest-fed last. Only the few most recent are kept: the cache
+    /// exists to bridge a frame to the first view of it, and holding one per
+    /// agent would hold a parse of every transcript in the session.
+    parsed_ahead: Vec<(AgentId, Arc<crate::render::ParseAhead>)>,
     draft_model: Entity<DraftModel>,
     /// Registered workdirs from the daemon; selection vocabulary for new
     /// agents.
@@ -329,6 +334,7 @@ impl Workspace {
             remote_projects: HashMap::new(),
             pending_diff_loads: HashMap::new(),
             pending_syncs: HashMap::new(),
+            parsed_ahead: Vec::new(),
             draft_model,
             workdirs: Vec::new(),
             draft_workstream: None,
@@ -512,15 +518,19 @@ impl Workspace {
                             summary,
                             now_ms(),
                             &|id| self.registry.agent_display_label(id),
+                            None,
                             cx,
                         )
                     });
                 }
-            } else if self.models.contains_key(&agent_id) {
-                self.pending_syncs
-                    .entry(agent_id)
-                    .and_modify(|pending| *pending = pending.merge(summary))
-                    .or_insert(summary);
+            } else {
+                if self.models.contains_key(&agent_id) {
+                    self.pending_syncs
+                        .entry(agent_id)
+                        .and_modify(|pending| *pending = pending.merge(summary))
+                        .or_insert(summary);
+                }
+                self.parse_ahead(agent_id, cx);
             }
         }
 
@@ -2317,12 +2327,63 @@ impl Workspace {
         self.select_agent(Some(agent_id), window, cx);
     }
 
+    /// How many agents keep a parse-ahead cache. A user opens one of the
+    /// agents that just moved, not one of hundreds, and each cache holds a
+    /// parse of its transcript.
+    const PARSE_AHEAD_AGENTS: usize = 8;
+
+    /// Hands this agent's unparsed messages to a background thread, so the
+    /// first view of it finds them parsed. Pure work: the frame's text goes
+    /// out, spans and markup ranges come back, and nothing here touches the
+    /// window.
+    fn parse_ahead(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let Some(state) = self.store.get(&agent_id) else {
+            return;
+        };
+        let cache = match self.parsed_ahead.iter().position(|(id, _)| *id == agent_id) {
+            Some(index) => {
+                let entry = self.parsed_ahead.remove(index);
+                self.parsed_ahead.push(entry);
+                self.parsed_ahead.last().expect("just pushed").1.clone()
+            }
+            None => {
+                let cache = Arc::new(crate::render::ParseAhead::default());
+                self.parsed_ahead.push((agent_id, cache.clone()));
+                if self.parsed_ahead.len() > Self::PARSE_AHEAD_AGENTS {
+                    self.parsed_ahead.remove(0);
+                }
+                cache
+            }
+        };
+        let texts = cache.claim(&state.blocks);
+        if texts.is_empty() {
+            return;
+        }
+        let markdown = crate::render::markdown::Markdown::new(cx);
+        cx.background_spawn(async move { cache.fill(texts, &markdown) })
+            .detach();
+    }
+
+    /// The agent's parse-ahead cache, retired: it has served the view it was
+    /// made for.
+    fn take_parsed_ahead(&mut self, agent_id: &AgentId) -> Option<Arc<crate::render::ParseAhead>> {
+        let index = self
+            .parsed_ahead
+            .iter()
+            .position(|(id, _)| id == agent_id)?;
+        Some(self.parsed_ahead.remove(index).1)
+    }
+
     fn materialize_model(
         &mut self,
         agent_id: &AgentId,
         cx: &mut Context<Self>,
     ) -> Entity<AgentModel> {
         let deferred = self.pending_syncs.remove(agent_id);
+        // Whatever was parsed ahead is spent here: the records hold the
+        // result from now on, and a view of its own agent keeps rendering
+        // inline.
+        let parsed_ahead = self.take_parsed_ahead(agent_id);
         if let Some(view) = self.models.get(agent_id).cloned() {
             if let (Some(summary), Some(state)) = (deferred, self.store.get(agent_id)) {
                 view.update(cx, |view, cx| {
@@ -2331,6 +2392,7 @@ impl Workspace {
                         summary,
                         now_ms(),
                         &|id| self.registry.agent_display_label(id),
+                        parsed_ahead.as_deref(),
                         cx,
                     )
                 });
@@ -2348,6 +2410,7 @@ impl Workspace {
                     FrameSummary::everything(),
                     now_ms(),
                     &|id| self.registry.agent_display_label(id),
+                    parsed_ahead.as_deref(),
                     cx,
                 );
             });

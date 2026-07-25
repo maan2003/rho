@@ -36,6 +36,8 @@ pub struct PromptGutter;
 
 pub struct AgentModel {
     transcript: TranscriptModel,
+    /// Runs until the transcript's history is fully concealed.
+    conceal_task: Option<gpui::Task<()>>,
     prompt_buffer: Entity<Buffer>,
     system_buffer: Entity<Buffer>,
     system_excerpt_added: bool,
@@ -98,12 +100,11 @@ impl AgentModel {
             }
         })];
 
-        let document_multi_buffer =
-            cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
-        let transcript =
-            TranscriptModel::new(transcript_buffer, document_multi_buffer.clone());
+        let document_multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
+        let transcript = TranscriptModel::new(transcript_buffer, document_multi_buffer.clone());
         Self {
             transcript,
+            conceal_task: None,
             prompt_buffer,
             system_buffer,
             system_excerpt_added: false,
@@ -153,6 +154,7 @@ impl AgentModel {
         });
         self.transcript
             .attach(&editor, crate::workspace::now_ms(), cx);
+        self.conceal_history(cx);
         self.apply_system_styles_to(&editor, cx);
         self.preview_editor = Some(editor.clone());
         editor
@@ -204,6 +206,7 @@ impl AgentModel {
 
         self.transcript
             .attach(&editor, crate::workspace::now_ms(), cx);
+        self.conceal_history(cx);
         self.editors.push(editor.downgrade());
         self.apply_status_to(&editor, cx);
         self.apply_system_styles_to(&editor, cx);
@@ -226,10 +229,39 @@ impl AgentModel {
         summary: FrameSummary,
         now_ms: u64,
         agent_label: &impl Fn(rho_ui_proto::AgentId) -> String,
+        parsed_ahead: Option<&crate::render::ParseAhead>,
         cx: &mut Context<Self>,
     ) {
         self.transcript
-            .sync(state, summary, now_ms, agent_label, cx);
+            .sync(state, summary, now_ms, agent_label, parsed_ahead, cx);
+        self.conceal_history(cx);
+    }
+
+    /// Keeps concealing the transcript's history until it is done. Each pass
+    /// hides a bounded number of markup runs, so a long scrollback costs a
+    /// few frames of a few milliseconds instead of one frame of hundreds.
+    fn conceal_history(&mut self, cx: &mut Context<Self>) {
+        if !self.transcript.concealing() {
+            self.conceal_task = None;
+            return;
+        }
+        if self.conceal_task.is_some() {
+            return;
+        }
+        self.conceal_task = Some(cx.spawn(async move |view, cx| {
+            while view
+                .update(cx, |view, cx| {
+                    view.transcript.conceal_more(crate::workspace::now_ms(), cx);
+                    view.transcript.concealing()
+                })
+                .unwrap_or(false)
+            {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+            }
+            view.update(cx, |view, _| view.conceal_task = None).ok();
+        }));
     }
 
     pub fn tick_timers(&mut self, now_ms: u64, cx: &mut Context<Self>) {

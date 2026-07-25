@@ -15,6 +15,8 @@ mod pane;
 mod registry;
 mod render;
 mod rho_assets;
+#[cfg(test)]
+mod sampler;
 mod shell_view;
 mod store;
 mod style;

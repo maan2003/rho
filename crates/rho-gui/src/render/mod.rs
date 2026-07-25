@@ -5,12 +5,17 @@
 //! model applies these as bounded buffer edits. Keeping this layer pure makes
 //! block rendering testable as plain string assertions.
 
+pub mod conceal;
 pub mod elision;
 pub mod markdown;
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::hash::{Hash as _, Hasher as _};
+use std::ops::Range;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use gpui::App;
 use rho_ui_proto::remote::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_ui_proto::{AgentId, MessageDelivery};
 
@@ -65,6 +70,9 @@ pub struct RenderedBlock {
     /// Index of the span that should carry the user-message gutter accent.
     pub gutter_span: Option<usize>,
     pub inlay: Option<InlaySpec>,
+    /// Markdown markup to hide at the display layer, as byte ranges into
+    /// this block's rendered text.
+    pub conceal: Vec<Range<usize>>,
 }
 
 impl RenderedBlock {
@@ -108,17 +116,263 @@ fn separator(prev: Option<BlockKind>, current: BlockKind) -> Option<Span> {
     }
 }
 
+/// One assistant message parsed: its syntax spans and the markup to
+/// conceal, both derived from the message text alone.
+#[derive(Clone)]
+pub struct ParsedMessage {
+    spans: Vec<Span>,
+    conceal: Vec<Range<usize>>,
+}
+
+/// Assistant messages parsed before the view that will show them exists.
+///
+/// An agent nobody has opened yet stores its frames and renders them only on
+/// the first view, which puts the whole scrollback's markdown parse on the
+/// window's thread at the worst possible moment. Parsing is pure, so the
+/// frame that delivers the text hands it to a background thread instead and
+/// the first view collects the result.
+#[derive(Default)]
+pub struct ParseAhead {
+    /// Keyed by the hash of the message text: blocks shift as a transcript
+    /// grows and a delta re-renders its tail, but a message whose text did
+    /// not change hashes the same. `None` marks a parse already handed out,
+    /// so a burst of frames asks for the same text once.
+    parsed: Mutex<HashMap<u64, Option<ParsedMessage>>>,
+}
+
+/// Message text worth parsing ahead for one agent. A first view lands at the
+/// end of a transcript, so the budget is spent from the tail back.
+const PARSE_AHEAD_BYTES: usize = 512 * 1024;
+
+impl ParseAhead {
+    /// The messages of `blocks` this cache neither holds nor has handed out,
+    /// claimed by the caller to parse. Parses of text the state no longer
+    /// carries are dropped here, which is what bounds the cache.
+    pub fn claim(&self, blocks: &[UiBlock]) -> Vec<String> {
+        let mut budget = PARSE_AHEAD_BYTES;
+        let wanted = blocks
+            .iter()
+            .rev()
+            .filter_map(message_text)
+            .map_while(|text| {
+                budget = budget.checked_sub(text.len())?;
+                Some((text_hash(text), text))
+            })
+            .collect::<Vec<_>>();
+
+        let mut parsed = self.lock();
+        let keys = wanted.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        parsed.retain(|key, _| keys.contains(key));
+        wanted
+            .into_iter()
+            .filter(|(key, _)| match parsed.entry(*key) {
+                Entry::Occupied(_) => false,
+                Entry::Vacant(slot) => {
+                    slot.insert(None);
+                    true
+                }
+            })
+            .map(|(_, text)| text.to_owned())
+            .collect()
+    }
+
+    /// Parses claimed texts, over as many threads as they are worth. Runs
+    /// off the main thread, but a transcript is still a second of parsing
+    /// and the view it is meant for can arrive at any moment.
+    pub fn fill(&self, texts: Vec<String>, markdown: &markdown::Markdown) {
+        let fill = |texts: &[String]| {
+            for text in texts {
+                let message = parse_message(text, markdown);
+                // The state may have moved on while this parsed; fill only a
+                // claim that is still outstanding.
+                if let Some(slot @ None) = self.lock().get_mut(&text_hash(text)) {
+                    *slot = Some(message);
+                }
+            }
+        };
+
+        let total = texts.iter().map(String::len).sum::<usize>();
+        let threads = (total / MIN_BYTES_PER_PARSE_THREAD).clamp(1, max_parse_threads());
+        if threads == 1 {
+            fill(&texts);
+            return;
+        }
+        let per_thread = total.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut texts = texts.as_slice();
+            while !texts.is_empty() {
+                let take = texts_worth(texts, per_thread);
+                let (head, tail) = texts.split_at(take);
+                scope.spawn(move || fill(head));
+                texts = tail;
+            }
+        });
+    }
+
+    /// The parse of `text`, if one was made ahead of this view. Copied
+    /// rather than taken: a transcript may carry the same message twice, and
+    /// copying spans costs a fraction of parsing them again.
+    fn get(&self, text: &str) -> Option<ParsedMessage> {
+        self.lock().get(&text_hash(text))?.clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Option<ParsedMessage>>> {
+        self.parsed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn text_hash(text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Parses the assistant messages in `blocks`, over as many threads as the
+/// text is worth, taking whatever [`ParseAhead`] already holds. Parsing is
+/// pure and dominates a full sync of a long transcript; leaving it inline
+/// would parse the whole scrollback on the thread the window is waiting on.
+pub fn parse_messages(
+    blocks: &[UiBlock],
+    markdown: &markdown::Markdown,
+    ahead: Option<&ParseAhead>,
+) -> Vec<Option<ParsedMessage>> {
+    fn parse(
+        blocks: &[UiBlock],
+        markdown: &markdown::Markdown,
+        into: &mut [Option<ParsedMessage>],
+    ) {
+        for (block, slot) in blocks.iter().zip(into) {
+            if slot.is_none()
+                && let Some(text) = message_text(block)
+            {
+                *slot = Some(parse_message(text, markdown));
+            }
+        }
+    }
+
+    let mut parsed = Vec::new();
+    parsed.resize_with(blocks.len(), || None);
+    if let Some(ahead) = ahead {
+        for (block, slot) in blocks.iter().zip(&mut parsed) {
+            *slot = message_text(block).and_then(|text| ahead.get(text));
+        }
+    }
+
+    let total = unparsed_bytes(blocks, &parsed);
+    let threads = (total / MIN_BYTES_PER_PARSE_THREAD).clamp(1, max_parse_threads());
+    if threads == 1 {
+        parse(blocks, markdown, &mut parsed);
+        return parsed;
+    }
+
+    let per_thread = total.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut blocks = blocks;
+        let mut slots = parsed.as_mut_slice();
+        while !blocks.is_empty() {
+            let take = blocks_worth(blocks, slots, per_thread);
+            let (head, blocks_tail) = blocks.split_at(take);
+            let (head_slots, slots_tail) = slots.split_at_mut(take);
+            scope.spawn(move || parse(head, markdown, head_slots));
+            blocks = blocks_tail;
+            slots = slots_tail;
+        }
+    });
+    parsed
+}
+
+/// How many leading texts carry `bytes` worth, at least one.
+fn texts_worth(texts: &[String], bytes: usize) -> usize {
+    let mut taken = 0;
+    for (index, text) in texts.iter().enumerate() {
+        taken += text.len();
+        if taken >= bytes {
+            return index + 1;
+        }
+    }
+    texts.len()
+}
+
+/// The message text in `blocks` that no slot holds a parse for.
+fn unparsed_bytes(blocks: &[UiBlock], parsed: &[Option<ParsedMessage>]) -> usize {
+    blocks
+        .iter()
+        .zip(parsed)
+        .filter(|(_, slot)| slot.is_none())
+        .filter_map(|(block, _)| message_text(block))
+        .map(str::len)
+        .sum()
+}
+
+/// How many leading blocks carry `bytes` worth of unparsed text, at least one.
+fn blocks_worth(blocks: &[UiBlock], parsed: &[Option<ParsedMessage>], bytes: usize) -> usize {
+    let mut taken = 0;
+    for (index, (block, slot)) in blocks.iter().zip(parsed).enumerate() {
+        if slot.is_none() {
+            taken += message_text(block).map_or(0, str::len);
+        }
+        if taken >= bytes {
+            return index + 1;
+        }
+    }
+    blocks.len()
+}
+
+fn message_text(block: &UiBlock) -> Option<&str> {
+    match block {
+        UiBlock::AssistantMessage { text, .. } if !text.is_empty() => Some(text),
+        _ => None,
+    }
+}
+
+/// Text worth handing to a thread of its own. Below this the hand-off (and
+/// the per-thread parser setup behind it) costs more than the parse does:
+/// a 32KB transcript measured 0.10s in place against 0.16s on five threads.
+const MIN_BYTES_PER_PARSE_THREAD: usize = 64 * 1024;
+
+/// Past this the threads spend more on contention - the allocator, mostly,
+/// since parsing allocates heavily - than they save: a 320KB transcript
+/// measured 0.92s on one thread, 0.49s on eight, and 2.0s on fifty.
+const MAX_PARSE_THREADS: usize = 8;
+
+fn max_parse_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |threads| threads.get())
+        .min(MAX_PARSE_THREADS)
+}
+
+fn parse_message(text: &str, markdown: &markdown::Markdown) -> ParsedMessage {
+    let owned;
+    let text = if text.ends_with('\n') {
+        text
+    } else {
+        owned = format!("{text}\n");
+        &owned
+    };
+    // Both halves read the same trees: the grammars are the slowest thing
+    // in a transcript sync, so the message is parsed once.
+    let trees = conceal::parse(text);
+    ParsedMessage {
+        conceal: conceal::concealed_ranges_of(text, &trees),
+        spans: markdown::markdown_spans_of(text, &trees, markdown),
+    }
+}
+
 pub fn render_block_with_agent_labels(
     block: &UiBlock,
     prev: Option<BlockKind>,
     now_ms: u64,
     agent_label: &impl Fn(AgentId) -> String,
-    cx: &App,
+    markdown: &markdown::Markdown,
+    parsed: Option<ParsedMessage>,
 ) -> RenderedBlock {
     let kind = block_kind(block);
     let mut spans = Vec::new();
     let mut gutter_span = None;
     let mut inlay = None;
+    let mut conceal = Vec::new();
     match block {
         UiBlock::UserMessage { text } => {
             if text.is_empty() {
@@ -133,7 +387,16 @@ pub fn render_block_with_agent_labels(
                 return invisible(kind);
             }
             spans.extend(separator(prev, kind));
-            spans.extend(markdown::markdown_spans_with_newline(text, cx));
+            let parsed = parsed.unwrap_or_else(|| parse_message(text, markdown));
+            // Conceal ranges are computed over the message text; shift them
+            // past whatever separator this block rendered first.
+            let offset = spans_len(&spans);
+            conceal = parsed
+                .conceal
+                .into_iter()
+                .map(|range| range.start + offset..range.end + offset)
+                .collect();
+            spans.extend(parsed.spans);
         }
         UiBlock::Reasoning { .. } => return invisible(kind),
         UiBlock::Tool(tool) => {
@@ -207,7 +470,12 @@ pub fn render_block_with_agent_labels(
         kind,
         gutter_span,
         inlay,
+        conceal,
     }
+}
+
+fn spans_len(spans: &[Span]) -> usize {
+    spans.iter().map(|span| span.text.len()).sum()
 }
 
 fn invisible(kind: BlockKind) -> RenderedBlock {
@@ -216,6 +484,7 @@ fn invisible(kind: BlockKind) -> RenderedBlock {
         kind,
         gutter_span: None,
         inlay: None,
+        conceal: Vec::new(),
     }
 }
 

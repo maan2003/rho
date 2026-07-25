@@ -50,6 +50,6 @@ uuid.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 prost = "0.9"
-rpc = { git = "https://github.com/maan2003/zed", rev = "4ca9239e36f4" }
+rpc = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
 rho-shell.workspace = true
 senax-encoder.workspace = true

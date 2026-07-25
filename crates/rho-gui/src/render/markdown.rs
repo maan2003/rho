@@ -12,30 +12,65 @@ use language::{Language, LanguageConfig, LanguageMatcher, LanguageQueries, Rope}
 use theme::ActiveTheme as _;
 
 use super::Span;
+use super::conceal::Trees;
 use crate::style::StyleClass;
 
 static MARKDOWN_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 static MARKDOWN_INLINE_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 
-/// Highlights `text` as markdown, appending a trailing newline if missing.
-pub fn markdown_spans_with_newline(text: &str, cx: &App) -> Vec<Span> {
-    let mut text = text.to_owned();
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-    markdown_spans(&text, cx)
+/// The markdown grammars, carrying the theme they were last styled with.
+///
+/// Resolving them once per sync keeps the theme lookup out of the per-block
+/// path, and leaves rendering with no handle on the app - a block can then
+/// be rendered away from the main thread.
+#[derive(Clone, Copy)]
+pub struct Markdown {
+    block: Option<&'static Arc<Language>>,
+    inline: Option<&'static Arc<Language>>,
 }
 
-pub fn markdown_spans(text: &str, cx: &App) -> Vec<Span> {
-    let Some(markdown_language) = markdown_language(cx) else {
+impl Markdown {
+    pub fn new(cx: &App) -> Self {
+        let markdown = Self {
+            block: markdown_language(cx),
+            inline: markdown_inline_language(cx),
+        };
+        for language in [markdown.block, markdown.inline].into_iter().flatten() {
+            language.set_theme(cx.theme().syntax());
+        }
+        markdown
+    }
+}
+
+/// Highlights `text`, parsing it for that alone; rendering shares its parse
+/// with concealment through [`markdown_spans_of`].
+#[cfg(test)]
+pub fn markdown_spans(text: &str, markdown: &Markdown) -> Vec<Span> {
+    markdown_spans_of(text, &super::conceal::parse(text), markdown)
+}
+
+/// Highlights `text` as markdown from trees the caller already parsed.
+pub fn markdown_spans_of(text: &str, trees: &Trees, markdown: &Markdown) -> Vec<Span> {
+    let Some(markdown_language) = markdown.block else {
         return vec![Span::new(text, StyleClass::Default)];
     };
-    markdown_language.set_theme(cx.theme().syntax());
+    let Some(block_tree) = trees.block() else {
+        return vec![Span::new(text, StyleClass::Default)];
+    };
     let rope = Rope::from(text);
-    let mut highlights = markdown_language.highlight_text(&rope, 0..text.len());
-    if let Some(markdown_inline_language) = markdown_inline_language(cx) {
-        markdown_inline_language.set_theme(cx.theme().syntax());
-        highlights.extend(markdown_inline_language.highlight_text(&rope, 0..text.len()));
+    let mut highlights = markdown_language.highlight_tree(&rope, block_tree, 0..text.len());
+    if let Some(markdown_inline_language) = markdown.inline {
+        for (span, tree) in trees.inline() {
+            let span = span.start_byte..span.end_byte;
+            // Highlights come back relative to the range asked for.
+            let offset = span.start;
+            highlights.extend(
+                markdown_inline_language
+                    .highlight_tree(&rope, tree, span)
+                    .into_iter()
+                    .map(|(range, id)| (range.start + offset..range.end + offset, id)),
+            );
+        }
     }
     highlights.sort_by_key(|(range, _)| range.start);
 

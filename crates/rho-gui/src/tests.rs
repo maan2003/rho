@@ -266,6 +266,48 @@ fn display_text(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) ->
         .expect("read display text")
 }
 
+fn buffer_text(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
+    let editor = active_editor(workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| editor.text(cx))
+        })
+        .expect("read buffer text")
+}
+
+/// The visible text with the highlight colour applied to it, one entry per
+/// run of identical styling.
+fn styled_runs(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+) -> Vec<(String, Option<gpui::Hsla>)> {
+    let editor = active_editor(workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
+                let rows = DisplayRow(0)..DisplayRow(snapshot.max_point().row().0 + 1);
+                let mut runs: Vec<(String, Option<gpui::Hsla>)> = Vec::new();
+                for chunk in snapshot.chunks(
+                    rows,
+                    language::LanguageAwareStyling {
+                        tree_sitter: false,
+                        diagnostics: false,
+                    },
+                    editor::display_map::HighlightStyles::default(),
+                ) {
+                    let color = chunk.highlight_style.and_then(|style| style.color);
+                    match runs.last_mut() {
+                        Some((text, last)) if *last == color => text.push_str(chunk.text),
+                        _ => runs.push((chunk.text.to_owned(), color)),
+                    }
+                }
+                runs
+            })
+        })
+        .expect("read styled runs")
+}
+
 fn has_display_elision(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> bool {
     let editor = active_editor(workspace, cx);
     workspace
@@ -440,6 +482,415 @@ fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
     assert!(
         text.contains("hello world"),
         "streamed suffix should append to the frontier: {text:?}"
+    );
+}
+
+/// Times a transcript being attached and then streamed into, and prints
+/// where the time went. Not a check, so it stays out of the suite:
+///
+/// ```text
+/// PERF_BLOCKS=400 cargo test --release -p rho-gui --bin rho-gui \
+///     bench_markdown_transcript -- --ignored --nocapture
+/// ```
+#[gpui::test]
+#[ignore = "benchmark"]
+fn bench_markdown_transcript(cx: &mut TestAppContext) {
+    let blocks_count: usize = std::env::var("PERF_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    let paragraph = "The **fast path** in `crates/fastc/src/lib.rs` aggregates \
+`callback_stats` before **cancellation**, so *counts* stay deterministic and \
+`Instant::now()` never runs when tracing is off.\n";
+    let body = paragraph.repeat(4);
+
+    let workspace = test_workspace(cx);
+    let mut blocks = Vec::new();
+    for index in 0..blocks_count {
+        blocks.push(user(&format!("request {index}")));
+        blocks.push(assistant(&body, Some(UiMessagePhase::FinalAnswer)));
+    }
+    crate::sampler::start(2000);
+    let start = std::time::Instant::now();
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(blocks, Vec::new())),
+    );
+    let initial = start.elapsed();
+    let attach_samples = crate::sampler::stop();
+
+    // Stream a message into the tail of that transcript, one delta at a time.
+    let mut text = String::new();
+    let mut deltas = Vec::new();
+    for word in body.split_inclusive(' ') {
+        let keep_bytes = text.len();
+        text.push_str(word);
+        deltas.push((keep_bytes, word.to_owned()));
+    }
+    let index = blocks_count * 2 - 1;
+    let mut worst = std::time::Duration::ZERO;
+    crate::sampler::start(2000);
+    let start = std::time::Instant::now();
+    for (keep_bytes, value) in &deltas {
+        let delta = std::time::Instant::now();
+        feed_frame(
+            &workspace,
+            cx,
+            agent(1),
+            AgentRemoteFrame::Diff {
+                blocks: UiBlocksDiff {
+                    truncate_to: None,
+                    updates: vec![UiBlockUpdate {
+                        index,
+                        block: UiBlockDiff::AssistantText(UiTextDiff {
+                            keep_bytes: *keep_bytes,
+                            value: value.clone(),
+                        }),
+                    }],
+                },
+                status: None,
+                context_used: None,
+            },
+        );
+        worst = worst.max(delta.elapsed());
+    }
+    let streaming = start.elapsed();
+    let stream_samples = crate::sampler::stop();
+    let count = deltas.len() as u32;
+    println!(
+        "blocks={blocks_count} initial={initial:?} deltas={count} mean={:?} worst={worst:?}",
+        streaming / count
+    );
+    crate::sampler::report(&attach_samples, "attach");
+    crate::sampler::report(&stream_samples, "streaming");
+}
+
+/// Times the flows a session actually spends its day in - switching
+/// agents, typing, tool traffic, the dashboard - and prints where each
+/// one goes. Not a check, so it stays out of the suite:
+///
+/// ```text
+/// PERF_BLOCKS=200 cargo test --release -p rho-gui --bin rho-gui \\
+///     bench_rho_gui_flows -- --ignored --nocapture
+/// ```
+#[gpui::test]
+#[ignore = "benchmark"]
+fn bench_rho_gui_flows(cx: &mut TestAppContext) {
+    let blocks_count: usize = std::env::var("PERF_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let paragraph = "The **fast path** in `crates/fastc/src/lib.rs` aggregates \
+`callback_stats` before **cancellation**, so *counts* stay deterministic and \
+`Instant::now()` never runs when tracing is off.\n";
+    let transcript = |seed: usize| {
+        let mut blocks = Vec::new();
+        for index in 0..blocks_count {
+            // Every message is its own text, as a real transcript's are.
+            let body = format!("Answer {seed}.{index}:\n{}", paragraph.repeat(4));
+            blocks.push(user(&format!("request {seed}.{index}")));
+            blocks.push(assistant(&body, Some(UiMessagePhase::FinalAnswer)));
+            blocks.push(UiBlock::Tool(tool(
+                &format!("t{seed}.{index}"),
+                UiToolStatus::Success,
+                Some(1_000),
+                Some(1_200),
+            )));
+            blocks.push(UiBlock::Notice {
+                text: format!("notice {index}"),
+            });
+        }
+        blocks
+    };
+
+    let workspace = test_workspace(cx);
+    let phase = |label: &str, elapsed: std::time::Duration, count: u32| {
+        println!(
+            "{label}: total={elapsed:?} each={:?}",
+            elapsed / count.max(1)
+        );
+    };
+
+    // Attaching to an agent for the first time.
+    let start = std::time::Instant::now();
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(transcript(1), Vec::new())),
+    );
+    phase("attach", start.elapsed(), 1);
+
+    let start = std::time::Instant::now();
+    feed_frame(
+        &workspace,
+        cx,
+        agent(2),
+        snapshot_frame(state(transcript(2), Vec::new())),
+    );
+    phase("second agent frame", start.elapsed(), 1);
+    // The user takes a moment before switching; the parse ahead of that view
+    // runs in it.
+    let start = std::time::Instant::now();
+    cx.run_until_parked();
+    phase("parse ahead settles", start.elapsed(), 1);
+
+    // Switching between two agents that both carry a transcript.
+    crate::sampler::start(2000);
+    let start = std::time::Instant::now();
+    for index in 0..10 {
+        let id = agent(if index % 2 == 0 { 2 } else { 1 });
+        let one = std::time::Instant::now();
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.select_agent(Some(id), window, cx);
+            })
+            .expect("select agent");
+        println!("  switch {index}: {:?}", one.elapsed());
+    }
+    phase("agent switch", start.elapsed(), 10);
+    let switch_samples = crate::sampler::stop();
+
+    // Typing into the prompt with that transcript on screen.
+    let editor = active_editor(&workspace, cx);
+    crate::sampler::start(2000);
+    let start = std::time::Instant::now();
+    for character in "the quick brown fox jumps over the lazy dog".chars() {
+        workspace
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.insert(&character.to_string(), window, cx)
+                });
+            })
+            .expect("type prompt");
+    }
+    phase("prompt keystroke", start.elapsed(), 43);
+    let typing_samples = crate::sampler::stop();
+
+    // Tool traffic: one running tool ticking its status.
+    let index = blocks_count * 4 - 2;
+    let start = std::time::Instant::now();
+    for tick in 0..50u64 {
+        feed_frame(
+            &workspace,
+            cx,
+            agent(1),
+            AgentRemoteFrame::Diff {
+                blocks: UiBlocksDiff {
+                    truncate_to: None,
+                    updates: vec![UiBlockUpdate {
+                        index,
+                        block: UiBlockDiff::Tool(UiToolDiff {
+                            id: format!("t1.{}", blocks_count - 1),
+                            name: "shell_command".to_owned(),
+                            arguments: Some(UiTextDiff {
+                                keep_bytes: 0,
+                                value: format!("echo {tick}"),
+                            }),
+                            preview: None,
+                            status: Some(UiToolStatus::Running),
+                            output: None,
+                            error: None,
+                            started_at: None,
+                            finished_at: None,
+                            metadata: None,
+                        }),
+                    }],
+                },
+                status: None,
+                context_used: None,
+            },
+        );
+    }
+    phase("tool update", start.elapsed(), 50);
+
+    // The dashboard, listing every agent.
+    let agents: Vec<_> = (1..=200).map(|id| agent_summary(id, None)).collect();
+    let start = std::time::Instant::now();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                ConnEvent::Ready {
+                    workstreams: vec![UiWorkstream {
+                        workstream_id: WorkstreamId(1),
+                        name: "bench".to_owned(),
+                        labels: Vec::new(),
+                    }],
+                    agents,
+                    projects: Vec::new(),
+                    machine_seed: 0,
+                    agent_counter: 200,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("sync dashboard");
+    phase("dashboard sync (200 agents)", start.elapsed(), 1);
+    crate::sampler::start(4000);
+    let start = std::time::Instant::now();
+    for _ in 0..10 {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.sync_dashboard(window, cx)
+            })
+            .expect("resync dashboard");
+    }
+    phase("dashboard resync (200 agents)", start.elapsed(), 10);
+    let dashboard_samples = crate::sampler::stop();
+    crate::sampler::report(&dashboard_samples, "dashboard resync");
+
+    crate::sampler::report(&switch_samples, "agent switch");
+    crate::sampler::report(&typing_samples, "prompt keystroke");
+}
+
+#[gpui::test]
+fn highlights_survive_the_folds_that_conceal_markup(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![assistant(
+                "**bold** and `code` and plain\n",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+            Vec::new(),
+        )),
+    );
+
+    // Highlight text that spans and follows concealed markup. The chunk
+    // iterator seeks past every concealed run, and each seek has to keep
+    // the highlights it is in the middle of.
+    let red = gpui::rgb(0xff0000);
+    let blue = gpui::rgb(0x0000ff);
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            let buffer = editor.read(cx).buffer().clone();
+            let snapshot = buffer.read(cx).snapshot(cx);
+            let text = snapshot.text();
+            let anchors = |needle: &str| {
+                let start = text.find(needle).expect("highlighted text in buffer");
+                vec![
+                    snapshot.anchor_after(multi_buffer::MultiBufferOffset(start))
+                        ..snapshot
+                            .anchor_before(multi_buffer::MultiBufferOffset(start + needle.len())),
+                ]
+            };
+            // The first range spans four concealed runs, so it has to stay
+            // active across every seek the fold map makes inside it.
+            let bold = anchors("**bold** and `code`");
+            let plain = anchors("plain");
+            editor.update(cx, |editor, cx| {
+                editor.highlight_text(
+                    editor::display_map::HighlightKey::DocumentHighlightRead,
+                    bold,
+                    gpui::HighlightStyle::color(red.into()),
+                    cx,
+                );
+                editor.highlight_text(
+                    editor::display_map::HighlightKey::DocumentHighlightWrite,
+                    plain,
+                    gpui::HighlightStyle::color(blue.into()),
+                    cx,
+                );
+            });
+        })
+        .expect("highlight words around concealed markup");
+
+    let runs = styled_runs(&workspace, cx);
+    let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
+    assert!(
+        text.starts_with("bold and code and plain\n"),
+        "concealed markup should stay hidden: {text:?}"
+    );
+    let styled: Vec<_> = runs
+        .iter()
+        .filter(|(_, color)| color.is_some())
+        .map(|(text, color)| (text.as_str(), *color))
+        .collect();
+    assert_eq!(
+        styled,
+        vec![
+            ("bold and code", Some(red.into())),
+            ("plain", Some(blue.into())),
+        ],
+        "highlights should cover their own words and nothing else: {runs:?}"
+    );
+}
+
+#[gpui::test]
+fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant(
+                "## Heading\n\n**bold** and `code`.\n",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
+    );
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("Heading\n\nbold and code.\n"),
+        "markup should not reach the screen: {text:?}"
+    );
+    let buffer = buffer_text(&workspace, cx);
+    assert!(
+        buffer.contains("## Heading\n\n**bold** and `code`.\n"),
+        "the buffer keeps the markdown source for copy and search: {buffer:?}"
+    );
+
+    // Streaming past a concealed range refolds it in place.
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 1,
+                    block: UiBlockDiff::AssistantText(UiTextDiff {
+                        keep_bytes: "## Heading\n\n**bold** and `code`.\n".len(),
+                        value: "*more*\n".to_owned(),
+                    }),
+                }],
+            },
+            status: None,
+            context_used: None,
+        },
+    );
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("bold and code.\nmore\n"),
+        "streamed markup should conceal too: {text:?}"
+    );
+
+    // Concealed markup is decoration, not something the reader folded: an
+    // unfold leaves it hidden.
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.unfold_all(&editor::actions::UnfoldAll, window, cx);
+            });
+        })
+        .expect("unfold all");
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("bold and code.\nmore\n"),
+        "unfolding should not reveal markup: {text:?}"
     );
 }
 
@@ -1144,4 +1595,73 @@ fn terminal_escape_chord_parses() {
     for stroke in "ctrl-\\ ctrl-n".split(' ') {
         gpui::Keystroke::parse(stroke).expect("terminal escape chord must parse");
     }
+}
+
+/// The inline grammar runs over the spans the block parse marked inline, so
+/// a fenced code block keeps its punctuation: `**` inside one is content,
+/// not emphasis, and is styled as the code around it.
+#[gpui::test]
+fn fenced_code_keeps_its_asterisks(cx: &mut TestAppContext) {
+    let _workspace = test_workspace(cx);
+    let markdown = cx.update(|cx| crate::render::markdown::Markdown::new(cx));
+    let class_of = |text: &str, needle: &str| {
+        crate::render::markdown::markdown_spans(text, &markdown)
+            .into_iter()
+            .find(|span| span.text.contains(needle))
+            .unwrap_or_else(|| panic!("no span carries {needle:?}"))
+            .class
+    };
+
+    let fenced = "```\n**bold**\nplain\n```\n";
+    assert_eq!(class_of(fenced, "**bold**"), class_of(fenced, "plain"));
+    assert_ne!(
+        class_of("**bold**\n", "**bold**"),
+        class_of(fenced, "**bold**")
+    );
+    assert!(crate::render::conceal::concealed_ranges(fenced).is_empty());
+}
+
+/// Concealment is spread over frames: the tail a view opens on is hidden in
+/// the frame that opens it, and the history behind it follows without the
+/// user ever seeing its markup.
+#[gpui::test]
+fn long_transcripts_conceal_their_history_after_the_frame_that_opens_them(cx: &mut TestAppContext) {
+    let markup = (0..400)
+        .map(|index| format!("line **{index}** of `history`\n"))
+        .collect::<String>();
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant(&markup, Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+
+    // The tail is hidden right away; the head may still show its markup.
+    let opened = display_text(&workspace, cx);
+    assert!(
+        opened.contains("line 399 of history"),
+        "the tail a view opens on should be concealed in that frame"
+    );
+
+    // The backfill paces itself between frames; let those frames pass.
+    for _ in 0..64 {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+    }
+    cx.run_until_parked();
+    let settled = display_text(&workspace, cx);
+    assert!(
+        !settled.contains("**"),
+        "history should end up concealed like the tail"
+    );
+    assert!(settled.contains("line 0 of history"));
+    assert!(
+        buffer_text(&workspace, cx).contains("line **0** of `history`"),
+        "the buffer keeps the markup either way"
+    );
 }
