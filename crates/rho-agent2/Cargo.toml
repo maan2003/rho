@@ -11,6 +11,7 @@ anyhow.workspace = true
 async-stream.workspace = true
 bytes.workspace = true
 futures.workspace = true
+inventory = "0.3"
 rand.workspace = true
 redb.workspace = true
 rho-core.workspace = true

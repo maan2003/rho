@@ -1,401 +1,226 @@
-//! A small, standalone agent harness.
+//! A small agent harness built around one question.
 //!
-//! `rho-agent2` deliberately contains only the native inference loop, durable
-//! transcript/queue storage, and a cheap observable handle. It has no tools,
-//! workspace, collaboration, prompt discovery, Claude, or code-mode support.
+//! The transcript is an append-only list of [`ContextBlock`]s. Several things
+//! produce blocks — the model, tools, the user, peer agents — but only the
+//! core appends, so the transcript has exactly one writer and a total order.
+//!
+//! Everything that produces blocks is a *source*. Sources accumulate on their
+//! own and are **pulled** by the core at a moment the core picks, so several
+//! sources merge into one request rather than waking one request each. That
+//! makes the entire scheduler one question, asked after every event:
+//!
+//! > *Should the next request start now?*
+//!
+//! [`Agent::boundary`] answers it, and it is the only place in this crate that
+//! exercises judgment. Everything else — spawning, persisting, draining,
+//! publishing — is mechanism. The division of labour with tools follows from
+//! it: **nothing outside the core decides *when*, and the core never decides
+//! *what***. A tool reports what it has and how it is doing; the core weighs
+//! that against everything else and picks the moment. The only thing the core
+//! ever says back to a tool is [`ToolSession::cancel`] — wind down — and even
+//! then it collects the tool's parting output, so the tool has the last word.
+//!
+//! There is deliberately no notion of a "turn", no foreground/background tool
+//! distinction, and no stored status enum — each was a way of saying something
+//! the question above already answers.
+
+mod source;
+mod store;
+mod tool;
 
 use std::borrow::Cow;
-use std::num::NonZeroU64;
-use std::path::Path;
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use redb::TableHandle as _;
 use rho_core::{
-    ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
-    MessageDelivery, MessageSender, PendingInferenceResponse, ProviderResponseId,
+    AgentId as PeerId, ContentPart, ContextBlock, InferenceEvent, InferenceRequest,
+    InferenceResponseItem, PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId,
+    ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, UnixMs,
 };
-use rho_db::{RhoDb, Sen, SenValue};
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
-use senax_encoder::{Decode, Encode};
 use tokio::sync::{Notify, mpsc};
 
-const RECORDS: redb::TableDefinition<[u8; 16], Sen<AgentRecord>> =
-    redb::TableDefinition::new("rho-agent2.records.v1");
-const EVENTS: redb::TableDefinition<Sen<EventKey>, Sen<AgentEvent<'static>>> =
-    redb::TableDefinition::new("rho-agent2.events.v1");
+pub use crate::source::{
+    Delivery, InputKind, InputSource, Preview, PreviewData, QueuePreview, QueuedInput, ToolPreview,
+    UnknownPreviewData,
+};
+use crate::source::{MailSource, PendingSource, UserSource};
+use crate::store::{AgentEvent, AgentRecord};
+pub use crate::store::{AgentId, Store};
+use crate::tool::{FinishedSession, RunningTool, ToolTake, lost_to_restart};
+pub use crate::tool::{Rhythm, SourceWaker, Tool, ToolSession, ToolStatus, elide_middle};
 
-/// Stable identifier for an agent in a [`Store`].
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct AgentId([u8; 16]);
-
-impl AgentId {
-    pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn as_bytes(self) -> [u8; 16] {
-        self.0
-    }
-
-    fn generate() -> Self {
-        let mut bytes = [0; 16];
-        use rand::RngCore as _;
-        rand::thread_rng().fill_bytes(&mut bytes);
-        Self(bytes)
-    }
-}
-
-/// An isolated redb-backed store. It may use its own database file or coexist
-/// with unrelated `rho-db` tables.
-#[derive(Clone, Debug)]
-pub struct Store(RhoDb);
-
-impl Store {
-    pub fn open(path: impl AsRef<Path>) -> Self {
-        Self(RhoDb::open(path))
-    }
-
-    fn load(&self, id: AgentId) -> Option<(AgentRecord, Vec<AgentEvent<'static>>)> {
-        let read = self.0.read();
-        if !read.has_table(RECORDS.name()) {
-            return None;
-        }
-        let records = read.open_table(RECORDS);
-        let record = records.get(id.0)?.value().as_ref().clone();
-        let mut events = Vec::with_capacity(record.next_event as usize);
-        if record.next_event != 0 {
-            let table = read.open_table(EVENTS);
-            for sequence in 0..record.next_event {
-                let key = SenValue::owned(EventKey { id: id.0, sequence });
-                events.push(
-                    table
-                        .get(key)
-                        .unwrap_or_else(|| panic!("missing rho-agent2 event {sequence}"))
-                        .value()
-                        .as_ref()
-                        .clone(),
-                );
-            }
-        }
-        Some((record, events))
-    }
-
-    async fn create_record(&self, record: &AgentRecord) -> AgentId {
-        let mut write = self.0.write().await;
-        let mut records = write.open_table(RECORDS);
-        let id = loop {
-            let id = AgentId::generate();
-            if records.get(id.0).is_none() {
-                break id;
-            }
-        };
-        records.insert(id.0, SenValue::borrowed(record));
-        drop(records);
-        write.commit();
-        id
-    }
-
-    async fn append(&self, id: AgentId, sequence: u64, event: &AgentEvent<'_>) {
-        let mut write = self.0.write().await;
-        let mut records = write.open_table(RECORDS);
-        let mut record = records
-            .get(id.0)
-            .unwrap_or_else(|| panic!("rho-agent2 agent disappeared"))
-            .value()
-            .as_ref()
-            .clone();
-        assert_eq!(record.next_event, sequence, "stale agent event writer");
-        record.next_event += 1;
-        records.insert(id.0, SenValue::borrowed(&record));
-        drop(records);
-        let mut events = write.open_table(EVENTS);
-        events.insert(
-            SenValue::owned(EventKey { id: id.0, sequence }),
-            SenValue::borrowed(event),
-        );
-        drop(events);
-        write.commit();
-    }
-}
-
-#[derive(Clone, Debug, Encode, Decode)]
-struct AgentRecord {
-    instructions: String,
-    profile: InferenceProfile,
-    model: PersistedModel,
-    prompt_cache_key: PromptCacheKey,
-    next_event: u64,
-}
-
-#[derive(Clone, Copy, Debug, Encode, Decode)]
-enum PersistedModel {
-    Gpt55,
-    Gpt56Sol,
-    Gpt56Luna,
-    Gpt56Terra,
-}
-
-impl From<InferenceModel> for PersistedModel {
-    fn from(value: InferenceModel) -> Self {
-        match value {
-            InferenceModel::Gpt55 => Self::Gpt55,
-            InferenceModel::Gpt56Sol => Self::Gpt56Sol,
-            InferenceModel::Gpt56Luna => Self::Gpt56Luna,
-            InferenceModel::Gpt56Terra => Self::Gpt56Terra,
-        }
-    }
-}
-
-impl From<PersistedModel> for InferenceModel {
-    fn from(value: PersistedModel) -> Self {
-        match value {
-            PersistedModel::Gpt55 => Self::Gpt55,
-            PersistedModel::Gpt56Sol => Self::Gpt56Sol,
-            PersistedModel::Gpt56Luna => Self::Gpt56Luna,
-            PersistedModel::Gpt56Terra => Self::Gpt56Terra,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
-struct EventKey {
-    id: [u8; 16],
-    sequence: u64,
-}
-
-/// Durable timeline events. Queue insertion is recorded before it becomes
-/// live state, and dequeue boundaries make pending inputs restart-safe.
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-enum AgentEvent<'a> {
-    Queued(QueuedItem),
-    Dequeued {
-        boundary: MessageDelivery,
-    },
-    QueueCleared,
-    RequestStarted,
-    RequestCancelled,
-    InferenceResponse {
-        items: Cow<'a, [InferenceResponseItem]>,
-        provider_response_id: Option<ProviderResponseId>,
-        context_used: Option<u64>,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub struct QueuedItem {
-    pub kind: QueuedItemKind,
-    pub delivery: MessageDelivery,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum QueuedItemKind {
-    UserMessage {
-        sender: MessageSender,
-        content: Arc<Vec<ContentPart>>,
-    },
-    Compaction,
-}
-
+/// Everything a UI needs, rebuilt whenever state changes.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct InputQueue {
-    items: Vec<QueuedItem>,
-}
-
-impl InputQueue {
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &QueuedItem> {
-        self.items.iter()
-    }
-
-    fn drain(&mut self, boundary: MessageDelivery) -> Vec<QueuedItem> {
-        let mut delivered = Vec::new();
-        self.items.retain(|item| {
-            let eligible =
-                boundary == MessageDelivery::NextTurn || item.delivery != MessageDelivery::NextTurn;
-            if eligible {
-                delivered.push(item.clone());
-            }
-            !eligible
-        });
-        delivered
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AgentState {
-    pub blocks: Vec<Arc<ContextBlock>>,
-    pub queued_inputs: InputQueue,
-    pub status: AgentStatus,
+pub struct AgentSnapshot {
+    pub history: Vec<Arc<ContextBlock>>,
+    /// Non-consuming view of what each source is holding, and since when.
+    /// Readiness signals to the core carry no payload, so this is the only way
+    /// to show pending content before it is pulled.
+    pub previews: Vec<Preview>,
+    /// Cancelled, and waiting for fresh input before doing anything else.
+    pub stopped: bool,
+    /// Model output for the in-flight request. Provisional: a failure drops it
+    /// without touching history.
+    pub streaming: Option<PendingInferenceResponse>,
     pub context_used: Option<u64>,
+    pub last_error: Option<Arc<str>>,
     pub quota: Option<QuotaObservation>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum AgentStatus {
-    Idle,
-    Streaming {
-        pending_response: PendingInferenceResponse,
-        temporary_failures: u64,
-        last_error: Option<Arc<str>>,
-    },
-    /// The process stopped after a request began but before its response was
-    /// durably recorded. Call [`Agent::continue_turn`] to retry it.
-    Interrupted,
-    Error {
-        error: Arc<str>,
-        attempt_count: NonZeroU64,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuotaObservation {
-    pub observed_at: rho_core::UnixMs,
+    pub observed_at: UnixMs,
     pub used_percent: u8,
     pub reset_at_unix: Option<i64>,
 }
 
-/// Cheap handle for observing and controlling a running agent.
+/// The tools an agent may call.
+#[derive(Clone, Default)]
+pub struct ToolRegistry {
+    tools: BTreeMap<ToolName, Arc<dyn Tool>>,
+}
+
+impl ToolRegistry {
+    pub fn register(&mut self, tool: impl Tool) -> &mut Self {
+        let spec = tool.spec();
+        self.tools.insert(spec.name, Arc::new(tool));
+        self
+    }
+
+    pub fn specs(&self) -> Arc<[ToolSpec]> {
+        self.tools.values().map(|tool| tool.spec()).collect()
+    }
+
+    fn get(&self, name: &ToolName) -> Option<&Arc<dyn Tool>> {
+        self.tools.get(name)
+    }
+}
+
+impl std::fmt::Debug for ToolRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolRegistry")
+            .field("tools", &self.tools.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Cheap clonable handle for observing and driving a running agent.
 #[derive(Clone)]
-pub struct Agent {
+pub struct AgentHandle {
     id: AgentId,
-    state: Arc<RwLock<AgentState>>,
     control: mpsc::UnboundedSender<Control>,
+    snapshot: Arc<RwLock<AgentSnapshot>>,
     notify: Arc<Notify>,
 }
 
-impl Agent {
+impl AgentHandle {
     pub async fn create(
         store: Store,
         auth: InferenceAuth,
         profile: InferenceProfile,
         model: InferenceModel,
+        registry: ToolRegistry,
         instructions: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let record = AgentRecord {
             instructions: instructions.into(),
-            // This harness never exposes code mode, regardless of a copied
-            // caller profile.
-            profile: InferenceProfile {
-                code_mode: false,
-                ..profile
-            },
+            profile,
             model: model.into(),
             prompt_cache_key: PromptCacheKey::generate(),
             next_event: 0,
         };
         let id = store.create_record(&record).await;
-        Ok(Self::start(store, auth, id, record, Restored::default()))
+        Ok(Agent::start(
+            store,
+            auth,
+            id,
+            record,
+            registry,
+            Restored::default(),
+        ))
     }
 
-    pub fn load(store: Store, auth: InferenceAuth, id: AgentId) -> anyhow::Result<Self> {
-        let (mut record, events) = store
-            .load(id)
-            .ok_or_else(|| anyhow::anyhow!("rho-agent2 agent not found"))?;
-        record.profile.code_mode = false;
-        Ok(Self::start(store, auth, id, record, restore(events)))
-    }
-
-    fn start(
+    pub fn load(
         store: Store,
         auth: InferenceAuth,
+        registry: ToolRegistry,
         id: AgentId,
-        record: AgentRecord,
-        restored: Restored,
-    ) -> Self {
-        let session = InferenceSession::new_deep(
+    ) -> anyhow::Result<Self> {
+        let (record, events) = store
+            .load(id)
+            .ok_or_else(|| anyhow::anyhow!("rho-agent2 agent not found"))?;
+        Ok(Agent::start(
+            store,
             auth,
-            record.profile,
-            record.model.into(),
-            record.prompt_cache_key,
-        );
-        let state = Arc::new(RwLock::new(AgentState {
-            blocks: restored.blocks,
-            queued_inputs: restored.queue,
-            status: if restored.request_active {
-                AgentStatus::Interrupted
-            } else {
-                AgentStatus::Idle
-            },
-            context_used: restored.context_used,
-            quota: None,
-        }));
-        let notify = Arc::new(Notify::new());
-        let (control, control_rx) = mpsc::unbounded_channel();
-        tokio::spawn(
-            AgentLoop {
-                store,
-                id,
-                next_event: record.next_event,
-                instructions: Arc::from(record.instructions),
-                session,
-                auto_compaction_in_flight: false,
-                state: Arc::clone(&state),
-                notify: Arc::clone(&notify),
-                control_rx,
-            }
-            .run(),
-        );
-        Self {
             id,
-            state,
-            control,
-            notify,
-        }
+            record,
+            registry,
+            restore(events),
+        ))
     }
 
     pub fn id(&self) -> AgentId {
         self.id
     }
 
-    pub fn state(&self) -> AgentState {
-        self.state.read().expect("poisoned agent state").clone()
+    pub fn snapshot(&self) -> AgentSnapshot {
+        self.snapshot.read().expect("poisoned snapshot").clone()
     }
 
-    pub fn send_user_message(&self, text: impl Into<String>, delivery: MessageDelivery) {
-        let _ = self.control.send(Control::Enqueue(QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender: MessageSender::User,
-                content: Arc::new(vec![ContentPart::Text { text: text.into() }]),
+    pub fn send_user_message(&self, text: impl Into<String>, delivery: Delivery) {
+        self.send_input(
+            InputKind::Message {
+                content: vec![ContentPart::Text { text: text.into() }],
             },
             delivery,
-        }));
+        );
     }
 
-    pub fn compact(&self, delivery: MessageDelivery) {
-        let _ = self.control.send(Control::Enqueue(QueuedItem {
-            kind: QueuedItemKind::Compaction,
+    pub fn compact(&self) {
+        self.send_input(InputKind::Compaction, Delivery::NextRequest);
+    }
+
+    fn send_input(&self, kind: InputKind, delivery: Delivery) {
+        let _ = self.control.send(Control::User(QueuedInput {
+            source: InputSource::User,
+            kind,
             delivery,
+            at: UnixMs::now(),
         }));
     }
 
-    pub fn continue_turn(&self) {
-        let _ = self.control.send(Control::Continue);
+    pub fn send_mail(&self, peer: PeerId, text: impl Into<String>) {
+        let _ = self.control.send(Control::Mail {
+            peer,
+            content: vec![ContentPart::Text { text: text.into() }],
+            at: UnixMs::now(),
+        });
     }
 
-    /// Abort the current request and durably discard queued inputs.
+    /// Abort the in-flight request and durably discard queued inputs.
     pub fn cancel(&self) {
         let _ = self.control.send(Control::Cancel);
     }
 
-    /// Yields an immediate snapshot and then every changed state.
-    pub fn subscribe(&self) -> impl futures::Stream<Item = AgentState> + use<> {
-        let state = Arc::clone(&self.state);
+    /// Retry after a failure, or resume a request interrupted by a restart.
+    pub fn retry(&self) {
+        let _ = self.control.send(Control::Retry);
+    }
+
+    /// An immediate snapshot, then every subsequent change.
+    pub fn subscribe(&self) -> impl futures::Stream<Item = AgentSnapshot> + use<> {
+        let snapshot = Arc::clone(&self.snapshot);
         let notify = Arc::clone(&self.notify);
         async_stream::stream! {
             loop {
                 let notified = notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                let snapshot = state.read().expect("poisoned agent state").clone();
-                yield snapshot;
+                let current = snapshot.read().expect("poisoned snapshot").clone();
+                yield current;
                 notified.await;
             }
         }
@@ -403,231 +228,717 @@ impl Agent {
 }
 
 enum Control {
-    Enqueue(QueuedItem),
-    Continue,
+    User(QueuedInput),
+    Mail {
+        peer: PeerId,
+        content: Vec<ContentPart>,
+        at: UnixMs,
+    },
     Cancel,
+    Retry,
 }
 
-struct AgentLoop {
+/// Everything that can move the agent. The `select!` normalises sources into
+/// one of these and does nothing else; all judgment lives in [`Agent::handle`]
+/// and [`Agent::boundary`].
+enum Event {
+    Control(Control),
+    Inference(InferenceEvent),
+    /// A tool says something about it changed. Deliberately carries no
+    /// payload: the core asks the sources what they hold when it decides to.
+    SourceChanged,
+    /// A rhythm deadline expired; re-ask the question.
+    Tick,
+}
+
+/// The in-flight request. Provisional until it finishes: a failure drops the
+/// whole thing without touching history.
+struct Inference {
+    pending: PendingInferenceResponse,
+    temporary_failures: u64,
+}
+
+/// A standing instruction that overrides the ordinary rhythm rules. The two
+/// overrides are opposites, so they cannot both be in force.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Standing {
+    /// Follow the rhythms.
+    #[default]
+    Normal,
+    /// Send at the next opportunity even with nothing pending: a retry, a
+    /// restart resume, or carrying on after a compaction.
+    MustSend,
+    /// Cancelled. Tool output still reaches history at the next boundary, but
+    /// nothing may *start* a request until fresh user input arrives —
+    /// otherwise a cancelled tool's dying words would wake the agent straight
+    /// back up.
+    Halted,
+}
+
+/// Whether the next request starts now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Boundary {
+    /// Not yet. Wait for more events, or for a rhythm deadline.
+    No,
+    /// Drain every source and send.
+    Now,
+    /// Throw away the in-flight request first.
+    AbortNow,
+}
+
+struct Agent {
     store: Store,
     id: AgentId,
     next_event: u64,
     instructions: Arc<str>,
+
+    /// The transcript. Append-only, and this struct is its sole writer.
+    history: Vec<Arc<ContextBlock>>,
+
     session: InferenceSession,
+    inference: Option<Inference>,
+
+    user: UserSource,
+    mail: BTreeMap<PeerId, MailSource>,
+    tools: BTreeMap<ToolCallId, RunningTool>,
+
+    registry: ToolRegistry,
+
+    /// When the model last spoke. `max_hold` is measured from here, because
+    /// impatience is a property of the conversation's cadence rather than of
+    /// any single pending item.
+    last_response_at: UnixMs,
+    context_used: Option<u64>,
+    standing: Standing,
     auto_compaction_in_flight: bool,
-    state: Arc<RwLock<AgentState>>,
+    last_error: Option<Arc<str>>,
+    quota: Option<QuotaObservation>,
+    /// Content-free signal that some tool changed. Tools hold a
+    /// [`SourceWaker`] over this; the core rescans rather than being told.
+    wake: Arc<Notify>,
+
+    snapshot: Arc<RwLock<AgentSnapshot>>,
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<Control>,
 }
 
-impl AgentLoop {
-    async fn run(mut self) {
-        loop {
-            let mut state = self.state.read().expect("poisoned agent state").clone();
-            tokio::select! {
-                biased;
-                control = self.control_rx.recv() => {
-                    let Some(control) = control else { return };
-                    match control {
-                        Control::Enqueue(item) => {
-                            self.persist(AgentEvent::Queued(item.clone())).await;
-                            state.queued_inputs.items.push(item);
-                            if !matches!(state.status, AgentStatus::Streaming { .. }) {
-                                self.deliver(&mut state, MessageDelivery::NextTurn).await;
-                                self.start_request(&mut state).await;
-                            }
-                        }
-                        Control::Continue => {
-                            let should_continue = matches!(
-                                state.status,
-                                AgentStatus::Interrupted | AgentStatus::Error { .. }
-                            ) || (matches!(state.status, AgentStatus::Idle)
-                                && !state.queued_inputs.is_empty());
-                            if should_continue {
-                                self.deliver(&mut state, MessageDelivery::NextTurn).await;
-                                if !state.blocks.is_empty() {
-                                    self.start_request(&mut state).await;
-                                }
-                            }
-                        }
-                        Control::Cancel => {
-                            self.session.abort();
-                            self.auto_compaction_in_flight = false;
-                            self.persist(AgentEvent::RequestCancelled).await;
-                            if !state.queued_inputs.is_empty() {
-                                self.persist(AgentEvent::QueueCleared).await;
-                                state.queued_inputs.items.clear();
-                            }
-                            state.status = AgentStatus::Idle;
-                        }
-                    }
-                }
-                event = self.session.run() => {
-                    let AgentStatus::Streaming {
-                        mut pending_response,
-                        mut temporary_failures,
-                        mut last_error,
-                    } = std::mem::replace(&mut state.status, AgentStatus::Idle) else {
-                        unreachable!("inference event without active request")
-                    };
-                    match event {
-                        InferenceEvent::RequestSent | InferenceEvent::StreamingStarted => {}
-                        InferenceEvent::Quota { used_percent, reset_at_unix } => {
-                            state.quota = Some(QuotaObservation {
-                                observed_at: rho_core::UnixMs::now(),
-                                used_percent,
-                                reset_at_unix,
-                            });
-                        }
-                        InferenceEvent::ContextItem { index, event } => {
-                            pending_response.apply(index, event);
-                        }
-                        InferenceEvent::TemporaryFailure { error, .. } => {
-                            temporary_failures = temporary_failures.saturating_add(1);
-                            last_error = Some(Arc::from(error.to_string()));
-                            pending_response = PendingInferenceResponse::default();
-                        }
-                        InferenceEvent::Failed { error } => {
-                            self.auto_compaction_in_flight = false;
-                            state.status = AgentStatus::Error {
-                                error: Arc::from(error.to_string()),
-                                attempt_count: NonZeroU64::new(temporary_failures.saturating_add(1))
-                                    .unwrap(),
-                            };
-                            self.publish(state);
-                            continue;
-                        }
-                        InferenceEvent::Finished { usage, provider_response_id } => {
-                            match pending_response.finish() {
-                                Err(error) => {
-                                    self.auto_compaction_in_flight = false;
-                                    state.status = AgentStatus::Error {
-                                        error: Arc::from(error.to_string()),
-                                        attempt_count: NonZeroU64::new(
-                                            temporary_failures.saturating_add(1),
-                                        ).unwrap(),
-                                    };
-                                }
-                                Ok(items) => {
-                                    let compacted = items.iter().any(|item| {
-                                        matches!(item, InferenceResponseItem::Compaction { .. })
-                                    });
-                                    let context_used = (!compacted)
-                                        .then(|| usage.map(|u| u.input_tokens + u.output_tokens))
-                                        .flatten();
-                                    state.context_used = context_used.or(state.context_used);
-                                    if compacted {
-                                        state.context_used = None;
-                                    }
-                                    self.persist(AgentEvent::InferenceResponse {
-                                        items: Cow::Borrowed(&items),
-                                        provider_response_id: provider_response_id.clone(),
-                                        context_used,
-                                    }).await;
-                                    let unexpected_tool = items.iter().any(|item| {
-                                        matches!(item, InferenceResponseItem::ToolCall { .. })
-                                    });
-                                    state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
-                                        items,
-                                        provider_response_id,
-                                    }));
-                                    if unexpected_tool {
-                                        self.auto_compaction_in_flight = false;
-                                        state.status = AgentStatus::Error {
-                                            error: Arc::from(
-                                                "provider returned a tool call with an empty tool surface",
-                                            ),
-                                            attempt_count: NonZeroU64::MIN,
-                                        };
-                                    } else if compacted
-                                        && std::mem::take(&mut self.auto_compaction_in_flight)
-                                    {
-                                        self.deliver(&mut state, MessageDelivery::NextRequest).await;
-                                        self.start_request(&mut state).await;
-                                    } else if !state.queued_inputs.is_empty() {
-                                        self.deliver(&mut state, MessageDelivery::NextTurn).await;
-                                        self.start_request(&mut state).await;
-                                    } else {
-                                        state.status = AgentStatus::Idle;
-                                    }
-                                }
-                            }
-                            self.publish(state);
-                            continue;
-                        }
-                    }
-                    state.status = AgentStatus::Streaming {
-                        pending_response,
-                        temporary_failures,
-                        last_error,
-                    };
-                }
-            }
-            self.publish(state);
+impl Agent {
+    fn start(
+        store: Store,
+        auth: InferenceAuth,
+        id: AgentId,
+        record: AgentRecord,
+        registry: ToolRegistry,
+        restored: Restored,
+    ) -> AgentHandle {
+        let session = InferenceSession::new_deep(
+            auth,
+            record.profile,
+            record.model.into(),
+            record.prompt_cache_key,
+        );
+        let snapshot = Arc::new(RwLock::new(AgentSnapshot::default()));
+        let notify = Arc::new(Notify::new());
+        let (control, control_rx) = mpsc::unbounded_channel();
+
+        let mut agent = Self {
+            store,
+            id,
+            next_event: record.next_event,
+            instructions: Arc::from(record.instructions),
+            history: restored.history,
+            session,
+            inference: None,
+            user: restored.user,
+            mail: restored.mail,
+            tools: BTreeMap::new(),
+            registry,
+            last_response_at: UnixMs::now(),
+            context_used: restored.context_used,
+            standing: if restored.request_active {
+                Standing::MustSend
+            } else {
+                Standing::Normal
+            },
+            auto_compaction_in_flight: false,
+            last_error: None,
+            quota: None,
+            wake: Arc::new(Notify::new()),
+            snapshot: Arc::clone(&snapshot),
+            notify: Arc::clone(&notify),
+            control_rx,
+        };
+
+        tokio::spawn(async move {
+            agent.recover_lost_tools(restored.orphan_tools).await;
+            agent.publish();
+            agent.run().await;
+        });
+
+        AgentHandle {
+            id,
+            control,
+            snapshot,
+            notify,
         }
     }
+
+    async fn run(mut self) {
+        loop {
+            let deadline = self.next_deadline(UnixMs::now());
+            let event = {
+                let Self {
+                    control_rx,
+                    session,
+                    wake,
+                    ..
+                } = &mut self;
+                next_event(control_rx, session, wake, deadline).await
+            };
+            let Some(event) = event else { return };
+            self.handle(event).await;
+            self.publish();
+        }
+    }
+
+    /// The single funnel. Every event updates state, then asks the one
+    /// question.
+    async fn handle(&mut self, event: Event) {
+        let now = UnixMs::now();
+        match event {
+            Event::Control(Control::User(input)) => {
+                self.persist(AgentEvent::Queued(input.clone())).await;
+                self.user.push(input);
+                // Fresh instructions revive a cancelled agent; peer mail alone
+                // does not, so a cancel stays a cancel.
+                if self.standing == Standing::Halted {
+                    self.standing = Standing::Normal;
+                }
+            }
+            Event::Control(Control::Mail { peer, content, at }) => {
+                let input = QueuedInput {
+                    source: InputSource::Mail { peer },
+                    kind: InputKind::Message {
+                        content: content.clone(),
+                    },
+                    delivery: Delivery::NextRequest,
+                    at,
+                };
+                self.persist(AgentEvent::Queued(input)).await;
+                self.mail
+                    .entry(peer)
+                    .or_insert_with(|| MailSource::new(peer, at))
+                    .push(content, at);
+            }
+            Event::Control(Control::Cancel) => self.cancel(now).await,
+            Event::Control(Control::Retry) => {
+                self.last_error = None;
+                self.standing = Standing::MustSend;
+            }
+            Event::Inference(event) => self.on_inference(event, now).await,
+            // Both are pure prompts to re-ask the question; what a source
+            // reports is read live, so there is nothing to record here.
+            Event::SourceChanged | Event::Tick => {}
+        }
+        self.maybe_request().await;
+    }
+
+    // -- the one decision ---------------------------------------------------
+
+    fn schedule(&self) -> Schedule {
+        Schedule {
+            pending: self.pending_sources(),
+            inference_active: self.inference.is_some(),
+            wants_interrupt: self.user.wants_interrupt(),
+            standing: self.standing,
+            last_response_at: self.last_response_at,
+        }
+    }
+
+    fn boundary(&self, now: UnixMs) -> Boundary {
+        self.schedule().boundary(now)
+    }
+
+    fn next_deadline(&self, now: UnixMs) -> Option<UnixMs> {
+        self.schedule().next_deadline(now)
+    }
+
+    fn pending_sources(&self) -> Vec<PendingSource> {
+        let mut sources: Vec<PendingSource> = Vec::new();
+        sources.extend(self.user.pending_source());
+        sources.extend(self.mail.values().filter_map(MailSource::pending_source));
+        sources.extend(
+            self.tools
+                .values()
+                .filter(|tool| tool.pending())
+                .map(|tool| {
+                    let status = tool.status();
+                    if status.exited {
+                        PendingSource::done(tool.rhythm)
+                    } else {
+                        PendingSource::talking(tool.rhythm, status.last_output_at)
+                    }
+                }),
+        );
+        sources
+    }
+
+    // -- acting on it -------------------------------------------------------
+
+    async fn maybe_request(&mut self) {
+        let now = UnixMs::now();
+        if self.boundary(now) == Boundary::AbortNow {
+            self.session.abort();
+            self.inference = None;
+            self.auto_compaction_in_flight = false;
+            self.persist(AgentEvent::RequestEnded { context_used: None })
+                .await;
+        }
+        if self.boundary(now) == Boundary::Now {
+            self.start_request(now).await;
+        }
+    }
+
+    async fn start_request(&mut self, now: UnixMs) {
+        let mut blocks = self.drain(now);
+
+        // Automatic compaction is not an input — it is something the core does
+        // while assembling a request. (A user-requested compaction *is* an
+        // input, and arrives through the user queue.)
+        let over_limit = self
+            .session
+            .auto_compact_token_limit()
+            .zip(self.context_used)
+            .is_some_and(|(limit, used)| used >= limit);
+        let compact = over_limit
+            && !latest_request_has_compaction_trigger(&self.history)
+            && !blocks.contains(&ContextBlock::CompactionTrigger);
+        if compact {
+            blocks.push(ContextBlock::CompactionTrigger);
+        }
+        self.auto_compaction_in_flight = compact;
+
+        if !blocks.is_empty() {
+            self.persist(AgentEvent::Appended {
+                blocks: Cow::Borrowed(&blocks),
+                drained: true,
+            })
+            .await;
+            self.history.extend(blocks.into_iter().map(Arc::new));
+        }
+        self.reap_tools().await;
+
+        self.persist(AgentEvent::RequestStarted).await;
+        self.session.request(InferenceRequest {
+            instructions: Arc::clone(&self.instructions),
+            input: self.history.clone(),
+            agent_id_labels: Default::default(),
+            tools: self.registry.specs(),
+        });
+        self.inference = Some(Inference {
+            pending: PendingInferenceResponse::default(),
+            temporary_failures: 0,
+        });
+        self.standing = Standing::Normal;
+    }
+
+    /// Pull from *every* source, not just whichever one triggered the
+    /// boundary. Batching them into one request is the whole point of pulling.
+    ///
+    /// Order is protocol-constrained rather than chronological: a provider
+    /// wants each `ToolCall` answered adjacent to the call, so tool output
+    /// leads.
+    fn drain(&mut self, now: UnixMs) -> Vec<ContextBlock> {
+        let mut blocks = Vec::new();
+
+        let mut results: Vec<ToolResult> = Vec::new();
+        let mut updates = Vec::new();
+        for tool in self.tools.values_mut() {
+            match tool.take(now) {
+                Some(ToolTake::Result(result)) => results.push(result),
+                Some(ToolTake::Update(update)) => updates.push(ContextBlock::ToolUpdate(update)),
+                None => {}
+            }
+        }
+        if !results.is_empty() {
+            blocks.push(ContextBlock::ToolResults { results });
+        }
+        blocks.extend(updates);
+
+        blocks.extend(self.mail.values_mut().filter_map(MailSource::take));
+        blocks.extend(self.user.take());
+        blocks
+    }
+
+    /// Forget tools that exited and whose output the model has seen, so a long
+    /// session does not accumulate them forever.
+    async fn reap_tools(&mut self) {
+        let done: Vec<ToolCallId> = self
+            .tools
+            .iter()
+            .filter(|(_, tool)| tool.reapable())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for call_id in done {
+            self.persist(AgentEvent::ToolReaped {
+                call_id: call_id.clone(),
+            })
+            .await;
+            self.tools.remove(&call_id);
+        }
+    }
+
+    async fn cancel(&mut self, now: UnixMs) {
+        // Ask every tool to wind down, then keep reading it: the core does not
+        // kill tools, so a tool still chooses its own last words. Those words
+        // reach history at the next boundary, but `stopped` makes sure they
+        // cannot themselves *cause* a boundary.
+        for tool in self.tools.values_mut() {
+            tool.cancel();
+        }
+        self.standing = Standing::Halted;
+        self.session.abort();
+        self.inference = None;
+        self.auto_compaction_in_flight = false;
+        self.persist(AgentEvent::RequestEnded { context_used: None })
+            .await;
+        if !self.user.is_empty() || self.mail.values().any(|mail| !mail.is_empty()) {
+            self.persist(AgentEvent::QueueCleared).await;
+            self.user.clear();
+            for mail in self.mail.values_mut() {
+                mail.clear();
+            }
+        }
+        let _ = now;
+    }
+
+    // -- inference ----------------------------------------------------------
+
+    async fn on_inference(&mut self, event: InferenceEvent, now: UnixMs) {
+        let Some(inference) = self.inference.as_mut() else {
+            return;
+        };
+        match event {
+            InferenceEvent::RequestSent | InferenceEvent::StreamingStarted => {}
+            InferenceEvent::Quota {
+                used_percent,
+                reset_at_unix,
+            } => {
+                self.quota = Some(QuotaObservation {
+                    observed_at: now,
+                    used_percent,
+                    reset_at_unix,
+                });
+            }
+            InferenceEvent::ContextItem { index, event } => inference.pending.apply(index, event),
+            InferenceEvent::TemporaryFailure { error, .. } => {
+                inference.temporary_failures += 1;
+                self.last_error = Some(Arc::from(error.to_string()));
+                // The retry starts a fresh response; drop the partial one.
+                inference.pending = PendingInferenceResponse::default();
+            }
+            InferenceEvent::Failed { error } => {
+                self.last_error = Some(Arc::from(error.to_string()));
+                self.fail_request().await;
+            }
+            InferenceEvent::Finished {
+                usage,
+                provider_response_id,
+            } => {
+                let items = inference.pending.finish();
+                match items {
+                    Err(error) => {
+                        self.last_error = Some(Arc::from(error.to_string()));
+                        self.fail_request().await;
+                    }
+                    Ok(items) => {
+                        self.finish_request(items, provider_response_id, usage, now)
+                            .await
+                    }
+                }
+            }
+        }
+    }
+
+    async fn fail_request(&mut self) {
+        self.inference = None;
+        self.auto_compaction_in_flight = false;
+        self.persist(AgentEvent::RequestEnded { context_used: None })
+            .await;
+    }
+
+    async fn finish_request(
+        &mut self,
+        items: Vec<InferenceResponseItem>,
+        provider_response_id: Option<ProviderResponseId>,
+        usage: Option<rho_core::TokenUsage>,
+        now: UnixMs,
+    ) {
+        let compacted = items
+            .iter()
+            .any(|item| matches!(item, InferenceResponseItem::Compaction { .. }));
+        let context_used = if compacted {
+            None
+        } else {
+            usage
+                .map(|usage| usage.input_tokens + usage.output_tokens)
+                .or(self.context_used)
+        };
+        self.context_used = context_used;
+
+        let calls: Vec<ToolCall> = items
+            .iter()
+            .filter_map(|item| match item {
+                InferenceResponseItem::ToolCall {
+                    id,
+                    name,
+                    tool_type,
+                    arguments,
+                    ..
+                } => Some(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    tool_type: *tool_type,
+                    arguments: arguments.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+
+        let block = ContextBlock::InferenceResponse {
+            items,
+            provider_response_id,
+        };
+        self.persist(AgentEvent::Appended {
+            blocks: Cow::Borrowed(std::slice::from_ref(&block)),
+            drained: false,
+        })
+        .await;
+        self.history.push(Arc::new(block));
+
+        self.inference = None;
+        self.last_error = None;
+        self.last_response_at = now;
+        self.persist(AgentEvent::RequestEnded { context_used })
+            .await;
+
+        for call in calls {
+            self.spawn_tool(call, now).await;
+        }
+
+        // A compaction the core asked for is a means, not an end: carry on
+        // with the work that triggered it.
+        if compacted && std::mem::take(&mut self.auto_compaction_in_flight) {
+            self.standing = Standing::MustSend;
+        }
+    }
+
+    // -- tools --------------------------------------------------------------
+
+    async fn spawn_tool(&mut self, call: ToolCall, now: UnixMs) {
+        self.persist(AgentEvent::ToolSpawned {
+            call: Cow::Borrowed(&call),
+        })
+        .await;
+
+        let (rhythm, session) = match self.registry.get(&call.name) {
+            Some(tool) => (
+                tool.rhythm(),
+                tool.run(call.clone(), SourceWaker::new(Arc::clone(&self.wake))),
+            ),
+            // Born exited: the error reaches the model at the next boundary
+            // through exactly the same path as any other tool output.
+            None => (
+                Rhythm::TOOL,
+                FinishedSession::boxed(
+                    ToolOutput {
+                        output: Arc::new(format!("unknown tool: {}", call.name.as_str())),
+                        status: ToolOutputStatus::Error,
+                    },
+                    now,
+                ),
+            ),
+        };
+        self.tools.insert(
+            call.id.clone(),
+            RunningTool::new(call, rhythm, session, now),
+        );
+    }
+
+    /// Tools do not survive a restart. Say so, rather than leaving their calls
+    /// unanswered.
+    async fn recover_lost_tools(&mut self, orphans: Vec<ToolCall>) {
+        if orphans.is_empty() {
+            return;
+        }
+        let now = UnixMs::now();
+        let blocks: Vec<ContextBlock> = orphans
+            .iter()
+            .map(|call| lost_to_restart(call, answered(&self.history, &call.id), now))
+            .collect();
+        self.persist(AgentEvent::Appended {
+            blocks: Cow::Borrowed(&blocks),
+            drained: false,
+        })
+        .await;
+        self.history.extend(blocks.into_iter().map(Arc::new));
+        for call in orphans {
+            self.persist(AgentEvent::ToolReaped { call_id: call.id })
+                .await;
+        }
+    }
+
+    // -- plumbing -----------------------------------------------------------
 
     async fn persist(&mut self, event: AgentEvent<'_>) {
         self.store.append(self.id, self.next_event, &event).await;
         self.next_event += 1;
     }
 
-    async fn deliver(&mut self, state: &mut AgentState, boundary: MessageDelivery) {
-        let items = state.queued_inputs.drain(boundary);
-        if items.is_empty() {
-            return;
+    fn publish(&self) {
+        let mut previews = Vec::new();
+        if let Some(since) = self.user.oldest() {
+            previews.push(Preview {
+                label: Cow::Borrowed("user"),
+                data: Box::new(QueuePreview {
+                    pending: self.user.len() as u32,
+                    since,
+                }),
+            });
         }
-        self.persist(AgentEvent::Dequeued { boundary }).await;
-        state.blocks.extend(items.into_iter().map(|item| {
-            Arc::new(match item.kind {
-                QueuedItemKind::UserMessage { sender, content } => ContextBlock::UserMessage {
-                    sender,
-                    content: Arc::unwrap_or_clone(content),
-                },
-                QueuedItemKind::Compaction => ContextBlock::CompactionTrigger,
-            })
-        }));
-    }
+        for (peer, mail) in &self.mail {
+            if !mail.is_empty() {
+                previews.push(Preview {
+                    label: Cow::Owned(format!("mail:{}", peer.encoded())),
+                    data: Box::new(mail.preview()),
+                });
+            }
+        }
+        for (call_id, tool) in &self.tools {
+            previews.push(Preview {
+                label: Cow::Owned(format!("tool:{}", call_id.as_str())),
+                data: tool.session.preview(),
+            });
+        }
 
-    async fn start_request(&mut self, state: &mut AgentState) {
-        let compact = self
-            .session
-            .auto_compact_token_limit()
-            .zip(state.context_used)
-            .is_some_and(|(limit, used)| used >= limit)
-            && !latest_request_has_compaction_trigger(&state.blocks);
-        if compact {
-            let item = QueuedItem {
-                kind: QueuedItemKind::Compaction,
-                delivery: MessageDelivery::NextRequest,
-            };
-            self.persist(AgentEvent::Queued(item.clone())).await;
-            state.queued_inputs.items.push(item);
-            self.deliver(state, MessageDelivery::NextRequest).await;
-        }
-        self.auto_compaction_in_flight = compact;
-        self.persist(AgentEvent::RequestStarted).await;
-        self.session.request(InferenceRequest {
-            instructions: Arc::clone(&self.instructions),
-            input: state.blocks.clone(),
-            agent_id_labels: Default::default(),
-            tools: Arc::from([]),
-        });
-        state.status = AgentStatus::Streaming {
-            pending_response: PendingInferenceResponse::default(),
-            temporary_failures: 0,
-            last_error: None,
+        *self.snapshot.write().expect("poisoned snapshot") = AgentSnapshot {
+            history: self.history.clone(),
+            previews,
+            stopped: self.standing == Standing::Halted,
+            streaming: self
+                .inference
+                .as_ref()
+                .map(|inference| inference.pending.clone()),
+            context_used: self.context_used,
+            last_error: self.last_error.clone(),
+            quota: self.quota.clone(),
         };
-    }
-
-    fn publish(&self, state: AgentState) {
-        *self.state.write().expect("poisoned agent state") = state;
         self.notify.notify_waiters();
     }
 }
 
-fn latest_request_has_compaction_trigger(blocks: &[Arc<ContextBlock>]) -> bool {
-    blocks
+/// Everything [`Schedule::boundary`] is allowed to look at.
+///
+/// Split out from [`Agent`] so the one decision in this crate can be exercised
+/// against a fabricated clock and fabricated sources, with no provider, no
+/// database, and no tasks.
+struct Schedule {
+    pending: Vec<PendingSource>,
+    inference_active: bool,
+    wants_interrupt: bool,
+    standing: Standing,
+    last_response_at: UnixMs,
+}
+
+impl Schedule {
+    /// Should the next request start now?
+    ///
+    /// Three rules, and nothing else in this crate decides anything:
+    ///
+    /// 1. An `Interrupt` message is worth throwing away an in-flight request.
+    /// 2. Otherwise go once every pending source has settled — nobody has more
+    ///    to say, so waiting cannot improve the request.
+    /// 3. Otherwise go at the earliest `max_hold` among pending sources. The
+    ///    most impatient source sets the deadline, and every source yields into
+    ///    that same request.
+    fn boundary(&self, now: UnixMs) -> Boundary {
+        if self.standing == Standing::Halted {
+            return Boundary::No;
+        }
+        if self.inference_active {
+            return if self.wants_interrupt {
+                Boundary::AbortNow
+            } else {
+                Boundary::No
+            };
+        }
+        if self.standing == Standing::MustSend {
+            return Boundary::Now;
+        }
+        if self.pending.is_empty() {
+            return Boundary::No;
+        }
+        if self.pending.iter().all(|source| source.settled(now)) {
+            return Boundary::Now;
+        }
+        if now >= self.hold_deadline().expect("pending is non-empty") {
+            Boundary::Now
+        } else {
+            Boundary::No
+        }
+    }
+
+    /// The earliest instant at which [`Schedule::boundary`] could change
+    /// answer, so the loop knows how long it may sleep.
+    fn next_deadline(&self, now: UnixMs) -> Option<UnixMs> {
+        // Nothing to wait for: the answer is already settled either way.
+        if self.inference_active || self.standing != Standing::Normal || self.pending.is_empty() {
+            return None;
+        }
+        self.pending
+            .iter()
+            .filter_map(|source| source.quiet_deadline())
+            .chain(self.hold_deadline())
+            .filter(|deadline| *deadline > now)
+            .min()
+            // Every deadline has already passed: wake immediately rather than
+            // sleeping through a boundary.
+            .or(Some(now))
+    }
+
+    fn hold_deadline(&self) -> Option<UnixMs> {
+        self.pending
+            .iter()
+            .map(|source| source.hold_deadline(self.last_response_at))
+            .min()
+    }
+}
+
+/// Normalise every source into one [`Event`]. No policy lives here.
+async fn next_event(
+    control_rx: &mut mpsc::UnboundedReceiver<Control>,
+    session: &mut InferenceSession,
+    wake: &Notify,
+    deadline: Option<UnixMs>,
+) -> Option<Event> {
+    // Disabled `select!` arms still evaluate their expression, so give the
+    // timer a zero duration when nothing is armed; the guard keeps it unpolled.
+    let sleep = Duration::from_millis(
+        deadline
+            .map(|deadline| deadline.0.saturating_sub(UnixMs::now().0))
+            .unwrap_or(0),
+    );
+    tokio::select! {
+        biased;
+        control = control_rx.recv() => control.map(Event::Control),
+        event = session.run() => Some(Event::Inference(event)),
+        _ = wake.notified() => Some(Event::SourceChanged),
+        _ = tokio::time::sleep(sleep), if deadline.is_some() => Some(Event::Tick),
+    }
+}
+
+fn latest_request_has_compaction_trigger(history: &[Arc<ContextBlock>]) -> bool {
+    history
         .iter()
         .rev()
         .find_map(|block| match &**block {
@@ -640,137 +951,81 @@ fn latest_request_has_compaction_trigger(blocks: &[Arc<ContextBlock>]) -> bool {
         .unwrap_or(false)
 }
 
+fn answered(history: &[Arc<ContextBlock>], call_id: &ToolCallId) -> bool {
+    history.iter().any(|block| match &**block {
+        ContextBlock::ToolResults { results } => {
+            results.iter().any(|result| result.call_id == *call_id)
+        }
+        _ => false,
+    })
+}
+
 #[derive(Default)]
 struct Restored {
-    blocks: Vec<Arc<ContextBlock>>,
-    queue: InputQueue,
+    history: Vec<Arc<ContextBlock>>,
+    user: UserSource,
+    mail: BTreeMap<PeerId, MailSource>,
     request_active: bool,
     context_used: Option<u64>,
+    /// Tools that were running when the process stopped.
+    orphan_tools: Vec<ToolCall>,
+}
+
+impl Restored {
+    fn clear_queues(&mut self) {
+        self.user.clear();
+        for mail in self.mail.values_mut() {
+            mail.clear();
+        }
+    }
 }
 
 fn restore(events: Vec<AgentEvent<'static>>) -> Restored {
     let mut restored = Restored::default();
+    let mut live_tools: BTreeMap<ToolCallId, ToolCall> = BTreeMap::new();
     for event in events {
         match event {
-            AgentEvent::Queued(item) => restored.queue.items.push(item),
-            AgentEvent::Dequeued { boundary } => {
-                for item in restored.queue.drain(boundary) {
-                    restored.blocks.push(Arc::new(match item.kind {
-                        QueuedItemKind::UserMessage { sender, content } => {
-                            ContextBlock::UserMessage {
-                                sender,
-                                content: Arc::unwrap_or_clone(content),
-                            }
-                        }
-                        QueuedItemKind::Compaction => ContextBlock::CompactionTrigger,
-                    }));
+            AgentEvent::Queued(input) => match input.source {
+                InputSource::User => restored.user.push(input),
+                InputSource::Mail { peer } => {
+                    let InputKind::Message { content } = input.kind else {
+                        continue;
+                    };
+                    restored
+                        .mail
+                        .entry(peer)
+                        .or_insert_with(|| MailSource::new(peer, input.at))
+                        .push(content, input.at);
+                }
+            },
+            AgentEvent::Appended { blocks, drained } => {
+                restored
+                    .history
+                    .extend(blocks.into_owned().into_iter().map(Arc::new));
+                if drained {
+                    restored.clear_queues();
                 }
             }
-            AgentEvent::QueueCleared => restored.queue.items.clear(),
+            AgentEvent::QueueCleared => restored.clear_queues(),
             AgentEvent::RequestStarted => restored.request_active = true,
-            AgentEvent::RequestCancelled => restored.request_active = false,
-            AgentEvent::InferenceResponse {
-                items,
-                provider_response_id,
-                context_used,
-            } => {
+            AgentEvent::RequestEnded { context_used } => {
                 restored.request_active = false;
-                if items
-                    .iter()
-                    .any(|item| matches!(item, InferenceResponseItem::Compaction { .. }))
-                {
-                    restored.context_used = None;
-                } else if context_used.is_some() {
+                if context_used.is_some() {
                     restored.context_used = context_used;
                 }
-                restored
-                    .blocks
-                    .push(Arc::new(ContextBlock::InferenceResponse {
-                        items: items.into_owned(),
-                        provider_response_id,
-                    }));
+            }
+            AgentEvent::ToolSpawned { call } => {
+                let call = call.into_owned();
+                live_tools.insert(call.id.clone(), call);
+            }
+            AgentEvent::ToolReaped { call_id } => {
+                live_tools.remove(&call_id);
             }
         }
     }
+    restored.orphan_tools = live_tools.into_values().collect();
     restored
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn message(text: &str, delivery: MessageDelivery) -> QueuedItem {
-        QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender: MessageSender::User,
-                content: Arc::new(vec![ContentPart::Text {
-                    text: text.to_owned(),
-                }]),
-            },
-            delivery,
-        }
-    }
-
-    #[test]
-    fn replay_preserves_undelivered_queue() {
-        let restored = restore(vec![AgentEvent::Queued(message(
-            "later",
-            MessageDelivery::NextTurn,
-        ))]);
-        assert_eq!(restored.queue.len(), 1);
-        assert!(restored.blocks.is_empty());
-    }
-
-    #[test]
-    fn next_request_delivery_leaves_next_turn_items_queued() {
-        let restored = restore(vec![
-            AgentEvent::Queued(message("steer", MessageDelivery::NextRequest)),
-            AgentEvent::Queued(message("later", MessageDelivery::NextTurn)),
-            AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextRequest,
-            },
-        ]);
-        assert_eq!(restored.blocks.len(), 1);
-        assert_eq!(restored.queue.len(), 1);
-    }
-
-    #[test]
-    fn started_request_restores_as_interrupted() {
-        let restored = restore(vec![
-            AgentEvent::Queued(message("hello", MessageDelivery::Immediate)),
-            AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextTurn,
-            },
-            AgentEvent::RequestStarted,
-        ]);
-        assert!(restored.request_active);
-        assert!(restored.queue.is_empty());
-    }
-
-    #[tokio::test]
-    async fn store_round_trips_record_and_queue_event() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = Store::open(temp.path().join("agent2.redb"));
-        let record = AgentRecord {
-            instructions: "minimal".to_owned(),
-            profile: InferenceProfile::default(),
-            model: PersistedModel::Gpt56Sol,
-            prompt_cache_key: PromptCacheKey::generate(),
-            next_event: 0,
-        };
-        let id = store.create_record(&record).await;
-        store
-            .append(
-                id,
-                0,
-                &AgentEvent::Queued(message("persist me", MessageDelivery::NextTurn)),
-            )
-            .await;
-
-        let (loaded, events) = store.load(id).unwrap();
-        assert_eq!(loaded.instructions, "minimal");
-        assert_eq!(loaded.next_event, 1);
-        assert_eq!(events.len(), 1);
-        assert_eq!(restore(events).queue.len(), 1);
-    }
-}
+mod tests;

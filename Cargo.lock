@@ -14205,6 +14205,7 @@ dependencies = [
  "async-stream",
  "bytes",
  "futures 0.3.33",
+ "inventory",
  "rand 0.8.7",
  "redb",
  "rho-core",
