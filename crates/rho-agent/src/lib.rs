@@ -15,7 +15,7 @@ use rho_core::{
 };
 pub use rho_core::{MessageDelivery, MessageSender};
 use rho_db::RhoDb;
-use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
+use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::WebSearchTools;
 use rho_workspaces::{Repo, View, Workspace};
@@ -545,7 +545,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create(
         db: RhoDb,
-        auth: InferenceAuth,
+        inference: Inference,
         mode: SessionBinding,
         role: db::AgentRole,
         workstream: db::WorkstreamId,
@@ -586,7 +586,7 @@ impl Agent {
         write.commit();
         let agent = Self::new(
             db,
-            auth,
+            inference,
             config,
             model,
             role,
@@ -603,17 +603,17 @@ impl Agent {
 
     pub fn load(
         db: RhoDb,
-        auth: InferenceAuth,
+        inference: Inference,
         agent_id: AgentId,
         view: Arc<View>,
         pool: std::sync::Weak<pool::AgentPool>,
     ) -> Self {
-        Self::load_lazy(db, auth, agent_id, Arc::new(Lazy::ready(view)), pool)
+        Self::load_lazy(db, inference, agent_id, Arc::new(Lazy::ready(view)), pool)
     }
 
     pub(crate) fn load_lazy(
         db: RhoDb,
-        auth: InferenceAuth,
+        inference: Inference,
         agent_id: AgentId,
         view: Arc<Lazy<Arc<View>>>,
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
@@ -638,7 +638,7 @@ impl Agent {
         // edge of an existing agent.
         Self::new(
             db,
-            auth,
+            inference,
             config,
             model,
             record.role,
@@ -657,7 +657,7 @@ impl Agent {
     #[expect(clippy::too_many_arguments)]
     fn new(
         db: RhoDb,
-        auth: InferenceAuth,
+        inference: Inference,
         config: InferenceProfile,
         model: InferenceModel,
         role: db::AgentRole,
@@ -672,8 +672,9 @@ impl Agent {
         // Role policy wins over persisted profiles created before PM code mode
         // was disabled.
         let code_mode_enabled = cfg!(feature = "code-mode") && config.code_mode && !role.is_pm();
-        let web_search = WebSearchTools::new(auth.clone(), agent_id.encoded().to_owned());
-        let inference_session = InferenceSession::new_deep(auth, config, model, prompt_cache_key);
+        let web_search =
+            WebSearchTools::new(inference.auth().clone(), agent_id.encoded().to_owned());
+        let inference_session = inference.deep_session(config, model, prompt_cache_key);
         let iris_tools = (role == db::AgentRole::Iris).then(|| {
             pool.upgrade()
                 .and_then(|pool| pool.iris_tool_host())

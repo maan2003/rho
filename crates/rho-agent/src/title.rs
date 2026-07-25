@@ -11,7 +11,7 @@ use rho_core::{
     ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
     PendingInferenceResponse,
 };
-use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
+use rho_inference::{Inference, PromptCacheKey};
 
 const INSTRUCTIONS: &str = "Write a kebab-case title (at most 25 characters) for a coding \
 agent's conversation. Name the subject — the component, feature, or problem — not the kind of \
@@ -33,8 +33,8 @@ const MAX_PROMPT_CHARS: usize = 2000;
 
 const MAX_TITLE_CHARS: usize = 30;
 
-pub async fn generate_title(auth: InferenceAuth, user_message: &str) -> anyhow::Result<String> {
-    let mut session = InferenceSession::new_title(auth, PromptCacheKey::generate());
+pub async fn generate_title(inference: &Inference, user_message: &str) -> anyhow::Result<String> {
+    let mut session = inference.title_session(PromptCacheKey::generate());
     session.request(InferenceRequest {
         instructions: Arc::from(INSTRUCTIONS),
         input: vec![Arc::new(ContextBlock::UserMessage {

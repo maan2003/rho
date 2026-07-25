@@ -379,6 +379,15 @@ impl UnixMs {
     }
 }
 
+/// A deadline, for code that reasons in "this long after that happened".
+impl std::ops::Add<std::time::Duration> for UnixMs {
+    type Output = Self;
+
+    fn add(self, later: std::time::Duration) -> Self {
+        Self(self.0.saturating_add(later.as_millis() as u64))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub enum ToolResultMetadata {
     ApplyPatch(ApplyPatchMetadata),

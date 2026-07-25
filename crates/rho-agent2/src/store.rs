@@ -24,9 +24,9 @@ const EVENTS: redb::TableDefinition<Sen<EventKey>, Sen<AgentEvent<'static>>> =
 /// Stable identifier for an agent in a [`Store`]. Distinct from
 /// [`rho_core::AgentId`], which names a *peer* an agent exchanges mail with.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct AgentId([u8; 16]);
+pub struct AgentKey([u8; 16]);
 
-impl AgentId {
+impl AgentKey {
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
@@ -53,7 +53,7 @@ impl Store {
         Self(RhoDb::open(path))
     }
 
-    pub(crate) fn load(&self, id: AgentId) -> Option<(AgentRecord, Vec<AgentEvent<'static>>)> {
+    pub(crate) fn load(&self, id: AgentKey) -> Option<(AgentRecord, Vec<AgentEvent<'static>>)> {
         let read = self.0.read();
         if !read.has_table(RECORDS.name()) {
             return None;
@@ -78,11 +78,11 @@ impl Store {
         Some((record, events))
     }
 
-    pub(crate) async fn create_record(&self, record: &AgentRecord) -> AgentId {
+    pub(crate) async fn create_record(&self, record: &AgentRecord) -> AgentKey {
         let mut write = self.0.write().await;
         let mut records = write.open_table(RECORDS);
         let id = loop {
-            let id = AgentId::generate();
+            let id = AgentKey::generate();
             if records.get(id.0).is_none() {
                 break id;
             }
@@ -93,7 +93,7 @@ impl Store {
         id
     }
 
-    pub(crate) async fn append(&self, id: AgentId, sequence: u64, event: &AgentEvent<'_>) {
+    pub(crate) async fn append(&self, id: AgentKey, sequence: u64, event: &AgentEvent<'_>) {
         let mut write = self.0.write().await;
         let mut records = write.open_table(RECORDS);
         let mut record = records

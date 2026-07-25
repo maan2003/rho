@@ -3,6 +3,7 @@ use std::sync::Arc;
 use rho_core::ToolOutput;
 
 use super::*;
+use crate::inference::Inference;
 
 fn inference_response(
     provider_response_id: Option<&str>,
@@ -18,7 +19,7 @@ fn inference_response(
 #[test]
 fn title_session_uses_luna_fast_profile() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = InferenceSession::new_title(auth, PromptCacheKey::generate());
+    let session = InferenceSession::new_title(Inference::new(auth), PromptCacheKey::generate());
 
     assert_eq!(session.responses_config.model, ResponsesModel::Gpt56Luna);
     assert_eq!(
@@ -184,7 +185,7 @@ fn serializes_configured_reasoning_effort() {
 fn serializes_configured_reasoning_context() {
     let (_temp, auth) = test_oauth_file("token", None);
     let mut session = InferenceSession::new_deep(
-        auth,
+        Inference::new(auth),
         InferenceProfile {
             effort: ReasoningEffort::High,
             fast_mode: false,
@@ -611,7 +612,7 @@ fn serializes_custom_tool_calls_and_results() {
 fn responses_lite_moves_tools_and_instructions_into_input() {
     let (_temp, auth) = test_oauth_file("token", None);
     let mut session = InferenceSession::new_deep(
-        auth,
+        Inference::new(auth),
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
@@ -659,7 +660,7 @@ fn responses_lite_moves_tools_and_instructions_into_input() {
 fn responses_lite_previous_response_skips_developer_prefix() {
     let (_temp, auth) = test_oauth_file("token", None);
     let session = InferenceSession::new_deep(
-        auth,
+        Inference::new(auth),
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,

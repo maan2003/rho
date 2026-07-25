@@ -12,7 +12,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use rho_db::RhoDb;
-use rho_inference::InferenceAuth;
+use rho_inference::Inference;
 use rho_workspaces::{PathOverrides, Repo, UserEnvironment, View, WorkspaceInfo};
 use tokio::sync::{Mutex, broadcast};
 
@@ -33,7 +33,7 @@ const ID_LABEL_HEADROOM: u64 = 200;
 
 pub struct AgentPool {
     db: RhoDb,
-    auth: InferenceAuth,
+    inference: Inference,
     path_overrides: PathOverrides,
     user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
@@ -141,7 +141,7 @@ impl AgentPool {
     /// Opens the pool over `db`, initializing the agent tables.
     pub async fn new(
         db: RhoDb,
-        auth: InferenceAuth,
+        inference: Inference,
         path_overrides: PathOverrides,
         user_environment: UserEnvironment,
     ) -> Arc<Self> {
@@ -151,7 +151,7 @@ impl AgentPool {
         write.commit();
         let pool = Arc::new(Self {
             db,
-            auth,
+            inference,
             path_overrides,
             user_environment,
             agents: Mutex::new(HashMap::new()),
@@ -280,8 +280,8 @@ impl AgentPool {
         write.commit();
     }
 
-    pub fn auth(&self) -> &InferenceAuth {
-        &self.auth
+    pub fn inference(&self) -> &Inference {
+        &self.inference
     }
 
     pub async fn loaded(&self) -> Vec<(AgentId, RunningAgent)> {
@@ -356,7 +356,7 @@ impl AgentPool {
             | SessionBinding::AdvisorSol(_) => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
-                    self.auth.clone(),
+                    self.inference.clone(),
                     mode,
                     config,
                     workstream,
@@ -655,7 +655,7 @@ impl AgentPool {
         let agent = match record.runtime {
             AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load_lazy(
                 self.db.clone(),
-                self.auth.clone(),
+                self.inference.clone(),
                 agent_id,
                 view,
                 Arc::downgrade(self),

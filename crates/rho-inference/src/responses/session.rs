@@ -10,10 +10,10 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::DEFAULT_CHATGPT_BASE_URL;
-use super::oauth::InferenceAuth;
 use super::wire::{ResponseState, ResponsesRequest};
 use super::ws::{self, WebSocketConnection};
 use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
+use crate::inference::Inference;
 
 #[derive(
     Clone, Copy, Debug, Decode, Encode, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
@@ -117,7 +117,7 @@ pub struct InferenceSession {
     /// can yield several updates, and `run` returns one at a time).
     buffered: VecDeque<InferenceEvent>,
     pub(crate) base_url: String,
-    pub(crate) auth: InferenceAuth,
+    pub(crate) inference: Inference,
     pub(crate) mode: InferenceSessionMode,
     pub(crate) responses_config: ResponsesConfig,
     pub(crate) prompt_cache_key: PromptCacheKey,
@@ -288,8 +288,8 @@ pub(crate) enum AutoCompaction {
 }
 
 impl InferenceSession {
-    pub fn new_deep(
-        auth: InferenceAuth,
+    pub(crate) fn new_deep(
+        inference: Inference,
         config: InferenceProfile,
         model: InferenceModel,
         prompt_cache_key: PromptCacheKey,
@@ -299,7 +299,7 @@ impl InferenceSession {
             turn: None,
             buffered: VecDeque::new(),
             base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
-            auth,
+            inference,
             mode: InferenceSessionMode::Deep(config),
             responses_config: ResponsesConfig::deep(config, model.into()),
             prompt_cache_key,
@@ -307,13 +307,13 @@ impl InferenceSession {
         }
     }
 
-    pub fn new_title(auth: InferenceAuth, prompt_cache_key: PromptCacheKey) -> Self {
+    pub(crate) fn new_title(inference: Inference, prompt_cache_key: PromptCacheKey) -> Self {
         Self {
             connection: None,
             turn: None,
             buffered: VecDeque::new(),
             base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
-            auth,
+            inference,
             mode: InferenceSessionMode::Title,
             responses_config: ResponsesConfig::title(),
             prompt_cache_key,
@@ -553,6 +553,17 @@ impl InferenceSession {
                         .map(|id| id.as_str().to_owned()),
                     _ => None,
                 });
+                // Quota is account-wide rather than a fact about this stream,
+                // so hand it to the account on the way past.
+                for update in &updates {
+                    if let InferenceEvent::Quota {
+                        used_percent,
+                        reset_at_unix,
+                    } = update
+                    {
+                        self.inference.observe_quota(*used_percent, *reset_at_unix);
+                    }
+                }
                 self.buffered.extend(updates);
                 if done {
                     let debug = turn
@@ -738,7 +749,7 @@ impl InferenceSession {
     /// Ensure a usable connection, reopening when missing, when OAuth rotated
     /// the bearer, or when nearing the server's age cap.
     async fn ensure_connection(&mut self) -> Result<()> {
-        let auth = self.auth.clone();
+        let auth = self.inference.auth().clone();
         let resolved = tokio::task::spawn_blocking(move || auth.resolve()).await??;
         let reusable = self.connection.as_ref().is_some_and(|connection| {
             connection.bearer_token == resolved.bearer_token
@@ -843,7 +854,7 @@ impl std::fmt::Debug for InferenceSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InferenceSession")
             .field("base_url", &self.base_url)
-            .field("auth", &self.auth)
+            .field("inference", &self.inference)
             .field("mode", &self.mode)
             .field("responses_config", &self.responses_config)
             .field("prompt_cache_key", &self.prompt_cache_key)

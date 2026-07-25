@@ -1,9 +1,14 @@
-//! Tools, and the rhythm at which their output reaches the model.
+//! Tools, and what they report about themselves.
 //!
 //! A tool is not a future that resolves once. It is a source that produces
-//! output over its lifetime, possibly for hours. There is no such thing as a
-//! "background" tool: the core only decides *when* to next talk to the model,
-//! and pulls from every source at that moment.
+//! output over its lifetime, possibly for hours. No tool declares itself a
+//! background job, because at the moment of the call `npm test` and
+//! `npm run dev` are the same call and nothing could tell them apart. So the
+//! core does not classify them at all: every call is the model's business for
+//! a fixed window after it was made, and background once that window is spent.
+//! A background job is simply a call that outlived its window, and it costs
+//! nothing from then on. The window runs from the call and from nothing else,
+//! so no other source can shorten it.
 //!
 //! Because the core pulls, a tool holds its own output until asked. That is
 //! the point — a tool asked for its output after five minutes can hand back
@@ -16,63 +21,63 @@
 //! its status, and the core weighs it against every other source.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use rho_core::{
     ContextBlock, ToolCall, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolUpdate, UnixMs,
 };
+use senax_encoder::{Decode, Encode};
 use tokio::sync::Notify;
 
-use crate::source::{PreviewData, ToolPreview};
+use crate::preview::{PreviewData, ToolPreview};
+use crate::source::SourceKind;
 
-/// How eagerly a source's pending output should reach the model.
+/// Whether a tool is still working.
 ///
-/// Both bounds are hints from the source, read by the one place that can see
-/// every source at once. Nothing acts on its own rhythm alone.
-#[derive(Clone, Copy, Debug)]
-pub struct Rhythm {
-    /// After this long with no new output, the source counts as *settled*:
-    /// whatever it holds is probably all it has to say, so the core may stop
-    /// waiting for more.
-    pub quiet_after: Duration,
-    /// Upper bound on sitting on pending output, measured from when the model
-    /// last spoke. The most impatient pending source sets the deadline for
-    /// everyone, and they all yield together.
-    pub max_hold: Duration,
+/// Ending is the one thing a tool cannot take back, which is why the core is
+/// willing to act on it: everything else it reports is a guess about what
+/// happens next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum ToolActivity {
+    Running,
+    /// Finished; nothing more will arrive. `at` is when it ended, which is the
+    /// moment whatever it was holding became worth sending on its own — not
+    /// when that output first started arriving.
+    Exited {
+        at: UnixMs,
+    },
 }
 
-impl Rhythm {
-    /// Typed input is complete the moment it arrives, so it is always settled;
-    /// only `max_hold` matters, and it bounds how long a message can wait
-    /// behind tools that are still chattering.
-    pub const USER: Self = Self {
-        quiet_after: Duration::ZERO,
-        max_hold: Duration::from_secs(2),
-    };
-
-    /// Peers often send several lines at once; wait a beat so they collapse
-    /// into one request instead of waking one per line.
-    pub const MAIL: Self = Self {
-        quiet_after: Duration::from_secs(1),
-        max_hold: Duration::from_secs(10),
-    };
-
-    pub const TOOL: Self = Self {
-        quiet_after: Duration::from_millis(250),
-        max_hold: Duration::from_secs(10),
-    };
+/// Whether a tool is holding output the model has not seen, and whether that
+/// output can stand on its own yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Unsent {
+    Nothing,
+    /// Holding output mid-thought. Worth sending eventually — half a build log
+    /// beats none — but worth less than the whole, so it is the most patient
+    /// thing the core knows about.
+    Waiting {
+        since: UnixMs,
+    },
+    /// Holding output that stands on its own: this much matters now, whatever
+    /// else the tool goes on to say. The one thing a running tool can say about
+    /// its own urgency, and it buys exactly one thing: it stops waiting for the
+    /// rest of the call. It still cannot interrupt a request in flight.
+    ///
+    /// `since` is when it became worth sending, not when it started arriving.
+    Settled {
+        since: UnixMs,
+    },
 }
 
 /// What a tool reports about itself, for the core to schedule against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolStatus {
-    /// When the tool last produced anything, for [`Rhythm::quiet_after`].
+    pub unsent: Unsent,
+    pub activity: ToolActivity,
+    /// For previews only. The decision measures nothing from it, because a wait
+    /// that moved every time a tool spoke would be a wait a chatty tool could
+    /// extend forever.
     pub last_output_at: UnixMs,
-    /// Output is waiting that the model has not seen.
-    pub pending: bool,
-    /// The tool has finished; nothing more will arrive. Certain, where quiet
-    /// is only a guess, so the core never waits on an exited tool.
-    pub exited: bool,
 }
 
 /// Tell the core that something changed.
@@ -112,16 +117,22 @@ pub trait ToolSession: Send {
     /// Wind down: stop the work and finish soon.
     ///
     /// The tool still gets to produce its last words; the core keeps it around
-    /// until [`ToolStatus::exited`] and its output has been collected.
+    /// until it reports [`ToolActivity::Exited`] and its output has been
+    /// collected.
     fn cancel(&mut self);
 
     /// What a UI should show while this tool runs. Tools with something richer
     /// to display define their own [`PreviewData`] type.
-    fn preview(&self) -> Box<dyn PreviewData> {
+    ///
+    /// The call is passed in so the preview can name itself; previews travel as
+    /// a flat list, and one that cannot say which call it belongs to is of no
+    /// use to a UI.
+    fn preview(&self, call: &ToolCall) -> Box<dyn PreviewData> {
         let status = self.status();
         Box::new(ToolPreview {
-            exited: status.exited,
-            pending: status.pending,
+            call_id: call.id.clone(),
+            activity: status.activity,
+            unsent: status.unsent,
             last_output_at: status.last_output_at,
         })
     }
@@ -129,12 +140,6 @@ pub trait ToolSession: Send {
 
 pub trait Tool: Send + Sync + 'static {
     fn spec(&self) -> ToolSpec;
-
-    /// How eagerly this tool's output should reach the model. Read by the
-    /// core, which is the only thing that can see every source at once.
-    fn rhythm(&self) -> Rhythm {
-        Rhythm::TOOL
-    }
 
     /// Start the work. Call [`SourceWaker::wake`] whenever the status
     /// changes; the core will come and ask.
@@ -161,8 +166,11 @@ impl ToolSession for FinishedSession {
     fn status(&self) -> ToolStatus {
         ToolStatus {
             last_output_at: self.at,
-            pending: self.output.is_some(),
-            exited: true,
+            unsent: match self.output {
+                Some(_) => Unsent::Waiting { since: self.at },
+                None => Unsent::Nothing,
+            },
+            activity: ToolActivity::Exited { at: self.at },
         }
     }
 
@@ -173,26 +181,37 @@ impl ToolSession for FinishedSession {
     fn cancel(&mut self) {}
 }
 
-/// The core's bookkeeping for one call: which tool, how impatient it is, and
-/// whether its single permitted result has been written. The output itself
-/// lives in the session.
+/// What the model has been told about one call. The milestones are ordered and
+/// each happens once, which is why they are a state rather than two flags: a
+/// call cannot end before it is answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Told {
+    /// Nothing yet. The next thing this call produces is its one
+    /// [`ToolResult`].
+    Nothing,
+    /// It has its result, so everything after arrives as a [`ToolUpdate`].
+    Result,
+    /// ...and that it ended. Nothing more will ever be said about it.
+    Exit,
+}
+
+/// The core's bookkeeping for one call: which tool, how much of its story the
+/// model has, and since when it has been holding something. The output itself
+/// lives in the session, which is asked for it at every boundary.
 pub(crate) struct RunningTool {
     pub call: ToolCall,
-    pub rhythm: Rhythm,
     pub started_at: UnixMs,
     pub session: Box<dyn ToolSession>,
-    /// Whether this call's single permitted [`ToolResult`] has been written.
-    pub answered: bool,
+    pub told: Told,
 }
 
 impl RunningTool {
-    pub fn new(call: ToolCall, rhythm: Rhythm, session: Box<dyn ToolSession>, now: UnixMs) -> Self {
+    pub fn new(call: ToolCall, session: Box<dyn ToolSession>, now: UnixMs) -> Self {
         Self {
             call,
-            rhythm,
             started_at: now,
             session,
-            answered: false,
+            told: Told::Nothing,
         }
     }
 
@@ -200,17 +219,26 @@ impl RunningTool {
         self.session.status()
     }
 
-    /// Whether this tool has anything the model has not seen. An exited tool
-    /// still counts until its call has been answered, even with no output.
-    pub fn pending(&self) -> bool {
-        let status = self.status();
-        status.pending || (status.exited && !self.answered)
+    /// Done with, and safe to forget.
+    pub fn reapable(&self) -> bool {
+        self.told == Told::Exit
     }
 
-    /// Done with, and safe to forget: it exited and the model has seen
-    /// everything it produced.
-    pub fn reapable(&self) -> bool {
-        self.status().exited && !self.pending()
+    /// What it is, with nothing decided about it. Every one of these is
+    /// something the tool observed; what any of them is worth is `boundary`'s
+    /// business, and so is every duration.
+    pub fn source(&self) -> SourceKind {
+        let status = self.status();
+        SourceKind::Tool {
+            called_at: self.started_at,
+            told: self.told,
+            activity: status.activity,
+            unsent: status.unsent,
+        }
+    }
+
+    pub fn preview(&self) -> Box<dyn PreviewData> {
+        self.session.preview(&self.call)
     }
 
     pub fn cancel(&mut self) {
@@ -221,35 +249,55 @@ impl RunningTool {
     /// [`ToolResult`]; every later one becomes a [`ToolUpdate`], because a
     /// provider accepts exactly one result per call id.
     pub fn take(&mut self, now: UnixMs) -> Option<ToolTake> {
-        let exited = self.status().exited;
+        let exited = matches!(self.status().activity, ToolActivity::Exited { .. });
         let output = self.session.take_output();
-        if self.answered {
-            return output.map(|output| {
+        let take = match self.told {
+            Told::Exit => return None,
+            Told::Nothing => {
+                if output.is_none() && !exited {
+                    return None;
+                }
+                // A tool that exits silently still owes the provider a result.
+                let body = output.unwrap_or(ToolOutput {
+                    output: Arc::new(String::new()),
+                    status: ToolOutputStatus::Success,
+                });
+                // A result carries `finished_at`, so answering a call that has
+                // already ended says both things at once.
+                self.told = if exited { Told::Exit } else { Told::Result };
+                ToolTake::Result(ToolResult {
+                    call_id: self.call.id.clone(),
+                    tool_type: self.call.tool_type,
+                    body,
+                    started_at: self.started_at,
+                    finished_at: now,
+                    metadata: None,
+                })
+            }
+            Told::Result if !exited => ToolTake::Update(ToolUpdate {
+                call_id: self.call.id.clone(),
+                tool_type: self.call.tool_type,
+                output: output?.output,
+                at: now,
+            }),
+            // Answered long ago and now over. Nothing else will report the
+            // ending, so this is the only chance to say it — a background job
+            // that dies quietly would otherwise just stop existing.
+            Told::Result => {
+                self.told = Told::Exit;
+                let ended = "[the tool has exited]";
                 ToolTake::Update(ToolUpdate {
                     call_id: self.call.id.clone(),
                     tool_type: self.call.tool_type,
-                    output: output.output,
+                    output: Arc::new(match output {
+                        Some(output) => format!("{}\n{ended}", output.output),
+                        None => ended.to_owned(),
+                    }),
                     at: now,
                 })
-            });
-        }
-        if output.is_none() && !exited {
-            return None;
-        }
-        self.answered = true;
-        // A tool that exits silently still owes the provider a result.
-        let body = output.unwrap_or(ToolOutput {
-            output: Arc::new(String::new()),
-            status: ToolOutputStatus::Success,
-        });
-        Some(ToolTake::Result(ToolResult {
-            call_id: self.call.id.clone(),
-            tool_type: self.call.tool_type,
-            body,
-            started_at: self.started_at,
-            finished_at: now,
-            metadata: None,
-        }))
+            }
+        };
+        Some(take)
     }
 }
 
@@ -260,11 +308,11 @@ pub(crate) enum ToolTake {
 }
 
 /// Note appended for a tool that was still running when the process stopped.
-pub(crate) fn lost_to_restart(call: &ToolCall, answered: bool, now: UnixMs) -> ContextBlock {
+pub(crate) fn lost_to_restart(call: &ToolCall, result_sent: bool, now: UnixMs) -> ContextBlock {
     let text = "This tool was still running when the agent restarted. Its output is lost; \
                 re-run it if you still need the result."
         .to_owned();
-    if answered {
+    if result_sent {
         ContextBlock::ToolUpdate(ToolUpdate {
             call_id: call.id.clone(),
             tool_type: call.tool_type,
@@ -320,125 +368,4 @@ fn ceil_boundary(text: &str, mut index: usize) -> usize {
         index += 1;
     }
     index
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn call() -> ToolCall {
-        ToolCall {
-            id: rho_core::ToolCallId::try_from("call-1").unwrap(),
-            name: rho_core::ToolName::try_from("shell").unwrap(),
-            tool_type: rho_core::ToolType::Function,
-            arguments: "{}".to_owned(),
-        }
-    }
-
-    /// Hands back whatever it has been given, one pull at a time.
-    struct Chatty {
-        chunks: std::collections::VecDeque<String>,
-        exited: bool,
-    }
-
-    impl ToolSession for Chatty {
-        fn status(&self) -> ToolStatus {
-            ToolStatus {
-                last_output_at: UnixMs(1_000),
-                pending: !self.chunks.is_empty(),
-                exited: self.exited,
-            }
-        }
-
-        fn take_output(&mut self) -> Option<ToolOutput> {
-            // The tool decides how to represent everything unsent — here, by
-            // concatenating; a log tailer would return only the tail.
-            let text: String = std::mem::take(&mut self.chunks).into_iter().collect();
-            (!text.is_empty()).then(|| ToolOutput {
-                output: Arc::new(text),
-                status: ToolOutputStatus::Success,
-            })
-        }
-
-        fn cancel(&mut self) {
-            self.exited = true;
-        }
-    }
-
-    fn chatty(chunks: &[&str]) -> Box<dyn ToolSession> {
-        Box::new(Chatty {
-            chunks: chunks.iter().map(|text| text.to_string()).collect(),
-            exited: false,
-        })
-    }
-
-    #[test]
-    fn first_take_answers_the_call_and_later_takes_annotate_it() {
-        let now = UnixMs(1_000);
-        let mut tool = RunningTool::new(call(), Rhythm::TOOL, chatty(&["one"]), now);
-
-        let Some(ToolTake::Result(result)) = tool.take(now) else {
-            panic!("first take must answer the call")
-        };
-        assert_eq!(*result.body.output, "one");
-
-        // The same tool produces more later; a provider accepts only one
-        // result per call, so this has to arrive as an update.
-        tool.session = chatty(&["two"]);
-        let Some(ToolTake::Update(update)) = tool.take(now) else {
-            panic!("later takes must annotate")
-        };
-        assert_eq!(*update.output, "two");
-    }
-
-    #[test]
-    fn several_chunks_collapse_into_one_block() {
-        // The core pulls once and gets everything, however much accumulated.
-        let now = UnixMs(1_000);
-        let mut tool = RunningTool::new(call(), Rhythm::TOOL, chatty(&["a", "b", "c"]), now);
-
-        let Some(ToolTake::Result(result)) = tool.take(now) else {
-            panic!("expected a result")
-        };
-        assert_eq!(*result.body.output, "abc");
-        assert!(!tool.pending(), "nothing left over");
-    }
-
-    #[test]
-    fn a_tool_that_exits_silently_still_owes_a_result() {
-        let now = UnixMs(1_000);
-        let mut tool = RunningTool::new(
-            call(),
-            Rhythm::TOOL,
-            Box::new(Chatty {
-                chunks: Default::default(),
-                exited: true,
-            }),
-            now,
-        );
-
-        assert!(tool.pending(), "the call is unanswered");
-        assert!(!tool.reapable());
-
-        assert!(matches!(tool.take(now), Some(ToolTake::Result(_))));
-        assert!(tool.reapable(), "answered and exited, safe to forget");
-    }
-
-    #[test]
-    fn a_running_tool_with_nothing_to_say_contributes_nothing() {
-        let now = UnixMs(1_000);
-        let mut tool = RunningTool::new(call(), Rhythm::TOOL, chatty(&[]), now);
-        assert!(!tool.pending());
-        assert!(tool.take(now).is_none());
-        assert!(!tool.answered, "and its call stays open");
-    }
-
-    #[test]
-    fn elide_middle_keeps_both_ends() {
-        let text = "x".repeat(1_000);
-        let elided = elide_middle(&text, 100);
-        assert!(elided.len() < 200);
-        assert!(elided.contains("bytes elided"));
-        assert_eq!(elide_middle("short", 100), "short");
-    }
 }

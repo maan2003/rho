@@ -1,4 +1,5 @@
 use super::*;
+use crate::inference::Inference;
 use crate::responses::session::{debug_file_name, provider_debug_dir};
 
 #[test]
@@ -26,7 +27,7 @@ fn gpt56_models_use_explicit_context_and_compaction_limits() {
     ] {
         let (_temp, auth) = test_oauth_file("token", None);
         let session = InferenceSession::new_deep(
-            auth,
+            Inference::new(auth),
             InferenceProfile::default(),
             model,
             PromptCacheKey::from_bytes(*b"testkey2"),

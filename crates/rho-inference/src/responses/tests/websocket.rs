@@ -38,7 +38,7 @@ fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
     );
     session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
-    let auth = session.auth.resolve().unwrap();
+    let auth = session.inference.auth().resolve().unwrap();
     let request = build_ws_request(&session, Some("thread-1"), &auth).unwrap();
 
     assert_eq!(
@@ -62,7 +62,7 @@ fn websocket_request_uses_oauth_bearer_without_account_header() {
         None,
     );
 
-    let auth = session.auth.resolve().unwrap();
+    let auth = session.inference.auth().resolve().unwrap();
     let request = build_ws_request(&session, None, &auth).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer sk-test");
@@ -89,7 +89,7 @@ fn websocket_request_uses_oauth_file_credentials() {
     );
     session.base_url = "https://chatgpt.com/backend-api".to_owned();
 
-    let auth = session.auth.resolve().unwrap();
+    let auth = session.inference.auth().resolve().unwrap();
     let request = build_ws_request(&session, Some("thread-1"), &auth).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer oauth-access");

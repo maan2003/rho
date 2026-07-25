@@ -26,6 +26,7 @@ use super::wire::{
 use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
+use crate::inference::Inference;
 
 fn first_assistant_message(
     items: &[InferenceResponseItem],
@@ -274,7 +275,7 @@ fn test_inference_service_with(
     auto_compaction: Option<AutoCompaction>,
 ) -> InferenceSession {
     let mut session = InferenceSession::new_deep(
-        auth,
+        Inference::new(auth),
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,

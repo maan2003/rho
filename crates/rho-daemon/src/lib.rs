@@ -16,7 +16,7 @@ use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent};
 use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
 use rho_core::{ContentPart, ContextBlock, text_content};
 use rho_db::RhoDb;
-use rho_inference::InferenceAuth;
+use rho_inference::{Inference, InferenceAuth};
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
@@ -315,7 +315,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(default_db_path()?);
-    let auth = InferenceAuth::named(&args.auth)?;
+    let inference = Inference::new(InferenceAuth::named(&args.auth)?);
     let path_overrides = PathOverrides {
         before: args
             .extra_before_path
@@ -338,7 +338,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let agents = Arc::new(
         AgentRegistry::new(
             db,
-            auth,
+            inference,
             path_overrides,
             user_environment,
             platform_secrets,
@@ -969,7 +969,7 @@ struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
     visualizations: rho_visualizations::VisualizationStore,
-    auth: InferenceAuth,
+    inference: Inference,
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
@@ -1013,7 +1013,7 @@ struct AgentRegistry {
 impl AgentRegistry {
     async fn new(
         db: RhoDb,
-        auth: InferenceAuth,
+        inference: Inference,
         path_overrides: PathOverrides,
         user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
@@ -1021,7 +1021,7 @@ impl AgentRegistry {
     ) -> anyhow::Result<Self> {
         let pool = AgentPool::new(
             db.clone(),
-            auth.clone(),
+            inference.clone(),
             path_overrides,
             user_environment.clone(),
         )
@@ -1034,7 +1034,7 @@ impl AgentRegistry {
             pool,
             db,
             visualizations,
-            auth,
+            inference,
             machine_seed,
             title_tasks: Mutex::new(HashSet::new()),
             land_locks: Mutex::new(HashMap::new()),
@@ -1593,7 +1593,7 @@ impl AgentRegistry {
         }
         let registry = Arc::clone(self);
         tokio::spawn(async move {
-            let generate = rho_agent::title::generate_title(registry.auth.clone(), &text);
+            let generate = rho_agent::title::generate_title(&registry.inference, &text);
             match tokio::time::timeout(std::time::Duration::from_secs(60), generate).await {
                 Ok(Ok(title)) => {
                     let mut write = registry.db.write().await;
