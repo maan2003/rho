@@ -18,6 +18,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   workspace-backed execution context (view, prompt, and tools) initializes
   lazily at first inference. It depends directly on the concrete
   `rho-inference` session.
+- `rho-agent2` is an isolated experimental harness with only native inference,
+  durable transcript/queue state, streaming observation, and cancellation. It
+  intentionally has no tools, code mode, workspace/context discovery,
+  collaboration, Claude runtime, or CLI/daemon/UI integration.
 - `rho-workspaces` owns checkout materialization and filesystem views. A
   `Workspace` is one materialized checkout (a stable jj-managed bcachefs
   subvolume, the user's live checkout, a VCS-masked sandbox workspace, or a

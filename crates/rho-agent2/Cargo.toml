@@ -1,0 +1,23 @@
+[package]
+name = "rho-agent2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+futures.workspace = true
+rand.workspace = true
+redb.workspace = true
+rho-core.workspace = true
+rho-db.workspace = true
+rho-inference.workspace = true
+senax-encoder.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

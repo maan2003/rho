@@ -6,6 +6,7 @@ members = [
   "crates/octo-types",
   "crates/prefix-id",
   "crates/rho-agent",
+  "crates/rho-agent2",
   "crates/rho-ci",
   "crates/rho-claude",
   "crates/rho-cli",
