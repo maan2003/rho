@@ -32,24 +32,34 @@ impl Workstream {
     }
 }
 
-fn root_of(workstream: &Workstream, mut agent_id: AgentId) -> Option<AgentId> {
-    let mut seen = BTreeSet::new();
-    while seen.insert(agent_id) {
-        let agent = workstream
-            .agents
-            .iter()
-            .find(|candidate| candidate.agent_id == agent_id)?;
-        match agent.parent_agent.filter(|parent| {
-            workstream
-                .agents
-                .iter()
-                .any(|candidate| candidate.agent_id == *parent)
-        }) {
-            Some(parent) => agent_id = parent,
-            None => return Some(agent_id),
-        }
-    }
-    None
+/// Every agent's root in one pass: an agent whose parent is missing from the
+/// workstream (or absent) is its own root, and a parent cycle stops where it
+/// closes. Walking the chain per agent instead rescans the workstream at
+/// every hop.
+fn roots_by_agent(workstream: &Workstream) -> BTreeMap<AgentId, AgentId> {
+    let by_id = workstream
+        .agents
+        .iter()
+        .map(|agent| (agent.agent_id, agent))
+        .collect::<BTreeMap<_, _>>();
+    workstream
+        .agents
+        .iter()
+        .map(|agent| {
+            let mut root = agent.agent_id;
+            let mut seen = BTreeSet::new();
+            while seen.insert(root) {
+                let Some(parent) = by_id.get(&root).and_then(|agent| agent.parent_agent) else {
+                    break;
+                };
+                if !by_id.contains_key(&parent) {
+                    break;
+                }
+                root = parent;
+            }
+            (agent.agent_id, root)
+        })
+        .collect()
 }
 
 /// The well-known label that hides whatever carries it.
@@ -205,24 +215,7 @@ impl<'a> TopicRailState<'a> {
             .iter()
             .map(|agent| (agent.agent_id, agent))
             .collect::<BTreeMap<_, _>>();
-        let root_by_id = topic
-            .agents
-            .iter()
-            .map(|agent| {
-                let mut root = agent.agent_id;
-                let mut seen = BTreeSet::new();
-                while seen.insert(root) {
-                    let Some(parent) = by_id.get(&root).and_then(|agent| agent.parent_agent) else {
-                        break;
-                    };
-                    if !by_id.contains_key(&parent) {
-                        break;
-                    }
-                    root = parent;
-                }
-                (agent.agent_id, root)
-            })
-            .collect::<BTreeMap<_, _>>();
+        let root_by_id = roots_by_agent(topic);
         let selected_root = registry
             .selected_agent()
             .and_then(|selected| root_by_id.get(selected))
@@ -627,9 +620,25 @@ impl AgentRegistry {
                 if roots.is_empty() || roots.iter().any(|root| agent_pinned(root)) {
                     return None;
                 }
-                let attention = roots
+                // Every agent's attention belongs to its root, so one pass
+                // over the workstream answers for all of them at once. Asking
+                // root by root instead rescans the workstream per root, which
+                // makes a dashboard sync quadratic in agent count.
+                let roots_by_agent = roots_by_agent(workstream);
+                let root_ids = roots
                     .iter()
-                    .map(|root| self.root_attention(workstream, root.agent_id))
+                    .map(|root| root.agent_id)
+                    .collect::<BTreeSet<_>>();
+                let attention = workstream
+                    .agents
+                    .iter()
+                    .filter(|agent| !agent.hidden)
+                    .filter(|agent| {
+                        roots_by_agent
+                            .get(&agent.agent_id)
+                            .is_some_and(|root| root_ids.contains(root))
+                    })
+                    .map(|agent| self.attention(agent.agent_id))
                     .max()
                     .unwrap_or_default();
                 let last_active = roots
@@ -985,20 +994,6 @@ impl AgentRegistry {
     /// Attention displayed for one dashboard root, including its visible
     /// descendants. This is also the signal used to place the root and its
     /// containing workstream in their coarse active cohorts.
-    pub(crate) fn root_attention(
-        &self,
-        workstream: &Workstream,
-        root_id: AgentId,
-    ) -> rho_ui_proto::UiAttention {
-        workstream
-            .agents
-            .iter()
-            .filter(|agent| !agent.hidden && root_of(workstream, agent.agent_id) == Some(root_id))
-            .map(|agent| self.attention(agent.agent_id))
-            .max()
-            .unwrap_or_default()
-    }
-
     #[cfg(test)]
     pub(crate) fn split_workstream_agents<'a>(
         &self,
