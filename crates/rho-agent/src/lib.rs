@@ -13,6 +13,7 @@ use rho_core::{
     StreamingContextItem, StreamingContextItemState, ToolCall, ToolCallId, ToolExecutionContext,
     ToolOutput, ToolOutputStatus, ToolResult, ToolResultMetadata, ToolSpec, ToolUpdate, UnixMs,
 };
+pub use rho_core::{MessageDelivery, MessageSender};
 use rho_db::RhoDb;
 use rho_inference::{InferenceAuth, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
@@ -22,8 +23,8 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRuntime,
-    AgentWriteTxnExt, InferenceModel, InferenceProfile, SessionBinding, UnixMillis,
+    AgentEventPos, AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRoleSessionProfile as _,
+    AgentRuntime, AgentWriteTxnExt, InferenceModel, InferenceProfile, SessionBinding, UnixMillis,
 };
 use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
@@ -107,8 +108,6 @@ pub enum AgentEvent<'a> {
     /// All queued items were dropped (cancel).
     QueueCleared,
 }
-
-pub use rho_core::MessageSender;
 
 /// Stable identity for an accepted user input in an agent's persisted event
 /// log.
@@ -278,20 +277,6 @@ impl InputQueues {
         self.items = held;
         drained
     }
-}
-
-/// When a message sent while the agent is busy enters model context.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum MessageDelivery {
-    /// Nothing to wait for: the message opens a turn right away. Renders as a
-    /// plain user message, never with a queue label. Sent while busy it
-    /// behaves like `NextRequest`.
-    Immediate,
-    /// Steer the current turn: delivered at the next inference request, i.e.
-    /// right after the in-flight tool batch commits its results.
-    NextRequest,
-    /// Wait until the current turn finishes, then start a new turn.
-    NextTurn,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]

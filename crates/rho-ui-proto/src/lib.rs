@@ -9,12 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
-pub use rho_agent::MessageDelivery;
-pub use rho_agent::db::{
-    AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
-    WorkstreamId,
-};
 use rho_core::ContentPart;
+pub use rho_core::{
+    AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
+    MessageDelivery, WorkstreamId,
+};
 pub use rho_workspaces::{
     WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
     WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
@@ -1071,10 +1070,6 @@ fn read_protocol_log_record(
         .context("read protocol log frame")?;
     Ok(Some((unix_ms, direction, frame)))
 }
-
-/// Marker tying this protocol layer to `rho-agent` without putting socket code
-/// in the agent crate.
-pub type Agent = rho_agent::Agent;
 
 #[cfg(test)]
 mod tests {

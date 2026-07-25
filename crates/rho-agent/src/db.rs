@@ -274,29 +274,10 @@ fn rebuild_usage_and_compact_quota(write: &mut WriteTxn) {
     compact_quota_observations(write);
 }
 
-pub use rho_core::{AgentId, AgentIdDomain};
-
-/// Plain sequential workstream id; no prefix-id scrambling — workstreams
-/// are addressed by their unique name in user-facing contexts, and clients
-/// that need a string render `ws-{n}`.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Key,
-    RedbValue,
-    Encode,
-    Decode,
-    Pack,
-    Unpack,
-)]
-pub struct WorkstreamId(pub u64);
+pub use rho_core::{
+    AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, AgentWorkflow,
+    EngineerIntelligence, WorkstreamId,
+};
 
 /// The persistent unit of work: the user's statement that its member
 /// agents belong together. Deliberately minimal — repos, attention, and
@@ -318,28 +299,6 @@ pub struct ProjectRecord {
     pub name: String,
     pub description: String,
     pub created_at: UnixMillis,
-}
-
-/// What the user did about an agent's last finished turn. Attention is
-/// action-cleared (the email-triage model) and *derived*: the daemon
-/// combines this stored verdict with live agent state to produce the
-/// attention level; only the verdict persists.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentDisposition {
-    /// No disposition yet: the ball is in the user's court.
-    Pending,
-    /// Acknowledged; nothing more needed until the next turn end. The
-    /// default so an agent that never finished a turn has nothing to act
-    /// on (and so pre-disposition records decode that way).
-    #[default]
-    Done,
-    /// Deferred: quiet until `until`, then pending again (the Slack-reminder
-    /// move for "I'll get back to this").
-    Snoozed { until: UnixMillis },
-    /// Done, and file it now: skips the rail's idle wait and folds the agent
-    /// immediately. Like every disposition it's a verdict on the last turn —
-    /// the next user message or turn end overwrites it.
-    Hidden,
 }
 
 #[derive(
@@ -863,48 +822,6 @@ pub(crate) enum SessionBinding {
     AdvisorSol(InferenceProfile),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentRole {
-    Engineer {
-        intelligence: EngineerIntelligence,
-    },
-    PM,
-    Advisor {
-        intelligence: AdvisorIntelligence,
-    },
-    WorkflowEngineer {
-        intelligence: EngineerIntelligence,
-        workflow: AgentWorkflow,
-    },
-    WorkflowPM {
-        workflow: AgentWorkflow,
-    },
-    /// Built-in hidden coordinator for Rho's global Iris voice surface.
-    Iris,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentWorkflow {
-    #[default]
-    Default,
-    PrFriendly,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum EngineerIntelligence {
-    Low,
-    Medium,
-    High,
-    Ultra,
-    Mini,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AdvisorIntelligence {
-    Medium,
-    High,
-}
-
 // Temporary migration-only representation of the previous latency field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 enum Latency {
@@ -912,44 +829,12 @@ enum Latency {
     Fast,
 }
 
-impl Default for AgentRole {
-    fn default() -> Self {
-        Self::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-        }
-    }
+pub(crate) trait AgentRoleSessionProfile {
+    fn session_profile(self) -> anyhow::Result<SessionBinding>;
 }
 
-impl AgentRole {
-    pub fn pm() -> Self {
-        Self::PM
-    }
-
-    pub fn workflow(self) -> AgentWorkflow {
-        match self {
-            Self::WorkflowEngineer { workflow, .. } | Self::WorkflowPM { workflow } => workflow,
-            Self::Engineer { .. } | Self::PM | Self::Advisor { .. } | Self::Iris => {
-                AgentWorkflow::Default
-            }
-        }
-    }
-    pub fn is_pm(self) -> bool {
-        matches!(self, Self::PM | Self::WorkflowPM { .. } | Self::Iris)
-    }
-
-    pub fn is_engineer(self) -> bool {
-        matches!(self, Self::Engineer { .. } | Self::WorkflowEngineer { .. })
-    }
-    pub fn handle_prefix(self) -> &'static str {
-        match self {
-            Self::Engineer { .. } | Self::WorkflowEngineer { .. } => "eng",
-            Self::PM | Self::WorkflowPM { .. } => "pm",
-            Self::Advisor { .. } => "adv",
-            Self::Iris => "iris",
-        }
-    }
-
-    pub(crate) fn session_profile(self) -> anyhow::Result<SessionBinding> {
+impl AgentRoleSessionProfile for AgentRole {
+    fn session_profile(self) -> anyhow::Result<SessionBinding> {
         let deep = |effort| InferenceProfile {
             effort,
             fast_mode: false,

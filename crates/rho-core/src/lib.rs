@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use prefix_id::{PrefixId, PrefixIdDomain};
+#[cfg(feature = "redb")]
+use redb::Value as _;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,12 +60,125 @@ impl PrefixIdDomain for AgentIdDomain {
     }
 }
 
+/// Plain sequential workstream id. User-facing surfaces normally address a
+/// workstream by its unique name and render this as `ws-{n}` when needed.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
+)]
+#[cfg_attr(feature = "redb", derive(redb_derive::Key, redb_derive::Value))]
+pub struct WorkstreamId(pub u64);
+
+/// What the user did about an agent's last finished turn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum AgentDisposition {
+    Pending,
+    #[default]
+    Done,
+    Snoozed {
+        until: UnixMs,
+    },
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum AgentRole {
+    Engineer {
+        intelligence: EngineerIntelligence,
+    },
+    PM,
+    Advisor {
+        intelligence: AdvisorIntelligence,
+    },
+    WorkflowEngineer {
+        intelligence: EngineerIntelligence,
+        workflow: AgentWorkflow,
+    },
+    WorkflowPM {
+        workflow: AgentWorkflow,
+    },
+    /// Built-in hidden coordinator for Rho's global Iris voice surface.
+    Iris,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum AgentWorkflow {
+    #[default]
+    Default,
+    PrFriendly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum EngineerIntelligence {
+    Low,
+    Medium,
+    High,
+    Ultra,
+    Mini,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum AdvisorIntelligence {
+    Medium,
+    High,
+}
+
+impl Default for AgentRole {
+    fn default() -> Self {
+        Self::Engineer {
+            intelligence: EngineerIntelligence::Medium,
+        }
+    }
+}
+
+impl AgentRole {
+    pub fn pm() -> Self {
+        Self::PM
+    }
+
+    pub fn workflow(self) -> AgentWorkflow {
+        match self {
+            Self::WorkflowEngineer { workflow, .. } | Self::WorkflowPM { workflow } => workflow,
+            Self::Engineer { .. } | Self::PM | Self::Advisor { .. } | Self::Iris => {
+                AgentWorkflow::Default
+            }
+        }
+    }
+
+    pub fn is_pm(self) -> bool {
+        matches!(self, Self::PM | Self::WorkflowPM { .. } | Self::Iris)
+    }
+
+    pub fn is_engineer(self) -> bool {
+        matches!(self, Self::Engineer { .. } | Self::WorkflowEngineer { .. })
+    }
+
+    pub fn handle_prefix(self) -> &'static str {
+        match self {
+            Self::Engineer { .. } | Self::WorkflowEngineer { .. } => "eng",
+            Self::PM | Self::WorkflowPM { .. } => "pm",
+            Self::Advisor { .. } => "adv",
+            Self::Iris => "iris",
+        }
+    }
+}
+
 /// Who authored a message entering an agent's context. Providers render both
 /// as user-role input; UIs render agent mail distinctly from user messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum MessageSender {
     User,
     Agent { id: AgentId },
+}
+
+/// When a message sent while an agent is busy enters model context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum MessageDelivery {
+    /// Start immediately when idle; while busy, steer the next request.
+    Immediate,
+    /// Enter at the next inference-request boundary.
+    NextRequest,
+    /// Wait for the current turn to finish, then start a new turn.
+    NextTurn,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]

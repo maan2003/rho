@@ -6,8 +6,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
 ## Crate layering
 
 - `rho-core` owns the shared vocabulary: transcript items, inference requests,
-  inference events and responses, tool calls/results, usage, roles, message
-  phases, and opaque provider items. It should stay policy-light.
+  inference events and responses, tool calls/results, usage, agent/workstream
+  identities, roles and dispositions, message delivery and phases, and opaque
+  provider items. It should stay policy-light.
 - Inference crates, currently `rho-inference`, translate `rho-core` inference
   requests into provider-specific wire protocols and translate provider events
   back into `rho-core` items and updates.
@@ -321,6 +322,9 @@ the persisted Engineer through `AgentPool`.
 The daemon's UI protocol (`rho-ui-proto`) is served over the local Unix socket
 and iroh connections from clients enrolled through `rho-iroh-auth` (`rho
 daemon --iroh`; approval via `rho iroh approve` stays on the Unix socket).
+The protocol crate owns only wire types and state diffs; `rho-daemon` projects
+the richer `rho-agent` runtime state into that wire shape. Consequently UI
+clients do not depend on the agent runtime or inherit its optional features.
 Unix sessions multiplex control and agent state on one byte stream. Native
 iroh sessions keep commands and lifecycle events on a high-priority
 bidirectional control stream (exactly one per physical connection); the daemon

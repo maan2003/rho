@@ -14,7 +14,6 @@ bytes.workspace = true
 camino.workspace = true
 dirs.workspace = true
 futures.workspace = true
-rho-agent = { workspace = true, default-features = false }
 rho-core.workspace = true
 rho-shell-proto.workspace = true
 rho-workspaces.workspace = true

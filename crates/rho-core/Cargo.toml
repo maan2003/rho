@@ -6,11 +6,16 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+redb = ["dep:redb", "dep:redb-derive"]
+
 [dependencies]
 anyhow.workspace = true
 bytes = "1"
 inventory = "0.3"
 prefix-id = { workspace = true, default-features = false }
+redb = { workspace = true, optional = true }
+redb-derive = { workspace = true, optional = true }
 senax-encoder = { workspace = true, features = ["serde_json"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true

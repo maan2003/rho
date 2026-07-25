@@ -30,6 +30,7 @@ use tokio::sync::{
     Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot, watch,
 };
 
+mod agent_ui;
 pub mod debug;
 mod iris;
 mod realtime;
@@ -774,7 +775,7 @@ async fn serve_iroh_agent_stream(
             &mut send,
             &ServerMessage::Agent {
                 agent_id,
-                frame: encoder.encode(agent.state()),
+                frame: encoder.encode(agent_ui::project_agent_state(&agent.state())),
             },
         )
         .await?;
@@ -788,7 +789,7 @@ async fn serve_iroh_agent_stream(
                         &mut send,
                         &ServerMessage::Agent {
                             agent_id,
-                            frame: encoder.encode(state),
+                            frame: encoder.encode(agent_ui::project_agent_state(&state)),
                         },
                     )
                     .await?;
@@ -3425,14 +3426,14 @@ fn subscribe_agent(
         let mut encoder = AgentRemoteEncoder::new();
         let _ = state_tx.send(ServerMessage::Agent {
             agent_id,
-            frame: encoder.encode(agent.state()),
+            frame: encoder.encode(agent_ui::project_agent_state(&agent.state())),
         });
         futures::pin_mut!(changes);
         while let Some(state) = changes.next().await {
             if state_tx
                 .send(ServerMessage::Agent {
                     agent_id,
-                    frame: encoder.encode(state),
+                    frame: encoder.encode(agent_ui::project_agent_state(&state)),
                 })
                 .is_err()
             {

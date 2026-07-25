@@ -19,8 +19,9 @@ use tokio::sync::{Mutex, broadcast};
 use crate::claude::ClaudeAgent;
 use crate::db::{
     AGENT_USAGE_BUCKET_MS, AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole,
-    AgentRuntime, AgentUsageBucket, AgentWorkflow, AgentWriteTxnExt as _, EngineerIntelligence,
-    InferenceModel, InferenceProfile, SessionBinding, WorkstreamId,
+    AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWorkflow,
+    AgentWriteTxnExt as _, EngineerIntelligence, InferenceModel, InferenceProfile, SessionBinding,
+    WorkstreamId,
 };
 use crate::lazy::Lazy;
 use crate::{Agent, AgentInputId, AgentState, InputSourceId, MessageDelivery, StartWorkdir};
