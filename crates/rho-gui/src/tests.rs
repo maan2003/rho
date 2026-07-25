@@ -1665,3 +1665,68 @@ fn long_transcripts_conceal_their_history_after_the_frame_that_opens_them(cx: &m
         "the buffer keeps the markup either way"
     );
 }
+
+/// The block map may not assume display elisions arrive sorted or apart:
+/// they are held in the order they were inserted, and two of them can cover
+/// rows that meet or overlap. Composing an edit per elision assumed both,
+/// and underflowed the row arithmetic when neither held.
+#[gpui::test]
+fn edits_under_overlapping_elisions_keep_the_block_map_consistent(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let lines = (0..40)
+        .map(|index| format!("line {index} of the answer\n"))
+        .collect::<String>();
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant(&lines, Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+
+    // Two elisions over rows that overlap, inserted latest-first.
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let elision = |start: usize, end: usize| editor::DisplayElisionProperties {
+                    range: snapshot.anchor_before(multi_buffer::MultiBufferOffset(start))
+                        ..snapshot.anchor_before(multi_buffer::MultiBufferOffset(end)),
+                    tail_rows: 1,
+                    height: Some(1),
+                    style: editor::display_map::BlockStyle::Flex,
+                    render: std::sync::Arc::new(|_| {
+                        gpui::IntoElement::into_any_element(gpui::Empty)
+                    }),
+                    priority: 0,
+                    type_tag: None,
+                };
+                editor.insert_display_elisions(vec![elision(300, 500)], None, cx);
+                editor.insert_display_elisions(vec![elision(100, 320)], None, cx);
+            });
+        })
+        .expect("insert overlapping elisions");
+
+    // An edit inside both of them.
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant(
+                &format!("{lines}line 40 of the answer\n"),
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
+    );
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("line 40 of the answer"),
+        "the edit should render: {text:?}"
+    );
+}

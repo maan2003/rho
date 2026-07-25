@@ -13,41 +13,41 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-askpass = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-assets = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+askpass = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+assets = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 buffer_diff.workspace = true
 async-trait = "0.1"
 camino.workspace = true
 clap.workspace = true
-client = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-clock = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-collections = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-command_palette = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+client = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+clock = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+collections = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+command_palette = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 dirs.workspace = true
-editor = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-fs = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+editor = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+fs = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 futures.workspace = true
 iroh = { workspace = true, features = ["qlog", "tls-aws-lc-rs"] }
-gpui = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce", default-features = false, features = [
+gpui = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa", default-features = false, features = [
   "wayland",
 ] }
-gpui_platform = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce", default-features = false, features = [
+gpui_platform = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa", default-features = false, features = [
   "font-kit",
   "wayland",
 ] }
-gpui_tokio = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-http_client = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+gpui_tokio = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+http_client = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 json-stream.workspace = true
-language = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-languages = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce", features = ["load-grammars"] }
-multi_buffer = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+language = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+languages = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa", features = ["load-grammars"] }
+multi_buffer = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 prefix-id = { workspace = true, features = ["redb"] }
-node_runtime = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+node_runtime = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 octo-types.workspace = true
-project = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+project = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 prost = "0.9"
-release_channel = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-remote = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+release_channel = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+remote = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 rho-core.workspace = true
 rho-iroh-auth.workspace = true
 rho-profiling.workspace = true
@@ -61,29 +61,29 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
   "playback",
   "wav",
 ] }
-rpc = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+rpc = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 rustc-hash = "2.1.0"
-search = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+search = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 semver = { version = "1.0", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
-settings = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-text = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-theme = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-theme_settings = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+settings = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+text = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+theme = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+theme_settings = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 tokio = { workspace = true, features = ["io-util", "net", "process", "rt"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tree-sitter = "0.26"
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
-ui = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-util = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-vim = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
-vim_mode_setting = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce" }
+ui = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+util = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+vim = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+vim_mode_setting = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
 
 [dev-dependencies]
 backtrace = "0.3"
-gpui = { git = "https://github.com/maan2003/zed", rev = "1712f95a5fce", default-features = false, features = [
+gpui = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa", default-features = false, features = [
   "test-support",
 ] }
 libc = "0.2"
