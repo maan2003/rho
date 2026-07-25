@@ -49,7 +49,7 @@ pub fn specs() -> Vec<ToolSpec> {
                     "task_name":{"type":"string","description":"Short display/workstream name."},
                     "project":{"type":"string","description":"Registered project name or absolute repository path."},
                     "workstream":{"type":"string","description":"Existing workstream name to join."},
-                    "role":{"type":"string","enum":["eng-mini","eng-low","eng","eng-high","eng-ultra","pm"]}
+                    "role":{"type":"string","enum":["eng-mini","eng-low","eng","eng-high","eng-ultra","eng-alt","pm"]}
                 }
             }),
         ),

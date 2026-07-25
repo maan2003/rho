@@ -114,17 +114,25 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
         .is_none_or(char::is_whitespace);
     let words = trimmed.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() || (words.len() == 1 && !typing_new_token) {
-        return ["eng", "eng-mini", "eng-low", "eng-high", "eng-ultra", "pm"]
-            .into_iter()
-            .filter(|mode| fuzzy_contains(mode, token))
-            .map(|mode| Candidate {
-                value: mode.to_owned(),
-                description: match mode {
-                    "pm" => "project manager".to_owned(),
-                    _ => "engineer intelligence".to_owned(),
-                },
-            })
-            .collect();
+        return [
+            "eng",
+            "eng-mini",
+            "eng-low",
+            "eng-high",
+            "eng-ultra",
+            "eng-alt",
+            "pm",
+        ]
+        .into_iter()
+        .filter(|mode| fuzzy_contains(mode, token))
+        .map(|mode| Candidate {
+            value: mode.to_owned(),
+            description: match mode {
+                "pm" => "project manager".to_owned(),
+                _ => "engineer intelligence".to_owned(),
+            },
+        })
+        .collect();
     }
 
     Vec::new()

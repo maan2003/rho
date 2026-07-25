@@ -3843,9 +3843,12 @@ fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
         "eng-ultra" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Ultra,
         }),
+        "eng-alt" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Alt,
+        }),
         "pm" => Ok(AgentRole::pm()),
         other => Err(format!(
-            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-high, eng-ultra, or pm"
+            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-high, eng-ultra, eng-alt, or pm"
         )),
     }
 }
@@ -3891,6 +3894,14 @@ fn cycle_agent_role_text(current: &str) -> &'static str {
         | AgentRole::WorkflowEngineer {
             intelligence: EngineerIntelligence::Ultra,
             ..
+        } => "eng-alt",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Alt,
+            ..
+        }
+        | AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Alt,
+            ..
         } => "pm",
         AgentRole::Advisor { .. } => "eng",
         AgentRole::PM | AgentRole::WorkflowPM { .. } => "eng-mini",
@@ -3933,9 +3944,13 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
                     EngineerIntelligence::Medium => "eng",
                     EngineerIntelligence::High => "eng-high",
                     EngineerIntelligence::Ultra => "eng-ultra",
+                    EngineerIntelligence::Alt => "eng-alt",
                 }
                 .to_owned(),
-                family: if intelligence == EngineerIntelligence::Ultra {
+                family: if matches!(
+                    intelligence,
+                    EngineerIntelligence::Ultra | EngineerIntelligence::Alt
+                ) {
                     RoleFamily::Fable
                 } else {
                     RoleFamily::Deep

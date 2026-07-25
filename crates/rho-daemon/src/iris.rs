@@ -545,6 +545,9 @@ fn parse_role(role: &str) -> anyhow::Result<AgentRole> {
         "eng-ultra" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Ultra,
         },
+        "eng-alt" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Alt,
+        },
         "pm" => AgentRole::pm(),
         other => anyhow::bail!("unknown role {other}"),
     })

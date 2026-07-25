@@ -312,6 +312,12 @@ fn agent_role_resolves_opinionated_bindings() {
         }
     );
     assert_eq!(
+        profile(EngineerIntelligence::Alt),
+        SessionBinding::ClaudeOpus {
+            effort: ClaudeEffort::High
+        }
+    );
+    assert_eq!(
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::High,
         }

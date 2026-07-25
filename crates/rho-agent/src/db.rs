@@ -897,6 +897,15 @@ impl AgentRoleSessionProfile for AgentRole {
             } => SessionBinding::ClaudeFable {
                 effort: ClaudeEffort::High,
             },
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Alt,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Alt,
+                ..
+            } => SessionBinding::ClaudeOpus {
+                effort: ClaudeEffort::High,
+            },
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Medium,
             } => SessionBinding::AdvisorSol(deep(ReasoningEffort::Xhigh)),
@@ -944,6 +953,9 @@ impl SessionBinding {
             | Self::ClaudeAdvisor {
                 effort: ClaudeEffort::High,
             } => (EngineerIntelligence::Ultra, Latency::Standard),
+            Self::ClaudeOpus {
+                effort: ClaudeEffort::High,
+            } => (EngineerIntelligence::Alt, Latency::Standard),
             Self::ResponsesSol(config) if config.effort == ReasoningEffort::Xhigh => (
                 EngineerIntelligence::High,
                 if config.fast_mode {
@@ -978,9 +990,10 @@ impl SessionBinding {
                     Latency::Standard
                 },
             ),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => {
+            Self::ClaudeFable { .. } | Self::ClaudeAdvisor { .. } => {
                 (EngineerIntelligence::Ultra, Latency::Standard)
             }
+            Self::ClaudeOpus { .. } => (EngineerIntelligence::Alt, Latency::Standard),
         };
         AgentRole::Engineer { intelligence }
     }

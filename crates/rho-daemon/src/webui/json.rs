@@ -221,6 +221,14 @@ fn role_label(config: AgentRole) -> &'static str {
             intelligence: EngineerIntelligence::Ultra,
             ..
         } => "eng-ultra",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Alt,
+            ..
+        }
+        | AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Alt,
+            ..
+        } => "eng-alt",
     }
 }
 

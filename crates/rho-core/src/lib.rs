@@ -114,6 +114,7 @@ pub enum EngineerIntelligence {
     High,
     Ultra,
     Mini,
+    Alt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
