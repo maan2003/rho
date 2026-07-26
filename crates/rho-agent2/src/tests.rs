@@ -114,7 +114,10 @@ fn ask(sources: Vec<SourceKind>) -> Ask {
             asked: ModelAsked::Calls,
             waiting_on,
         }),
-        phase: Phase::Idle,
+        phase: Phase::Idle {
+            owed: Vec::new(),
+            standing: Standing::Nothing,
+        },
     }
 }
 
@@ -831,9 +834,12 @@ fn typed_input_and_finished_tools_go_at_once() {
 //  ms      boundary
 //  0       SEND — a retry or a resume, with nothing pending at all
 #[test]
-fn a_must_send_sends_even_with_nothing_pending() {
+fn at_once_sends_even_with_nothing_pending() {
     let mut schedule = ask(Vec::new());
-    schedule.phase = Phase::MustSend;
+    schedule.phase = Phase::Idle {
+        owed: Vec::new(),
+        standing: Standing::Asked,
+    };
     assert_eq!(schedule.boundary(UnixMs(0)), Boundary::Now);
 }
 
@@ -849,7 +855,10 @@ fn a_cancelled_agent_is_not_woken_by_its_tools_dying_words() {
         "an exited tool would normally go at once"
     );
 
-    schedule.phase = Phase::Halted;
+    schedule.phase = Phase::Idle {
+        owed: Vec::new(),
+        standing: Standing::Cancelled { at: UnixMs(0) },
+    };
     assert_eq!(
         schedule.boundary(UnixMs(0)),
         Boundary::No { recheck: None },
@@ -859,8 +868,41 @@ fn a_cancelled_agent_is_not_woken_by_its_tools_dying_words() {
     // Not even the check-in, which is the one thing that fires with nothing to
     // send: a cancelled agent must stay stopped until a person says otherwise.
     let mut running = ask(vec![silent_call("call-1")]);
-    running.phase = Phase::Halted;
+    running.phase = Phase::Idle {
+        owed: Vec::new(),
+        standing: Standing::Cancelled { at: UnixMs(0) },
+    };
     assert_eq!(running.recheck(UnixMs(0)), None);
+}
+
+//  ms      stop   input   boundary
+//  0       cancel  —      hold, no timer
+//  1       cancel  mail   still held — a peer is not a person
+//  2       cancel  user   SEND
+#[test]
+fn only_a_person_lifts_a_stop() {
+    let stopped = |sources| {
+        let mut schedule = ask(sources);
+        schedule.phase = Phase::Idle {
+            owed: Vec::new(),
+            standing: Standing::Cancelled { at: UnixMs(0) },
+        };
+        schedule
+    };
+
+    assert_eq!(stopped(Vec::new()).recheck(UnixMs(2)), None);
+    assert_eq!(
+        stopped(vec![pending_mail(1, 1)]).recheck(UnixMs(2)),
+        None,
+        "mail is queued and waits there"
+    );
+    // Input from before the stop is what the stop was about, so it is only
+    // input that arrived after it that counts.
+    assert_eq!(stopped(vec![pending_user(0)]).recheck(UnixMs(2)), None);
+    assert_eq!(
+        stopped(vec![pending_user(2)]).boundary(UnixMs(2)),
+        Boundary::Now
+    );
 }
 
 //  ms      call-1    boundary
@@ -869,31 +911,31 @@ fn a_cancelled_agent_is_not_woken_by_its_tools_dying_words() {
 //  0       —         ...and cancelled before it could: hold, no timer
 #[test]
 fn what_a_restart_owes_and_when_it_pays_are_two_questions() {
-    let lost = vec![call("call-1")];
-    let restarted = |resume| {
+    let owed = vec![call("call-1")];
+    let restarted = |standing| {
         let mut schedule = ask(Vec::new());
-        schedule.phase = Phase::Restarted {
-            lost: lost.clone(),
-            resume,
+        schedule.phase = Phase::Idle {
+            owed: owed.clone(),
+            standing,
         };
         schedule
     };
 
     assert_eq!(
-        restarted(Resume::AtOnce).boundary(UnixMs(0)),
+        restarted(Standing::Asked).boundary(UnixMs(0)),
         Boundary::Now,
-        "the request the shutdown interrupted was already judged worth making"
+        "a retry hurries the request without changing what is in it"
     );
     // Owing an explanation is not itself a reason to speak: the call is gone
     // either way, and there is nobody waiting on the answer. What is left is
-    // the ordinary check-in, which the restart neither brought forward nor
+    // the ordinary check-in, which what is owed neither brought forward nor
     // put off.
     assert_eq!(
-        restarted(Resume::WhenDue).recheck(UnixMs(0)),
+        restarted(Standing::Nothing).recheck(UnixMs(0)),
         Some(UnixMs(0) + DEFAULT_WAIT),
     );
     assert_eq!(
-        restarted(Resume::NotUntilAsked).recheck(UnixMs(0)),
+        restarted(Standing::Cancelled { at: UnixMs(0) }).recheck(UnixMs(0)),
         None,
         "a cancel stops the agent without cancelling the debt"
     );
@@ -907,7 +949,13 @@ fn a_failed_request_is_not_retried_by_whatever_finishes_next() {
     // ends, so an agent left to itself would hammer the provider for as long
     // as it had tools. Somebody has to look at it: `Retry`, or fresh input.
     let mut schedule = ask(vec![ended_call("call-1", 0)]);
-    schedule.phase = Phase::Failed(Arc::from("provider said no"));
+    schedule.phase = Phase::Idle {
+        owed: Vec::new(),
+        standing: Standing::Failed {
+            at: UnixMs(0),
+            error: Arc::from("provider said no"),
+        },
+    };
     assert_eq!(
         schedule.boundary(UnixMs(0)),
         Boundary::No { recheck: None },
@@ -1073,18 +1121,7 @@ fn a_drain_empties_the_queues_it_touched() {
 }
 
 #[test]
-fn the_restart_note_is_one_paragraph() {
-    // The line continuations in the literal swallow the newline *and* the
-    // indent after it, so a missing trailing space silently glues two words
-    // together and nothing else would notice.
-    assert!(!RESTART_NOTE.contains('\n'));
-    assert!(!RESTART_NOTE.contains("  "));
-    assert!(RESTART_NOTE.contains("foreground and background"));
-    assert!(RESTART_NOTE.contains("empty tool results above are placeholders"));
-}
-
-#[test]
-fn a_call_the_transcript_never_answered_is_the_one_left_lost() {
+fn a_call_the_transcript_never_answered_is_the_one_still_owed() {
     // Nothing records which tools were alive; a call with no result is one no
     // tool is going to answer, because none of them survived.
     let restored = restore(vec![
@@ -1097,12 +1134,12 @@ fn a_call_the_transcript_never_answered_is_the_one_left_lost() {
         },
     ]);
 
-    assert_eq!(restored.orphan_tools.len(), 1);
-    assert_eq!(restored.orphan_tools[0].id.as_str(), "call-2");
+    assert_eq!(restored.owed.len(), 1);
+    assert_eq!(restored.owed[0].id.as_str(), "call-2");
 }
 
 #[test]
-fn a_call_answered_turns_ago_is_not_lost_however_long_its_tool_ran() {
+fn a_call_answered_turns_ago_is_not_owed_however_long_its_tool_ran() {
     // The tool behind it may have gone on producing updates for an hour and
     // then died with the process. It is still not owed a result, and the note
     // in the next request is what tells the model its output stopped.
@@ -1124,31 +1161,31 @@ fn a_call_answered_turns_ago_is_not_lost_however_long_its_tool_ran() {
         },
     ]);
 
-    assert!(restored.orphan_tools.is_empty());
+    assert!(restored.owed.is_empty());
 }
 
 #[test]
-fn a_lost_tool_is_admitted_to_at_the_next_request_not_at_load() {
+fn what_is_owed_is_settled_at_the_next_request_not_at_load() {
     // Loading an agent to look at it must not write to its transcript; the note
     // is only worth making when there is a request to put it in.
-    let restored = restore(vec![
-        AgentEvent::Replied {
-            blocks: Cow::Owned(called_blocks(&["call-1"])),
-            context_used: None,
-        },
-        AgentEvent::Ended,
-    ]);
+    let restored = restore(vec![AgentEvent::Replied {
+        blocks: Cow::Owned(called_blocks(&["call-1"])),
+        context_used: None,
+    }]);
 
     assert_eq!(
         restored.history.len(),
         1,
         "replay appends nothing of its own"
     );
-    assert_eq!(restored.orphan_tools.len(), 1, "but the call is remembered");
+    assert_eq!(restored.owed.len(), 1, "but the call is remembered");
 }
 
 #[test]
-fn a_request_cut_short_by_shutdown_resumes() {
+fn a_request_cut_short_by_shutdown_does_not_resume_itself() {
+    // The message is not lost — the `Sent` carried it into history. What does
+    // not happen is the request being made again the moment the process is
+    // back, which is a person's call and reaches the agent through `retry`.
     let restored = restore(vec![
         AgentEvent::Queued(user_input(Delivery::NextRequest, 10)),
         AgentEvent::Sent {
@@ -1161,8 +1198,9 @@ fn a_request_cut_short_by_shutdown_resumes() {
         },
     ]);
 
-    assert!(restored.request_active, "resumes on load");
-    assert!(restored.user.is_empty(), "the message already landed");
+    assert_eq!(restored.history.len(), 1, "the message reached history");
+    assert!(restored.user.is_empty(), "and is no longer queued");
+    assert!(restored.owed.is_empty(), "no call was left hanging");
 }
 
 #[test]
@@ -1237,7 +1275,7 @@ async fn events_round_trip_through_the_store() {
     assert_eq!(restored.history.len(), 1);
     assert!(restored.user.is_empty(), "the queue was drained");
     assert_eq!(restored.context_used, Some(1_234));
-    assert_eq!(restored.orphan_tools.len(), 1, "the tool never finished");
+    assert_eq!(restored.owed.len(), 1, "the tool never finished");
 }
 
 #[tokio::test]
@@ -1257,7 +1295,7 @@ async fn a_log_is_read_back_in_order_and_only_its_own() {
         };
         at = store.append(at, &event).await;
     }
-    store.append(elsewhere, &AgentEvent::Ended).await;
+    store.append(elsewhere, &AgentEvent::QueueCleared).await;
 
     assert_eq!(counted(&store, id), (0..300).collect::<Vec<_>>());
     assert_eq!(store.load(other).unwrap().2.len(), 1);

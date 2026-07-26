@@ -1,9 +1,8 @@
 //! Inputs waiting to reach the model.
 //!
 //! Every source works the same way: it accumulates on its own, reports how it
-//! is doing, and is *pulled* by the core at a moment the core chooses. Nothing
-//! outside the core decides when a request happens; the core never decides what
-//! a source has to say.
+//! is doing, and is *pulled* by the core at a moment the core chooses.
+//! `DECISION-pull-based-sources`.
 
 mod mail;
 mod user;
@@ -57,11 +56,10 @@ pub struct QueuedInput {
 /// One source, whether or not it has anything to say.
 ///
 /// Facts and nothing else — when something arrived, whether a call has been
-/// answered — because a duration a source picked for itself would be a duration
-/// picked without seeing what else is waiting. Even "is this worth sending" is
-/// left to `boundary`: an empty queue and a tool that has produced nothing are
-/// both reported, because being empty is a fact too, and for a tool it is one
-/// that changes the answer.
+/// answered. Even "is this worth sending" is left to `boundary`, so an empty
+/// queue and a tool that has produced nothing are both reported: being empty is
+/// a fact too, and for a tool it is one that changes the answer.
+/// `DECISION-boundary-is-the-only-decision`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SourceKind {
     /// Typed input is whole on arrival, so it never has more to say.
@@ -77,10 +75,9 @@ pub(crate) enum SourceKind {
         newest_at: Option<UnixMs>,
     },
     /// A called tool, reported exactly as it reports itself. There is
-    /// deliberately no tidier enum in between: naming the states here would be
-    /// deciding what they mean, and any name that collapsed two of these facts
-    /// would put a decision outside the one place decisions live — which is how
-    /// a request caused by a person came to demote somebody else's tool.
+    /// deliberately no tidier enum in between: any name that collapsed two of
+    /// these facts would be deciding what they mean, outside the one place
+    /// decisions live.
     Tool {
         /// What the model called it, which is the only handle either side has
         /// on a particular call: the model names it when it asks, and names it

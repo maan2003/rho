@@ -1,25 +1,11 @@
-//! A small agent harness built around one question.
-//!
-//! The transcript is an append-only list of [`ContextBlock`]s. Several things
-//! produce blocks — the model, tools, the user, peer agents — but only the
-//! core appends, so the transcript has exactly one writer and a total order.
-//!
-//! Everything that produces blocks is a *source*. Sources accumulate on their
-//! own and are **pulled** by the core at a moment the core picks, so several
-//! sources merge into one request rather than waking one request each. That
-//! makes the entire scheduler one question, asked after every event:
+//! A small agent harness built around one question, asked after every event:
 //!
 //! > *Should the next request start now?*
 //!
-//! The `boundary` module answers it, and is the only place in this crate that
-//! exercises judgment. Everything else — spawning, persisting, draining,
-//! publishing — is mechanism, and lives here. The division of labour with
-//! tools follows from the same split: **nothing outside the core decides
-//! *when*, and the core never decides *what***. A tool reports what it has and
-//! how it is doing; the core weighs that against everything else and picks the
-//! moment. The only thing the core ever says back to a tool is
-//! [`ToolSession::cancel`] — wind down — and even then it collects the tool's
-//! parting output, so the tool has the last word.
+//! The `boundary` module answers it. Everything here is mechanism — spawning,
+//! draining, persisting, publishing — and the transcript's sole writer.
+//!
+//! `specs/ARCH-rho-agent2.md` has the shape and the invariants.
 
 mod boundary;
 mod db;
@@ -146,9 +132,7 @@ impl AgentHandle {
     }
 
     /// Instructions come from the caller here exactly as they do for a new
-    /// agent, because they are code rather than a row: an agent reopened next
-    /// month runs today's prompt, and editing the prompt reaches every agent
-    /// that already exists.
+    /// agent: `DECISION-instructions-are-code`.
     pub fn load(
         store: Store,
         inference: Inference,
@@ -293,70 +277,61 @@ enum Event {
     Tick,
 }
 
-/// Told to the model by the first request after a restart, once every call it
-/// left unanswered has been given an empty result.
-///
-/// "Restarted" rather than "crashed": a clean shutdown and a crash look exactly
-/// alike from here — all the agent knows is that it was not running. The middle
-/// sentence is the one doing the work, because an empty result on its own reads
-/// as a command that succeeded quietly.
-const RESTART_NOTE: &str = "note: rho restarted. Every tool that was running is gone — foreground \
-     and background alike — and nothing was recorded about what any of them did. The empty tool \
-     results above are placeholders, not output. Re-run anything you still need.";
-
 /// What the agent is up to, and the first thing the decision asks about.
 ///
-/// One enum rather than flags beside `Option`s, because only the first of these
-/// leaves "should the next request start now?" open, and no two of the rest can
-/// be in force at once: an agent cannot be halted *and* mid-request, a request
-/// cannot already be in flight *and* owed, and an error the agent has moved on
-/// from is not an error it is stopped by.
+/// Either a request is in flight or it is not, and there is nothing else to be.
 #[derive(Clone)]
 enum Phase {
-    /// Nothing in the way. What happens next is up to the sources.
-    Idle,
-    /// Loaded from a log and not yet spoken. `lost` is the calls whose tools
-    /// did not survive, and the first request has to admit that before
-    /// anything else. Owing that is a phase rather than a list on the side
-    /// because it is true of the agent exactly until it speaks: making the
-    /// note at the request rather than at load means an agent that is only
-    /// opened and read is never written to, and the note lands next to the
-    /// request it explains.
-    Restarted { lost: Vec<ToolCall>, resume: Resume },
+    /// No request in flight. `owed` is what the next one has to open with —
+    /// calls nothing is going to answer, which after a restart is every call
+    /// history left hanging (`SPEC-restart-recovery`). Ordinarily empty.
+    Idle {
+        owed: Vec<ToolCall>,
+        standing: Standing,
+    },
     /// A request is in flight, and nothing but an interrupt may disturb it.
     Requesting(InFlight),
-    /// Send at the next opportunity even with nothing pending: a retry, or
-    /// carrying on after a compaction.
-    MustSend,
-    /// The last request failed for good, carrying what it said. Stopped for the
-    /// same reason as `Halted`: a request that failed will fail the same way
-    /// when the next tool ends, and an agent that keeps trying on its own is
-    /// one nobody can call off.
-    Failed(Arc<str>),
-    /// Cancelled. Tool output still reaches history at the next boundary, but
-    /// nothing may *start* a request until fresh user input arrives — otherwise
-    /// a cancelled tool's dying words would wake the agent straight back up.
-    Halted,
 }
 
-/// When a restart's first request is, which is the only question left open
-/// while it still owes one.
+/// The last thing to happen to an idle agent that bears on whether it should
+/// speak, and when it happened.
 ///
-/// These are the three phases a restart can be *in the middle of*, and there
-/// are exactly three because the others cannot coexist with it: nothing can be
-/// in flight before the first request, and nothing can have failed either.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Resume {
-    /// A request was cut short by the shutdown. Nothing it produced reached
-    /// history, so it has to be sent again.
-    AtOnce,
-    /// Nothing was in flight. The sources say when, as they always do — the
-    /// restart only says what has to be in it.
-    WhenDue,
-    /// Cancelled before it could explain itself. Still owed, because a cancel
-    /// is not an answer and no provider will accept a call that never got
-    /// one; it has just stopped being a reason to send.
-    NotUntilAsked,
+/// Facts rather than a verdict: what any of them is worth is `boundary`'s to
+/// say. Nothing here survives a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Standing {
+    /// Nothing either way; the sources decide. The ordinary case, and what a
+    /// loaded agent always comes back as.
+    Nothing,
+    /// Somebody asked for a request the sources would not have made: a retry,
+    /// or a compaction the core performed on work that still owes a reply.
+    /// Never set by loading: `DECISION-a-restart-does-not-resume-by-itself`.
+    Asked,
+    /// The user pressed stop. What is `owed` outlives it, because a cancel is
+    /// not an answer.
+    Cancelled { at: UnixMs },
+    /// The request in flight then failed for good, saying `error`.
+    Failed { at: UnixMs, error: Arc<str> },
+}
+
+impl Standing {
+    /// Whether the agent is stopped, given the oldest thing the user has
+    /// queued.
+    ///
+    /// A stop waits on a person, so only user input that arrived after it lifts
+    /// it: `DECISION-stopped-agents-wait-for-a-person`. Derived from the queue
+    /// rather than recorded, because the queue already says it.
+    fn stopped(&self, user_oldest_at: Option<UnixMs>) -> bool {
+        match self {
+            Self::Nothing | Self::Asked => false,
+            // A cancel empties the queues and a failed request had already
+            // drained them, so anything dated at or after the stop is somebody
+            // typing since. Anything older was already on its way.
+            Self::Cancelled { at } | Self::Failed { at, .. } => {
+                !user_oldest_at.is_some_and(|oldest| oldest >= *at)
+            }
+        }
+    }
 }
 
 /// The in-flight request. Provisional until it finishes: a failure drops the
@@ -388,6 +363,7 @@ struct Agent {
     session: InferenceSession,
     phase: Phase,
 
+    // review: inlilne ToolRegister, UserSource, MailSource
     user: UserSource,
     mail: MailSource,
     tools: BTreeMap<ToolCallId, RunningTool>,
@@ -438,19 +414,12 @@ impl Agent {
             instructions: Arc::from(instructions),
             history: restored.history,
             session,
-            phase: match restored.orphan_tools.is_empty() {
-                // Nothing to explain, so nothing to be in the middle of.
-                true => match restored.request_active {
-                    true => Phase::MustSend,
-                    false => Phase::Idle,
-                },
-                false => Phase::Restarted {
-                    lost: restored.orphan_tools,
-                    resume: match restored.request_active {
-                        true => Resume::AtOnce,
-                        false => Resume::WhenDue,
-                    },
-                },
+            // A fresh agent lands here too — being loaded from a log is not
+            // its own kind of state, and coming up is never by itself a reason
+            // to send: `DECISION-a-restart-does-not-resume-by-itself`.
+            phase: Phase::Idle {
+                owed: restored.owed,
+                standing: Standing::Nothing,
             },
             user: restored.user,
             mail: restored.mail,
@@ -491,7 +460,9 @@ impl Agent {
             let deadline = match boundary(&sources, self.turn.as_ref(), &self.phase, now) {
                 Boundary::No { recheck } => recheck,
                 Boundary::AbortAndResend => {
-                    self.abort_in_flight().await;
+                    // Nothing to undo: what the model had said was provisional
+                    // and never reached history.
+                    self.session.abort();
                     self.start_request(now).await;
                     None
                 }
@@ -540,25 +511,12 @@ impl Agent {
                 let done = match control {
                     Control::User(input, done) => {
                         self.persist(AgentEvent::Queued(input.clone())).await;
+                        // Queueing it is the whole of it. Whether this revives
+                        // an agent that had stopped is `Standing::stopped`'s
+                        // reading of the very queue this pushes onto, so there
+                        // is no second place for it to be written down and go
+                        // stale.
                         self.user.push(input);
-                        // Fresh instructions revive an agent that has stopped,
-                        // however it stopped; peer mail alone does not, so a
-                        // cancel stays a cancel and a failure stays somebody's
-                        // to look at.
-                        self.phase = match std::mem::replace(&mut self.phase, Phase::Idle) {
-                            Phase::Halted | Phase::Failed(_) => Phase::Idle,
-                            // Reviving a restart does not cash in what it owes;
-                            // that still waits for the request the sources ask
-                            // for.
-                            Phase::Restarted {
-                                lost,
-                                resume: Resume::NotUntilAsked,
-                            } => Phase::Restarted {
-                                lost,
-                                resume: Resume::WhenDue,
-                            },
-                            unchanged => unchanged,
-                        };
                         done
                     }
                     Control::Mail {
@@ -582,30 +540,20 @@ impl Agent {
                     Control::Cancel(done) => {
                         // Ask every tool to wind down, then keep reading it: the
                         // core does not kill tools, so a tool still chooses its
-                        // own last words. Those words reach history at the next
-                        // boundary, but a halted agent makes sure they cannot
-                        // themselves *cause* one.
+                        // own last words.
                         for tool in self.tools.values_mut() {
                             tool.cancel();
                         }
-                        // Taken before the abort, which resets the phase: a
-                        // cancel is not an answer, so what a restart owes
-                        // outlives it.
-                        let restart = match &mut self.phase {
-                            Phase::Restarted { lost, .. } => std::mem::take(lost),
-                            Phase::Idle
-                            | Phase::Requesting(_)
-                            | Phase::MustSend
-                            | Phase::Failed(_)
-                            | Phase::Halted => Vec::new(),
+                        // A cancel is not an answer, so what is owed outlives
+                        // it.
+                        let owed = match &mut self.phase {
+                            Phase::Idle { owed, .. } => std::mem::take(owed),
+                            Phase::Requesting(_) => Vec::new(),
                         };
-                        self.abort_in_flight().await;
-                        self.phase = match restart.is_empty() {
-                            true => Phase::Halted,
-                            false => Phase::Restarted {
-                                lost: restart,
-                                resume: Resume::NotUntilAsked,
-                            },
+                        self.session.abort();
+                        self.phase = Phase::Idle {
+                            owed,
+                            standing: Standing::Cancelled { at: now },
                         };
                         if !self.user.is_empty() || !self.mail.is_empty() {
                             self.persist(AgentEvent::QueueCleared).await;
@@ -615,22 +563,11 @@ impl Agent {
                         done
                     }
                     Control::Retry(done) => {
-                        self.phase = match std::mem::replace(&mut self.phase, Phase::Idle) {
-                            // Nothing to retry while one is already going, and
-                            // saying otherwise would throw away the request in
-                            // flight.
-                            Phase::Requesting(in_flight) => Phase::Requesting(in_flight),
-                            // A restart still owes its explanation, so retrying
-                            // hurries the request rather than replacing what has
-                            // to be in it.
-                            Phase::Restarted { lost, .. } => Phase::Restarted {
-                                lost,
-                                resume: Resume::AtOnce,
-                            },
-                            Phase::Idle | Phase::MustSend | Phase::Failed(_) | Phase::Halted => {
-                                Phase::MustSend
-                            }
-                        };
+                        // Hurries the next request rather than changing what has
+                        // to be in it; nothing to hurry while one is in flight.
+                        if let Phase::Idle { standing, .. } = &mut self.phase {
+                            *standing = Standing::Asked;
+                        }
                         done
                     }
                 };
@@ -663,11 +600,18 @@ impl Agent {
                         // one.
                         in_flight.pending = PendingInferenceResponse::default();
                     }
-                    // Nothing to abort: the request is already over, and it is
-                    // the agent that stops here rather than the request.
+                    // Nothing to abort, and nothing to record: the request is
+                    // already over, it is the agent that stops here rather than
+                    // the request, and everything the request had was
+                    // provisional.
                     InferenceEvent::Failed { error } => {
-                        self.phase = Phase::Failed(Arc::from(error.to_string()));
-                        self.persist(AgentEvent::Ended).await;
+                        self.phase = Phase::Idle {
+                            owed: Vec::new(),
+                            standing: Standing::Failed {
+                                at: now,
+                                error: Arc::from(error.to_string()),
+                            },
+                        };
                     }
                     InferenceEvent::Finished {
                         usage,
@@ -676,8 +620,13 @@ impl Agent {
                         // Finished streaming, but what arrived does not
                         // assemble into a response.
                         Err(error) => {
-                            self.phase = Phase::Failed(Arc::from(error.to_string()));
-                            self.persist(AgentEvent::Ended).await;
+                            self.phase = Phase::Idle {
+                                owed: Vec::new(),
+                                standing: Standing::Failed {
+                                    at: now,
+                                    error: Arc::from(error.to_string()),
+                                },
+                            };
                         }
                         Ok(items) => {
                             self.finish_request(items, provider_response_id, usage, now)
@@ -694,32 +643,17 @@ impl Agent {
 
     // -- acting on it -------------------------------------------------------
 
-    /// Throw away the in-flight request. Whatever the model had said so far was
-    /// provisional and never reached history, so there is nothing to undo.
-    async fn abort_in_flight(&mut self) {
-        self.session.abort();
-        self.phase = Phase::Idle;
-        self.persist(AgentEvent::Ended).await;
-    }
-
     async fn start_request(&mut self, now: UnixMs) {
-        // Tools do not survive a restart and their calls are still unanswered,
-        // so the first request after one has to say so before anything else.
-        let lost = match &mut self.phase {
-            Phase::Restarted { lost, .. } => std::mem::take(lost),
-            Phase::Idle
-            | Phase::Requesting(_)
-            | Phase::MustSend
-            | Phase::Failed(_)
-            | Phase::Halted => Vec::new(),
+        // What is owed is settled here and nowhere earlier:
+        // `SPEC-restart-recovery`.
+        let owed = match &mut self.phase {
+            Phase::Idle { owed, .. } => std::mem::take(owed),
+            Phase::Requesting(_) => Vec::new(),
         };
         let mut blocks: Vec<ContextBlock> = Vec::new();
-        if !lost.is_empty() {
-            // Empty on purpose, and cancelled rather than successful, because
-            // nothing was recorded about what any of them did and an empty
-            // success reads as a command that ran quietly.
+        if !owed.is_empty() {
             blocks.push(ContextBlock::ToolResults {
-                results: lost
+                results: owed
                     .iter()
                     .map(|call| ToolResult {
                         call_id: call.id.clone(),
@@ -734,24 +668,24 @@ impl Agent {
                     })
                     .collect(),
             });
-            // What the results cannot say themselves. One note for the restart
-            // rather than one per call, because the restart happened once —
-            // and prose belongs in a message rather than dressed up as output
-            // some tool never produced.
+            // What the empty results cannot say themselves.
             blocks.push(ContextBlock::UserMessage {
                 sender: MessageSender::User,
                 content: vec![ContentPart::Text {
-                    text: RESTART_NOTE.to_owned(),
+                    // The prose half of what the request owes the model;
+                    // the empty results above are the other half.
+                    text: "note: rho restarted. Every tool that was running is gone — foreground \
+                           and background alike — and nothing was recorded about what any of them \
+                           did. The empty tool results above are placeholders, not output. Re-run \
+                           anything you still need."
+                        .to_owned(),
                 }],
             });
         }
-        // Pull from *every* source, not just whichever one triggered the
-        // boundary. Batching them into one request is the whole point of
-        // pulling.
-        //
-        // Order is protocol-constrained rather than chronological: a provider
-        // wants each `ToolCall` answered adjacent to the call, so tool output
-        // leads.
+        // Every source, not just whichever one triggered the boundary:
+        // `DECISION-pull-based-sources`. The order is protocol-constrained
+        // rather than chronological, so tool output leads:
+        // `REQ-provider-transcript-protocol`.
         let mut results: Vec<ToolResult> = Vec::new();
         let mut updates = Vec::new();
         for tool in self.tools.values_mut() {
@@ -883,17 +817,12 @@ impl Agent {
         .await;
         self.history.push(Arc::new(block));
 
-        // The request is over, and everything it was carrying goes with it —
-        // except whether it still owes a reply, which is the one thing it was
-        // holding on somebody else's behalf.
-        let owed_a_reply = match std::mem::replace(&mut self.phase, Phase::Idle) {
+        // Everything the request carried goes with it, except whether it still
+        // owes a reply.
+        let owed_a_reply = match &self.phase {
             Phase::Requesting(in_flight) => in_flight.compaction_owes_reply,
             // Only a request in flight can finish.
-            Phase::Idle
-            | Phase::Restarted { .. }
-            | Phase::MustSend
-            | Phase::Failed(_)
-            | Phase::Halted => false,
+            Phase::Idle { .. } => false,
         };
 
         // A turn that issues no calls asks for nothing and changes nothing: it
@@ -920,9 +849,15 @@ impl Agent {
             self.spawn_tool(call, now);
         }
 
-        if compacted && owed_a_reply {
-            self.phase = Phase::MustSend;
-        }
+        self.phase = Phase::Idle {
+            owed: Vec::new(),
+            standing: match compacted && owed_a_reply {
+                // The compaction ate the turn the model owed a reply to, so ask
+                // for it again.
+                true => Standing::Asked,
+                false => Standing::Nothing,
+            },
+        };
     }
 
     // -- tools --------------------------------------------------------------
@@ -963,32 +898,26 @@ impl Agent {
         *self.snapshot.write().expect("poisoned snapshot") = AgentSnapshot {
             history: self.history.clone(),
             previews,
-            activity: match self.phase {
-                Phase::Halted
-                | Phase::Failed(_)
-                | Phase::Restarted {
-                    resume: Resume::NotUntilAsked,
-                    ..
-                } => AgentActivity::Stopped,
-                Phase::Idle | Phase::Restarted { .. } | Phase::Requesting(_) | Phase::MustSend => {
-                    AgentActivity::Live
+            activity: match &self.phase {
+                Phase::Idle { standing, .. } if standing.stopped(self.user.oldest_at()) => {
+                    AgentActivity::Stopped
                 }
+                Phase::Idle { .. } | Phase::Requesting(_) => AgentActivity::Live,
             },
             streaming: match &self.phase {
                 Phase::Requesting(in_flight) => Some(in_flight.pending.clone()),
-                Phase::Idle
-                | Phase::Restarted { .. }
-                | Phase::MustSend
-                | Phase::Failed(_)
-                | Phase::Halted => None,
+                Phase::Idle { .. } => None,
             },
             context_used: self.context_used,
             // What stopped the agent, or — while it is still retrying inside one
             // request — what it is retrying from.
             last_error: match &self.phase {
-                Phase::Failed(error) => Some(Arc::clone(error)),
+                Phase::Idle {
+                    standing: Standing::Failed { error, .. },
+                    ..
+                } => Some(Arc::clone(error)),
                 Phase::Requesting(in_flight) => in_flight.temporary_failures.last().cloned(),
-                Phase::Idle | Phase::Restarted { .. } | Phase::MustSend | Phase::Halted => None,
+                Phase::Idle { .. } => None,
             },
         };
         self.published.notify_waiters();
@@ -1000,10 +929,9 @@ struct Restored {
     history: Vec<Arc<ContextBlock>>,
     user: UserSource,
     mail: MailSource,
-    request_active: bool,
     context_used: Option<u64>,
-    /// Tools that were running when the process stopped.
-    orphan_tools: Vec<ToolCall>,
+    /// Calls nothing is going to answer, because no tool survived.
+    owed: Vec<ToolCall>,
 }
 
 impl Restored {
@@ -1034,7 +962,6 @@ fn restore(events: Vec<AgentEvent<'static>>) -> Restored {
                 // A send drains everything, so nothing that was pending when it
                 // went out is pending after it.
                 restored.clear_queues();
-                restored.request_active = true;
             }
             AgentEvent::Replied {
                 blocks,
@@ -1043,23 +970,16 @@ fn restore(events: Vec<AgentEvent<'static>>) -> Restored {
                 restored
                     .history
                     .extend(blocks.into_owned().into_iter().map(Arc::new));
-                restored.request_active = false;
                 if context_used.is_some() {
                     restored.context_used = context_used;
                 }
             }
-            AgentEvent::Ended => restored.request_active = false,
         }
     }
 
     // Every call the model has made, minus the ones the transcript already
-    // answers. No tool survives a restart, so whatever is left is a call that
-    // will never be answered by the thing that owed it — and a provider will
-    // not accept a call that is never answered at all.
-    //
-    // Read off history rather than remembered, because history already says it.
-    // The core wrote down spawns and reaps for a while, which was two events
-    // recording something the blocks beside them spelled out.
+    // answers. Read off history rather than remembered, because history already
+    // says it. `SPEC-restart-recovery`.
     let mut unanswered: BTreeMap<ToolCallId, ToolCall> = BTreeMap::new();
     for block in &restored.history {
         match &**block {
@@ -1096,7 +1016,7 @@ fn restore(events: Vec<AgentEvent<'static>>) -> Restored {
             | ContextBlock::CompactionTrigger => {}
         }
     }
-    restored.orphan_tools = unanswered.into_values().collect();
+    restored.owed = unanswered.into_values().collect();
     restored
 }
 

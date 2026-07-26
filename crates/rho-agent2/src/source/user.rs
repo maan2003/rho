@@ -1,6 +1,6 @@
 //! Messages typed by the user.
 
-use rho_core::{ContextBlock, MessageSender};
+use rho_core::{ContextBlock, MessageSender, UnixMs};
 
 use crate::preview::{PendingItem, Preview, text_of};
 use crate::source::{Delivery, InputKind, QueuedInput, SourceKind};
@@ -22,22 +22,26 @@ impl UserSource {
 
     /// Items are kept in arrival order, so the first is the one that has been
     /// waiting longest — the one whose patience the core is spending.
+    pub(crate) fn oldest_at(&self) -> Option<UnixMs> {
+        self.items.first().map(|item| item.at)
+    }
+
     pub(crate) fn source(&self) -> SourceKind {
         SourceKind::User {
             interrupt: self
                 .items
                 .iter()
                 .any(|item| item.delivery == Delivery::Interrupt),
-            oldest_at: self.items.first().map(|item| item.at),
+            oldest_at: self.oldest_at(),
         }
     }
 
     /// Every queued item is eligible at every boundary, so a drain is total.
     ///
-    /// Compaction is stable-sorted to the back, matching what the provider is
-    /// told: the wire layer requires the trigger to be the final input item, so
-    /// history would otherwise disagree with the request it produced. Messages
-    /// keep their relative order among themselves.
+    /// Compaction is stable-sorted to the back, because the trigger has to be
+    /// the final input item and history would otherwise disagree with the
+    /// request it produced: `REQ-provider-transcript-protocol`. Messages keep
+    /// their relative order among themselves.
     pub(crate) fn take(&mut self) -> Vec<ContextBlock> {
         let mut items = std::mem::take(&mut self.items);
         items.sort_by_key(|item| matches!(item.kind, InputKind::Compaction));

@@ -1,24 +1,16 @@
 //! Tools, and what they report about themselves.
 //!
 //! A tool is not a future that resolves once. It is a source that produces
-//! output over its lifetime, possibly for hours. No tool declares itself a
-//! background job, because at the moment of the call `npm test` and
-//! `npm run dev` are the same call and nothing could tell them apart. So the
-//! core does not classify them at all: every call is the model's business for
-//! a fixed window after it was made, and background once that window is spent.
-//! A background job is simply a call that outlived its window, and it costs
-//! nothing from then on. The window runs from the call and from nothing else,
-//! so no other source can shorten it.
+//! output over its lifetime, possibly for hours, and no tool declares itself a
+//! background job: a background job is simply a call that outlived the window
+//! the model gave it. `DECISION-model-sets-the-pace`.
 //!
-//! Because the core pulls, a tool holds its own output until asked. That is
-//! the point — a tool asked for its output after five minutes can hand back
-//! the relevant tail plus "1200 lines suppressed", which no buffer owned by
-//! the core could have produced. The core never sees a byte it did not ask
-//! for, and a chatty tool costs nothing between requests.
+//! Because the core pulls, a tool holds its own output until asked, and answers
+//! at that moment in whatever shape it judges best.
+//! `DECISION-pull-based-sources`.
 //!
 //! The core says exactly one thing to a running tool — [`ToolSession::cancel`],
-//! meaning *wind down*. Everything else flows the other way: the tool reports
-//! its status, and the core weighs it against every other source.
+//! meaning *wind down*. Everything else flows the other way.
 
 use std::sync::Arc;
 
@@ -234,8 +226,9 @@ impl RunningTool {
     }
 
     /// Hand over everything unsent. The call's first contribution becomes its
-    /// [`ToolResult`]; every later one becomes a [`ToolUpdate`], because a
-    /// provider accepts exactly one result per call id.
+    /// [`ToolResult`] and every later one a [`ToolUpdate`], because a provider
+    /// accepts exactly one result per call id:
+    /// `REQ-provider-transcript-protocol`.
     pub fn take(&mut self, now: UnixMs) -> Option<ToolTake> {
         let exited = matches!(self.status().activity, ToolActivity::Exited { .. });
         let output = self.session.take_output();

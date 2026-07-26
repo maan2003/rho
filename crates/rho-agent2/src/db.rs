@@ -5,11 +5,8 @@
 //! it becomes live state, so a message that was accepted cannot be lost.
 //!
 //! The log belongs to a *lineage* rather than to an agent; an agent points at
-//! the one it is currently on. Forking mints a new lineage and remembers the
-//! position in its parent it branched from, so a rewind is a new branch rather
-//! than a hole: nothing is rewritten, nothing is deleted, and the abandoned
-//! branch is still there to go back to. Reading is that path walked back to the
-//! root and then replayed forwards.
+//! the one it is currently on, and reading is that path walked back to the root
+//! and then replayed forwards. `DECISION-history-only-branches`.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -237,8 +234,7 @@ fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
 /// What an agent is, as opposed to what has happened to it. Only
 /// `current_lineage` ever changes, and only when it is forked.
 ///
-/// Instructions are deliberately absent: they are policy, so they are code, and
-/// a copy in here would be a stale one the day the prompt is edited.
+/// Instructions are deliberately absent: `DECISION-instructions-are-code`.
 #[derive(Clone, Debug, Encode, Decode)]
 pub(crate) struct AgentRecord {
     pub profile: InferenceProfile,
@@ -296,12 +292,4 @@ pub(crate) enum AgentEvent<'a> {
         blocks: Cow<'a, [ContextBlock]>,
         context_used: Option<u64>,
     },
-    /// The request is over and produced nothing — aborted, or failed. Whatever
-    /// the model had said was provisional and never reached history, so there
-    /// is nothing here to carry.
-    ///
-    /// A failure is not remembered as one. Coming back up is a fresh start, and
-    /// an error from a process that is no longer running is not a reason to
-    /// keep the new one from trying.
-    Ended,
 }

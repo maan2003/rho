@@ -1,18 +1,13 @@
 //! Should the next request start now?
 //!
 //! The whole scheduler, kept apart from the agent it schedules because it is
-//! the only part that decides anything. What it decides about is here too: the
-//! durations, and the two things the model's last turn settled. Nothing in
+//! the only part that decides anything:
+//! `DECISION-boundary-is-the-only-decision`. What it decides about is here too
+//! — the durations, and the two things the model's last turn settled. Nothing
 //! here touches the store, the provider, or a task.
 //!
-//! There is deliberately no stored status enum, and no foreground/background
-//! tool distinction to declare — at the moment of the call `npm test` and
-//! `npm run dev` are the same call, and nothing could tell them apart. So the
-//! core does not try. A running tool has no urgency of its own; the pace at
-//! which its output reaches the model is the model's own, stated by what its
-//! last turn did and revised every turn. What a tool *can* say is that it
-//! ended, or that what it holds stands alone, and those are worth waking
-//! somebody for whatever else is going on.
+//! Tools get no urgency of their own and no status enum to declare:
+//! `DECISION-model-sets-the-pace`.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -21,7 +16,7 @@ use rho_core::{ToolCallId, UnixMs};
 
 use crate::source::SourceKind;
 use crate::tool::{Told, ToolActivity, Unsent};
-use crate::{Phase, Resume};
+use crate::{Phase, Standing};
 
 /// How long a person's message waits for the machines around it to settle. Long
 /// enough that a tool about to finish rides along with it, short enough not to
@@ -80,12 +75,8 @@ pub(crate) struct ModelTurn {
 }
 
 /// What the model's latest turn asked for, which is what says whether to look
-/// again, and when.
-///
-/// A look-in lasts exactly one turn. The model is shown what its calls have
-/// once, and to be shown again it has to ask, by calling something or by naming
-/// an interval. Otherwise an agent that answered "the build is going" would be
-/// asked for another opinion every ten seconds for the length of the build.
+/// again, and when. A look-in lasts exactly one turn:
+/// `DECISION-model-sets-the-pace`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModelAsked {
     /// Nothing at all: prose, and then quiet. Whatever is still running will
@@ -123,14 +114,9 @@ pub(crate) enum Boundary {
 /// Should the next request start now?
 ///
 /// A plain function of what every source reports, so it can be exercised
-/// against a fabricated clock and fabricated sources. Every rule and every
-/// duration lives here rather than on the sources, because a number chosen by
-/// one source in isolation is a number chosen without seeing what else is
-/// waiting.
-///
-/// Every source is here, including the ones with nothing to say, because
-/// "this one is not worth sending" is a decision too and this is where
-/// decisions live.
+/// against a fabricated clock and fabricated sources. Every source is here,
+/// including the ones with nothing to say, because "this one is not worth
+/// sending" is a decision too and this is where decisions live.
 ///
 /// Everything holding something names the moment it stops waiting for company.
 /// Three rules, and nothing else in this crate decides anything:
@@ -151,12 +137,10 @@ pub(crate) enum Boundary {
 /// of. An empty room does not make half a build log any more worth reading, so
 /// those are never collapsed.
 ///
-/// Note what tools do *not* get: a running tool has no patience of its own
-/// worth speaking of, because there is no way to tell `npm test` from
-/// `npm run dev` by looking at either one. The pace at which a tool's output
-/// reaches the model is set by the model, in rule 2, and revised every turn.
-/// Only the two things a tool can say that are true regardless — it ended, or
-/// what it holds stands on its own — buy it any urgency.
+/// Note what tools do *not* get: no patience of their own. Rule 2 sets the pace
+/// at which a tool's output reaches the model, and only the two things a tool
+/// can say that are true regardless — it ended, or what it holds stands on its
+/// own — buy it any urgency. `DECISION-model-sets-the-pace`.
 ///
 /// Every wait is measured from a moment that has already happened, never from
 /// the last thing a source did, so no source can extend a wait by continuing to
@@ -174,17 +158,11 @@ pub(crate) fn boundary(
     // Only an idle agent hands the question to its sources; every other phase
     // answers on its own. Exhaustive rather than a run of early returns, because
     // with those the precedence lived in the order they were written.
+    let user_oldest_at = sources.iter().find_map(|source| match source {
+        SourceKind::User { oldest_at, .. } => *oldest_at,
+        SourceKind::Mail { .. } | SourceKind::Tool { .. } => None,
+    });
     match phase {
-        // Stopped, all three, and for the same reason: whatever is still running
-        // will be heard at the next boundary, but nothing running is allowed to
-        // *start* a request, because a stop somebody asked for and a failure
-        // nobody has looked at are both waiting on a person.
-        Phase::Halted
-        | Phase::Failed(_)
-        | Phase::Restarted {
-            resume: Resume::NotUntilAsked,
-            ..
-        } => return NEVER,
         Phase::Requesting(_) => {
             let interrupt = sources.iter().any(|source| match source {
                 SourceKind::User { interrupt, .. } => *interrupt,
@@ -197,19 +175,15 @@ pub(crate) fn boundary(
                 false => NEVER,
             };
         }
-        // A restart that has something to explain is not a reason to send by
-        // itself. Only the request it interrupted is, because that one was
-        // already judged worth making.
-        Phase::MustSend
-        | Phase::Restarted {
-            resume: Resume::AtOnce,
+        // `DECISION-stopped-agents-wait-for-a-person`.
+        Phase::Idle { standing, .. } if standing.stopped(user_oldest_at) => return NEVER,
+        // What the next request owes is not itself a reason to make one, so
+        // `owed` is never read here: only `standing` is.
+        Phase::Idle {
+            standing: Standing::Asked,
             ..
         } => return Boundary::Now,
-        Phase::Idle
-        | Phase::Restarted {
-            resume: Resume::WhenDue,
-            ..
-        } => {}
+        Phase::Idle { .. } => {}
     }
     /// Whether anything more is coming.
     ///
