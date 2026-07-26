@@ -571,9 +571,6 @@ impl Workspace {
                     self.seed_draft(false, window, cx);
                 }
                 self.update_statuses(cx);
-                if first_ready && self.realtime_task.is_none() {
-                    self.cmd_voice(window, cx);
-                }
                 cx.notify();
             }
             ConnEvent::WorkstreamCreated(workstream) => {
