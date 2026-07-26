@@ -562,6 +562,7 @@ async fn run_iroh_listener(
                                 ClientMessage::ChannelOpen { .. }
                                     | ClientMessage::RealtimeOpen { .. }
                                     | ClientMessage::DiffSnapshot { .. }
+                                    | ClientMessage::VisualizationGet { .. }
                                     | ClientMessage::TerminalCreate { .. }
                                     | ClientMessage::TerminalAttach { .. }
                                     | ClientMessage::TerminalList { .. }
@@ -967,6 +968,7 @@ impl GitTransportBroker {
 struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
+    visualizations: rho_visualizations::VisualizationStore,
     auth: InferenceAuth,
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
@@ -1027,9 +1029,11 @@ impl AgentRegistry {
         let machine_seed = db.read().machine_seed();
         let slack = rho_slack::SlackManager::new(pool.clone(), db.clone()).await;
         let pr_monitor = rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone()).await?;
+        let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
         let registry = Self {
             pool,
             db,
+            visualizations,
             auth,
             machine_seed,
             title_tasks: Mutex::new(HashSet::new()),
@@ -1732,6 +1736,21 @@ where
         return serve_diff_snapshot(agents, writer, workspace, known_commit_id, include_paths)
             .await;
     }
+    if let ClientMessage::VisualizationGet { id } = first {
+        let mut writer = writer;
+        let response = match agents.visualizations.get(&id) {
+            Some(visualization) => ServerMessage::VisualizationContent {
+                id,
+                mime_type: visualization.mime_type,
+                content: visualization.content,
+            },
+            None => ServerMessage::VisualizationRefused {
+                reason: format!("visualization {id} does not exist"),
+            },
+        };
+        write_frame(&mut writer, &response).await?;
+        return Ok(());
+    }
     if let ClientMessage::TerminalCreate {
         agent,
         terminal_id,
@@ -2304,6 +2323,11 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::Pong);
             Ok(Refresh::None)
         }
+        ClientMessage::RecordVisualization { mime_type, content } => {
+            let id = agents.visualizations.record(mime_type, content).await?;
+            let _ = outgoing_tx.send(ServerMessage::VisualizationRecorded { id });
+            Ok(Refresh::None)
+        }
         ClientMessage::ChatGptUsage => {
             let _ = outgoing_tx.send(ServerMessage::QuotaUsage {
                 summaries: quota_summaries(&agents.db),
@@ -2855,6 +2879,7 @@ async fn handle_message(
             anyhow::bail!("RealtimeOpen must be the first frame on a dedicated stream")
         }
         ClientMessage::DiffSnapshot { .. }
+        | ClientMessage::VisualizationGet { .. }
         | ClientMessage::TerminalCreate { .. }
         | ClientMessage::TerminalAttach { .. }
         | ClientMessage::TerminalList { .. }

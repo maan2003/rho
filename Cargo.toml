@@ -26,6 +26,7 @@ members = [
   "crates/rho-slack",
   "crates/rho-tool-shell",
   "crates/rho-ui-proto",
+  "crates/rho-visualizations",
   "crates/rho-webui-messages",
   "crates/rho-web-search",
   "crates/rho-workspaces",
@@ -60,7 +61,7 @@ async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
-buffer_diff = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
+buffer_diff = { git = "https://github.com/maan2003/zed", rev = "5f8fe61ae986" }
 camino = "1"
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
@@ -109,6 +110,7 @@ rho-shell = { path = "crates/rho-shell" }
 rho-slack = { path = "crates/rho-slack" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
+rho-visualizations = { path = "crates/rho-visualizations" }
 rho-webui-messages = { path = "crates/rho-webui-messages" }
 rho-web-search = { path = "crates/rho-web-search" }
 rho-workspaces = { path = "crates/rho-workspaces" }
@@ -149,7 +151,7 @@ tracing = { version = "0.1", default-features = false, features = [
 ] }
 url = { version = "2", default-features = false }
 uuid = { version = "1", features = ["serde", "v4"] }
-worktree = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
+worktree = { git = "https://github.com/maan2003/zed", rev = "5f8fe61ae986" }
 zip = { version = "2", default-features = false, features = [
   "deflate",
   "time",

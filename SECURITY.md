@@ -587,6 +587,33 @@ do not restrict filesystem access or grant tools.
   busy-looping cells (with session survival), tool-failure propagation, and
   output truncation.
 
+## Visualization artifacts
+
+- Storage boundary: visualization content is model-authored opaque input. The
+  daemon enforces a 4 MiB per-record byte limit but does not parse, sanitize, or
+  validate SVG and does not impose record-count or aggregate-byte quotas.
+  Content-addressed ids deduplicate registrations; records are immutable and
+  retained indefinitely. The independent artifact table does not change the
+  agent database format.
+- Render boundary: the GUI passes stored SVG bytes to GPUI without structural
+  or resource validation. Model-authored SVG is allowed to exhaust GUI render
+  resources, and a malicious or compromised daemon exhausting a GUI client is
+  likewise accepted. GPUI's SVG renderer disables usvg's string image-href
+  resolver at the source, preventing artifact-supplied filesystem paths from
+  being loaded; this is a renderer capability restriction, not a work bound.
+- Presentation: artifact content travels only on an explicit one-shot lazy
+  fetch. The daemon has no knowledge of transcript reference syntax.
+  `rho-gui` recognizes dedicated `visualization` fenced blocks and uses the
+  model-supplied `rows` value from 1 through 50 as their block height.
+  GPUI's SVG renderer performs rasterization; a failed fetch or raster displays
+  a non-interactive error placeholder.
+- Tests: `rho-visualizations` covers immutable round trips, deduplication,
+  opaque invalid content, and the per-record byte limit.
+  `rho-ui-proto` covers visualization wire round trips; `rho-gui` covers marker
+  parsing (including required row sizing and rejection of malformed or
+  nested fences), inline replace-block insertion, removal when the transcript
+  reference changes, and GPUI SVG rasterization.
+
 ## Future review notes
 
 Future changes that add providers, credential storage, transcript persistence,

@@ -33,6 +33,7 @@ rho-pr-monitor.workspace = true
 rho-profiling.workspace = true
 rho-slack.workspace = true
 rho-ui-proto.workspace = true
+rho-visualizations.workspace = true
 rho-webui-messages.workspace = true
 rho-workspaces.workspace = true
 rho-zed-host.workspace = true
@@ -50,6 +51,6 @@ uuid.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 prost = "0.9"
-rpc = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
+rpc = { git = "https://github.com/maan2003/zed", rev = "5f8fe61ae986" }
 rho-shell.workspace = true
 senax-encoder.workspace = true

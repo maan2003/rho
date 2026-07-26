@@ -19,6 +19,7 @@ mod land;
 mod mcp_agent_tools;
 mod pr;
 mod slack;
+mod visualization;
 mod wayland;
 mod workstream;
 
@@ -70,6 +71,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Land(args) => land::run(args).await,
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
         Command::Pr(args) => pr::run(args).await,
+        Command::RecordVisualization(args) => visualization::run(args).await,
         Command::Slack(args) => slack::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::Workstream(args) => workstream::run(args).await,
@@ -162,6 +164,7 @@ enum Command {
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
     Pr(PrArgs),
+    RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
     Wayland(wayland::WaylandArgs),
@@ -187,6 +190,8 @@ enum CliCommand {
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
     Pr(PrArgs),
+    /// Register an immutable SVG visualization read from stdin.
+    RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
     Slack(SlackArgs),
     /// Run and control applications in an isolated headless Wayland session.
@@ -246,9 +251,18 @@ pub(crate) struct PrArgs {
     command: PrCliCommand,
 }
 
+#[derive(Clone, clap::Args)]
+pub(crate) struct RecordVisualizationArgs {
+    #[arg(long = "auth", default_value = "default")]
+    auth: String,
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+}
+
 #[derive(Clone, Subcommand)]
 pub(crate) enum PrCliCommand {
-    /// Install the GitHub token used for PR, Actions, and constrained Git operations.
+    /// Install the GitHub token used for PR, Actions, and constrained Git
+    /// operations.
     Init,
     /// Create a draft pull request and subscribe the current Engineer.
     Create {
@@ -365,6 +379,7 @@ impl Args {
             CliCommand::Land(args) => Command::Land(args),
             CliCommand::McpAgentTools(args) => Command::McpAgentTools(args),
             CliCommand::Pr(args) => Command::Pr(args),
+            CliCommand::RecordVisualization(args) => Command::RecordVisualization(args),
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),
             CliCommand::Slack(args) => Command::Slack(args),
             CliCommand::Wayland(args) => Command::Wayland(args),

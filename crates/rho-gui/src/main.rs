@@ -25,6 +25,7 @@ mod terminal_view;
 mod tests;
 mod transcript;
 mod transient;
+mod visualization;
 mod workspace;
 mod zed_remote;
 

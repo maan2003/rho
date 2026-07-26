@@ -26,22 +26,26 @@ mod inlays;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use conceal::{ConcealState, ConcealSync};
 use editor::Editor;
+use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
 use elisions::{ElisionState, ElisionSync};
-use gpui::{Context, Entity, WeakEntity};
+use gpui::{AppContext as _, Context, Entity, IntoElement as _, WeakEntity};
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
-use multi_buffer::{MultiBuffer, PathKey};
+use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_ui_proto::remote::UiAgentState;
 use text::{Anchor, ToOffset as _};
 
+use crate::connection::VisualizationClient;
 use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::render::elision::ElisionPlan;
 use crate::render::{BlockKind, RenderedBlock, render_block_with_agent_labels};
 use crate::store::{FrameSummary, IncrementalUpdate};
 use crate::style::{Region, StyleClass};
+use crate::visualization::Visualization;
 
 pub struct TranscriptModel {
     buffer: Entity<Buffer>,
@@ -69,6 +73,8 @@ pub struct TranscriptModel {
     // placeholder (id 0), so they start at 1. One counter serves every
     // attachment: ids only need uniqueness within an editor.
     next_inlay_id: usize,
+    visualization_client: VisualizationClient,
+    visualization_cache: HashMap<String, Entity<Visualization>>,
     attachments: Vec<Attachment>,
 }
 
@@ -83,6 +89,7 @@ struct Attachment {
     elisions: ElisionState,
     conceal: ConcealState,
     inlays: Vec<PlacedInlay>,
+    visualizations: Vec<PlacedVisualization>,
 }
 
 struct BlockRecord {
@@ -95,12 +102,28 @@ struct BlockRecord {
     styles: Vec<(StyleClass, Range<Anchor>)>,
     /// Markdown markup hidden at the display layer.
     conceal: Vec<Range<Anchor>>,
+    visualizations: Vec<VisualizationAnchor>,
+}
+
+#[derive(Clone)]
+struct VisualizationAnchor {
+    id: String,
+    rows: u32,
+    range: Range<Anchor>,
+}
+
+struct PlacedVisualization {
+    id: String,
+    rows: u32,
+    source_range: Range<Anchor>,
+    block_id: CustomBlockId,
 }
 
 type PlacedSpans = (
     Vec<Range<Anchor>>,
     Option<InlayRecord>,
     Option<(StyleClass, Range<Anchor>)>,
+    Vec<VisualizationAnchor>,
 );
 
 struct UserMessageGutter;
@@ -119,7 +142,11 @@ enum DocumentTail {
 }
 
 impl TranscriptModel {
-    pub fn new(buffer: Entity<Buffer>, document_multi_buffer: Entity<MultiBuffer>) -> Self {
+    pub fn new(
+        buffer: Entity<Buffer>,
+        document_multi_buffer: Entity<MultiBuffer>,
+        visualization_client: VisualizationClient,
+    ) -> Self {
         Self {
             buffer,
             document_multi_buffer,
@@ -131,6 +158,8 @@ impl TranscriptModel {
             conceal: ConcealSync::default(),
             backfill_concealment: false,
             next_inlay_id: 1,
+            visualization_client,
+            visualization_cache: HashMap::new(),
             attachments: Vec::new(),
         }
     }
@@ -170,6 +199,7 @@ impl TranscriptModel {
             elisions: ElisionState::default(),
             conceal: ConcealState::default(),
             inlays: Vec::new(),
+            visualizations: Vec::new(),
         });
         let history = classes_in(&self.records[..self.turn_boundary]);
         let live = classes_in(&self.records[self.turn_boundary..]);
@@ -338,7 +368,8 @@ impl TranscriptModel {
             let edit_end = block_start + edit.old_range.end;
             buffer.edit([(edit_start..edit_end, edit.inserted.clone())], None, cx);
 
-            let (span_ranges, inlay, gutter) = spans_for_rendered(buffer, block_start, &rendered);
+            let (span_ranges, inlay, gutter, visualizations) =
+                spans_for_rendered(buffer, block_start, &rendered);
             let styles = rendered
                 .spans
                 .iter()
@@ -364,6 +395,7 @@ impl TranscriptModel {
                 inlay,
                 styles,
                 conceal,
+                visualizations,
             };
         });
 
@@ -512,6 +544,17 @@ impl TranscriptModel {
             .filter_map(|record| record.inlay.as_ref())
             .filter_map(|inlay| inlay.desired(now_ms))
             .collect::<Vec<_>>();
+        let desired_visualizations = self
+            .records
+            .iter()
+            .flat_map(|record| record.visualizations.iter().cloned())
+            .collect::<Vec<_>>();
+        let desired_visualization_ids = desired_visualizations
+            .iter()
+            .map(|visualization| visualization.id.as_str())
+            .collect::<HashSet<_>>();
+        self.visualization_cache
+            .retain(|id, _| desired_visualization_ids.contains(id.as_str()));
 
         let Self {
             document_multi_buffer,
@@ -520,6 +563,8 @@ impl TranscriptModel {
             elisions,
             conceal,
             backfill_concealment,
+            visualization_client,
+            visualization_cache,
             ..
         } = self;
         let backfill_concealment = *backfill_concealment;
@@ -535,6 +580,7 @@ impl TranscriptModel {
                 attachment.inlays.clear();
                 attachment.elisions = ElisionState::default();
                 attachment.conceal = ConcealState::default();
+                attachment.visualizations.clear();
             }
             // Scale rows before anything lays them out: the wrap map sizes a
             // row when it wraps it, and highlights, inlays and folds below
@@ -615,6 +661,15 @@ impl TranscriptModel {
                 &editor,
                 cx,
             );
+            reconcile_visualizations(
+                &desired_visualizations,
+                &mut attachment.visualizations,
+                visualization_cache,
+                visualization_client,
+                multi_buffer,
+                &editor,
+                cx,
+            );
             elisions.apply(&mut attachment.elisions, multi_buffer, &editor, cx);
             conceal.apply(
                 &mut attachment.conceal,
@@ -686,7 +741,7 @@ fn append_block(
     rendered: RenderedBlock,
 ) -> BlockRecord {
     let start = buffer.len();
-    let (span_ranges, inlay, gutter) = append_spans(buffer, cx, &rendered);
+    let (span_ranges, inlay, gutter, visualizations) = append_spans(buffer, cx, &rendered);
     let styles = rendered
         .spans
         .iter()
@@ -703,6 +758,7 @@ fn append_block(
         inlay,
         styles,
         conceal: conceal_anchors(buffer, start, &rendered),
+        visualizations,
     }
 }
 
@@ -838,7 +894,115 @@ fn spans_for_rendered(buffer: &Buffer, start: usize, rendered: &RenderedBlock) -
         ranges.push(range);
         offset = end;
     }
-    (ranges, inlay, gutter)
+    let visualizations = rendered
+        .visualizations
+        .iter()
+        .map(|visualization| VisualizationAnchor {
+            id: visualization.id.clone(),
+            rows: visualization.rows,
+            range: buffer.anchor_before(start + visualization.range.start)
+                ..buffer.anchor_before(start + visualization.range.end),
+        })
+        .collect();
+    (ranges, inlay, gutter, visualizations)
+}
+
+fn reconcile_visualizations<V: 'static>(
+    desired: &[VisualizationAnchor],
+    placed: &mut Vec<PlacedVisualization>,
+    cache: &mut HashMap<String, Entity<Visualization>>,
+    client: &VisualizationClient,
+    multi_buffer: &Entity<MultiBuffer>,
+    editor: &Entity<Editor>,
+    cx: &mut Context<V>,
+) {
+    let snapshot = multi_buffer.read(cx).snapshot(cx);
+    let desired_keys = desired
+        .iter()
+        .filter_map(|desired| {
+            visualization_key(&desired.id, desired.rows, &desired.range, &snapshot)
+        })
+        .collect::<HashSet<_>>();
+    let mut removed = collections::HashSet::default();
+    placed.retain(|placed| {
+        let keep = visualization_key(&placed.id, placed.rows, &placed.source_range, &snapshot)
+            .is_some_and(|key| desired_keys.contains(&key));
+        if !keep {
+            removed.insert(placed.block_id);
+        }
+        keep
+    });
+    if !removed.is_empty() {
+        editor.update(cx, |editor, cx| editor.remove_blocks(removed, None, cx));
+    }
+
+    let mut placed_keys = placed
+        .iter()
+        .filter_map(|placed| {
+            visualization_key(&placed.id, placed.rows, &placed.source_range, &snapshot)
+        })
+        .collect::<HashSet<_>>();
+    for desired in desired {
+        let Some(key) = visualization_key(&desired.id, desired.rows, &desired.range, &snapshot)
+        else {
+            continue;
+        };
+        if !placed_keys.insert(key) {
+            continue;
+        }
+        let Some(start) = snapshot.anchor_in_excerpt(desired.range.start) else {
+            continue;
+        };
+        let Some(end) = snapshot.anchor_in_excerpt(desired.range.end) else {
+            continue;
+        };
+        let view = match cache.get(&desired.id) {
+            Some(view) => view.clone(),
+            None => {
+                let view = cx.new(|_| Visualization::new(desired.id.clone(), client.clone()));
+                cache.insert(desired.id.clone(), view.clone());
+                view
+            }
+        };
+        let render_view = view.clone();
+        let ids = editor.update(cx, |editor, cx| {
+            editor.insert_blocks(
+                [BlockProperties {
+                    // Preserve the reference in the buffer for copy/search,
+                    // but replace its whole source line in the display map.
+                    placement: BlockPlacement::Replace(start..=end),
+                    height: Some(desired.rows),
+                    style: BlockStyle::Flex,
+                    render: Arc::new(move |_| render_view.clone().into_any_element()),
+                    priority: 0,
+                }],
+                None,
+                cx,
+            )
+        });
+        if let Some(block_id) = ids.into_iter().next() {
+            placed.push(PlacedVisualization {
+                id: desired.id.clone(),
+                rows: desired.rows,
+                source_range: desired.range.clone(),
+                block_id,
+            });
+        }
+    }
+}
+
+fn visualization_key(
+    id: &str,
+    rows: u32,
+    range: &Range<Anchor>,
+    snapshot: &multi_buffer::MultiBufferSnapshot,
+) -> Option<(String, u32, usize, usize)> {
+    let start = snapshot
+        .anchor_in_excerpt(range.start)?
+        .to_offset(snapshot)
+        .0;
+    let end = snapshot.anchor_in_excerpt(range.end)?.to_offset(snapshot).0;
+    Some((id.to_owned(), rows, start, end))
 }
 
 #[cfg(test)]

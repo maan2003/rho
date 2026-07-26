@@ -350,6 +350,27 @@ async fn dial_diff_snapshot(
     }
 }
 
+async fn dial_visualization(
+    dialer: ChannelDialer,
+    id: String,
+) -> anyhow::Result<VisualizationArtifact> {
+    let mut stream = dial_bulk_stream(dialer).await?;
+    write_frame(
+        &mut stream,
+        &ClientMessage::VisualizationGet { id: id.clone() },
+    )
+    .await?;
+    match read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::VisualizationContent {
+            id: response_id,
+            mime_type,
+            content,
+        } if response_id == id => Ok(VisualizationArtifact { mime_type, content }),
+        ServerMessage::VisualizationRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected reply to VisualizationGet"),
+    }
+}
+
 /// Opens a low-priority one-shot/bulk stream. Unlike terminal streams this
 /// deliberately keeps iroh's default priority below interactive traffic.
 async fn dial_bulk_stream(dialer: ChannelDialer) -> anyhow::Result<Box<dyn AsyncStream>> {
@@ -554,6 +575,30 @@ pub struct Connection {
     _io_task: Task<Result<(), gpui_tokio::JoinError>>,
 }
 
+pub struct VisualizationArtifact {
+    pub mime_type: String,
+    pub content: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct VisualizationClient {
+    dialer: Arc<Mutex<Option<ChannelDialer>>>,
+}
+
+impl VisualizationClient {
+    pub fn get(
+        &self,
+        id: String,
+        cx: &App,
+    ) -> Task<Result<anyhow::Result<VisualizationArtifact>, gpui_tokio::JoinError>> {
+        let dialer = self.dialer.lock().unwrap().clone();
+        Tokio::spawn(cx, async move {
+            let dialer = dialer.context("not connected to rho-daemon")?;
+            dial_visualization(dialer, id).await
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct DiffClient {
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
@@ -578,6 +623,12 @@ impl DiffClient {
 }
 
 impl Connection {
+    pub fn visualization_client(&self) -> VisualizationClient {
+        VisualizationClient {
+            dialer: self.dialer.clone(),
+        }
+    }
+
     pub fn diff_client(&self) -> DiffClient {
         DiffClient {
             dialer: self.dialer.clone(),
@@ -955,6 +1006,7 @@ async fn run(
                 None
             }
             ServerMessage::Pong
+            | ServerMessage::VisualizationRecorded { .. }
             | ServerMessage::LandLeaseQueued { .. }
             | ServerMessage::LandLeaseGranted { .. }
             | ServerMessage::LandStatus { .. }
@@ -979,7 +1031,9 @@ async fn run(
             | ServerMessage::DiffRefused { .. }
             | ServerMessage::RealtimeOpened { .. }
             | ServerMessage::RealtimeRefused { .. }
-            | ServerMessage::AgentStreamOpened { .. } => None,
+            | ServerMessage::AgentStreamOpened { .. }
+            | ServerMessage::VisualizationContent { .. }
+            | ServerMessage::VisualizationRefused { .. } => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()

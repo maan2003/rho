@@ -337,6 +337,17 @@ pub enum ClientMessage {
     GlobalUsage {
         since_ms: u64,
     },
+    /// Stores an immutable visualization snapshot and replies with
+    /// [`ServerMessage::VisualizationRecorded`].
+    RecordVisualization {
+        mime_type: String,
+        content: Vec<u8>,
+    },
+    /// One-shot request on a fresh stream. The daemon returns only the
+    /// requested artifact, if it exists, then closes the stream.
+    VisualizationGet {
+        id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -679,6 +690,17 @@ pub enum ServerMessage {
     },
     GlobalUsage {
         series: Vec<AgentUsageSeries>,
+    },
+    VisualizationRecorded {
+        id: String,
+    },
+    VisualizationContent {
+        id: String,
+        mime_type: String,
+        content: Vec<u8>,
+    },
+    VisualizationRefused {
+        reason: String,
     },
 }
 
@@ -1133,6 +1155,28 @@ mod tests {
         let mut slice: &[u8] = &bytes;
         let decoded = senax_encoder::unpack(&mut slice).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn visualization_messages_round_trip() {
+        let request = ClientMessage::RecordVisualization {
+            mime_type: "image/svg+xml".to_owned(),
+            content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
+        };
+        let bytes = senax_encoder::pack(&request).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(request, decoded);
+
+        let response = ServerMessage::VisualizationContent {
+            id: "0123456789abcdef0123456789abcdef".to_owned(),
+            mime_type: "image/svg+xml".to_owned(),
+            content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
+        };
+        let bytes = senax_encoder::pack(&response).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(response, decoded);
     }
 
     #[test]

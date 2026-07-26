@@ -147,6 +147,16 @@ than by running a supervisor, extension protocol, or daemon process graph.
   daemon or `rho-core` transcript vocabulary.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
   execution.
+- `rho-visualizations` owns opaque immutable visualization records, ids, and
+  their independent RhoDB table. The daemon enforces only the per-record byte
+  envelope while registering and retrieving those records; it does not parse
+  or validate SVG. UI protocols carry artifacts only on explicit registration
+  or one-shot lazy fetches. The daemon does not know the transcript
+  `visualization` fenced-block syntax; `rho-gui` alone recognizes references
+  and uses their required 1-to-50 `rows` field as the editor-block height. SVG
+  capability safety belongs to GPUI's renderer; `rho-gui` does not layer a
+  second SVG
+  validator or resource policy over the stored bytes.
 - `rho-profiling` owns the thin opt-in profiling lifecycle shared by the
   native GUI and daemon. Dial9 owns CPU sampling, buffering, symbolization, and
   the canonical binary trace; folded and Perfetto runtime exports are non-goals.

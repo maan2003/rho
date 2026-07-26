@@ -322,6 +322,20 @@ fn has_display_elision(workspace: &WindowHandle<Workspace>, cx: &mut TestAppCont
         .expect("inspect blocks")
 }
 
+fn has_custom_block(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> bool {
+    let editor = active_editor(workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                snapshot
+                    .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
+                    .any(|(_, block)| matches!(block, Block::Custom(_)))
+            })
+        })
+        .expect("inspect custom blocks")
+}
+
 fn user(text: &str) -> UiBlock {
     UiBlock::UserMessage {
         text: text.to_owned(),
@@ -892,6 +906,46 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
         text.contains("bold and code.\nmore\n"),
         "unfolding should not reveal markup: {text:?}"
     );
+}
+
+#[gpui::test]
+fn visualization_refs_become_inline_editor_blocks(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let tag = "```visualization\nref=0123456789abcdef0123456789abcdef rows=12\n```";
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("show it")],
+            vec![assistant(tag, Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+
+    assert!(buffer_text(&workspace, cx).contains(tag));
+    assert!(!display_text(&workspace, cx).contains(tag));
+    assert!(has_custom_block(&workspace, cx));
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 1,
+                    block: UiBlockDiff::Replace(assistant(
+                        "ordinary text",
+                        Some(UiMessagePhase::FinalAnswer),
+                    )),
+                }],
+            },
+            status: None,
+            context_used: None,
+        },
+    );
+    assert!(!has_custom_block(&workspace, cx));
 }
 
 #[gpui::test]

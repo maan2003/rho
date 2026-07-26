@@ -2402,7 +2402,8 @@ impl Workspace {
         // A freshly created view renders the full state below, which
         // subsumes any deferred summary.
         let workspace = cx.entity().downgrade();
-        let view = cx.new(|cx| AgentModel::new(workspace, cx));
+        let visualization_client = self.connection.visualization_client();
+        let view = cx.new(|cx| AgentModel::new(workspace, visualization_client, cx));
         if let Some(state) = self.store.get(agent_id) {
             view.update(cx, |view, cx| {
                 view.sync(

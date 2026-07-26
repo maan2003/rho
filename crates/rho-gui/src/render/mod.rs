@@ -73,6 +73,15 @@ pub struct RenderedBlock {
     /// Markdown markup to hide at the display layer, as byte ranges into
     /// this block's rendered text.
     pub conceal: Vec<Range<usize>>,
+    /// Immutable visualization references embedded in this message.
+    pub visualizations: Vec<VisualizationSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualizationSpec {
+    pub range: Range<usize>,
+    pub id: String,
+    pub rows: u32,
 }
 
 impl RenderedBlock {
@@ -122,6 +131,7 @@ fn separator(prev: Option<BlockKind>, current: BlockKind) -> Option<Span> {
 pub struct ParsedMessage {
     spans: Vec<Span>,
     conceal: Vec<Range<usize>>,
+    visualizations: Vec<VisualizationSpec>,
 }
 
 /// Assistant messages parsed before the view that will show them exists.
@@ -354,10 +364,67 @@ fn parse_message(text: &str, markdown: &markdown::Markdown) -> ParsedMessage {
     // Both halves read the same trees: the grammars are the slowest thing
     // in a transcript sync, so the message is parsed once.
     let trees = conceal::parse(text);
+    let visualizations = visualization_refs(text, &trees);
+    let mut concealed = conceal::concealed_ranges_of(text, &trees);
+    concealed.retain(|concealed| {
+        !visualizations.iter().any(|(visualization, _, _)| {
+            concealed.start < visualization.end && visualization.start < concealed.end
+        })
+    });
     ParsedMessage {
-        conceal: conceal::concealed_ranges_of(text, &trees),
+        conceal: concealed,
         spans: markdown::markdown_spans_of(text, &trees, markdown),
+        visualizations: visualizations
+            .into_iter()
+            .map(|(range, id, rows)| VisualizationSpec { range, id, rows })
+            .collect(),
     }
+}
+
+fn visualization_refs(text: &str, trees: &conceal::Trees) -> Vec<(Range<usize>, String, u32)> {
+    let Some(tree) = trees.block() else {
+        return Vec::new();
+    };
+    let mut refs = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "fenced_code_block" {
+            if let Some((range, id, rows)) = parse_visualization_fence(text, node.byte_range()) {
+                refs.push((range, id, rows));
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    refs.sort_by_key(|(range, _, _)| range.start);
+    refs
+}
+
+fn parse_visualization_fence(
+    text: &str,
+    range: Range<usize>,
+) -> Option<(Range<usize>, String, u32)> {
+    let block = &text[range.clone()];
+    let mut lines = block.lines();
+    (lines.next()?.trim() == "\x60\x60\x60visualization").then_some(())?;
+    let (id, rows) = parse_visualization_attributes(lines.next()?.trim())?;
+    (lines.next()?.trim() == "\x60\x60\x60" && lines.next().is_none()).then_some(())?;
+    let end = range.end - block.len() + block.trim_end_matches(['\r', '\n']).len();
+    Some((range.start..end, id, rows))
+}
+
+const MAX_VISUALIZATION_ROWS: u32 = 50;
+
+fn parse_visualization_attributes(body: &str) -> Option<(String, u32)> {
+    let body = body.strip_prefix("ref=")?;
+    let (id, rows) = body.split_once(" rows=")?;
+    let rows = rows
+        .parse()
+        .ok()
+        .filter(|rows| (1..=MAX_VISUALIZATION_ROWS).contains(rows))?;
+    (id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| (id.to_ascii_lowercase(), rows))
 }
 
 pub fn render_block_with_agent_labels(
@@ -373,6 +440,7 @@ pub fn render_block_with_agent_labels(
     let mut gutter_span = None;
     let mut inlay = None;
     let mut conceal = Vec::new();
+    let mut visualizations = Vec::new();
     match block {
         UiBlock::UserMessage { text } => {
             if text.is_empty() {
@@ -395,6 +463,15 @@ pub fn render_block_with_agent_labels(
                 .conceal
                 .into_iter()
                 .map(|range| range.start + offset..range.end + offset)
+                .collect();
+            visualizations = parsed
+                .visualizations
+                .into_iter()
+                .map(|visualization| VisualizationSpec {
+                    range: visualization.range.start + offset..visualization.range.end + offset,
+                    id: visualization.id,
+                    rows: visualization.rows,
+                })
                 .collect();
             spans.extend(parsed.spans);
         }
@@ -471,6 +548,7 @@ pub fn render_block_with_agent_labels(
         gutter_span,
         inlay,
         conceal,
+        visualizations,
     }
 }
 
@@ -485,6 +563,7 @@ fn invisible(kind: BlockKind) -> RenderedBlock {
         gutter_span: None,
         inlay: None,
         conceal: Vec::new(),
+        visualizations: Vec::new(),
     }
 }
 
@@ -643,6 +722,51 @@ mod tests {
 
     fn text_of(spans: &[Span]) -> String {
         spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    #[test]
+    fn visualization_ref_parser_accepts_complete_canonical_fences() {
+        let fence = "```visualization\nref=0123456789abcdef0123456789abcdef rows=12\n```";
+        let text = format!("before\n{fence}\nafter");
+        assert_eq!(
+            visualization_refs(&text, &conceal::parse(&text)),
+            vec![(
+                7..7 + fence.len(),
+                "0123456789abcdef0123456789abcdef".to_owned(),
+                12
+            )]
+        );
+    }
+
+    #[test]
+    fn visualization_ref_parser_ignores_streaming_and_malformed_fences() {
+        let refs = |text| visualization_refs(text, &conceal::parse(text));
+        assert!(refs("```visualization\nref=0123").is_empty());
+        assert!(refs("```visualization\nref=not-an-id rows=12\n```").is_empty());
+        assert!(refs("```visualization\nref=0123456789abcdef0123456789abcdef\n```").is_empty());
+        assert!(
+            refs("```visualization\nref=0123456789abcdef0123456789abcdef rows=0\n```").is_empty()
+        );
+        assert!(
+            refs("```visualization\nref=0123456789abcdef0123456789abcdef rows=many\n```")
+                .is_empty()
+        );
+        assert_eq!(
+            refs("```visualization\nref=0123456789abcdef0123456789abcdef rows=50\n```").len(),
+            1
+        );
+        assert!(
+            refs("```visualization\nref=0123456789abcdef0123456789abcdef rows=51\n```").is_empty()
+        );
+        assert!(refs("```rust\nref=0123456789abcdef0123456789abcdef rows=12\n```").is_empty());
+        assert!(
+            refs("````text\n```visualization\nref=0123456789abcdef0123456789abcdef rows=12\n```\n````")
+                .is_empty()
+        );
+        assert!(
+            refs("    ```visualization\n    ref=0123456789abcdef0123456789abcdef rows=12\n    ```")
+                .is_empty()
+        );
     }
 
     #[test]

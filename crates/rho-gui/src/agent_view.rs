@@ -62,7 +62,11 @@ pub struct AgentModel {
 }
 
 impl AgentModel {
-    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        visualization_client: crate::connection::VisualizationClient,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let transcript_buffer = cx.new(|cx| {
             let mut buffer = Buffer::local("", cx);
             buffer.set_capability(Capability::Read, cx);
@@ -101,7 +105,11 @@ impl AgentModel {
         })];
 
         let document_multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
-        let transcript = TranscriptModel::new(transcript_buffer, document_multi_buffer.clone());
+        let transcript = TranscriptModel::new(
+            transcript_buffer,
+            document_multi_buffer.clone(),
+            visualization_client,
+        );
         Self {
             transcript,
             conceal_task: None,

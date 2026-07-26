@@ -49,6 +49,15 @@ fn bare_rho_requires_a_subcommand() {
 }
 
 #[test]
+fn record_visualization_parses() {
+    let args = Args::try_parse(["record-visualization".to_owned()].into_iter()).unwrap();
+    assert!(matches!(
+        args.command,
+        super::Command::RecordVisualization(_)
+    ));
+}
+
+#[test]
 fn ws_alias_parses_to_workstream_commands() {
     let args = Args::try_parse(["ws".to_owned(), "list".to_owned()].into_iter()).unwrap();
     assert!(matches!(
