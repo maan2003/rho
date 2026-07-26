@@ -13,6 +13,16 @@ const RHO_OKSOLAR_P3_THEME: &[u8] =
 pub const RHO_DEFAULT_SETTINGS: &str = include_str!("../assets/settings/default.json");
 const DEFAULT_SETTINGS_PATH: &str = "settings/default.json";
 
+/// The transcript's typeface, bundled so rho reads the same everywhere
+/// rather than depending on what a machine happens to have installed.
+///
+/// One `wght` axis from 400 to 700 in each of upright and italic, so a theme
+/// can ask for a weight between the two ends (see `emphasis.strong`) instead
+/// of choosing between regular and a bold that shouts. Renamed from iA
+/// Writer Duo V under the OFL; see `assets/fonts/rho-font/README.md`.
+const RHO_FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/rho-font/RhoFont-Regular.ttf");
+const RHO_FONT_ITALIC: &[u8] = include_bytes!("../assets/fonts/rho-font/RhoFont-Italic.ttf");
+
 pub struct RhoAssets;
 
 impl AssetSource for RhoAssets {
@@ -38,6 +48,10 @@ impl AssetSource for RhoAssets {
 
 impl RhoAssets {
     pub fn load_fonts(&self, cx: &App) -> anyhow::Result<()> {
-        assets::Assets.load_fonts(cx)
+        assets::Assets.load_fonts(cx)?;
+        cx.text_system().add_fonts(vec![
+            Cow::Borrowed(RHO_FONT_REGULAR),
+            Cow::Borrowed(RHO_FONT_ITALIC),
+        ])
     }
 }

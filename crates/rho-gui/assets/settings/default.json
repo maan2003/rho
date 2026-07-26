@@ -23,10 +23,11 @@
   // 5. "SublimeText"
   // 6. "TextMate"
   "base_keymap": "VSCode",
-  // The name of a font to use for rendering text in the editor
-  // ".ZedMono" currently aliases to Lilex
-  // but this may change in the future.
-  "buffer_font_family": ".ZedMono",
+  // The name of a font to use for rendering text in the editor.
+  // "Rho Font" is bundled, so it resolves without being installed, and
+  // its weight axis makes any weight from 400 to 700 real rather than
+  // rounded to the nearest face.
+  "buffer_font_family": "Rho Font",
   // Set the buffer text's font fallbacks, this will be merged with
   // the platform's default fallbacks.
   "buffer_font_fallbacks": null,
