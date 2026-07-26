@@ -9,7 +9,7 @@
 
 use rho_core::{AgentId, ContentPart, ToolCallId, UnixMs};
 
-use crate::tool::ToolReport;
+use crate::tool::ToolHaste;
 
 /// What one source is holding, as much as a UI can show without taking it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,13 +21,13 @@ pub enum Preview {
         sender: AgentId,
         items: Vec<PendingItem>,
     },
-    /// A call, and what its tool has to say about itself. Deliberately the same
-    /// facts the decision reads and no summary line: a tool describes its own
-    /// output better than the core could, and it does that when *asked*, at a
-    /// request boundary — not on every repaint.
+    /// A call, and how much of a hurry its tool says it is in. Deliberately the
+    /// same hint the decision reads and no summary line: a tool describes its
+    /// own output better than the core could, and it does that when *asked*, at
+    /// a request boundary — not on every repaint.
     Tool {
         call_id: ToolCallId,
-        report: ToolReport,
+        haste: ToolHaste,
     },
 }
 

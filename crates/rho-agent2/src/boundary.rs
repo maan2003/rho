@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use rho_core::UnixMs;
 
-use crate::tool::ToolReport;
-use crate::{Phase, Standing, Told};
+use crate::tool::ToolHaste;
+use crate::{Phase, Standing, ToolCallAnswer};
 
 /// One source, whether or not it has anything to say.
 ///
@@ -37,11 +37,14 @@ pub(crate) enum SourceKind {
         oldest_at: Option<UnixMs>,
         newest_at: Option<UnixMs>,
     },
-    /// A called tool, reported exactly as it reports itself. There is
-    /// deliberately no tidier enum in between: any name that summarised these
-    /// facts would be deciding what they mean, outside the one place decisions
-    /// live.
-    Tool { told: Told, report: ToolReport },
+    /// A called tool: whether its one result has gone out, and how much of a
+    /// hurry it says the rest is in. There is deliberately no tidier enum in
+    /// between: any name that summarised these facts would be deciding what
+    /// they mean, outside the one place decisions live.
+    Tool {
+        answer: ToolCallAnswer,
+        haste: ToolHaste,
+    },
 }
 
 /// How long a person's message waits for the machines around it to settle. Long
@@ -233,16 +236,15 @@ pub(crate) fn boundary(
                 Some(until) if until > now => Due::Until(until),
                 _ => Due::Nothing,
             },
-            SourceKind::Tool { told, report } => match (told, report) {
+            SourceKind::Tool { answer, haste } => match (answer, haste) {
                 // An ended call has nothing left to wait for, nor has one that
                 // says what it holds stands on its own — which is it saying not
                 // to wait for the rest of the call. Nor has one that has
                 // already answered: a dev server that never finishes would
                 // otherwise be a wait nobody could end.
-                (_, ToolReport::Exited { .. } | ToolReport::Settled { .. }) | (Told::Result, _) => {
-                    Due::Nothing
-                }
-                (Told::Nothing, ToolReport::Running | ToolReport::Waiting { .. }) => {
+                (_, ToolHaste::Ended { .. } | ToolHaste::Soon { .. })
+                | (ToolCallAnswer::Sent, _) => Due::Nothing,
+                (ToolCallAnswer::Owed, ToolHaste::None | ToolHaste::Eventually { .. }) => {
                     Due::UntilItEnds
                 }
             },
@@ -280,8 +282,8 @@ pub(crate) fn boundary(
             // Both date from the moment they happened, so a tool that ends
             // after an hour of output gets its siblings' full attention rather
             // than looking an hour overdue.
-            SourceKind::Tool { report, .. } => match report {
-                ToolReport::Running => None,
+            SourceKind::Tool { haste, .. } => match haste {
+                ToolHaste::None => None,
                 // Mid-thought, so nobody asked for it and it is nobody's reason
                 // to make a request — it is only not worth leaving unsent
                 // forever, which is why an empty room does not hurry it along.
@@ -289,9 +291,9 @@ pub(crate) fn boundary(
                 // because the check-in is sooner; this is what half a build log
                 // is worth to an agent that has moved on, or asked for a long
                 // quiet.
-                ToolReport::Waiting { since } => Some(since + PROGRESS_PATIENCE),
-                ToolReport::Settled { since } => Some(since + patience(TOOL_PATIENCE)),
-                ToolReport::Exited { at } => Some(at + patience(TOOL_PATIENCE)),
+                ToolHaste::Eventually { since } => Some(since + PROGRESS_PATIENCE),
+                ToolHaste::Soon { since } => Some(since + patience(TOOL_PATIENCE)),
+                ToolHaste::Ended { at } => Some(at + patience(TOOL_PATIENCE)),
             },
         })
         .chain(checkin)

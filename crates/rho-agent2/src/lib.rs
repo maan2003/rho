@@ -32,7 +32,7 @@ pub use crate::db::Store;
 use crate::db::{AgentEvent, EventPos};
 use crate::preview::text_of;
 pub use crate::preview::{PendingItem, Preview};
-pub use crate::tool::{SourceWaker, Tool, ToolReport, ToolSession};
+pub use crate::tool::{SourceWaker, Tool, ToolHaste, ToolSession};
 
 // -- what is waiting to reach the model -------------------------------------
 //
@@ -505,19 +505,19 @@ impl Standing {
     }
 }
 
-/// Whether the model has this call's one answer yet. The core's own
-/// bookkeeping, and the only thing about a call it remembers: what the call is
-/// *doing* is the tool's to report, every time it is asked.
+/// Whether this call's one answer has gone out. The core's own bookkeeping,
+/// and the only thing about a call it remembers: what the call is *doing* is
+/// the tool's to report, every time it is asked.
 ///
-/// It doubles as the nearest thing to "the model is waiting on this": a call
-/// that has never spoken owes an answer nothing else can supply.
+/// It is also what "the model is waiting on this call" means, there being no
+/// other definition of it: the model waits on a call until the call answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Told {
-    /// Nothing yet. The next thing this call produces is its one
+pub(crate) enum ToolCallAnswer {
+    /// Still owed. The next thing this call produces is its one
     /// [`ToolResult`].
-    Nothing,
-    /// It has its result, so everything after arrives as a [`ToolUpdate`].
-    Result,
+    Owed,
+    /// Sent, so everything after it arrives as a [`ToolUpdate`].
+    Sent,
 }
 
 /// The core's bookkeeping for one call: which tool, how much of its story the
@@ -527,7 +527,7 @@ struct RunningTool {
     call: ToolCall,
     started_at: UnixMs,
     session: Box<dyn ToolSession>,
-    told: Told,
+    answer: ToolCallAnswer,
 }
 
 /// The in-flight request. Provisional until it finishes: a failure drops the
@@ -617,8 +617,8 @@ impl Agent {
             // these is something the tool observed, and what any of them is
             // worth is `boundary`'s business.
             sources.extend(self.tools.values().map(|tool| SourceKind::Tool {
-                told: tool.told,
-                report: tool.session.status(),
+                answer: tool.answer,
+                haste: tool.session.haste(),
             }));
 
             let deadline = match boundary(&sources, self.turn.as_ref(), &self.phase, now) {
@@ -859,12 +859,14 @@ impl Agent {
         let mut results: Vec<ToolResult> = Vec::new();
         let mut updates = Vec::new();
         for tool in self.tools.values_mut() {
-            match (tool.told, tool.session.status()) {
-                // Holding nothing, so there is nothing to say about it either
-                // way.
-                (_, ToolReport::Running) => {}
-                (Told::Nothing, _) => {
-                    tool.told = Told::Result;
+            // Whatever the tool is reporting: a request that leaves one call
+            // unanswered is rejected whole, so the first drain after a call is
+            // made answers it and the tool says what it has, even if that is
+            // nothing yet. `ToolHaste` is a hint for `boundary` and is not
+            // read here, nor is `done`, which is asked below.
+            match tool.answer {
+                ToolCallAnswer::Owed => {
+                    tool.answer = ToolCallAnswer::Sent;
                     results.push(ToolResult {
                         call_id: tool.call.id.clone(),
                         tool_type: tool.call.tool_type,
@@ -876,7 +878,7 @@ impl Agent {
                         metadata: None,
                     });
                 }
-                (Told::Result, _) => {
+                ToolCallAnswer::Sent => {
                     if let Some(output) = tool.session.more_output() {
                         updates.push(ContextBlock::ToolUpdate(ToolUpdate {
                             call_id: tool.call.id.clone(),
@@ -888,13 +890,11 @@ impl Agent {
                 }
             }
         }
-        // Forget the ones that have ended: the drain above was their last
-        // chance to speak and they will never say anything else, so keeping
-        // them would be a source that reports the same ending forever. Nothing
-        // to record — a reaped call is one the transcript has finished talking
-        // about.
-        self.tools
-            .retain(|_, tool| !matches!(tool.session.status(), ToolReport::Exited { .. }));
+        // Asked after the drain, so whatever a tool said last has been taken:
+        // a tool that answers `true` here has had its last chance to speak and
+        // is choosing not to want another. Nothing to record — a reaped call is
+        // one the transcript has finished talking about.
+        self.tools.retain(|_, tool| !tool.session.done());
         if !results.is_empty() {
             blocks.push(ContextBlock::ToolResults { results });
         }
@@ -1086,8 +1086,11 @@ impl Agent {
         }
 
         impl ToolSession for BornExited {
-            fn status(&self) -> ToolReport {
-                ToolReport::Exited { at: self.at }
+            fn haste(&self) -> ToolHaste {
+                ToolHaste::Ended { at: self.at }
+            }
+            fn done(&self) -> bool {
+                true
             }
 
             fn first_output(&mut self) -> ToolOutput {
@@ -1117,7 +1120,7 @@ impl Agent {
                 started_at: now,
                 call,
                 session,
-                told: Told::Nothing,
+                answer: ToolCallAnswer::Owed,
             },
         );
     }
@@ -1163,7 +1166,7 @@ impl Agent {
         );
         previews.extend(self.tools.values().map(|tool| Preview::Tool {
             call_id: tool.call.id.clone(),
-            report: tool.session.status(),
+            haste: tool.session.haste(),
         }));
 
         *self.snapshot.write().expect("poisoned snapshot") = AgentSnapshot {

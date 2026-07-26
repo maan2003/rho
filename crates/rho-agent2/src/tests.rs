@@ -62,8 +62,8 @@ struct Ask {
     phase: Phase,
 }
 
-/// Every call listed is one the model asked for at 0 and is still waiting on;
-/// [`Ask::moved_past`] is how a test says otherwise.
+/// Every call listed is one the model asked for at 0 and has not answered
+/// yet; [`answered`] is how a test says otherwise.
 fn ask(sources: Vec<SourceKind>) -> Ask {
     Ask {
         sources,
@@ -100,8 +100,8 @@ impl Ask {
         self
     }
 
-    /// The model issued calls at this instant. Which ones is
-    /// [`moved_past`]'s business, source by source.
+    /// The model issued calls at this instant. Which of them have answered
+    /// since is [`answered`]'s business, source by source.
     fn called(mut self, at: u64) -> Self {
         self.turn = Some(ModelTurn {
             spoke_at: UnixMs(at),
@@ -124,46 +124,46 @@ impl Ask {
 /// A call that still owes the model its one answer. The names in the tables
 /// above are labels for the reader; a source carries no id, because nothing
 /// about the decision depends on which call it is.
-fn tool(report: ToolReport) -> SourceKind {
+fn tool(haste: ToolHaste) -> SourceKind {
     SourceKind::Tool {
-        told: Told::Nothing,
-        report,
+        answer: ToolCallAnswer::Owed,
+        haste,
     }
 }
 
 /// ...and the same call once it has answered, so everything after is an update.
 fn answered(call: SourceKind) -> SourceKind {
     match call {
-        SourceKind::Tool { report, .. } => SourceKind::Tool {
-            told: Told::Result,
-            report,
+        SourceKind::Tool { haste, .. } => SourceKind::Tool {
+            answer: ToolCallAnswer::Sent,
+            haste,
         },
-        SourceKind::User { .. } | SourceKind::Mail { .. } => panic!("only a call is told"),
+        SourceKind::User { .. } | SourceKind::Mail { .. } => panic!("only a call has an answer"),
     }
 }
 
 /// Called and working, and has not produced a byte.
 fn silent_call() -> SourceKind {
-    tool(ToolReport::Running)
+    tool(ToolHaste::None)
 }
 
 /// Called and working, holding output it is in the middle of.
 fn partial_call(since: u64) -> SourceKind {
-    tool(ToolReport::Waiting {
+    tool(ToolHaste::Eventually {
         since: UnixMs(since),
     })
 }
 
 /// Called and working, holding output it says stands on its own.
 fn settled_call(since: u64) -> SourceKind {
-    tool(ToolReport::Settled {
+    tool(ToolHaste::Soon {
         since: UnixMs(since),
     })
 }
 
 /// Ended at `at`, with the model not yet told.
 fn ended_call(at: u64) -> SourceKind {
-    tool(ToolReport::Exited { at: UnixMs(at) })
+    tool(ToolHaste::Ended { at: UnixMs(at) })
 }
 
 fn pending_mail(oldest_at: u64, newest_at: u64) -> SourceKind {
@@ -576,7 +576,7 @@ fn a_call_that_ends_or_stands_alone_interrupts_a_wait() {
     );
 
     let mut ended = waiting.clone();
-    ended.sources = vec![tool(ToolReport::Exited { at: UnixMs(60_100) })];
+    ended.sources = vec![tool(ToolHaste::Ended { at: UnixMs(60_100) })];
     assert_eq!(
         ended.boundary(UnixMs(60_100)),
         Boundary::Now,
@@ -1043,4 +1043,44 @@ async fn a_wake_that_lands_while_the_core_is_busy_is_not_lost() {
 
     let woken = tokio::time::timeout(Duration::from_millis(50), notify.notified());
     assert!(woken.await.is_ok(), "the permit survives until awaited");
+}
+
+//  ms      model      rg      dev server   a peer   boundary
+//  0       calls rg   call    (running)             hold
+//  4000                       "GET /"               hold — nobody asked for it
+//  4900                       flags a crash         hold
+//  5000                exit                         SEND — at once
+//  5000                                    writes   ...unless one is mid-burst
+#[test]
+fn a_finished_call_answers_at_once_however_much_is_running_behind_it() {
+    // Every background tool has already answered its own call, so none of them
+    // is a result still to come and none can make rg wait for it. Their own
+    // moments are all later than rg's, and a deadline is a minimum.
+    let running_behind = || {
+        vec![
+            answered(silent_call()),
+            answered(partial_call(4_000)),
+            answered(settled_call(4_900)),
+        ]
+    };
+    let mut alone = running_behind();
+    alone.push(ended_call(5_000));
+    assert_eq!(ask(alone).called(0).boundary(UnixMs(5_000)), Boundary::Now);
+
+    // The one thing that does hold it: a peer that may still be mid-burst,
+    // because that is a source with more genuinely on the way. It costs rg the
+    // rest of the burst and nothing more — once the burst lapses the patience
+    // collapses and rg's own moment, already past, is the deadline.
+    let mut mid_burst = running_behind();
+    mid_burst.push(ended_call(5_000));
+    mid_burst.push(pending_mail(5_000, 5_000));
+    let schedule = ask(mid_burst).called(0);
+    assert_eq!(
+        schedule.recheck(UnixMs(5_000)),
+        Some(UnixMs(5_000 + millis(MAIL_BURST)))
+    );
+    assert_eq!(
+        schedule.boundary(UnixMs(5_000 + millis(MAIL_BURST))),
+        Boundary::Now
+    );
 }

@@ -61,9 +61,9 @@ one-result-per-call rule made unmissable
 ([REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md)). Both
 carry the tool's words and only the tool's words
 ([DECISION-the-core-never-speaks-for-a-tool](DECISION-the-core-never-speaks-for-a-tool.md)),
-which is also why a call is forgotten the moment it reports that it ended: the
-drain beside the reap was its last chance to speak, and the core has nothing to
-add afterwards.
+which is also why the tool says when it may be forgotten: `done` is asked after
+the drain beside it, so the last thing a tool has to say is always taken, and
+the core never decides on its behalf that there is nothing more to hear.
 
 ## Persistence
 
