@@ -118,6 +118,11 @@ pub enum PagerReply {
     Continue,
     Drain,
     Quit,
+    /// Answers `Hello`: the sidecar has resolved this connection to the
+    /// execution that spawned it and will carry its page credit. The pager
+    /// waits for this before writing a byte, which is what keeps the
+    /// execution alive until the sidecar has claimed the connection.
+    Attached,
 }
 
 impl From<PagerAction> for PagerReply {

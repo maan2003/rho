@@ -480,5 +480,19 @@ fn write(control: &mut std::os::unix::net::UnixStream, request: &Request) {
 }
 
 fn read(control: &mut std::os::unix::net::UnixStream) -> Response {
-    rho_shell_proto::read_frame(control).unwrap()
+    match rho_shell_proto::read_frame(control) {
+        Ok(response) => response,
+        // The read timeout is a backstop, so say what it means: the frame the
+        // test is standing on never came, and the stream is desynchronised
+        // anyway once a partial one has been consumed.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            panic!("rho-shell sent no further frames within the read timeout")
+        }
+        Err(error) => panic!("read response frame: {error}"),
+    }
 }

@@ -41,8 +41,12 @@ const PTY_COLS: u16 = 80;
 const PAGER_SOCKET_ENV: &str = "RHO_PAGER_SOCKET";
 const PAGER_TOKEN_ENV: &str = "RHO_PAGER_TOKEN";
 const PAGER_EXECUTION_TOKEN_ENV: &str = "RHO_PAGER_EXECUTION_TOKEN";
-const PAGER_PROTOCOL_VERSION: u16 = 1;
+const PAGER_PROTOCOL_VERSION: u16 = 2;
 const PAGER_CHUNK: usize = 8 * 1024;
+/// How long a pager waits to be claimed before deciding there is no sidecar
+/// listening and behaving like `cat`. Only a wedged sidecar reaches it; a
+/// rejection arrives as a closed connection, immediately.
+const PAGER_ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct ActiveExecutionPty {
     execution: u64,
@@ -245,6 +249,15 @@ fn serve_pager(
         .send(Response::PagerStarted { execution, pager })
         .is_err()
     {
+        return;
+    }
+    // Claim the connection before the pager writes anything. The execution's
+    // token dies with its PTY, and the PTY outlives the pager process, so a
+    // pager that waits here cannot have its execution retired out from under
+    // it - which is how a pager short enough to finish in one page used to
+    // lose its whole session.
+    if rho_shell_proto::write_pager_frame(&mut stream, &PagerReply::Attached).is_err() {
+        let _ = responses.send(Response::PagerFinished { execution, pager });
         return;
     }
     let mut last_page = 0;
@@ -795,6 +808,15 @@ fn connect_pager_control() -> Option<UnixStream> {
         },
     )
     .ok()?;
+    // Nothing is paged until the sidecar answers. A rejected or stale token
+    // closes the connection instead, and both that and a silent sidecar leave
+    // the caller with no control stream, which is plain `cat`.
+    stream.set_read_timeout(Some(PAGER_ATTACH_TIMEOUT)).ok()?;
+    let attached = rho_shell_proto::read_pager_frame::<PagerReply>(&mut stream).ok()?;
+    if attached != PagerReply::Attached {
+        return None;
+    }
+    stream.set_read_timeout(None).ok()?;
     Some(stream)
 }
 
@@ -878,7 +900,7 @@ fn relay_paged_with_lines(
                 lines = 0;
                 bytes = 0;
             }
-            Ok(PagerReply::Drain) | Err(_) => {
+            Ok(PagerReply::Drain | PagerReply::Attached) | Err(_) => {
                 output.write_all(&pending[pending_start..])?;
                 return io::copy(input, output).map(|_| ());
             }
