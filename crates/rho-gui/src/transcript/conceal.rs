@@ -44,6 +44,24 @@ pub struct ConcealState {
     /// first pass reads as "start at the end" once it knows how many ranges
     /// there are.
     concealed_from: usize,
+    /// One fold this editor carries, held as the anchors the fold map holds
+    /// rather than the ones the model holds.
+    ///
+    /// A fold dies with the anchors under it: a rewrite of the text it
+    /// covers, or a change to the editor's excerpts, leaves it in the fold
+    /// map as an empty range that conceals nothing. The model mints fresh
+    /// anchors for the same markup in the same pass, and they resolve to the
+    /// offsets the old fold used to cover - so the diff below sees a fold
+    /// exactly where it wants one, and every other signal agrees. This is
+    /// the only thing that can tell the difference.
+    probe: Option<Probe>,
+}
+
+/// A fold to re-resolve next pass, to catch the collapse that would
+/// otherwise silently unfold this editor. See [`ConcealState::probe`].
+struct Probe {
+    index: usize,
+    range: Range<multi_buffer::Anchor>,
 }
 
 impl Default for ConcealState {
@@ -51,6 +69,7 @@ impl Default for ConcealState {
         Self {
             applied: BTreeMap::new(),
             concealed_from: usize::MAX,
+            probe: None,
         }
     }
 }
@@ -98,7 +117,9 @@ impl ConcealSync {
     /// untouched. Stale folds go by removing everything of this type from the
     /// divergence point onward, which also collects folds whose text the
     /// rewrite deleted. `refresh` redoes the editor wholesale, for an
-    /// attachment whose excerpt was replaced under it.
+    /// attachment whose excerpt was replaced under it - which this also
+    /// detects for itself, via the probe, for the collapses no caller
+    /// announces.
     pub fn apply<V: 'static>(
         &self,
         state: &mut ConcealState,
@@ -108,6 +129,28 @@ impl ConcealSync {
         editor: &Entity<Editor>,
         cx: &mut Context<V>,
     ) {
+        let snapshot = multi_buffer.read(cx).snapshot(cx);
+        let resolve = |range: &Range<Anchor>| {
+            let range = excerpt_range(&snapshot, range)?;
+            let offsets = range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot);
+            Some((range, offsets))
+        };
+
+        // A fold that has collapsed where the model still has something to
+        // conceal took the whole editor's folds with it: they all died to
+        // the same rewrite, and it has to be redone from the tail back.
+        let refresh = refresh
+            || state.probe.as_ref().is_some_and(|probe| {
+                let live = probe.range.start.to_offset(&snapshot)
+                    ..probe.range.end.to_offset(&snapshot);
+                live.start >= live.end
+                    && self
+                        .ranges
+                        .get(probe.index)
+                        .and_then(&resolve)
+                        .is_some_and(|(_, offsets)| offsets.start < offsets.end)
+            });
+
         // An editor that has concealed nothing yet hides its tail in this
         // pass: it is about to be shown, and the tail is what it opens on.
         let opening = refresh || state.concealed_from == usize::MAX;
@@ -134,17 +177,11 @@ impl ConcealSync {
             return;
         }
 
-        let snapshot = multi_buffer.read(cx).snapshot(cx);
-        let resolve = |range: &Range<Anchor>| {
-            let range = excerpt_range(&snapshot, range)?;
-            Some(range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot))
-        };
-
         // Ranges whose fold no longer covers what the model says it should:
         // everything from the first of them is refolded.
         let mut diverged = None;
         for index in checked..self.ranges.len() {
-            let desired = resolve(&self.ranges[index]);
+            let desired = resolve(&self.ranges[index]).map(|(_, offsets)| offsets);
             if desired.as_ref() != state.applied.get(&index) {
                 diverged = Some(index);
                 break;
@@ -158,9 +195,13 @@ impl ConcealSync {
 
         let mut folds = Vec::new();
         let mut fold = |index: usize, state: &mut ConcealState| {
-            if let Some(range) = resolve(&self.ranges[index]) {
-                folds.push(range.clone());
-                state.applied.insert(index, range);
+            if let Some((anchors, offsets)) = resolve(&self.ranges[index]) {
+                folds.push(offsets.clone());
+                state.applied.insert(index, offsets);
+                state.probe = Some(Probe {
+                    index,
+                    range: anchors,
+                });
             }
         };
         for index in backfill..state.concealed_from {

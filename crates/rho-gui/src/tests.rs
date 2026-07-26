@@ -1830,3 +1830,58 @@ fn every_row_of_a_user_message_renders_larger(cx: &mut TestAppContext) {
         })
         .expect("read display snapshot");
 }
+
+/// Markup that arrives in pieces has to end up concealed like markup that
+/// arrived whole: a delimiter is only recognisable once its closing run is
+/// there, so every delta re-renders the block and the folds have to follow.
+#[gpui::test]
+fn streamed_markup_conceals_once_its_delimiters_close(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("go")], vec![assistant("", None)])),
+    );
+
+    let message = "Here is **bold** text, `code`, and **more strong** words.\n";
+    let mut sent = 0;
+    while sent < message.len() {
+        let mut next = (sent + 3).min(message.len());
+        while !message.is_char_boundary(next) {
+            next += 1;
+        }
+        feed_frame(
+            &workspace,
+            cx,
+            agent(1),
+            AgentRemoteFrame::Diff {
+                blocks: UiBlocksDiff {
+                    truncate_to: None,
+                    updates: vec![UiBlockUpdate {
+                        index: 1,
+                        block: UiBlockDiff::AssistantText(UiTextDiff {
+                            keep_bytes: sent,
+                            value: message[sent..next].to_owned(),
+                        }),
+                    }],
+                },
+                status: None,
+                context_used: None,
+            },
+        );
+        sent = next;
+    }
+
+    for _ in 0..64 {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+    }
+    cx.run_until_parked();
+    let text = display_text(&workspace, cx);
+    assert!(
+        !text.contains("**"),
+        "streamed markup should conceal like markup that arrived whole: {text:?}"
+    );
+}
