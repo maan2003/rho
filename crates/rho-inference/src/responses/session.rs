@@ -555,6 +555,20 @@ impl InferenceSession {
                 });
                 // Quota is account-wide rather than a fact about this stream,
                 // so hand it to the account on the way past.
+                //
+                // TODO: and then stop forwarding it. `InferenceEvent::Quota`
+                // only exists because the wire parser has no handle on the
+                // account, so it smuggles the observation through the update
+                // stream to be picked up here. Once it has been, nothing
+                // downstream needs it: `Inference::quota` is a watch that
+                // yields immediately and on every change, and `latest_quota`
+                // covers callers with nothing to await. Every consumer today
+                // either ignores the event (rho-agent2, rho-agent's title
+                // session) or copies it into a second place that then has to be
+                // diffed against itself (rho-agent's `AgentState`, read by
+                // rho-daemon). Dropping the variant means moving those to
+                // `inference.quota()` and handing the parser a way to report it
+                // that is not a public enum.
                 for update in &updates {
                     if let InferenceEvent::Quota {
                         used_percent,

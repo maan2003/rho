@@ -1,26 +1,43 @@
 //! Non-consuming views of what each source is holding, for UIs.
 //!
 //! Signals to the core carry no payload, so this is the only way to show
-//! pending content before it is pulled. The payload is open the same way
-//! provider data is: a shell tool shows a terminal buffer, a search shows match
-//! counts, and neither has to be describable as one summary string.
+//! pending content before it is pulled.
 //!
-//! Each source has its own preview type carrying its own identity — the sender
-//! of a piece of mail, the call a tool is answering — so nothing here needs a
-//! separate label that could drift from the data it describes.
+//! Every variant names what it belongs to — the sender of a piece of mail, the
+//! call a tool is answering — so a flat list needs no parallel labelling that
+//! could drift from the data it describes.
 
 use rho_core::{AgentId, ContentPart, ToolCallId, UnixMs};
-use senax_encoder::{Decode, Encode};
 
 use crate::tool::{ToolActivity, Unsent};
 
-senax_encoder::declare_senax_tagged_trait!(
-    pub trait PreviewData,
-    unknown = UnknownPreviewData,
-);
+/// What one source is holding, as much as a UI can show without taking it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Preview {
+    /// Messages the user has typed that the model has not seen yet.
+    User { items: Vec<PendingItem> },
+    /// Mail from one sender, waiting to be collapsed into a single block.
+    Mail {
+        sender: AgentId,
+        items: Vec<PendingItem>,
+    },
+    /// A call, and what its tool has to say about itself. Deliberately the same
+    /// facts the decision reads and no summary line: a tool describes its own
+    /// output better than the core could, and it does that when *asked*, at a
+    /// request boundary — not on every repaint.
+    Tool {
+        call_id: ToolCallId,
+        activity: ToolActivity,
+        unsent: Unsent,
+        /// For display only. The decision measures nothing from it, because a
+        /// wait that moved every time a tool spoke would be a wait a chatty
+        /// tool could extend forever.
+        last_output_at: UnixMs,
+    },
+}
 
 /// One input waiting in a queue.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingItem {
     /// When this particular item arrived, so a UI can age each one rather than
     /// only the queue as a whole.
@@ -39,43 +56,3 @@ pub(crate) fn text_of(content: &[ContentPart]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-
-/// Messages the user has typed that the model has not seen yet.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct UserPreview {
-    pub items: Vec<PendingItem>,
-}
-
-senax_encoder::register_senax_tagged!(
-    trait = PreviewData,
-    type = UserPreview,
-    tag = "rho-agent2.preview.user",
-);
-
-/// Mail from one sender, waiting to be collapsed into a single block.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct MailPreview {
-    pub sender: AgentId,
-    pub items: Vec<PendingItem>,
-}
-
-senax_encoder::register_senax_tagged!(
-    trait = PreviewData,
-    type = MailPreview,
-    tag = "rho-agent2.preview.mail",
-);
-
-/// Default preview for a tool with nothing richer to show.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct ToolPreview {
-    pub call_id: ToolCallId,
-    pub activity: ToolActivity,
-    pub unsent: Unsent,
-    pub last_output_at: UnixMs,
-}
-
-senax_encoder::register_senax_tagged!(
-    trait = PreviewData,
-    type = ToolPreview,
-    tag = "rho-agent2.preview.tool",
-);

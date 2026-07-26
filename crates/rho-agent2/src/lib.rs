@@ -22,9 +22,9 @@
 //! parting output, so the tool has the last word.
 
 mod boundary;
+mod db;
 mod preview;
 mod source;
-mod store;
 mod tool;
 
 use std::borrow::Cow;
@@ -34,22 +34,20 @@ use std::time::Duration;
 
 use rho_core::{
     AgentId, ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
-    PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId, ToolName, ToolOutput,
-    ToolOutputStatus, ToolResult, ToolSpec, UnixMs,
+    MessageSender, PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId, ToolName,
+    ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, UnixMs,
 };
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::boundary::{Boundary, ModelAsked, ModelTurn, Standing, boundary};
-pub use crate::preview::{
-    MailPreview, PendingItem, PreviewData, ToolPreview, UnknownPreviewData, UserPreview,
-};
+use crate::boundary::{Boundary, ModelAsked, ModelTurn, boundary};
+pub use crate::db::Store;
+use crate::db::{AgentEvent, AgentRecord, EventPos};
+pub use crate::preview::{PendingItem, Preview};
 pub use crate::source::{Delivery, InputKind, InputSource, QueuedInput};
-use crate::source::{MailSource, SourceKind, UserSource};
-use crate::store::{AgentEvent, AgentRecord};
-pub use crate::store::{AgentKey, Store};
-use crate::tool::{FinishedSession, RunningTool, ToolTake, lost_to_restart};
+use crate::source::{MailSource, UserSource};
+use crate::tool::{FinishedSession, RunningTool, ToolTake};
 pub use crate::tool::{
     SourceWaker, Tool, ToolActivity, ToolSession, ToolStatus, Unsent, elide_middle,
 };
@@ -64,7 +62,7 @@ pub struct AgentSnapshot {
     /// Non-consuming view of what each source is holding, and since when.
     /// Readiness signals to the core carry no payload, so this is the only way
     /// to show pending content before it is pulled.
-    pub previews: Vec<Box<dyn PreviewData>>,
+    pub previews: Vec<Preview>,
     pub activity: AgentActivity,
     /// Model output for the in-flight request. Provisional: a failure drops it
     /// without touching history.
@@ -79,7 +77,8 @@ pub enum AgentActivity {
     /// Working, or waiting on something that is coming.
     #[default]
     Live,
-    /// Cancelled: nothing will start a request until fresh user input arrives.
+    /// Cancelled, or failed: nothing will start a request until fresh user
+    /// input arrives. Which of the two it was is `last_error`.
     Stopped,
 }
 
@@ -116,10 +115,10 @@ impl std::fmt::Debug for ToolRegistry {
 /// Cheap clonable handle for observing and driving a running agent.
 #[derive(Clone)]
 pub struct AgentHandle {
-    id: AgentKey,
+    id: AgentId,
     control: mpsc::UnboundedSender<Control>,
     snapshot: Arc<RwLock<AgentSnapshot>>,
-    notify: Arc<Notify>,
+    published: Arc<Notify>,
 }
 
 impl AgentHandle {
@@ -131,31 +130,33 @@ impl AgentHandle {
         registry: ToolRegistry,
         instructions: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        let record = AgentRecord {
-            instructions: instructions.into(),
-            profile,
-            model: model.into(),
-            prompt_cache_key: PromptCacheKey::generate(),
-            next_event: 0,
-        };
-        let id = store.create_record(&record).await;
+        let (id, next_event, record) = store
+            .create_agent(profile, model.into(), PromptCacheKey::generate())
+            .await;
         Ok(Agent::start(
             store,
             inference,
             id,
             record,
+            instructions.into(),
+            next_event,
             registry,
             Restored::default(),
         ))
     }
 
+    /// Instructions come from the caller here exactly as they do for a new
+    /// agent, because they are code rather than a row: an agent reopened next
+    /// month runs today's prompt, and editing the prompt reaches every agent
+    /// that already exists.
     pub fn load(
         store: Store,
         inference: Inference,
         registry: ToolRegistry,
-        id: AgentKey,
+        id: AgentId,
+        instructions: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        let (record, events) = store
+        let (record, next_event, events) = store
             .load(id)
             .ok_or_else(|| anyhow::anyhow!("rho-agent2 agent not found"))?;
         Ok(Agent::start(
@@ -163,12 +164,14 @@ impl AgentHandle {
             inference,
             id,
             record,
+            instructions.into(),
+            next_event,
             registry,
             restore(events),
         ))
     }
 
-    pub fn id(&self) -> AgentKey {
+    pub fn id(&self) -> AgentId {
         self.id
     }
 
@@ -176,61 +179,78 @@ impl AgentHandle {
         self.snapshot.read().expect("poisoned snapshot").clone()
     }
 
-    pub fn send_user_message(&self, text: impl Into<String>, delivery: Delivery) {
+    pub async fn send_user_message(&self, text: impl Into<String>, delivery: Delivery) -> bool {
         self.send_input(
             InputKind::Message {
                 content: vec![ContentPart::Text { text: text.into() }],
             },
             delivery,
-        );
+        )
+        .await
     }
 
-    pub fn compact(&self) {
-        self.send_input(InputKind::Compaction, Delivery::NextRequest);
+    pub async fn compact(&self) -> bool {
+        self.send_input(InputKind::Compaction, Delivery::NextRequest)
+            .await
     }
 
-    fn send_input(&self, kind: InputKind, delivery: Delivery) {
-        let _ = self.control.send(Control::User(QueuedInput {
-            source: InputSource::User,
-            kind,
-            delivery,
-            at: UnixMs::now(),
-        }));
+    async fn send_input(&self, kind: InputKind, delivery: Delivery) -> bool {
+        self.send(|done| {
+            Control::User(
+                QueuedInput {
+                    source: InputSource::User,
+                    kind,
+                    delivery,
+                    at: UnixMs::now(),
+                },
+                done,
+            )
+        })
+        .await
     }
 
     /// Deliver mail from a peer agent.
-    ///
-    /// The returned [`Queued`] resolves once the message is durably recorded,
-    /// so a sender can wait for that rather than assume it. Dropping it sends
-    /// the mail all the same.
-    pub fn send_mail(&self, sender: AgentId, text: impl Into<String>) -> Queued {
-        let (queued, receiver) = oneshot::channel();
-        let _ = self.control.send(Control::Mail {
+    pub async fn send_mail(&self, sender: AgentId, text: impl Into<String>) -> bool {
+        self.send(|done| Control::Mail {
             sender,
             content: vec![ContentPart::Text { text: text.into() }],
             at: UnixMs::now(),
-            queued,
-        });
-        Queued(receiver)
+            done,
+        })
+        .await
     }
 
     /// Abort the in-flight request and durably discard queued inputs.
-    pub fn cancel(&self) {
-        let _ = self.control.send(Control::Cancel);
+    pub async fn cancel(&self) -> bool {
+        self.send(Control::Cancel).await
     }
 
     /// Retry after a failure, or resume a request interrupted by a restart.
-    pub fn retry(&self) {
-        let _ = self.control.send(Control::Retry);
+    pub async fn retry(&self) -> bool {
+        self.send(Control::Retry).await
+    }
+
+    /// Hand a command to the loop and wait for it to land.
+    ///
+    /// `false` means the agent stopped before it got there — either the loop
+    /// had already ended when the command was sent, or it ended while the
+    /// command was in the queue. A caller cannot tell those apart and has no
+    /// reason to: neither one happened.
+    async fn send(&self, command: impl FnOnce(oneshot::Sender<()>) -> Control) -> bool {
+        let (done, landed) = oneshot::channel();
+        if self.control.send(command(done)).is_err() {
+            return false;
+        }
+        landed.await.is_ok()
     }
 
     /// An immediate snapshot, then every subsequent change.
     pub fn subscribe(&self) -> impl futures::Stream<Item = AgentSnapshot> + use<> {
         let snapshot = Arc::clone(&self.snapshot);
-        let notify = Arc::clone(&self.notify);
+        let published = Arc::clone(&self.published);
         async_stream::stream! {
             loop {
-                let notified = notify.notified();
+                let notified = published.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 let current = snapshot.read().expect("poisoned snapshot").clone();
@@ -241,26 +261,23 @@ impl AgentHandle {
     }
 }
 
-/// Resolves once a message has been durably recorded.
-pub struct Queued(oneshot::Receiver<()>);
-
-impl Queued {
-    /// `false` if the agent stopped before the message could be recorded.
-    pub async fn recorded(self) -> bool {
-        self.0.await.is_ok()
-    }
-}
-
+/// A command, and the ack that says it landed.
+///
+/// Every one carries the ack, not just the ones that write: what a caller wants
+/// to know is that the loop has *acted*, and "the queue is durable" and "the
+/// cancel has taken effect" are the same promise from the outside. The ack
+/// fires after the command's own handling, so anything it persisted is on disk
+/// by then.
 enum Control {
-    User(QueuedInput),
+    User(QueuedInput, oneshot::Sender<()>),
     Mail {
         sender: AgentId,
         content: Vec<ContentPart>,
         at: UnixMs,
-        queued: oneshot::Sender<()>,
+        done: oneshot::Sender<()>,
     },
-    Cancel,
-    Retry,
+    Cancel(oneshot::Sender<()>),
+    Retry(oneshot::Sender<()>),
 }
 
 /// Everything that can move the agent. The `select!` normalises sources into
@@ -276,31 +293,104 @@ enum Event {
     Tick,
 }
 
+/// Told to the model by the first request after a restart, once every call it
+/// left unanswered has been given an empty result.
+///
+/// "Restarted" rather than "crashed": a clean shutdown and a crash look exactly
+/// alike from here — all the agent knows is that it was not running. The middle
+/// sentence is the one doing the work, because an empty result on its own reads
+/// as a command that succeeded quietly.
+const RESTART_NOTE: &str = "note: rho restarted. Every tool that was running is gone — foreground \
+     and background alike — and nothing was recorded about what any of them did. The empty tool \
+     results above are placeholders, not output. Re-run anything you still need.";
+
+/// What the agent is up to, and the first thing the decision asks about.
+///
+/// One enum rather than flags beside `Option`s, because only the first of these
+/// leaves "should the next request start now?" open, and no two of the rest can
+/// be in force at once: an agent cannot be halted *and* mid-request, a request
+/// cannot already be in flight *and* owed, and an error the agent has moved on
+/// from is not an error it is stopped by.
+#[derive(Clone)]
+enum Phase {
+    /// Nothing in the way. What happens next is up to the sources.
+    Idle,
+    /// Loaded from a log and not yet spoken. `lost` is the calls whose tools
+    /// did not survive, and the first request has to admit that before
+    /// anything else. Owing that is a phase rather than a list on the side
+    /// because it is true of the agent exactly until it speaks: making the
+    /// note at the request rather than at load means an agent that is only
+    /// opened and read is never written to, and the note lands next to the
+    /// request it explains.
+    Restarted { lost: Vec<ToolCall>, resume: Resume },
+    /// A request is in flight, and nothing but an interrupt may disturb it.
+    Requesting(InFlight),
+    /// Send at the next opportunity even with nothing pending: a retry, or
+    /// carrying on after a compaction.
+    MustSend,
+    /// The last request failed for good, carrying what it said. Stopped for the
+    /// same reason as `Halted`: a request that failed will fail the same way
+    /// when the next tool ends, and an agent that keeps trying on its own is
+    /// one nobody can call off.
+    Failed(Arc<str>),
+    /// Cancelled. Tool output still reaches history at the next boundary, but
+    /// nothing may *start* a request until fresh user input arrives — otherwise
+    /// a cancelled tool's dying words would wake the agent straight back up.
+    Halted,
+}
+
+/// When a restart's first request is, which is the only question left open
+/// while it still owes one.
+///
+/// These are the three phases a restart can be *in the middle of*, and there
+/// are exactly three because the others cannot coexist with it: nothing can be
+/// in flight before the first request, and nothing can have failed either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resume {
+    /// A request was cut short by the shutdown. Nothing it produced reached
+    /// history, so it has to be sent again.
+    AtOnce,
+    /// Nothing was in flight. The sources say when, as they always do — the
+    /// restart only says what has to be in it.
+    WhenDue,
+    /// Cancelled before it could explain itself. Still owed, because a cancel
+    /// is not an answer and no provider will accept a call that never got
+    /// one; it has just stopped being a reason to send.
+    NotUntilAsked,
+}
+
 /// The in-flight request. Provisional until it finishes: a failure drops the
-/// whole thing without touching history.
+/// whole thing without touching history, and everything here goes with it.
+#[derive(Clone, Default)]
 struct InFlight {
     pending: PendingInferenceResponse,
-    temporary_failures: u64,
+    /// What each temporary failure said, latest last — so the count is how deep
+    /// into retrying this request is, and the last one is what it is retrying
+    /// *from*. Both belong to the request rather than to the agent: a retry
+    /// that eventually works leaves nothing behind to explain.
+    temporary_failures: Vec<Arc<str>>,
+    /// This request compacted on behalf of work that still owes a reply, so a
+    /// compaction must not be where the agent stops. A fact about *this*
+    /// request, so a request that never finishes never has to unset it.
+    compaction_owes_reply: bool,
 }
 
 struct Agent {
     store: Store,
-    id: AgentKey,
-    next_event: u64,
+    /// Where this agent's next event goes. It is the sole writer of its own
+    /// log, so this is all it needs to carry on from.
+    next_event: EventPos,
     instructions: Arc<str>,
 
     /// The transcript. Append-only, and this struct is its sole writer.
     history: Vec<Arc<ContextBlock>>,
 
     session: InferenceSession,
-    in_flight: Option<InFlight>,
+    phase: Phase,
 
     user: UserSource,
-    mail: BTreeMap<AgentId, MailSource>,
+    mail: MailSource,
     tools: BTreeMap<ToolCallId, RunningTool>,
-    /// Calls left unanswered by a restart, waiting for the next request to
-    /// admit that their tools are gone.
-    lost_tools: Vec<ToolCall>,
 
     registry: ToolRegistry,
 
@@ -308,61 +398,69 @@ struct Agent {
     /// What the model's latest turn settled about being looked in on. `None`
     /// until it has spoken once — after a restart included, which is safe
     /// because no tool survives one.
+    // review: why turn not part of Phase
     turn: Option<ModelTurn>,
-    standing: Standing,
-    /// The request in flight was compacting on behalf of work that still owes
-    /// a reply, so a compaction must not be where the agent stops.
-    compaction_owes_reply: bool,
-    last_error: Option<Arc<str>>,
     /// Content-free signal that some tool changed. Tools hold a
     /// [`SourceWaker`] over this; the core rescans rather than being told.
     wake: Arc<Notify>,
 
     snapshot: Arc<RwLock<AgentSnapshot>>,
-    notify: Arc<Notify>,
+    /// Poked whenever the published snapshot changes; `subscribe` waits on it.
+    published: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<Control>,
 }
 
 impl Agent {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "everything the loop needs, and a struct to hold it would be \
+                  these same arguments with a name"
+    )]
     fn start(
         store: Store,
         inference: Inference,
-        id: AgentKey,
+        id: AgentId,
         record: AgentRecord,
+        instructions: String,
+        next_event: EventPos,
         registry: ToolRegistry,
         restored: Restored,
     ) -> AgentHandle {
         let session =
             inference.deep_session(record.profile, record.model.into(), record.prompt_cache_key);
         let snapshot = Arc::new(RwLock::new(AgentSnapshot::default()));
-        let notify = Arc::new(Notify::new());
+        let published = Arc::new(Notify::new());
         let (control, control_rx) = mpsc::unbounded_channel();
 
         let agent = Self {
             store,
-            id,
-            next_event: record.next_event,
-            instructions: Arc::from(record.instructions),
+            next_event,
+            instructions: Arc::from(instructions),
             history: restored.history,
             session,
-            in_flight: None,
+            phase: match restored.orphan_tools.is_empty() {
+                // Nothing to explain, so nothing to be in the middle of.
+                true => match restored.request_active {
+                    true => Phase::MustSend,
+                    false => Phase::Idle,
+                },
+                false => Phase::Restarted {
+                    lost: restored.orphan_tools,
+                    resume: match restored.request_active {
+                        true => Resume::AtOnce,
+                        false => Resume::WhenDue,
+                    },
+                },
+            },
             user: restored.user,
             mail: restored.mail,
             tools: BTreeMap::new(),
-            lost_tools: restored.orphan_tools,
             registry,
             context_used: restored.context_used,
             turn: None,
-            standing: if restored.request_active {
-                Standing::MustSend
-            } else {
-                Standing::Normal
-            },
-            compaction_owes_reply: false,
-            last_error: None,
             wake: Arc::new(Notify::new()),
             snapshot: Arc::clone(&snapshot),
-            notify: Arc::clone(&notify),
+            published: Arc::clone(&published),
             control_rx,
         };
 
@@ -372,7 +470,7 @@ impl Agent {
             id,
             control,
             snapshot,
-            notify,
+            published,
         }
     }
 
@@ -384,7 +482,13 @@ impl Agent {
             // timer — so the timer and the rule behind it cannot drift apart —
             // or it says to send, and a request in flight is never waited for.
             let now = UnixMs::now();
-            let deadline = match self.boundary(now) {
+            // Every source, in whatever state it is in — nothing is filtered
+            // out for having nothing to say, because deciding that is the
+            // decision's job, and an empty queue is a fact it reads.
+            let mut sources = vec![self.user.source(), self.mail.source()];
+            sources.extend(self.tools.values().map(RunningTool::source));
+
+            let deadline = match boundary(&sources, self.turn.as_ref(), &self.phase, now) {
                 Boundary::No { recheck } => recheck,
                 Boundary::AbortAndResend => {
                     self.abort_in_flight().await;
@@ -432,71 +536,160 @@ impl Agent {
     async fn handle(&mut self, event: Event) {
         let now = UnixMs::now();
         match event {
-            Event::Control(Control::User(input)) => {
-                self.persist(AgentEvent::Queued(input.clone())).await;
-                self.user.push(input);
-                // Fresh instructions revive a cancelled agent; peer mail alone
-                // does not, so a cancel stays a cancel.
-                if self.standing == Standing::Halted {
-                    self.standing = Standing::Normal;
+            Event::Control(control) => {
+                let done = match control {
+                    Control::User(input, done) => {
+                        self.persist(AgentEvent::Queued(input.clone())).await;
+                        self.user.push(input);
+                        // Fresh instructions revive an agent that has stopped,
+                        // however it stopped; peer mail alone does not, so a
+                        // cancel stays a cancel and a failure stays somebody's
+                        // to look at.
+                        self.phase = match std::mem::replace(&mut self.phase, Phase::Idle) {
+                            Phase::Halted | Phase::Failed(_) => Phase::Idle,
+                            // Reviving a restart does not cash in what it owes;
+                            // that still waits for the request the sources ask
+                            // for.
+                            Phase::Restarted {
+                                lost,
+                                resume: Resume::NotUntilAsked,
+                            } => Phase::Restarted {
+                                lost,
+                                resume: Resume::WhenDue,
+                            },
+                            unchanged => unchanged,
+                        };
+                        done
+                    }
+                    Control::Mail {
+                        sender,
+                        content,
+                        at,
+                        done,
+                    } => {
+                        let input = QueuedInput {
+                            source: InputSource::Mail { sender },
+                            kind: InputKind::Message {
+                                content: content.clone(),
+                            },
+                            delivery: Delivery::NextRequest,
+                            at,
+                        };
+                        self.persist(AgentEvent::Queued(input)).await;
+                        self.mail.push(sender, content, at);
+                        done
+                    }
+                    Control::Cancel(done) => {
+                        // Ask every tool to wind down, then keep reading it: the
+                        // core does not kill tools, so a tool still chooses its
+                        // own last words. Those words reach history at the next
+                        // boundary, but a halted agent makes sure they cannot
+                        // themselves *cause* one.
+                        for tool in self.tools.values_mut() {
+                            tool.cancel();
+                        }
+                        // Taken before the abort, which resets the phase: a
+                        // cancel is not an answer, so what a restart owes
+                        // outlives it.
+                        let restart = match &mut self.phase {
+                            Phase::Restarted { lost, .. } => std::mem::take(lost),
+                            Phase::Idle
+                            | Phase::Requesting(_)
+                            | Phase::MustSend
+                            | Phase::Failed(_)
+                            | Phase::Halted => Vec::new(),
+                        };
+                        self.abort_in_flight().await;
+                        self.phase = match restart.is_empty() {
+                            true => Phase::Halted,
+                            false => Phase::Restarted {
+                                lost: restart,
+                                resume: Resume::NotUntilAsked,
+                            },
+                        };
+                        if !self.user.is_empty() || !self.mail.is_empty() {
+                            self.persist(AgentEvent::QueueCleared).await;
+                            self.user.clear();
+                            self.mail.clear();
+                        }
+                        done
+                    }
+                    Control::Retry(done) => {
+                        self.phase = match std::mem::replace(&mut self.phase, Phase::Idle) {
+                            // Nothing to retry while one is already going, and
+                            // saying otherwise would throw away the request in
+                            // flight.
+                            Phase::Requesting(in_flight) => Phase::Requesting(in_flight),
+                            // A restart still owes its explanation, so retrying
+                            // hurries the request rather than replacing what has
+                            // to be in it.
+                            Phase::Restarted { lost, .. } => Phase::Restarted {
+                                lost,
+                                resume: Resume::AtOnce,
+                            },
+                            Phase::Idle | Phase::MustSend | Phase::Failed(_) | Phase::Halted => {
+                                Phase::MustSend
+                            }
+                        };
+                        done
+                    }
+                };
+                // After the handling rather than before, so a caller that waited
+                // knows the thing happened — and for the commands that persist,
+                // that it is on disk. Not that the model has *seen* it: that
+                // waits for a boundary the caller does not control.
+                let _ = done.send(());
+            }
+            // Anything the model says outside a request of ours is somebody
+            // else's, or the tail of one already abandoned.
+            Event::Inference(event) => {
+                let Phase::Requesting(in_flight) = &mut self.phase else {
+                    return;
+                };
+                match event {
+                    // Quota is account-wide and published by rho-inference
+                    // itself, so there is nothing here to carry.
+                    InferenceEvent::RequestSent
+                    | InferenceEvent::StreamingStarted
+                    | InferenceEvent::Quota { .. } => {}
+                    InferenceEvent::ContextItem { index, event } => {
+                        in_flight.pending.apply(index, event)
+                    }
+                    InferenceEvent::TemporaryFailure { error, .. } => {
+                        in_flight
+                            .temporary_failures
+                            .push(Arc::from(error.to_string()));
+                        // The retry starts a fresh response; drop the partial
+                        // one.
+                        in_flight.pending = PendingInferenceResponse::default();
+                    }
+                    // Nothing to abort: the request is already over, and it is
+                    // the agent that stops here rather than the request.
+                    InferenceEvent::Failed { error } => {
+                        self.phase = Phase::Failed(Arc::from(error.to_string()));
+                        self.persist(AgentEvent::Ended).await;
+                    }
+                    InferenceEvent::Finished {
+                        usage,
+                        provider_response_id,
+                    } => match in_flight.pending.finish() {
+                        // Finished streaming, but what arrived does not
+                        // assemble into a response.
+                        Err(error) => {
+                            self.phase = Phase::Failed(Arc::from(error.to_string()));
+                            self.persist(AgentEvent::Ended).await;
+                        }
+                        Ok(items) => {
+                            self.finish_request(items, provider_response_id, usage, now)
+                                .await
+                        }
+                    },
                 }
             }
-            Event::Control(Control::Mail {
-                sender,
-                content,
-                at,
-                queued,
-            }) => {
-                let input = QueuedInput {
-                    source: InputSource::Mail { sender },
-                    kind: InputKind::Message {
-                        content: content.clone(),
-                    },
-                    delivery: Delivery::NextRequest,
-                    at,
-                };
-                self.persist(AgentEvent::Queued(input)).await;
-                // Answered once the record is durable, not once it is read: a
-                // sender wants to know the message cannot be lost, and waiting
-                // for the model to see it would be waiting on a boundary the
-                // sender does not control.
-                let _ = queued.send(());
-                self.mail
-                    .entry(sender)
-                    .or_insert_with(|| MailSource::new(sender))
-                    .push(content, at);
-            }
-            Event::Control(Control::Cancel) => self.cancel().await,
-            Event::Control(Control::Retry) => {
-                self.last_error = None;
-                self.standing = Standing::MustSend;
-            }
-            Event::Inference(event) => self.on_inference(event, now).await,
             // Both are pure prompts to re-ask the question; what a source
             // reports is read live, so there is nothing to record here.
             Event::SourceChanged | Event::Tick => {}
         }
-    }
-
-    // -- the one decision ---------------------------------------------------
-
-    fn boundary(&self, now: UnixMs) -> Boundary {
-        boundary(
-            &self.sources(),
-            self.turn.as_ref(),
-            self.in_flight.is_some(),
-            self.standing,
-            now,
-        )
-    }
-
-    /// Every source, in whatever state it is in — nothing is filtered out for
-    /// having nothing to say, because deciding that is the decision's job.
-    fn sources(&self) -> Vec<SourceKind> {
-        let mut sources = vec![self.user.source()];
-        sources.extend(self.mail.values().map(MailSource::source));
-        sources.extend(self.tools.values().map(RunningTool::source));
-        sources
     }
 
     // -- acting on it -------------------------------------------------------
@@ -505,83 +698,60 @@ impl Agent {
     /// provisional and never reached history, so there is nothing to undo.
     async fn abort_in_flight(&mut self) {
         self.session.abort();
-        self.in_flight = None;
-        self.compaction_owes_reply = false;
-        self.persist(AgentEvent::RequestEnded { context_used: None })
-            .await;
+        self.phase = Phase::Idle;
+        self.persist(AgentEvent::Ended).await;
     }
 
     async fn start_request(&mut self, now: UnixMs) {
         // Tools do not survive a restart and their calls are still unanswered,
-        // so the first request after one has to say so. Saying it here rather
-        // than at load means an agent that is only opened and read is never
-        // written to, and the note lands next to the request it explains.
-        let lost = std::mem::take(&mut self.lost_tools);
-        let mut blocks: Vec<ContextBlock> = lost
-            .iter()
-            .map(|call| lost_to_restart(call, result_sent(&self.history, &call.id), now))
-            .collect();
-        blocks.extend(self.drain(now));
-
-        // Automatic compaction is not an input — it is something the core does
-        // while assembling a request. (A user-requested compaction *is* an
-        // input, and arrives through the user queue.)
-        let over_limit = self
-            .session
-            .auto_compact_token_limit()
-            .zip(self.context_used)
-            .is_some_and(|(limit, used)| used >= limit);
-        // A trigger can already be on the table two ways: this drain carries a
-        // `/compact`, or an earlier request pushed one and never got its answer
-        // because it failed.
-        let compacting_already = blocks.contains(&ContextBlock::CompactionTrigger)
-            || latest_request_has_compaction_trigger(&self.history);
-        let compact = over_limit && !compacting_already;
-        if compact {
-            blocks.push(ContextBlock::CompactionTrigger);
+        // so the first request after one has to say so before anything else.
+        let lost = match &mut self.phase {
+            Phase::Restarted { lost, .. } => std::mem::take(lost),
+            Phase::Idle
+            | Phase::Requesting(_)
+            | Phase::MustSend
+            | Phase::Failed(_)
+            | Phase::Halted => Vec::new(),
+        };
+        let mut blocks: Vec<ContextBlock> = Vec::new();
+        if !lost.is_empty() {
+            // Empty on purpose, and cancelled rather than successful, because
+            // nothing was recorded about what any of them did and an empty
+            // success reads as a command that ran quietly.
+            blocks.push(ContextBlock::ToolResults {
+                results: lost
+                    .iter()
+                    .map(|call| ToolResult {
+                        call_id: call.id.clone(),
+                        tool_type: call.tool_type,
+                        body: ToolOutput {
+                            output: Arc::new(String::new()),
+                            status: ToolOutputStatus::Cancelled,
+                        },
+                        started_at: now,
+                        finished_at: now,
+                        metadata: None,
+                    })
+                    .collect(),
+            });
+            // What the results cannot say themselves. One note for the restart
+            // rather than one per call, because the restart happened once —
+            // and prose belongs in a message rather than dressed up as output
+            // some tool never produced.
+            blocks.push(ContextBlock::UserMessage {
+                sender: MessageSender::User,
+                content: vec![ContentPart::Text {
+                    text: RESTART_NOTE.to_owned(),
+                }],
+            });
         }
-        self.compaction_owes_reply = compaction_owes_reply(compact, &blocks);
-
-        if !blocks.is_empty() {
-            self.persist(AgentEvent::Appended {
-                blocks: Cow::Borrowed(&blocks),
-                drained: true,
-            })
-            .await;
-            self.history.extend(blocks.into_iter().map(Arc::new));
-        }
-        // Only once the note is durable: a crash in between must leave the call
-        // still looking lost, not silently answered.
-        for call in lost {
-            self.persist(AgentEvent::ToolReaped { call_id: call.id })
-                .await;
-        }
-        self.reap_tools().await;
-
-        // review: might smart to vendor a AgentEvent if it is better
-        self.persist(AgentEvent::RequestStarted).await;
-        self.session.request(InferenceRequest {
-            instructions: Arc::clone(&self.instructions),
-            input: self.history.clone(),
-            agent_id_labels: Default::default(),
-            tools: self.registry.specs(),
-        });
-        self.in_flight = Some(InFlight {
-            pending: PendingInferenceResponse::default(),
-            temporary_failures: 0,
-        });
-        self.standing = Standing::Normal;
-    }
-
-    /// Pull from *every* source, not just whichever one triggered the
-    /// boundary. Batching them into one request is the whole point of pulling.
-    ///
-    /// Order is protocol-constrained rather than chronological: a provider
-    /// wants each `ToolCall` answered adjacent to the call, so tool output
-    /// leads.
-    fn drain(&mut self, now: UnixMs) -> Vec<ContextBlock> {
-        let mut blocks = Vec::new();
-
+        // Pull from *every* source, not just whichever one triggered the
+        // boundary. Batching them into one request is the whole point of
+        // pulling.
+        //
+        // Order is protocol-constrained rather than chronological: a provider
+        // wants each `ToolCall` answered adjacent to the call, so tool output
+        // leads.
         let mut results: Vec<ToolResult> = Vec::new();
         let mut updates = Vec::new();
         for tool in self.tools.values_mut() {
@@ -595,97 +765,74 @@ impl Agent {
             blocks.push(ContextBlock::ToolResults { results });
         }
         blocks.extend(updates);
-
-        blocks.extend(self.mail.values_mut().filter_map(MailSource::take));
+        blocks.extend(self.mail.take());
         blocks.extend(self.user.take());
-        blocks
-    }
 
-    /// Forget tools that exited and whose output the model has seen, so a long
-    /// session does not accumulate them forever.
-    async fn reap_tools(&mut self) {
-        let done: Vec<ToolCallId> = self
-            .tools
-            .iter()
-            .filter(|(_, tool)| tool.reapable())
-            .map(|(id, _)| id.clone())
-            .collect();
-        for call_id in done {
-            self.persist(AgentEvent::ToolReaped {
-                call_id: call_id.clone(),
-            })
-            .await;
-            self.tools.remove(&call_id);
+        // Automatic compaction is not an input — it is something the core does
+        // while assembling a request. (A user-requested compaction *is* an
+        // input, and arrives through the user queue.)
+        let over_limit = self
+            .session
+            .auto_compact_token_limit()
+            .zip(self.context_used)
+            .is_some_and(|(limit, used)| used >= limit);
+        // A trigger can already be on the table two ways: this drain carries a
+        // `/compact`, or an earlier request pushed one and never got its answer
+        // because it failed — which is what reading back as far as the latest
+        // response finds.
+        let compacting_already = blocks.contains(&ContextBlock::CompactionTrigger)
+            || self
+                .history
+                .iter()
+                .rev()
+                .find_map(|block| match &**block {
+                    ContextBlock::CompactionTrigger => Some(true),
+                    ContextBlock::InferenceResponse { .. } => Some(false),
+                    ContextBlock::UserMessage { .. }
+                    | ContextBlock::ToolResults { .. }
+                    | ContextBlock::ToolUpdate(_) => None,
+                })
+                .unwrap_or(false);
+        let compact = over_limit && !compacting_already;
+        if compact {
+            blocks.push(ContextBlock::CompactionTrigger);
         }
-    }
+        // Once it compacts, is the agent still owed a reply? A compaction is a
+        // means, not an end: whatever else rode in the request is inside the
+        // summary now rather than answered, and one the core asked for displaced
+        // a request that had its own purpose. Only a bare `/compact` asks for
+        // nothing further, and that is where the agent stops.
+        let owes_reply = compact
+            || blocks
+                .iter()
+                .any(|block| *block != ContextBlock::CompactionTrigger);
 
-    async fn cancel(&mut self) {
-        // Ask every tool to wind down, then keep reading it: the core does not
-        // kill tools, so a tool still chooses its own last words. Those words
-        // reach history at the next boundary, but `stopped` makes sure they
-        // cannot themselves *cause* a boundary.
-        for tool in self.tools.values_mut() {
-            tool.cancel();
-        }
-        self.standing = Standing::Halted;
-        self.abort_in_flight().await;
-        if !self.user.is_empty() || self.mail.values().any(|mail| !mail.is_empty()) {
-            self.persist(AgentEvent::QueueCleared).await;
-            self.user.clear();
-            for mail in self.mail.values_mut() {
-                mail.clear();
-            }
-        }
+        // Forget tools that exited and whose output the model has seen, so a
+        // long session does not accumulate them forever. Nothing to record: a
+        // reaped tool is one the transcript has already finished talking about.
+        self.tools.retain(|_, tool| !tool.reapable());
+
+        // The drain, the append and the send are one event because they are one
+        // thing: a crash between them would leave a transcript nobody drained
+        // into and a queue nobody emptied.
+        self.persist(AgentEvent::Sent {
+            blocks: Cow::Borrowed(&blocks),
+        })
+        .await;
+        self.history.extend(blocks.into_iter().map(Arc::new));
+        self.session.request(InferenceRequest {
+            instructions: Arc::clone(&self.instructions),
+            input: self.history.clone(),
+            agent_id_labels: Default::default(),
+            tools: self.registry.specs(),
+        });
+        self.phase = Phase::Requesting(InFlight {
+            compaction_owes_reply: owes_reply,
+            ..InFlight::default()
+        });
     }
 
     // -- inference ----------------------------------------------------------
-
-    async fn on_inference(&mut self, event: InferenceEvent, now: UnixMs) {
-        let Some(in_flight) = self.in_flight.as_mut() else {
-            return;
-        };
-        match event {
-            // Quota is account-wide and published by rho-inference itself, so
-            // there is nothing here to carry.
-            InferenceEvent::RequestSent
-            | InferenceEvent::StreamingStarted
-            | InferenceEvent::Quota { .. } => {}
-            InferenceEvent::ContextItem { index, event } => in_flight.pending.apply(index, event),
-            InferenceEvent::TemporaryFailure { error, .. } => {
-                in_flight.temporary_failures += 1;
-                self.last_error = Some(Arc::from(error.to_string()));
-                // The retry starts a fresh response; drop the partial one.
-                in_flight.pending = PendingInferenceResponse::default();
-            }
-            InferenceEvent::Failed { error } => {
-                self.last_error = Some(Arc::from(error.to_string()));
-                self.fail_request().await;
-            }
-            InferenceEvent::Finished {
-                usage,
-                provider_response_id,
-            } => {
-                let items = in_flight.pending.finish();
-                match items {
-                    Err(error) => {
-                        self.last_error = Some(Arc::from(error.to_string()));
-                        self.fail_request().await;
-                    }
-                    Ok(items) => {
-                        self.finish_request(items, provider_response_id, usage, now)
-                            .await
-                    }
-                }
-            }
-        }
-    }
-
-    async fn fail_request(&mut self) {
-        self.in_flight = None;
-        self.compaction_owes_reply = false;
-        self.persist(AgentEvent::RequestEnded { context_used: None })
-            .await;
-    }
 
     async fn finish_request(
         &mut self,
@@ -729,17 +876,25 @@ impl Agent {
             items,
             provider_response_id,
         };
-        self.persist(AgentEvent::Appended {
+        self.persist(AgentEvent::Replied {
             blocks: Cow::Borrowed(std::slice::from_ref(&block)),
-            drained: false,
+            context_used,
         })
         .await;
         self.history.push(Arc::new(block));
 
-        self.in_flight = None;
-        self.last_error = None;
-        self.persist(AgentEvent::RequestEnded { context_used })
-            .await;
+        // The request is over, and everything it was carrying goes with it —
+        // except whether it still owes a reply, which is the one thing it was
+        // holding on somebody else's behalf.
+        let owed_a_reply = match std::mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::Requesting(in_flight) => in_flight.compaction_owes_reply,
+            // Only a request in flight can finish.
+            Phase::Idle
+            | Phase::Restarted { .. }
+            | Phase::MustSend
+            | Phase::Failed(_)
+            | Phase::Halted => false,
+        };
 
         // A turn that issues no calls asks for nothing and changes nothing: it
         // neither buys another look-in nor moves what the model is waiting on.
@@ -762,22 +917,17 @@ impl Agent {
         });
 
         for call in calls {
-            self.spawn_tool(call, now).await;
+            self.spawn_tool(call, now);
         }
 
-        if compacted && std::mem::take(&mut self.compaction_owes_reply) {
-            self.standing = Standing::MustSend;
+        if compacted && owed_a_reply {
+            self.phase = Phase::MustSend;
         }
     }
 
     // -- tools --------------------------------------------------------------
 
-    async fn spawn_tool(&mut self, call: ToolCall, now: UnixMs) {
-        self.persist(AgentEvent::ToolSpawned {
-            call: Cow::Borrowed(&call),
-        })
-        .await;
-
+    fn spawn_tool(&mut self, call: ToolCall, now: UnixMs) {
         let session = match self.registry.get(&call.name) {
             Some(tool) => tool.run(call.clone(), SourceWaker::new(Arc::clone(&self.wake))),
             // Born exited: the error reaches the model at the next boundary
@@ -797,86 +947,59 @@ impl Agent {
     // -- plumbing -----------------------------------------------------------
 
     async fn persist(&mut self, event: AgentEvent<'_>) {
-        self.store.append(self.id, self.next_event, &event).await;
-        self.next_event += 1;
+        self.next_event = self.store.append(self.next_event, &event).await;
     }
 
     fn publish(&self) {
         // Each preview names itself, so the list needs no parallel labelling
         // that could drift from the data.
-        let mut previews: Vec<Box<dyn PreviewData>> = Vec::new();
+        let mut previews = Vec::new();
         if !self.user.is_empty() {
             previews.push(self.user.preview());
         }
-        previews.extend(
-            self.mail
-                .values()
-                .filter(|mail| !mail.is_empty())
-                .map(MailSource::preview),
-        );
+        previews.extend(self.mail.previews());
         previews.extend(self.tools.values().map(RunningTool::preview));
 
         *self.snapshot.write().expect("poisoned snapshot") = AgentSnapshot {
             history: self.history.clone(),
             previews,
-            activity: if self.standing == Standing::Halted {
-                AgentActivity::Stopped
-            } else {
-                AgentActivity::Live
+            activity: match self.phase {
+                Phase::Halted
+                | Phase::Failed(_)
+                | Phase::Restarted {
+                    resume: Resume::NotUntilAsked,
+                    ..
+                } => AgentActivity::Stopped,
+                Phase::Idle | Phase::Restarted { .. } | Phase::Requesting(_) | Phase::MustSend => {
+                    AgentActivity::Live
+                }
             },
-            streaming: self
-                .in_flight
-                .as_ref()
-                .map(|in_flight| in_flight.pending.clone()),
+            streaming: match &self.phase {
+                Phase::Requesting(in_flight) => Some(in_flight.pending.clone()),
+                Phase::Idle
+                | Phase::Restarted { .. }
+                | Phase::MustSend
+                | Phase::Failed(_)
+                | Phase::Halted => None,
+            },
             context_used: self.context_used,
-            last_error: self.last_error.clone(),
+            // What stopped the agent, or — while it is still retrying inside one
+            // request — what it is retrying from.
+            last_error: match &self.phase {
+                Phase::Failed(error) => Some(Arc::clone(error)),
+                Phase::Requesting(in_flight) => in_flight.temporary_failures.last().cloned(),
+                Phase::Idle | Phase::Restarted { .. } | Phase::MustSend | Phase::Halted => None,
+            },
         };
-        self.notify.notify_waiters();
+        self.published.notify_waiters();
     }
-}
-
-/// Once a request compacts, is the agent still owed a reply?
-///
-/// A compaction is a means, not an end: whatever else rode in the request is
-/// inside the summary now rather than answered, and a compaction the core asked
-/// for displaced a request that had its own purpose. Only a bare `/compact`
-/// asks for nothing further, and that is where the agent stops.
-fn compaction_owes_reply(core_asked: bool, blocks: &[ContextBlock]) -> bool {
-    core_asked
-        || blocks
-            .iter()
-            .any(|block| *block != ContextBlock::CompactionTrigger)
-}
-
-fn latest_request_has_compaction_trigger(history: &[Arc<ContextBlock>]) -> bool {
-    history
-        .iter()
-        .rev()
-        .find_map(|block| match &**block {
-            ContextBlock::CompactionTrigger => Some(true),
-            ContextBlock::InferenceResponse { .. } => Some(false),
-            ContextBlock::UserMessage { .. }
-            | ContextBlock::ToolResults { .. }
-            | ContextBlock::ToolUpdate(_) => None,
-        })
-        .unwrap_or(false)
-}
-
-/// Whether a call already has its result, for a tool the core no longer has.
-fn result_sent(history: &[Arc<ContextBlock>], call_id: &ToolCallId) -> bool {
-    history.iter().any(|block| match &**block {
-        ContextBlock::ToolResults { results } => {
-            results.iter().any(|result| result.call_id == *call_id)
-        }
-        _ => false,
-    })
 }
 
 #[derive(Default)]
 struct Restored {
     history: Vec<Arc<ContextBlock>>,
     user: UserSource,
-    mail: BTreeMap<AgentId, MailSource>,
+    mail: MailSource,
     request_active: bool,
     context_used: Option<u64>,
     /// Tools that were running when the process stopped.
@@ -886,15 +1009,12 @@ struct Restored {
 impl Restored {
     fn clear_queues(&mut self) {
         self.user.clear();
-        for mail in self.mail.values_mut() {
-            mail.clear();
-        }
+        self.mail.clear();
     }
 }
 
 fn restore(events: Vec<AgentEvent<'static>>) -> Restored {
     let mut restored = Restored::default();
-    let mut live_tools: BTreeMap<ToolCallId, ToolCall> = BTreeMap::new();
     for event in events {
         match event {
             AgentEvent::Queued(input) => match input.source {
@@ -903,39 +1023,80 @@ fn restore(events: Vec<AgentEvent<'static>>) -> Restored {
                     let InputKind::Message { content } = input.kind else {
                         continue;
                     };
-                    restored
-                        .mail
-                        .entry(sender)
-                        .or_insert_with(|| MailSource::new(sender))
-                        .push(content, input.at);
+                    restored.mail.push(sender, content, input.at);
                 }
             },
-            AgentEvent::Appended { blocks, drained } => {
+            AgentEvent::QueueCleared => restored.clear_queues(),
+            AgentEvent::Sent { blocks } => {
                 restored
                     .history
                     .extend(blocks.into_owned().into_iter().map(Arc::new));
-                if drained {
-                    restored.clear_queues();
-                }
+                // A send drains everything, so nothing that was pending when it
+                // went out is pending after it.
+                restored.clear_queues();
+                restored.request_active = true;
             }
-            AgentEvent::QueueCleared => restored.clear_queues(),
-            AgentEvent::RequestStarted => restored.request_active = true,
-            AgentEvent::RequestEnded { context_used } => {
+            AgentEvent::Replied {
+                blocks,
+                context_used,
+            } => {
+                restored
+                    .history
+                    .extend(blocks.into_owned().into_iter().map(Arc::new));
                 restored.request_active = false;
                 if context_used.is_some() {
                     restored.context_used = context_used;
                 }
             }
-            AgentEvent::ToolSpawned { call } => {
-                let call = call.into_owned();
-                live_tools.insert(call.id.clone(), call);
-            }
-            AgentEvent::ToolReaped { call_id } => {
-                live_tools.remove(&call_id);
-            }
+            AgentEvent::Ended => restored.request_active = false,
         }
     }
-    restored.orphan_tools = live_tools.into_values().collect();
+
+    // Every call the model has made, minus the ones the transcript already
+    // answers. No tool survives a restart, so whatever is left is a call that
+    // will never be answered by the thing that owed it — and a provider will
+    // not accept a call that is never answered at all.
+    //
+    // Read off history rather than remembered, because history already says it.
+    // The core wrote down spawns and reaps for a while, which was two events
+    // recording something the blocks beside them spelled out.
+    let mut unanswered: BTreeMap<ToolCallId, ToolCall> = BTreeMap::new();
+    for block in &restored.history {
+        match &**block {
+            ContextBlock::InferenceResponse { items, .. } => {
+                for item in items {
+                    let InferenceResponseItem::ToolCall {
+                        id,
+                        name,
+                        tool_type,
+                        arguments,
+                        ..
+                    } = item
+                    else {
+                        continue;
+                    };
+                    unanswered.insert(
+                        id.clone(),
+                        ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            tool_type: *tool_type,
+                            arguments: arguments.clone(),
+                        },
+                    );
+                }
+            }
+            ContextBlock::ToolResults { results } => {
+                for result in results {
+                    unanswered.remove(&result.call_id);
+                }
+            }
+            ContextBlock::UserMessage { .. }
+            | ContextBlock::ToolUpdate(_)
+            | ContextBlock::CompactionTrigger => {}
+        }
+    }
+    restored.orphan_tools = unanswered.into_values().collect();
     restored
 }
 

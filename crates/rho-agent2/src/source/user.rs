@@ -2,7 +2,7 @@
 
 use rho_core::{ContextBlock, MessageSender};
 
-use crate::preview::{PendingItem, PreviewData, UserPreview, text_of};
+use crate::preview::{PendingItem, Preview, text_of};
 use crate::source::{Delivery, InputKind, QueuedInput, SourceKind};
 
 /// Discrete, never merged or summarised, and always drained in arrival order.
@@ -57,10 +57,10 @@ impl UserSource {
         self.items.clear();
     }
 
-    pub(crate) fn preview(&self) -> Box<dyn PreviewData> {
-        Box::new(UserPreview {
+    pub(crate) fn preview(&self) -> Preview {
+        Preview::User {
             items: self.items.iter().map(pending_item).collect(),
-        })
+        }
     }
 }
 

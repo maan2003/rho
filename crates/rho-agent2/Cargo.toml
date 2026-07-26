@@ -11,10 +11,11 @@ anyhow.workspace = true
 async-stream.workspace = true
 bytes.workspace = true
 futures.workspace = true
-inventory = "0.3"
+prefix-id = { workspace = true, features = ["redb"] }
 rand.workspace = true
 redb.workspace = true
-rho-core.workspace = true
+redb-derive.workspace = true
+rho-core = { workspace = true, features = ["redb"] }
 rho-db.workspace = true
 rho-inference.workspace = true
 senax-encoder.workspace = true

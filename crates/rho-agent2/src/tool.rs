@@ -22,13 +22,11 @@
 
 use std::sync::Arc;
 
-use rho_core::{
-    ContextBlock, ToolCall, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolUpdate, UnixMs,
-};
+use rho_core::{ToolCall, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolUpdate, UnixMs};
 use senax_encoder::{Decode, Encode};
 use tokio::sync::Notify;
 
-use crate::preview::{PreviewData, ToolPreview};
+use crate::preview::Preview;
 use crate::source::SourceKind;
 
 /// Whether a tool is still working.
@@ -120,22 +118,6 @@ pub trait ToolSession: Send {
     /// until it reports [`ToolActivity::Exited`] and its output has been
     /// collected.
     fn cancel(&mut self);
-
-    /// What a UI should show while this tool runs. Tools with something richer
-    /// to display define their own [`PreviewData`] type.
-    ///
-    /// The call is passed in so the preview can name itself; previews travel as
-    /// a flat list, and one that cannot say which call it belongs to is of no
-    /// use to a UI.
-    fn preview(&self, call: &ToolCall) -> Box<dyn PreviewData> {
-        let status = self.status();
-        Box::new(ToolPreview {
-            call_id: call.id.clone(),
-            activity: status.activity,
-            unsent: status.unsent,
-            last_output_at: status.last_output_at,
-        })
-    }
 }
 
 pub trait Tool: Send + Sync + 'static {
@@ -237,8 +219,14 @@ impl RunningTool {
         }
     }
 
-    pub fn preview(&self) -> Box<dyn PreviewData> {
-        self.session.preview(&self.call)
+    pub fn preview(&self) -> Preview {
+        let status = self.status();
+        Preview::Tool {
+            call_id: self.call.id.clone(),
+            activity: status.activity,
+            unsent: status.unsent,
+            last_output_at: status.last_output_at,
+        }
     }
 
     pub fn cancel(&mut self) {
@@ -305,35 +293,6 @@ impl RunningTool {
 pub(crate) enum ToolTake {
     Result(ToolResult),
     Update(ToolUpdate),
-}
-
-/// Note appended for a tool that was still running when the process stopped.
-pub(crate) fn lost_to_restart(call: &ToolCall, result_sent: bool, now: UnixMs) -> ContextBlock {
-    let text = "This tool was still running when the agent restarted. Its output is lost; \
-                re-run it if you still need the result."
-        .to_owned();
-    if result_sent {
-        ContextBlock::ToolUpdate(ToolUpdate {
-            call_id: call.id.clone(),
-            tool_type: call.tool_type,
-            output: Arc::new(text),
-            at: now,
-        })
-    } else {
-        ContextBlock::ToolResults {
-            results: vec![ToolResult {
-                call_id: call.id.clone(),
-                tool_type: call.tool_type,
-                body: ToolOutput {
-                    output: Arc::new(text),
-                    status: ToolOutputStatus::Cancelled,
-                },
-                started_at: now,
-                finished_at: now,
-                metadata: None,
-            }],
-        }
-    }
 }
 
 /// Keep the head and tail of oversized output, noting what was dropped.

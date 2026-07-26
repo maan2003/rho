@@ -21,6 +21,7 @@ use rho_core::{ToolCallId, UnixMs};
 
 use crate::source::SourceKind;
 use crate::tool::{Told, ToolActivity, Unsent};
+use crate::{Phase, Resume};
 
 /// How long a person's message waits for the machines around it to settle. Long
 /// enough that a tool about to finish rides along with it, short enough not to
@@ -96,25 +97,11 @@ pub(crate) enum ModelAsked {
     /// An interval the model named for itself. Honoured with nothing running,
     /// because a model with nothing to do asking to be woken later is the whole
     /// point of it.
-    #[allow(dead_code, reason = "the tool that names an interval is not built yet")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the tool that names an interval is not built yet")
+    )]
     Wait(Duration),
-}
-
-/// A standing instruction that overrides the ordinary rhythm rules. The two
-/// overrides are opposites, so they cannot both be in force.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Standing {
-    /// Follow the rhythms.
-    #[default]
-    Normal,
-    /// Send at the next opportunity even with nothing pending: a retry, a
-    /// restart resume, or carrying on after a compaction.
-    MustSend,
-    /// Cancelled. Tool output still reaches history at the next boundary, but
-    /// nothing may *start* a request until fresh user input arrives —
-    /// otherwise a cancelled tool's dying words would wake the agent straight
-    /// back up.
-    Halted,
 }
 
 /// Whether the next request starts now.
@@ -177,32 +164,52 @@ pub(crate) enum Boundary {
 pub(crate) fn boundary(
     sources: &[SourceKind],
     turn: Option<&ModelTurn>,
-    inference_active: bool,
-    standing: Standing,
+    phase: &Phase,
     now: UnixMs,
 ) -> Boundary {
     // Cases where only a fresh event can change the answer, so there is nothing
     // to wake up for.
     const NEVER: Boundary = Boundary::No { recheck: None };
 
-    if standing == Standing::Halted {
-        return NEVER;
-    }
-    if inference_active {
-        let interrupt = sources.iter().any(|source| match source {
-            SourceKind::User { interrupt, .. } => *interrupt,
-            // However loud a peer or a tool is, the model finishes what it is
-            // saying.
-            SourceKind::Mail { .. } | SourceKind::Tool { .. } => false,
-        });
-        if interrupt {
-            return Boundary::AbortAndResend;
-        } else {
-            return NEVER;
+    // Only an idle agent hands the question to its sources; every other phase
+    // answers on its own. Exhaustive rather than a run of early returns, because
+    // with those the precedence lived in the order they were written.
+    match phase {
+        // Stopped, all three, and for the same reason: whatever is still running
+        // will be heard at the next boundary, but nothing running is allowed to
+        // *start* a request, because a stop somebody asked for and a failure
+        // nobody has looked at are both waiting on a person.
+        Phase::Halted
+        | Phase::Failed(_)
+        | Phase::Restarted {
+            resume: Resume::NotUntilAsked,
+            ..
+        } => return NEVER,
+        Phase::Requesting(_) => {
+            let interrupt = sources.iter().any(|source| match source {
+                SourceKind::User { interrupt, .. } => *interrupt,
+                // However loud a peer or a tool is, the model finishes what it
+                // is saying.
+                SourceKind::Mail { .. } | SourceKind::Tool { .. } => false,
+            });
+            return match interrupt {
+                true => Boundary::AbortAndResend,
+                false => NEVER,
+            };
         }
-    }
-    if standing == Standing::MustSend {
-        return Boundary::Now;
+        // A restart that has something to explain is not a reason to send by
+        // itself. Only the request it interrupted is, because that one was
+        // already judged worth making.
+        Phase::MustSend
+        | Phase::Restarted {
+            resume: Resume::AtOnce,
+            ..
+        } => return Boundary::Now,
+        Phase::Idle
+        | Phase::Restarted {
+            resume: Resume::WhenDue,
+            ..
+        } => {}
     }
     /// Whether anything more is coming.
     ///
