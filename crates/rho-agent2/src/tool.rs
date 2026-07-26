@@ -230,7 +230,7 @@ impl RunningTool {
     pub fn source(&self) -> SourceKind {
         let status = self.status();
         SourceKind::Tool {
-            called_at: self.started_at,
+            id: self.call.id.clone(),
             told: self.told,
             activity: status.activity,
             unsent: status.unsent,

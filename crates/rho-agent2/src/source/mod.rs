@@ -8,7 +8,7 @@
 mod mail;
 mod user;
 
-use rho_core::{ContentPart, UnixMs};
+use rho_core::{ContentPart, ToolCallId, UnixMs};
 use senax_encoder::{Decode, Encode};
 
 pub use crate::source::mail::MailSource;
@@ -62,7 +62,7 @@ pub struct QueuedInput {
 /// left to `boundary`: an empty queue and a tool that has produced nothing are
 /// both reported, because being empty is a fact too, and for a tool it is one
 /// that changes the answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SourceKind {
     /// Typed input is whole on arrival, so it never has more to say.
     /// `interrupt` is the one rule no other source has: a message worth
@@ -82,7 +82,10 @@ pub(crate) enum SourceKind {
     /// would put a decision outside the one place decisions live — which is how
     /// a request caused by a person came to demote somebody else's tool.
     Tool {
-        called_at: UnixMs,
+        /// What the model called it, which is the only handle either side has
+        /// on a particular call: the model names it when it asks, and names it
+        /// again when it stops waiting by asking for something else.
+        id: ToolCallId,
         told: Told,
         activity: ToolActivity,
         unsent: Unsent,

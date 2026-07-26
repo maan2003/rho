@@ -11,24 +11,17 @@
 //!
 //! > *Should the next request start now?*
 //!
-//! [`Agent::boundary`] answers it, and it is the only place in this crate that
+//! The `boundary` module answers it, and is the only place in this crate that
 //! exercises judgment. Everything else — spawning, persisting, draining,
-//! publishing — is mechanism. The division of labour with tools follows from
-//! it: **nothing outside the core decides *when*, and the core never decides
-//! *what***. A tool reports what it has and how it is doing; the core weighs
-//! that against everything else and picks the moment. The only thing the core
-//! ever says back to a tool is [`ToolSession::cancel`] — wind down — and even
-//! then it collects the tool's parting output, so the tool has the last word.
-//!
-//! There is deliberately no stored status enum, and no foreground/background
-//! tool distinction to declare — at the moment of the call `npm test` and
-//! `npm run dev` are the same call, and nothing could tell them apart. So the
-//! core does not try. A running tool has no urgency of its own; the pace at
-//! which its output reaches the model is the model's own, stated by what its
-//! last turn did and revised every turn. What a tool *can* say is that it
-//! ended, or that what it holds stands alone, and those are worth waking
-//! somebody for whatever else is going on.
+//! publishing — is mechanism, and lives here. The division of labour with
+//! tools follows from the same split: **nothing outside the core decides
+//! *when*, and the core never decides *what***. A tool reports what it has and
+//! how it is doing; the core weighs that against everything else and picks the
+//! moment. The only thing the core ever says back to a tool is
+//! [`ToolSession::cancel`] — wind down — and even then it collects the tool's
+//! parting output, so the tool has the last word.
 
+mod boundary;
 mod preview;
 mod source;
 mod store;
@@ -48,6 +41,7 @@ use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use tokio::sync::{Notify, mpsc, oneshot};
 
+use crate::boundary::{Boundary, ModelAsked, ModelTurn, Standing, boundary};
 pub use crate::preview::{
     MailPreview, PendingItem, PreviewData, ToolPreview, UnknownPreviewData, UserPreview,
 };
@@ -55,7 +49,7 @@ pub use crate::source::{Delivery, InputKind, InputSource, QueuedInput};
 use crate::source::{MailSource, SourceKind, UserSource};
 use crate::store::{AgentEvent, AgentRecord};
 pub use crate::store::{AgentKey, Store};
-use crate::tool::{FinishedSession, RunningTool, Told, ToolTake, lost_to_restart};
+use crate::tool::{FinishedSession, RunningTool, ToolTake, lost_to_restart};
 pub use crate::tool::{
     SourceWaker, Tool, ToolActivity, ToolSession, ToolStatus, Unsent, elide_middle,
 };
@@ -289,37 +283,6 @@ struct InFlight {
     temporary_failures: u64,
 }
 
-/// A standing instruction that overrides the ordinary rhythm rules. The two
-/// overrides are opposites, so they cannot both be in force.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Standing {
-    /// Follow the rhythms.
-    #[default]
-    Normal,
-    /// Send at the next opportunity even with nothing pending: a retry, a
-    /// restart resume, or carrying on after a compaction.
-    MustSend,
-    /// Cancelled. Tool output still reaches history at the next boundary, but
-    /// nothing may *start* a request until fresh user input arrives —
-    /// otherwise a cancelled tool's dying words would wake the agent straight
-    /// back up.
-    Halted,
-}
-
-/// Whether the next request starts now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Boundary {
-    /// Not yet. `recheck` is the earliest instant at which the answer could
-    /// change by itself; `None` means only a new event can change it. Carrying
-    /// it here means the loop cannot arm a timer that disagrees with the
-    /// decision, because the decision handed it the timer.
-    No { recheck: Option<UnixMs> },
-    /// Drain every source and send.
-    Now,
-    /// Throw away the in-flight request first.
-    AbortNow,
-}
-
 struct Agent {
     store: Store,
     id: AgentKey,
@@ -345,7 +308,7 @@ struct Agent {
     /// What the model's latest turn settled about being looked in on. `None`
     /// until it has spoken once — after a restart included, which is safe
     /// because no tool survives one.
-    turn: Option<Turn>,
+    turn: Option<ModelTurn>,
     standing: Standing,
     /// The request in flight was compacting on behalf of work that still owes
     /// a reply, so a compaction must not be where the agent stops.
@@ -413,17 +376,27 @@ impl Agent {
         }
     }
 
-    /// Publish the starting state, then answer the one question after every
-    /// event until the last handle is dropped.
+    /// Answer the one question after every event, act on the answer, and wait
+    /// for the next one, until the last handle is dropped.
     async fn run(mut self) {
-        self.publish();
         loop {
-            // The decision itself says when it might change, so the timer and
-            // the rule behind it cannot drift apart.
-            let deadline = match self.boundary(UnixMs::now()) {
+            // One question per event. Either it says to wait and hands over the
+            // timer — so the timer and the rule behind it cannot drift apart —
+            // or it says to send, and a request in flight is never waited for.
+            let now = UnixMs::now();
+            let deadline = match self.boundary(now) {
                 Boundary::No { recheck } => recheck,
-                Boundary::Now | Boundary::AbortNow => None,
+                Boundary::AbortAndResend => {
+                    self.abort_in_flight().await;
+                    self.start_request(now).await;
+                    None
+                }
+                Boundary::Now => {
+                    self.start_request(now).await;
+                    None
+                }
             };
+            self.publish();
             // Disabled `select!` arms still evaluate their expression, so give
             // the timer a zero duration when nothing is armed; the guard keeps
             // it unpolled.
@@ -451,12 +424,11 @@ impl Agent {
             };
             let Some(event) = event else { return };
             self.handle(event).await;
-            self.publish();
         }
     }
 
-    /// The single funnel. Every event updates state, then asks the one
-    /// question.
+    /// The single funnel. Every event lands here and does nothing but update
+    /// state; what to do about it is asked once, by the caller.
     async fn handle(&mut self, event: Event) {
         let now = UnixMs::now();
         match event {
@@ -504,7 +476,6 @@ impl Agent {
             // reports is read live, so there is nothing to record here.
             Event::SourceChanged | Event::Tick => {}
         }
-        self.maybe_request().await;
     }
 
     // -- the one decision ---------------------------------------------------
@@ -512,7 +483,7 @@ impl Agent {
     fn boundary(&self, now: UnixMs) -> Boundary {
         boundary(
             &self.sources(),
-            self.turn,
+            self.turn.as_ref(),
             self.in_flight.is_some(),
             self.standing,
             now,
@@ -530,18 +501,14 @@ impl Agent {
 
     // -- acting on it -------------------------------------------------------
 
-    async fn maybe_request(&mut self) {
-        let now = UnixMs::now();
-        if self.boundary(now) == Boundary::AbortNow {
-            self.session.abort();
-            self.in_flight = None;
-            self.compaction_owes_reply = false;
-            self.persist(AgentEvent::RequestEnded { context_used: None })
-                .await;
-        }
-        if self.boundary(now) == Boundary::Now {
-            self.start_request(now).await;
-        }
+    /// Throw away the in-flight request. Whatever the model had said so far was
+    /// provisional and never reached history, so there is nothing to undo.
+    async fn abort_in_flight(&mut self) {
+        self.session.abort();
+        self.in_flight = None;
+        self.compaction_owes_reply = false;
+        self.persist(AgentEvent::RequestEnded { context_used: None })
+            .await;
     }
 
     async fn start_request(&mut self, now: UnixMs) {
@@ -661,11 +628,7 @@ impl Agent {
             tool.cancel();
         }
         self.standing = Standing::Halted;
-        self.session.abort();
-        self.in_flight = None;
-        self.compaction_owes_reply = false;
-        self.persist(AgentEvent::RequestEnded { context_used: None })
-            .await;
+        self.abort_in_flight().await;
         if !self.user.is_empty() || self.mail.values().any(|mail| !mail.is_empty()) {
             self.persist(AgentEvent::QueueCleared).await;
             self.user.clear();
@@ -778,16 +741,24 @@ impl Agent {
         self.persist(AgentEvent::RequestEnded { context_used })
             .await;
 
-        // A turn that issues no calls still resets the check-in — the model has
-        // just seen everything and is entitled to another interval before being
-        // shown more — but it does not change what the model is waiting on.
-        self.turn = Some(Turn {
+        // A turn that issues no calls asks for nothing and changes nothing: it
+        // neither buys another look-in nor moves what the model is waiting on.
+        // `ModelAsked::Wait` arrives with the tool that names an interval.
+        let waiting_on = match calls.is_empty() {
+            false => calls.iter().map(|call| call.id.clone()).collect(),
+            true => self
+                .turn
+                .take()
+                .map(|turn| turn.waiting_on)
+                .unwrap_or_default(),
+        };
+        self.turn = Some(ModelTurn {
             spoke_at: now,
-            wait: None,
-            calls_at: match calls.is_empty() {
-                false => now,
-                true => self.turn.map_or(now, |turn| turn.calls_at),
+            asked: match calls.is_empty() {
+                false => ModelAsked::Calls,
+                true => ModelAsked::Nothing,
             },
+            waiting_on,
         });
 
         for call in calls {
@@ -861,275 +832,6 @@ impl Agent {
             last_error: self.last_error.clone(),
         };
         self.notify.notify_waiters();
-    }
-}
-
-/// How long a person's message waits for the machines around it to settle. Long
-/// enough that a tool about to finish rides along with it, short enough not to
-/// be felt.
-const USER_PATIENCE: Duration = Duration::from_millis(500);
-/// A peer usually sends several lines in a row; expect a beat more so they
-/// collapse into one request instead of waking one apiece.
-const MAIL_BURST: Duration = Duration::from_secs(1);
-/// ...and how long a peer's mail waits for anything else, which also flushes a
-/// peer that never stops.
-const MAIL_PATIENCE: Duration = Duration::from_secs(2);
-/// How long something a tool has finished with waits for a call that is still
-/// working, so that a round of parallel calls arrives as one request rather
-/// than one apiece.
-const TOOL_PATIENCE: Duration = Duration::from_secs(10);
-/// How long output a tool is still in the middle of sits unsent, once nobody is
-/// waiting for it. Not a patience: it never shortens anybody else's wait, and
-/// nothing about it is urgent. A build log is worth more whole than in pieces,
-/// and a log nobody asked for is worth very little — but neither is worth
-/// leaving unsent forever.
-const PROGRESS_PATIENCE: Duration = Duration::from_secs(60);
-/// How long the model waits to be shown what its calls have, when it did not
-/// say.
-///
-/// Every other number here is a patience — how long something already worth
-/// sending waits for company. This one is the opposite and the only one of its
-/// kind: it is the model asking to be woken, and it is honoured whether or not
-/// anything arrived, because an empty request is how the model learns to ask
-/// for a longer interval next time.
-const CHECKIN: Duration = Duration::from_secs(10);
-
-/// What the model's latest turn settled: when it wants to be looked in on, and
-/// which calls it is waiting on.
-///
-/// Two instants rather than one, because a turn can move one without the other.
-/// Replying in prose while a build runs buys everyone another interval without
-/// changing what the model is blocked on — and if a single instant did both, a
-/// person typing during a five minute test run would end up demoting it, which
-/// is the shape of bug this whole design keeps walking into.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Turn {
-    /// The end of the model's latest turn, whatever it contained.
-    pub spoke_at: UnixMs,
-    /// How long it asked to be left alone for. `None` is the ordinary case:
-    /// it made some calls and said nothing about when to look at them.
-    pub wait: Option<Duration>,
-    /// The end of the latest turn that issued calls. Calls made at or after
-    /// this are the ones it is waiting on; anything older it has moved past.
-    pub calls_at: UnixMs,
-}
-
-/// Whether anything more is coming.
-///
-/// The one thing that can make a source impatient sooner than its own patience:
-/// if nothing is due, waiting cannot improve the request, so whoever is holding
-/// something goes now rather than sitting out a wait for company that is not
-/// coming. Without it every finished tool call would cost [`TOOL_PATIENCE`] and
-/// every typed message [`USER_PATIENCE`], however quiet the rest of the agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Due {
-    Nothing,
-    /// A peer may be mid-burst until this instant. The only guess in here, and
-    /// the only expectation that has to be waited out on a clock, because a
-    /// quiet peer and a finished peer look exactly alike.
-    Until(UnixMs),
-    /// A call the model is waiting on. It wakes the core when it ends, so there
-    /// is nothing to guess and no timer to arm.
-    UntilItEnds,
-}
-
-/// Should the next request start now?
-///
-/// The one decision in this crate, and a plain function of what every source
-/// reports — so it can be exercised against a fabricated clock and fabricated
-/// sources, with no provider, no database, and no tasks. Every rule and every
-/// duration lives here rather than on the sources, because a number chosen by
-/// one source in isolation is a number chosen without seeing what else is
-/// waiting.
-///
-/// Every source is here, including the ones with nothing to say, because
-/// "this one is not worth sending" is a decision too and this is where
-/// decisions live.
-///
-/// Everything holding something says how long it will wait for company, and
-/// [`Due`] says whether company is coming. Four rules, and nothing else in this
-/// crate decides anything:
-///
-/// 1. An `Interrupt` message is worth throwing away an in-flight request.
-/// 2. The model is looked in on when it asked to be, whether or not anything
-///    arrived.
-/// 3. Otherwise go once nothing more is due — waiting cannot improve the
-///    request.
-/// 4. Otherwise go when the least patient holder runs out of patience, and
-///    everyone yields into that same request.
-///
-/// Note what tools do *not* get: a running tool has no patience of its own
-/// worth speaking of, because there is no way to tell `npm test` from
-/// `npm run dev` by looking at either one. The pace at which a tool's output
-/// reaches the model is set by the model, in rule 2, and revised every turn.
-/// Only the two things a tool can say that are true regardless — it ended, or
-/// what it holds stands on its own — buy it any urgency.
-///
-/// Every wait is measured from a moment that has already happened, never from
-/// the last thing a source did, so no source can extend a wait by continuing to
-/// talk — which is what stops one chatty tool from pinning everybody else.
-fn boundary(
-    sources: &[SourceKind],
-    turn: Option<Turn>,
-    inference_active: bool,
-    standing: Standing,
-    now: UnixMs,
-) -> Boundary {
-    // Cases where only a fresh event can change the answer, so there is nothing
-    // to wake up for.
-    let never = Boundary::No { recheck: None };
-    if standing == Standing::Halted {
-        return never;
-    }
-    if inference_active {
-        let interrupt = sources.iter().any(|source| match source {
-            SourceKind::User { interrupt, .. } => *interrupt,
-            // However loud a peer or a tool is, the model finishes what it is
-            // saying.
-            SourceKind::Mail { .. } | SourceKind::Tool { .. } => false,
-        });
-        return if interrupt { Boundary::AbortNow } else { never };
-    }
-    if standing == Standing::MustSend {
-        return Boundary::Now;
-    }
-    let mut due = Due::Nothing;
-    // Something worth sending on its own, and when it stops waiting for company
-    // — a person, a peer, a call that ended or flagged what it holds.
-    let mut urgent: Option<UnixMs> = None;
-    // When to collect whatever exists, whether or not any of it stands alone.
-    // These are the opposite of a patience: nothing here is impatient, it is
-    // just not worth leaving unsent forever.
-    let mut sweep: Option<UnixMs> = None;
-    // Rule 2, and it applies only while something the model is actually waiting
-    // on is still running. An agent that has finished everything asked of it
-    // must not wake itself up forever to say so — and a dev server it started
-    // an hour ago is not a reason to keep waking it either, or an agent could
-    // never be idle again until every long-lived tool it ever ran had died.
-    if let Some(turn) = turn.filter(|turn| {
-        sources.iter().any(|source| {
-            matches!(
-                source,
-                SourceKind::Tool { called_at, told, activity: ToolActivity::Running, .. }
-                    if *told != Told::Exit && *called_at >= turn.calls_at
-            )
-        })
-    }) {
-        sweep = Some(turn.spoke_at + turn.wait.unwrap_or(CHECKIN));
-    }
-    for source in sources {
-        let (stands_alone, collect_by, source_due) = match *source {
-            // Typed input is whole on arrival, so nothing more is ever due from
-            // it. An empty queue has no patience, which is what makes it nothing
-            // to send rather than a special case.
-            SourceKind::User { oldest_at, .. } => {
-                (oldest_at.map(|at| at + USER_PATIENCE), None, Due::Nothing)
-            }
-            SourceKind::Mail {
-                oldest_at,
-                newest_at,
-            } => (
-                oldest_at.map(|at| at + MAIL_PATIENCE),
-                None,
-                match newest_at.map(|at| at + MAIL_BURST) {
-                    Some(until) if until > now => Due::Until(until),
-                    _ => Due::Nothing,
-                },
-            ),
-            SourceKind::Tool {
-                called_at,
-                told,
-                activity,
-                unsent,
-            } => {
-                // When what it is holding stops waiting for anybody else. An
-                // ending and a flag are the same kind of news and wait the
-                // same; anything else is mid-thought and waits far longer.
-                // Every one of these dates from the moment it happened, so a
-                // tool that ends after an hour of output gets its siblings'
-                // full attention rather than looking an hour overdue.
-                let (stands_alone, collect_by) = match (activity, unsent) {
-                    (ToolActivity::Exited { at }, Unsent::Settled { since }) => {
-                        (Some(at.min(since) + TOOL_PATIENCE), None)
-                    }
-                    (ToolActivity::Exited { at }, _) => (Some(at + TOOL_PATIENCE), None),
-                    (ToolActivity::Running, Unsent::Settled { since }) => {
-                        (Some(since + TOOL_PATIENCE), None)
-                    }
-                    // Mid-thought, so nobody asked for it and it is nobody's
-                    // reason to make a request — it is only not worth leaving
-                    // unsent forever. While the model is being looked in on it
-                    // never gets this far, because the check-in is sooner; this
-                    // is what half a build log is worth to an agent that has
-                    // moved on, or asked for a long quiet.
-                    (ToolActivity::Running, Unsent::Waiting { since }) => {
-                        (None, Some(since + PROGRESS_PATIENCE))
-                    }
-                    (ToolActivity::Running, Unsent::Nothing) => (None, None),
-                };
-                match told {
-                    // Everything there was to say has been said.
-                    Told::Exit => (None, None, Due::Nothing),
-                    _ => (
-                        stands_alone,
-                        collect_by,
-                        match (activity, unsent) {
-                            // It says what it holds stands on its own, which is
-                            // it saying not to wait for the rest of the call.
-                            (ToolActivity::Running, Unsent::Settled { .. }) => Due::Nothing,
-                            // A call the model went on to ask for something
-                            // else after is one it has stopped waiting on. If
-                            // it still counted, a dev server that never
-                            // finishes would be a wait nobody could ever end.
-                            (ToolActivity::Running, _)
-                                if turn.is_some_and(|turn| called_at >= turn.calls_at) =>
-                            {
-                                Due::UntilItEnds
-                            }
-                            _ => Due::Nothing,
-                        },
-                    ),
-                }
-            }
-        };
-        if let Some(ends) = stands_alone {
-            urgent = Some(urgent.unwrap_or(ends).min(ends));
-        }
-        if let Some(by) = collect_by {
-            sweep = Some(sweep.unwrap_or(by).min(by));
-        }
-        due = match (due, source_due) {
-            (Due::UntilItEnds, _) | (_, Due::UntilItEnds) => Due::UntilItEnds,
-            (Due::Until(one), Due::Until(other)) => Due::Until(one.max(other)),
-            (Due::Nothing, other) | (other, Due::Nothing) => other,
-        };
-    }
-
-    // Rule 3. Only what stands on its own is cut short this way: a patience is
-    // a wait for company, and there is no company coming. A sweep is not a
-    // patience — half a build log is no more worth sending because the room is
-    // empty — so it is left to run.
-    if urgent.is_some() && due == Due::Nothing {
-        return Boundary::Now;
-    }
-    // Nothing worth a request, whoever is still busy.
-    let deadline = match (urgent, sweep) {
-        (Some(urgent), Some(sweep)) => urgent.min(sweep),
-        (Some(only), None) | (None, Some(only)) => only,
-        (None, None) => return never,
-    };
-    match due {
-        // Rule 4.
-        _ if now >= deadline => Boundary::Now,
-        // A peer going quiet is not an event, so the one expectation that
-        // lapses on a clock has to be waited out. Everything else announces
-        // itself, so the deadline is the only thing to wake up for.
-        Due::Until(until) => Boundary::No {
-            recheck: Some(deadline.min(until)),
-        },
-        Due::Nothing | Due::UntilItEnds => Boundary::No {
-            recheck: Some(deadline),
-        },
     }
 }
 
