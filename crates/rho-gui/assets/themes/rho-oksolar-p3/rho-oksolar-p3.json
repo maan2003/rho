@@ -158,7 +158,7 @@
             "font_style": "italic"
           },
           "emphasis.strong": {
-            "font_weight": 700
+            "font_weight": 600
           }
         },
         "terminal.background": "oklch(23.0% 0.018 150)",
