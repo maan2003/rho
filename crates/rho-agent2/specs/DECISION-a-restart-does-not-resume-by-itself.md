@@ -4,7 +4,7 @@ Authority: confirmed, 2026-07-26, maan2003
 
 ## Decision
 
-Loading an agent never sets `Resume::AtOnce`. A process that died mid-request
+Loading an agent never sets `Standing::Asked`. A process that died mid-request
 comes back up owing whatever the request left hanging, but does not make that
 request again on its own; it waits for the sources like any other idle agent,
 and a person asks for the retry.

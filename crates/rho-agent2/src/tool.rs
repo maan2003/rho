@@ -14,60 +14,41 @@
 
 use std::sync::Arc;
 
-use rho_core::{ToolCall, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolUpdate, UnixMs};
-use senax_encoder::{Decode, Encode};
+use rho_core::{ToolCall, ToolOutput, ToolSpec, UnixMs};
 use tokio::sync::Notify;
 
-use crate::preview::Preview;
-use crate::source::SourceKind;
-
-/// Whether a tool is still working.
+/// What a tool has to say about itself, and since when.
 ///
-/// Ending is the one thing a tool cannot take back, which is why the core is
-/// willing to act on it: everything else it reports is a guess about what
-/// happens next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum ToolActivity {
+/// One enum rather than one for working-or-not and another for what is unsent,
+/// because no question the core asks is answered by half of it — and because
+/// two would spell pairs that cannot happen: output is not still mid-thought
+/// once whatever was writing it has stopped.
+///
+/// Facts only. Which of these is worth a request, and how long any of them
+/// waits, is `boundary`'s to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolReport {
+    /// Working, and the model has seen everything said so far.
     Running,
-    /// Finished; nothing more will arrive. `at` is when it ended, which is the
-    /// moment whatever it was holding became worth sending on its own — not
-    /// when that output first started arriving.
-    Exited {
-        at: UnixMs,
-    },
-}
-
-/// Whether a tool is holding output the model has not seen, and whether that
-/// output can stand on its own yet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum Unsent {
-    Nothing,
-    /// Holding output mid-thought. Worth sending eventually — half a build log
-    /// beats none — but worth less than the whole, so it is the most patient
-    /// thing the core knows about.
-    Waiting {
-        since: UnixMs,
-    },
-    /// Holding output that stands on its own: this much matters now, whatever
-    /// else the tool goes on to say. The one thing a running tool can say about
-    /// its own urgency, and it buys exactly one thing: it stops waiting for the
-    /// rest of the call. It still cannot interrupt a request in flight.
+    /// Working, and holding output mid-thought. Worth sending eventually — half
+    /// a build log beats none — but worth less than the whole, so it is the
+    /// most patient thing the core knows about.
+    Waiting { since: UnixMs },
+    /// Working, and holding output that stands on its own: this much matters
+    /// now, whatever else the tool goes on to say. The one thing a running tool
+    /// can say about its own urgency, and it buys exactly one thing: it stops
+    /// waiting for the rest of the call. It still cannot interrupt a request in
+    /// flight.
     ///
     /// `since` is when it became worth sending, not when it started arriving.
-    Settled {
-        since: UnixMs,
-    },
-}
-
-/// What a tool reports about itself, for the core to schedule against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ToolStatus {
-    pub unsent: Unsent,
-    pub activity: ToolActivity,
-    /// For previews only. The decision measures nothing from it, because a wait
-    /// that moved every time a tool spoke would be a wait a chatty tool could
-    /// extend forever.
-    pub last_output_at: UnixMs,
+    Settled { since: UnixMs },
+    /// Finished at `at`; nothing more will arrive. Ending is the one thing a
+    /// tool cannot take back, which is why the core is willing to act on it:
+    /// everything else here is a guess about what happens next.
+    ///
+    /// Whether it is holding anything is not said, because an ending makes
+    /// whatever it has final and the core is going to ask for it either way.
+    Exited { at: UnixMs },
 }
 
 /// Tell the core that something changed.
@@ -93,21 +74,40 @@ impl SourceWaker {
 }
 
 /// One running invocation of a tool.
+///
+/// Output comes out in two shapes because a provider takes exactly one result
+/// per call and everything after it is an update:
+/// `REQ-provider-transcript-protocol`. The split is here rather than left to
+/// the core to sort out, so the required one cannot be missing.
 pub trait ToolSession: Send {
-    fn status(&self) -> ToolStatus;
+    /// What it has to say about itself right now.
+    ///
+    /// The only thing that says whether there is anything to collect: a tool
+    /// reporting [`ToolReport::Running`] is not asked for output, however much
+    /// it is holding.
+    fn status(&self) -> ToolReport;
 
-    /// Everything the model has not seen, in whatever shape the tool judges
-    /// best — a tail, a summary, a diff, an exit status. Called only at a
-    /// request boundary, so a long-lived tool decides how to represent
-    /// minutes of activity in one block.
+    /// The call's one answer, taken the first time the core has anything to say
+    /// about the call at all — because it is holding output, or because it
+    /// ended.
+    ///
+    /// Required, and asked for exactly once. A tool that ends without producing
+    /// anything says so in its own words here; nobody else can, and an empty
+    /// success invented by the core reads as a command that ran quietly.
+    fn first_output(&mut self) -> ToolOutput;
+
+    /// Everything since, in whatever shape the tool judges best — a tail, a
+    /// summary, a diff, an exit status. Called only at a request boundary, so
+    /// a long-lived tool decides how to represent minutes of activity in one
+    /// block.
     ///
     /// Returning `None` means "nothing new".
-    fn take_output(&mut self) -> Option<ToolOutput>;
+    fn more_output(&mut self) -> Option<ToolOutput>;
 
     /// Wind down: stop the work and finish soon.
     ///
     /// The tool still gets to produce its last words; the core keeps it around
-    /// until it reports [`ToolActivity::Exited`] and its output has been
+    /// until it reports [`ToolReport::Exited`] and its output has been
     /// collected.
     fn cancel(&mut self);
 }
@@ -118,206 +118,4 @@ pub trait Tool: Send + Sync + 'static {
     /// Start the work. Call [`SourceWaker::wake`] whenever the status
     /// changes; the core will come and ask.
     fn run(&self, call: ToolCall, waker: SourceWaker) -> Box<dyn ToolSession>;
-}
-
-/// A session that is already over. Used for calls that fail before any work
-/// starts, so the failure reaches the model through the ordinary path.
-pub(crate) struct FinishedSession {
-    output: Option<ToolOutput>,
-    at: UnixMs,
-}
-
-impl FinishedSession {
-    pub fn boxed(output: ToolOutput, at: UnixMs) -> Box<dyn ToolSession> {
-        Box::new(Self {
-            output: Some(output),
-            at,
-        })
-    }
-}
-
-impl ToolSession for FinishedSession {
-    fn status(&self) -> ToolStatus {
-        ToolStatus {
-            last_output_at: self.at,
-            unsent: match self.output {
-                Some(_) => Unsent::Waiting { since: self.at },
-                None => Unsent::Nothing,
-            },
-            activity: ToolActivity::Exited { at: self.at },
-        }
-    }
-
-    fn take_output(&mut self) -> Option<ToolOutput> {
-        self.output.take()
-    }
-
-    fn cancel(&mut self) {}
-}
-
-/// What the model has been told about one call. The milestones are ordered and
-/// each happens once, which is why they are a state rather than two flags: a
-/// call cannot end before it is answered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Told {
-    /// Nothing yet. The next thing this call produces is its one
-    /// [`ToolResult`].
-    Nothing,
-    /// It has its result, so everything after arrives as a [`ToolUpdate`].
-    Result,
-    /// ...and that it ended. Nothing more will ever be said about it.
-    Exit,
-}
-
-/// The core's bookkeeping for one call: which tool, how much of its story the
-/// model has, and since when it has been holding something. The output itself
-/// lives in the session, which is asked for it at every boundary.
-pub(crate) struct RunningTool {
-    pub call: ToolCall,
-    pub started_at: UnixMs,
-    pub session: Box<dyn ToolSession>,
-    pub told: Told,
-}
-
-impl RunningTool {
-    pub fn new(call: ToolCall, session: Box<dyn ToolSession>, now: UnixMs) -> Self {
-        Self {
-            call,
-            started_at: now,
-            session,
-            told: Told::Nothing,
-        }
-    }
-
-    pub fn status(&self) -> ToolStatus {
-        self.session.status()
-    }
-
-    /// Done with, and safe to forget.
-    pub fn reapable(&self) -> bool {
-        self.told == Told::Exit
-    }
-
-    /// What it is, with nothing decided about it. Every one of these is
-    /// something the tool observed; what any of them is worth is `boundary`'s
-    /// business, and so is every duration.
-    pub fn source(&self) -> SourceKind {
-        let status = self.status();
-        SourceKind::Tool {
-            id: self.call.id.clone(),
-            told: self.told,
-            activity: status.activity,
-            unsent: status.unsent,
-        }
-    }
-
-    pub fn preview(&self) -> Preview {
-        let status = self.status();
-        Preview::Tool {
-            call_id: self.call.id.clone(),
-            activity: status.activity,
-            unsent: status.unsent,
-            last_output_at: status.last_output_at,
-        }
-    }
-
-    pub fn cancel(&mut self) {
-        self.session.cancel();
-    }
-
-    /// Hand over everything unsent. The call's first contribution becomes its
-    /// [`ToolResult`] and every later one a [`ToolUpdate`], because a provider
-    /// accepts exactly one result per call id:
-    /// `REQ-provider-transcript-protocol`.
-    pub fn take(&mut self, now: UnixMs) -> Option<ToolTake> {
-        let exited = matches!(self.status().activity, ToolActivity::Exited { .. });
-        let output = self.session.take_output();
-        let take = match self.told {
-            Told::Exit => return None,
-            Told::Nothing => {
-                if output.is_none() && !exited {
-                    return None;
-                }
-                // A tool that exits silently still owes the provider a result.
-                let body = output.unwrap_or(ToolOutput {
-                    output: Arc::new(String::new()),
-                    status: ToolOutputStatus::Success,
-                });
-                // A result carries `finished_at`, so answering a call that has
-                // already ended says both things at once.
-                self.told = if exited { Told::Exit } else { Told::Result };
-                ToolTake::Result(ToolResult {
-                    call_id: self.call.id.clone(),
-                    tool_type: self.call.tool_type,
-                    body,
-                    started_at: self.started_at,
-                    finished_at: now,
-                    metadata: None,
-                })
-            }
-            Told::Result if !exited => ToolTake::Update(ToolUpdate {
-                call_id: self.call.id.clone(),
-                tool_type: self.call.tool_type,
-                output: output?.output,
-                at: now,
-            }),
-            // Answered long ago and now over. Nothing else will report the
-            // ending, so this is the only chance to say it — a background job
-            // that dies quietly would otherwise just stop existing.
-            Told::Result => {
-                self.told = Told::Exit;
-                let ended = "[the tool has exited]";
-                ToolTake::Update(ToolUpdate {
-                    call_id: self.call.id.clone(),
-                    tool_type: self.call.tool_type,
-                    output: Arc::new(match output {
-                        Some(output) => format!("{}\n{ended}", output.output),
-                        None => ended.to_owned(),
-                    }),
-                    at: now,
-                })
-            }
-        };
-        Some(take)
-    }
-}
-
-/// The two shapes a drained tool can take in history.
-pub(crate) enum ToolTake {
-    Result(ToolResult),
-    Update(ToolUpdate),
-}
-
-/// Keep the head and tail of oversized output, noting what was dropped.
-///
-/// Offered to tools rather than applied by the core: a tool that knows its own
-/// output can nearly always choose better than "keep both ends". This is the
-/// fallback for ones that cannot.
-pub fn elide_middle(text: &str, budget: usize) -> String {
-    if text.len() <= budget {
-        return text.to_owned();
-    }
-    let half = budget / 2;
-    let head = floor_boundary(text, half);
-    let tail = ceil_boundary(text, text.len() - half);
-    format!(
-        "{}\n... {} bytes elided ...\n{}",
-        &text[..head],
-        tail - head,
-        &text[tail..]
-    )
-}
-
-fn floor_boundary(text: &str, mut index: usize) -> usize {
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-fn ceil_boundary(text: &str, mut index: usize) -> usize {
-    while index < text.len() && !text.is_char_boundary(index) {
-        index += 1;
-    }
-    index
 }

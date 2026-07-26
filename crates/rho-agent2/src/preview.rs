@@ -9,7 +9,7 @@
 
 use rho_core::{AgentId, ContentPart, ToolCallId, UnixMs};
 
-use crate::tool::{ToolActivity, Unsent};
+use crate::tool::ToolReport;
 
 /// What one source is holding, as much as a UI can show without taking it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,12 +27,7 @@ pub enum Preview {
     /// request boundary — not on every repaint.
     Tool {
         call_id: ToolCallId,
-        activity: ToolActivity,
-        unsent: Unsent,
-        /// For display only. The decision measures nothing from it, because a
-        /// wait that moved every time a tool spoke would be a wait a chatty
-        /// tool could extend forever.
-        last_output_at: UnixMs,
+        report: ToolReport,
     },
 }
 

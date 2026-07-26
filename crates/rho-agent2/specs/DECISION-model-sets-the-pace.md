@@ -17,8 +17,14 @@ interval.
 
 At the moment of the call `npm test` and `npm run dev` are the same call and
 nothing can tell them apart, so any classification is a guess made at the worst
-possible time. The model, by contrast, states what it is waiting on every turn
-and can revise it.
+possible time. The model, by contrast, sets the pace at the end of every turn
+and can revise it at the end of the next one.
+
+Nothing tracks which calls the model is waiting on, either. The two calls above
+diverge on their own once they run: `npm test` says nothing until it is done,
+`npm run dev` answers in a second and then talks forever. So "has this call
+answered yet" separates them without anyone having to guess, and it is a fact
+the core already keeps for the transcript's sake.
 
 Without the one-turn limit, an agent that answered "the build is going" would be
 asked for another opinion every ten seconds for the length of the build.

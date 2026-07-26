@@ -1,17 +1,11 @@
 use std::time::Duration;
 
-use rho_core::{AgentIdDomain, ContentPart, ToolType, ToolUpdate, UnknownProviderSpecificData};
+use rho_core::{ContentPart, ToolType, UnknownProviderSpecificData};
 
 use super::*;
 use crate::boundary::{
     DEFAULT_WAIT, MAIL_BURST, MAIL_PATIENCE, PROGRESS_PATIENCE, TOOL_PATIENCE, USER_PATIENCE,
 };
-use crate::source::SourceKind;
-use crate::tool::Told;
-
-fn peer(counter: u64) -> AgentId {
-    AgentId::from_counter(counter, &AgentIdDomain(7)).unwrap()
-}
 
 fn call(id: &str) -> ToolCall {
     ToolCall {
@@ -41,26 +35,6 @@ fn called_blocks(ids: &[&str]) -> Vec<ContextBlock> {
     }]
 }
 
-/// ...and the results that answer them.
-fn answered_blocks(ids: &[&str]) -> Vec<ContextBlock> {
-    vec![ContextBlock::ToolResults {
-        results: ids
-            .iter()
-            .map(|id| ToolResult {
-                call_id: ToolCallId::try_from(*id).unwrap(),
-                tool_type: ToolType::Function,
-                body: ToolOutput {
-                    output: Arc::new("done".to_owned()),
-                    status: ToolOutputStatus::Success,
-                },
-                started_at: UnixMs(0),
-                finished_at: UnixMs(1),
-                metadata: None,
-            })
-            .collect(),
-    }]
-}
-
 fn user_input(delivery: Delivery, at: u64) -> QueuedInput {
     user_message("hello", delivery, at)
 }
@@ -78,15 +52,6 @@ fn user_message(text: &str, delivery: Delivery, at: u64) -> QueuedInput {
     }
 }
 
-fn compaction(at: u64) -> QueuedInput {
-    QueuedInput {
-        source: InputSource::User,
-        kind: InputKind::Compaction,
-        delivery: Delivery::NextRequest,
-        at: UnixMs(at),
-    }
-}
-
 /// The decision as an idle, uninterrupted agent asks it: the model made the
 /// calls it is waiting on at 0, and said nothing about when to look at them.
 /// Each test varies only what it is about.
@@ -98,21 +63,13 @@ struct Ask {
 }
 
 /// Every call listed is one the model asked for at 0 and is still waiting on;
-/// [`Ask::called`] is how a test says otherwise.
+/// [`Ask::moved_past`] is how a test says otherwise.
 fn ask(sources: Vec<SourceKind>) -> Ask {
-    let waiting_on = sources
-        .iter()
-        .filter_map(|source| match source {
-            SourceKind::Tool { id, .. } => Some(id.clone()),
-            SourceKind::User { .. } | SourceKind::Mail { .. } => None,
-        })
-        .collect();
     Ask {
         sources,
         turn: Some(ModelTurn {
             spoke_at: UnixMs(0),
             asked: ModelAsked::Calls,
-            waiting_on,
         }),
         phase: Phase::Idle {
             owed: Vec::new(),
@@ -136,22 +93,19 @@ impl Ask {
 
     /// The model replied in prose and asked for nothing.
     fn replied(mut self, at: u64) -> Self {
-        self.turn = self.turn.map(|turn| ModelTurn {
+        self.turn = Some(ModelTurn {
             spoke_at: UnixMs(at),
             asked: ModelAsked::Nothing,
-            ..turn
         });
         self
     }
 
-    /// The model asked for exactly these calls at this instant, so anything
-    /// else it called is something it has moved past — and an empty list is a
-    /// model waiting on nothing at all, whatever is still running.
-    fn called(mut self, at: u64, calls: &[&str]) -> Self {
+    /// The model issued calls at this instant. Which ones is
+    /// [`moved_past`]'s business, source by source.
+    fn called(mut self, at: u64) -> Self {
         self.turn = Some(ModelTurn {
             spoke_at: UnixMs(at),
             asked: ModelAsked::Calls,
-            waiting_on: calls.iter().map(|id| call_id(id)).collect(),
         });
         self
     }
@@ -167,67 +121,49 @@ impl Ask {
     }
 }
 
-fn call_id(id: &str) -> ToolCallId {
-    ToolCallId::try_from(id).unwrap()
+/// A call that still owes the model its one answer. The names in the tables
+/// above are labels for the reader; a source carries no id, because nothing
+/// about the decision depends on which call it is.
+fn tool(report: ToolReport) -> SourceKind {
+    SourceKind::Tool {
+        told: Told::Nothing,
+        report,
+    }
 }
 
-fn tool(id: &str, told: Told, activity: ToolActivity, unsent: Unsent) -> SourceKind {
-    SourceKind::Tool {
-        id: call_id(id),
-        told,
-        activity,
-        unsent,
+/// ...and the same call once it has answered, so everything after is an update.
+fn answered(call: SourceKind) -> SourceKind {
+    match call {
+        SourceKind::Tool { report, .. } => SourceKind::Tool {
+            told: Told::Result,
+            report,
+        },
+        SourceKind::User { .. } | SourceKind::Mail { .. } => panic!("only a call is told"),
     }
 }
 
 /// Called and working, and has not produced a byte.
-fn silent_call(id: &str) -> SourceKind {
-    tool(id, Told::Nothing, ToolActivity::Running, Unsent::Nothing)
+fn silent_call() -> SourceKind {
+    tool(ToolReport::Running)
 }
 
 /// Called and working, holding output it is in the middle of.
-fn partial_call(id: &str, since: u64) -> SourceKind {
-    tool(
-        id,
-        Told::Nothing,
-        ToolActivity::Running,
-        Unsent::Waiting {
-            since: UnixMs(since),
-        },
-    )
+fn partial_call(since: u64) -> SourceKind {
+    tool(ToolReport::Waiting {
+        since: UnixMs(since),
+    })
 }
 
 /// Called and working, holding output it says stands on its own.
-fn settled_call(id: &str, since: u64) -> SourceKind {
-    tool(
-        id,
-        Told::Nothing,
-        ToolActivity::Running,
-        Unsent::Settled {
-            since: UnixMs(since),
-        },
-    )
+fn settled_call(since: u64) -> SourceKind {
+    tool(ToolReport::Settled {
+        since: UnixMs(since),
+    })
 }
 
 /// Ended at `at`, with the model not yet told.
-fn ended_call(id: &str, at: u64) -> SourceKind {
-    tool(
-        id,
-        Told::Nothing,
-        ToolActivity::Exited { at: UnixMs(at) },
-        Unsent::Nothing,
-    )
-}
-
-/// Ended, and the model has been told so. Nothing will ever be said about it
-/// again; it is only still here because it has not been reaped yet.
-fn spent_call(id: &str) -> SourceKind {
-    tool(
-        id,
-        Told::Exit,
-        ToolActivity::Exited { at: UnixMs(0) },
-        Unsent::Nothing,
-    )
+fn ended_call(at: u64) -> SourceKind {
+    tool(ToolReport::Exited { at: UnixMs(at) })
 }
 
 fn pending_mail(oldest_at: u64, newest_at: u64) -> SourceKind {
@@ -300,7 +236,7 @@ fn the_model_is_shown_what_its_calls_have_at_the_interval_it_set() {
     // Nothing about the output causes this. A running tool has no urgency of
     // its own, because there is nothing to see at 2000 that would look any
     // different if this were a dev server nobody is waiting for.
-    let schedule = ask(vec![partial_call("build", 2_000)]);
+    let schedule = ask(vec![partial_call(2_000)]);
     assert_eq!(
         schedule.boundary(UnixMs(2_000)),
         Boundary::No {
@@ -321,7 +257,7 @@ fn the_check_in_happens_even_when_nothing_arrived() {
     // The empty request is the point: it is how a model that has nothing to do
     // finds out it has nothing to do, and asks for a longer interval next time.
     // Everything else here refuses to make a request with nothing in it.
-    let schedule = ask(vec![silent_call("rg")]);
+    let schedule = ask(vec![silent_call()]);
     assert_eq!(
         schedule.recheck(UnixMs(0)),
         Some(UnixMs(millis(DEFAULT_WAIT))),
@@ -343,7 +279,7 @@ fn a_look_in_lasts_exactly_one_turn() {
     // Otherwise a model that answers in prose is asked for another opinion
     // every ten seconds for as long as its build runs. Asking again is how it
     // gets looked at again — by calling something, or by naming an interval.
-    let building = ask(vec![silent_call("build")]);
+    let building = ask(vec![silent_call()]);
     assert_eq!(
         building.recheck(UnixMs(0)),
         Some(UnixMs(millis(DEFAULT_WAIT)))
@@ -367,13 +303,6 @@ fn a_look_in_lasts_exactly_one_turn() {
         ask(idle_queues()).replied(0).boundary(UnixMs(600_000)),
         Boundary::No { recheck: None }
     );
-    assert_eq!(
-        ask(vec![spent_call("build")])
-            .replied(0)
-            .boundary(UnixMs(600_000)),
-        Boundary::No { recheck: None },
-        "a call already told it has ended is not something to look in on"
-    );
 }
 
 //  ms      user    mail    cargo build   boundary
@@ -385,7 +314,7 @@ fn an_empty_queue_is_not_a_deadline() {
     // In the list like every other source, but with nothing queued there is no
     // arrival to count from, so it cannot drag a request forward.
     let mut sources = idle_queues();
-    sources.push(partial_call("build", 1_000));
+    sources.push(partial_call(1_000));
     assert_eq!(
         ask(sources).recheck(UnixMs(1_100)),
         Some(UnixMs(millis(DEFAULT_WAIT)))
@@ -409,7 +338,7 @@ fn a_typed_message_goes_at_once_when_nothing_is_due() {
 #[test]
 fn a_person_does_not_sit_out_the_models_own_interval() {
     let typed_at = 1_000;
-    let schedule = ask(vec![pending_user(typed_at), silent_call("rg")]);
+    let schedule = ask(vec![pending_user(typed_at), silent_call()]);
     let patience_ends = typed_at + millis(USER_PATIENCE);
     assert_eq!(
         schedule.boundary(UnixMs(typed_at)),
@@ -442,11 +371,7 @@ fn interrupt_discards_the_in_flight_request_and_a_plain_send_waits_for_it() {
 fn only_a_typed_message_can_interrupt_an_in_flight_request() {
     // Peers and tools wait their turn however loud they are, and a tool that
     // flags its output as standing alone has bought itself nothing here.
-    let mut schedule = ask(vec![
-        pending_mail(0, 0),
-        settled_call("call-2", 0),
-        ended_call("call-1", 0),
-    ]);
+    let mut schedule = ask(vec![pending_mail(0, 0), settled_call(0), ended_call(0)]);
     schedule.phase = Phase::Requesting(InFlight::default());
     assert_eq!(
         schedule.boundary(UnixMs(5_000)),
@@ -464,11 +389,7 @@ fn one_round_of_parallel_calls_arrives_in_one_request() {
     // Three shells called together; the quick one finishes while the others
     // have not printed a byte. A call that has been made is certain to speak,
     // so the finished result waits rather than going out alone.
-    let waiting = ask(vec![
-        ended_call("a", 200),
-        silent_call("b"),
-        silent_call("c"),
-    ]);
+    let waiting = ask(vec![ended_call(200), silent_call(), silent_call()]);
     assert_eq!(
         waiting.recheck(UnixMs(200)),
         Some(UnixMs(millis(DEFAULT_WAIT))),
@@ -478,14 +399,10 @@ fn one_round_of_parallel_calls_arrives_in_one_request() {
     // ...and the moment the last one lands they all go, without sitting out
     // either patience. This is the whole reason the decision asks whether
     // anything is still due: without it every tool call would cost ten seconds.
-    let finished = ask(vec![
-        ended_call("a", 200),
-        ended_call("b", 3_000),
-        ended_call("c", 3_100),
-    ]);
+    let finished = ask(vec![ended_call(200), ended_call(3_000), ended_call(3_100)]);
     assert_eq!(finished.boundary(UnixMs(3_100)), Boundary::Now);
     assert_eq!(
-        ask(vec![ended_call("a", 100)]).boundary(UnixMs(100)),
+        ask(vec![ended_call(100)]).boundary(UnixMs(100)),
         Boundary::Now,
         "a single fast call is not made to wait for company that is not coming"
     );
@@ -501,7 +418,7 @@ fn one_round_of_parallel_calls_arrives_in_one_request() {
 //  10200                                    SEND — but not a whole wait
 #[test]
 fn a_call_that_never_speaks_does_not_hold_a_finished_sibling_forever() {
-    let schedule = ask(vec![ended_call("a", 200), silent_call("b")]);
+    let schedule = ask(vec![ended_call(200), silent_call()]);
     assert_eq!(
         schedule.recheck(UnixMs(200)),
         Some(UnixMs(millis(DEFAULT_WAIT)))
@@ -529,7 +446,7 @@ fn talking_does_not_buy_a_call_anything() {
     // Every wait is measured from something that already happened, so a source
     // cannot extend one by continuing to produce, and cannot shorten one
     // either. This is what stops one chatty tool from pinning everybody else.
-    let schedule = ask(vec![partial_call("dev", 1_000)]);
+    let schedule = ask(vec![partial_call(1_000)]);
     for now in [1_000, 5_000, 9_000] {
         assert_eq!(
             schedule.recheck(UnixMs(now)),
@@ -541,20 +458,21 @@ fn talking_does_not_buy_a_call_anything() {
 
 //  ms      model       npm run dev    curl :3000   boundary
 //  0       calls dev   call                        hold
-//  1000    calls curl                 call         hold — dev is left behind
+//  500                 "listening"                 SEND — dev has answered
+//  1000    calls curl                 call         hold
 //  1500                "GET /"                     hold — and says nothing new
 //  2000                               exit         SEND — dev is not due
 #[test]
-fn a_call_the_model_moved_past_does_not_hold_up_the_one_it_is_on() {
+fn a_call_that_has_already_answered_does_not_hold_up_one_that_has_not() {
     // Without this, curl's result would sit for a full TOOL_PATIENCE waiting
     // for a dev server that is never going to finish — and the wait for a tool
     // that never ends is a wait nobody can end.
-    let schedule =
-        ask(vec![partial_call("dev", 1_500), ended_call("curl", 2_000)]).called(1_000, &["curl"]);
+    let schedule = ask(vec![answered(partial_call(1_500)), ended_call(2_000)]).called(1_000);
     assert_eq!(schedule.boundary(UnixMs(2_000)), Boundary::Now);
 
-    // While the model is still on it, the same two sources wait for each other.
-    let still_on_it = ask(vec![silent_call("dev"), ended_call("curl", 2_000)]);
+    // While dev still owes its answer, the same two sources wait for each
+    // other.
+    let still_on_it = ask(vec![silent_call(), ended_call(2_000)]);
     assert_eq!(
         still_on_it.recheck(UnixMs(2_000)),
         Some(UnixMs(millis(DEFAULT_WAIT))),
@@ -564,16 +482,19 @@ fn a_call_the_model_moved_past_does_not_hold_up_the_one_it_is_on() {
 
 //  ms      model         npm run dev    boundary
 //  0       calls dev     call           hold
-//  1000    calls rg      "GET /"        hold — nobody asked for this
+//  500                   "listening"    SEND — dev answers
+//  1100    replies                      hold — and asks for no look-in
+//  1500                  "GET /"        hold — nobody asked for this
 //  61500                                SEND — but it is not left unsent
 // forever
 #[test]
-fn a_call_the_model_moved_past_is_never_itself_a_reason_to_send() {
+fn a_call_that_has_already_answered_is_never_itself_a_reason_to_send() {
     // A minute is the longest anything sits unsent, and it is the only thing
-    // plain output from a tool nobody is waiting on ever buys. It cannot
-    // shorten a wait for anybody: there is no impatience here, just a sweep.
-    let schedule = ask(vec![partial_call("dev", 1_500)])
-        .called(1_000, &["rg"])
+    // plain output from a call nobody is owed an answer from ever buys. It
+    // cannot shorten a wait for anybody: there is no impatience here, just a
+    // sweep.
+    let schedule = ask(vec![answered(partial_call(1_500))])
+        .called(1_000)
         .replied(1_100);
     assert_eq!(
         schedule.recheck(UnixMs(1_500)),
@@ -588,7 +509,7 @@ fn a_call_the_model_moved_past_is_never_itself_a_reason_to_send() {
     // ...and a finished sibling does not sit out that minute, because a sweep
     // is not company anybody is waiting for.
     let mut with_result = schedule.clone();
-    with_result.sources.push(ended_call("rg", 2_000));
+    with_result.sources.push(ended_call(2_000));
     assert_eq!(with_result.boundary(UnixMs(2_000)), Boundary::Now);
 }
 
@@ -606,7 +527,7 @@ fn a_turn_that_issues_no_calls_asks_for_nothing_and_moves_nothing() {
     // The drain at 1500 answers every outstanding call, because a provider
     // takes one result per call id — so nothing about being answered can be
     // allowed to mean the model stopped waiting. Only the model saying so does.
-    let schedule = ask(vec![partial_call("test", 2_000)]).replied(1_500);
+    let schedule = ask(vec![partial_call(2_000)]).replied(1_500);
     assert_eq!(
         schedule.recheck(UnixMs(2_000)),
         Some(UnixMs(2_000 + millis(PROGRESS_PATIENCE))),
@@ -615,8 +536,7 @@ fn a_turn_that_issues_no_calls_asks_for_nothing_and_moves_nothing() {
 
     // ...and it is still the call the model is waiting on, so a sibling that
     // finishes waits for it rather than going out alone.
-    let with_sibling =
-        ask(vec![partial_call("test", 2_000), ended_call("rg", 2_500)]).replied(1_500);
+    let with_sibling = ask(vec![partial_call(2_000), ended_call(2_500)]).replied(1_500);
     assert_eq!(
         with_sibling.recheck(UnixMs(2_500)),
         Some(UnixMs(2_500 + millis(TOOL_PATIENCE))),
@@ -635,13 +555,10 @@ fn a_call_that_ends_or_stands_alone_interrupts_a_wait() {
     // The two things a tool can say that are true whatever the model is doing.
     // They are safe to honour because they are bounded: a call can only end
     // once, and one flag per call per wait is all this can ever cost.
-    let waiting = ask(Vec::new())
-        .called(0, &["dev", "test"])
-        .replied(1_000)
-        .waiting(300);
+    let waiting = ask(Vec::new()).called(0).replied(1_000).waiting(300);
 
     let mut panicked = waiting.clone();
-    panicked.sources = vec![settled_call("dev", 60_000)];
+    panicked.sources = vec![settled_call(60_000)];
     assert_eq!(
         panicked.boundary(UnixMs(60_000)),
         Boundary::Now,
@@ -651,7 +568,7 @@ fn a_call_that_ends_or_stands_alone_interrupts_a_wait() {
     // With a sibling still running it takes the ordinary collecting window
     // first, so the two arrive together rather than a request apiece.
     let mut with_sibling = panicked.clone();
-    with_sibling.sources.push(silent_call("test"));
+    with_sibling.sources.push(silent_call());
     assert_eq!(
         with_sibling.recheck(UnixMs(60_000)),
         Some(UnixMs(60_000 + millis(TOOL_PATIENCE))),
@@ -659,14 +576,7 @@ fn a_call_that_ends_or_stands_alone_interrupts_a_wait() {
     );
 
     let mut ended = waiting.clone();
-    ended.sources = vec![tool(
-        "dev",
-        Told::Nothing,
-        ToolActivity::Exited { at: UnixMs(60_100) },
-        Unsent::Settled {
-            since: UnixMs(60_000),
-        },
-    )];
+    ended.sources = vec![tool(ToolReport::Exited { at: UnixMs(60_100) })];
     assert_eq!(
         ended.boundary(UnixMs(60_100)),
         Boundary::Now,
@@ -685,9 +595,7 @@ fn a_wait_is_worth_at_most_a_minute_of_quiet_while_a_tool_is_talking() {
     // The one number a tool's plain output still buys. It cannot fire while the
     // model is being looked in on every DEFAULT_WAIT, so it only bites once the
     // model has asked for a longer interval than a minute.
-    let schedule = ask(vec![partial_call("dev", 5_000)])
-        .replied(1_000)
-        .waiting(300);
+    let schedule = ask(vec![partial_call(5_000)]).replied(1_000).waiting(300);
     assert_eq!(
         schedule.recheck(UnixMs(5_000)),
         Some(UnixMs(5_000 + millis(PROGRESS_PATIENCE)))
@@ -698,7 +606,7 @@ fn a_wait_is_worth_at_most_a_minute_of_quiet_while_a_tool_is_talking() {
     );
 
     // With nothing to show, the wait runs its full length.
-    let quiet = ask(vec![silent_call("dev")]).replied(1_000).waiting(300);
+    let quiet = ask(vec![silent_call()]).replied(1_000).waiting(300);
     assert_eq!(quiet.recheck(UnixMs(5_000)), Some(UnixMs(301_000)));
     assert_eq!(quiet.boundary(UnixMs(301_000)), Boundary::Now);
 }
@@ -712,14 +620,14 @@ fn a_wait_is_worth_at_most_a_minute_of_quiet_while_a_tool_is_talking() {
 //  60000                                     typed   SEND at 60500
 #[test]
 fn a_wait_does_not_muffle_a_crash_or_a_person() {
-    // The model moved on from dev long ago, so nothing it *says* would reach
-    // anybody. Flagging is how it says the difference.
-    let crashed = ask(vec![settled_call("dev", 60_000)])
-        .called(1_000, &[])
+    // Dev answered long ago, so nothing it *says* reaches anybody in a hurry.
+    // Flagging is how it says the difference.
+    let crashed = ask(vec![answered(settled_call(60_000))])
+        .called(1_000)
         .waiting(300);
     assert_eq!(crashed.boundary(UnixMs(60_000)), Boundary::Now);
 
-    let typed = ask(vec![silent_call("dev"), pending_user(60_000)])
+    let typed = ask(vec![silent_call(), pending_user(60_000)])
         .replied(1_000)
         .waiting(300);
     assert_eq!(
@@ -734,7 +642,7 @@ fn a_wait_does_not_muffle_a_crash_or_a_person() {
 //  400000               (silent)   SEND — the wait ended long ago
 #[test]
 fn a_check_in_that_has_already_passed_is_not_a_reason_to_keep_waiting() {
-    let schedule = ask(vec![silent_call("rg")]).waiting(300);
+    let schedule = ask(vec![silent_call()]).waiting(300);
     assert_eq!(schedule.boundary(UnixMs(400_000)), Boundary::Now);
 }
 
@@ -787,7 +695,7 @@ fn the_last_peer_to_speak_sets_how_long_anything_is_still_due() {
 //  7000                                   SEND
 #[test]
 fn mail_sits_out_its_patience_for_a_call_the_model_is_on() {
-    let schedule = ask(vec![silent_call("rg"), pending_mail(5_000, 5_000)]);
+    let schedule = ask(vec![silent_call(), pending_mail(5_000, 5_000)]);
     assert_eq!(
         schedule.recheck(UnixMs(5_000)),
         Some(UnixMs(5_000 + millis(MAIL_PATIENCE))),
@@ -804,7 +712,7 @@ fn mail_sits_out_its_patience_for_a_call_the_model_is_on() {
 //  1500    typed                     SEND — the least patient ends it for all
 #[test]
 fn the_least_patient_holder_ends_the_wait_for_everyone() {
-    let waiting = vec![pending_mail(1_000, 1_000), silent_call("rg")];
+    let waiting = vec![pending_mail(1_000, 1_000), silent_call()];
     assert!(matches!(
         ask(waiting.clone()).boundary(UnixMs(1_000)),
         Boundary::No { .. }
@@ -824,7 +732,7 @@ fn the_least_patient_holder_ends_the_wait_for_everyone() {
 fn typed_input_and_finished_tools_go_at_once() {
     // Neither can say more, so neither sits out a wait meant for something that
     // still might.
-    for settled in [pending_user(0), ended_call("call-1", 0)] {
+    for settled in [pending_user(0), ended_call(0)] {
         let schedule = ask(vec![settled]);
         assert_eq!(schedule.boundary(UnixMs(0)), Boundary::Now);
         assert_eq!(schedule.recheck(UnixMs(0)), None);
@@ -848,7 +756,7 @@ fn at_once_sends_even_with_nothing_pending() {
 //  0       exit      cancelled: hold, no timer — its words land later
 #[test]
 fn a_cancelled_agent_is_not_woken_by_its_tools_dying_words() {
-    let mut schedule = ask(vec![ended_call("call-1", 0)]);
+    let mut schedule = ask(vec![ended_call(0)]);
     assert_eq!(
         schedule.boundary(UnixMs(0)),
         Boundary::Now,
@@ -867,7 +775,7 @@ fn a_cancelled_agent_is_not_woken_by_its_tools_dying_words() {
 
     // Not even the check-in, which is the one thing that fires with nothing to
     // send: a cancelled agent must stay stopped until a person says otherwise.
-    let mut running = ask(vec![silent_call("call-1")]);
+    let mut running = ask(vec![silent_call()]);
     running.phase = Phase::Idle {
         owed: Vec::new(),
         standing: Standing::Cancelled { at: UnixMs(0) },
@@ -948,7 +856,7 @@ fn a_failed_request_is_not_retried_by_whatever_finishes_next() {
     // A request that failed for good fails the same way when the next tool
     // ends, so an agent left to itself would hammer the provider for as long
     // as it had tools. Somebody has to look at it: `Retry`, or fresh input.
-    let mut schedule = ask(vec![ended_call("call-1", 0)]);
+    let mut schedule = ask(vec![ended_call(0)]);
     schedule.phase = Phase::Idle {
         owed: Vec::new(),
         standing: Standing::Failed {
@@ -965,7 +873,7 @@ fn a_failed_request_is_not_retried_by_whatever_finishes_next() {
 
 #[test]
 fn no_timer_is_armed_while_a_request_is_in_flight() {
-    let mut schedule = ask(vec![pending_user(0), partial_call("call-1", 0)]);
+    let mut schedule = ask(vec![pending_user(0), partial_call(0)]);
     schedule.phase = Phase::Requesting(InFlight::default());
     assert_eq!(schedule.recheck(UnixMs(0)), None);
 }
@@ -976,11 +884,11 @@ fn the_loop_can_never_sleep_past_a_boundary() {
     // the answer is Now rather than another wait — so the loop that sleeps
     // until the recheck always wakes to a decision it can act on.
     for sources in [
-        vec![silent_call("a")],
-        vec![partial_call("a", 0)],
-        vec![ended_call("a", 0), silent_call("b")],
+        vec![silent_call()],
+        vec![partial_call(0)],
+        vec![ended_call(0), silent_call()],
         vec![pending_mail(0, 0)],
-        vec![pending_user(0), silent_call("a")],
+        vec![pending_user(0), silent_call()],
     ] {
         let schedule = ask(sources);
         let Some(recheck) = schedule.recheck(UnixMs(0)) else {
@@ -989,227 +897,6 @@ fn the_loop_can_never_sleep_past_a_boundary() {
         assert!(recheck > UnixMs(0));
         assert_eq!(schedule.boundary(recheck), Boundary::Now);
     }
-}
-
-//  ms      cargo test    boundary
-//  0       call          hold — before the model has ever spoken
-#[test]
-fn a_call_nobody_is_waiting_on_yet_is_not_due() {
-    // Only reachable through a restart, which loses its tools anyway. Pinned
-    // because "no turn recorded" must not read as "the model is waiting on
-    // everything" — that would be a wait with no way to end it.
-    let mut schedule = ask(vec![silent_call("test"), ended_call("rg", 200)]);
-    schedule.turn = None;
-    assert_eq!(
-        schedule.boundary(UnixMs(200)),
-        Boundary::Now,
-        "nothing is due, so what is finished goes"
-    );
-
-    let mut alone = ask(vec![silent_call("test")]);
-    alone.turn = None;
-    assert_eq!(
-        alone.boundary(UnixMs(600_000)),
-        Boundary::No { recheck: None },
-        "and with nobody holding anything there is still no request"
-    );
-}
-
-// -- draining sources -------------------------------------------------------
-
-#[test]
-fn user_drain_is_total_and_ordered() {
-    let mut user = UserSource::default();
-    user.push(user_message("first", Delivery::NextRequest, 1));
-    user.push(user_message("second", Delivery::Interrupt, 2));
-
-    let blocks = user.take();
-    assert_eq!(blocks.len(), 2);
-    assert!(user.is_empty(), "no item is ever left behind");
-    assert_eq!(
-        blocks[0],
-        ContextBlock::UserMessage {
-            sender: rho_core::MessageSender::User,
-            content: vec![ContentPart::Text {
-                text: "first".to_owned()
-            }],
-        }
-    );
-}
-
-#[test]
-fn compaction_lands_after_everything_typed_beside_it() {
-    let mut user = UserSource::default();
-    user.push(compaction(1));
-    user.push(user_message("and then do this", Delivery::NextRequest, 2));
-
-    let blocks = user.take();
-    assert_eq!(
-        blocks.last(),
-        Some(&ContextBlock::CompactionTrigger),
-        "history has to agree with the request it produced"
-    );
-    assert_eq!(blocks.len(), 2);
-}
-
-#[test]
-fn mail_collapses_per_sender_and_two_peers_stay_apart() {
-    let mut mail = MailSource::default();
-    let text = |text: &str| {
-        vec![ContentPart::Text {
-            text: text.to_owned(),
-        }]
-    };
-    mail.push(peer(1), text("a"), UnixMs(10));
-    mail.push(peer(2), text("b"), UnixMs(20));
-    mail.push(peer(1), text("c"), UnixMs(30));
-
-    assert_eq!(
-        mail.source(),
-        SourceKind::Mail {
-            oldest_at: Some(UnixMs(10)),
-            newest_at: Some(UnixMs(30)),
-        },
-        "one wait across everyone, spent from the oldest and still running at the newest"
-    );
-
-    let blocks = mail.take();
-    assert_eq!(blocks.len(), 2, "one block per sender, not one per message");
-    let ContextBlock::UserMessage { sender, content } = &blocks[0] else {
-        panic!("expected a user message block")
-    };
-    assert_eq!(*sender, rho_core::MessageSender::Agent { id: peer(1) });
-    assert_eq!(content.len(), 2, "both of that peer's messages, collapsed");
-    assert!(mail.is_empty());
-}
-
-// -- replay -----------------------------------------------------------------
-
-#[test]
-fn accepted_input_survives_a_restart_that_never_delivered_it() {
-    let restored = restore(vec![AgentEvent::Queued(user_input(
-        Delivery::NextRequest,
-        10,
-    ))]);
-    let mut restored = restored;
-    assert_eq!(restored.user.take().len(), 1);
-    assert!(restored.history.is_empty());
-}
-
-#[test]
-fn a_drain_empties_the_queues_it_touched() {
-    let restored = restore(vec![
-        AgentEvent::Queued(user_input(Delivery::NextRequest, 10)),
-        AgentEvent::Queued(QueuedInput {
-            source: InputSource::Mail { sender: peer(1) },
-            kind: InputKind::Message {
-                content: vec![ContentPart::Text {
-                    text: "from a peer".to_owned(),
-                }],
-            },
-            delivery: Delivery::NextRequest,
-            at: UnixMs(11),
-        }),
-        AgentEvent::Sent {
-            blocks: Cow::Owned(vec![ContextBlock::CompactionTrigger]),
-        },
-    ]);
-
-    assert_eq!(restored.history.len(), 1);
-    assert!(restored.user.is_empty());
-    assert!(restored.mail.is_empty());
-}
-
-#[test]
-fn a_call_the_transcript_never_answered_is_the_one_still_owed() {
-    // Nothing records which tools were alive; a call with no result is one no
-    // tool is going to answer, because none of them survived.
-    let restored = restore(vec![
-        AgentEvent::Replied {
-            blocks: Cow::Owned(called_blocks(&["call-1", "call-2"])),
-            context_used: None,
-        },
-        AgentEvent::Sent {
-            blocks: Cow::Owned(answered_blocks(&["call-1"])),
-        },
-    ]);
-
-    assert_eq!(restored.owed.len(), 1);
-    assert_eq!(restored.owed[0].id.as_str(), "call-2");
-}
-
-#[test]
-fn a_call_answered_turns_ago_is_not_owed_however_long_its_tool_ran() {
-    // The tool behind it may have gone on producing updates for an hour and
-    // then died with the process. It is still not owed a result, and the note
-    // in the next request is what tells the model its output stopped.
-    let restored = restore(vec![
-        AgentEvent::Replied {
-            blocks: Cow::Owned(called_blocks(&["dev-server"])),
-            context_used: None,
-        },
-        AgentEvent::Sent {
-            blocks: Cow::Owned(answered_blocks(&["dev-server"])),
-        },
-        AgentEvent::Sent {
-            blocks: Cow::Owned(vec![ContextBlock::ToolUpdate(ToolUpdate {
-                call_id: ToolCallId::try_from("dev-server").unwrap(),
-                tool_type: ToolType::Function,
-                output: Arc::new("listening on :3000".to_owned()),
-                at: UnixMs(50),
-            })]),
-        },
-    ]);
-
-    assert!(restored.owed.is_empty());
-}
-
-#[test]
-fn what_is_owed_is_settled_at_the_next_request_not_at_load() {
-    // Loading an agent to look at it must not write to its transcript; the note
-    // is only worth making when there is a request to put it in.
-    let restored = restore(vec![AgentEvent::Replied {
-        blocks: Cow::Owned(called_blocks(&["call-1"])),
-        context_used: None,
-    }]);
-
-    assert_eq!(
-        restored.history.len(),
-        1,
-        "replay appends nothing of its own"
-    );
-    assert_eq!(restored.owed.len(), 1, "but the call is remembered");
-}
-
-#[test]
-fn a_request_cut_short_by_shutdown_does_not_resume_itself() {
-    // The message is not lost — the `Sent` carried it into history. What does
-    // not happen is the request being made again the moment the process is
-    // back, which is a person's call and reaches the agent through `retry`.
-    let restored = restore(vec![
-        AgentEvent::Queued(user_input(Delivery::NextRequest, 10)),
-        AgentEvent::Sent {
-            blocks: Cow::Owned(vec![ContextBlock::UserMessage {
-                sender: rho_core::MessageSender::User,
-                content: vec![ContentPart::Text {
-                    text: "hello".to_owned(),
-                }],
-            }]),
-        },
-    ]);
-
-    assert_eq!(restored.history.len(), 1, "the message reached history");
-    assert!(restored.user.is_empty(), "and is no longer queued");
-    assert!(restored.owed.is_empty(), "no call was left hanging");
-}
-
-#[test]
-fn cancelling_drops_queued_input_durably() {
-    let restored = restore(vec![
-        AgentEvent::Queued(user_input(Delivery::NextRequest, 10)),
-        AgentEvent::QueueCleared,
-    ]);
-    assert!(restored.user.is_empty());
 }
 
 // -- request assembly -------------------------------------------------------
@@ -1269,13 +956,6 @@ async fn events_round_trip_through_the_store() {
         events, written,
         "every event survives the encoder verbatim, in the order it was written"
     );
-
-    // And the restored state is what those events describe.
-    let restored = restore(events);
-    assert_eq!(restored.history.len(), 1);
-    assert!(restored.user.is_empty(), "the queue was drained");
-    assert_eq!(restored.context_used, Some(1_234));
-    assert_eq!(restored.owed.len(), 1, "the tool never finished");
 }
 
 #[tokio::test]
@@ -1351,407 +1031,7 @@ fn counted(store: &Store, id: AgentId) -> Vec<u64> {
         .collect()
 }
 
-// -- running tools ----------------------------------------------------------
-
-/// Accumulates on its own and hands everything over when asked — the shape
-/// every real tool has, since the core pulls rather than being pushed to.
-#[derive(Default)]
-struct FakeSession {
-    unsent: String,
-    unsent_since: UnixMs,
-    last_output_at: UnixMs,
-    exited: Option<UnixMs>,
-    cancels: u32,
-}
-
-impl FakeSession {
-    fn tool_status(&self) -> ToolStatus {
-        ToolStatus {
-            unsent: if self.unsent.is_empty() {
-                Unsent::Nothing
-            } else {
-                Unsent::Waiting {
-                    since: self.unsent_since,
-                }
-            },
-            activity: match self.exited {
-                Some(at) => ToolActivity::Exited { at },
-                None => ToolActivity::Running,
-            },
-            last_output_at: self.last_output_at,
-        }
-    }
-
-    fn produce(&mut self, text: &str, at: UnixMs) {
-        if self.unsent.is_empty() {
-            self.unsent_since = at;
-        }
-        self.unsent.push_str(text);
-        self.last_output_at = at;
-    }
-}
-
-impl ToolSession for FakeSession {
-    fn status(&self) -> ToolStatus {
-        self.tool_status()
-    }
-
-    fn take_output(&mut self) -> Option<ToolOutput> {
-        let text = std::mem::take(&mut self.unsent);
-        (!text.is_empty()).then(|| ToolOutput {
-            output: Arc::new(text),
-            status: ToolOutputStatus::Success,
-        })
-    }
-
-    fn cancel(&mut self) {
-        self.cancels += 1;
-        self.exited = Some(self.last_output_at);
-    }
-}
-
-/// A session the test can keep poking after handing it to the core.
-#[derive(Clone, Default)]
-struct SharedSession(Arc<std::sync::Mutex<FakeSession>>);
-
-impl SharedSession {
-    fn produce(&self, text: &str, at: UnixMs) {
-        self.0.lock().unwrap().produce(text, at);
-    }
-
-    fn cancels(&self) -> u32 {
-        self.0.lock().unwrap().cancels
-    }
-
-    /// Finish without being asked to, the way a real tool ends on its own.
-    fn exit(&self, at: UnixMs) {
-        self.0.lock().unwrap().exited = Some(at);
-    }
-}
-
-impl ToolSession for SharedSession {
-    fn status(&self) -> ToolStatus {
-        self.0.lock().unwrap().status()
-    }
-
-    fn take_output(&mut self) -> Option<ToolOutput> {
-        self.0.lock().unwrap().take_output()
-    }
-
-    fn cancel(&mut self) {
-        self.0.lock().unwrap().cancel();
-    }
-}
-
-fn running(id: &str, session: SharedSession) -> (ToolCallId, RunningTool) {
-    let call = call(id);
-    (
-        call.id.clone(),
-        RunningTool::new(call, Box::new(session), UnixMs(0)),
-    )
-}
-
-#[test]
-fn first_take_answers_the_call_and_later_takes_annotate_it() {
-    let session = SharedSession::default();
-    let (_, mut tool) = running("call-1", session.clone());
-    session.produce("one", UnixMs(10));
-
-    let Some(ToolTake::Result(result)) = tool.take(UnixMs(20)) else {
-        panic!("first take must answer the call")
-    };
-    assert_eq!(*result.body.output, "one");
-
-    // The same tool produces more later; a provider accepts only one result
-    // per call, so this has to arrive as an update.
-    session.produce("two", UnixMs(30));
-    let Some(ToolTake::Update(update)) = tool.take(UnixMs(40)) else {
-        panic!("later takes must annotate")
-    };
-    assert_eq!(*update.output, "two");
-}
-
-#[test]
-fn a_tool_that_exits_silently_still_owes_a_result() {
-    let session = SharedSession::default();
-    let (_, mut tool) = running("call-1", session.clone());
-    session.exit(UnixMs(5));
-
-    assert!(!tool.reapable(), "the call is unanswered");
-    assert_eq!(
-        ask(vec![tool.source()]).boundary(UnixMs(10)),
-        Boundary::Now,
-        "and a bare result is worth a request"
-    );
-
-    assert!(matches!(tool.take(UnixMs(10)), Some(ToolTake::Result(_))));
-    assert!(tool.reapable(), "answered and exited, safe to forget");
-}
-
-#[test]
-fn a_running_tool_with_nothing_to_say_is_no_reason_to_send() {
-    let (_, mut tool) = running("call-1", SharedSession::default());
-    // It is still a source — it was called, so it will speak — but nothing
-    // about it causes a request. The only timer here is the model's own.
-    assert_eq!(
-        ask(vec![tool.source()]).recheck(UnixMs(10)),
-        Some(UnixMs(millis(DEFAULT_WAIT)))
-    );
-    assert_eq!(
-        ask(vec![tool.source()])
-            .replied(600)
-            .boundary(UnixMs(10_000)),
-        Boundary::No { recheck: None },
-        "and once the model has asked for nothing, not even that"
-    );
-    assert!(tool.take(UnixMs(10)).is_none());
-    assert_eq!(tool.told, Told::Nothing, "and its call stays open");
-}
-
-#[test]
-fn a_tool_that_exits_at_once_pays_no_wait() {
-    let session = SharedSession::default();
-    let (_, tool) = running("call-1", session.clone());
-    session.produce("done", UnixMs(1_000));
-    session.exit(UnixMs(1_000));
-
-    let schedule = ask(vec![tool.source()]);
-    assert_eq!(
-        schedule.boundary(UnixMs(1_000)),
-        Boundary::Now,
-        "no five second tax on a finished tool"
-    );
-}
-
-//  ms      build     boundary
-//  0       call      hold — nothing to send
-//  1000    out       hold — until the model is looked in on
-//  10000             SEND — its one result
-//  200000  out ...   held: everything after the result is an update
-//  400000  exit      SEND — the end is news
-#[test]
-fn a_call_hands_over_what_it_has_once_and_then_waits_for_the_end() {
-    let session = SharedSession::default();
-    let (_, mut tool) = running("call-1", session.clone());
-    session.produce("compiling...", UnixMs(1_000));
-
-    let floor = millis(DEFAULT_WAIT);
-    assert!(matches!(
-        ask(vec![tool.source()]).boundary(UnixMs(floor - 1)),
-        Boundary::No { .. }
-    ));
-    assert_eq!(
-        ask(vec![tool.source()]).boundary(UnixMs(floor)),
-        Boundary::Now
-    );
-    assert!(matches!(
-        tool.take(UnixMs(floor)),
-        Some(ToolTake::Result(_))
-    ));
-
-    // Answered, and by 200_000 the model has long since gone on to something
-    // else, so nothing it says is worth a request of its own — only the sweep
-    // that stops output sitting unsent forever.
-    session.produce("still compiling...", UnixMs(200_000));
-    let moved_on = ask(vec![tool.source()]).replied(150_000);
-    assert_eq!(
-        moved_on.recheck(UnixMs(200_000)),
-        Some(UnixMs(200_000 + millis(PROGRESS_PATIENCE)))
-    );
-
-    // ...until it ends, which is news whatever it has to say.
-    session.exit(UnixMs(400_000));
-    assert_eq!(
-        ask(vec![tool.source()]).boundary(UnixMs(400_000)),
-        Boundary::Now
-    );
-}
-
-//  ms      model       call-1    call-2    boundary
-//  0       wait(300)   call      call      hold
-//  1000                out                 hold — mid-thought
-//  40000               exit                hold — ready, and waits from here
-//  50000                                   SEND
-#[test]
-fn a_tool_that_ends_after_a_long_run_still_waits_for_its_siblings() {
-    let session = SharedSession::default();
-    let (_, tool) = running("call-1", session.clone());
-    session.produce("...", UnixMs(1_000));
-    session.exit(UnixMs(40_000));
-
-    // Dating the wait from the output rather than from the ending would leave
-    // it looking thirty-nine seconds overdue, and it would walk out on the
-    // sibling it ought to be leaving with.
-    let schedule = ask(vec![tool.source(), partial_call("call-2", 39_000)]).waiting(300);
-    let waits_until = 40_000 + millis(TOOL_PATIENCE);
-    assert_eq!(
-        schedule.boundary(UnixMs(40_000)),
-        Boundary::No {
-            recheck: Some(UnixMs(waits_until))
-        }
-    );
-    assert_eq!(schedule.boundary(UnixMs(waits_until)), Boundary::Now);
-}
-
-#[test]
-fn a_running_tool_can_say_its_output_stands_on_its_own() {
-    /// Reports everything it holds as settled — what a long-lived process does
-    /// when it flags a line as worth reading now rather than eventually.
-    struct Flagged(SharedSession);
-
-    impl ToolSession for Flagged {
-        fn status(&self) -> ToolStatus {
-            let status = self.0.status();
-            ToolStatus {
-                unsent: match status.unsent {
-                    // Flagging says something about output it is holding, so a
-                    // tool with nothing to hand over still says so.
-                    Unsent::Nothing => Unsent::Nothing,
-                    Unsent::Waiting { since } | Unsent::Settled { since } => {
-                        Unsent::Settled { since }
-                    }
-                },
-                ..status
-            }
-        }
-
-        fn take_output(&mut self) -> Option<ToolOutput> {
-            self.0.take_output()
-        }
-
-        fn cancel(&mut self) {
-            self.0.cancel();
-        }
-    }
-
-    let session = SharedSession::default();
-    session.produce("PANIC: disk full", UnixMs(1_000));
-    let tool = RunningTool::new(
-        call("call-1"),
-        Box::new(Flagged(session.clone())),
-        UnixMs(0),
-    );
-
-    let schedule = ask(vec![tool.source()]);
-    assert_eq!(
-        schedule.boundary(UnixMs(1_000)),
-        Boundary::Now,
-        "a line that matters does not sit out the burst gap"
-    );
-    assert_eq!(
-        tool.status().activity,
-        ToolActivity::Running,
-        "and the tool carries on regardless"
-    );
-}
-
-#[test]
-fn answering_a_call_does_not_stop_the_model_waiting_on_it() {
-    let session = SharedSession::default();
-    let (_, mut tool) = running("call-1", session.clone());
-    session.produce("Compiling foo v0.1.0", UnixMs(500));
-
-    // A person types, and their patience ends the wait for everyone.
-    assert_eq!(
-        ask(vec![pending_user(1_000), tool.source()]).boundary(UnixMs(1_500)),
-        Boundary::Now
-    );
-    assert!(matches!(
-        tool.take(UnixMs(1_500)),
-        Some(ToolTake::Result(_))
-    ));
-    assert_eq!(tool.told, Told::Result);
-
-    // Writing that result is what the provider demands, not a statement that
-    // anyone stopped waiting. Only the model's own next turn says that, so the
-    // five minute test run keeps its place until the model moves on from it.
-    session.produce("test foo ... ok", UnixMs(2_000));
-    let after = ask(vec![tool.source(), ended_call("call-2", 2_500)]).replied(1_500);
-    assert_eq!(
-        after.recheck(UnixMs(2_500)),
-        Some(UnixMs(2_500 + millis(TOOL_PATIENCE))),
-        "a person typing must not demote somebody else's call"
-    );
-}
-
-//  ms      dev       boundary
-//  0       call      hold
-//  200     out       answered, and past its floor: a background job
-//  40000   exit      SEND — an ending is news, answered or not
-#[test]
-fn an_answered_call_that_ends_still_says_so() {
-    let session = SharedSession::default();
-    let (_, mut tool) = running("call-1", session.clone());
-    session.produce("listening on :3000", UnixMs(100));
-    assert!(matches!(tool.take(UnixMs(200)), Some(ToolTake::Result(_))));
-    assert_eq!(
-        ask(vec![tool.source()])
-            .replied(300)
-            .boundary(UnixMs(100_000)),
-        Boundary::No { recheck: None },
-        "nothing was asked for, and it is holding nothing anyway"
-    );
-
-    // Hours of logs later it dies holding nothing. Without this the model would
-    // never learn the server stopped: the call would simply be forgotten.
-    session.exit(UnixMs(40_000));
-    assert_eq!(
-        ask(vec![tool.source()]).boundary(UnixMs(40_000)),
-        Boundary::Now
-    );
-    let Some(ToolTake::Update(update)) = tool.take(UnixMs(40_000)) else {
-        panic!("the ending has to reach the model")
-    };
-    assert!(update.output.contains("exited"));
-    assert!(tool.reapable(), "and only then is it safe to forget");
-}
-
-#[test]
-fn the_core_never_sees_output_it_did_not_ask_for() {
-    let session = SharedSession::default();
-    let (_, mut tool) = running("call-1", session.clone());
-
-    // Minutes of chatter accumulate inside the tool, costing the core nothing.
-    for line in 0..1_000 {
-        session.produce(&format!("line {line}\n"), UnixMs(line));
-    }
-    assert!(
-        matches!(tool.status().unsent, Unsent::Waiting { .. }),
-        "the core knows there is something, not what"
-    );
-
-    // One pull, one block: the tool chose how to represent all of it.
-    let Some(ToolTake::Result(result)) = tool.take(UnixMs(2_000)) else {
-        panic!("expected a result")
-    };
-    assert!(result.body.output.starts_with("line 0"));
-    assert_eq!(
-        tool.status().unsent,
-        Unsent::Nothing,
-        "nothing left buffered anywhere"
-    );
-}
-
-#[test]
-fn cancel_reaches_the_tool_and_lets_it_have_the_last_word() {
-    let session = SharedSession::default();
-    let (_, mut tool) = running("call-1", session.clone());
-
-    tool.cancel();
-    assert_eq!(session.cancels(), 1);
-
-    // Winding down produced a parting note, which still reaches the model.
-    session.produce("cleaned up", UnixMs(10));
-    assert!(matches!(
-        tool.status().activity,
-        ToolActivity::Exited { .. }
-    ));
-    let Some(ToolTake::Result(result)) = tool.take(UnixMs(20)) else {
-        panic!("the call must still be answered")
-    };
-    assert_eq!(*result.body.output, "cleaned up");
-    assert!(tool.reapable(), "and then it is forgotten");
-}
+// -- tool plumbing ----------------------------------------------------------
 
 #[tokio::test]
 async fn a_wake_that_lands_while_the_core_is_busy_is_not_lost() {
@@ -1763,45 +1043,4 @@ async fn a_wake_that_lands_while_the_core_is_busy_is_not_lost() {
 
     let woken = tokio::time::timeout(Duration::from_millis(50), notify.notified());
     assert!(woken.await.is_ok(), "the permit survives until awaited");
-}
-
-#[test]
-fn elide_middle_keeps_both_ends() {
-    let text = "x".repeat(1_000);
-    let elided = elide_middle(&text, 100);
-    assert!(elided.len() < 200);
-    assert!(elided.contains("bytes elided"));
-    assert_eq!(elide_middle("short", 100), "short");
-}
-
-// -- previews ---------------------------------------------------------------
-
-#[test]
-fn a_preview_says_which_source_it_came_from() {
-    // Previews travel as one flat list, so one that cannot name the call or the
-    // sender it belongs to is of no use to a UI.
-    let session = SharedSession::default();
-    let (_, tool) = running("call-1", session.clone());
-    session.produce("hello", UnixMs(5));
-    assert_eq!(
-        tool.preview(),
-        Preview::Tool {
-            call_id: call_id("call-1"),
-            activity: ToolActivity::Running,
-            unsent: Unsent::Waiting { since: UnixMs(5) },
-            last_output_at: UnixMs(5),
-        }
-    );
-
-    let mut user = UserSource::default();
-    user.push(user_message("hello", Delivery::NextRequest, 7));
-    assert_eq!(
-        user.preview(),
-        Preview::User {
-            items: vec![PendingItem {
-                at: UnixMs(7),
-                text: "hello".to_owned(),
-            }],
-        }
-    );
 }

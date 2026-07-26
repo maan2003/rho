@@ -19,7 +19,7 @@ use rho_inference::PromptCacheKey;
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use senax_encoder::{Decode, Encode};
 
-use crate::source::QueuedInput;
+use crate::QueuedInput;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("rho-agent2.counters.v1");
 /// Singleton row holding this database's random machine seed, which keys

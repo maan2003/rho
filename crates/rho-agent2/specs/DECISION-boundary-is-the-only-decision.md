@@ -9,6 +9,9 @@ source, tool, or handle may name a delay, a priority, or a reason to send;
 sources report facts, and even "this is not worth sending" is `boundary`'s
 answer to give.
 
+`SourceKind`, the shape of those facts, is declared in `boundary.rs` too — it
+exists to be read by the decision and by nothing else.
+
 ## Rationale
 
 A duration chosen by one source in isolation is chosen without seeing what else

@@ -3,20 +3,46 @@
 //! The whole scheduler, kept apart from the agent it schedules because it is
 //! the only part that decides anything:
 //! `DECISION-boundary-is-the-only-decision`. What it decides about is here too
-//! — the durations, and the two things the model's last turn settled. Nothing
-//! here touches the store, the provider, or a task.
+//! — the durations, what the model's last turn settled, and the facts each
+//! source reports. Nothing here touches the store, the provider, or a task.
 //!
 //! Tools get no urgency of their own and no status enum to declare:
 //! `DECISION-model-sets-the-pace`.
 
-use std::collections::BTreeSet;
 use std::time::Duration;
 
-use rho_core::{ToolCallId, UnixMs};
+use rho_core::UnixMs;
 
-use crate::source::SourceKind;
-use crate::tool::{Told, ToolActivity, Unsent};
-use crate::{Phase, Standing};
+use crate::tool::ToolReport;
+use crate::{Phase, Standing, Told};
+
+/// One source, whether or not it has anything to say.
+///
+/// Facts and nothing else — when something arrived, whether a call has been
+/// answered. Even "is this worth sending" is left to `boundary`, so an empty
+/// queue and a tool that has produced nothing are both reported: being empty is
+/// a fact too, and for a tool it is one that changes the answer.
+/// `DECISION-boundary-is-the-only-decision`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    /// Typed input is whole on arrival, so it never has more to say.
+    /// `interrupt` is the one rule no other source has: a message worth
+    /// throwing away an in-flight request for.
+    User {
+        interrupt: bool,
+        /// The longest-waiting message, if anything is queued at all.
+        oldest_at: Option<UnixMs>,
+    },
+    Mail {
+        oldest_at: Option<UnixMs>,
+        newest_at: Option<UnixMs>,
+    },
+    /// A called tool, reported exactly as it reports itself. There is
+    /// deliberately no tidier enum in between: any name that summarised these
+    /// facts would be deciding what they mean, outside the one place decisions
+    /// live.
+    Tool { told: Told, report: ToolReport },
+}
 
 /// How long a person's message waits for the machines around it to settle. Long
 /// enough that a tool about to finish rides along with it, short enough not to
@@ -51,27 +77,18 @@ pub(crate) const PROGRESS_PATIENCE: Duration = Duration::from_secs(60);
 /// nothing to see and asks for longer next time.
 pub(crate) const DEFAULT_WAIT: Duration = Duration::from_secs(10);
 
-/// What the model's latest turn settled: whether it wants to be looked in on,
-/// and which calls it is waiting on.
+/// What the model's latest turn settled: when it spoke, and whether it wants to
+/// be looked in on.
 ///
-/// Two things rather than one, because a turn can move one without the other.
-/// Replying in prose while a build runs buys everyone another interval without
-/// changing what the model is blocked on — and if one field did both, a person
-/// typing during a five minute test run would end up demoting it, which is the
-/// shape of bug this whole design keeps walking into.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Which calls it is waiting on is not here, and is not tracked anywhere: a
+/// call that has never spoken is one the model is still owed an answer from,
+/// and that is as much as the decision needs. `ModelAsked` sets the pace once
+/// the answering starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModelTurn {
     /// The end of the model's latest turn, whatever it contained.
     pub spoke_at: UnixMs,
     pub asked: ModelAsked,
-    /// The calls the latest turn that issued any asked for. Those are the ones
-    /// the model is waiting on; anything it called before that it has moved
-    /// past, having asked for something else since.
-    ///
-    /// Named calls rather than a cutoff instant, because a call made at the
-    /// same millisecond as the turn that superseded it is a coincidence no
-    /// clock can rule out, and the model has already said which ones it means.
-    pub waiting_on: BTreeSet<ToolCallId>,
 }
 
 /// What the model's latest turn asked for, which is what says whether to look
@@ -216,26 +233,18 @@ pub(crate) fn boundary(
                 Some(until) if until > now => Due::Until(until),
                 _ => Due::Nothing,
             },
-            SourceKind::Tool {
-                id,
-                told,
-                activity,
-                unsent,
-            } => match (told, activity, unsent) {
-                // Everything there was to say has been said.
-                (Told::Exit, ..) => Due::Nothing,
-                // It says what it holds stands on its own, which is it saying
-                // not to wait for the rest of the call.
-                (_, ToolActivity::Running, Unsent::Settled { .. }) => Due::Nothing,
-                // A call the model went on to ask for something else after is
-                // one it has stopped waiting on. If it still counted, a dev
-                // server that never finishes would be a wait nobody could end.
-                (_, ToolActivity::Running, _)
-                    if turn.is_some_and(|turn| turn.waiting_on.contains(id)) =>
-                {
+            SourceKind::Tool { told, report } => match (told, report) {
+                // An ended call has nothing left to wait for, nor has one that
+                // says what it holds stands on its own — which is it saying not
+                // to wait for the rest of the call. Nor has one that has
+                // already answered: a dev server that never finishes would
+                // otherwise be a wait nobody could end.
+                (_, ToolReport::Exited { .. } | ToolReport::Settled { .. }) | (Told::Result, _) => {
+                    Due::Nothing
+                }
+                (Told::Nothing, ToolReport::Running | ToolReport::Waiting { .. }) => {
                     Due::UntilItEnds
                 }
-                _ => Due::Nothing,
             },
         };
         match (due, source_due) {
@@ -267,23 +276,12 @@ pub(crate) fn boundary(
             // send rather than a special case.
             SourceKind::User { oldest_at, .. } => oldest_at.map(|at| at + patience(USER_PATIENCE)),
             SourceKind::Mail { oldest_at, .. } => oldest_at.map(|at| at + patience(MAIL_PATIENCE)),
-            SourceKind::Tool {
-                told: Told::Exit, ..
-            } => None,
             // An ending and a flag are the same kind of news and wait the same.
             // Both date from the moment they happened, so a tool that ends
             // after an hour of output gets its siblings' full attention rather
             // than looking an hour overdue.
-            SourceKind::Tool {
-                activity, unsent, ..
-            } => match (activity, unsent) {
-                (ToolActivity::Exited { at }, Unsent::Settled { since }) => {
-                    Some(at.min(since) + patience(TOOL_PATIENCE))
-                }
-                (ToolActivity::Exited { at }, _) => Some(at + patience(TOOL_PATIENCE)),
-                (ToolActivity::Running, Unsent::Settled { since }) => {
-                    Some(since + patience(TOOL_PATIENCE))
-                }
+            SourceKind::Tool { report, .. } => match report {
+                ToolReport::Running => None,
                 // Mid-thought, so nobody asked for it and it is nobody's reason
                 // to make a request — it is only not worth leaving unsent
                 // forever, which is why an empty room does not hurry it along.
@@ -291,10 +289,9 @@ pub(crate) fn boundary(
                 // because the check-in is sooner; this is what half a build log
                 // is worth to an agent that has moved on, or asked for a long
                 // quiet.
-                (ToolActivity::Running, Unsent::Waiting { since }) => {
-                    Some(since + PROGRESS_PATIENCE)
-                }
-                (ToolActivity::Running, Unsent::Nothing) => None,
+                ToolReport::Waiting { since } => Some(since + PROGRESS_PATIENCE),
+                ToolReport::Settled { since } => Some(since + patience(TOOL_PATIENCE)),
+                ToolReport::Exited { at } => Some(at + patience(TOOL_PATIENCE)),
             },
         })
         .chain(checkin)

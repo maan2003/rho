@@ -10,7 +10,6 @@
 mod boundary;
 mod db;
 mod preview;
-mod source;
 mod tool;
 
 use std::borrow::Cow;
@@ -21,22 +20,76 @@ use std::time::Duration;
 use rho_core::{
     AgentId, ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
     MessageSender, PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId, ToolName,
-    ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, UnixMs,
+    ToolOutput, ToolOutputStatus, ToolResult, ToolUpdate, UnixMs,
 };
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
+use senax_encoder::{Decode, Encode};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::boundary::{Boundary, ModelAsked, ModelTurn, boundary};
+use crate::boundary::{Boundary, ModelAsked, ModelTurn, SourceKind, boundary};
 pub use crate::db::Store;
-use crate::db::{AgentEvent, AgentRecord, EventPos};
+use crate::db::{AgentEvent, EventPos};
+use crate::preview::text_of;
 pub use crate::preview::{PendingItem, Preview};
-pub use crate::source::{Delivery, InputKind, InputSource, QueuedInput};
-use crate::source::{MailSource, UserSource};
-use crate::tool::{FinishedSession, RunningTool, ToolTake};
-pub use crate::tool::{
-    SourceWaker, Tool, ToolActivity, ToolSession, ToolStatus, Unsent, elide_middle,
-};
+pub use crate::tool::{SourceWaker, Tool, ToolReport, ToolSession};
+
+// -- what is waiting to reach the model -------------------------------------
+//
+// A queue accumulates on its own and is *pulled* by the agent at a moment the
+// agent chooses; nothing here starts a request.
+// `DECISION-pull-based-sources`.
+
+/// The only scheduling lever a sender has: whether this input is worth
+/// throwing away an in-flight request for.
+///
+/// There is deliberately no "deliver after the current task" mode. Prose says
+/// that better than an enum can — "once you've finished the edits, run the
+/// tests" is a boundary no variant could express.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub enum Delivery {
+    /// Abort the in-flight request so this lands now.
+    Interrupt,
+    /// Ride along with the next request, whenever the core makes one.
+    #[default]
+    NextRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum InputKind {
+    Message {
+        content: Vec<ContentPart>,
+    },
+    /// The user explicitly asked to compact. Automatic compaction is not an
+    /// input at all — it happens while building a request.
+    Compaction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum InputSource {
+    User,
+    Mail { sender: AgentId },
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct QueuedInput {
+    pub source: InputSource,
+    pub kind: InputKind,
+    pub delivery: Delivery,
+    pub at: UnixMs,
+}
+
+/// A piece of mail, once the queue has it. Who sent it lives on the message,
+/// because that is where it varies: everyone's mail is one queue, since the
+/// decision reads it as one — the oldest across every sender is the wait being
+/// spent, and the newest across every sender is the burst that might still be
+/// going.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MailItem {
+    pub sender: AgentId,
+    pub content: Vec<ContentPart>,
+    pub at: UnixMs,
+}
 
 /// Everything a UI needs, rebuilt whenever state changes.
 ///
@@ -68,36 +121,6 @@ pub enum AgentActivity {
     Stopped,
 }
 
-/// The tools an agent may call.
-#[derive(Clone, Default)]
-pub struct ToolRegistry {
-    tools: BTreeMap<ToolName, Arc<dyn Tool>>,
-}
-
-impl ToolRegistry {
-    pub fn register(&mut self, tool: impl Tool) -> &mut Self {
-        let spec = tool.spec();
-        self.tools.insert(spec.name, Arc::new(tool));
-        self
-    }
-
-    pub fn specs(&self) -> Arc<[ToolSpec]> {
-        self.tools.values().map(|tool| tool.spec()).collect()
-    }
-
-    fn get(&self, name: &ToolName) -> Option<&Arc<dyn Tool>> {
-        self.tools.get(name)
-    }
-}
-
-impl std::fmt::Debug for ToolRegistry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolRegistry")
-            .field("tools", &self.tools.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
 /// Cheap clonable handle for observing and driving a running agent.
 #[derive(Clone)]
 pub struct AgentHandle {
@@ -113,46 +136,194 @@ impl AgentHandle {
         inference: Inference,
         profile: InferenceProfile,
         model: InferenceModel,
-        registry: ToolRegistry,
+        tools: Vec<Arc<dyn Tool>>,
         instructions: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let (id, next_event, record) = store
             .create_agent(profile, model.into(), PromptCacheKey::generate())
             .await;
-        Ok(Agent::start(
-            store,
-            inference,
+        let session =
+            inference.deep_session(record.profile, record.model.into(), record.prompt_cache_key);
+        let snapshot = Arc::new(RwLock::new(AgentSnapshot::default()));
+        let published = Arc::new(Notify::new());
+        let (control, control_rx) = mpsc::unbounded_channel();
+        tokio::spawn(
+            Agent {
+                store,
+                next_event,
+                instructions: Arc::from(instructions.into()),
+                history: Vec::new(),
+                session,
+                phase: Phase::Idle {
+                    owed: Vec::new(),
+                    standing: Standing::Nothing,
+                },
+                user: Vec::new(),
+                mail: Vec::new(),
+                tools: BTreeMap::new(),
+                registry: tools
+                    .into_iter()
+                    .map(|tool| (tool.spec().name, tool))
+                    .collect(),
+                context_used: None,
+                turn: None,
+                wake: Arc::new(Notify::new()),
+                snapshot: Arc::clone(&snapshot),
+                published: Arc::clone(&published),
+                control_rx,
+            }
+            .run(),
+        );
+        Ok(Self {
             id,
-            record,
-            instructions.into(),
-            next_event,
-            registry,
-            Restored::default(),
-        ))
+            control,
+            snapshot,
+            published,
+        })
     }
 
     /// Instructions come from the caller here exactly as they do for a new
     /// agent: `DECISION-instructions-are-code`.
+    ///
+    /// Replaying the log is the whole of recovery, and it happens here rather
+    /// than in a function of its own so that what a loaded agent starts as sits
+    /// beside what a fresh one starts as. `SPEC-restart-recovery`.
     pub fn load(
         store: Store,
         inference: Inference,
-        registry: ToolRegistry,
+        tools: Vec<Arc<dyn Tool>>,
         id: AgentId,
         instructions: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let (record, next_event, events) = store
             .load(id)
             .ok_or_else(|| anyhow::anyhow!("rho-agent2 agent not found"))?;
-        Ok(Agent::start(
-            store,
-            inference,
+
+        let mut history: Vec<Arc<ContextBlock>> = Vec::new();
+        let mut user: Vec<QueuedInput> = Vec::new();
+        let mut mail: Vec<MailItem> = Vec::new();
+        let mut context_used = None;
+        for event in events {
+            match event {
+                AgentEvent::Queued(input) => match input.source {
+                    InputSource::User => user.push(input),
+                    InputSource::Mail { sender } => {
+                        let InputKind::Message { content } = input.kind else {
+                            continue;
+                        };
+                        mail.push(MailItem {
+                            sender,
+                            content,
+                            at: input.at,
+                        });
+                    }
+                },
+                AgentEvent::QueueCleared => {
+                    user.clear();
+                    mail.clear();
+                }
+                AgentEvent::Sent { blocks } => {
+                    history.extend(blocks.into_owned().into_iter().map(Arc::new));
+                    // A send drains everything, so nothing that was pending
+                    // when it went out is pending after it.
+                    user.clear();
+                    mail.clear();
+                }
+                AgentEvent::Replied {
+                    blocks,
+                    context_used: used,
+                } => {
+                    history.extend(blocks.into_owned().into_iter().map(Arc::new));
+                    if used.is_some() {
+                        context_used = used;
+                    }
+                }
+            }
+        }
+
+        // Every call the model has made, minus the ones the transcript already
+        // answers: no tool survived, so the rest are calls nothing is ever
+        // going to answer. Read off history rather than remembered, because
+        // history already says it.
+        let mut unanswered: BTreeMap<ToolCallId, ToolCall> = BTreeMap::new();
+        for block in &history {
+            match &**block {
+                ContextBlock::InferenceResponse { items, .. } => {
+                    for item in items {
+                        let InferenceResponseItem::ToolCall {
+                            id,
+                            name,
+                            tool_type,
+                            arguments,
+                            ..
+                        } = item
+                        else {
+                            continue;
+                        };
+                        unanswered.insert(
+                            id.clone(),
+                            ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                tool_type: *tool_type,
+                                arguments: arguments.clone(),
+                            },
+                        );
+                    }
+                }
+                ContextBlock::ToolResults { results } => {
+                    for result in results {
+                        unanswered.remove(&result.call_id);
+                    }
+                }
+                ContextBlock::UserMessage { .. }
+                | ContextBlock::ToolUpdate(_)
+                | ContextBlock::CompactionTrigger => {}
+            }
+        }
+
+        let session =
+            inference.deep_session(record.profile, record.model.into(), record.prompt_cache_key);
+        let snapshot = Arc::new(RwLock::new(AgentSnapshot::default()));
+        let published = Arc::new(Notify::new());
+        let (control, control_rx) = mpsc::unbounded_channel();
+        tokio::spawn(
+            Agent {
+                store,
+                next_event,
+                instructions: Arc::from(instructions.into()),
+                history,
+                session,
+                // The same phase a fresh agent starts in. Being loaded from a
+                // log is not its own kind of state, and coming up is never by
+                // itself a reason to send:
+                // `DECISION-a-restart-does-not-resume-by-itself`.
+                phase: Phase::Idle {
+                    owed: unanswered.into_values().collect(),
+                    standing: Standing::Nothing,
+                },
+                user,
+                mail,
+                tools: BTreeMap::new(),
+                registry: tools
+                    .into_iter()
+                    .map(|tool| (tool.spec().name, tool))
+                    .collect(),
+                context_used,
+                turn: None,
+                wake: Arc::new(Notify::new()),
+                snapshot: Arc::clone(&snapshot),
+                published: Arc::clone(&published),
+                control_rx,
+            }
+            .run(),
+        );
+        Ok(Self {
             id,
-            record,
-            instructions.into(),
-            next_event,
-            registry,
-            restore(events),
-        ))
+            control,
+            snapshot,
+            published,
+        })
     }
 
     pub fn id(&self) -> AgentId {
@@ -334,6 +505,31 @@ impl Standing {
     }
 }
 
+/// Whether the model has this call's one answer yet. The core's own
+/// bookkeeping, and the only thing about a call it remembers: what the call is
+/// *doing* is the tool's to report, every time it is asked.
+///
+/// It doubles as the nearest thing to "the model is waiting on this": a call
+/// that has never spoken owes an answer nothing else can supply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Told {
+    /// Nothing yet. The next thing this call produces is its one
+    /// [`ToolResult`].
+    Nothing,
+    /// It has its result, so everything after arrives as a [`ToolUpdate`].
+    Result,
+}
+
+/// The core's bookkeeping for one call: which tool, how much of its story the
+/// model has, and since when it has been holding something. The output itself
+/// lives in the session, which is asked for it at every boundary.
+struct RunningTool {
+    call: ToolCall,
+    started_at: UnixMs,
+    session: Box<dyn ToolSession>,
+    told: Told,
+}
+
 /// The in-flight request. Provisional until it finishes: a failure drops the
 /// whole thing without touching history, and everything here goes with it.
 #[derive(Clone, Default)]
@@ -363,12 +559,16 @@ struct Agent {
     session: InferenceSession,
     phase: Phase,
 
-    // review: inlilne ToolRegister, UserSource, MailSource
-    user: UserSource,
-    mail: MailSource,
+    /// Typed input, in arrival order: discrete, never merged or summarised,
+    /// and always drained in that order.
+    user: Vec<QueuedInput>,
+    /// Everyone's mail, in arrival order.
+    mail: Vec<MailItem>,
+    /// One entry per call the model has made and nothing has answered.
     tools: BTreeMap<ToolCallId, RunningTool>,
 
-    registry: ToolRegistry,
+    /// The tools the model may call, keyed by the name it calls them by.
+    registry: BTreeMap<ToolName, Arc<dyn Tool>>,
 
     context_used: Option<u64>,
     /// What the model's latest turn settled about being looked in on. `None`
@@ -387,62 +587,6 @@ struct Agent {
 }
 
 impl Agent {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "everything the loop needs, and a struct to hold it would be \
-                  these same arguments with a name"
-    )]
-    fn start(
-        store: Store,
-        inference: Inference,
-        id: AgentId,
-        record: AgentRecord,
-        instructions: String,
-        next_event: EventPos,
-        registry: ToolRegistry,
-        restored: Restored,
-    ) -> AgentHandle {
-        let session =
-            inference.deep_session(record.profile, record.model.into(), record.prompt_cache_key);
-        let snapshot = Arc::new(RwLock::new(AgentSnapshot::default()));
-        let published = Arc::new(Notify::new());
-        let (control, control_rx) = mpsc::unbounded_channel();
-
-        let agent = Self {
-            store,
-            next_event,
-            instructions: Arc::from(instructions),
-            history: restored.history,
-            session,
-            // A fresh agent lands here too — being loaded from a log is not
-            // its own kind of state, and coming up is never by itself a reason
-            // to send: `DECISION-a-restart-does-not-resume-by-itself`.
-            phase: Phase::Idle {
-                owed: restored.owed,
-                standing: Standing::Nothing,
-            },
-            user: restored.user,
-            mail: restored.mail,
-            tools: BTreeMap::new(),
-            registry,
-            context_used: restored.context_used,
-            turn: None,
-            wake: Arc::new(Notify::new()),
-            snapshot: Arc::clone(&snapshot),
-            published: Arc::clone(&published),
-            control_rx,
-        };
-
-        tokio::spawn(agent.run());
-
-        AgentHandle {
-            id,
-            control,
-            snapshot,
-            published,
-        }
-    }
-
     /// Answer the one question after every event, act on the answer, and wait
     /// for the next one, until the last handle is dropped.
     async fn run(mut self) {
@@ -454,8 +598,28 @@ impl Agent {
             // Every source, in whatever state it is in — nothing is filtered
             // out for having nothing to say, because deciding that is the
             // decision's job, and an empty queue is a fact it reads.
-            let mut sources = vec![self.user.source(), self.mail.source()];
-            sources.extend(self.tools.values().map(RunningTool::source));
+            let mut sources = vec![
+                SourceKind::User {
+                    interrupt: self
+                        .user
+                        .iter()
+                        .any(|input| input.delivery == Delivery::Interrupt),
+                    // Arrival order, so the first is the one that has waited
+                    // longest — the one whose patience is being spent.
+                    oldest_at: self.user.first().map(|input| input.at),
+                },
+                SourceKind::Mail {
+                    oldest_at: self.mail.first().map(|item| item.at),
+                    newest_at: self.mail.last().map(|item| item.at),
+                },
+            ];
+            // What each call is, with nothing decided about it: every one of
+            // these is something the tool observed, and what any of them is
+            // worth is `boundary`'s business.
+            sources.extend(self.tools.values().map(|tool| SourceKind::Tool {
+                told: tool.told,
+                report: tool.session.status(),
+            }));
 
             let deadline = match boundary(&sources, self.turn.as_ref(), &self.phase, now) {
                 Boundary::No { recheck } => recheck,
@@ -534,7 +698,11 @@ impl Agent {
                             at,
                         };
                         self.persist(AgentEvent::Queued(input)).await;
-                        self.mail.push(sender, content, at);
+                        self.mail.push(MailItem {
+                            sender,
+                            content,
+                            at,
+                        });
                         done
                     }
                     Control::Cancel(done) => {
@@ -542,7 +710,7 @@ impl Agent {
                         // core does not kill tools, so a tool still chooses its
                         // own last words.
                         for tool in self.tools.values_mut() {
-                            tool.cancel();
+                            tool.session.cancel();
                         }
                         // A cancel is not an answer, so what is owed outlives
                         // it.
@@ -684,23 +852,84 @@ impl Agent {
         }
         // Every source, not just whichever one triggered the boundary:
         // `DECISION-pull-based-sources`. The order is protocol-constrained
-        // rather than chronological, so tool output leads:
-        // `REQ-provider-transcript-protocol`.
+        // rather than chronological, so tool output leads, and each call's
+        // first contribution becomes its `ToolResult` and every later one a
+        // `ToolUpdate`, because a provider accepts exactly one result per call
+        // id: `REQ-provider-transcript-protocol`.
         let mut results: Vec<ToolResult> = Vec::new();
         let mut updates = Vec::new();
         for tool in self.tools.values_mut() {
-            match tool.take(now) {
-                Some(ToolTake::Result(result)) => results.push(result),
-                Some(ToolTake::Update(update)) => updates.push(ContextBlock::ToolUpdate(update)),
-                None => {}
+            match (tool.told, tool.session.status()) {
+                // Holding nothing, so there is nothing to say about it either
+                // way.
+                (_, ToolReport::Running) => {}
+                (Told::Nothing, _) => {
+                    tool.told = Told::Result;
+                    results.push(ToolResult {
+                        call_id: tool.call.id.clone(),
+                        tool_type: tool.call.tool_type,
+                        body: tool.session.first_output(),
+                        started_at: tool.started_at,
+                        // A result carries `finished_at`, so answering a call
+                        // that has already ended says both things at once.
+                        finished_at: now,
+                        metadata: None,
+                    });
+                }
+                (Told::Result, _) => {
+                    if let Some(output) = tool.session.more_output() {
+                        updates.push(ContextBlock::ToolUpdate(ToolUpdate {
+                            call_id: tool.call.id.clone(),
+                            tool_type: tool.call.tool_type,
+                            output: output.output,
+                            at: now,
+                        }));
+                    }
+                }
             }
         }
+        // Forget the ones that have ended: the drain above was their last
+        // chance to speak and they will never say anything else, so keeping
+        // them would be a source that reports the same ending forever. Nothing
+        // to record — a reaped call is one the transcript has finished talking
+        // about.
+        self.tools
+            .retain(|_, tool| !matches!(tool.session.status(), ToolReport::Exited { .. }));
         if !results.is_empty() {
             blocks.push(ContextBlock::ToolResults { results });
         }
         blocks.extend(updates);
-        blocks.extend(self.mail.take());
-        blocks.extend(self.user.take());
+        // One block per sender: several messages from the same peer collapse,
+        // so a chatty one costs the model one block rather than five.
+        let mut by_sender: BTreeMap<AgentId, Vec<ContentPart>> = BTreeMap::new();
+        for item in std::mem::take(&mut self.mail) {
+            by_sender
+                .entry(item.sender)
+                .or_default()
+                .extend(item.content);
+        }
+        blocks.extend(
+            by_sender
+                .into_iter()
+                .map(|(sender, content)| ContextBlock::UserMessage {
+                    sender: MessageSender::Agent { id: sender },
+                    content,
+                }),
+        );
+
+        // Every queued item is eligible at every boundary, so the drain is
+        // total. Compaction is stable-sorted to the back, because the trigger
+        // has to be the final input item and history would otherwise disagree
+        // with the request it produced: `REQ-provider-transcript-protocol`.
+        let mut inputs = std::mem::take(&mut self.user);
+        inputs.sort_by_key(|input| matches!(input.kind, InputKind::Compaction));
+        blocks.extend(inputs.into_iter().map(|input| match input.kind {
+            InputKind::Message { content } => ContextBlock::UserMessage {
+                sender: MessageSender::User,
+                content,
+            },
+            InputKind::Compaction => ContextBlock::CompactionTrigger,
+        }));
 
         // Automatic compaction is not an input — it is something the core does
         // while assembling a request. (A user-requested compaction *is* an
@@ -741,11 +970,6 @@ impl Agent {
                 .iter()
                 .any(|block| *block != ContextBlock::CompactionTrigger);
 
-        // Forget tools that exited and whose output the model has seen, so a
-        // long session does not accumulate them forever. Nothing to record: a
-        // reaped tool is one the transcript has already finished talking about.
-        self.tools.retain(|_, tool| !tool.reapable());
-
         // The drain, the append and the send are one event because they are one
         // thing: a crash between them would leave a transcript nobody drained
         // into and a queue nobody emptied.
@@ -758,7 +982,7 @@ impl Agent {
             instructions: Arc::clone(&self.instructions),
             input: self.history.clone(),
             agent_id_labels: Default::default(),
-            tools: self.registry.specs(),
+            tools: self.registry.values().map(|tool| tool.spec()).collect(),
         });
         self.phase = Phase::Requesting(InFlight {
             compaction_owes_reply: owes_reply,
@@ -825,26 +1049,16 @@ impl Agent {
             Phase::Idle { .. } => false,
         };
 
-        // A turn that issues no calls asks for nothing and changes nothing: it
-        // neither buys another look-in nor moves what the model is waiting on.
-        // `ModelAsked::Wait` arrives with the tool that names an interval.
-        let waiting_on = match calls.is_empty() {
-            false => calls.iter().map(|call| call.id.clone()).collect(),
-            true => self
-                .turn
-                .take()
-                .map(|turn| turn.waiting_on)
-                .unwrap_or_default(),
-        };
+        // A turn that issues no calls buys no further look-in: whatever is
+        // still running speaks for itself. `ModelAsked::Wait` arrives with the
+        // tool that names an interval.
         self.turn = Some(ModelTurn {
             spoke_at: now,
             asked: match calls.is_empty() {
                 false => ModelAsked::Calls,
                 true => ModelAsked::Nothing,
             },
-            waiting_on,
         });
-
         for call in calls {
             self.spawn_tool(call, now);
         }
@@ -863,20 +1077,49 @@ impl Agent {
     // -- tools --------------------------------------------------------------
 
     fn spawn_tool(&mut self, call: ToolCall, now: UnixMs) {
-        let session = match self.registry.get(&call.name) {
+        /// A session that is already over, so a call that fails before any work
+        /// starts reaches the model through exactly the same path as any other
+        /// tool output.
+        struct BornExited {
+            output: ToolOutput,
+            at: UnixMs,
+        }
+
+        impl ToolSession for BornExited {
+            fn status(&self) -> ToolReport {
+                ToolReport::Exited { at: self.at }
+            }
+
+            fn first_output(&mut self) -> ToolOutput {
+                self.output.clone()
+            }
+
+            fn more_output(&mut self) -> Option<ToolOutput> {
+                None
+            }
+
+            fn cancel(&mut self) {}
+        }
+
+        let session: Box<dyn ToolSession> = match self.registry.get(&call.name) {
             Some(tool) => tool.run(call.clone(), SourceWaker::new(Arc::clone(&self.wake))),
-            // Born exited: the error reaches the model at the next boundary
-            // through exactly the same path as any other tool output.
-            None => FinishedSession::boxed(
-                ToolOutput {
+            None => Box::new(BornExited {
+                output: ToolOutput {
                     output: Arc::new(format!("unknown tool: {}", call.name.as_str())),
                     status: ToolOutputStatus::Error,
                 },
-                now,
-            ),
+                at: now,
+            }),
         };
-        self.tools
-            .insert(call.id.clone(), RunningTool::new(call, session, now));
+        self.tools.insert(
+            call.id.clone(),
+            RunningTool {
+                started_at: now,
+                call,
+                session,
+                told: Told::Nothing,
+            },
+        );
     }
 
     // -- plumbing -----------------------------------------------------------
@@ -890,16 +1133,46 @@ impl Agent {
         // that could drift from the data.
         let mut previews = Vec::new();
         if !self.user.is_empty() {
-            previews.push(self.user.preview());
+            previews.push(Preview::User {
+                items: self
+                    .user
+                    .iter()
+                    .map(|input| PendingItem {
+                        at: input.at,
+                        text: match &input.kind {
+                            InputKind::Message { content } => text_of(content),
+                            InputKind::Compaction => "/compact".to_owned(),
+                        },
+                    })
+                    .collect(),
+            });
         }
-        previews.extend(self.mail.previews());
-        previews.extend(self.tools.values().map(RunningTool::preview));
+        // Grouped the way a drain groups it, so what a UI shows is what the
+        // next request will carry.
+        let mut by_sender: BTreeMap<AgentId, Vec<PendingItem>> = BTreeMap::new();
+        for item in &self.mail {
+            by_sender.entry(item.sender).or_default().push(PendingItem {
+                at: item.at,
+                text: text_of(&item.content),
+            });
+        }
+        previews.extend(
+            by_sender
+                .into_iter()
+                .map(|(sender, items)| Preview::Mail { sender, items }),
+        );
+        previews.extend(self.tools.values().map(|tool| Preview::Tool {
+            call_id: tool.call.id.clone(),
+            report: tool.session.status(),
+        }));
 
         *self.snapshot.write().expect("poisoned snapshot") = AgentSnapshot {
             history: self.history.clone(),
             previews,
             activity: match &self.phase {
-                Phase::Idle { standing, .. } if standing.stopped(self.user.oldest_at()) => {
+                Phase::Idle { standing, .. }
+                    if standing.stopped(self.user.first().map(|input| input.at)) =>
+                {
                     AgentActivity::Stopped
                 }
                 Phase::Idle { .. } | Phase::Requesting(_) => AgentActivity::Live,
@@ -922,102 +1195,6 @@ impl Agent {
         };
         self.published.notify_waiters();
     }
-}
-
-#[derive(Default)]
-struct Restored {
-    history: Vec<Arc<ContextBlock>>,
-    user: UserSource,
-    mail: MailSource,
-    context_used: Option<u64>,
-    /// Calls nothing is going to answer, because no tool survived.
-    owed: Vec<ToolCall>,
-}
-
-impl Restored {
-    fn clear_queues(&mut self) {
-        self.user.clear();
-        self.mail.clear();
-    }
-}
-
-fn restore(events: Vec<AgentEvent<'static>>) -> Restored {
-    let mut restored = Restored::default();
-    for event in events {
-        match event {
-            AgentEvent::Queued(input) => match input.source {
-                InputSource::User => restored.user.push(input),
-                InputSource::Mail { sender } => {
-                    let InputKind::Message { content } = input.kind else {
-                        continue;
-                    };
-                    restored.mail.push(sender, content, input.at);
-                }
-            },
-            AgentEvent::QueueCleared => restored.clear_queues(),
-            AgentEvent::Sent { blocks } => {
-                restored
-                    .history
-                    .extend(blocks.into_owned().into_iter().map(Arc::new));
-                // A send drains everything, so nothing that was pending when it
-                // went out is pending after it.
-                restored.clear_queues();
-            }
-            AgentEvent::Replied {
-                blocks,
-                context_used,
-            } => {
-                restored
-                    .history
-                    .extend(blocks.into_owned().into_iter().map(Arc::new));
-                if context_used.is_some() {
-                    restored.context_used = context_used;
-                }
-            }
-        }
-    }
-
-    // Every call the model has made, minus the ones the transcript already
-    // answers. Read off history rather than remembered, because history already
-    // says it. `SPEC-restart-recovery`.
-    let mut unanswered: BTreeMap<ToolCallId, ToolCall> = BTreeMap::new();
-    for block in &restored.history {
-        match &**block {
-            ContextBlock::InferenceResponse { items, .. } => {
-                for item in items {
-                    let InferenceResponseItem::ToolCall {
-                        id,
-                        name,
-                        tool_type,
-                        arguments,
-                        ..
-                    } = item
-                    else {
-                        continue;
-                    };
-                    unanswered.insert(
-                        id.clone(),
-                        ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            tool_type: *tool_type,
-                            arguments: arguments.clone(),
-                        },
-                    );
-                }
-            }
-            ContextBlock::ToolResults { results } => {
-                for result in results {
-                    unanswered.remove(&result.call_id);
-                }
-            }
-            ContextBlock::UserMessage { .. }
-            | ContextBlock::ToolUpdate(_)
-            | ContextBlock::CompactionTrigger => {}
-        }
-    }
-    restored.owed = unanswered.into_values().collect();
-    restored
 }
 
 #[cfg(test)]

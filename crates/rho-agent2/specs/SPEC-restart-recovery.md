@@ -2,10 +2,10 @@
 
 ## Record justification
 
-Recovery is split across `restore`, which derives what is owed from the event
-log; `Phase::Idle`, which carries `owed` between load and the next request; and
-`Agent::start_request`, which settles it — and none of the three can state the
-contract the other two depend on.
+Recovery is split across `AgentHandle::load`, which derives what is owed by
+replaying the event log; `Phase::Idle`, which carries `owed` between load and the
+next request; and `Agent::start_request`, which settles it — and none of the
+three can state the contract the other two depend on.
 
 ## Contract
 
@@ -20,10 +20,10 @@ Restarting is not a state of its own. A loaded agent and a fresh one are both
 
 No tool survives a restart, and nothing is recorded about what any of them did,
 so every `ToolCall` in history that no `ToolResult` answers is a call nothing is
-ever going to answer. `restore` derives that set by replaying history, adding
-each call and removing each answered id, rather than by remembering which tools
-were alive — history already says it, and a live-tool record would be a second
-thing to keep true.
+ever going to answer. `load` derives that set by replaying history, adding each
+call and removing each answered id, rather than by remembering which tools were
+alive — history already says it, and a live-tool record would be a second thing
+to keep true.
 
 Membership does not depend on when the call was made. A call the model has moved
 past is still unanswered, and a call from five turns ago whose tool ran the whole
@@ -35,7 +35,7 @@ It emits, ahead of everything the sources drain:
 1. one `ToolResult` per owed call — empty, and `ToolOutputStatus::Cancelled`
    rather than a success, because an empty success reads as a command that ran
    quietly;
-2. one `RESTART_NOTE`, as a user message, saying that every tool is gone —
+2. one note, as a user message, saying that every tool is gone —
    foreground and background alike — and that the empty results are placeholders
    rather than output. One note however many calls were owed, because the restart
    happened once, and prose belongs in a message rather than dressed up as

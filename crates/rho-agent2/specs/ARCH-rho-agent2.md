@@ -16,6 +16,10 @@ reports plain facts — when something arrived, whether a call has been answered
 whether a tool has ended. It names no durations and starts no requests
 ([DECISION-pull-based-sources](DECISION-pull-based-sources.md)).
 
+Being a source is a role, not a module. The two queues are plain vectors on the
+`Agent`, and `SourceKind` — the facts a source reports — is declared in
+`boundary.rs` beside the only code that reads it.
+
 `boundary` is a pure function of every source's facts, the model's latest turn,
 the current `Phase`, and the clock. It is the only part of the crate that
 decides anything
@@ -37,16 +41,29 @@ supplies `owed` differently ([SPEC-restart-recovery](SPEC-restart-recovery.md)).
 
 ## Boundaries and direction
 
-The loop depends on `boundary`, the sources, the tool registry, `Store`, and an
+The loop depends on `boundary`, the tools it has been given, `Store`, and an
 `rho-inference` session. Nothing depends on `boundary`, and `boundary` reaches
 nothing: no store, no provider, no task, no clock but the instant it is handed.
-Sources know about neither each other nor the clock.
+It is handed every source's facts at once and reads them together; no source
+knows about another, or about the clock.
 
-Tools come from the caller through `ToolRegistry` and implement the `Tool` and
-`ToolSession` traits. The core says exactly one thing to a running tool —
-`cancel`, meaning wind down — and still collects its parting output, so a tool
-has the last word
+Tools come from the caller as a list of `Tool` implementations, keyed on the way
+in by the name the model calls them by; a call in flight is a `ToolSession`. A
+registry type would have been that map with pass-through methods, so there is
+not one. The core says exactly one thing to a running tool — `cancel`, meaning
+wind down — and still collects its parting output, so a tool has the last word
 ([DECISION-model-sets-the-pace](DECISION-model-sets-the-pace.md)).
+
+A session hands its output over in two shapes, and the split is in the trait
+rather than sorted out by the core: `first_output` is required and taken once,
+`more_output` is optional and taken forever after. That is the provider's
+one-result-per-call rule made unmissable
+([REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md)). Both
+carry the tool's words and only the tool's words
+([DECISION-the-core-never-speaks-for-a-tool](DECISION-the-core-never-speaks-for-a-tool.md)),
+which is also why a call is forgotten the moment it reports that it ended: the
+drain beside the reap was its last chance to speak, and the core has nothing to
+add afterwards.
 
 ## Persistence
 
