@@ -21,14 +21,14 @@ fn title_session_uses_luna_fast_profile() {
     let (_temp, auth) = test_oauth_file("token", None);
     let session = InferenceSession::new_title(Inference::new(auth), PromptCacheKey::generate());
 
-    assert_eq!(session.responses_config.model, ResponsesModel::Gpt56Luna);
+    assert_eq!(session.config.responses_config.model, ResponsesModel::Gpt56Luna);
     assert_eq!(
-        session.responses_config.reasoning_context,
+        session.config.responses_config.reasoning_context,
         ReasoningContext::AllTurns
     );
-    assert_eq!(session.responses_config.effort, ResponsesEffort::Medium);
-    assert_eq!(session.responses_config.text_verbosity, TextVerbosity::Low);
-    assert_eq!(session.responses_config.service_tier, ServiceTier::Priority);
+    assert_eq!(session.config.responses_config.effort, ResponsesEffort::Medium);
+    assert_eq!(session.config.responses_config.text_verbosity, TextVerbosity::Low);
+    assert_eq!(session.config.responses_config.service_tier, ServiceTier::Priority);
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
         }],
     );
 
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["model"], "gpt-test");
@@ -108,7 +108,7 @@ fn omits_tool_choice_without_declared_tools() {
     let session = test_inference_service("gpt-test");
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("tool_choice").is_none());
@@ -132,7 +132,7 @@ fn renders_agent_mail_with_supplied_short_label() {
         tools: Arc::from([]),
     };
 
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(
@@ -155,7 +155,7 @@ fn stamps_phase_on_assistant_messages_when_supported() {
     );
 
     let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         None,
     );
@@ -170,7 +170,7 @@ fn serializes_configured_reasoning_effort() {
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
     let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         None,
     );
@@ -194,12 +194,12 @@ fn serializes_configured_reasoning_context() {
         InferenceModel::Gpt55,
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
-    session.responses_config.model = ResponsesModel::Test("gpt-test".to_owned());
-    session.responses_config.reasoning_context = ReasoningContext::CurrentTurn;
-    session.responses_config.text_verbosity = TextVerbosity::Medium;
+    session.config.responses_config.model = ResponsesModel::Test("gpt-test".to_owned());
+    session.config.responses_config.reasoning_context = ReasoningContext::CurrentTurn;
+    session.config.responses_config.text_verbosity = TextVerbosity::Medium;
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["reasoning"]["context"], "current_turn");
@@ -216,7 +216,7 @@ fn serializes_required_instructions() {
     };
 
     let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         None,
     );
@@ -236,7 +236,7 @@ fn serializes_prompt_cache_key() {
     );
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(
@@ -257,7 +257,7 @@ fn previous_response_hint_slices_input_in_provider() {
     );
 
     let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         Some("resp_1"),
     );
@@ -280,7 +280,7 @@ fn previous_response_hint_requires_connection_cached_match() {
     );
 
     let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         Some("other_resp"),
     );
@@ -302,7 +302,7 @@ fn previous_response_without_valid_boundary_replays_full_history() {
     );
 
     let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         None,
     );
@@ -323,7 +323,7 @@ fn stale_previous_response_error_builds_full_replay_request() {
         Vec::new(),
     );
     let sliced = serde_json::to_value(ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request.clone(),
         Some("resp_1"),
     ))
@@ -337,7 +337,7 @@ fn stale_previous_response_error_builds_full_replay_request() {
         "stream error: previous_response_id expired"
     )));
     let replay = serde_json::to_value(ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         None,
     ))
@@ -367,7 +367,7 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
         PromptCacheKey::from_bytes(*b"testkey1"),
         None,
     );
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("context_management").is_none());
@@ -386,7 +386,7 @@ fn configured_compaction_threshold_overrides_provider_default() {
     );
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["content"][0]["text"], "hello");
@@ -406,7 +406,7 @@ fn chatgpt_codex_with_compaction_requests_configured_threshold() {
     );
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["content"][0]["text"], "hello");
@@ -432,7 +432,7 @@ fn compaction_trigger_is_the_last_provider_input_item() {
         Vec::new(),
     );
 
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["context_management"][0]["type"], "compaction");
@@ -467,7 +467,7 @@ fn compaction_replay_trims_before_latest_compaction_item() {
     );
 
     let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         None,
     );
@@ -499,7 +499,7 @@ fn skips_compaction_without_encrypted_content() {
     );
 
     let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         None,
     );
@@ -527,7 +527,7 @@ fn replays_reasoning_provider_item() {
     );
 
     let body = serde_json::to_value(ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         None,
     ))
@@ -591,7 +591,7 @@ fn serializes_custom_tool_calls_and_results() {
     );
 
     let body = ResponsesRequest::from_inference_request(
-        &test_inference_service("gpt-test"),
+        &test_inference_service("gpt-test").config,
         request,
         None,
     );
@@ -621,7 +621,7 @@ fn responses_lite_moves_tools_and_instructions_into_input() {
         InferenceModel::Gpt56Sol,
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
-    session.responses_config.text_verbosity = TextVerbosity::Low;
+    session.config.responses_config.text_verbosity = TextVerbosity::Low;
     let mut request = inference_request(
         vec![user_block("hello")],
         vec![ToolSpec {
@@ -634,7 +634,7 @@ fn responses_lite_moves_tools_and_instructions_into_input() {
     );
     request.instructions = Arc::from("You are rho.");
 
-    let body = ResponsesRequest::from_inference_request(&session, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["model"], "gpt-5.6-sol");
@@ -679,7 +679,7 @@ fn responses_lite_previous_response_skips_developer_prefix() {
     );
     request.instructions = Arc::from("You are rho.");
 
-    let body = ResponsesRequest::from_inference_request(&session, request, Some("resp_1"));
+    let body = ResponsesRequest::from_inference_request(&session.config, request, Some("resp_1"));
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["previous_response_id"], "resp_1");

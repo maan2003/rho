@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -92,6 +90,7 @@ struct Turn {
     retry_attempts: u32,
 }
 
+#[derive(Clone, Copy)]
 enum TurnPhase {
     /// A request is waiting to be sent. `replay` means the previous attempt hit
     /// a stale `previous_response_id`, so this send must be a full replay.
@@ -106,22 +105,75 @@ enum TurnPhase {
     },
 }
 
+/// What a session asks for and where it asks, all of it settled by the caller
+/// rather than by the wire.
+///
+/// Held by the handle, because callers read and revise it between turns without
+/// awaiting anything, and copied to the task with every request so a body is
+/// built from what was true when the request was made.
+#[derive(Clone)]
+pub(crate) struct SessionConfig {
+    pub(crate) base_url: String,
+    pub(crate) inference: Inference,
+    pub(crate) mode: InferenceSessionMode,
+    pub(crate) responses_config: ResponsesConfig,
+    pub(crate) prompt_cache_key: PromptCacheKey,
+}
+
+/// A handle onto a session that runs in a task of its own.
+///
+/// Every method here is either a synchronous read of `config` or a message, so
+/// nothing a caller does can interrupt the socket. That is the whole reason for
+/// the split: a caller that drives [`InferenceSession::run`] from a `select!`
+/// drops that future every time any other arm wins, and the I/O it was in the
+/// middle of used to go with it — a half-written envelope, or a TLS handshake
+/// started over from nothing. `run` is now a channel receive, which loses
+/// nothing when it is dropped.
 pub struct InferenceSession {
+    pub(crate) config: SessionConfig,
+    /// Spawned on the first request rather than at construction, so a session
+    /// can be built and inspected outside a runtime.
+    commands: Option<tokio::sync::mpsc::UnboundedSender<Command>>,
+    events: tokio::sync::mpsc::UnboundedReceiver<(u64, InferenceEvent)>,
+    events_tx: tokio::sync::mpsc::UnboundedSender<(u64, InferenceEvent)>,
+    /// The turn this handle is waiting on, if any. Events are tagged with the
+    /// epoch of the turn that produced them, so the ones already in the channel
+    /// when a turn is abandoned are dropped rather than delivered as if they
+    /// answered whatever came next — and `None` says that *everything* still
+    /// arriving is stale, which is what an abort leaves behind.
+    ///
+    /// It is also the answer to [`InferenceSession::has_active_request`], there
+    /// being no second place for that to be written down and disagree.
+    awaiting: Option<u64>,
+    /// Never reused, so an abandoned turn can never be mistaken for the one
+    /// that replaced it.
+    epochs: u64,
+}
+
+enum Command {
+    Request {
+        epoch: u64,
+        config: SessionConfig,
+        request: InferenceRequest,
+    },
+    Abort,
+}
+
+/// The half that owns the socket, and the only half that awaits it.
+struct SessionTask {
     /// The session's warm WebSocket, kept alive across turns and owned outright
     /// (single owner, no lock). Reopened lazily when missing, stale, or dropped
     /// after a failure.
     connection: Option<WebSocketConnection>,
     /// The active turn, if one has been requested.
     turn: Option<Turn>,
-    /// Updates parsed from a frame but not yet handed out by `run` (one frame
-    /// can yield several updates, and `run` returns one at a time).
-    buffered: VecDeque<InferenceEvent>,
-    pub(crate) base_url: String,
-    pub(crate) inference: Inference,
-    pub(crate) mode: InferenceSessionMode,
-    pub(crate) responses_config: ResponsesConfig,
-    pub(crate) prompt_cache_key: PromptCacheKey,
+    config: SessionConfig,
     debug_counter: u64,
+    /// Where every event goes, tagged with the turn that produced it. Emitting
+    /// straight into the channel is what lets one frame yield several updates
+    /// without a queue in between: the channel is that queue.
+    events: tokio::sync::mpsc::UnboundedSender<(u64, InferenceEvent)>,
+    epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -294,38 +346,42 @@ impl InferenceSession {
         model: InferenceModel,
         prompt_cache_key: PromptCacheKey,
     ) -> Self {
-        Self {
-            connection: None,
-            turn: None,
-            buffered: VecDeque::new(),
+        Self::new(SessionConfig {
             base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
             inference,
             mode: InferenceSessionMode::Deep(config),
             responses_config: ResponsesConfig::deep(config, model.into()),
             prompt_cache_key,
-            debug_counter: 0,
-        }
+        })
     }
 
     pub(crate) fn new_title(inference: Inference, prompt_cache_key: PromptCacheKey) -> Self {
-        Self {
-            connection: None,
-            turn: None,
-            buffered: VecDeque::new(),
+        Self::new(SessionConfig {
             base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
             inference,
             mode: InferenceSessionMode::Title,
             responses_config: ResponsesConfig::title(),
             prompt_cache_key,
-            debug_counter: 0,
+        })
+    }
+
+    fn new(config: SessionConfig) -> Self {
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            config,
+            commands: None,
+            events,
+            events_tx,
+            awaiting: None,
+            epochs: 0,
         }
     }
 
     pub fn set_deep_config(&mut self, config: InferenceProfile, model: InferenceModel) -> bool {
-        match &mut self.mode {
+        match &mut self.config.mode {
             InferenceSessionMode::Deep(current) => {
                 *current = config;
-                self.responses_config = ResponsesConfig::deep(config, model.into());
+                self.config.responses_config = ResponsesConfig::deep(config, model.into());
                 true
             }
             InferenceSessionMode::Title => false,
@@ -333,33 +389,138 @@ impl InferenceSession {
     }
 
     pub fn prompt_cache_key(&self) -> PromptCacheKey {
-        self.prompt_cache_key
+        self.config.prompt_cache_key
     }
 
     pub fn set_prompt_cache_key(&mut self, prompt_cache_key: PromptCacheKey) {
-        self.prompt_cache_key = prompt_cache_key;
+        self.config.prompt_cache_key = prompt_cache_key;
     }
 
     pub fn has_active_request(&self) -> bool {
-        self.turn.is_some()
+        self.awaiting.is_some()
     }
 
     /// Report the advertised context window for a deep inference session.
     pub fn context_window(&self) -> Option<u64> {
-        matches!(self.mode, InferenceSessionMode::Deep(_))
-            .then(|| self.responses_config.model.info().context_window)
+        matches!(self.config.mode, InferenceSessionMode::Deep(_))
+            .then(|| self.config.responses_config.model.info().context_window)
     }
 
     /// Report the context occupancy at which the client should explicitly
     /// request compaction.
     pub fn auto_compact_token_limit(&self) -> Option<u64> {
-        matches!(self.mode, InferenceSessionMode::Deep(_))
-            .then(|| self.responses_config.model.info().auto_compact_token_limit)
+        matches!(self.config.mode, InferenceSessionMode::Deep(_)).then(|| {
+            self.config
+                .responses_config
+                .model
+                .info()
+                .auto_compact_token_limit
+        })
     }
 
-    /// Queue a turn. The work happens in `run`.
+    /// Queue a turn. The work happens in the task.
     pub fn request(&mut self, request: InferenceRequest) {
-        self.buffered.clear();
+        self.epochs += 1;
+        self.awaiting = Some(self.epochs);
+        let events_tx = self.events_tx.clone();
+        let config = self.config.clone();
+        let commands = self.commands.get_or_insert_with(|| {
+            let (commands, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(
+                SessionTask {
+                    connection: None,
+                    turn: None,
+                    config: config.clone(),
+                    debug_counter: 0,
+                    events: events_tx,
+                    epoch: 0,
+                }
+                .drive(rx),
+            );
+            commands
+        });
+        // The task outlives every individual turn, so a closed channel here
+        // means the runtime is going down and there is nothing to say about it.
+        let _ = commands.send(Command::Request {
+            epoch: self.epochs,
+            config,
+            request,
+        });
+    }
+
+    /// Abort the active turn and drop the (now indeterminate) connection.
+    pub fn abort(&mut self) {
+        self.awaiting = None;
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::Abort);
+        }
+    }
+
+    /// Take the next update for the active request.
+    ///
+    /// Cancel-safe: dropping this future loses nothing, because the work is in
+    /// the task and this only takes what the task has already produced. Pends
+    /// when there is nothing outstanding.
+    pub async fn run(&mut self) -> InferenceEvent {
+        loop {
+            let Some((epoch, event)) = self.events.recv().await else {
+                // Only reachable if the task panicked. Pending is the truthful
+                // answer — nothing further is coming — and it keeps a caller in
+                // a `select!` from spinning on the same news forever.
+                std::future::pending::<()>().await;
+                unreachable!()
+            };
+            // Whatever this belonged to has ended or been thrown away.
+            if Some(epoch) != self.awaiting {
+                continue;
+            }
+            if matches!(
+                event,
+                InferenceEvent::Finished { .. } | InferenceEvent::Failed { .. }
+            ) {
+                self.awaiting = None;
+            }
+            return event;
+        }
+    }
+}
+
+impl SessionTask {
+    /// Live for as long as the handle does, which is what the task is: the
+    /// socket has one owner and it is this.
+    ///
+    /// The only thing that interrupts `pump` is a command, and both commands
+    /// throw the connection away when a turn was in flight — so the socket is
+    /// never left half-written *and* kept. That is the invariant the whole
+    /// split exists to hold, and it is why the task may have a `select!` where
+    /// the caller may not.
+    async fn drive(mut self, mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        loop {
+            tokio::select! {
+                biased;
+                command = commands.recv() => match command {
+                    // The handle is gone, and with it anyone who could read an
+                    // event or ask for a turn.
+                    None => return,
+                    Some(Command::Abort) => self.abort(),
+                    Some(Command::Request { epoch, config, request }) => {
+                        // Replacing a turn is an abort first: `pump` may have
+                        // been mid-write when this arrived, and dropping the
+                        // connection is what makes that harmless.
+                        if self.turn.is_some() {
+                            self.abort();
+                        }
+                        self.config = config;
+                        self.epoch = epoch;
+                        self.request(request);
+                    }
+                },
+                () = self.pump() => unreachable!("the socket is never finished with"),
+            }
+        }
+    }
+
+    fn request(&mut self, request: InferenceRequest) {
         self.turn = Some(Turn {
             request,
             phase: TurnPhase::Queued {
@@ -374,32 +535,30 @@ impl InferenceSession {
         });
     }
 
-    /// Abort the active turn and drop the (now indeterminate) connection.
-    pub fn abort(&mut self) {
+    fn abort(&mut self) {
         self.turn = None;
-        self.buffered.clear();
         self.connection = None;
     }
 
-    /// Drive the connection and return the next update for the active request.
-    /// Pends, keeping any warm socket alive, when there is no active request.
-    pub async fn run(&mut self) -> InferenceEvent {
-        loop {
-            // 1. Hand out anything already parsed.
-            if let Some(update) = self.buffered.pop_front() {
-                return update;
-            }
+    /// Hand one event to whoever is listening, tagged with the turn it belongs
+    /// to. A closed channel means the handle is gone, which the command arm of
+    /// `serve` notices for itself.
+    fn emit(&self, event: InferenceEvent) {
+        let _ = self.events.send((self.epoch, event));
+    }
 
-            // 2. Send a queued envelope (connecting first if needed).
-            if self
-                .turn
-                .as_ref()
-                .is_some_and(|turn| matches!(turn.phase, TurnPhase::Queued { .. }))
+    /// Send what is queued and read what comes back, emitting as it goes.
+    /// Never returns: with nothing to send it keeps any warm socket alive, and
+    /// with no socket either it pends.
+    async fn pump(&mut self) {
+        loop {
+            // 1. Send a queued envelope (connecting first if needed). Read
+            // once: what the phase says is settled before anything below is
+            // awaited, and re-reading it afterwards only invites a second
+            // answer.
+            if let Some(TurnPhase::Queued { replay, not_before }) =
+                self.turn.as_ref().map(|turn| turn.phase)
             {
-                let not_before = self.turn.as_ref().and_then(|turn| match turn.phase {
-                    TurnPhase::Queued { not_before, .. } => not_before,
-                    TurnPhase::InFlight { .. } => None,
-                });
                 if let Some(not_before) = not_before {
                     let now = Instant::now();
                     if not_before > now {
@@ -408,16 +567,8 @@ impl InferenceSession {
                 }
                 if let Err(error) = self.ensure_connection().await {
                     self.connection = None;
-                    match self.on_turn_error(error) {
-                        ErrorAction::Retry { error, retrying_at } => {
-                            return temporary_failure(error, retrying_at);
-                        }
-                        ErrorAction::Fail(error) => {
-                            return InferenceEvent::Failed {
-                                error: error.into(),
-                            };
-                        }
-                    }
+                    self.fail_turn(error);
+                    continue;
                 }
                 let debug_sequence = self.next_debug_sequence();
                 let cached_response_id = self
@@ -425,23 +576,17 @@ impl InferenceSession {
                     .as_ref()
                     .and_then(|connection| connection.cached_response_id.as_deref())
                     .map(str::to_owned);
-                let (replay, request) = {
-                    let turn = self.turn.as_ref().unwrap();
-                    let replay = match turn.phase {
-                        TurnPhase::Queued { replay, .. } => replay,
-                        TurnPhase::InFlight { .. } => unreachable!("checked above"),
-                    };
-                    (replay, turn.request.clone())
-                };
+                let request = self.turn.as_ref().unwrap().request.clone();
                 let mut body = ResponsesRequest::from_inference_request(
-                    self,
+                    &self.config,
                     request,
                     (!replay).then_some(cached_response_id).flatten().as_deref(),
                 );
                 let connection = self.connection.as_ref().unwrap();
                 body.prompt_cache_key = self
+                    .config
                     .prompt_cache_key
-                    .to_wire_uuid(&self.base_url, connection.client_secret);
+                    .to_wire_uuid(&self.config.base_url, connection.client_secret);
                 let turn = self.turn.as_mut().unwrap();
                 turn.debug_sequence = Some(debug_sequence);
                 turn.raw_events.clear();
@@ -451,71 +596,59 @@ impl InferenceSession {
                 };
                 self.maybe_debug_write_provider_request(debug_sequence, &body);
                 if let Err(error) = self.connection.as_mut().unwrap().send_envelope(body).await {
-                    match self.on_socket_failure(error) {
-                        ControlFlow::Continue(()) => continue,
-                        ControlFlow::Break(update) => return update,
-                    }
+                    self.on_socket_failure(error);
+                    continue;
                 }
-                return InferenceEvent::RequestSent;
+                self.emit(InferenceEvent::RequestSent);
             }
 
-            // 3. Read the socket. With no connection and nothing to send we are idle with
+            // 2. Read the socket. With no connection and nothing to send we are idle with
             //    nothing to keep warm, so pend.
             if self.connection.is_none() {
                 std::future::pending::<()>().await;
             }
-            let active = self.turn.is_some();
-            let timeout = active.then_some(ws::EVENT_TIMEOUT);
-            let read = {
-                let connection = self.connection.as_mut().unwrap();
-                match connection.next_message(timeout).await {
-                    Ok(Some(message)) => Read::Message(message),
-                    Ok(None) => Read::Closed(anyhow::anyhow!(
-                        "stream error: websocket ended before response.completed"
-                    )),
-                    Err(error) => Read::Failed(error),
-                }
-            };
+            // A turn bounds how long silence is allowed to last; an idle warm
+            // socket may be quiet forever.
+            let timeout = self.turn.is_some().then_some(ws::EVENT_TIMEOUT);
+            // Read to a value first, so the borrow of the connection is over
+            // before anything below reaches for it again.
+            let read = self
+                .connection
+                .as_mut()
+                .unwrap()
+                .next_message(timeout)
+                .await
+                .and_then(|message| {
+                    message.ok_or_else(|| {
+                        anyhow::anyhow!("stream error: websocket ended before response.completed")
+                    })
+                });
 
             match read {
-                Read::Message(WsMessage::Text(text)) => {
-                    if let ControlFlow::Break(update) = self.apply_text(text.as_ref()) {
-                        return update;
+                Ok(WsMessage::Text(text)) => self.apply_text(text.as_ref()),
+                Ok(WsMessage::Ping(payload)) => {
+                    if let Err(error) = self.connection.as_mut().unwrap().pong(payload).await {
+                        self.on_socket_failure(error);
                     }
                 }
-                Read::Message(WsMessage::Ping(payload)) => {
-                    if let Err(error) = self.connection.as_mut().unwrap().pong(payload).await
-                        && let ControlFlow::Break(update) = self.on_socket_failure(error)
-                    {
-                        return update;
-                    }
-                }
-                Read::Message(WsMessage::Close(_)) => {
-                    if let ControlFlow::Break(update) = self.on_socket_failure(anyhow::anyhow!(
-                        "stream error: websocket closed mid-stream"
-                    )) {
-                        return update;
-                    }
-                }
-                Read::Message(WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_)) => {}
-                Read::Closed(error) | Read::Failed(error) => {
-                    if let ControlFlow::Break(update) = self.on_socket_failure(error) {
-                        return update;
-                    }
-                }
+                Ok(WsMessage::Close(_)) => self.on_socket_failure(anyhow::anyhow!(
+                    "stream error: websocket closed mid-stream"
+                )),
+                Ok(WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_)) => {}
+                Err(error) => self.on_socket_failure(error),
             }
         }
     }
 
-    /// Apply one text frame to the active turn's accumulator, buffering the
-    /// updates it produces. `Break` carries an update to surface from `run`.
-    fn apply_text(&mut self, text: &str) -> ControlFlow<InferenceEvent> {
+    /// Apply one text frame to the active turn's accumulator and emit whatever
+    /// it produces — which may be nothing, or several updates at once.
+    fn apply_text(&mut self, text: &str) {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(text) else {
-            return ControlFlow::Continue(());
+            return;
         };
         // Ignore stray frames while idle (no response is in flight).
         if self.turn.is_none() {
-            return ControlFlow::Continue(());
+            return;
         }
         let outcome = {
             let turn = self.turn.as_mut().unwrap();
@@ -523,24 +656,17 @@ impl InferenceSession {
             turn.response.apply_event(&event)
         };
         match outcome {
-            Err(error) => match self.on_turn_error(error) {
-                ErrorAction::Retry { error, retrying_at } => {
-                    ControlFlow::Break(temporary_failure(error, retrying_at))
-                }
-                ErrorAction::Fail(error) => ControlFlow::Break(InferenceEvent::Failed {
-                    error: error.into(),
-                }),
-            },
+            Err(error) => self.fail_turn(error),
             Ok((done, updates)) => {
                 // Announce the first streamed content of the turn once.
                 let turn = self.turn.as_mut().unwrap();
-                if !turn.streaming_started
+                let starting = !turn.streaming_started
                     && updates
                         .iter()
-                        .any(|update| matches!(update, InferenceEvent::ContextItem { .. }))
-                {
-                    turn.streaming_started = true;
-                    self.buffered.push_back(InferenceEvent::StreamingStarted);
+                        .any(|update| matches!(update, InferenceEvent::ContextItem { .. }));
+                turn.streaming_started |= starting;
+                if starting {
+                    self.emit(InferenceEvent::StreamingStarted);
                 }
                 // The terminal `InferenceUpdate::Finished` is emitted by
                 // `apply_event` itself, so here we just drop the finished turn.
@@ -575,14 +701,22 @@ impl InferenceSession {
                         reset_at_unix,
                     } = update
                     {
-                        self.inference.observe_quota(*used_percent, *reset_at_unix);
+                        self.config
+                            .inference
+                            .observe_quota(*used_percent, *reset_at_unix);
                     }
                 }
-                self.buffered.extend(updates);
+                for update in updates {
+                    self.emit(update);
+                }
                 if done {
-                    let debug = turn
-                        .debug_sequence
-                        .map(|sequence| (sequence, turn.raw_events.clone()));
+                    // Re-read rather than hold a borrow across the emits above:
+                    // the events go out first, and this runs once per turn
+                    // rather than once per frame.
+                    let debug = self.turn.as_ref().and_then(|turn| {
+                        turn.debug_sequence
+                            .map(|sequence| (sequence, turn.raw_events.clone()))
+                    });
                     self.turn = None;
                     if let Some(connection) = self.connection.as_mut() {
                         connection.cached_response_id = response_id;
@@ -591,26 +725,30 @@ impl InferenceSession {
                         self.maybe_debug_write_provider_response(sequence, &raw_events, None);
                     }
                 }
-                ControlFlow::Continue(())
             }
         }
     }
 
     /// A read/write failure: replay or fail the active turn, or just drop the
-    /// dead socket when idle. `Break` carries the update to return from `run`.
-    fn on_socket_failure(&mut self, error: anyhow::Error) -> ControlFlow<InferenceEvent> {
-        if self.turn.is_some() {
-            match self.on_turn_error(error) {
-                ErrorAction::Retry { error, retrying_at } => {
-                    ControlFlow::Break(temporary_failure(error, retrying_at))
-                }
-                ErrorAction::Fail(error) => ControlFlow::Break(InferenceEvent::Failed {
-                    error: error.into(),
-                }),
+    /// dead socket when idle.
+    fn on_socket_failure(&mut self, error: anyhow::Error) {
+        match self.turn.is_some() {
+            true => self.fail_turn(error),
+            // Nothing to fail, so the dead socket is the whole of it.
+            false => self.connection = None,
+        }
+    }
+
+    /// Say what a failed turn sounds like: a recoverable failure if it is being
+    /// retried internally, and a final one if it is not.
+    fn fail_turn(&mut self, error: anyhow::Error) {
+        match self.on_turn_error(error) {
+            ErrorAction::Retry { error, retrying_at } => {
+                self.emit(temporary_failure(error, retrying_at))
             }
-        } else {
-            self.connection = None;
-            ControlFlow::Continue(())
+            ErrorAction::Fail(error) => self.emit(InferenceEvent::Failed {
+                error: error.into(),
+            }),
         }
     }
 
@@ -691,7 +829,7 @@ impl InferenceSession {
 
     fn maybe_debug_write_provider_request(&self, sequence: u64, body: &ResponsesRequest) {
         let metadata = serde_json::json!({
-            "prompt_cache_key": self.prompt_cache_key.debug_file_stem(),
+            "prompt_cache_key": self.config.prompt_cache_key.debug_file_stem(),
             "sequence": sequence,
             "kind": "request",
             "backend": "responses",
@@ -701,7 +839,7 @@ impl InferenceSession {
         });
         if let Err(error) = self.debug_write_json(sequence, "request", &metadata) {
             tracing::warn!(
-                prompt_cache_key = %self.prompt_cache_key.debug_file_stem(),
+                prompt_cache_key = %self.config.prompt_cache_key.debug_file_stem(),
                 sequence,
                 "failed to write provider request debug log: {error}",
             );
@@ -715,7 +853,7 @@ impl InferenceSession {
         error: Option<&str>,
     ) {
         let metadata = serde_json::json!({
-            "prompt_cache_key": self.prompt_cache_key.debug_file_stem(),
+            "prompt_cache_key": self.config.prompt_cache_key.debug_file_stem(),
             "sequence": sequence,
             "kind": "response",
             "backend": "responses",
@@ -725,7 +863,7 @@ impl InferenceSession {
         });
         if let Err(error) = self.debug_write_json(sequence, "response", &metadata) {
             tracing::warn!(
-                prompt_cache_key = %self.prompt_cache_key.debug_file_stem(),
+                prompt_cache_key = %self.config.prompt_cache_key.debug_file_stem(),
                 sequence,
                 "failed to write provider response debug log: {error}",
             );
@@ -742,7 +880,11 @@ impl InferenceSession {
             return Ok(());
         };
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(debug_file_name(self.prompt_cache_key, sequence, kind));
+        let path = dir.join(debug_file_name(
+            self.config.prompt_cache_key,
+            sequence,
+            kind,
+        ));
         std::fs::write(path, serde_json::to_vec_pretty(metadata)?)?;
         Ok(())
     }
@@ -763,7 +905,7 @@ impl InferenceSession {
     /// Ensure a usable connection, reopening when missing, when OAuth rotated
     /// the bearer, or when nearing the server's age cap.
     async fn ensure_connection(&mut self) -> Result<()> {
-        let auth = self.inference.auth().clone();
+        let auth = self.config.inference.auth().clone();
         let resolved = tokio::task::spawn_blocking(move || auth.resolve()).await??;
         let reusable = self.connection.as_ref().is_some_and(|connection| {
             connection.bearer_token == resolved.bearer_token
@@ -775,11 +917,12 @@ impl InferenceSession {
                 .as_ref()
                 .filter(|turn| matches!(turn.phase, TurnPhase::Queued { .. }))
                 .map(|_| {
-                    self.prompt_cache_key
-                        .to_wire_uuid(&self.base_url, resolved.client_secret)
+                    self.config
+                        .prompt_cache_key
+                        .to_wire_uuid(&self.config.base_url, resolved.client_secret)
                         .to_string()
                 });
-            let request = ws::build_ws_request(self, thread_id.as_deref(), &resolved)?;
+            let request = ws::build_ws_request(&self.config, thread_id.as_deref(), &resolved)?;
             let (socket, _response) = connect_async(request).await?;
             self.connection = Some(WebSocketConnection::new(socket, &resolved));
         }
@@ -805,12 +948,6 @@ pub(crate) fn debug_file_name(
         "{}-{sequence:04}-{kind}.json",
         prompt_cache_key.debug_file_stem()
     )
-}
-
-enum Read {
-    Message(WsMessage),
-    Closed(anyhow::Error),
-    Failed(anyhow::Error),
 }
 
 enum ErrorAction {
@@ -867,11 +1004,11 @@ fn temporary_failure(error: anyhow::Error, retrying_at: Instant) -> InferenceEve
 impl std::fmt::Debug for InferenceSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InferenceSession")
-            .field("base_url", &self.base_url)
-            .field("inference", &self.inference)
-            .field("mode", &self.mode)
-            .field("responses_config", &self.responses_config)
-            .field("prompt_cache_key", &self.prompt_cache_key)
+            .field("base_url", &self.config.base_url)
+            .field("inference", &self.config.inference)
+            .field("mode", &self.config.mode)
+            .field("responses_config", &self.config.responses_config)
+            .field("prompt_cache_key", &self.config.prompt_cache_key)
             .finish()
     }
 }

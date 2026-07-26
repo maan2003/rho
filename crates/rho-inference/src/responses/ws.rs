@@ -10,8 +10,9 @@ use tokio_tungstenite::tungstenite::http::HeaderMap;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::oauth::ResolvedAuth;
+use super::session::SessionConfig;
 use super::wire::ResponsesRequest;
-use super::{InferenceSession, OPENAI_BETA_WS, responses_url};
+use super::{OPENAI_BETA_WS, responses_url};
 
 /// How long an active turn may go without any provider event before we treat
 /// the socket as wedged and fail the turn. Not applied while idle.
@@ -141,7 +142,7 @@ pub(crate) struct WsResponseCreate {
 }
 
 pub(crate) fn build_ws_request(
-    session: &InferenceSession,
+    session: &SessionConfig,
     thread_id: Option<&str>,
     auth: &ResolvedAuth,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
@@ -163,7 +164,7 @@ pub(crate) fn build_ws_request(
     Ok(request)
 }
 
-fn build_ws_url(session: &InferenceSession) -> Result<String> {
+fn build_ws_url(session: &SessionConfig) -> Result<String> {
     let url = responses_url(&session.base_url);
     if let Some(rest) = url.strip_prefix("https://") {
         Ok(format!("wss://{rest}"))

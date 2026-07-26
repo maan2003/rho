@@ -284,7 +284,7 @@ fn test_inference_service_with(
         InferenceModel::Gpt55,
         prompt_cache_key,
     );
-    session.responses_config = super::session::ResponsesConfig {
+    session.config.responses_config = super::session::ResponsesConfig {
         model: ResponsesModel::Test(model.into()),
         auto_compaction,
         reasoning_context: super::session::ReasoningContext::AllTurns,

@@ -14,9 +14,8 @@ use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::InferenceSession;
 use super::session::{
-    AutoCompaction, ReasoningContext, ResponsesEffort, ServiceTier, TextVerbosity,
+    AutoCompaction, ReasoningContext, ResponsesEffort, ServiceTier, SessionConfig, TextVerbosity,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -113,7 +112,7 @@ pub(crate) struct ContextManagementRequest {
 
 impl ResponsesRequest {
     pub(crate) fn from_inference_request(
-        session: &InferenceSession,
+        session: &SessionConfig,
         request: InferenceRequest,
         cached_response_id: Option<&str>,
     ) -> Self {
@@ -149,7 +148,7 @@ impl ResponsesRequest {
     }
 
     fn from_inference_request_with_previous(
-        session: &InferenceSession,
+        session: &SessionConfig,
         request: InferenceRequest,
         previous_response: Option<(String, usize)>,
     ) -> Self {

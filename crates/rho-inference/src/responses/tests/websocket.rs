@@ -36,10 +36,10 @@ fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
         PromptCacheKey::from_bytes(*b"testkey1"),
         None,
     );
-    session.base_url = "https://chatgpt.com/backend-api".to_owned();
+    session.config.base_url = "https://chatgpt.com/backend-api".to_owned();
 
-    let auth = session.inference.auth().resolve().unwrap();
-    let request = build_ws_request(&session, Some("thread-1"), &auth).unwrap();
+    let auth = session.config.inference.auth().resolve().unwrap();
+    let request = build_ws_request(&session.config, Some("thread-1"), &auth).unwrap();
 
     assert_eq!(
         request.uri(),
@@ -62,8 +62,8 @@ fn websocket_request_uses_oauth_bearer_without_account_header() {
         None,
     );
 
-    let auth = session.inference.auth().resolve().unwrap();
-    let request = build_ws_request(&session, None, &auth).unwrap();
+    let auth = session.config.inference.auth().resolve().unwrap();
+    let request = build_ws_request(&session.config, None, &auth).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer sk-test");
     assert!(!request.headers().contains_key("chatgpt-account-id"));
@@ -87,10 +87,10 @@ fn websocket_request_uses_oauth_file_credentials() {
         PromptCacheKey::from_bytes(*b"testkey1"),
         None,
     );
-    session.base_url = "https://chatgpt.com/backend-api".to_owned();
+    session.config.base_url = "https://chatgpt.com/backend-api".to_owned();
 
-    let auth = session.inference.auth().resolve().unwrap();
-    let request = build_ws_request(&session, Some("thread-1"), &auth).unwrap();
+    let auth = session.config.inference.auth().resolve().unwrap();
+    let request = build_ws_request(&session.config, Some("thread-1"), &auth).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer oauth-access");
     assert_eq!(request.headers()["chatgpt-account-id"], "acct_file");
