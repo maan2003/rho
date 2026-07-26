@@ -1730,3 +1730,103 @@ fn edits_under_overlapping_elisions_keep_the_block_map_consistent(cx: &mut TestA
         "the edit should render: {text:?}"
     );
 }
+
+/// A turn of your own is a couple of lines in a thousand, so it renders
+/// larger than the transcript around it - the one cue that survives being
+/// seen out of the corner of an eye while scrolling.
+#[gpui::test]
+fn user_messages_render_larger_than_the_transcript_around_them(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("my question")],
+            vec![assistant("the answer", Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    let lines = display_text(&workspace, cx);
+    let row_of = |needle: &str| {
+        lines
+            .lines()
+            .position(|line| line.contains(needle))
+            .map(|row| editor::display_map::DisplayRow(row as u32))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen: {lines:?}"))
+    };
+    let (question, answer) = (row_of("my question"), row_of("the answer"));
+
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                assert_eq!(
+                    snapshot.row_scale(question),
+                    crate::style::USER_MESSAGE_SCALE,
+                    "the user's own turn renders larger"
+                );
+                assert_eq!(
+                    snapshot.row_scale(answer),
+                    1.0,
+                    "everything else renders at the transcript's size"
+                );
+            })
+        })
+        .expect("read display snapshot");
+}
+
+/// Every row of a user message scales, not just the one its anchor starts
+/// on, and the mapping survives the folds that conceal markdown markup -
+/// which shift display rows out of step with buffer rows.
+#[gpui::test]
+fn every_row_of_a_user_message_renders_larger(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("first line\nsecond line\nthird line")],
+            vec![assistant(
+                "## Heading\n\n**bold** answer\n",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    let lines = display_text(&workspace, cx);
+    let row_of = |needle: &str| {
+        lines
+            .lines()
+            .position(|line| line.contains(needle))
+            .map(|row| editor::display_map::DisplayRow(row as u32))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen: {lines:?}"))
+    };
+    let mine = ["first line", "second line", "third line"].map(row_of);
+    let theirs = ["Heading", "bold answer"].map(row_of);
+
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                for row in mine {
+                    assert_eq!(
+                        snapshot.row_scale(row),
+                        crate::style::USER_MESSAGE_SCALE,
+                        "every row of the user's turn renders larger: {lines:?}"
+                    );
+                }
+                for row in theirs {
+                    assert_eq!(
+                        snapshot.row_scale(row),
+                        1.0,
+                        "the answer renders at the transcript's size: {lines:?}"
+                    );
+                }
+            })
+        })
+        .expect("read display snapshot");
+}

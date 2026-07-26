@@ -9,23 +9,23 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-extension = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
-fs = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+extension = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
+fs = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
 futures.workspace = true
-gpui = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa", default-features = false }
-gpui_platform = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa", default-features = false, features = [
+gpui = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a", default-features = false }
+gpui_platform = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a", default-features = false, features = [
   "font-kit",
 ] }
-gpui_tokio = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
-http_client = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
-language = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+gpui_tokio = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
+http_client = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
+language = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
 log = "0.4"
-node_runtime = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+node_runtime = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
 prost = "0.9"
-release_channel = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
-remote = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
-remote_server = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
-rpc = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+release_channel = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
+remote = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
+remote_server = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
+rpc = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
 semver = { version = "1.0", features = ["serde"] }
-settings = { git = "https://github.com/maan2003/zed", rev = "73c7baaa94aa" }
+settings = { git = "https://github.com/maan2003/zed", rev = "600d0450c73a" }
 worktree.workspace = true

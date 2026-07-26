@@ -10,6 +10,31 @@ use editor::HighlightKey;
 use gpui::{App, FontWeight, HighlightStyle, Hsla};
 use theme::ActiveTheme as _;
 
+/// How much larger a user message renders than everything around it.
+///
+/// A transcript is mostly agent prose and tool output, and a turn of your own
+/// is a couple of lines in a thousand: color alone does not find it when you
+/// are scrolling. Size does, because it survives being seen out of the corner
+/// of an eye, which is how a transcript is actually read.
+///
+/// Row height does not vary with this - the editor's rows are uniform - so
+/// the transcript pays for it in leading on every other row. See
+/// [`transcript_line_height`].
+pub const USER_MESSAGE_SCALE: f32 = 1.25;
+
+/// The line height a transcript needs to fit its largest rows.
+///
+/// Rows are uniform, so they are sized for the biggest text in the document
+/// rather than for the text in each one. Every row gives up the difference as
+/// leading, which is the standing cost of [`USER_MESSAGE_SCALE`].
+pub fn transcript_line_height(cx: &App) -> gpui::DefiniteLength {
+    use settings::Settings as _;
+    let configured = theme_settings::ThemeSettings::get_global(cx)
+        .buffer_line_height
+        .value();
+    gpui::DefiniteLength::Fraction(configured * USER_MESSAGE_SCALE)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoleFamily {
     Deep,

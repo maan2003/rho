@@ -536,6 +536,20 @@ impl TranscriptModel {
                 attachment.elisions = ElisionState::default();
                 attachment.conceal = ConcealState::default();
             }
+            // Scale rows before anything lays them out: the wrap map sizes a
+            // row when it wraps it, and highlights, inlays and folds below
+            // all take display snapshots.
+            if let Some(ranges) = &gutter_anchor_ranges {
+                let snapshot = attachment.multi_buffer.read(cx).snapshot(cx);
+                let scales = ranges
+                    .iter()
+                    .filter(|(class, _)| *class == StyleClass::UserMessage)
+                    .filter_map(|(_, range)| excerpt_range(&snapshot, range))
+                    .map(|range| (range, crate::style::USER_MESSAGE_SCALE))
+                    .collect::<Vec<_>>();
+                let display_map = editor.read(cx).display_map.clone();
+                display_map.update(cx, |display_map, _| display_map.set_row_scales(scales));
+            }
             let (history_styles, live_styles) = if refresh {
                 (&full_history_styles, &full_live_styles)
             } else {

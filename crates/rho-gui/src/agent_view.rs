@@ -146,6 +146,10 @@ impl AgentModel {
                 cx,
             );
             crate::editor_config::configure(&mut editor, window, cx);
+            editor.set_text_style_refinement(gpui::TextStyleRefinement {
+                line_height: Some(crate::style::transcript_line_height(cx)),
+                ..Default::default()
+            });
             editor.disable_header_for_buffer(transcript_id, cx);
             editor.disable_header_for_buffer(system_id, cx);
             editor.set_read_only(true);
@@ -181,6 +185,10 @@ impl AgentModel {
                 cx,
             );
             crate::editor_config::configure(&mut editor, window, cx);
+            editor.set_text_style_refinement(gpui::TextStyleRefinement {
+                line_height: Some(crate::style::transcript_line_height(cx)),
+                ..Default::default()
+            });
             editor.disable_header_for_buffer(transcript_id, cx);
             editor.disable_header_for_buffer(system_id, cx);
             editor.disable_header_for_buffer(prompt_id, cx);
