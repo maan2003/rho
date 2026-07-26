@@ -17,23 +17,16 @@ use theme::ActiveTheme as _;
 /// are scrolling. Size does, because it survives being seen out of the corner
 /// of an eye, which is how a transcript is actually read.
 ///
-/// Row height does not vary with this - the editor's rows are uniform - so
-/// the transcript pays for it in leading on every other row. See
-/// [`transcript_line_height`].
-pub const USER_MESSAGE_SCALE: f32 = 1.25;
-
-/// The line height a transcript needs to fit its largest rows.
+/// A little goes a long way: this is 18px against the default 16px buffer
+/// font, which reads as a different weight of message from across the screen
+/// without turning your own words into a headline.
 ///
-/// Rows are uniform, so they are sized for the biggest text in the document
-/// rather than for the text in each one. Every row gives up the difference as
-/// leading, which is the standing cost of [`USER_MESSAGE_SCALE`].
-pub fn transcript_line_height(cx: &App) -> gpui::DefiniteLength {
-    use settings::Settings as _;
-    let configured = theme_settings::ThemeSettings::get_global(cx)
-        .buffer_line_height
-        .value();
-    gpui::DefiniteLength::Fraction(configured * USER_MESSAGE_SCALE)
-}
+/// Row height does not vary with this - the editor's rows are uniform - so a
+/// scaled row keeps the transcript's leading rather than getting its own.
+/// Scaling the editor's line height to fit instead would spend the leading on
+/// every row of the document, including the ones you are writing, which is a
+/// worse deal than a tight row on the few rows that are large.
+pub const USER_MESSAGE_SCALE: f32 = 1.125;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoleFamily {
