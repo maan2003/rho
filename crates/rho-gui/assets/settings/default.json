@@ -53,11 +53,11 @@
   "buffer_line_height": {
     "custom": 1.2,
   },
-  // The name of a font to use for rendering text in the UI
-  // You can set this to ".SystemUIFont" to use the system font
-  // ".ZedSans" currently aliases to "IBM Plex Sans", but this may
-  // change in the future
-  "ui_font_family": ".ZedMono",
+  // The name of a font to use for rendering text in the UI.
+  // The same bundled "Rho Font" the buffers use: rho's chrome is a
+  // status line and a few chips beside a transcript, so a second
+  // typeface would only be noticed for disagreeing with the first.
+  "ui_font_family": "Rho Font",
   // Set the UI's font fallbacks, this will be merged with the platform's
   // default font fallbacks.
   "ui_font_fallbacks": null,
