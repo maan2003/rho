@@ -3594,25 +3594,18 @@ impl Workspace {
                 .reset_at_unix
                 .map(|reset| ((reset as f64 - now).max(0.0)) / 86_400.0)
                 .unwrap_or(0.0);
-            let provider_color: gpui::Hsla = if summary.model == "fable" {
-                gpui::rgb(0xd97757).into()
-            } else {
-                colors.terminal_ansi_cyan.into()
+            let provider_color: gpui::Hsla = match summary.model.as_str() {
+                "claude" => colors.terminal_ansi_magenta.into(),
+                "fable" => gpui::rgb(0xd97757).into(),
+                _ => colors.terminal_ansi_cyan.into(),
             };
             stats = stats
                 .child(
                     div()
                         .text_color(provider_color)
-                        .child(if summary.model == "fable" {
-                            "claude".to_owned()
-                        } else {
-                            summary.model.clone()
-                        }),
+                        .child(summary.model.clone()),
                 )
-                .child(format!(
-                    "{}% −{}% {:.1}d",
-                    summary.remaining_percent, summary.burn_2h, days
-                ));
+                .child(format!("{}% {:.1}d", summary.remaining_percent, days));
         }
         div()
             .w_full()

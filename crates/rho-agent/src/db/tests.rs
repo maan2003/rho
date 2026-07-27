@@ -226,6 +226,12 @@ async fn quota_history_deduplicates_unchanged_samples() {
         ..sample.clone()
     }));
     assert!(write.record_quota_observation(QuotaObservationRecord {
+        model: QuotaModel::CLAUDE,
+        observed_at: UnixMs(3),
+        used_percent: 30,
+        ..sample.clone()
+    }));
+    assert!(write.record_quota_observation(QuotaObservationRecord {
         model: QuotaModel::FABLE,
         observed_at: UnixMs(3),
         used_percent: 40,
@@ -237,6 +243,14 @@ async fn quota_history_deduplicates_unchanged_samples() {
     assert_eq!(history.len(), 3);
     assert_eq!(history[0].used_percent, 20);
     assert_eq!(history[2].used_percent, 22);
+    assert_eq!(
+        db.read().quota_observations(QuotaModel::CLAUDE, UnixMs(0))[0].used_percent,
+        30
+    );
+    assert_eq!(
+        db.read().quota_observations(QuotaModel::FABLE, UnixMs(0))[0].used_percent,
+        40
+    );
 
     // A bounded reverse read returns only the horizon and one baseline,
     // without crossing into another model's key range.

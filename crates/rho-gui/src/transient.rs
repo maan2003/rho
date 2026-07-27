@@ -159,6 +159,7 @@ impl Transient {
             let series = series.clone();
             let days = self.usage_days;
             let gpt: Hsla = colors.terminal_ansi_cyan.into();
+            let claude: Hsla = colors.terminal_ansi_magenta.into();
             let fable: Hsla = rgb(0xd97757).into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
             return bottom_strip(text_style, cx)
@@ -174,7 +175,8 @@ impl Transient {
                         .gap_4()
                         .px_2()
                         .child(div().text_color(gpt).child("gpt"))
-                        .child(div().text_color(fable).child("claude")),
+                        .child(div().text_color(claude).child("claude"))
+                        .child(div().text_color(fable).child("fable")),
                 )
                 .child(
                     div().px_2().pb_1().child(
@@ -199,10 +201,9 @@ impl Transient {
                                     .flex()
                                     .flex_col()
                                     .child(
-                                        div()
-                                            .w(px(832.))
-                                            .h(px(240.))
-                                            .child(usage_chart(series, days, gpt, fable, grid)),
+                                        div().w(px(832.)).h(px(240.)).child(usage_chart(
+                                            series, days, gpt, claude, fable, grid,
+                                        )),
                                     )
                                     .child(
                                         div()
@@ -485,6 +486,7 @@ fn usage_chart(
     series: Vec<rho_ui_proto::QuotaSeries>,
     days: u64,
     gpt: Hsla,
+    claude: Hsla,
     fable: Hsla,
     grid: Hsla,
 ) -> impl IntoElement {
@@ -505,7 +507,11 @@ fn usage_chart(
             let now = crate::workspace::now_ms();
             let start = now.saturating_sub(days * 24 * 60 * 60 * 1_000);
             for model in &series {
-                let color = if model.model == "fable" { fable } else { gpt };
+                let color = match model.model.as_str() {
+                    "claude" => claude,
+                    "fable" => fable,
+                    _ => gpt,
+                };
                 let mut segment = Vec::new();
                 let mut previous: Option<&rho_ui_proto::QuotaPoint> = None;
                 for sample in &model.points {

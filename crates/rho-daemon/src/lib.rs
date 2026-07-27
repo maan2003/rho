@@ -2098,6 +2098,7 @@ fn spawn_attention_watcher(
                     let model = match observation.model.as_str() {
                         "gpt" => QuotaModel::GPT,
                         "fable" => QuotaModel::FABLE,
+                        "claude" => QuotaModel::CLAUDE,
                         _ => continue,
                     };
                     let provider = match observation.provider {
@@ -2159,7 +2160,7 @@ fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
     let now = rho_core::UnixMs::now().0;
     let since = rho_core::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
     let read = db.read();
-    [QuotaModel::GPT, QuotaModel::FABLE]
+    [QuotaModel::GPT, QuotaModel::CLAUDE, QuotaModel::FABLE]
         .into_iter()
         .filter_map(|model| {
             let observations = read.quota_observations(model, since);
@@ -2194,7 +2195,7 @@ fn quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
     let now = rho_core::UnixMs::now().0;
     let since = rho_core::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
     let read = db.read();
-    [QuotaModel::GPT, QuotaModel::FABLE]
+    [QuotaModel::GPT, QuotaModel::CLAUDE, QuotaModel::FABLE]
         .into_iter()
         .filter_map(|model| {
             let points = read
@@ -3656,6 +3657,13 @@ mod tests {
                 reset_at_unix: Some(123),
             }));
         }
+        assert!(write.record_quota_observation(QuotaObservationRecord {
+            provider: QuotaProvider::Claude,
+            model: QuotaModel::CLAUDE,
+            observed_at: rho_core::UnixMs(now),
+            used_percent: 25,
+            reset_at_unix: Some(456),
+        }));
         write.commit();
 
         let history = quota_history(&db);
@@ -3668,6 +3676,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [100, 99, 98, 97, 96]
         );
+        let claude = history
+            .iter()
+            .find(|series| series.model == "claude")
+            .unwrap();
+        assert_eq!(claude.points[0].remaining_percent, 75);
     }
 
     fn environment_value<'a>(

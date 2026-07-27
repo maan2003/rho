@@ -1193,18 +1193,11 @@ impl ClaudeLoop {
             }
             rho_claude::ClaudeEvent::RateLimitEvent(event) => {
                 let info = event.rate_limit_info;
-                if info
-                    .rate_limit_type
-                    .as_deref()
-                    .is_some_and(|kind| kind.contains("seven_day"))
+                let model = claude_weekly_quota_model(info.rate_limit_type.as_deref());
+                if let Some(model) = model
                     && let Some(utilization) = info.utilization
                     && utilization.is_finite()
                 {
-                    let model = match self.model {
-                        Model::Fable => "fable",
-                        Model::Opus => "opus",
-                        Model::Sonnet => "sonnet",
-                    };
                     self.state.write().expect("poison").quota_observation =
                         Some(crate::QuotaObservation {
                             provider: crate::QuotaProvider::Claude,
@@ -1523,6 +1516,14 @@ fn remove_compact_commands(inputs: &mut InputQueues) {
     });
 }
 
+fn claude_weekly_quota_model(rate_limit_type: Option<&str>) -> Option<&'static str> {
+    match rate_limit_type {
+        Some("seven_day") => Some("claude"),
+        Some("seven_day_fable") => Some("fable"),
+        _ => None,
+    }
+}
+
 fn promote_queued_user_message(state: &mut AgentState, content: &[ContentPart]) -> bool {
     let matched = state.queued_inputs.remove_first(|queued| {
         matches!(
@@ -1553,6 +1554,17 @@ fn is_compact_command(content: &[ContentPart]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weekly_quota_uses_the_provider_bucket_not_the_running_model() {
+        assert_eq!(claude_weekly_quota_model(Some("seven_day")), Some("claude"));
+        assert_eq!(
+            claude_weekly_quota_model(Some("seven_day_fable")),
+            Some("fable")
+        );
+        assert_eq!(claude_weekly_quota_model(Some("five_hour")), None);
+        assert_eq!(claude_weekly_quota_model(Some("seven_day_opus")), None);
+    }
 
     fn text(text: &str) -> Arc<Vec<ContentPart>> {
         Arc::new(vec![ContentPart::Text {
