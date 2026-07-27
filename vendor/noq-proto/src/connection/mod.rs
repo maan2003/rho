@@ -901,6 +901,28 @@ impl Connection {
         Ok(prev)
     }
 
+    /// Overrides the negotiated connection-wide idle timeout.
+    ///
+    /// Both peers must coordinate this out of band: QUIC transport parameters
+    /// themselves are immutable after the handshake. An armed timer preserves
+    /// its last-activity origin when the duration changes.
+    pub fn set_max_idle_timeout(
+        &mut self,
+        now: Instant,
+        timeout: Option<Duration>,
+    ) -> Option<Duration> {
+        let prev = std::mem::replace(&mut self.idle_timeout, timeout);
+        let timer = Timer::Conn(ConnTimer::Idle);
+        if self.state.is_closed() || timeout.is_none() {
+            self.timers.stop(timer, self.qlog.with_time(now));
+        } else if let Some(timeout) = timeout {
+            let deadline =
+                updated_idle_timeout_deadline(now, prev, self.timers.get(timer), timeout);
+            self.timers.set(timer, deadline, self.qlog.with_time(now));
+        }
+        prev
+    }
+
     /// Sets the keep_alive_interval for a specific path
     ///
     /// See [`TransportConfig::default_path_keep_alive_interval`] for details.
@@ -2668,6 +2690,8 @@ impl Connection {
             // Add<PathStats> for ConnectionStats`.
             stats += *path_stats;
         }
+
+        stats.authenticated_packets = self.total_authed_packets;
 
         stats
     }
@@ -7861,9 +7885,56 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
     }
 }
 
+fn updated_idle_timeout_deadline(
+    now: Instant,
+    previous_timeout: Option<Duration>,
+    previous_deadline: Option<Instant>,
+    timeout: Duration,
+) -> Instant {
+    match (previous_timeout, previous_deadline) {
+        (Some(previous_timeout), Some(previous_deadline)) => {
+            previous_deadline
+                .checked_sub(previous_timeout)
+                .unwrap_or(now)
+                + timeout
+        }
+        _ => now + timeout,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_timeout_override_preserves_last_activity() {
+        let now = Instant::now();
+        let old = Duration::from_secs(30);
+        let old_deadline = now + Duration::from_secs(20);
+
+        assert_eq!(
+            updated_idle_timeout_deadline(
+                now,
+                Some(old),
+                Some(old_deadline),
+                Duration::from_secs(600),
+            ),
+            now + Duration::from_secs(590),
+        );
+        assert_eq!(
+            updated_idle_timeout_deadline(
+                now,
+                Some(old),
+                Some(old_deadline),
+                Duration::from_secs(5),
+            ),
+            now.checked_sub(Duration::from_secs(5)).unwrap(),
+        );
+        assert_eq!(
+            updated_idle_timeout_deadline(now, None, None, Duration::from_secs(600)),
+            now + Duration::from_secs(600),
+        );
+    }
 
     #[test]
     fn negotiate_max_idle_timeout_commutative() {

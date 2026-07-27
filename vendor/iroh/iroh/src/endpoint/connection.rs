@@ -1111,6 +1111,15 @@ impl<T: ConnectionState> Connection<T> {
 }
 
 impl Connection<HandshakeCompleted> {
+    /// Overrides the max idle timeout negotiated during the QUIC handshake.
+    ///
+    /// Application protocols must coordinate the same value on both peers.
+    /// Returns the previous value.
+    #[inline]
+    pub fn set_max_idle_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
+        self.inner.set_max_idle_timeout(timeout)
+    }
+
     /// Extracts the ALPN protocol from the peer's handshake data.
     pub fn alpn(&self) -> &[u8] {
         &self.data.info.alpn

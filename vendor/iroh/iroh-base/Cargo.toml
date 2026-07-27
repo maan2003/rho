@@ -11,8 +11,8 @@ repository = "https://github.com/n0-computer/iroh"
 # Sadly this also needs to be updated in .github/workflows/ci.yml
 rust-version = "1.91"
 
-[lints]
-workspace = true
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(iroh_docsrs)"] }
 
 [dependencies]
 curve25519-dalek = { version = "=5.0.0-rc.0", features = ["serde", "rand_core", "zeroize"], optional = true }

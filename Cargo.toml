@@ -172,3 +172,4 @@ inherits = "release"
 # `noq` exposes the API and `noq-proto` owns the packet scheduler.
 noq = { path = "vendor/noq" }
 noq-proto = { path = "vendor/noq-proto" }
+iroh = { path = "vendor/iroh/iroh" }

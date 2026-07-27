@@ -110,11 +110,10 @@ pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The maximum time a path can stay idle before being closed.
 ///
-/// 15s gives 3x [`HEARTBEAT_INTERVAL`] (5s) for multiple retry chances, and enough
-/// margin for real-world outages (WiFi reconnect 2-5s, cellular handoff 2-10s).
-/// iroh 0.35 used 10s at the QUIC level; tailscale uses 45s at the WireGuard session
-/// level with 3s heartbeats.
-pub(crate) const PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Rho's authenticated sessions deliberately survive laptop sleep and longer
+/// network changes. Pre-authentication connections are closed by the bounded
+/// application authentication exchange.
+pub(crate) const PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// The maximum time a relay path can stay idle before being closed.
 ///
@@ -124,9 +123,9 @@ pub(crate) const PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 5-15s, during which no relay traffic flows. Once the interface recovers, the relay
 /// actor reconnects (DNS + TCP + TLS + WebSocket upgrade), which adds another 1-2s.
 ///
-/// Set to match the connection-level idle timeout (30s) so the relay path survives
-/// as long as the connection itself.
-pub(crate) const RELAY_PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Set to match rho's authenticated connection recovery window so the relay
+/// path survives as long as the connection itself.
+pub(crate) const RELAY_PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Maximum number of concurrent QUIC multipath paths per connection.
 ///

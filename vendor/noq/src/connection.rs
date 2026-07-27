@@ -831,6 +831,16 @@ impl Connection {
             .force_key_update()
     }
 
+    /// Overrides the max idle timeout negotiated during the QUIC handshake.
+    ///
+    /// This is intended for application protocols that coordinate the same
+    /// value on both peers after authenticating. Returns the previous value.
+    pub fn set_max_idle_timeout(&self, timeout: Option<Duration>) -> Option<Duration> {
+        let mut conn = self.0.lock_and_wake("set_max_idle_timeout");
+        let now = conn.runtime.now();
+        conn.inner.set_max_idle_timeout(now, timeout)
+    }
+
     /// Derive keying material from this connection's TLS session secrets.
     ///
     /// When both peers call this method with the same `label` and `context`

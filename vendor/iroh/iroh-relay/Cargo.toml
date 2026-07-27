@@ -15,8 +15,8 @@ rust-version = "1.91"
 # It would be nice if we could make this target-dependent, but we can't (yet): https://github.com/rust-lang/cargo/issues/12260
 crate-type = ["lib", "cdylib"]
 
-[lints]
-workspace = true
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(iroh_docsrs)"] }
 
 [dependencies]
 blake3 = "1.8.2"
