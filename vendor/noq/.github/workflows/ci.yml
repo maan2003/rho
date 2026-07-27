@@ -1,0 +1,429 @@
+name: CI
+
+on:
+  pull_request:
+    types: ["labeled", "unlabeled", "opened", "synchronize", "reopened"]
+  merge_group:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -Dwarnings
+  RUSTDOCFLAGS: -Dwarnings
+  MSRV: "1.88"
+  SCCACHE_CACHE_SIZE: "10G"
+
+jobs:
+  tests:
+    name: CI Test Suite
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    uses: "./.github/workflows/tests.yaml"
+
+  test-aws-lc-rs:
+    name: Test aws-lc-rs crypto backend
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      # Go is required for FIPS builds
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      # Prevent feature unification from selecting *ring* as the crypto provider
+      - run: RUST_BACKTRACE=1 cargo test --locked --manifest-path noq-proto/Cargo.toml --no-default-features --features rustls,aws-lc-rs
+      - run: RUST_BACKTRACE=1 cargo test --locked --manifest-path noq/Cargo.toml --no-default-features --features rustls,aws-lc-rs,runtime-tokio,__rustls-post-quantum-test
+      # FIPS
+      - run: RUST_BACKTRACE=1 cargo test --locked --manifest-path noq-proto/Cargo.toml --no-default-features --features rustls,aws-lc-rs-fips
+      - run: RUST_BACKTRACE=1 cargo test --locked --manifest-path noq/Cargo.toml --no-default-features --features rustls,aws-lc-rs-fips,runtime-tokio,__rustls-post-quantum-test
+
+  test_posix_minimal:
+    name: Test posix_minimal (noq-udp)
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+      RUSTFLAGS: "-Dwarnings --cfg posix_minimal"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Build and test noq-udp (posix_minimal)
+        run: cargo test --locked -p noq-udp
+
+  esp32_check:
+    name: ESP32-C3 build check (noq-udp, noq-proto, noq)
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Check noq for ESP32-C3
+        run: cargo check -Z build-std=std,panic_abort --target riscv32imc-esp-espidf -p noq -p noq-proto -p noq-udp --no-default-features
+
+  wasm_test:
+    name: Build & test wasm32
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
+    runs-on: [self-hosted, linux, X64]
+    env:
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+      RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install LLVM tools for wasm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm clang lld
+
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add wasm32-unknown-unknown
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+      - uses: bytecodealliance/actions/wasm-tools/setup@v1
+      - uses: cargo-bins/cargo-binstall@v1.16.3
+
+      - name: wasm32 test build (noq-proto)
+        run: cargo test --locked -p noq-proto --target wasm32-unknown-unknown --no-run
+
+      - name: wasm32 check (noq-udp)
+        run: cargo check --locked -p noq-udp --target wasm32-unknown-unknown --no-default-features --features=tracing,log
+
+      - name: wasm32 build (noq)
+        run: cargo rustc --locked -p noq --target wasm32-unknown-unknown --no-default-features --features=tracing-log,platform-verifier,rustls,ring --crate-type=cdylib
+
+      # If the Wasm file contains any 'import "env"' declarations, then
+      # some non-Wasm-compatible code made it into the final code.
+      - name: Ensure no 'import "env"' in noq-proto Wasm
+        run: |
+          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/deps/noq_proto-*.wasm | grep 'import "env"'
+      - name: Ensure no 'import "env"' in noq Wasm
+        run: |
+          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/noq.wasm | grep 'import "env"'
+
+      # Match the version of wasm-bindgen used in Cargo.lock
+      - run: cargo binstall wasm-bindgen-cli@0.2.121 --force --locked --no-confirm
+      - name: wasm32 test (noq-proto)
+        run: cargo test --locked -p noq-proto --target wasm32-unknown-unknown
+
+  android_build:
+    name: Android Build Only
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
+    runs-on: [self-hosted, linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install rustup target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        uses: arqu/setup-ndk@main
+        id: setup-ndk
+        with:
+          ndk-version: r23
+          add-to-path: true
+
+      - name: Install cargo-ndk
+        run: |
+          if ! cargo ndk --version 2>/dev/null | grep -q "3.5.4"; then
+            cargo install --version 3.5.4 cargo-ndk
+          fi
+
+      - name: Build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: cargo ndk --target ${{ matrix.target }} build
+
+  android_emulator_test:
+    name: Android Emulator Tests
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 45
+    runs-on: [self-hosted, linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [28]
+        target: [x86_64-linux-android]
+        emulator-arch: [x86_64]
+    env:
+      TARGET: ${{ matrix.target }}
+      API_LEVEL: ${{ matrix.api-level }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        uses: arqu/setup-ndk@main
+        id: setup-ndk
+        with:
+          ndk-version: r23
+          add-to-path: true
+
+      - name: Install cargo-ndk
+        run: |
+          if ! cargo ndk --version 2>/dev/null | grep -q "3.5.4"; then
+            cargo install --version 3.5.4 cargo-ndk
+          fi
+
+      - name: Build unit tests for Android
+        env:
+          RUSTC_WRAPPER: "sccache"
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: cargo ndk -t ${{ matrix.target }} test --no-run
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up Android Emulator and run tests
+        env:
+          TARGET: ${{ matrix.target }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: ${{ matrix.emulator-arch }}
+          script: .github/workflows/rust-android-run-tests-on-emulator.sh
+
+  fuzz_build:
+    name: Fuzz build check
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+
+  check_fmt:
+    timeout-minutes: 30
+    name: Checking fmt
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: taiki-e/install-action@cargo-make
+      - run: cargo make format-check
+
+  check_docs:
+    timeout-minutes: 30
+    name: Checking docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/install@cargo-docs-rs
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: noq docs-rs
+        run: cargo docs-rs -p noq
+      - name: noq-proto docs-rs
+        run: cargo docs-rs -p noq-proto
+      - name: noq-udp docs-rs
+        run: cargo docs-rs -p noq-udp
+      - name: noq internal docs
+        run: cargo doc --workspace --no-deps --document-private-items
+
+  clippy_check:
+    timeout-minutes: 30
+    name: Clippy
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: clippy check (all features)
+        run: cargo clippy --workspace --exclude fuzz --all-features --all-targets --lib --bins --tests --benches --examples -- -D warnings
+
+      - name: clippy check (no features)
+        run: cargo clippy --workspace --exclude fuzz --no-default-features --all-targets --lib --bins --tests --benches --examples -- -D warnings
+
+      - name: clippy check (default features)
+        run: cargo clippy --workspace --exclude fuzz --all-targets --lib --bins --tests --benches --examples -- -D warnings
+
+  msrv:
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
+    name: Minimal Supported Rust Version
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Check MSRV all features
+        run: |
+          cargo +$MSRV check --workspace --exclude fuzz --all-targets
+
+  external_types:
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+      # Pin to the nightly that the pinned `cargo-check-external-types`
+      # release was last tested against. Update both together.
+      CARGO_CHECK_EXTERNAL_TYPES_VERSION: "0.4.0"
+      TOOLCHAIN: "nightly-2025-10-18"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.18.1
+      - uses: taiki-e/install-action@cargo-make
+      - name: Install cargo-check-external-types
+        run: cargo binstall cargo-check-external-types@${{ env.CARGO_CHECK_EXTERNAL_TYPES_VERSION }} --locked --no-confirm
+      - name: Check external types
+        run: cargo make check-external-types
+
+  cargo_deny:
+    timeout-minutes: 30
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --workspace --all-features
+          command: check
+          command-arguments: "-Dwarnings"
+
+  codespell:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-codespell-2.4.1
+      - run: pip install --user codespell[toml]==2.4.1
+      - run: codespell --ignore-words-list=ans,atmost,crate,ect,inout,keep-alives,ser,te,worl --skip=CHANGELOG.md,*.lock
+
+  check_semver:
+    runs-on: [self-hosted, linux, X64]
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      # Go is required for FIPS builds
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Setup Environment (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          echo "HEAD_COMMIT_SHA=$(git rev-parse origin/${{ github.base_ref }})" >> ${GITHUB_ENV}
+      - name: Setup Environment (Push)
+        if: ${{ github.event_name == 'push' || github.event_name == 'merge_group' }}
+        shell: bash
+        run: |
+          echo "HEAD_COMMIT_SHA=$(git rev-parse origin/main)" >> ${GITHUB_ENV}
+      - name: Check semver
+        # uses: obi1kenobi/cargo-semver-checks-action@v2
+        uses: n0-computer/cargo-semver-checks-action@feat-baseline
+        with:
+          package: noq, noq-proto, noq-udp
+          baseline-rev: ${{ env.HEAD_COMMIT_SHA }}
+          use-cache: false

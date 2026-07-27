@@ -1,0 +1,16 @@
+[package]
+name = "book"
+version = "0.1.0"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes = { workspace = true }
+noq = { version = "1.0.1", path = "../../noq" }
+rcgen.workspace = true
+rustls.workspace = true

@@ -39,7 +39,6 @@ exclude = [
   "vendor/brush",
   "vendor/jj",
   "vendor/noq",
-  "vendor/noq-proto",
   "webui",
 ]
 resolver = "2"
@@ -170,6 +169,6 @@ inherits = "release"
 # Local noq fork: adds per-send-stream weights to fair scheduling while
 # preserving noq's strict priority classes. Keep both crates patched because
 # `noq` exposes the API and `noq-proto` owns the packet scheduler.
-noq = { path = "vendor/noq" }
-noq-proto = { path = "vendor/noq-proto" }
+noq = { path = "vendor/noq/noq" }
+noq-proto = { path = "vendor/noq/noq-proto" }
 iroh = { path = "vendor/iroh/iroh" }
