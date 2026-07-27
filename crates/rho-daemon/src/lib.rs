@@ -2215,14 +2215,39 @@ fn quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
 }
 
 fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -> u16 {
-    samples
-        .windows(2)
-        .filter(|pair| pair[1].observed_at.0 >= now.saturating_sub(duration_ms))
-        // A changed reset target starts a new epoch. A downward utilization
-        // jump with unchanged metadata is also naturally skipped below.
-        .filter(|pair| pair[0].reset_at_unix == pair[1].reset_at_unix)
-        .map(|pair| pair[1].used_percent.saturating_sub(pair[0].used_percent) as u16)
-        .sum()
+    let cutoff = now.saturating_sub(duration_ms);
+    let start = samples
+        .partition_point(|sample| sample.observed_at.0 < cutoff)
+        .saturating_sub(1);
+    let Some((first, rest)) = samples
+        .get(start..)
+        .and_then(|samples| samples.split_first())
+    else {
+        return 0;
+    };
+
+    let mut epoch_start = *first;
+    let mut epoch_end = *first;
+    let mut burn = 0u16;
+    for sample in rest {
+        let same_epoch = match (epoch_end.reset_at_unix, sample.reset_at_unix) {
+            (Some(old), Some(new)) => old.abs_diff(new) <= 60,
+            (None, None) => true,
+            _ => false,
+        };
+        if same_epoch {
+            epoch_end = sample;
+        } else {
+            burn += epoch_end
+                .used_percent
+                .saturating_sub(epoch_start.used_percent) as u16;
+            epoch_start = sample;
+            epoch_end = sample;
+        }
+    }
+    burn + epoch_end
+        .used_percent
+        .saturating_sub(epoch_start.used_percent) as u16
 }
 
 fn spawn_chatgpt_quota_poller(
@@ -3554,7 +3579,7 @@ mod tests {
     };
 
     #[test]
-    fn quota_burn_skips_resets_and_sums_across_epochs() {
+    fn quota_burn_uses_net_change_within_each_reset_epoch() {
         let sample = |at, used_percent, reset_at_unix| QuotaObservationRecord {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
@@ -3565,13 +3590,55 @@ mod tests {
         let records = [
             sample(0, 10, Some(100)),
             sample(100, 15, Some(100)),
-            sample(200, 3, Some(100)),
-            sample(300, 6, Some(100)),
-            sample(400, 9, Some(200)),
+            sample(200, 13, Some(100)),
+            sample(300, 3, Some(200)),
+            sample(400, 6, Some(200)),
         ];
         let samples = records.iter().collect::<Vec<_>>();
-        assert_eq!(quota_burn(&samples, 400, 1_000), 8);
+        assert_eq!(quota_burn(&samples, 400, 1_000), 6);
         assert_eq!(quota_burn(&samples, 400, 150), 3);
+    }
+
+    #[test]
+    fn quota_burn_does_not_sum_sample_jitter() {
+        let sample = |at, used_percent| QuotaObservationRecord {
+            provider: QuotaProvider::ChatGpt,
+            model: QuotaModel::GPT,
+            observed_at: rho_core::UnixMs(at),
+            used_percent,
+            reset_at_unix: Some(100),
+        };
+        let records = [
+            sample(0, 50),
+            sample(100, 48),
+            sample(200, 50),
+            sample(300, 49),
+            sample(400, 50),
+        ];
+        let samples = records.iter().collect::<Vec<_>>();
+
+        assert_eq!(quota_burn(&samples, 400, 1_000), 0);
+    }
+
+    #[test]
+    fn quota_burn_tolerates_reset_target_jitter() {
+        let sample = |at, used_percent, reset_at_unix| QuotaObservationRecord {
+            provider: QuotaProvider::ChatGpt,
+            model: QuotaModel::GPT,
+            observed_at: rho_core::UnixMs(at),
+            used_percent,
+            reset_at_unix: Some(reset_at_unix),
+        };
+        let records = [
+            sample(0, 17, 1_000),
+            sample(100, 15, 1_001),
+            sample(200, 17, 999),
+            sample(300, 16, 1_000),
+            sample(400, 17, 1_002),
+        ];
+        let samples = records.iter().collect::<Vec<_>>();
+
+        assert_eq!(quota_burn(&samples, 400, 1_000), 0);
     }
 
     #[tokio::test]
