@@ -524,6 +524,7 @@ async fn run_iroh_listener(
             };
             match rho_iroh_auth::authenticate_server_connection(&auth, &connection).await {
                 Ok(rho_iroh_auth::ServerAuthDecision::Approved) => {
+                    connection.set_max_concurrent_bi_streams(1024u32.into());
                     drop(permit);
                 }
                 Ok(

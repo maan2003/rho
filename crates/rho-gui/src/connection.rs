@@ -97,6 +97,8 @@ pub enum ConnEvent {
     QuotaHistory(Vec<rho_ui_proto::QuotaSeries>),
     GlobalUsage(Vec<rho_ui_proto::AgentUsageSeries>),
     ServerError(String),
+    Recovering(std::time::Duration),
+    Recovered,
     Disconnected(String),
     GitTransportApproval {
         request_id: u64,
@@ -844,6 +846,7 @@ async fn run(
 
     write_frame(&mut stream, &ClientMessage::GitTransportRegister).await?;
 
+    let health_connection = agent_connection.clone();
     let agent_stream_task = agent_connection.map(|connection| {
         let events = events.clone();
         tokio::spawn(run_agent_streams(connection, events))
@@ -854,6 +857,39 @@ async fn run(
     ));
 
     let (mut reader, mut writer) = tokio::io::split(stream);
+    let health_task = health_connection.map(|connection| {
+        let events = events.clone();
+        tokio::spawn(async move {
+            const RECOVERY_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut received = connection.stats().authenticated_packets;
+            let mut last_received = tokio::time::Instant::now();
+            let mut recovering = false;
+            loop {
+                interval.tick().await;
+                let current = connection.stats().authenticated_packets;
+                if current != received {
+                    received = current;
+                    last_received = tokio::time::Instant::now();
+                }
+                let elapsed = last_received.elapsed();
+                if elapsed >= RECOVERY_NOTICE_AFTER {
+                    recovering = true;
+                    if events
+                        .unbounded_send(ConnEvent::Recovering(elapsed))
+                        .is_err()
+                    {
+                        break;
+                    }
+                } else if recovering {
+                    recovering = false;
+                    if events.unbounded_send(ConnEvent::Recovered).is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+    });
     let writer_task = tokio::spawn(async move {
         let mut usage_refresh = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
         // The initial request was sent above; skip the interval's immediate tick.
@@ -1042,6 +1078,9 @@ async fn run(
         }
     }
     writer_task.abort();
+    if let Some(task) = health_task {
+        task.abort();
+    }
     shell_requests.lock().unwrap().pending.clear();
     if let Some(task) = agent_stream_task {
         task.abort();

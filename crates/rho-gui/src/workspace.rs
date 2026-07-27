@@ -149,6 +149,7 @@ pub struct Workspace {
     /// (bad working directory, say) never loses the message.
     awaiting_draft_agent: bool,
     connected: bool,
+    connection_status: Option<ConnectionStatus>,
     quota_summaries: Vec<rho_ui_proto::QuotaSummary>,
     quota_history: Vec<rho_ui_proto::QuotaSeries>,
     quota_history_days: u64,
@@ -200,6 +201,11 @@ pub struct Workspace {
     iris_context_agent: Arc<Mutex<Option<AgentId>>>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
+}
+
+enum ConnectionStatus {
+    Recovering(Duration),
+    Disconnected(String),
 }
 
 /// Which workstream operation a transient prompt collects a name for.
@@ -341,6 +347,7 @@ impl Workspace {
             new_agent_draft: None,
             awaiting_draft_agent: false,
             connected: false,
+            connection_status: None,
             quota_summaries: Vec::new(),
             quota_history: Vec::new(),
             quota_history_days: 7,
@@ -564,6 +571,7 @@ impl Workspace {
                 self.prune_contexts();
                 self.workdirs = workdirs;
                 self.connected = true;
+                self.connection_status = None;
                 self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.registry.active_pane(), ActivePane::Startup) {
                     // The startup scaffold guessed before daemon data existed;
@@ -696,6 +704,14 @@ impl Workspace {
                     cx,
                 );
             }
+            ConnEvent::Recovering(elapsed) => {
+                self.connection_status = Some(ConnectionStatus::Recovering(elapsed));
+                cx.notify();
+            }
+            ConnEvent::Recovered => {
+                self.connection_status = None;
+                cx.notify();
+            }
             ConnEvent::Disconnected(reason) => {
                 let had_git_approval = if let Some(pending) = self.pending_git_approval.take() {
                     let _ = pending.response.send(GitApprovalDecision::Done);
@@ -707,16 +723,8 @@ impl Workspace {
                     self.finish_overlay_focus(window, cx);
                 }
                 self.connected = false;
+                self.connection_status = Some(ConnectionStatus::Disconnected(reason.clone()));
                 self.awaiting_draft_agent = false;
-                let notice = format!("[disconnected from rho daemon: {reason}]");
-                for view in self.models.values() {
-                    view.update(cx, |view, cx| {
-                        view.system_notice(&notice, StyleClass::Disconnect, cx);
-                    });
-                }
-                self.draft_model.update(cx, |view, cx| {
-                    view.system_notice(&notice, StyleClass::Disconnect, cx);
-                });
                 self.update_statuses(cx);
                 cx.notify();
             }
@@ -3902,6 +3910,46 @@ impl Workspace {
         }
     }
 
+    fn render_connection_status(
+        &self,
+        text_style: &gpui::TextStyle,
+        cx: &Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let (text, class) = match self.connection_status.as_ref()? {
+            ConnectionStatus::Recovering(elapsed) => {
+                let seconds = elapsed.as_secs();
+                let elapsed = if seconds < 60 {
+                    format!("{seconds}s")
+                } else {
+                    format!("{}m {:02}s", seconds / 60, seconds % 60)
+                };
+                (
+                    format!("connection interrupted · recovering · {elapsed}"),
+                    StyleClass::SystemImportant,
+                )
+            }
+            ConnectionStatus::Disconnected(reason) => (
+                format!("disconnected from rho daemon · {reason}"),
+                StyleClass::Disconnect,
+            ),
+        };
+        let mut strip = bottom_strip(text_style, cx);
+        if let Some(color) = class.resolve(cx).color {
+            strip = strip.text_color(color);
+        }
+        Some(strip.child(div().px_2().child(text)).into_any_element())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_status_label(&self) -> Option<String> {
+        match self.connection_status.as_ref()? {
+            ConnectionStatus::Recovering(elapsed) => {
+                Some(format!("recovering {}s", elapsed.as_secs()))
+            }
+            ConnectionStatus::Disconnected(reason) => Some(format!("disconnected {reason}")),
+        }
+    }
+
     /// Chip label: the agent's own working directory, when its summary has
     /// arrived.
     fn working_directory_label(&self, agent_id: &AgentId) -> String {
@@ -4118,6 +4166,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
+        let connection_status = self.render_connection_status(&text_style, cx);
         // Regenerate the dashboard listing whenever anything redraws; sync
         // is cheap and a near no-op when nothing changed.
         self.dashboard.sync(&self.registry, window, cx);
@@ -4243,9 +4292,10 @@ impl Render for Workspace {
                     &self.pending_git_approval,
                     &self.minibuffer,
                     &self.transient,
+                    connection_status,
                     &self.echo,
                 ) {
-                    (Some(pending), _, _, _) => {
+                    (Some(pending), _, _, _, _) => {
                         let colors = cx.theme().colors();
                         let focused = self.git_approval_focus.is_focused(window);
                         let mut deny = div().flex().flex_row().px_1().child("n deny");
@@ -4293,16 +4343,17 @@ impl Render for Workspace {
                                 .into_any_element(),
                         )
                     }
-                    (None, Some(minibuffer), _, _) => Some(minibuffer.render(&text_style, cx)),
-                    (None, None, Some(transient), _) => Some(
+                    (None, Some(minibuffer), _, _, _) => Some(minibuffer.render(&text_style, cx)),
+                    (None, None, Some(transient), _, _) => Some(
                         div()
                             .track_focus(&self.transient_focus)
                             .on_key_down(cx.listener(Self::transient_key))
                             .child(transient.render(&text_style, cx))
                             .into_any_element(),
                     ),
-                    (None, None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
-                    (None, None, None, None) => None,
+                    (None, None, None, Some(status), _) => Some(status),
+                    (None, None, None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
+                    (None, None, None, None, None) => None,
                 },
             )
     }

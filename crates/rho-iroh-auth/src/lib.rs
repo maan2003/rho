@@ -16,6 +16,9 @@ const AUTH_REQUEST: &[u8] = b"rho-auth-v1\n";
 const AUTH_ACK: &[u8] = b"ack\n";
 const MAX_AUTH_RESPONSE_LEN: usize = 128;
 
+/// Recovery window granted after both peers authenticate the connection.
+pub const AUTHENTICATED_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// Result of the mandatory auth-only first stream on an iroh connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientAuthResult {
@@ -47,6 +50,9 @@ pub async fn authenticate_client(
     // that the application consumed its enrollment response.
     send.write_all(AUTH_ACK).await?;
     send.finish()?;
+    if result == ClientAuthResult::Approved {
+        connection.set_max_idle_timeout(Some(AUTHENTICATED_IDLE_TIMEOUT));
+    }
     Ok(result)
 }
 
@@ -74,6 +80,9 @@ pub async fn authenticate_server_connection(
         send.finish()?;
         let ack = recv.read_to_end(AUTH_ACK.len()).await?;
         anyhow::ensure!(ack == AUTH_ACK, "invalid iroh auth acknowledgement");
+        if decision == ServerAuthDecision::Approved {
+            connection.set_max_idle_timeout(Some(AUTHENTICATED_IDLE_TIMEOUT));
+        }
         Ok(decision)
     })
     .await

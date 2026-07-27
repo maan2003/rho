@@ -216,9 +216,13 @@ AI APIs.
   Active pending enrollments are capped at 10 and the five-minute
   recently-used collision cache at 4096 entries, including under repeated
   reconnects from one endpoint. At most 64 pre-auth exchanges run concurrently,
-  each connection permits at most 16 queued bidirectional streams, and both
-  client and server bound the auth exchange to ten seconds. The daemon's iroh
-  secret key lives in the local rho database.
+  each connection permits at most 16 queued bidirectional streams before
+  approval, and both client and server bound the auth exchange to ten seconds.
+  Approved iroh clients receive 1024 bidirectional-stream credits and both
+  peers extend the connection and path recovery window to ten minutes. This is
+  an intentional trusted-client capability rather than a post-authentication
+  denial-of-service boundary. The daemon's iroh secret key lives in the local
+  rho database.
   After authentication, native GUI connections may accept up to 1024
   daemon-initiated unidirectional agent-state streams. These streams carry only
   framed UI state for agents already loaded by the daemon; authorization and

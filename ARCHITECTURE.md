@@ -348,7 +348,13 @@ opens one unidirectional stream per non-hidden loaded agent, up to 1024, so
 state remains warm in the GUI cache without cross-agent
 head-of-line blocking. The focused stream has weight 200 and background streams
 weight 1 within their lower-priority class. Focus changes travel over the
-control stream and update transport weights without reopening streams. The
+control stream and update transport weights without reopening streams.
+Authentication upgrades both peers from the standard QUIC idle timeout to a
+ten-minute same-connection recovery window and raises the daemon's incoming
+bidirectional stream credit from its pre-authentication limit. Iroh already
+sends five-second transport heartbeats; after ten seconds without receiving an
+authenticated QUIC datagram, the native GUI presents a temporary bottom
+recovery strip until the same connection responds or finally closes. The
 same iroh endpoint carries a second ALPN for the web UI: newline-delimited JSON
 (`rho-webui-messages`, shared with the browser as a wasm-safe crate) bridged
 through an in-process duplex pipe onto a normal UI protocol session, so the
@@ -393,11 +399,15 @@ unchecked save only after explicit confirmation, while discard reloads through
 Zed. Focus loss does not save because arbitrary external writers can still race
 the metadata check and write.
 
-Rho patches iroh's `noq` transport dependencies to vendored copies. The local
-extension preserves strict stream priorities and adds relative send-stream
-weights within each equal-priority fair-scheduling class. Weight 1 retains
-upstream behavior; higher weights receive proportionally more packet-writing
-turns without changing anything on the QUIC wire. Transport scheduling owns
+Rho imports iroh as a managed jj subtree and patches its `noq` transport
+dependencies to vendored copies. The local extensions preserve strict stream
+priorities, add relative send-stream weights within each equal-priority
+fair-scheduling class, and allow an application-authenticated pair to
+coordinate a post-handshake idle-timeout override. Weight 1 retains upstream
+behavior; higher weights receive proportionally more packet-writing turns
+without changing anything on the QUIC wire. The fork's default and relay path
+idle limits are ten minutes as well; this default also applies to custom paths
+created through rho's iroh build. Transport scheduling owns
 connection bandwidth allocation, while application-level stream selection and
 coalescing remain UI protocol policy. Native GUI and daemon endpoints enable
 noq's qlog instrumentation when `QLOGDIR` is set, writing `rho-gui-*` and

@@ -1484,6 +1484,35 @@ fn turn_cancelled_ack_is_not_persisted_as_notice(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                ConnEvent::Recovering(std::time::Duration::from_secs(17)),
+                window,
+                cx,
+            );
+            assert_eq!(
+                workspace.connection_status_label().as_deref(),
+                Some("recovering 17s")
+            );
+            workspace.handle_event(ConnEvent::Recovered, window, cx);
+            assert_eq!(workspace.connection_status_label(), None);
+            workspace.handle_event(ConnEvent::Disconnected("timed out".to_owned()), window, cx);
+            assert_eq!(
+                workspace.connection_status_label().as_deref(),
+                Some("disconnected timed out")
+            );
+        })
+        .expect("update connection status");
+    assert!(
+        !display_text(&workspace, cx).contains("disconnected"),
+        "connection status belongs in workspace chrome, not transcript content"
+    );
+}
+
+#[gpui::test]
 fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     cx.update(bind_test_keymaps);
