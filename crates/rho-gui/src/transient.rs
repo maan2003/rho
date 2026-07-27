@@ -872,6 +872,9 @@ fn agent_menu() -> Transient {
         .item("c", "cancel turn", |workspace, _, cx| {
             workspace.cmd_agent_cancel(cx);
         })
+        .item("r", "role…", |workspace, window, cx| {
+            workspace.prompt_change_agent_role(window, cx);
+        })
         .item("k", "compact", |workspace, _, cx| {
             workspace.cmd_compact(cx);
         })

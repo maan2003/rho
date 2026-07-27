@@ -21,8 +21,9 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{
-    AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRuntime, AgentWriteTxnExt,
-    ClaudeRewind, SessionBinding, UnixMillis, WorkstreamId,
+    AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRoleSessionProfile as _,
+    AgentRuntime, AgentWriteTxnExt, ClaudeRewind, EngineerIntelligence, SessionBinding, UnixMillis,
+    WorkstreamId,
 };
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
@@ -341,6 +342,16 @@ impl ClaudeAgent {
             .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?
     }
 
+    pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(ClaudeControl::ChangeRole { role, reply })
+            .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?;
+        result
+            .await
+            .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?
+    }
+
     pub fn cancel(&self) {
         let _ = self.control.send(ClaudeControl::Cancel);
     }
@@ -391,6 +402,10 @@ enum ClaudeControl {
     },
     SetEffort {
         effort: Effort,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+    ChangeRole {
+        role: AgentRole,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     Cancel,
@@ -564,6 +579,9 @@ impl ClaudeLoop {
             ClaudeControl::SetEffort { effort, reply } => {
                 let _ = reply.send(self.set_effort(effort).await);
             }
+            ClaudeControl::ChangeRole { role, reply } => {
+                let _ = reply.send(self.change_role(role).await);
+            }
             ClaudeControl::Cancel => {
                 let kind = self.state.read().expect("poison").kind.clone();
                 let busy = matches!(kind, AgentStateKind::ApiStreaming { .. });
@@ -715,6 +733,70 @@ impl ClaudeLoop {
         let request_id = process.apply_effort(effort).await?;
         self.await_control_response(request_id, "Claude Code rejected effort update")
             .await?;
+        Ok(())
+    }
+
+    async fn change_role(&mut self, requested: AgentRole) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(
+                self.state.read().expect("poison").kind,
+                AgentStateKind::Idle | AgentStateKind::Error(_)
+            ),
+            "role changes are only available while idle or errored; cancel the turn first"
+        );
+        anyhow::ensure!(
+            self.state.read().expect("poison").queued_inputs.is_empty()
+                && self.queued_turns.is_empty(),
+            "role changes are not available with queued inputs"
+        );
+
+        let requested = match requested {
+            AgentRole::Engineer { intelligence }
+            | AgentRole::WorkflowEngineer { intelligence, .. } => intelligence,
+            _ => anyhow::bail!("role changes currently support only eng-ultra and eng-alt"),
+        };
+        anyhow::ensure!(
+            matches!(
+                requested,
+                EngineerIntelligence::Ultra | EngineerIntelligence::Alt
+            ),
+            "role changes currently support only eng-ultra and eng-alt"
+        );
+
+        let role = match self.role {
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
+            } => AgentRole::Engineer {
+                intelligence: requested,
+            },
+            AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
+                workflow,
+            } => AgentRole::WorkflowEngineer {
+                intelligence: requested,
+                workflow,
+            },
+            _ => anyhow::bail!("role changes currently support only eng-ultra and eng-alt"),
+        };
+        if role == self.role {
+            return Ok(());
+        }
+
+        let binding = role.session_profile()?;
+        let model = binding
+            .claude_model()
+            .ok_or_else(|| anyhow::anyhow!("role change would leave the Claude runtime"))?;
+        let effort = binding
+            .claude_effort()
+            .ok_or_else(|| anyhow::anyhow!("role change has no Claude effort"))?;
+
+        self.close_process().await;
+        let mut write = self.db.write().await;
+        write.set_agent_profile(self.agent_id, role, binding);
+        write.commit();
+        self.model = model;
+        self.effort = effort;
+        self.role = role;
         Ok(())
     }
 

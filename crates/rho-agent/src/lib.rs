@@ -713,7 +713,6 @@ impl Agent {
                         view,
                         role,
                         agent_id,
-                        model,
                         web_search,
                         code_mode_enabled,
                         agent_tools_enabled,
@@ -737,6 +736,7 @@ impl Agent {
         let notify = Arc::new(Notify::new());
         let agent_loop = AgentLoop {
             inference_session,
+            model,
             auto_compaction_in_flight: false,
             pending_tools: FuturesUnordered::new(),
             state: Arc::clone(&state),
@@ -824,6 +824,16 @@ impl Agent {
         let _ = self
             .control
             .send(AgentControl::SetDeepConfig(config, model));
+    }
+
+    pub async fn change_role(&self, role: db::AgentRole) -> anyhow::Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(AgentControl::ChangeRole { role, reply })
+            .map_err(|_| anyhow::anyhow!("agent control loop is closed"))?;
+        result
+            .await
+            .map_err(|_| anyhow::anyhow!("agent control loop is closed"))?
     }
 
     pub fn change_prompt_cache_key(&self) {
@@ -999,6 +1009,10 @@ enum AgentControl {
     #[cfg(feature = "code-mode")]
     ToolUpdate(ToolUpdate),
     SetDeepConfig(InferenceProfile, InferenceModel),
+    ChangeRole {
+        role: db::AgentRole,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
     ChangePromptCacheKey(PromptCacheKey),
     Rewind {
         turns: u32,
@@ -1010,6 +1024,7 @@ enum AgentControl {
 
 struct AgentLoop {
     inference_session: InferenceSession,
+    model: InferenceModel,
     /// The active request includes a trigger injected by the automatic
     /// context-occupancy policy. A compaction-only response must continue the
     /// interrupted turn; a manually requested compaction remains standalone.
@@ -1040,7 +1055,6 @@ struct ExecutionContext {
     system_prompt: Arc<str>,
     shell_tools: ShellTools,
     web_search: WebSearchTools,
-    model: Arc<str>,
     tool_specs: Arc<[ToolSpec]>,
     #[cfg(feature = "code-mode")]
     code_mode: Option<Arc<CodeModeSession>>,
@@ -1052,7 +1066,6 @@ impl ExecutionContext {
         view: Arc<View>,
         role: db::AgentRole,
         agent_id: AgentId,
-        model: InferenceModel,
         web_search: WebSearchTools,
         code_mode_enabled: bool,
         agent_tools_enabled: bool,
@@ -1092,7 +1105,6 @@ impl ExecutionContext {
             system_prompt,
             shell_tools,
             web_search,
-            model: Arc::from(model.as_str()),
             tool_specs,
             #[cfg(feature = "code-mode")]
             code_mode,
@@ -1101,6 +1113,88 @@ impl ExecutionContext {
 }
 
 impl AgentLoop {
+    async fn change_role(
+        &mut self,
+        state: &AgentState,
+        requested: db::AgentRole,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(&state.kind, AgentStateKind::Idle | AgentStateKind::Error(_)),
+            "role changes are only available while idle or errored; cancel the turn first"
+        );
+        anyhow::ensure!(
+            state.queued_inputs.is_empty(),
+            "role changes are not available with queued inputs"
+        );
+        anyhow::ensure!(
+            self.pending_tools.is_empty() && !self.inference_session.has_active_request(),
+            "role changes are not available while work is running"
+        );
+
+        let requested = match requested {
+            db::AgentRole::Engineer { intelligence }
+            | db::AgentRole::WorkflowEngineer { intelligence, .. } => intelligence,
+            _ => anyhow::bail!("role changes currently support only engineer roles"),
+        };
+        anyhow::ensure!(
+            matches!(
+                requested,
+                db::EngineerIntelligence::Low
+                    | db::EngineerIntelligence::Medium
+                    | db::EngineerIntelligence::High
+            ),
+            "this agent can switch only between eng-low, eng, and eng-high"
+        );
+
+        let current = self
+            .persistence
+            .db
+            .read()
+            .get_agent(self.persistence.agent_id)
+            .role;
+        let role = match current {
+            db::AgentRole::Engineer {
+                intelligence:
+                    db::EngineerIntelligence::Low
+                    | db::EngineerIntelligence::Medium
+                    | db::EngineerIntelligence::High,
+            } => db::AgentRole::Engineer {
+                intelligence: requested,
+            },
+            db::AgentRole::WorkflowEngineer {
+                intelligence:
+                    db::EngineerIntelligence::Low
+                    | db::EngineerIntelligence::Medium
+                    | db::EngineerIntelligence::High,
+                workflow,
+            } => db::AgentRole::WorkflowEngineer {
+                intelligence: requested,
+                workflow,
+            },
+            _ => anyhow::bail!("this agent can switch only between eng-low, eng, and eng-high"),
+        };
+        if role == current {
+            return Ok(());
+        }
+
+        let binding = role.session_profile()?;
+        let config = binding
+            .deep_config()
+            .ok_or_else(|| anyhow::anyhow!("role change would leave the Rho runtime"))?;
+        let model = binding
+            .deep_model()
+            .ok_or_else(|| anyhow::anyhow!("role change has no Rho model"))?;
+        anyhow::ensure!(
+            self.inference_session.set_deep_config(config, model),
+            "agent does not have a configurable inference session"
+        );
+        let mut write = self.persistence.db.write().await;
+        write.set_agent_profile(self.persistence.agent_id, role, binding);
+        write.commit();
+        self.model = model;
+        Ok(())
+    }
+
     /// Drive the agent through one user turn: stream the provider response, run
     /// whatever tools the model calls, feed the results back, and repeat until
     /// it answers without calling tools (→ `Idle`) or the turn fails for good
@@ -1245,6 +1339,11 @@ impl AgentLoop {
                         }
                         AgentControl::SetDeepConfig(config, model) => {
                             let _ = self.inference_session.set_deep_config(config, model);
+                            self.model = model;
+                        }
+                        AgentControl::ChangeRole { role, reply } => {
+                            let result = self.change_role(&state, role).await;
+                            let _ = reply.send(result);
                         }
                         AgentControl::ChangePromptCacheKey(prompt_cache_key) => {
                             let mut write = self.persistence.db.write().await;
@@ -1565,11 +1664,7 @@ impl AgentLoop {
                                     let mut previews = BTreeMap::new();
                                     let mut waiting = None;
                                     let tool_context = ToolExecutionContext {
-                                        model: Arc::clone(&self
-                                            .execution
-                                            .get_if_ready()
-                                            .expect("tool call has an execution context")
-                                            .model),
+                                        model: Arc::from(self.model.as_str()),
                                         input: state.blocks.clone().into(),
                                         max_output_tokens: Some(10_000),
                                     };

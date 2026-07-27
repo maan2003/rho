@@ -1187,6 +1187,8 @@ pub(crate) trait AgentProfileWriteTxnExt {
         runtime: AgentRuntime,
         parent_agent: Option<AgentId>,
     ) -> AgentEventPos;
+
+    fn set_agent_profile(&mut self, agent_id: AgentId, role: AgentRole, binding: SessionBinding);
 }
 
 impl AgentProfileWriteTxnExt for WriteTxn {
@@ -1243,6 +1245,18 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         self.open_table(AGENTS)
             .insert(&agent_id, SenValue::borrowed(&agent));
         AgentEventPos::root(lineage_id)
+    }
+
+    fn set_agent_profile(&mut self, agent_id: AgentId, role: AgentRole, binding: SessionBinding) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent missing")
+            .value()
+            .into_owned();
+        agent.role = role;
+        agent.binding = binding;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 }
 

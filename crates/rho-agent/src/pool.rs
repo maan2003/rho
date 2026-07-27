@@ -824,6 +824,13 @@ impl RunningAgent {
         }
     }
 
+    pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
+        match self {
+            Self::Claude(agent) => agent.change_role(role).await,
+            Self::Rho(agent) => agent.change_role(role).await,
+        }
+    }
+
     pub fn change_prompt_cache_key(&self) -> anyhow::Result<()> {
         match self {
             Self::Rho(agent) => {

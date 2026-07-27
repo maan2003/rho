@@ -109,6 +109,10 @@ pub enum ClientMessage {
         agent_id: AgentId,
         name: String,
     },
+    ChangeAgentRole {
+        agent_id: AgentId,
+        role: AgentRole,
+    },
     /// Renames a workstream; a colliding name gets a numeric suffix.
     WorkstreamRename {
         workstream_id: WorkstreamId,

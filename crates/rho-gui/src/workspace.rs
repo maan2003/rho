@@ -1134,6 +1134,99 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn cmd_change_agent_role(
+        &mut self,
+        intelligence: EngineerIntelligence,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.require_connected(cx) {
+            return;
+        }
+        let Some(agent_id) = self.selected_or_notice("change-role", cx) else {
+            return;
+        };
+        self.connection.send(ClientMessage::ChangeAgentRole {
+            agent_id,
+            role: AgentRole::Engineer { intelligence },
+        });
+    }
+
+    pub(crate) fn prompt_change_agent_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.selected_or_notice("change-role", cx) else {
+            return;
+        };
+        let Some(role) = self.registry.agent_role(agent_id) else {
+            return;
+        };
+        let roles: &[&str] = match role {
+            AgentRole::Engineer {
+                intelligence:
+                    EngineerIntelligence::Low
+                    | EngineerIntelligence::Medium
+                    | EngineerIntelligence::High,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence:
+                    EngineerIntelligence::Low
+                    | EngineerIntelligence::Medium
+                    | EngineerIntelligence::High,
+                ..
+            } => &["eng-low", "eng", "eng-high"],
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
+                ..
+            } => &["eng-ultra", "eng-alt"],
+            _ => {
+                self.notice_on(
+                    Some(&agent_id),
+                    "role changes are not available for this agent",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                return;
+            }
+        };
+        let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_ascii_lowercase();
+            roles
+                .iter()
+                .filter(|role| role.contains(&needle))
+                .map(|role| crate::commands::Candidate {
+                    value: (*role).to_owned(),
+                    description: "engineer role".to_owned(),
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             _window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let intelligence = match input.trim().to_ascii_lowercase().as_str() {
+                    "eng-low" => Some(EngineerIntelligence::Low),
+                    "eng" => Some(EngineerIntelligence::Medium),
+                    "eng-high" => Some(EngineerIntelligence::High),
+                    "eng-ultra" => Some(EngineerIntelligence::Ultra),
+                    "eng-alt" => Some(EngineerIntelligence::Alt),
+                    _ => None,
+                };
+                match intelligence {
+                    Some(intelligence) => workspace.cmd_change_agent_role(intelligence, cx),
+                    None => workspace.notice_on(
+                        None,
+                        "change-role: choose a listed engineer role",
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            },
+        );
+        self.open_prompt("role:", complete, on_submit, window, cx);
+    }
+
     pub(crate) fn cmd_workstream_rename(&mut self, name: String, cx: &mut Context<Self>) {
         if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
             self.connection.send(ClientMessage::WorkstreamRename {
