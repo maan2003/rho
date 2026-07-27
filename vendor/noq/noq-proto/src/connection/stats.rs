@@ -254,6 +254,11 @@ pub struct PathStats {
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub struct ConnectionStats {
+    /// Number of successfully authenticated QUIC packets received.
+    ///
+    /// Unlike UDP receive counters, this excludes unrelated or invalid
+    /// datagrams and can be used to observe transport liveness.
+    pub authenticated_packets: u64,
     /// Statistics about UDP datagrams transmitted on the connection.
     pub udp_tx: UdpStats,
     /// Statistics about UDP datagrams received on the connection.
@@ -291,6 +296,7 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             current_mtu: _,
         } = rhs;
         Self {
+            authenticated_packets: self.authenticated_packets,
             udp_tx: self.udp_tx + udp_tx,
             udp_rx: self.udp_rx + udp_rx,
             frame_tx: self.frame_tx + frame_tx,
@@ -322,6 +328,7 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             current_mtu: _,
         } = rhs;
         let Self {
+            authenticated_packets: _,
             udp_tx,
             udp_rx,
             frame_tx,

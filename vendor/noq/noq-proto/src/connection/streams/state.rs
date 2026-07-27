@@ -523,15 +523,16 @@ impl StreamsState {
         fair: bool,
         stats: &mut FrameStats,
     ) {
+        self.pending.apply_weight_updates(fair);
         while builder.frame_space_remaining() > frame::Stream::SIZE_BOUND {
             // Pop the stream of the highest priority that currently has pending data. If
             // the stream still has some pending data left after writing, it will be
             // reinserted, otherwise not
-            let Some(stream) = self.pending.pop() else {
+            let Some(queued) = self.pending.pop() else {
                 break;
             };
 
-            let id = stream.id;
+            let id = queued.id;
 
             let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
                 // Stream was reset with pending data and the reset was acknowledged
@@ -561,7 +562,13 @@ impl StreamsState {
                 // so that the other streams will have a chance to write data
                 // before we touch this stream again.
                 if fair {
-                    self.pending.push_pending(id, stream.priority);
+                    if stream.weight_left > 1 {
+                        stream.weight_left -= 1;
+                        self.pending.continue_weighted(queued, stream.priority);
+                    } else {
+                        stream.weight_left = stream.weight.get();
+                        self.pending.push_pending(id, stream.priority);
+                    }
                 } else {
                     self.pending.reinsert_pending(id, stream.priority);
                 }
@@ -621,7 +628,11 @@ impl StreamsState {
             return;
         };
         if !stream.is_pending() {
+            stream.weight_left = stream.weight.get();
             self.pending.push_pending(frame.id, stream.priority);
+            if std::mem::take(&mut stream.promote_on_enqueue) {
+                self.pending.update_weight(frame.id, true);
+            }
         }
         stream.fin_pending |= frame.fin;
         stream.pending.retransmit(frame.offsets);
@@ -640,7 +651,11 @@ impl StreamsState {
                     continue;
                 }
                 if !stream.is_pending() {
+                    stream.weight_left = stream.weight.get();
                     self.pending.push_pending(id, stream.priority);
+                    if std::mem::take(&mut stream.promote_on_enqueue) {
+                        self.pending.update_weight(id, true);
+                    }
                 }
                 stream.pending.retransmit_all_for_0rtt();
             }
@@ -1422,6 +1437,9 @@ mod tests {
             conn_state: &state,
         };
         high.set_priority(-1).unwrap();
+        // A weight change must not make the pending priority change take
+        // effect any earlier than upstream priority scheduling would.
+        high.set_weight(std::num::NonZeroU16::new(2).unwrap()).unwrap();
 
         let meta = server.write_frames_for_test(40, true);
         assert_eq!(meta.len(), 1);
@@ -1517,6 +1535,202 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn same_priority_stream_weights_are_proportional() {
+        let mut server = make(Side::Server);
+        server.set_params(&TransportParameters {
+            initial_max_streams_bidi: 2u32.into(),
+            initial_max_data: 200u32.into(),
+            initial_max_stream_data_bidi_remote: 100u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let mut streams = Streams {
+            state: &mut server,
+            conn_state: &state,
+        };
+        let id_heavy = streams.open(Dir::Bi).unwrap();
+        let id_light = streams.open(Dir::Bi).unwrap();
+
+        let mut heavy = SendStream {
+            id: id_heavy,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        heavy.set_weight(std::num::NonZeroU16::new(2).unwrap()).unwrap();
+        assert_eq!(heavy.weight().unwrap().get(), 2);
+        heavy.write(&[0; 100]).unwrap();
+
+        let mut light = SendStream {
+            id: id_light,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        assert_eq!(light.weight().unwrap().get(), 1);
+        light.write(&[0; 100]).unwrap();
+
+        let mut stream_ids = Vec::new();
+        loop {
+            let frames = server.write_frames_for_test(40, true);
+            if frames.is_empty() {
+                break;
+            }
+            stream_ids.extend(frames.into_iter().map(|frame| frame.id));
+        }
+
+        assert_eq!(
+            stream_ids,
+            vec![id_heavy, id_heavy, id_light, id_heavy, id_light, id_light]
+        );
+    }
+
+    #[test]
+    fn increasing_weight_promotes_an_already_pending_stream() {
+        let mut server = make(Side::Server);
+        server.set_params(&TransportParameters {
+            initial_max_streams_bidi: 2u32.into(),
+            initial_max_data: 200u32.into(),
+            initial_max_stream_data_bidi_remote: 100u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let mut streams = Streams {
+            state: &mut server,
+            conn_state: &state,
+        };
+        let id_a = streams.open(Dir::Bi).unwrap();
+        let id_b = streams.open(Dir::Bi).unwrap();
+
+        for id in [id_a, id_b] {
+            let mut stream = SendStream {
+                id,
+                state: &mut server,
+                pending: &mut pending,
+                conn_state: &state,
+            };
+            stream.write(&[0; 100]).unwrap();
+        }
+
+        assert_eq!(server.write_frames_for_test(40, true)[0].id, id_a);
+        let mut stream_b = SendStream {
+            id: id_b,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        stream_b
+            .set_weight(std::num::NonZeroU16::new(2).unwrap())
+            .unwrap();
+
+        assert_eq!(server.write_frames_for_test(40, true)[0].id, id_b);
+        SendStream {
+            id: id_b,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        }
+            .set_weight(std::num::NonZeroU16::new(2).unwrap())
+            .unwrap();
+        assert_eq!(server.write_frames_for_test(40, true)[0].id, id_b);
+        assert_eq!(server.write_frames_for_test(40, true)[0].id, id_a);
+    }
+
+    #[test]
+    fn increasing_idle_weight_promotes_the_next_write() {
+        let mut server = make(Side::Server);
+        server.set_params(&TransportParameters {
+            initial_max_streams_bidi: 2u32.into(),
+            initial_max_data: 200u32.into(),
+            initial_max_stream_data_bidi_remote: 100u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let mut streams = Streams {
+            state: &mut server,
+            conn_state: &state,
+        };
+        let id_background = streams.open(Dir::Bi).unwrap();
+        let id_focused = streams.open(Dir::Bi).unwrap();
+        SendStream {
+            id: id_background,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        }
+        .write(&[0; 100])
+        .unwrap();
+
+        let mut focused = SendStream {
+            id: id_focused,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        focused
+            .set_weight(std::num::NonZeroU16::new(2).unwrap())
+            .unwrap();
+        focused.write(&[0; 100]).unwrap();
+
+        assert_eq!(
+            server.write_frames_for_test(40, true)[0].id,
+            id_focused
+        );
+    }
+
+    #[test]
+    fn weights_do_not_reorder_streams_when_fairness_is_disabled() {
+        let mut server = make(Side::Server);
+        server.set_params(&TransportParameters {
+            initial_max_streams_bidi: 2u32.into(),
+            initial_max_data: 200u32.into(),
+            initial_max_stream_data_bidi_remote: 100u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let mut streams = Streams {
+            state: &mut server,
+            conn_state: &state,
+        };
+        let id_a = streams.open(Dir::Bi).unwrap();
+        let id_b = streams.open(Dir::Bi).unwrap();
+        for id in [id_a, id_b] {
+            let mut stream = SendStream {
+                id,
+                state: &mut server,
+                pending: &mut pending,
+                conn_state: &state,
+            };
+            stream.write(&[0; 100]).unwrap();
+        }
+        SendStream {
+            id: id_b,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        }
+        .set_weight(std::num::NonZeroU16::new(2).unwrap())
+        .unwrap();
+
+        let mut stream_ids = Vec::new();
+        loop {
+            let frames = server.write_frames_for_test(40, false);
+            if frames.is_empty() {
+                break;
+            }
+            stream_ids.extend(frames.into_iter().map(|frame| frame.id));
+        }
+        assert_eq!(
+            stream_ids,
+            vec![id_a, id_a, id_a, id_b, id_b, id_b]
+        );
     }
 
     #[test]

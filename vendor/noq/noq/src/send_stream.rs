@@ -1,6 +1,7 @@
 use std::{
     future::{Future, poll_fn},
     io,
+    num::NonZeroU16,
     pin::{Pin, pin},
     task::{Context, Poll},
 };
@@ -45,6 +46,15 @@ impl SendStream {
             conn,
             stream,
             is_0rtt,
+        }
+    }
+
+    /// Return a cloneable, non-owning handle for changing this stream's local
+    /// scheduler settings while another task is writing it.
+    pub fn priority_handle(&self) -> SendStreamPriorityHandle {
+        SendStreamPriorityHandle {
+            conn: self.conn.clone(),
+            stream: self.stream,
         }
     }
 
@@ -238,6 +248,24 @@ impl SendStream {
         conn.inner.send_stream(self.stream).priority()
     }
 
+    /// Set the relative scheduling weight of this stream.
+    ///
+    /// Weight is considered only among streams with the same priority. With
+    /// send fairness enabled (the default), higher-weight streams receive
+    /// proportionally more packet-writing turns. Every stream starts at
+    /// weight 1.
+    pub fn set_weight(&self, weight: NonZeroU16) -> Result<(), ClosedStream> {
+        let mut conn = self.conn.lock_and_wake("SendStream::set_weight");
+        conn.inner.send_stream(self.stream).set_weight(weight)?;
+        Ok(())
+    }
+
+    /// Get the relative scheduling weight of this stream.
+    pub fn weight(&self) -> Result<NonZeroU16, ClosedStream> {
+        let mut conn = self.conn.lock_without_waking("SendStream::weight");
+        conn.inner.send_stream(self.stream).weight()
+    }
+
     /// Completes when the peer stops the stream or reads the stream to completion
     ///
     /// Yields `Some` with the stop error code if the peer stops the stream. Yields `None` if the
@@ -285,6 +313,36 @@ impl SendStream {
         buf: &[u8],
     ) -> Poll<Result<usize, WriteError>> {
         pin!(self.get_mut().write(buf)).as_mut().poll(cx)
+    }
+}
+
+/// A non-owning handle to one send stream's local scheduler settings.
+///
+/// Dropping this handle does not finish the stream. It can therefore be moved
+/// to a control task while the owning [`SendStream`] is blocked writing data.
+#[derive(Clone, Debug)]
+pub struct SendStreamPriorityHandle {
+    conn: ConnectionRef,
+    stream: StreamId,
+}
+
+impl SendStreamPriorityHandle {
+    /// Set the stream's strict priority class.
+    pub fn set_priority(&self, priority: i32) -> Result<(), ClosedStream> {
+        let mut conn = self
+            .conn
+            .lock_and_wake("SendStreamPriorityHandle::set_priority");
+        conn.inner.send_stream(self.stream).set_priority(priority)?;
+        Ok(())
+    }
+
+    /// Set the stream's relative weight within its priority class.
+    pub fn set_weight(&self, weight: NonZeroU16) -> Result<(), ClosedStream> {
+        let mut conn = self
+            .conn
+            .lock_and_wake("SendStreamPriorityHandle::set_weight");
+        conn.inner.send_stream(self.stream).set_weight(weight)?;
+        Ok(())
     }
 }
 

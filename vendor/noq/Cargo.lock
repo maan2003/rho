@@ -1865,7 +1865,7 @@ dependencies = [
  "http",
  "lazy_static",
  "noq-proto",
- "noq-udp",
+ "noq-udp 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "pin-project-lite",
  "rand 0.10.1",
  "rcgen",
@@ -1935,6 +1935,19 @@ dependencies = [
  "log",
  "socket2",
  "tokio",
+ "tracing",
+ "windows-sys 0.61.1",
+]
+
+[[package]]
+name = "noq-udp"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3137a52df66c20090a889828d1c655f21f52294cba64e5c4fbb04fc83eee7c8e"
+dependencies = [
+ "cfg_aliases",
+ "libc",
+ "socket2",
  "tracing",
  "windows-sys 0.61.1",
 ]

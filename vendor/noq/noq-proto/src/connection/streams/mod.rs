@@ -1,6 +1,7 @@
 use std::{
     collections::{BinaryHeap, hash_map},
     io,
+    num::NonZeroU16,
 };
 
 use bytes::Bytes;
@@ -290,7 +291,11 @@ impl<'a> SendStream<'a> {
         self.state.unacked_data += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
         if !was_pending {
+            stream.weight_left = stream.weight.get();
             self.state.pending.push_pending(self.id, stream.priority);
+            if std::mem::take(&mut stream.promote_on_enqueue) {
+                self.state.pending.update_weight(self.id, true);
+            }
         }
         Ok(written)
     }
@@ -321,7 +326,11 @@ impl<'a> SendStream<'a> {
         let was_pending = stream.is_pending();
         stream.finish()?;
         if !was_pending {
+            stream.weight_left = stream.weight.get();
             self.state.pending.push_pending(self.id, stream.priority);
+            if std::mem::take(&mut stream.promote_on_enqueue) {
+                self.state.pending.update_weight(self.id, true);
+            }
         }
 
         Ok(())
@@ -386,11 +395,57 @@ impl<'a> SendStream<'a> {
 
         Ok(stream.as_ref().map(|s| s.priority).unwrap_or_default())
     }
+
+    /// Set the relative scheduling weight of a stream.
+    ///
+    /// Weight is considered only among streams at the same priority and only
+    /// when send fairness is enabled. A stream with weight 4 receives four
+    /// packet-writing turns per round for every one turn received by a stream
+    /// with weight 1. New streams have weight 1.
+    pub fn set_weight(&mut self, weight: NonZeroU16) -> Result<(), ClosedStream> {
+        let max_send_data = self.state.max_send_data(self.id);
+        let stream = self
+            .state
+            .send
+            .get_mut(&self.id)
+            .map(get_or_insert_send(max_send_data))
+            .ok_or(ClosedStream { _private: () })?;
+
+        let previous = stream.weight;
+        if previous == weight {
+            return Ok(());
+        }
+        stream.weight = weight;
+        stream.weight_left = weight.get();
+        if stream.is_pending() {
+            stream.promote_on_enqueue = false;
+            self.state
+                .pending
+                .update_weight(self.id, weight > previous);
+        } else {
+            stream.promote_on_enqueue = weight > previous;
+        }
+        Ok(())
+    }
+
+    /// Get the relative scheduling weight of a stream.
+    pub fn weight(&self) -> Result<NonZeroU16, ClosedStream> {
+        let stream = self
+            .state
+            .send
+            .get(&self.id)
+            .ok_or(ClosedStream { _private: () })?;
+
+        Ok(stream.as_ref().map(|s| s.weight).unwrap_or(NonZeroU16::MIN))
+    }
 }
 
 /// A queue of streams with pending outgoing data, sorted by priority
 struct PendingStreamsQueue {
     streams: BinaryHeap<PendingStream>,
+    /// Weight changes awaiting a packet write, where the connection's
+    /// fairness setting is available.
+    weight_updates: Vec<(StreamId, bool)>,
     /// The next stream to write out. This is `Some` when `TransportConfig::send_fairness(false)` and writing a stream is
     /// interrupted while the stream still has some pending data. See `reinsert_pending()`.
     next: Option<PendingStream>,
@@ -403,6 +458,7 @@ impl PendingStreamsQueue {
     fn new() -> Self {
         Self {
             streams: BinaryHeap::new(),
+            weight_updates: Vec::new(),
             next: None,
             recency: u64::MAX,
         }
@@ -417,6 +473,60 @@ impl PendingStreamsQueue {
             recency: self.recency, // the value here doesn't really matter
             id,
         });
+    }
+
+    /// Keep a stream at the front of its current equal-priority round.
+    fn continue_weighted(&mut self, mut stream: PendingStream, priority: i32) {
+        stream.priority = priority;
+        self.streams.push(stream);
+    }
+
+    /// Record a changed weight. Queue order is updated by the packet writer
+    /// only when fair scheduling is enabled.
+    fn update_weight(&mut self, id: StreamId, increased: bool) {
+        self.weight_updates.retain(|(queued, _)| *queued != id);
+        self.weight_updates.push((id, increased));
+    }
+
+    fn apply_weight_updates(&mut self, fair: bool) {
+        let updates = std::mem::take(&mut self.weight_updates);
+        if !fair {
+            return;
+        }
+        for (id, increased) in updates {
+            self.requeue_weight(id, increased);
+        }
+    }
+
+    /// Start a changed weight immediately: increased weights move to the
+    /// front of their class, while decreased weights begin at the back.
+    fn requeue_weight(&mut self, id: StreamId, increased: bool) {
+        if self.next.as_ref().is_some_and(|stream| stream.id == id) {
+            let mut stream = self.next.take().expect("checked above");
+            if increased {
+                stream.recency = u64::MAX;
+                self.streams.push(stream);
+            } else {
+                self.push_pending(id, stream.priority);
+            }
+            return;
+        }
+        if !self.streams.iter().any(|stream| stream.id == id) {
+            return;
+        }
+        let mut queued = self
+            .streams
+            .iter()
+            .find(|stream| stream.id == id)
+            .cloned()
+            .expect("checked above");
+        self.streams.retain(|stream| stream.id != id);
+        if increased {
+            queued.recency = u64::MAX;
+            self.streams.push(queued);
+        } else {
+            self.push_pending(id, queued.priority);
+        }
     }
 
     /// Push a pending stream ID with the given priority, queued after any already-queued streams for the priority
@@ -444,6 +554,7 @@ impl PendingStreamsQueue {
     fn clear(&mut self) {
         self.next = None;
         self.streams.clear();
+        self.weight_updates.clear();
     }
 
     fn iter(&self) -> impl Iterator<Item = &PendingStream> {

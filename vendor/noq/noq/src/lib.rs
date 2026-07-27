@@ -95,7 +95,9 @@ pub use crate::runtime::TokioRuntime;
 #[cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
 pub use crate::runtime::default_runtime;
 pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender};
-pub use crate::send_stream::{SendStream, Stopped, StoppedError, WriteError};
+pub use crate::send_stream::{
+    SendStream, SendStreamPriorityHandle, Stopped, StoppedError, WriteError,
+};
 
 #[cfg(test)]
 mod tests;

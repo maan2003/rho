@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::num::NonZeroU16;
 use thiserror::Error;
 
 use crate::{
@@ -13,6 +14,13 @@ pub(super) struct Send {
     pub(super) state: SendState,
     pub(super) pending: SendBuffer,
     pub(super) priority: i32,
+    /// Relative number of packet-writing turns this stream receives among
+    /// pending streams at the same priority.
+    pub(super) weight: NonZeroU16,
+    /// Turns left before this stream rotates behind equal-priority peers.
+    pub(super) weight_left: u16,
+    /// Promote the next data queued after an idle weight increase.
+    pub(super) promote_on_enqueue: bool,
     /// Whether a frame containing a FIN bit must be transmitted, even if we don't have any new data
     pub(super) fin_pending: bool,
     /// Whether this stream is in the `connection_blocked` list of `Streams`
@@ -28,6 +36,9 @@ impl Send {
             state: SendState::Ready,
             pending: SendBuffer::new(),
             priority: 0,
+            weight: NonZeroU16::MIN,
+            weight_left: 1,
+            promote_on_enqueue: false,
             fin_pending: false,
             connection_blocked: false,
             stop_reason: None,
