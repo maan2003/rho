@@ -280,7 +280,6 @@
                   $out/share/rho/skills/delegate-engineering
                 cp -r ${./.agents/skills/rho-wayland} $out/share/rho/skills/rho-wayland
                 cp -r ${./.agents/skills/rho-workstreams} $out/share/rho/skills/rho-workstreams
-                cp -r ${./.agents/skills/visualizations} $out/share/rho/skills/visualizations
                 chmod -R u+w $out/share/rho/skills
               '';
             };
