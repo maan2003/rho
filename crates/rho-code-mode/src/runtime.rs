@@ -236,7 +236,12 @@ async fn run(
         };
         let response: JsonValue = match serde_json::from_str(&msg.content) {
             Ok(response) => response,
-            Err(_) => json!({}),
+            Err(error) => {
+                cell.finish(CellStatus::Completed {
+                    error: Some(format!("invalid inspector response: {error}")),
+                });
+                return;
+            }
         };
         cell.finish(evaluation_outcome(&cell, &response));
     });
@@ -297,11 +302,15 @@ async fn run(
                 }
                 // Runs the cell's synchronous prefix inline; a busy loop
                 // blocks here until terminated via the isolate handle.
+                // A final primitive keeps V8's awaited REPL result alive;
+                // evaluations settling to `undefined` can otherwise race GC
+                // and report "Promise was collected" despite having run.
+                let expression = format!("{source}\n;0");
                 session.post_message(
                     eval_id,
                     "Runtime.evaluate",
                     Some(json!({
-                        "expression": source,
+                        "expression": expression,
                         "replMode": true,
                         "awaitPromise": true,
                     })),
@@ -323,15 +332,10 @@ fn evaluation_outcome(cell: &CellShared, response: &JsonValue) -> CellStatus {
     let exited = cell.exit_requested.load(Ordering::Acquire);
 
     if let Some(error) = response.get("error") {
-        // "Promise was collected" is how REPL-mode evaluations that settle to
-        // `undefined` can report; the evaluation itself succeeded.
         let message = error
             .get("message")
             .and_then(JsonValue::as_str)
-            .unwrap_or("");
-        if message == "Promise was collected" {
-            return CellStatus::Completed { error: None };
-        }
+            .unwrap_or("script evaluation failed");
         if terminated {
             return CellStatus::Terminated;
         }
@@ -356,7 +360,13 @@ fn evaluation_outcome(cell: &CellShared, response: &JsonValue) -> CellStatus {
         return CellStatus::Completed { error: Some(error) };
     }
 
-    CellStatus::Completed { error: None }
+    if response.pointer("/result/result").is_some() {
+        CellStatus::Completed { error: None }
+    } else {
+        CellStatus::Completed {
+            error: Some("invalid inspector evaluation response".to_string()),
+        }
+    }
 }
 
 fn install_prelude(runtime: &mut JsRuntime, tools: &[NestedTool]) -> Result<(), String> {

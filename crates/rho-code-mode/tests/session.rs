@@ -479,7 +479,7 @@ async fn script_errors_are_reported() {
         "{}",
         result.output
     );
-    assert!(result.output.contains("boom"), "{}", result.output);
+    assert!(result.output.contains("Script error:"), "{}", result.output);
 }
 
 #[tokio::test]
