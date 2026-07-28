@@ -2556,6 +2556,11 @@ async fn handle_message(
                         .comment(agent_id, &url, &body, reply.as_deref())
                         .await
                         .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Edit { url, title, body } => agents
+                        .pr_monitor
+                        .edit(agent_id, &url, title, body)
+                        .await
+                        .map(|output| (output, Vec::new())),
                     rho_ui_proto::PrCommand::Rerun { url, run_id } => agents
                         .pr_monitor
                         .rerun(agent_id, &url, run_id)

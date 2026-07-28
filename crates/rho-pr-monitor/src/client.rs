@@ -2,7 +2,8 @@ use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use octo_types::{
-    PrCommentRequest, PrCommentResponse, PrCreateRequest, PrCreateResponse, PrSnapshot,
+    PrCommentRequest, PrCommentResponse, PrCreateRequest, PrCreateResponse, PrEditRequest,
+    PrEditResponse, PrSnapshot,
 };
 
 #[derive(Clone)]
@@ -39,6 +40,17 @@ impl OctoClient {
         request: &PrCreateRequest,
     ) -> Result<PrCreateResponse> {
         self.post(&format!("/pr/create/{owner}/{repo}"), request)
+            .await
+    }
+
+    pub(crate) async fn edit(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        request: &PrEditRequest,
+    ) -> Result<PrEditResponse> {
+        self.patch(&format!("/pr/edit/{owner}/{repo}/{number}"), request)
             .await
     }
 
@@ -118,6 +130,20 @@ impl OctoClient {
         let response = self
             .client
             .post(self.base_url.join(path)?)
+            .json(body)
+            .send()
+            .await?;
+        decode(response).await
+    }
+
+    async fn patch<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> Result<T> {
+        let response = self
+            .client
+            .patch(self.base_url.join(path)?)
             .json(body)
             .send()
             .await?;

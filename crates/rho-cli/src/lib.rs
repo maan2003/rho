@@ -291,6 +291,14 @@ pub(crate) enum PrCliCommand {
     List,
     /// Stop monitoring an open pull request.
     Stop { url: String },
+    /// Edit a pull request's title or description.
+    Edit {
+        url: String,
+        #[arg(short = 't', long)]
+        title: Option<String>,
+        #[arg(short = 'b', long, alias = "description")]
+        body: Option<String>,
+    },
     /// Add a PR comment, optionally replying to a delivered feedback event.
     Comment {
         url: String,

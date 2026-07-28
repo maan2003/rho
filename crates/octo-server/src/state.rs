@@ -268,6 +268,34 @@ impl AppState {
         let result = serde_json::from_slice(&bytes)?;
         Ok(result)
     }
+
+    pub async fn github_patch_json<B: Serialize>(
+        &self,
+        segments: &[&str],
+        body: &B,
+    ) -> Result<serde_json::Value> {
+        let token = self.get_token().await?;
+        let url = self.build_url(segments, None);
+
+        let resp = self
+            .client
+            .patch(url)
+            .headers(Self::github_headers(&token))
+            .json(body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let bytes = Self::bounded_response_bytes(resp).await?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "GitHub returned {}: {}",
+                status,
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
 }
 
 #[cfg(test)]

@@ -352,6 +352,31 @@ impl PrMonitor {
         Ok(format!("stopped watching {url}"))
     }
 
+    pub async fn edit(
+        &self,
+        subscriber: AgentId,
+        url: &str,
+        title: Option<String>,
+        body: Option<String>,
+    ) -> anyhow::Result<String> {
+        self.ensure_engineer(subscriber)?;
+        anyhow::ensure!(
+            title.is_some() || body.is_some(),
+            "provide --title or --body"
+        );
+        let (owner, repo, number) = parse_pr_url(url)?;
+        let response = self
+            .octo
+            .edit(
+                &owner,
+                &repo,
+                number,
+                &octo_types::PrEditRequest { title, body },
+            )
+            .await?;
+        Ok(format!("updated pull request: {}", response.url))
+    }
+
     pub async fn comment(
         &self,
         subscriber: AgentId,

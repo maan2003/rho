@@ -93,6 +93,13 @@ fn command(command: PrCliCommand) -> anyhow::Result<PrCommand> {
         PrCliCommand::Status { url } => PrCommand::Status { url },
         PrCliCommand::List => PrCommand::List,
         PrCliCommand::Stop { url } => PrCommand::Stop { url },
+        PrCliCommand::Edit { url, title, body } => {
+            anyhow::ensure!(
+                title.is_some() || body.is_some(),
+                "provide --title or --body"
+            );
+            PrCommand::Edit { url, title, body }
+        }
         PrCliCommand::Comment { url, reply, body } => PrCommand::Comment { url, reply, body },
         PrCliCommand::Rerun { url, run_id } => PrCommand::Rerun { url, run_id },
         PrCliCommand::Logs { url, run_id } => PrCommand::Logs { url, run_id },

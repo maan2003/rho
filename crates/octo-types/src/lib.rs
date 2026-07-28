@@ -203,6 +203,17 @@ pub struct PrCreateResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct PrEditRequest {
+    pub title: Option<String>,
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PrEditResponse {
+    pub url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PrSnapshot {
     pub repository_id: u64,
     pub authenticated_user_id: Option<u64>,

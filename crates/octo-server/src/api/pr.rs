@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use octo_types::{
-    PrCommentRequest, PrCommentResponse, PrCreateRequest, PrCreateResponse, PrFeedback, PrSnapshot,
-    WorkflowRun,
+    PrCommentRequest, PrCommentResponse, PrCreateRequest, PrCreateResponse, PrEditRequest,
+    PrEditResponse, PrFeedback, PrSnapshot, WorkflowRun,
 };
 
 use crate::error::AppError;
@@ -15,6 +15,7 @@ use crate::types::PathSegment;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/pr/create/{owner}/{repo}", post(create_pr))
+        .route("/pr/edit/{owner}/{repo}/{number}", patch(edit_pr))
         .route("/pr/snapshot/{owner}/{repo}/{number}", get(pr_snapshot))
         .route("/pr/comment/{owner}/{repo}/{number}", post(comment_on_pr))
         .route(
@@ -52,6 +53,31 @@ async fn create_pr(
         head: pr_json["head"]["ref"].as_str().unwrap_or("").to_string(),
         base: pr_json["base"]["ref"].as_str().unwrap_or("").to_string(),
         draft: pr_json["draft"].as_bool().unwrap_or(true),
+    }))
+}
+
+async fn edit_pr(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(PathSegment, PathSegment, u64)>,
+    Json(req): Json<PrEditRequest>,
+) -> Result<Json<PrEditResponse>, AppError> {
+    let pr_json = state
+        .github_patch_json(
+            &[
+                "repos",
+                owner.as_str(),
+                repo.as_str(),
+                "pulls",
+                &number.to_string(),
+            ],
+            &req,
+        )
+        .await?;
+    Ok(Json(PrEditResponse {
+        url: pr_json["html_url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("PR response missing html_url"))?
+            .to_owned(),
     }))
 }
 

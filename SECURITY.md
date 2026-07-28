@@ -176,6 +176,9 @@ AI APIs.
   Top-level comments require an active subscription owned by the calling
   Engineer. When replying to feedback, the event must also belong to that same
   PR and subscription generation.
+  Title and description edits require an Engineer and a canonical PR URL but
+  intentionally do not require a subscription or local ownership check;
+  GitHub permissions govern the operation and GitHub retains its edit history.
   Outbound markers suppress input only when the comment author matches GitHub's
   authenticated viewer id. Event replies carry a reserved random operation
   marker for ambiguous retry recovery; reply commands revalidate subscription

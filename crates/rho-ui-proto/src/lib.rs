@@ -408,6 +408,11 @@ pub enum PrCommand {
         url: String,
         run_id: u64,
     },
+    Edit {
+        url: String,
+        title: Option<String>,
+        body: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -1131,10 +1136,10 @@ mod tests {
         let message = ClientMessage::PrCommand {
             request_id: 7,
             agent_id: Some("eng-abcd".into()),
-            command: PrCommand::Comment {
+            command: PrCommand::Edit {
                 url: "https://github.com/acme/widgets/pull/1".into(),
-                reply: Some("inline:9:v1".into()),
-                body: "addressed".into(),
+                title: Some("Better title".into()),
+                body: Some("Better summary".into()),
             },
         };
         let bytes = senax_encoder::pack(&message).unwrap();

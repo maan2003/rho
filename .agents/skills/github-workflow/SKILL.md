@@ -27,6 +27,11 @@ Use only `rho pr` for pull-request and GitHub Actions operations:
   published feedback.
 - `rho pr status` returns the current PR snapshot, including workflow run IDs;
   `rho pr list` shows this Engineer's persisted subscriptions.
+- `rho pr edit PR_URL --title "..." --body "..."` updates either or both PR
+  metadata fields. Prefer editing the title or description when correcting or
+  improving the PR's current summary instead of posting a new comment about
+  the change. Edits do not require a subscription; GitHub permissions and
+  edit history provide the authority check and audit trail.
 - `rho pr comment PR_URL --body "..."` starts a top-level comment. When
   responding to delivered feedback, prefer
   `rho pr comment PR_URL --reply EVENT_ID --body "..."` so GitHub context and

@@ -44,6 +44,37 @@ fn pr_comment_parses_with_optional_reply() {
 }
 
 #[test]
+fn pr_edit_parses_title_and_description() {
+    let args = Args::try_parse(
+        [
+            "pr",
+            "edit",
+            "https://github.com/acme/widgets/pull/1",
+            "--title",
+            "Better title",
+            "--description",
+            "Better summary",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    )
+    .unwrap();
+    assert!(matches!(
+        args.command,
+        super::Command::Pr(super::PrArgs {
+            command: super::PrCliCommand::Edit {
+                url,
+                title: Some(title),
+                body: Some(body),
+            },
+            ..
+        }) if url == "https://github.com/acme/widgets/pull/1"
+            && title == "Better title"
+            && body == "Better summary"
+    ));
+}
+
+#[test]
 fn bare_rho_requires_a_subcommand() {
     assert!(Args::try_parse(std::iter::empty()).is_err());
 }
