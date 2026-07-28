@@ -480,7 +480,7 @@ Report outcomes honestly. Don't claim tests pass when they don't, don't suppress
 
 ## High-Impact Actions
 
-Ask before taking actions that are destructive, hard to reverse, or shared with others, such as deleting untracked data, deleting branches, discarding work with `git checkout` or `git restore`, rewriting history, pushing code, or changing shared infrastructure. Approval applies to the action requested, not to later follow-up actions after the state changes.
+Ask before taking actions that are destructive, hard to reverse, or shared with others, such as deleting untracked data, deleting branches, discarding work with `git checkout` or `git restore`, pushing code, or changing shared infrastructure. Approval applies to the action requested, not to later follow-up actions after the state changes.
 
 ## Tool Use
 
@@ -523,6 +523,47 @@ Example:
      └───────▶│ Worker │
               └────────┘
 ```
+
+";
+
+/// Draft replacement for the rendered `## Workspace Context` section under the
+/// per-agent clone model (each agent gets its own jj repo over shared storage
+/// instead of a Rho-managed workspace in one shared repo). Unused until that
+/// runtime lands.
+///
+/// Variants the renderer still needs: "Every repository in your working set is
+/// your own clone" for multiple jj workdirs; a live-directory line for plain
+/// workdirs; the existing per-workdir list when the working set is mixed; and,
+/// for an agent that joined its spawner's checkout, "You share this clone with
+/// the agent that started you, so your edits are visible to it immediately" in
+/// place of the second sentence.
+#[allow(dead_code)]
+const DRAFT_CLONE_WORKSPACE_PROMPT: &str = "## Workspace Context
+
+Your working directory is your own clone of the repository. No other agent \
+works in it, so edit files and run tests here freely. The user may also open \
+and edit it — treat changes you did not make as intentional and leave them \
+alone.
+
+";
+
+/// Draft version-control section to accompany [`DRAFT_CLONE_WORKSPACE_PROMPT`],
+/// rendered only when at least one workdir is a jj repo. Landing and history
+/// editing are deliberately absent: the `land` skill owns that policy, and
+/// restating it here is the repetition that makes agents ask before safe,
+/// expected actions.
+///
+/// Blocked on the handoff fix: `delegate-engineering/SKILL.md` and the
+/// `spawn_engineer` result still hand out `jj diff -r '<workspace>@'`, which
+/// reads empty once an agent commits. That needs to become a range from the
+/// spawn base, which is also correct when the agent leaves work uncommitted.
+#[allow(dead_code)]
+const DRAFT_JJ_WORKFLOW_PROMPT: &str = "## jj Workflow
+
+This repository uses jj. Record a change once it is complete: \
+`jj commit -m '<message>'` for new work, or `jj squash -u` to fold a follow-up \
+into the change you just made. Work still in progress can stay in the working \
+copy.
 
 ";
 

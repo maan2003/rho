@@ -116,6 +116,10 @@ impl ClaudeCodeOptions {
         );
         command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
         command.env("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", "1");
+        // Built-in commit and PR workflow instructions are written for git and
+        // conflict with Rho's jj guidance; the land and github-workflow skills
+        // own that territory instead.
+        command.env("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1");
         for (name, value) in &self.env {
             command.env(name, value);
         }
