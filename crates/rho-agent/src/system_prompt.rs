@@ -516,7 +516,7 @@ fn render_workspace_prompt(workdirs: &[WorkdirPrompt], delegated_engineer: bool)
         .iter()
         .filter(|workdir| workdir.workspace_handle.is_some())
         .count();
-    let mut out = String::from("## Workspace\n\n");
+    let mut out = String::from("## Workspace Context\n\n");
     if managed == workdirs.len() {
         if workdirs.len() == 1 {
             out.push_str("Your working directory is a Rho-managed jj workspace.\n\n");
@@ -527,7 +527,7 @@ fn render_workspace_prompt(workdirs: &[WorkdirPrompt], delegated_engineer: bool)
         }
     } else if managed == 0 {
         out.push_str(
-            "Your workdirs are live directories rather than Rho-managed jj workspaces.\n\n",
+            "Your workdirs are live directories rather than Rho-managed jj workspaces. Edits there are immediately visible to the user and other processes using those directories.\n\n",
         );
     } else {
         out.push_str("Workspace management differs across your working set:\n");
@@ -541,8 +541,11 @@ fn render_workspace_prompt(workdirs: &[WorkdirPrompt], delegated_engineer: bool)
         }
         out.push('\n');
     }
+    if managed > 0 {
+        out.push_str("A Rho-managed workspace is the checkout assigned to this agent. Agent views can mount different checkouts at the same absolute repository path, so an identical path does not imply shared live filesystem edits. Within each managed repository, `@` refers to that workspace's working-copy commit. Files and changes already present are your assigned starting state.\n\n");
+    }
     if delegated_engineer && managed > 0 {
-        out.push_str("### Delegated Engineer Isolation\n\nRho gives each delegated Engineer separate managed jj workspaces. Those workspaces do not share live filesystem edits, even when their visible paths are the same. Additional setup is therefore not necessary merely to protect your edits from concurrent Engineer work; use your judgment if the task itself benefits from another setup.\n\n");
+        out.push_str("### Delegated Engineer Isolation\n\nRho gives each delegated Engineer separate managed jj workspaces. Changes you make in a managed workdir stay in your workspace's commit until they are explicitly integrated elsewhere. This provides an independent place for implementation and experiments. Additional setup is not necessary merely to protect your edits from concurrent Engineer work; use your judgment if the task itself benefits from another setup.\n\n");
     }
     out
 }
@@ -609,9 +612,11 @@ mod tests {
     #[test]
     fn managed_workspace_prompt_is_informational() {
         let prompt = render_workspace_prompt(&[workdir("/repo", Some("agentws"))], false);
-        assert!(prompt.contains("## Workspace"));
+        assert!(prompt.contains("## Workspace Context"));
         assert!(prompt.contains("working directory is a Rho-managed jj workspace"));
-        assert!(!prompt.contains("other agents"));
+        assert!(prompt.contains("`@` refers to that workspace's working-copy commit"));
+        assert!(prompt.contains("assigned starting state"));
+        assert!(!prompt.contains("Delegated Engineer Isolation"));
         assert!(!prompt.contains("do not create"));
     }
 
@@ -619,7 +624,8 @@ mod tests {
     fn delegated_engineer_prompt_explains_isolation_without_prohibiting_setup() {
         let prompt = render_workspace_prompt(&[workdir("/repo", Some("agentws"))], true);
         assert!(prompt.contains("### Delegated Engineer Isolation"));
-        assert!(prompt.contains("do not share live filesystem edits"));
+        assert!(prompt.contains("stay in your workspace's commit"));
+        assert!(prompt.contains("independent place for implementation and experiments"));
         assert!(prompt.contains("use your judgment"));
         assert!(!prompt.contains("do not create"));
     }
@@ -628,6 +634,7 @@ mod tests {
     fn live_workspace_prompt_reports_management() {
         let prompt = render_workspace_prompt(&[workdir("/repo", None)], false);
         assert!(prompt.contains("live directories rather than Rho-managed jj workspaces"));
+        assert!(prompt.contains("immediately visible to the user"));
     }
 
     #[test]
