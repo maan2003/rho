@@ -1276,6 +1276,11 @@ impl ConnectionPool {
                                 .await
                                 .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
                         }
+                        RemoteConnectionOptions::Custom(opts) => Err(anyhow!(
+                            "custom connection {:?} cannot be created through the pool; \
+                             construct the RemoteConnection directly",
+                            opts.name
+                        )),
                         #[cfg(any(test, feature = "test-support"))]
                         RemoteConnectionOptions::Mock(opts) => match cx.update(|cx| {
                             cx.default_global::<crate::transport::mock::MockConnectionRegistry>()
@@ -1323,8 +1328,18 @@ pub enum RemoteConnectionOptions {
     Ssh(SshConnectionOptions),
     Wsl(WslConnectionOptions),
     Docker(DockerConnectionOptions),
+    /// An application-embedded transport (e.g. rho's in-process host); never
+    /// constructed by zed itself.
+    Custom(CustomConnectionOptions),
     #[cfg(any(test, feature = "test-support"))]
     Mock(crate::transport::mock::MockConnectionOptions),
+}
+
+/// Identity of a connection whose transport is provided by the embedding
+/// application rather than by zed (see [`RemoteConnectionOptions::Custom`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CustomConnectionOptions {
+    pub name: String,
 }
 
 impl RemoteConnectionOptions {
@@ -1342,6 +1357,7 @@ impl RemoteConnectionOptions {
                     opts.name.clone()
                 }
             }
+            RemoteConnectionOptions::Custom(opts) => opts.name.clone(),
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(opts) => format!("mock-{}", opts.id),
         }
@@ -1360,6 +1376,7 @@ impl RemoteConnectionOptions {
                     "docker"
                 }
             }
+            RemoteConnectionOptions::Custom(_) => "custom",
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(_) => "mock",
         }

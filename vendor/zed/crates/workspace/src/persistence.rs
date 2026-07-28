@@ -1698,6 +1698,14 @@ impl WorkspaceDb {
                 name = Some(identity_name);
                 user = Some(remote_user);
             }
+            // Custom connections are embedded-app transports; zed never
+            // restores them from the workspace database, so any stable row
+            // shape works. Reuse the Ssh kind with a marker host.
+            RemoteConnectionIdentity::Custom { name: custom_name } => {
+                kind = RemoteConnectionKind::Ssh;
+                host = Some(format!("custom-{custom_name}"));
+                user = None;
+            }
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionIdentity::Mock { id } => {
                 kind = RemoteConnectionKind::Ssh;

@@ -22,6 +22,7 @@ pub enum RemoteConnectionIdentity {
         name: String,
         remote_user: String,
     },
+    Custom { name: String },
     #[cfg(any(test, feature = "test-support"))]
     Mock { id: u64 },
 }
@@ -51,6 +52,7 @@ impl RemoteConnectionIdentity {
                 name,
                 remote_user,
             } => format!("docker:{remote_user}@{name}:{container_id}"),
+            Self::Custom { name } => format!("custom:{name}"),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock { id } => format!("mock:{id}"),
         }
@@ -73,6 +75,9 @@ impl From<&RemoteConnectionOptions> for RemoteConnectionIdentity {
                 container_id: options.container_id.clone(),
                 name: options.name.clone(),
                 remote_user: options.remote_user.clone(),
+            },
+            RemoteConnectionOptions::Custom(options) => Self::Custom {
+                name: options.name.clone(),
             },
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(options) => Self::Mock { id: options.id },
