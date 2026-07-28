@@ -304,6 +304,42 @@ impl FoldMapWriter<'_> {
         )
     }
 
+    /// Removes every fold carrying `type_id`, including folds whose anchors
+    /// collapsed to an empty range after an edit.
+    pub(crate) fn remove_all_folds_with_type(
+        &mut self,
+        type_id: TypeId,
+    ) -> (FoldSnapshot, Vec<FoldEdit>) {
+        let snapshot = self.0.snapshot.inlay_snapshot.clone();
+        let buffer = &snapshot.buffer;
+        let mut cursor = self.0.snapshot.folds.cursor::<FoldRange>(buffer);
+        let mut kept = Vec::new();
+        let mut edits = Vec::new();
+        cursor.next();
+        while let Some(fold) = cursor.item() {
+            if fold.placeholder.type_tag == Some(type_id) {
+                let range = fold.range.start.to_offset(buffer)..fold.range.end.to_offset(buffer);
+                if !range.is_empty() {
+                    let range =
+                        snapshot.to_inlay_offset(range.start)..snapshot.to_inlay_offset(range.end);
+                    edits.push(InlayEdit {
+                        old: range.clone(),
+                        new: range,
+                    });
+                }
+                self.0.snapshot.fold_metadata_by_id.remove(&fold.id);
+            } else {
+                kept.push(fold.clone());
+            }
+            cursor.next();
+        }
+        drop(cursor);
+        self.0.snapshot.folds = SumTree::from_iter(kept, buffer);
+        let edits = consolidate_inlay_edits(edits);
+        let edits = self.0.sync(snapshot, edits);
+        (self.0.snapshot.clone(), edits)
+    }
+
     /// Removes any folds whose ranges intersect the given ranges. Concealed
     /// folds stay: they hide markup rather than content, so unfolding a
     /// region is not a request to reveal them.

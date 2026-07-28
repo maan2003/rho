@@ -5369,6 +5369,67 @@ impl BufferSnapshot {
         })
     }
 
+    /// Returns ranges captured by the active languages' concealment queries.
+    /// Line-prefix captures also consume horizontal whitespace immediately
+    /// after the captured node.
+    pub fn concealed_ranges<T: ToOffset, U: ToOffset>(
+        &self,
+        scan_range: Range<T>,
+        eligible_range: Range<U>,
+    ) -> impl Iterator<Item = Range<usize>> + '_ {
+        let offset_range = scan_range.start.to_offset(self)..scan_range.end.to_offset(self);
+        let eligible_range =
+            eligible_range.start.to_offset(self)..eligible_range.end.to_offset(self);
+        let mut syntax_matches = self.syntax.matches(offset_range, self, |grammar| {
+            grammar
+                .concealments_config
+                .as_ref()
+                .map(|config| &config.query)
+        });
+
+        let configs = syntax_matches
+            .grammars()
+            .iter()
+            .map(|grammar| grammar.concealments_config.as_ref())
+            .collect::<Vec<_>>();
+
+        iter::from_fn(move || {
+            let concealed_range = syntax_matches.peek().and_then(|mat| {
+                let config = configs[mat.grammar_index]?;
+                let capture = mat
+                    .captures
+                    .iter()
+                    .find(|capture| capture.index == config.conceal_capture_ix)?;
+                let context = mat
+                    .captures
+                    .iter()
+                    .find(|capture| capture.index == config.conceal_context_capture_ix)?;
+                let context_range = context.node.byte_range();
+                if context_range.start < eligible_range.start
+                    || context_range.end > eligible_range.end
+                {
+                    return None;
+                }
+                let mut range = capture.node.byte_range();
+                if config.conceal_line_prefix_capture_ix.is_some_and(|ix| {
+                    mat.captures.iter().any(|line_capture| {
+                        line_capture.index == ix && line_capture.node.id() == capture.node.id()
+                    })
+                }) {
+                    for character in self.chars_at(range.end) {
+                        if !matches!(character, ' ' | '\t') {
+                            break;
+                        }
+                        range.end += character.len_utf8();
+                    }
+                }
+                Some(range)
+            });
+            syntax_matches.advance();
+            concealed_range
+        })
+    }
+
     pub fn injections_intersecting_range<T: ToOffset>(
         &self,
         range: Range<T>,

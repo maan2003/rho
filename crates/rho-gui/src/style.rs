@@ -59,9 +59,6 @@ pub enum StyleClass {
     AgentLabel,
     ShellPrompt,
     ShellCommand,
-    /// Tree-sitter highlight, by syntax-theme index (see
-    /// `language::HighlightId`).
-    Syntax(u32),
 }
 
 /// Which highlight-key space a style range lives in.
@@ -74,7 +71,6 @@ pub enum Region {
 }
 
 const SEMANTIC_KEY_BASE: usize = 0;
-const SYNTAX_KEY_BASE: usize = 1_000;
 pub const PROMPT_DRAFT_HIGHLIGHT_KEY: usize = usize::MAX - 1;
 
 impl StyleClass {
@@ -97,7 +93,6 @@ impl StyleClass {
             Self::ShellPrompt => 14,
             Self::ShellCommand => 15,
             Self::AgentLabel => 16,
-            Self::Syntax(id) => SYNTAX_KEY_BASE + id as usize,
         };
         let region_bit = match region {
             Region::History => 0,
@@ -127,14 +122,6 @@ impl StyleClass {
             Self::AgentLabel => (agent_message_color(cx), false),
             Self::ShellPrompt => (colors.terminal_ansi_green.into(), false),
             Self::ShellCommand => (colors.text_accent.into(), false),
-            Self::Syntax(id) => {
-                return cx
-                    .theme()
-                    .syntax()
-                    .get(id as usize)
-                    .copied()
-                    .unwrap_or_default();
-            }
         };
         HighlightStyle {
             color: Some(color),

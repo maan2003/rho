@@ -534,7 +534,6 @@ fn user_messages_render_with_turn_gaps_and_gutters(cx: &mut TestAppContext) {
             Vec::new(),
         )),
     );
-
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("first\n\nanswer\n\nsecond\n\n"),
@@ -943,6 +942,7 @@ fn highlights_survive_the_folds_that_conceal_markup(cx: &mut TestAppContext) {
             });
         })
         .expect("highlight words around concealed markup");
+    cx.run_until_parked();
 
     let runs = styled_runs(&workspace, cx);
     let text: String = runs.iter().map(|(text, _)| text.as_str()).collect();
@@ -973,19 +973,21 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
         cx,
         agent(1),
         snapshot_frame(state(
-            vec![user("go")],
+            vec![user("**user markup stays visible**")],
             vec![assistant(
                 "## Heading\n\n**bold** and `code`.\n",
                 Some(UiMessagePhase::FinalAnswer),
             )],
         )),
     );
+    cx.run_until_parked();
 
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("Heading\n\nbold and code.\n"),
         "markup should not reach the screen: {text:?}"
     );
+    assert!(text.contains("**user markup stays visible**"));
     let buffer = buffer_text(&workspace, cx);
     assert!(
         buffer.contains("## Heading\n\n**bold** and `code`.\n"),
@@ -1012,6 +1014,7 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
             context_used: None,
         },
     );
+    cx.run_until_parked();
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("bold and code.\nmore\n"),
@@ -1807,35 +1810,31 @@ fn terminal_escape_chord_parses() {
     }
 }
 
-/// The inline grammar runs over the spans the block parse marked inline, so
-/// a fenced code block keeps its punctuation: `**` inside one is content,
-/// not emphasis, and is styled as the code around it.
+/// The inline injection only runs over inline spans, so fenced code keeps
+/// punctuation that would be markup in prose.
 #[gpui::test]
 fn fenced_code_keeps_its_asterisks(cx: &mut TestAppContext) {
-    let _workspace = test_workspace(cx);
-    let markdown = cx.update(|cx| crate::render::markdown::Markdown::new(cx));
-    let class_of = |text: &str, needle: &str| {
-        crate::render::markdown::markdown_spans(text, &markdown)
-            .into_iter()
-            .find(|span| span.text.contains(needle))
-            .unwrap_or_else(|| panic!("no span carries {needle:?}"))
-            .class
-    };
-
-    let fenced = "```\n**bold**\nplain\n```\n";
-    assert_eq!(class_of(fenced, "**bold**"), class_of(fenced, "plain"));
-    assert_ne!(
-        class_of("**bold**\n", "**bold**"),
-        class_of(fenced, "**bold**")
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant(
+                "```\n**bold**\nplain\n```\n",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
     );
-    assert!(crate::render::conceal::concealed_ranges(fenced).is_empty());
+    cx.run_until_parked();
+    assert!(display_text(&workspace, cx).contains("**bold**"));
 }
 
-/// Concealment is spread over frames: the tail a view opens on is hidden in
-/// the frame that opens it, and the history behind it follows without the
-/// user ever seeing its markup.
+/// A long transcript conceals the visible tail after parsing without eagerly
+/// decorating its off-screen history.
 #[gpui::test]
-fn long_transcripts_conceal_their_history_after_the_frame_that_opens_them(cx: &mut TestAppContext) {
+fn long_transcripts_conceal_their_visible_tail_after_parsing(cx: &mut TestAppContext) {
     let markup = (0..400)
         .map(|index| format!("line **{index}** of `history`\n"))
         .collect::<String>();
@@ -1850,14 +1849,7 @@ fn long_transcripts_conceal_their_history_after_the_frame_that_opens_them(cx: &m
         )),
     );
 
-    // The tail is hidden right away; the head may still show its markup.
-    let opened = display_text(&workspace, cx);
-    assert!(
-        opened.contains("line 399 of history"),
-        "the tail a view opens on should be concealed in that frame"
-    );
-
-    // The backfill paces itself between frames; let those frames pass.
+    // Parsing and query-backed decoration are both asynchronous.
     for _ in 0..64 {
         cx.run_until_parked();
         cx.executor()
@@ -1865,11 +1857,8 @@ fn long_transcripts_conceal_their_history_after_the_frame_that_opens_them(cx: &m
     }
     cx.run_until_parked();
     let settled = display_text(&workspace, cx);
-    assert!(
-        !settled.contains("**"),
-        "history should end up concealed like the tail"
-    );
-    assert!(settled.contains("line 0 of history"));
+    assert!(settled.contains("line 399 of history"));
+    assert!(!settled.contains("line **399** of `history`"));
     assert!(
         buffer_text(&workspace, cx).contains("line **0** of `history`"),
         "the buffer keeps the markup either way"
@@ -2005,6 +1994,7 @@ fn every_row_of_a_user_message_renders_larger(cx: &mut TestAppContext) {
             )],
         )),
     );
+    cx.run_until_parked();
 
     let editor = active_editor(&workspace, cx);
     let lines = display_text(&workspace, cx);

@@ -851,6 +851,51 @@ impl DisplayMap {
             .write(self_new_wrap_snapshot, self_new_wrap_edits, None);
     }
 
+    /// Atomically replaces all folds tagged with `type_id`.
+    #[instrument(skip_all)]
+    pub fn replace_folds_with_type<T: Clone + ToOffset>(
+        &mut self,
+        type_id: TypeId,
+        creases: Vec<Crease<T>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.companion().is_some() {
+            return;
+        }
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let edits = self.buffer_subscription.consume().into_inner();
+        let tab_size = Self::tab_size(&self.buffer, cx);
+        let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
+        let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (snapshot, edits) = self
+            .wrap_map
+            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        self.block_map.read(snapshot, edits, None);
+
+        let (snapshot, edits) = fold_map.remove_all_folds_with_type(type_id);
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (snapshot, edits) = self
+            .wrap_map
+            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        self.block_map.read(snapshot, edits, None);
+        let inline = creases.into_iter().filter_map(|crease| match crease {
+            Crease::Inline {
+                range,
+                placeholder,
+                elision_policy,
+                ..
+            } => Some((range, placeholder, elision_policy)),
+            Crease::Block { .. } => None,
+        });
+        let (snapshot, edits) = fold_map.fold(inline);
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (snapshot, edits) = self
+            .wrap_map
+            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        self.block_map.write(snapshot, edits, None);
+    }
+
     /// Removes any folds whose ranges intersect any of the given ranges.
     #[instrument(skip_all)]
     pub fn unfold_intersecting<T: ToOffset>(

@@ -633,6 +633,11 @@ type BackgroundHighlight = (
 );
 type GutterHighlight = (fn(&App) -> Hsla, Vec<Range<Anchor>>);
 
+struct SyntaxConcealment {
+    scopes: Vec<Range<Anchor>>,
+    covered: Vec<Range<MultiBufferOffset>>,
+}
+
 #[derive(Default)]
 struct ScrollbarMarkerState {
     scrollbar_size: Size<Pixels>,
@@ -1013,6 +1018,7 @@ pub struct Editor {
     highlight_order: usize,
     highlighted_rows: TypeIdHashMap<Vec<RowHighlight>>,
     background_highlights: HashMap<HighlightKey, BackgroundHighlight>,
+    syntax_concealments: HashMap<TypeId, SyntaxConcealment>,
     navigation_overlays: HashMap<NavigationOverlayKey, Arc<[NavigationTargetOverlay]>>,
     gutter_highlights: TypeIdHashMap<GutterHighlight>,
     allow_git_diff_scrollbar_markers: bool,
@@ -2327,6 +2333,7 @@ impl Editor {
             highlight_order: 0,
             highlighted_rows: Default::default(),
             background_highlights: HashMap::default(),
+            syntax_concealments: HashMap::default(),
             navigation_overlays: HashMap::default(),
             gutter_highlights: Default::default(),
             allow_git_diff_scrollbar_markers: false,
@@ -9547,6 +9554,96 @@ impl Editor {
         results
     }
 
+    /// Conceals syntax-query captures inside the given multibuffer ranges.
+    pub fn set_syntax_concealment_ranges<T: 'static>(
+        &mut self,
+        scopes: Vec<Range<Anchor>>,
+        cx: &mut Context<Self>,
+    ) {
+        let type_id = TypeId::of::<T>();
+        let state = self
+            .syntax_concealments
+            .entry(type_id)
+            .or_insert_with(|| SyntaxConcealment {
+                scopes: Vec::new(),
+                covered: Vec::new(),
+            });
+        let divergence = state
+            .scopes
+            .iter()
+            .zip(&scopes)
+            .position(|(old, new)| old != new)
+            .unwrap_or(state.scopes.len().min(scopes.len()));
+        if divergence == state.scopes.len() && divergence == scopes.len() {
+            return;
+        }
+
+        state.scopes = scopes;
+        state.covered.clear();
+
+        let display_map = self.display_map.clone();
+        display_map.update(cx, |display_map, cx| {
+            display_map.replace_folds_with_type::<MultiBufferOffset>(type_id, Vec::new(), cx);
+        });
+        cx.notify();
+    }
+
+    fn refresh_visible_syntax_concealments(&mut self, cx: &mut Context<Self>) {
+        if self.syntax_concealments.is_empty() {
+            return;
+        }
+        let display_snapshot = self.display_snapshot(cx);
+        let snapshot = display_snapshot.buffer_snapshot();
+        let mut visible = self.multi_buffer_visible_range(&display_snapshot, cx);
+        visible.start = Point::new(visible.start.row.saturating_sub(20), 0);
+        visible.end = snapshot.clip_point(
+            Point::new(visible.end.row.saturating_add(100), 0),
+            Bias::Right,
+        );
+        let visible = multi_buffer::ToOffset::to_offset(&visible.start, snapshot)
+            ..multi_buffer::ToOffset::to_offset(&visible.end, snapshot);
+        if visible.is_empty() {
+            return;
+        }
+
+        let mut updates = Vec::new();
+        for (type_id, state) in &mut self.syntax_concealments {
+            if state
+                .covered
+                .iter()
+                .any(|covered| covered.start <= visible.start && covered.end >= visible.end)
+            {
+                continue;
+            }
+
+            let mut concealed = Vec::new();
+            for scope in &state.scopes {
+                let scope = scope.start.to_offset(snapshot)..scope.end.to_offset(snapshot);
+                let intersection = scope.start.max(visible.start)..scope.end.min(visible.end);
+                if !intersection.is_empty() {
+                    concealed.extend(snapshot.concealed_ranges(intersection, scope));
+                }
+            }
+            concealed.sort_unstable_by_key(|range| (range.start, range.end));
+            concealed.dedup();
+            state.covered.clear();
+            state.covered.push(visible.clone());
+            updates.push((*type_id, concealed));
+        }
+
+        let display_map = self.display_map.clone();
+        for (type_id, concealed) in updates {
+            let creases = concealed
+                .into_iter()
+                .filter(|range| !range.is_empty())
+                .map(|range| Crease::simple(range, FoldPlaceholder::concealed(type_id)))
+                .collect::<Vec<_>>();
+            display_map.update(cx, |display_map, cx| {
+                display_map.replace_folds_with_type(type_id, creases, cx);
+            });
+        }
+    }
+
     /// Get the text ranges corresponding to the redaction query
     pub fn redacted_ranges(
         &self,
@@ -9817,6 +9914,9 @@ impl Editor {
                 edited_buffer,
                 source,
             } => {
+                for concealment in self.syntax_concealments.values_mut() {
+                    concealment.covered.clear();
+                }
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
                 self.refresh_active_diagnostics(cx);
@@ -9866,6 +9966,9 @@ impl Editor {
                 ranges,
                 path_key,
             } => {
+                for concealment in self.syntax_concealments.values_mut() {
+                    concealment.covered.clear();
+                }
                 if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
                     hovered_link_state.symbol_range = None;
                 }
@@ -9936,6 +10039,10 @@ impl Editor {
                 });
             }
             multi_buffer::Event::Reparsed(buffer_id) => {
+                for concealment in self.syntax_concealments.values_mut() {
+                    concealment.covered.clear();
+                }
+                cx.notify();
                 self.refresh_runnables(Some(*buffer_id), window, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
@@ -9947,6 +10054,9 @@ impl Editor {
                 self.refresh_runnables(None, window, cx);
             }
             multi_buffer::Event::LanguageChanged(buffer_id, is_fresh_language) => {
+                for concealment in self.syntax_concealments.values_mut() {
+                    concealment.covered.clear();
+                }
                 if !is_fresh_language {
                     self.registered_buffers.remove(&buffer_id);
                 }
@@ -12144,6 +12254,7 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_visible_syntax_concealments(cx);
         EditorElement::new(&cx.entity(), self.create_style(cx))
     }
 }

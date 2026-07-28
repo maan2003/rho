@@ -5744,6 +5744,30 @@ impl MultiBufferSnapshot {
         .map(|(range, _, _)| range)
     }
 
+    /// Returns syntax-query concealment ranges lifted into multibuffer
+    /// coordinates.
+    pub fn concealed_ranges<'a, T: ToOffset, U: ToOffset>(
+        &'a self,
+        scan_range: Range<T>,
+        eligible_range: Range<U>,
+    ) -> impl Iterator<Item = Range<MultiBufferOffset>> + 'a {
+        let scan_range = scan_range.start.to_offset(self)..scan_range.end.to_offset(self);
+        let eligible_range =
+            eligible_range.start.to_offset(self)..eligible_range.end.to_offset(self);
+        let eligible = self
+            .range_to_buffer_range(eligible_range)
+            .map(|(buffer, range)| (buffer.remote_id(), range));
+        self.lift_buffer_metadata(scan_range, move |buffer, range| {
+            let (buffer_id, eligible_range) = eligible.as_ref()?;
+            (*buffer_id == buffer.remote_id()).then(|| {
+                buffer
+                    .concealed_ranges(range, eligible_range.clone())
+                    .map(|range| (range, ()))
+            })
+        })
+        .map(|(range, _, _)| range)
+    }
+
     pub fn runnable_ranges(
         &self,
         range: Range<Anchor>,

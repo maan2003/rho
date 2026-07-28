@@ -767,7 +767,7 @@ impl Render for FileView {
 struct RemoteLanguageRegistry(Arc<language::LanguageRegistry>);
 impl gpui::Global for RemoteLanguageRegistry {}
 
-fn language_registry(cx: &mut App) -> Arc<language::LanguageRegistry> {
+pub(crate) fn language_registry(cx: &mut App) -> Arc<language::LanguageRegistry> {
     if !cx.has_global::<RemoteLanguageRegistry>() {
         let fs: Arc<dyn fs::Fs> = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
         let languages = Arc::new(language::LanguageRegistry::new(

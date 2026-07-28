@@ -20,7 +20,6 @@
 //! the block list itself; moving it re-buckets highlights without touching
 //! the buffer.
 
-mod conceal;
 mod elisions;
 mod inlays;
 
@@ -28,7 +27,6 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use conceal::{ConcealState, ConcealSync};
 use editor::Editor;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
 use elisions::{ElisionState, ElisionSync};
@@ -65,10 +63,6 @@ pub struct TranscriptModel {
     /// in the live-turn region.
     turn_boundary: usize,
     elisions: ElisionSync,
-    conceal: ConcealSync,
-    /// Set while the backfill pass runs, so a sync of its own conceals only
-    /// what it changed and leaves history to it.
-    backfill_concealment: bool,
     // Custom inlay ids share each editor's id space with the prompt
     // placeholder (id 0), so they start at 1. One counter serves every
     // attachment: ids only need uniqueness within an editor.
@@ -87,7 +81,6 @@ struct Attachment {
     editor: WeakEntity<Editor>,
     multi_buffer: Entity<MultiBuffer>,
     elisions: ElisionState,
-    conceal: ConcealState,
     inlays: Vec<PlacedInlay>,
     visualizations: Vec<PlacedVisualization>,
 }
@@ -100,8 +93,7 @@ struct BlockRecord {
     gutter: Option<(StyleClass, Range<Anchor>)>,
     inlay: Option<InlayRecord>,
     styles: Vec<(StyleClass, Range<Anchor>)>,
-    /// Markdown markup hidden at the display layer.
-    conceal: Vec<Range<Anchor>>,
+    markdown: bool,
     visualizations: Vec<VisualizationAnchor>,
 }
 
@@ -128,6 +120,7 @@ type PlacedSpans = (
 
 struct UserMessageGutter;
 struct AgentMessageGutter;
+struct MarkdownConcealment;
 
 /// The document excerpt's tail policy. Replacing an excerpt gives it a
 /// new id (invalidating every anchor into it), so the tail changes shape
@@ -155,8 +148,6 @@ impl TranscriptModel {
             records: Vec::new(),
             turn_boundary: 0,
             elisions: ElisionSync::default(),
-            conceal: ConcealSync::default(),
-            backfill_concealment: false,
             next_inlay_id: 1,
             visualization_client,
             visualization_cache: HashMap::new(),
@@ -166,21 +157,6 @@ impl TranscriptModel {
 
     pub fn buffer(&self) -> &Entity<Buffer> {
         &self.buffer
-    }
-
-    /// Whether any attached editor still has history left to conceal.
-    pub fn concealing(&self) -> bool {
-        self.attachments
-            .iter()
-            .any(|attachment| attachment.conceal.backfilling())
-    }
-
-    /// Conceals another budget of history in every attached editor.
-    pub fn conceal_more<V: 'static>(&mut self, now_ms: u64, cx: &mut Context<V>) {
-        let empty = HashSet::new();
-        self.backfill_concealment = true;
-        self.apply_to_attachments(now_ms, &empty, &empty, false, cx);
-        self.backfill_concealment = false;
     }
 
     /// Attaches an editor showing this transcript (over whatever
@@ -197,7 +173,6 @@ impl TranscriptModel {
             editor: editor.downgrade(),
             multi_buffer: editor.read(cx).buffer().clone(),
             elisions: ElisionState::default(),
-            conceal: ConcealState::default(),
             inlays: Vec::new(),
             visualizations: Vec::new(),
         });
@@ -213,7 +188,6 @@ impl TranscriptModel {
         summary: FrameSummary,
         now_ms: u64,
         agent_label: &impl Fn(rho_ui_proto::AgentId) -> String,
-        parsed_ahead: Option<&crate::render::ParseAhead>,
         cx: &mut Context<V>,
     ) {
         self.turn_open = crate::store::turn_open(state.status);
@@ -233,24 +207,12 @@ impl TranscriptModel {
 
         let start = first_changed.min(self.records.len());
 
-        // Render changed blocks before any buffer mutation; rendering only
-        // needs read access to the app (theme, languages).
-        let markdown = crate::render::markdown::Markdown::new(cx);
         let changed_blocks = state.blocks.get(start..).unwrap_or(&[]);
-        let parsed = crate::render::parse_messages(changed_blocks, &markdown, parsed_ahead);
         let mut prev_kind = last_visible_kind(&self.records[..start]);
         let rendered_blocks = changed_blocks
             .iter()
-            .zip(parsed)
-            .map(|(block, parsed)| {
-                let block = render_block_with_agent_labels(
-                    block,
-                    prev_kind,
-                    now_ms,
-                    agent_label,
-                    &markdown,
-                    parsed,
-                );
+            .map(|block| {
+                let block = render_block_with_agent_labels(block, prev_kind, now_ms, agent_label);
                 if block.visible() {
                     prev_kind = Some(block.kind);
                 }
@@ -279,8 +241,8 @@ impl TranscriptModel {
                 .first()
                 .map(|record| record.range.start.to_offset(buffer))
                 .unwrap_or_else(|| buffer.len());
-            // One edit keeps attached editors from synchronizing their display maps once per
-            // transcript block while a large agent is materialized.
+            // One edit keeps attached editors from synchronizing their display maps once
+            // per transcript block while a large agent is materialized.
             let replacement = rendered_blocks
                 .iter()
                 .map(rendered_text)
@@ -323,7 +285,6 @@ impl TranscriptModel {
         self.turn_boundary = new_boundary;
 
         self.refresh_elision_plans(state, start);
-        self.refresh_conceal(start);
         self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
         cx.notify();
     }
@@ -350,9 +311,7 @@ impl TranscriptModel {
         let Some(block) = state.blocks.get(index) else {
             return false;
         };
-        let markdown = crate::render::markdown::Markdown::new(cx);
-        let rendered =
-            render_block_with_agent_labels(block, prev_kind, now_ms, agent_label, &markdown, None);
+        let rendered = render_block_with_agent_labels(block, prev_kind, now_ms, agent_label);
         let old_record = &self.records[index];
         if index + 1 < self.records.len()
             && (old_record.kind != rendered.kind || old_record.visible != rendered.visible())
@@ -391,7 +350,6 @@ impl TranscriptModel {
                 &new_relative_styles,
             ));
 
-            let conceal = conceal_anchors(buffer, block_start, &rendered);
             let new_end = block_start + new_text.len();
             gutters_changed = self.records[index].gutter.is_some() || gutter.is_some();
             self.records[index] = BlockRecord {
@@ -402,7 +360,7 @@ impl TranscriptModel {
                 gutter,
                 inlay,
                 styles,
-                conceal,
+                markdown: rendered.markdown,
                 visualizations,
             };
         });
@@ -414,7 +372,6 @@ impl TranscriptModel {
             (&changed, &empty)
         };
         self.refresh_elision_plans(state, index);
-        self.refresh_conceal(index);
         self.apply_to_attachments(now_ms, changed_history, changed_live, gutters_changed, cx);
         cx.notify();
         true
@@ -434,25 +391,6 @@ impl TranscriptModel {
         self.records
             .iter()
             .any(|record| record.inlay.as_ref().is_some_and(InlayRecord::ticks))
-    }
-
-    /// Records before `first_changed_block` kept their anchors, so their
-    /// concealed ranges stand; only the rest is rebuilt.
-    fn refresh_conceal(&mut self, first_changed_block: usize) {
-        let first_changed = first_changed_block.min(self.records.len());
-        let unchanged = self.records[..first_changed]
-            .iter()
-            .map(|record| record.conceal.len())
-            .sum();
-        let Self {
-            records, conceal, ..
-        } = self;
-        conceal.refresh(
-            unchanged,
-            records[first_changed..]
-                .iter()
-                .flat_map(|record| &record.conceal),
-        );
     }
 
     fn refresh_elision_plans(&mut self, state: &UiAgentState, first_changed_block: usize) {
@@ -557,6 +495,12 @@ impl TranscriptModel {
             .iter()
             .flat_map(|record| record.visualizations.iter().cloned())
             .collect::<Vec<_>>();
+        let markdown_ranges = self
+            .records
+            .iter()
+            .filter(|record| record.markdown)
+            .map(|record| record.range.clone())
+            .collect::<Vec<_>>();
         let desired_visualization_ids = desired_visualizations
             .iter()
             .map(|visualization| visualization.id.as_str())
@@ -569,13 +513,10 @@ impl TranscriptModel {
             next_inlay_id,
             attachments,
             elisions,
-            conceal,
-            backfill_concealment,
             visualization_client,
             visualization_cache,
             ..
         } = self;
-        let backfill_concealment = *backfill_concealment;
         attachments.retain_mut(|attachment| {
             let Some(editor) = attachment.editor.upgrade() else {
                 return false;
@@ -587,7 +528,6 @@ impl TranscriptModel {
                 // them anew with live anchors.
                 attachment.inlays.clear();
                 attachment.elisions = ElisionState::default();
-                attachment.conceal = ConcealState::default();
                 attachment.visualizations.clear();
             }
             // Scale rows before anything lays them out: the wrap map sizes a
@@ -679,14 +619,14 @@ impl TranscriptModel {
                 cx,
             );
             elisions.apply(&mut attachment.elisions, multi_buffer, &editor, cx);
-            conceal.apply(
-                &mut attachment.conceal,
-                refresh,
-                backfill_concealment,
-                multi_buffer,
-                &editor,
-                cx,
-            );
+            let snapshot = multi_buffer.read(cx).snapshot(cx);
+            let scopes = markdown_ranges
+                .iter()
+                .filter_map(|range| excerpt_range(&snapshot, range))
+                .collect();
+            editor.update(cx, |editor, cx| {
+                editor.set_syntax_concealment_ranges::<MarkdownConcealment>(scopes, cx)
+            });
             true
         });
     }
@@ -761,27 +701,9 @@ fn block_record(buffer: &Buffer, start: usize, rendered: RenderedBlock) -> Block
         gutter,
         inlay,
         styles,
-        conceal: conceal_anchors(buffer, start, &rendered),
+        markdown: rendered.markdown,
         visualizations,
     }
-}
-
-/// Anchors for the block's concealed markup. The range never grows with
-/// later edits at its edges: markup is hidden, and text arriving next to it
-/// is not.
-fn conceal_anchors(
-    buffer: &Buffer,
-    block_start: usize,
-    rendered: &RenderedBlock,
-) -> Vec<Range<Anchor>> {
-    rendered
-        .conceal
-        .iter()
-        .map(|range| {
-            buffer.anchor_after(block_start + range.start)
-                ..buffer.anchor_before(block_start + range.end)
-        })
-        .collect()
 }
 
 fn rendered_text(rendered: &RenderedBlock) -> String {

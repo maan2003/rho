@@ -32,6 +32,7 @@ pub struct Grammar {
     pub error_query: Option<Query>,
     pub highlights_config: Option<HighlightsConfig>,
     pub brackets_config: Option<BracketsConfig>,
+    pub concealments_config: Option<ConcealmentConfig>,
     pub redactions_config: Option<RedactionConfig>,
     pub runnable_config: Option<RunnableConfig>,
     pub indents_config: Option<IndentConfig>,
@@ -132,6 +133,13 @@ pub struct InjectionConfig {
 pub struct RedactionConfig {
     pub query: Query,
     pub redaction_capture_ix: u32,
+}
+
+pub struct ConcealmentConfig {
+    pub query: Query,
+    pub conceal_capture_ix: u32,
+    pub conceal_context_capture_ix: u32,
+    pub conceal_line_prefix_capture_ix: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,6 +275,7 @@ impl Grammar {
             indents_config: None,
             injection_config: None,
             override_config: None,
+            concealments_config: None,
             redactions_config: None,
             runnable_config: None,
             error_query: Query::new(&ts_language, "(ERROR) @error").ok(),
@@ -340,6 +349,11 @@ impl Grammar {
                     &config.scope_opt_in_language_servers,
                 )
                 .context("Error loading override query")?;
+        }
+        if let Some(query) = queries.conceals {
+            self = self
+                .with_concealment_query(query.as_ref(), name)
+                .context("Error loading conceals query")?;
         }
         if let Some(query) = queries.redactions {
             self = self
@@ -763,6 +777,36 @@ impl Grammar {
             self.redactions_config = Some(RedactionConfig {
                 query,
                 redaction_capture_ix,
+            });
+        }
+        Ok(self)
+    }
+
+    pub fn with_concealment_query(
+        mut self,
+        source: &str,
+        language_name: &LanguageName,
+    ) -> Result<Self> {
+        let query = Query::new(&self.ts_language, source)?;
+        let mut conceal_capture_ix = 0;
+        let mut conceal_context_capture_ix = 0;
+        let mut conceal_line_prefix_capture_ix = None;
+        if populate_capture_indices(
+            &query,
+            language_name,
+            "conceals",
+            &[],
+            &mut [
+                Capture::Required("conceal", &mut conceal_capture_ix),
+                Capture::Required("conceal.context", &mut conceal_context_capture_ix),
+                Capture::Optional("conceal.line_prefix", &mut conceal_line_prefix_capture_ix),
+            ],
+        ) {
+            self.concealments_config = Some(ConcealmentConfig {
+                query,
+                conceal_capture_ix,
+                conceal_context_capture_ix,
+                conceal_line_prefix_capture_ix,
             });
         }
         Ok(self)

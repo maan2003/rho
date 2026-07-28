@@ -1,19 +1,11 @@
-//! Tree-sitter markdown highlighting for assistant messages.
-//!
-//! Produces spans carrying [`StyleClass::Syntax`] highlight ids; the theme
-//! color for each id is resolved at highlight-application time, so rendered
-//! spans stay theme-independent.
+//! Markdown languages used by the transcript buffer's persistent syntax map.
 
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
-use gpui::App;
-use language::{Language, LanguageConfig, LanguageMatcher, LanguageQueries, Rope};
+use gpui::{App, Global};
+use language::{Buffer, Language, LanguageConfig, LanguageMatcher, LanguageQueries};
 use theme::ActiveTheme as _;
-
-use super::Span;
-use super::conceal::Trees;
-use crate::style::StyleClass;
 
 static MARKDOWN_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
 static MARKDOWN_INLINE_LANGUAGE: OnceLock<Option<Arc<Language>>> = OnceLock::new();
@@ -42,57 +34,26 @@ impl Markdown {
     }
 }
 
-/// Highlights `text`, parsing it for that alone; rendering shares its parse
-/// with concealment through [`markdown_spans_of`].
-#[cfg(test)]
-pub fn markdown_spans(text: &str, markdown: &Markdown) -> Vec<Span> {
-    markdown_spans_of(text, &super::conceal::parse(text), markdown)
-}
+struct MarkdownLanguagesRegistered;
+impl Global for MarkdownLanguagesRegistered {}
 
-/// Highlights `text` as markdown from trees the caller already parsed.
-pub fn markdown_spans_of(text: &str, trees: &Trees, markdown: &Markdown) -> Vec<Span> {
-    let Some(markdown_language) = markdown.block else {
-        return vec![Span::new(text, StyleClass::Default)];
+/// Gives a transcript buffer Zed's persistent, background Markdown syntax
+/// pipeline. The transcript limits query-backed concealment to assistant
+/// message ranges at the editor layer.
+pub fn configure_buffer(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
+    let markdown = Markdown::new(cx);
+    let (Some(block), Some(inline)) = (markdown.block, markdown.inline) else {
+        return;
     };
-    let Some(block_tree) = trees.block() else {
-        return vec![Span::new(text, StyleClass::Default)];
-    };
-    let rope = Rope::from(text);
-    let mut highlights = markdown_language.highlight_tree(&rope, block_tree, 0..text.len());
-    if let Some(markdown_inline_language) = markdown.inline {
-        for (span, tree) in trees.inline() {
-            let span = span.start_byte..span.end_byte;
-            // Highlights come back relative to the range asked for.
-            let offset = span.start;
-            highlights.extend(
-                markdown_inline_language
-                    .highlight_tree(&rope, tree, span)
-                    .into_iter()
-                    .map(|(range, id)| (range.start + offset..range.end + offset, id)),
-            );
-        }
+    let registry = crate::zed_remote::language_registry(cx);
+    if !cx.has_global::<MarkdownLanguagesRegistered>() {
+        registry.add(block.clone());
+        registry.add(inline.clone());
+        cx.set_global(MarkdownLanguagesRegistered);
     }
-    highlights.sort_by_key(|(range, _)| range.start);
-
-    let mut spans = Vec::new();
-    let mut cursor = 0;
-    for (range, highlight_id) in highlights {
-        if range.start > cursor {
-            spans.push(Span::new(&text[cursor..range.start], StyleClass::Default));
-        }
-        let start = range.start.max(cursor);
-        if range.end > start {
-            spans.push(Span::new(
-                &text[start..range.end],
-                StyleClass::Syntax(usize::from(highlight_id) as u32),
-            ));
-        }
-        cursor = cursor.max(range.end);
-    }
-    if cursor < text.len() {
-        spans.push(Span::new(&text[cursor..], StyleClass::Default));
-    }
-    spans
+    buffer.set_language_registry(registry);
+    buffer.set_sync_parse_timeout(None);
+    buffer.set_language_async(Some(block.clone()), cx);
 }
 
 fn markdown_language(cx: &App) -> Option<&'static Arc<Language>> {
@@ -100,7 +61,7 @@ fn markdown_language(cx: &App) -> Option<&'static Arc<Language>> {
         .get_or_init(|| {
             let language = Language::new(
                 LanguageConfig {
-                    name: "Markdown".into(),
+                    name: "Rho Markdown".into(),
                     matcher: LanguageMatcher {
                         path_suffixes: vec!["md".into()],
                         ..Default::default()
@@ -114,6 +75,10 @@ fn markdown_language(cx: &App) -> Option<&'static Arc<Language>> {
                 highlights: Some(Cow::from(include_str!(
                     "../grammars/markdown/highlights.scm"
                 ))),
+                injections: Some(Cow::from(include_str!(
+                    "../grammars/markdown/injections.scm"
+                ))),
+                conceals: Some(Cow::from(include_str!("../grammars/markdown/conceals.scm"))),
                 ..LanguageQueries::default()
             })
             .ok()?;
@@ -129,7 +94,7 @@ fn markdown_inline_language(cx: &App) -> Option<&'static Arc<Language>> {
         .get_or_init(|| {
             let language = Language::new(
                 LanguageConfig {
-                    name: "Markdown-Inline".into(),
+                    name: "Rho Markdown Inline".into(),
                     hidden: true,
                     ..LanguageConfig::default()
                 },
@@ -138,6 +103,9 @@ fn markdown_inline_language(cx: &App) -> Option<&'static Arc<Language>> {
             .with_queries(LanguageQueries {
                 highlights: Some(Cow::from(include_str!(
                     "../grammars/markdown-inline/highlights.scm"
+                ))),
+                conceals: Some(Cow::from(include_str!(
+                    "../grammars/markdown-inline/conceals.scm"
                 ))),
                 ..LanguageQueries::default()
             })
