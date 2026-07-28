@@ -1110,11 +1110,27 @@ impl Language {
         text: &'a Rope,
         range: Range<usize>,
     ) -> Vec<(Range<usize>, HighlightId)> {
+        let Some(grammar) = &self.grammar else {
+            return Vec::new();
+        };
+        let tree = parse_text(grammar, text, None);
+        self.highlight_tree(text, &tree, range)
+    }
+
+    /// Highlights a tree the caller already parsed. A caller that needs the
+    /// tree for something else - locating the syntax it wants to hide, say -
+    /// parses once and highlights from that, rather than paying for a parse
+    /// of the same text here.
+    pub fn highlight_tree<'a>(
+        self: &'a Arc<Self>,
+        text: &'a Rope,
+        tree: &tree_sitter::Tree,
+        range: Range<usize>,
+    ) -> Vec<(Range<usize>, HighlightId)> {
         let mut result = Vec::new();
         if let Some(grammar) = &self.grammar {
-            let tree = parse_text(grammar, text, None);
             let captures =
-                SyntaxSnapshot::single_tree_captures(range.clone(), text, &tree, self, |grammar| {
+                SyntaxSnapshot::single_tree_captures(range.clone(), text, tree, self, |grammar| {
                     grammar
                         .highlights_config
                         .as_ref()
