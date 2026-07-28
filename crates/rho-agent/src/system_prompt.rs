@@ -21,7 +21,7 @@ pub fn prompt(
         .iter()
         .map(|workspace| WorkdirPrompt {
             path: workspace.repo().to_string(),
-            workspace_handle: workspace.info().workspace_handle(),
+            kind: WorkdirKind::of(workspace),
         })
         .collect::<Vec<_>>();
     let (agents_md, skills) = if role.is_pm() {
@@ -191,7 +191,7 @@ pub fn claude_prompt(
                 .iter()
                 .map(|workspace| WorkdirPrompt {
                     path: workspace.repo().to_string(),
-                    workspace_handle: workspace.info().workspace_handle(),
+                    kind: WorkdirKind::of(workspace),
                 })
                 .collect::<Vec<_>>();
             render_workspace_prompt(&workdirs)
@@ -199,12 +199,30 @@ pub fn claude_prompt(
     format!("{team}{role_prompt}{workflow}{workspace}").into()
 }
 
-/// One workdir as the prompt renders it: the agent-visible path plus its jj
-/// managed workspace handle (`None` for the user's checkout or a plain
-/// directory).
+/// One workdir as the prompt renders it: the agent-visible path and the kind
+/// of checkout mounted there.
 struct WorkdirPrompt {
     path: String,
-    workspace_handle: Option<String>,
+    kind: WorkdirKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkdirKind {
+    Live,
+    Managed,
+    Sandbox,
+}
+
+impl WorkdirKind {
+    fn of(workspace: &rho_workspaces::Workspace) -> Self {
+        if workspace.is_sandbox() {
+            Self::Sandbox
+        } else if workspace.is_user_checkout() {
+            Self::Live
+        } else {
+            Self::Managed
+        }
+    }
 }
 
 /// Union of every workdir's discovered context: AGENTS.md files deduped by
@@ -396,9 +414,12 @@ Relative paths in commands and patches resolve against this directory.
     if workdirs.len() > 1 {
         out.push_str("\nAdditional workdirs in your working set:\n");
         for workdir in &workdirs[1..] {
-            let binding = match &workdir.workspace_handle {
-                Some(_) => "your own checkout",
-                None => "the live directory — edits are immediately visible to the user",
+            let binding = match workdir.kind {
+                WorkdirKind::Managed => "a Rho-managed jj workspace",
+                WorkdirKind::Sandbox => "a Rho-managed sandbox workspace",
+                WorkdirKind::Live => {
+                    "the live directory — edits are immediately visible to the user"
+                }
             };
             out.push_str(&format!("- {} ({binding})\n", workdir.path));
         }
@@ -510,7 +531,11 @@ Example:
 fn render_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
     let managed = workdirs
         .iter()
-        .filter(|workdir| workdir.workspace_handle.is_some())
+        .filter(|workdir| workdir.kind == WorkdirKind::Managed)
+        .count();
+    let sandboxed = workdirs
+        .iter()
+        .filter(|workdir| workdir.kind == WorkdirKind::Sandbox)
         .count();
     let mut out = String::from("## Workspace Context\n\n");
     if managed == workdirs.len() {
@@ -521,24 +546,35 @@ fn render_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
                 "Every repository workdir in your working set is a Rho-managed jj workspace.\n\n",
             );
         }
-    } else if managed == 0 {
+    } else if sandboxed == workdirs.len() {
+        if workdirs.len() == 1 {
+            out.push_str("Your working directory is a Rho-managed sandbox workspace.\n\n");
+        } else {
+            out.push_str(
+                "Every workdir in your working set is a Rho-managed sandbox workspace.\n\n",
+            );
+        }
+    } else if managed == 0 && sandboxed == 0 {
         out.push_str(
             "Your workdirs are live directories rather than Rho-managed jj workspaces. Edits there are immediately visible to the user and other processes using those directories.\n\n",
         );
     } else {
         out.push_str("Workspace management differs across your working set:\n");
         for workdir in workdirs {
-            let management = if workdir.workspace_handle.is_some() {
-                "Rho-managed jj workspace"
-            } else {
-                "live directory"
+            let management = match workdir.kind {
+                WorkdirKind::Managed => "Rho-managed jj workspace",
+                WorkdirKind::Sandbox => "Rho-managed sandbox workspace",
+                WorkdirKind::Live => "live directory",
             };
             out.push_str(&format!("- {} — {management}\n", workdir.path));
         }
         out.push('\n');
     }
     if managed > 0 {
-        out.push_str("A Rho-managed workspace is the checkout assigned to this agent. Agent views can mount different checkouts at the same absolute repository path, so an identical path does not imply shared live filesystem edits. Within each managed repository, `@` refers to that workspace's working-copy commit. Files and changes already present are your assigned starting state.\n\n");
+        out.push_str("Each Rho-managed jj workdir is a workspace: a checkout with its own working copy and working-copy commit, which `@` names inside that workdir. jj snapshots working-copy changes into `@` as you work; no separate Git-style commit is needed merely to keep them. Files and uncommitted changes already present are the starting state you were given, not leftovers to clean up.\n\nAgent views can mount different checkouts at the same absolute repository path, so the path alone does not tell you which other agents, if any, see your edits live. Your edits are not in the user's own checkout; they reach it only through an explicit jj operation. The repository and its operation log are shared even when working copies are not: rewrites, bookmark moves, and `jj abandon` are visible across workspaces.\n\nBecause this workdir is already a checkout of its own, working in place is the ordinary way to work here.\n\n");
+    }
+    if sandboxed > 0 {
+        out.push_str("A Rho-managed sandbox workspace masks the repository's original VCS metadata from commands and presents a separate synthetic Git baseline. Work with the checkout and VCS view provided inside the sandbox rather than assuming the origin checkout's metadata is available.\n\n");
     }
     out
 }
@@ -595,35 +631,47 @@ mod tests {
         assert!(!prompt.contains("name"));
     }
 
-    fn workdir(path: &str, workspace_handle: Option<&str>) -> WorkdirPrompt {
+    fn workdir(path: &str, kind: WorkdirKind) -> WorkdirPrompt {
         WorkdirPrompt {
             path: path.to_owned(),
-            workspace_handle: workspace_handle.map(str::to_owned),
+            kind,
         }
     }
 
     #[test]
     fn managed_workspace_prompt_is_informational() {
-        let prompt = render_workspace_prompt(&[workdir("/repo", Some("agentws"))]);
+        let prompt = render_workspace_prompt(&[workdir("/repo", WorkdirKind::Managed)]);
         assert!(prompt.contains("## Workspace Context"));
         assert!(prompt.contains("working directory is a Rho-managed jj workspace"));
-        assert!(prompt.contains("`@` refers to that workspace's working-copy commit"));
-        assert!(prompt.contains("assigned starting state"));
+        assert!(prompt.contains("which `@` names inside that workdir"));
+        assert!(prompt.contains("starting state you were given"));
+        assert!(prompt.contains("path alone does not tell you"));
+        assert!(prompt.contains("working in place is the ordinary way"));
         assert!(!prompt.contains("Delegated Engineer Isolation"));
         assert!(!prompt.contains("do not create"));
     }
 
     #[test]
     fn live_workspace_prompt_reports_management() {
-        let prompt = render_workspace_prompt(&[workdir("/repo", None)]);
+        let prompt = render_workspace_prompt(&[workdir("/repo", WorkdirKind::Live)]);
         assert!(prompt.contains("live directories rather than Rho-managed jj workspaces"));
         assert!(prompt.contains("immediately visible to the user"));
     }
 
     #[test]
+    fn sandbox_workspace_prompt_does_not_call_it_live() {
+        let prompt = render_workspace_prompt(&[workdir("/repo", WorkdirKind::Sandbox)]);
+        assert!(prompt.contains("Rho-managed sandbox workspace"));
+        assert!(prompt.contains("masks the repository's original VCS metadata"));
+        assert!(!prompt.contains("immediately visible to the user"));
+    }
+
+    #[test]
     fn workspace_prompt_lists_mixed_workdirs() {
-        let prompt =
-            render_workspace_prompt(&[workdir("/repo", Some("agentws")), workdir("/docs", None)]);
+        let prompt = render_workspace_prompt(&[
+            workdir("/repo", WorkdirKind::Managed),
+            workdir("/docs", WorkdirKind::Live),
+        ]);
         assert!(prompt.contains("Workspace management differs across your working set"));
         assert!(prompt.contains("- /repo — Rho-managed jj workspace"));
         assert!(prompt.contains("- /docs — live directory"));
@@ -702,7 +750,7 @@ mod tests {
 
     #[test]
     fn environment_prompt_mentions_working_directory() {
-        let prompt = render_environment_prompt(&[workdir("/repo", Some("agentws"))]);
+        let prompt = render_environment_prompt(&[workdir("/repo", WorkdirKind::Managed)]);
         assert!(prompt.contains("Working directory: /repo"));
         assert!(!prompt.contains("jj workspace id"));
         assert!(!prompt.contains("Additional workdirs"));
@@ -711,12 +759,12 @@ mod tests {
     #[test]
     fn environment_prompt_lists_additional_workdirs() {
         let prompt = render_environment_prompt(&[
-            workdir("/repo", Some("agentws")),
-            workdir("/lib", Some("agentws")),
-            workdir("/docs", None),
+            workdir("/repo", WorkdirKind::Managed),
+            workdir("/lib", WorkdirKind::Managed),
+            workdir("/docs", WorkdirKind::Live),
         ]);
         assert!(prompt.contains("Working directory: /repo"));
-        assert!(prompt.contains("- /lib (your own checkout)"));
+        assert!(prompt.contains("- /lib (a Rho-managed jj workspace)"));
         assert!(prompt.contains("- /docs (the live directory"));
     }
 }
