@@ -50,6 +50,13 @@ parent's complete working set. Otherwise list the repositories the child needs;
 `revset` starts an isolated checkout from a specific revision. Plain directories
 cannot be isolated and remain shared.
 
+Separate child Engineer workspaces do not share live filesystem edits, even
+when their visible paths are the same. That existing isolation is normally
+sufficient for implementation and experiments; an additional temporary
+worktree, jj workspace, clone, or copy is not required merely to avoid
+concurrent edits. This is context, not a prohibition: use judgment when the
+task itself benefits from another setup.
+
 Give the Engineer an outcome-focused, self-contained prompt. It already receives
 repository guidance, skills, tools, and environment context.
 

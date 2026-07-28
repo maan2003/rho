@@ -66,7 +66,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `rho-agent` owns system prompt rendering. Clients have no special skill or
   AGENTS.md command path. The native Rho inference loop and Claude Code use
   separate prompt compositions: Claude performs its own project and skill
-  discovery and receives only Rho role/team and workspace-isolation context on
+  discovery and receives only Rho role/team and workspace context on
   top of Claude Code's own harness prompt.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
   rendering. They should not own inference protocol details. The native GUI
