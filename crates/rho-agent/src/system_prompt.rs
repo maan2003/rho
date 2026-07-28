@@ -120,12 +120,13 @@ request.
         AgentRole::Iris => unreachable!("Iris prompt returned above"),
     };
     let environment = render_environment_prompt(&workdirs);
+    let workspace_isolation = render_workspace_isolation_prompt(&workdirs);
     if role.is_pm() {
         let projects = render_projects_prompt(projects);
         return format!("{PM_BASE_PROMPT}{workflow_prompt}{projects}{agents_md}{skills}{code_mode}{team_context}")
             .into();
     }
-    format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}{role_prompt}{workflow_prompt}{environment}")
+    format!("{BASE_PROMPT}{agents_md}{skills}{code_mode}{team_context}{role_prompt}{workflow_prompt}{workspace_isolation}{environment}")
         .into()
 }
 
@@ -144,9 +145,13 @@ fn render_projects_prompt(projects: &[(camino::Utf8PathBuf, String)]) -> String 
 }
 
 /// Rho orchestration guidance for Claude Code. Claude supplies its own agent
-/// prompt and project discovery, so this contains only Rho team identity and
-/// the one Claude-backed specialized role.
-pub fn claude_prompt(multi_agent: Option<&MultiAgentTools>, role: AgentRole) -> Arc<str> {
+/// prompt and project discovery, so this contains only Rho team identity,
+/// workspace-isolation context, and the one Claude-backed specialized role.
+pub fn claude_prompt(
+    view: Option<&rho_workspaces::View>,
+    multi_agent: Option<&MultiAgentTools>,
+    role: AgentRole,
+) -> Arc<str> {
     let team = multi_agent.map_or_else(String::new, |tools| {
         let identity = match tools.parent() {
             Some(parent) => format!(
@@ -178,7 +183,20 @@ pub fn claude_prompt(multi_agent: Option<&MultiAgentTools>, role: AgentRole) -> 
         AgentRole::Advisor { .. } => ADVISOR_PROMPT,
         AgentRole::Iris => crate::iris_tools::PROMPT,
     };
-    format!("{team}{role_prompt}{workflow}").into()
+    let workspace_isolation = view
+        .filter(|_| role.is_engineer() || matches!(role, AgentRole::Advisor { .. }))
+        .map_or_else(String::new, |view| {
+            let workdirs = view
+                .entries()
+                .iter()
+                .map(|workspace| WorkdirPrompt {
+                    path: workspace.repo().to_string(),
+                    workspace_handle: workspace.info().workspace_handle(),
+                })
+                .collect::<Vec<_>>();
+            render_workspace_isolation_prompt(&workdirs)
+        });
+    format!("{team}{role_prompt}{workflow}{workspace_isolation}").into()
 }
 
 /// One workdir as the prompt renders it: the agent-visible path plus its jj
@@ -489,53 +507,40 @@ Example:
 
 ";
 
-#[cfg(test)]
-fn render_multi_agent_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
-    let own_workspace = if workdirs.len() == 1 {
-        match &workdirs[0].workspace_handle {
-            Some(name) => format!(
-                "Your jj workspace id is `{name}`. In your own workspace, your current \
-                 working-copy commit is `@`; other workspaces can refer to that same \
-                 working-copy commit as `{name}@`.\n\n"
-            ),
-            None => "You are running in the user's checkout. Your current working-copy commit \
-                     is `@`; there is no separate jj workspace id for other workspaces to \
-                     reference.\n\n"
-                .to_owned(),
+fn render_workspace_isolation_prompt(workdirs: &[WorkdirPrompt]) -> String {
+    let isolated = workdirs
+        .iter()
+        .filter(|workdir| workdir.workspace_handle.is_some())
+        .count();
+    let mut out = String::from("## Workspace Isolation\n\n");
+    if isolated == workdirs.len() {
+        if workdirs.len() == 1 {
+            out.push_str("Your working directory is an isolated jj workspace.\n\n");
+        } else {
+            out.push_str(
+                "Every repository workdir in your working set is an isolated jj workspace.\n\n",
+            );
         }
+    } else if isolated == 0 {
+        out.push_str("Your workdirs are live directories shared with the user and other processes; they are not isolated workspaces.\n\n");
     } else {
-        let mut out = String::from("Your workdirs and their jj workspace handles:\n");
+        out.push_str("Isolation differs across your working set:\n");
         for workdir in workdirs {
-            match &workdir.workspace_handle {
-                Some(name) => out.push_str(&format!(
-                    "- {} — your jj workspace `{name}` (other workspaces address your \
-                     working-copy commit there as `{name}@`)\n",
-                    workdir.path
-                )),
-                None => out.push_str(&format!(
-                    "- {} — the live checkout, no separate jj workspace handle\n",
-                    workdir.path
-                )),
-            }
+            let isolation = if workdir.workspace_handle.is_some() {
+                "isolated jj workspace"
+            } else {
+                "live shared directory"
+            };
+            out.push_str(&format!("- {} — {isolation}\n", workdir.path));
         }
         out.push('\n');
-        out
-    };
-    format!(
-        "\
-## Working With Workspaces
-
-Repositories here use Jujutsu (`jj`) workspaces. Separate agents may run in separate jj workspaces that present the same working-directory path but do not share live filesystem edits. Use the workspace/revset handle rather than the path to inspect or transfer work; with several repositories involved, name the repository too.
-
-{own_workspace}
-
-- A workspace working-copy commit is addressable as `<workspace>@` within its repository.
-- Inspect another workspace with commands such as `jj status --workspace <workspace>`, `jj log -r '<workspace>@'`, or `jj diff -r '<workspace>@' --stat`.
-- To take over another workspace's change, prefer explicit jj operations such as `jj edit '<workspace>@'` or `jj squash --from '<workspace>@' --into @`, depending on whether you want to move your workspace to that change or steal its diff into your current change.
-- Do not take, squash, abandon, or otherwise rewrite another agent's work unless the user or owning agent asked you to.
-
-"
-    )
+    }
+    if isolated > 0 {
+        out.push_str("Isolated workdirs do not share a live filesystem with other agents, even when their visible paths are the same, so ordinary edits cannot overwrite one another. Work directly in your assigned workdir for implementation and experiments; do not create a temporary worktree, jj workspace, clone, or copy merely for isolation. Existing changes there are part of your starting state; preserve unrelated changes and do not discard them.\n\n");
+    } else {
+        out.push_str("Other processes may change the same files concurrently. Preserve unrelated changes and do not discard work you did not create.\n\n");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -598,33 +603,33 @@ mod tests {
     }
 
     #[test]
-    fn workspace_handoff_guidance_is_multi_agent_only() {
-        assert!(!BASE_PROMPT.contains("## Working With Workspaces"));
-        let prompt = render_multi_agent_workspace_prompt(&[workdir("/repo", Some("agentws"))]);
-        assert!(prompt.contains("## Working With Workspaces"));
-        assert!(prompt.contains("Your jj workspace id is `agentws`"));
-        assert!(prompt.contains("current working-copy commit is `@`"));
-        assert!(prompt.contains("`agentws@`"));
-        assert!(prompt.contains("jj diff -r '<workspace>@' --stat"));
-        assert!(prompt.contains("jj squash --from '<workspace>@' --into @"));
+    fn isolated_workspace_prompt_encourages_direct_edits() {
+        let prompt = render_workspace_isolation_prompt(&[workdir("/repo", Some("agentws"))]);
+        assert!(prompt.contains("## Workspace Isolation"));
+        assert!(prompt.contains("working directory is an isolated jj workspace"));
+        assert!(prompt.contains("ordinary edits cannot overwrite one another"));
+        assert!(prompt.contains("Work directly in your assigned workdir"));
+        assert!(prompt.contains("do not create a temporary worktree"));
+        assert!(prompt.contains("preserve unrelated changes"));
     }
 
     #[test]
-    fn workspace_prompt_mentions_user_checkout_without_workspace_id() {
-        let prompt = render_multi_agent_workspace_prompt(&[workdir("/repo", None)]);
-        assert!(prompt.contains("user's checkout"));
-        assert!(prompt.contains("current working-copy commit is `@`"));
-        assert!(prompt.contains("no separate jj workspace id"));
+    fn shared_workspace_prompt_warns_about_concurrent_edits() {
+        let prompt = render_workspace_isolation_prompt(&[workdir("/repo", None)]);
+        assert!(prompt.contains("live directories shared with the user"));
+        assert!(prompt.contains("not isolated workspaces"));
+        assert!(prompt.contains("may change the same files concurrently"));
     }
 
     #[test]
-    fn workspace_prompt_lists_multiple_workdirs() {
-        let prompt = render_multi_agent_workspace_prompt(&[
+    fn workspace_prompt_lists_mixed_workdirs() {
+        let prompt = render_workspace_isolation_prompt(&[
             workdir("/repo", Some("agentws")),
             workdir("/docs", None),
         ]);
-        assert!(prompt.contains("- /repo — your jj workspace `agentws`"));
-        assert!(prompt.contains("- /docs — the live checkout"));
+        assert!(prompt.contains("Isolation differs across your working set"));
+        assert!(prompt.contains("- /repo — isolated jj workspace"));
+        assert!(prompt.contains("- /docs — live shared directory"));
     }
 
     #[test]
@@ -670,6 +675,7 @@ mod tests {
 
         let engineer = claude_prompt(
             None,
+            None,
             AgentRole::WorkflowEngineer {
                 intelligence: EngineerIntelligence::Medium,
                 workflow: AgentWorkflow::PrFriendly,
@@ -677,11 +683,13 @@ mod tests {
         );
         let pm = claude_prompt(
             None,
+            None,
             AgentRole::WorkflowPM {
                 workflow: AgentWorkflow::PrFriendly,
             },
         );
         let default_engineer = claude_prompt(
+            None,
             None,
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Medium,

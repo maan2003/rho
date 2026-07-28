@@ -1055,7 +1055,7 @@ impl ClaudeLoop {
                     .with_context(|| format!("create Claude prompt bind target {target}"));
             }
         }
-        let prompt = system_prompt::claude_prompt(self.multi_agent.as_ref(), self.role);
+        let prompt = system_prompt::claude_prompt(Some(view), self.multi_agent.as_ref(), self.role);
         let mut source_file = tempfile::Builder::new()
             .prefix("rho-claude-prompt-")
             .suffix(".md")

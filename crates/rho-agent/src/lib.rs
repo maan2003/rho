@@ -61,7 +61,7 @@ pub fn render_agent_surface(
     let binding = role.session_profile()?;
     if binding.claude_model().is_some() {
         return Ok(RenderedAgentSurface {
-            system_prompt: system_prompt::claude_prompt(None, role),
+            system_prompt: system_prompt::claude_prompt(Some(view.as_ref()), None, role),
             tools: Arc::from([]),
         });
     }
