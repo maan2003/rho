@@ -491,7 +491,7 @@ impl Dashboard {
     fn apply_rail_tail_fold(&self, cx: &mut Context<Workspace>) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let range = (!self.rail_tail_expanded)
-            .then(|| self.rail_tail.as_ref())
+            .then_some(self.rail_tail.as_ref())
             .flatten()
             .and_then(|(first, last)| {
                 let first = self.buffers.get(first)?;
@@ -967,6 +967,7 @@ impl Line {
 }
 
 /// Serializes the registry into the dashboard listing.
+#[cfg(test)]
 fn generate(registry: &AgentRegistry) -> Vec<Line> {
     generate_with_rail_tail(registry, false)
 }
