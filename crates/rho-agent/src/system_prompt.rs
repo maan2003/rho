@@ -120,9 +120,7 @@ request.
         AgentRole::Iris => unreachable!("Iris prompt returned above"),
     };
     let environment = render_environment_prompt(&workdirs);
-    let delegated_engineer = role.is_engineer()
-        && multi_agent.is_some_and(|tools| tools.spawned_by() != AgentSpawnedBy::Direct);
-    let workspace = render_workspace_prompt(&workdirs, delegated_engineer);
+    let workspace = render_workspace_prompt(&workdirs);
     if role.is_pm() {
         let projects = render_projects_prompt(projects);
         return format!("{PM_BASE_PROMPT}{workflow_prompt}{projects}{agents_md}{skills}{code_mode}{team_context}")
@@ -196,9 +194,7 @@ pub fn claude_prompt(
                     workspace_handle: workspace.info().workspace_handle(),
                 })
                 .collect::<Vec<_>>();
-            let delegated_engineer = role.is_engineer()
-                && multi_agent.is_some_and(|tools| tools.spawned_by() != AgentSpawnedBy::Direct);
-            render_workspace_prompt(&workdirs, delegated_engineer)
+            render_workspace_prompt(&workdirs)
         });
     format!("{team}{role_prompt}{workflow}{workspace}").into()
 }
@@ -511,7 +507,7 @@ Example:
 
 ";
 
-fn render_workspace_prompt(workdirs: &[WorkdirPrompt], delegated_engineer: bool) -> String {
+fn render_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
     let managed = workdirs
         .iter()
         .filter(|workdir| workdir.workspace_handle.is_some())
@@ -543,9 +539,6 @@ fn render_workspace_prompt(workdirs: &[WorkdirPrompt], delegated_engineer: bool)
     }
     if managed > 0 {
         out.push_str("A Rho-managed workspace is the checkout assigned to this agent. Agent views can mount different checkouts at the same absolute repository path, so an identical path does not imply shared live filesystem edits. Within each managed repository, `@` refers to that workspace's working-copy commit. Files and changes already present are your assigned starting state.\n\n");
-    }
-    if delegated_engineer && managed > 0 {
-        out.push_str("### Delegated Engineer Isolation\n\nRho gives each delegated Engineer separate managed jj workspaces. Changes you make in a managed workdir stay in your workspace's commit until they are explicitly integrated elsewhere. This provides an independent place for implementation and experiments. Additional setup is not necessary merely to protect your edits from concurrent Engineer work; use your judgment if the task itself benefits from another setup.\n\n");
     }
     out
 }
@@ -611,7 +604,7 @@ mod tests {
 
     #[test]
     fn managed_workspace_prompt_is_informational() {
-        let prompt = render_workspace_prompt(&[workdir("/repo", Some("agentws"))], false);
+        let prompt = render_workspace_prompt(&[workdir("/repo", Some("agentws"))]);
         assert!(prompt.contains("## Workspace Context"));
         assert!(prompt.contains("working directory is a Rho-managed jj workspace"));
         assert!(prompt.contains("`@` refers to that workspace's working-copy commit"));
@@ -621,28 +614,16 @@ mod tests {
     }
 
     #[test]
-    fn delegated_engineer_prompt_explains_isolation_without_prohibiting_setup() {
-        let prompt = render_workspace_prompt(&[workdir("/repo", Some("agentws"))], true);
-        assert!(prompt.contains("### Delegated Engineer Isolation"));
-        assert!(prompt.contains("stay in your workspace's commit"));
-        assert!(prompt.contains("independent place for implementation and experiments"));
-        assert!(prompt.contains("use your judgment"));
-        assert!(!prompt.contains("do not create"));
-    }
-
-    #[test]
     fn live_workspace_prompt_reports_management() {
-        let prompt = render_workspace_prompt(&[workdir("/repo", None)], false);
+        let prompt = render_workspace_prompt(&[workdir("/repo", None)]);
         assert!(prompt.contains("live directories rather than Rho-managed jj workspaces"));
         assert!(prompt.contains("immediately visible to the user"));
     }
 
     #[test]
     fn workspace_prompt_lists_mixed_workdirs() {
-        let prompt = render_workspace_prompt(
-            &[workdir("/repo", Some("agentws")), workdir("/docs", None)],
-            false,
-        );
+        let prompt =
+            render_workspace_prompt(&[workdir("/repo", Some("agentws")), workdir("/docs", None)]);
         assert!(prompt.contains("Workspace management differs across your working set"));
         assert!(prompt.contains("- /repo — Rho-managed jj workspace"));
         assert!(prompt.contains("- /docs — live directory"));
