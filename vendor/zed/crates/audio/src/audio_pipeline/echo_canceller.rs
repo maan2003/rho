@@ -15,9 +15,9 @@ mod real_implementation {
             // Sound-effect playback only feeds this APM through `process_reverse_stream`
             // for AEC reference; gain/HPF/NS would be no-ops here, so we keep the
             // original (echo only) configuration via the legacy flag form.
-            Self(Arc::new(Mutex::new(
-                apm::AudioProcessingModule::from_flags(true, false, false, false),
-            )))
+            Self(Arc::new(Mutex::new(apm::AudioProcessingModule::new(
+                true, false, false, false,
+            ))))
         }
     }
 
