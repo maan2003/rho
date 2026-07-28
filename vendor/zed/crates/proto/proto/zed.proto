@@ -100,6 +100,7 @@ message Envelope {
     UpdateBuffer update_buffer = 60;
     UpdateBufferFile update_buffer_file = 61;
     SaveBuffer save_buffer = 62;
+    SaveBufferChecked save_buffer_checked = 478;
     BufferSaved buffer_saved = 63;
     BufferReloaded buffer_reloaded = 64;
     ReloadBuffers reload_buffers = 65;
@@ -505,7 +506,8 @@ message Envelope {
     RefreshDocumentColors refresh_document_colors = 474;
     RefreshDocumentLinks refresh_document_links = 475;
     RefreshFoldingRanges refresh_folding_ranges = 476;
-    RefreshDocumentSymbols refresh_document_symbols = 477; // current max
+    RefreshDocumentSymbols refresh_document_symbols = 477;
+    // current max: 478
   }
 
   reserved 87 to 88;
@@ -568,6 +570,7 @@ enum ErrorCode {
   RemoteUpgradeRequired = 17;
   RateLimitExceeded = 18;
   CommitFailed = 19;
+  SaveConflict = 20;
   reserved 6;
   reserved 14 to 15;
 }

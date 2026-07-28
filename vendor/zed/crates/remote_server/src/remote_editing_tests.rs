@@ -41,7 +41,7 @@ use project::{
     search::{SearchQuery, SearchResult},
 };
 use remote::RemoteClient;
-use rpc::proto;
+use rpc::{ErrorCode, ErrorExt as _, proto};
 use serde_json::json;
 use settings::{Settings, SettingsLocation, SettingsStore, initial_server_settings_content};
 use smol::stream::StreamExt;
@@ -188,6 +188,113 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
             "fn one() -> usize { 100 }"
         );
     });
+}
+
+#[gpui::test]
+async fn test_checked_remote_save_rejects_external_changes(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code"),
+        json!({
+            "project": {
+                "file.txt": "original",
+            },
+        }),
+    )
+    .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project"), true, cx)
+        })
+        .await
+        .unwrap();
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("file.txt")), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..buffer.len(), "editor")], None, cx)
+    });
+
+    fs.save(
+        path!("/code/project/file.txt").as_ref(),
+        &"external".into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let error = project
+        .update(cx, |project, cx| {
+            project.save_buffer_checked(buffer.clone(), cx)
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.error_code(), ErrorCode::SaveConflict);
+    assert_eq!(error.error_tag("kind"), Some("modified"));
+    assert_eq!(
+        fs.load(path!("/code/project/file.txt").as_ref())
+            .await
+            .unwrap(),
+        "external"
+    );
+
+    // An explicit overwrite uses the existing unconditional save API.
+    project
+        .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..buffer.len(), "second edit")], None, cx)
+    });
+    fs.remove_file(path!("/code/project/file.txt").as_ref(), Default::default())
+        .await
+        .unwrap();
+    let error = project
+        .update(cx, |project, cx| {
+            project.save_buffer_checked(buffer.clone(), cx)
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.error_code(), ErrorCode::SaveConflict);
+    assert_eq!(error.error_tag("kind"), Some("deleted"));
+
+    let new_buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("new.txt")), cx)
+        })
+        .await
+        .unwrap();
+    new_buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "editor new file")], None, cx)
+    });
+    fs.save(
+        path!("/code/project/new.txt").as_ref(),
+        &"external creation".into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let error = project
+        .update(cx, |project, cx| {
+            project.save_buffer_checked(new_buffer.clone(), cx)
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.error_code(), ErrorCode::SaveConflict);
+    assert_eq!(error.error_tag("kind"), Some("created"));
+    assert_eq!(
+        fs.load(path!("/code/project/new.txt").as_ref())
+            .await
+            .unwrap(),
+        "external creation"
+    );
 }
 
 #[gpui::test]

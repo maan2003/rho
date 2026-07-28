@@ -6,7 +6,12 @@ use crate::{
 use anyhow::{Context as _, Result, anyhow};
 use client::Client;
 use collections::{HashMap, HashSet, hash_map};
-use futures::{Future, FutureExt as _, channel::oneshot, future::Shared};
+use futures::{
+    Future, FutureExt as _,
+    channel::oneshot,
+    future::{Either, Shared},
+    lock::Mutex as AsyncMutex,
+};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, TaskExt,
     WeakEntity,
@@ -20,7 +25,7 @@ use language::{
     },
 };
 use rpc::{
-    AnyProtoClient, ErrorCode, ErrorExt as _, TypedEnvelope,
+    AnyProtoClient, ErrorCode, ErrorCodeExt as _, ErrorExt as _, TypedEnvelope,
     proto::{self, PeerId},
 };
 
@@ -77,8 +82,17 @@ struct RemoteBufferStore {
 
 struct LocalBufferStore {
     local_buffer_ids_by_entry_id: HashMap<ProjectEntryId, BufferId>,
+    save_gates: HashMap<BufferId, Arc<AsyncMutex<()>>>,
     worktree_store: Entity<WorktreeStore>,
     _subscription: Subscription,
+}
+
+enum SaveTarget {
+    Current,
+    Explicit {
+        worktree: Entity<Worktree>,
+        path: Arc<RelPath>,
+    },
 }
 
 enum OpenBuffer {
@@ -136,6 +150,7 @@ impl RemoteBufferStore {
         &self,
         buffer_handle: Entity<Buffer>,
         new_path: Option<proto::ProjectPath>,
+        check_for_external_changes: bool,
         cx: &Context<BufferStore>,
     ) -> Task<Result<()>> {
         let buffer = buffer_handle.read(cx);
@@ -144,14 +159,21 @@ impl RemoteBufferStore {
         let rpc = self.upstream_client.clone();
         let project_id = self.project_id;
         cx.spawn(async move |_, cx| {
-            let response = rpc
-                .request(proto::SaveBuffer {
+            let response = if check_for_external_changes {
+                Either::Left(rpc.request(proto::SaveBufferChecked {
+                    project_id,
+                    buffer_id,
+                    version: serialize_version(&version),
+                }))
+            } else {
+                Either::Right(rpc.request(proto::SaveBuffer {
                     project_id,
                     buffer_id,
                     new_path,
                     version: serialize_version(&version),
-                })
-                .await?;
+                }))
+            }
+            .await?;
             let version = deserialize_version(&response.version);
             let mtime = response.mtime.map(|mtime| mtime.into());
 
@@ -383,34 +405,89 @@ impl RemoteBufferStore {
 
 impl LocalBufferStore {
     fn save_local_buffer(
-        &self,
+        &mut self,
         buffer_handle: Entity<Buffer>,
-        worktree: Entity<Worktree>,
-        path: Arc<RelPath>,
-        mut has_changed_file: bool,
+        target: SaveTarget,
+        has_changed_file: bool,
+        check_for_external_changes: bool,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<()>> {
-        let buffer = buffer_handle.read(cx);
-
-        let text = buffer.as_rope().clone();
-        let line_ending = buffer.line_ending();
-        let encoding = buffer.encoding();
-        let has_bom = buffer.has_bom();
-        let version = buffer.version();
-        let buffer_id = buffer.remote_id();
-        let file = buffer.file().cloned();
-        if file
-            .as_ref()
-            .is_some_and(|file| file.disk_state() == DiskState::New)
-        {
-            has_changed_file = true;
-        }
-
-        let save = worktree.update(cx, |worktree, cx| {
-            worktree.write_file(path, text, line_ending, encoding, has_bom, cx)
-        });
+        let buffer_id = buffer_handle.read(cx).remote_id();
+        let save_gate = self
+            .save_gates
+            .entry(buffer_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone();
 
         cx.spawn(async move |this, cx| {
+            let _save_guard = save_gate.lock().await;
+            let (
+                text,
+                line_ending,
+                encoding,
+                has_bom,
+                version,
+                file,
+                expected_mtime,
+                known_conflict,
+            ) = buffer_handle.read_with(cx, |buffer, _| {
+                (
+                    buffer.as_rope().clone(),
+                    buffer.line_ending(),
+                    buffer.encoding(),
+                    buffer.has_bom(),
+                    buffer.version(),
+                    buffer.file().cloned(),
+                    buffer.saved_mtime(),
+                    buffer.has_conflict(),
+                )
+            });
+            let known_deleted = file
+                .as_ref()
+                .is_some_and(|file| file.disk_state() == DiskState::Deleted);
+            let has_changed_file = has_changed_file
+                || file
+                    .as_ref()
+                    .is_some_and(|file| file.disk_state() == DiskState::New);
+            let file_on_disk = if check_for_external_changes {
+                File::from_dyn(file.as_ref()).map(|file| file.disk_state_on_disk(cx))
+            } else {
+                None
+            };
+            let (worktree, path) = match target {
+                SaveTarget::Current => {
+                    let file = File::from_dyn(file.as_ref())
+                        .context("buffer no longer has a worktree file")?;
+                    (file.worktree.clone(), file.path.clone())
+                }
+                SaveTarget::Explicit { worktree, path } => (worktree, path),
+            };
+            if let Some(file_on_disk) = file_on_disk {
+                let disk_state = file_on_disk.await?;
+                if matches!(disk_state, DiskState::Deleted)
+                    && (expected_mtime.is_some() || known_deleted)
+                {
+                    return Err(ErrorCode::SaveConflict.with_tag("kind", "deleted").into());
+                }
+                if known_conflict
+                    || known_deleted
+                    || match (expected_mtime, disk_state) {
+                        (None, DiskState::Present { .. }) => true,
+                        (Some(expected), DiskState::Present { mtime, .. }) => expected != mtime,
+                        _ => false,
+                    }
+                {
+                    let kind = if expected_mtime.is_none() {
+                        "created"
+                    } else {
+                        "modified"
+                    };
+                    return Err(ErrorCode::SaveConflict.with_tag("kind", kind).into());
+                }
+            }
+            let save = worktree.update(cx, |worktree, cx| {
+                worktree.write_file(path, text, line_ending, encoding, has_bom, cx)
+            });
             let new_file = save.await?;
             let mtime = new_file.disk_state().mtime();
             this.update(cx, |this, cx| {
@@ -608,19 +685,25 @@ impl LocalBufferStore {
     }
 
     fn save_buffer(
-        &self,
+        &mut self,
         buffer: Entity<Buffer>,
+        check_for_external_changes: bool,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<()>> {
-        let Some(file) = File::from_dyn(buffer.read(cx).file()) else {
+        if File::from_dyn(buffer.read(cx).file()).is_none() {
             return Task::ready(Err(anyhow!("buffer doesn't have a file")));
-        };
-        let worktree = file.worktree.clone();
-        self.save_local_buffer(buffer, worktree, file.path.clone(), false, cx)
+        }
+        self.save_local_buffer(
+            buffer,
+            SaveTarget::Current,
+            false,
+            check_for_external_changes,
+            cx,
+        )
     }
 
     fn save_buffer_as(
-        &self,
+        &mut self,
         buffer: Entity<Buffer>,
         path: ProjectPath,
         cx: &mut Context<BufferStore>,
@@ -632,7 +715,16 @@ impl LocalBufferStore {
         else {
             return Task::ready(Err(anyhow!("no such worktree")));
         };
-        self.save_local_buffer(buffer, worktree, path.path, true, cx)
+        self.save_local_buffer(
+            buffer,
+            SaveTarget::Explicit {
+                worktree,
+                path: path.path,
+            },
+            true,
+            false,
+            cx,
+        )
     }
 
     #[ztracing::instrument(skip_all)]
@@ -781,6 +873,7 @@ impl BufferStore {
         client.add_entity_message_handler(Self::handle_buffer_saved);
         client.add_entity_message_handler(Self::handle_update_buffer_file);
         client.add_entity_request_handler(Self::handle_save_buffer);
+        client.add_entity_request_handler(Self::handle_save_buffer_checked);
         client.add_entity_request_handler(Self::handle_reload_buffers);
     }
 
@@ -789,6 +882,7 @@ impl BufferStore {
         Self {
             state: BufferStoreState::Local(LocalBufferStore {
                 local_buffer_ids_by_entry_id: Default::default(),
+                save_gates: Default::default(),
                 worktree_store: worktree_store.clone(),
                 _subscription: cx.subscribe(&worktree_store, |this, _, event, cx| {
                     if let WorktreeStoreEvent::WorktreeAdded(worktree) = event {
@@ -928,8 +1022,19 @@ impl BufferStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         match &mut self.state {
-            BufferStoreState::Local(this) => this.save_buffer(buffer, cx),
-            BufferStoreState::Remote(this) => this.save_remote_buffer(buffer, None, cx),
+            BufferStoreState::Local(this) => this.save_buffer(buffer, false, cx),
+            BufferStoreState::Remote(this) => this.save_remote_buffer(buffer, None, false, cx),
+        }
+    }
+
+    pub fn save_buffer_checked(
+        &mut self,
+        buffer: Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        match &mut self.state {
+            BufferStoreState::Local(this) => this.save_buffer(buffer, true, cx),
+            BufferStoreState::Remote(this) => this.save_remote_buffer(buffer, None, true, cx),
         }
     }
 
@@ -940,10 +1045,10 @@ impl BufferStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         let old_file = buffer.read(cx).file().cloned();
-        let task = match &self.state {
+        let task = match &mut self.state {
             BufferStoreState::Local(this) => this.save_buffer_as(buffer.clone(), path, cx),
             BufferStoreState::Remote(this) => {
-                this.save_remote_buffer(buffer.clone(), Some(path.to_proto()), cx)
+                this.save_remote_buffer(buffer.clone(), Some(path.to_proto()), false, cx)
             }
         };
         cx.spawn(async move |this, cx| {
@@ -1411,6 +1516,40 @@ impl BufferStore {
             this.update(&mut cx, |this, cx| this.save_buffer(buffer.clone(), cx))
                 .await?;
         }
+
+        Ok(buffer.read_with(&cx, |buffer, _| proto::BufferSaved {
+            project_id,
+            buffer_id: buffer_id.into(),
+            version: serialize_version(buffer.saved_version()),
+            mtime: buffer.saved_mtime().map(|time| time.into()),
+        }))
+    }
+
+    pub async fn handle_save_buffer_checked(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::SaveBufferChecked>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::BufferSaved> {
+        let buffer_id = BufferId::new(envelope.payload.buffer_id)?;
+        let (buffer, project_id) = this.read_with(&cx, |this, _| {
+            anyhow::Ok((
+                this.get_existing(buffer_id)?,
+                this.downstream_client
+                    .as_ref()
+                    .map(|(_, project_id)| *project_id)
+                    .context("project is not shared")?,
+            ))
+        })?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&envelope.payload.version))
+            })
+            .await?;
+        let buffer_id = buffer.read_with(&cx, |buffer, _| buffer.remote_id());
+        this.update(&mut cx, |this, cx| {
+            this.save_buffer_checked(buffer.clone(), cx)
+        })
+        .await?;
 
         Ok(buffer.read_with(&cx, |buffer, _| proto::BufferSaved {
             project_id,

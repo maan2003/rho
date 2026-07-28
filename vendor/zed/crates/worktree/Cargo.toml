@@ -15,6 +15,11 @@ name = "integration"
 required-features = ["test-support"]
 path = "tests/integration/worktree_tests.rs"
 
+[[test]]
+name = "load_limit"
+required-features = ["test-support"]
+path = "tests/load_limit.rs"
+
 [lints]
 workspace = true
 

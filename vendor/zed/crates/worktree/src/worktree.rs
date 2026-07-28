@@ -64,7 +64,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
     },
     time::{Duration, Instant},
 };
@@ -78,6 +78,16 @@ use util::{
 pub use worktree_settings::WorktreeSettings;
 
 use crate::ignore::IgnoreKind;
+
+const DEFAULT_FILE_SIZE_LIMIT: u64 = 6 * 1024 * 1024 * 1024;
+static FILE_SIZE_LIMIT: AtomicU64 = AtomicU64::new(DEFAULT_FILE_SIZE_LIMIT);
+
+/// Sets the process-wide maximum file size accepted by local worktree file
+/// loads and reloads. Embedders with tighter memory budgets should call this
+/// before opening any worktrees.
+pub fn set_file_size_limit(bytes: u64) {
+    FILE_SIZE_LIMIT.store(bytes, SeqCst);
+}
 
 pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
 
@@ -1624,7 +1634,8 @@ impl LocalWorktree {
 
         let worktree = cx.weak_entity();
         cx.background_spawn(async move {
-            let content = fs.load_bytes(&abs_path).await?;
+            let content =
+                load_bytes_with_limit(fs.as_ref(), &abs_path, FILE_SIZE_LIMIT.load(SeqCst)).await?;
 
             let worktree = worktree.upgrade().context("worktree was dropped")?;
             let file = match entry.await? {
@@ -1667,20 +1678,17 @@ impl LocalWorktree {
 
         let this = cx.weak_entity();
         cx.background_spawn(async move {
-            // WARN: Temporary workaround for #27283.
-            //       We are not efficient with our memory usage per file, and use in excess of 64GB for a 10GB file
-            //       Therefore, as a temporary workaround to prevent system freezes, we just bail before opening a file
-            //       if it is too large
-            //       5GB seems to be more reasonable, peaking at ~16GB, while 6GB jumps up to >24GB which seems like a
-            //       reasonable limit
-            const FILE_SIZE_MAX: u64 = 6 * 1024 * 1024 * 1024; // 6GB
+            // Preflight metadata for the common case, then enforce the same
+            // cap while reading so a replacement/growth race cannot bypass it.
+            let file_size_max = FILE_SIZE_LIMIT.load(SeqCst);
             let metadata = fs.metadata(&abs_path).await?;
             if let Some(metadata) = metadata.as_ref()
-                && metadata.len >= FILE_SIZE_MAX
+                && metadata.len > file_size_max
             {
                 anyhow::bail!("File is too large to load");
             }
-            let (text, encoding, has_bom) = decode_file_text(fs.as_ref(), &abs_path).await?;
+            let (text, encoding, has_bom) =
+                decode_file_text(fs.as_ref(), &abs_path, file_size_max).await?;
             let is_writable = metadata.is_some_and(|metadata| metadata.is_writable);
 
             let worktree = this.upgrade().context("worktree was dropped")?;
@@ -3840,18 +3848,42 @@ impl language::LocalFile for File {
         let worktree = self.worktree.read(cx).as_local().unwrap();
         let abs_path = worktree.absolutize(&self.path);
         let fs = worktree.fs.clone();
-        cx.background_spawn(async move { fs.load(&abs_path).await })
+        cx.background_spawn(async move {
+            let bytes =
+                load_bytes_with_limit(fs.as_ref(), &abs_path, FILE_SIZE_LIMIT.load(SeqCst)).await?;
+            Ok(String::from_utf8(bytes)?)
+        })
     }
 
     fn load_bytes(&self, cx: &App) -> Task<Result<Vec<u8>>> {
         let worktree = self.worktree.read(cx).as_local().unwrap();
         let abs_path = worktree.absolutize(&self.path);
         let fs = worktree.fs.clone();
-        cx.background_spawn(async move { fs.load_bytes(&abs_path).await })
+        cx.background_spawn(async move {
+            load_bytes_with_limit(fs.as_ref(), &abs_path, FILE_SIZE_LIMIT.load(SeqCst)).await
+        })
     }
 }
 
 impl File {
+    /// Reads the path's current metadata instead of relying on the watcher
+    /// snapshot stored in this handle.
+    pub fn disk_state_on_disk(&self, cx: &AsyncApp) -> Task<Result<DiskState>> {
+        let (abs_path, fs) = self.worktree.read_with(cx, |worktree, _| {
+            let worktree = worktree.as_local().unwrap();
+            (worktree.absolutize(&self.path), worktree.fs.clone())
+        });
+        cx.background_spawn(async move {
+            Ok(match fs.metadata(&abs_path).await? {
+                Some(metadata) => DiskState::Present {
+                    mtime: metadata.mtime,
+                    size: metadata.len,
+                },
+                None => DiskState::Deleted,
+            })
+        })
+    }
+
     pub fn for_entry(entry: Entry, worktree: Entity<Worktree>) -> Arc<Self> {
         Arc::new(Self {
             worktree,
@@ -7092,7 +7124,9 @@ impl fs::Watcher for NullWatcher {
 async fn decode_file_text(
     fs: &dyn Fs,
     abs_path: &Path,
+    file_size_limit: u64,
 ) -> Result<(String, &'static Encoding, bool)> {
+    let file_size_limit = usize::try_from(file_size_limit).unwrap_or(usize::MAX);
     let mut file = fs
         .open_sync(&abs_path)
         .await
@@ -7107,9 +7141,14 @@ async fn decode_file_text(
         if file_first_bytes.len() >= FILE_ANALYSIS_BYTES {
             break;
         }
-        let n = file
-            .read(&mut buf)
-            .with_context(|| format!("reading bytes of the file {abs_path:?}"))?;
+        let read_len = buf.len().min(FILE_ANALYSIS_BYTES - file_first_bytes.len());
+        let n = read_bounded(
+            file.as_mut(),
+            &mut buf[..read_len],
+            file_first_bytes.len(),
+            file_size_limit,
+        )
+        .with_context(|| format!("reading bytes of the file {abs_path:?}"))?;
         if n == 0 {
             reached_eof = true;
             break;
@@ -7127,8 +7166,7 @@ async fn decode_file_text(
     if !reached_eof {
         let mut buf = [0u8; 8 * 1024];
         loop {
-            let n = file
-                .read(&mut buf)
+            let n = read_bounded(file.as_mut(), &mut buf, content.len(), file_size_limit)
                 .with_context(|| format!("reading remaining bytes of the file {abs_path:?}"))?;
             if n == 0 {
                 break;
@@ -7137,6 +7175,46 @@ async fn decode_file_text(
         }
     }
     decode_byte_full(content, bom_encoding, byte_content)
+}
+
+async fn load_bytes_with_limit(fs: &dyn Fs, path: &Path, limit: u64) -> Result<Vec<u8>> {
+    if let Ok(Some(metadata)) = fs.metadata(path).await
+        && metadata.len > limit
+    {
+        anyhow::bail!("File is too large to load");
+    }
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut file = fs
+        .open_sync(path)
+        .await
+        .with_context(|| format!("opening file {path:?}"))?;
+    let mut content = Vec::new();
+    let mut buf = [0; 8 * 1024];
+    loop {
+        let n = read_bounded(file.as_mut(), &mut buf, content.len(), limit)
+            .with_context(|| format!("reading bytes of the file {path:?}"))?;
+        if n == 0 {
+            return Ok(content);
+        }
+        content.extend_from_slice(&buf[..n]);
+    }
+}
+
+fn read_bounded<R: std::io::Read + ?Sized>(
+    reader: &mut R,
+    buf: &mut [u8],
+    bytes_read: usize,
+    limit: usize,
+) -> Result<usize> {
+    let read_len = buf
+        .len()
+        .min(limit.saturating_sub(bytes_read).saturating_add(1));
+    let n = reader.read(&mut buf[..read_len])?;
+    anyhow::ensure!(
+        bytes_read.saturating_add(n) <= limit,
+        "File is too large to load"
+    );
+    Ok(n)
 }
 
 fn decode_byte_header(prefix: &[u8]) -> (Option<&'static Encoding>, ByteContent) {

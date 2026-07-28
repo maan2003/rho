@@ -5972,6 +5972,66 @@ async fn test_save_file(cx: &mut gpui::TestAppContext) {
     assert_eq!(new_text, buffer.update(cx, |buffer, _| buffer.text()));
 }
 
+#[gpui::test(iterations = 30)]
+async fn test_concurrent_saves_cannot_finish_with_older_contents(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "file": "original" }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/file"), cx)
+        })
+        .await
+        .unwrap();
+
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..buffer.len(), "older")], None, cx)
+    });
+    let older_save = project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..buffer.len(), "newer")], None, cx)
+    });
+    let newer_save = project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
+    futures::try_join!(older_save, newer_save).unwrap();
+
+    assert_eq!(fs.load(path!("/dir/file").as_ref()).await.unwrap(), "newer");
+}
+
+#[gpui::test]
+async fn test_queued_save_uses_the_post_gate_buffer_path(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "old": "original" }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/old"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..buffer.len(), "editor")], None, cx)
+    });
+
+    let queued_save = project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
+    buffer.update(cx, |buffer, cx| {
+        let mut file = worktree::File::from_dyn(buffer.file()).unwrap().clone();
+        file.path = rel_path("new").into();
+        file.disk_state = DiskState::New;
+        buffer.file_updated(Arc::new(file), cx);
+    });
+    queued_save.await.unwrap();
+
+    assert_eq!(
+        fs.load(path!("/dir/old").as_ref()).await.unwrap(),
+        "original"
+    );
+    assert_eq!(fs.load(path!("/dir/new").as_ref()).await.unwrap(), "editor");
+}
+
 #[gpui::test(iterations = 10)]
 async fn test_save_file_spawns_language_server(cx: &mut gpui::TestAppContext) {
     // Issue: #24349
