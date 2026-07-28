@@ -232,11 +232,12 @@ fn push_message(
 ) {
     let content = content
         .iter()
-        .map(|part| match part {
+        .filter_map(|part| match part {
             ContentPart::Text { text } if role == "assistant" => {
-                ContentItem::OutputText { text: text.clone() }
+                Some(ContentItem::OutputText { text: text.clone() })
             }
-            ContentPart::Text { text } => ContentItem::InputText { text: text.clone() },
+            ContentPart::Text { text } => Some(ContentItem::InputText { text: text.clone() }),
+            ContentPart::Image { .. } => None,
         })
         .collect::<Vec<_>>();
     if !content.is_empty() {

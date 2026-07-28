@@ -175,6 +175,28 @@ impl ClaudeCode {
             .await
     }
 
+    pub async fn send_user_content_with_uuid(
+        &mut self,
+        content: Vec<rho_core::ContentPart>,
+        uuid: String,
+    ) -> Result<()> {
+        use base64::Engine as _;
+        let content = content
+            .into_iter()
+            .map(|part| match part {
+                rho_core::ContentPart::Text { text } => protocol::InputContent::Text { text },
+                rho_core::ContentPart::Image { media_type, data } => protocol::InputContent::image(
+                    media_type,
+                    base64::engine::general_purpose::STANDARD.encode(data),
+                ),
+            })
+            .collect();
+        self.write_message(&protocol::InputMessage::user_content_with_uuid(
+            content, uuid,
+        ))
+        .await
+    }
+
     pub async fn apply_effort(&mut self, effort: Effort) -> Result<String> {
         self.write_control_request(serde_json::json!({
                 "subtype": "apply_flag_settings",
@@ -360,6 +382,27 @@ mod tests {
             ))
             .unwrap()["uuid"],
             "prompt-1"
+        );
+    }
+
+    #[test]
+    fn builds_user_message_with_base64_image() {
+        let message = protocol::InputMessage::user_content_with_uuid(
+            vec![
+                protocol::InputContent::Text {
+                    text: "inspect".to_owned(),
+                },
+                protocol::InputContent::image("image/jpeg".to_owned(), "AQID".to_owned()),
+            ],
+            "prompt-1".to_owned(),
+        );
+        let value = serde_json::to_value(message).unwrap();
+        assert_eq!(
+            value["message"]["content"][1],
+            json!({
+                "type": "image",
+                "source": {"type":"base64", "media_type":"image/jpeg", "data":"AQID"}
+            })
         );
     }
 

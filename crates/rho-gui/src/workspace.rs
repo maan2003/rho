@@ -15,7 +15,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable as _, Task, Window, div, px, svg};
+use gpui::{App, ClipboardEntry, Context, Entity, Focusable as _, Task, Window, div, px, svg};
 use rho_core::ContentPart;
 use rho_ui_proto::{
     AdvisorIntelligence, AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery,
@@ -36,8 +36,8 @@ use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious,
     DashboardNewAgent, DashboardReply, DashboardToggleSubagents, GitApprovalAllow, GitApprovalDeny,
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
-    PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, RailFocus, RailOpen,
-    RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
+    PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
+    RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
     ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
 };
 
@@ -604,6 +604,7 @@ impl Workspace {
                         .unwrap_or_default();
                     self.draft_model.update(cx, |view, cx| {
                         view.set_body_text("", cx);
+                        view.clear_attachments(cx);
                         view.set_workdir_text(&label, cx);
                         view.set_role_text(crate::draft_view::DEFAULT_ROLE, cx);
                         view.set_start_text(crate::draft_view::DEFAULT_START, cx);
@@ -784,10 +785,10 @@ impl Workspace {
                 let Some(view) = self.models.get(&agent_id).cloned() else {
                     return;
                 };
-                let Some(text) = view.update(cx, |view, cx| view.take_prompt(cx)) else {
+                let Some(content) = view.update(cx, |view, cx| view.take_prompt(cx)) else {
                     return;
                 };
-                self.handle_submit(agent_id, text, cx);
+                self.handle_submit(agent_id, content, cx);
             }
             None => self.submit_draft(window, cx),
         }
@@ -866,7 +867,12 @@ impl Workspace {
         }
     }
 
-    fn handle_submit(&mut self, agent_id: AgentId, text: String, cx: &mut Context<Self>) {
+    fn handle_submit(
+        &mut self,
+        agent_id: AgentId,
+        content: Vec<ContentPart>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.connected {
             self.notice_on(
                 Some(&agent_id),
@@ -878,7 +884,7 @@ impl Workspace {
         }
         self.connection.send(ClientMessage::SendUserMessage {
             agent_id,
-            content: vec![ContentPart::Text { text }],
+            content,
             delivery: MessageDelivery::NextRequest,
         });
         // Engagement bump: keeps display-time staleness correct between
@@ -891,8 +897,7 @@ impl Workspace {
     /// inherited. The buffers are not cleared here — they survive until the
     /// daemon confirms creation.
     fn submit_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let body = self.draft_model.read(cx).body_text(cx).trim().to_owned();
-        if body.is_empty() {
+        let Some(content) = self.draft_model.read(cx).content(cx) else {
             // Enter in the workdir field with nothing to send: jump to the
             // body instead of submitting.
             if let Some(editor) = self.focused_draft_editor() {
@@ -900,7 +905,7 @@ impl Workspace {
                     .update(cx, |view, cx| view.focus_body(&editor, window, cx));
             }
             return;
-        }
+        };
         if !self.connected {
             self.notice_on(
                 None,
@@ -940,8 +945,112 @@ impl Workspace {
             workstream: None,
             role,
             start,
-            content: Some(vec![ContentPart::Text { text: body }]),
+            content: Some(content),
         });
+    }
+
+    fn paste_prompt(&mut self, _: &PastePrompt, window: &mut Window, cx: &mut Context<Self>) {
+        self.cmd_paste_prompt(window, cx);
+    }
+
+    pub(crate) fn cmd_paste_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let dashboard_mode = self.dashboard_mode(window, cx);
+        let dashboard_prompt = dashboard_mode && self.dashboard.accepts_attachments(cx);
+        let pane_prompt = matches!(
+            self.active_tree().focused().surface.view,
+            SurfaceView::Draft { .. } | SurfaceView::Transcript { .. }
+        );
+        let images = item
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(image) if !image.bytes.is_empty() => Some(image),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if (!dashboard_prompt && !pane_prompt) || images.is_empty() {
+            let editor = if dashboard_mode {
+                self.dashboard.editor().clone()
+            } else {
+                self.active_editor(cx)
+            };
+            editor.update(cx, |editor, cx| editor.paste_item(&item, window, cx));
+            return;
+        }
+        let mut accepted = 0;
+        for image in images {
+            let media_type = match image.format {
+                gpui::ImageFormat::Png => "image/png",
+                gpui::ImageFormat::Jpeg => "image/jpeg",
+                gpui::ImageFormat::Webp => "image/webp",
+                gpui::ImageFormat::Gif => "image/gif",
+                _ => {
+                    self.notice_on(
+                        None,
+                        "unsupported clipboard image format (use PNG, JPEG, WebP, or GIF)",
+                        StyleClass::SystemImportant,
+                        cx,
+                    );
+                    continue;
+                }
+            };
+            let added = if dashboard_prompt {
+                self.dashboard
+                    .add_image(media_type.to_owned(), image.bytes.clone(), cx)
+            } else {
+                match &self.active_tree().focused().surface.view {
+                    SurfaceView::Draft { .. } => {
+                        self.draft_model.update(cx, |model, cx| {
+                            model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
+                        });
+                        true
+                    }
+                    SurfaceView::Transcript { model, .. } => {
+                        model.update(cx, |model, cx| {
+                            model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
+                        });
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            accepted += usize::from(added);
+        }
+        if accepted > 0 {
+            cx.stop_propagation();
+        }
+    }
+
+    pub(crate) fn cmd_clear_prompt_attachments(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cleared = if self.dashboard_mode(window, cx) {
+            self.dashboard.clear_attachments(cx)
+        } else {
+            match &self.active_tree().focused().surface.view {
+                SurfaceView::Draft { .. } => self
+                    .draft_model
+                    .update(cx, |model, cx| model.clear_attachments(cx)),
+                SurfaceView::Transcript { model, .. } => {
+                    model.update(cx, |model, cx| model.clear_attachments(cx))
+                }
+                _ => false,
+            }
+        };
+        if cleared {
+            let agent_id = self.registry.selected_agent().copied();
+            self.notice_on(
+                agent_id.as_ref(),
+                "image attachments cleared",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
     }
 
     /// Interprets the draft's start field (`auto` selects the first available
@@ -3463,8 +3572,8 @@ impl Workspace {
                 if !self.require_connected(cx) {
                     return;
                 }
-                if let Some(text) = self.dashboard.take_reply(agent_id, cx) {
-                    self.handle_submit(agent_id, text, cx);
+                if let Some(content) = self.dashboard.take_reply(agent_id, cx) {
+                    self.handle_submit(agent_id, content, cx);
                 }
                 // Removing the draft's excerpt would drop the cursor onto
                 // whatever text slid into the gap; park it back on the row
@@ -3485,8 +3594,8 @@ impl Workspace {
                         return;
                     }
                 };
-                if let Some(body) = self.dashboard.take_new_draft(cx) {
-                    self.create_inline_agent(body, start, role);
+                if let Some(content) = self.dashboard.take_new_draft(cx) {
+                    self.create_inline_agent(content, start, role);
                 }
                 self.new_agent_draft = None;
                 self.dashboard_exit_insert(window, cx);
@@ -3497,7 +3606,7 @@ impl Workspace {
 
     fn create_inline_agent(
         &mut self,
-        body: String,
+        content: Vec<ContentPart>,
         start: rho_ui_proto::StartMode,
         role: AgentRole,
     ) {
@@ -3505,7 +3614,7 @@ impl Workspace {
             workstream: None,
             role,
             start,
-            content: Some(vec![ContentPart::Text { text: body }]),
+            content: Some(content),
         });
     }
 
@@ -4191,6 +4300,7 @@ impl Render for Workspace {
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
             .on_action(cx.listener(Self::submit_prompt))
+            .on_action(cx.listener(Self::paste_prompt))
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(Self::shell_eof))

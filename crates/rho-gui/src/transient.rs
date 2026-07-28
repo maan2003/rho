@@ -384,6 +384,9 @@ pub fn root_menu() -> Transient {
         .item("n", "new agent", |workspace, window, cx| {
             workspace.open_new_agent_transient(window, cx);
         })
+        .item("i", "input…", |workspace, window, cx| {
+            workspace.open_transient(input_menu(), window, cx);
+        })
         .item(
             "m",
             "iris microphone · listening",
@@ -452,6 +455,16 @@ pub fn root_menu() -> Transient {
         .item("q", "quit", |_, _, cx| cx.quit())
 }
 
+fn input_menu() -> Transient {
+    Transient::new("input")
+        .item("p", "paste clipboard", |workspace, window, cx| {
+            workspace.cmd_paste_prompt(window, cx);
+        })
+        .item("c", "clear images", |workspace, window, cx| {
+            workspace.cmd_clear_prompt_attachments(window, cx);
+        })
+}
+
 pub fn usage_root_menu() -> Transient {
     Transient::new("usage")
         .item("r", "rate limit · 7d", |workspace, window, cx| {
@@ -511,8 +524,8 @@ fn usage_chart(
                 midnight = midnight.saturating_add(DAY_MS);
             }
             while midnight < now {
-                let x_ratio = midnight.saturating_sub(start) as f64
-                    / now.saturating_sub(start).max(1) as f64;
+                let x_ratio =
+                    midnight.saturating_sub(start) as f64 / now.saturating_sub(start).max(1) as f64;
                 let x = bounds.origin.x + bounds.size.width * x_ratio as f32;
                 paint_grid_line(
                     point(x, bounds.origin.y),

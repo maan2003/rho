@@ -68,7 +68,10 @@ pub async fn generate_title(inference: &Inference, user_message: &str) -> anyhow
             InferenceResponseItem::AssistantMessage { content, .. } => Some(
                 content
                     .iter()
-                    .map(|ContentPart::Text { text }| text.as_str())
+                    .filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        ContentPart::Image { .. } => None,
+                    })
                     .collect::<String>(),
             ),
             _ => None,

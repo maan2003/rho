@@ -301,14 +301,16 @@ impl ClaudeAgent {
     }
 
     pub fn send_user_message(&self, text: impl Into<String>) {
+        self.send_user_content(vec![ContentPart::Text { text: text.into() }]);
+    }
+
+    pub fn send_user_content(&self, content: Vec<ContentPart>) {
         let seq = self.input_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let uuid = Uuid::new_v4().to_string();
         self.input_notify.notify_waiters();
-        let _ = self.control.send(ClaudeControl::UserMessage {
-            text: text.into(),
-            seq,
-            uuid,
-        });
+        let _ = self
+            .control
+            .send(ClaudeControl::UserMessage { content, seq, uuid });
     }
 
     pub async fn wait_for_input(&self, timeout: std::time::Duration) -> bool {
@@ -396,7 +398,7 @@ enum ClaudeStartMode {
 
 enum ClaudeControl {
     UserMessage {
-        text: String,
+        content: Vec<ContentPart>,
         seq: u64,
         uuid: String,
     },
@@ -518,7 +520,7 @@ impl ClaudeLoop {
 
     async fn handle_control(&mut self, control: ClaudeControl) {
         match control {
-            ClaudeControl::UserMessage { text, seq, uuid } => {
+            ClaudeControl::UserMessage { content, seq, uuid } => {
                 self.cancelling = false;
                 if let Err(error) = self.ensure_process().await {
                     self.fail(error);
@@ -539,7 +541,7 @@ impl ClaudeLoop {
                 } else {
                     MessageDelivery::Immediate
                 };
-                let content = Arc::new(vec![ContentPart::Text { text: text.clone() }]);
+                let content = Arc::new(content);
                 self.queued_turns.push_back(ClaudeTurn {
                     uuid: uuid.clone(),
                     input_seq: seq,
@@ -552,7 +554,7 @@ impl ClaudeLoop {
                     .push(QueuedItem {
                         kind: QueuedItemKind::UserMessage {
                             sender: crate::MessageSender::User,
-                            content,
+                            content: Arc::clone(&content),
                             source_id: None,
                         },
                         delivery,
@@ -570,7 +572,7 @@ impl ClaudeLoop {
                     .process
                     .as_mut()
                     .unwrap()
-                    .send_user_message_with_uuid(text, uuid)
+                    .send_user_content_with_uuid((*content).clone(), uuid)
                     .await
                 {
                     self.fail(error);
@@ -942,7 +944,7 @@ impl ClaudeLoop {
                             content: queued, ..
                         },
                     ..
-                } => **queued == *content,
+                } => queued_user_content_matches(queued, content),
                 // Claude agents never queue tool updates.
                 QueuedItem {
                     kind: QueuedItemKind::Compaction | QueuedItemKind::ToolUpdate(_),
@@ -1544,6 +1546,10 @@ fn promote_queued_user_message(state: &mut AgentState, content: &[ContentPart]) 
     true
 }
 
+fn queued_user_content_matches(queued: &[ContentPart], echoed: &[ContentPart]) -> bool {
+    rho_core::text_content(queued) == rho_core::text_content(echoed)
+}
+
 fn is_compact_command(content: &[ContentPart]) -> bool {
     match content {
         [ContentPart::Text { text }] => text.trim() == "/compact",
@@ -1564,6 +1570,23 @@ mod tests {
         );
         assert_eq!(claude_weekly_quota_model(Some("five_hour")), None);
         assert_eq!(claude_weekly_quota_model(Some("seven_day_opus")), None);
+    }
+
+    #[test]
+    fn raw_image_queue_matches_claude_textual_echo() {
+        let queued = vec![
+            ContentPart::Text {
+                text: "inspect".to_owned(),
+            },
+            ContentPart::Image {
+                media_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+            },
+        ];
+        let echoed = vec![ContentPart::Text {
+            text: "inspect\n[image: PNG]".to_owned(),
+        }];
+        assert!(queued_user_content_matches(&queued, &echoed));
     }
 
     fn text(text: &str) -> Arc<Vec<ContentPart>> {

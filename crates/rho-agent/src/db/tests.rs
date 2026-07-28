@@ -395,6 +395,7 @@ fn event_text(event: &AgentEvent<'_>) -> String {
             ..
         }) => match &content[0] {
             ContentPart::Text { text } => text.clone(),
+            ContentPart::Image { .. } => panic!("expected text content"),
         },
         _ => unreachable!(),
     }

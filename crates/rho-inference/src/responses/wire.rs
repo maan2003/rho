@@ -552,12 +552,26 @@ fn convert_tool_call_with_optional_item_id(
 }
 
 fn convert_user_message(content: &[ContentPart], out: &mut Vec<Value>) {
+    use base64::Engine as _;
+    let content = content
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => json!({
+                "type": "input_text",
+                "text": text,
+            }),
+            ContentPart::Image { media_type, data } => json!({
+                "type": "input_image",
+                "image_url": format!(
+                    "data:{media_type};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(data)
+                ),
+            }),
+        })
+        .collect::<Vec<_>>();
     out.push(json!({
         "role": "user",
-        "content": [{
-            "type": "input_text",
-            "text": text_content(content),
-        }],
+        "content": content,
     }));
 }
 

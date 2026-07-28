@@ -2585,6 +2585,9 @@ async fn handle_message(
             start,
             content,
         } => {
+            if let Some(content) = content.as_deref() {
+                validate_image_content(content)?;
+            }
             // Without a workstream to join, the agent founds its own,
             // provisionally named after its first message until the
             // generated title lands.
@@ -2608,7 +2611,7 @@ async fn handle_message(
             if let Some(content) = content {
                 let text = text_content(&content);
                 // The agent is fresh, so the lanes are equivalent here.
-                agent.send_user_message(text.clone(), MessageDelivery::NextRequest);
+                agent.send_user_content(content, MessageDelivery::NextRequest);
                 agents.maybe_generate_title(agent_id, text, founded).await;
             }
             Ok(Refresh::Ready)
@@ -2708,12 +2711,13 @@ async fn handle_message(
             content,
             delivery,
         } => {
+            validate_image_content(&content)?;
             let agent = agents
                 .get(agent_id)
                 .await
                 .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
             let text = text_content(&content);
-            agent.send_user_message(text.clone(), delivery);
+            agent.send_user_content(content, delivery);
             {
                 let mut write = agents.db.write().await;
                 write.record_agent_user_message(rho_core::UnixMs::now(), agent_id, &text);
@@ -3562,6 +3566,44 @@ fn provisional_workstream_name(content: Option<&[ContentPart]>) -> String {
     }
 }
 
+const MAX_INPUT_IMAGES: usize = 20;
+const MAX_IMAGE_BASE64_BYTES: usize = 10 * 1024 * 1024;
+
+/// Validate image inputs before they enter an agent queue or persistent log.
+/// The aggregate bound leaves room for content tags and framing inside the
+/// protocol's 64 MiB payload cap.
+fn validate_image_content(content: &[ContentPart]) -> anyhow::Result<()> {
+    let mut count = 0usize;
+    let mut encoded_total = 0usize;
+    for part in content {
+        let ContentPart::Image { media_type, data } = part else {
+            continue;
+        };
+        count += 1;
+        if count > MAX_INPUT_IMAGES {
+            anyhow::bail!("too many image attachments (maximum {MAX_INPUT_IMAGES})");
+        }
+        if !matches!(
+            media_type.as_str(),
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+        ) {
+            anyhow::bail!("unsupported image format: {media_type}");
+        }
+        if data.is_empty() {
+            anyhow::bail!("image attachment is empty");
+        }
+        let encoded = data.len().div_ceil(3).saturating_mul(4);
+        if encoded > MAX_IMAGE_BASE64_BYTES {
+            anyhow::bail!("image attachment exceeds the 10 MiB encoded limit");
+        }
+        encoded_total = encoded_total.saturating_add(encoded);
+    }
+    if encoded_total > rho_ui_proto::MAX_FRAME_LEN.saturating_sub(1024 * 1024) {
+        anyhow::bail!("image attachments exceed the protocol aggregate size limit");
+    }
+    Ok(())
+}
+
 fn validate_label(label: &str) -> anyhow::Result<()> {
     if label.trim().is_empty() {
         anyhow::bail!("label cannot be empty");
@@ -3613,9 +3655,9 @@ mod tests {
     use rho_ui_proto::ServerMessage;
 
     use super::{
-        GitProviderClaim, GitTransportBroker, configure_octo_git_transport,
-        inference_response_count, latest_final_response, load_or_create_iroh_secret, quota_burn,
-        quota_history,
+        GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
+        configure_octo_git_transport, inference_response_count, latest_final_response,
+        load_or_create_iroh_secret, quota_burn, quota_history, validate_image_content,
     };
 
     #[test]
@@ -3945,6 +3987,36 @@ mod tests {
         assert_eq!(
             latest_final_response(&state),
             Some((2, "second".to_owned()))
+        );
+    }
+
+    #[test]
+    fn image_input_validation_enforces_format_count_and_encoded_size() {
+        let image = |media_type: &str, len: usize| ContentPart::Image {
+            media_type: media_type.to_owned(),
+            data: vec![0; len],
+        };
+        assert!(validate_image_content(&[image("image/png", 3)]).is_ok());
+        assert!(
+            validate_image_content(&[image("image/bmp", 3)])
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+        assert!(
+            validate_image_content(
+                &(0..=MAX_INPUT_IMAGES)
+                    .map(|_| image("image/png", 1))
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
+        let raw_over_limit = (MAX_IMAGE_BASE64_BYTES / 4) * 3 + 1;
+        assert!(
+            validate_image_content(&[image("image/jpeg", raw_over_limit)])
+                .unwrap_err()
+                .to_string()
+                .contains("10 MiB")
         );
     }
 }

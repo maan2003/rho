@@ -13498,8 +13498,10 @@ name = "rho-claude"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "camino",
+ "rho-core",
  "rho-workspaces",
  "senax-encoder",
  "serde",

@@ -1,6 +1,6 @@
 use super::*;
 use crate::inference::Inference;
-use crate::responses::session::{debug_file_name, provider_debug_dir};
+use crate::responses::session::{debug_file_name, provider_debug_dir, redact_image_data};
 
 #[test]
 fn chatgpt_codex_config_sets_endpoint_defaults() {
@@ -54,4 +54,18 @@ fn provider_debug_dir_is_rho_namespaced() {
     };
 
     assert!(dir.ends_with("rho/debug/provider-requests"));
+}
+
+#[test]
+fn provider_debug_request_redacts_image_data() {
+    let mut value = serde_json::json!({"input": [{"content": [{
+        "type": "input_image",
+        "image_url": "data:image/png;base64,SECRET"
+    }]}]});
+    redact_image_data(&mut value);
+    assert_eq!(
+        value["input"][0]["content"][0]["image_url"],
+        "[image data redacted]"
+    );
+    assert!(!value.to_string().contains("SECRET"));
 }

@@ -828,6 +828,8 @@ impl SessionTask {
     }
 
     fn maybe_debug_write_provider_request(&self, sequence: u64, body: &ResponsesRequest) {
+        let mut redacted_body = serde_json::to_value(body).unwrap_or(serde_json::Value::Null);
+        redact_image_data(&mut redacted_body);
         let metadata = serde_json::json!({
             "prompt_cache_key": self.config.prompt_cache_key.debug_file_stem(),
             "sequence": sequence,
@@ -835,7 +837,7 @@ impl SessionTask {
             "backend": "responses",
             "transport": "websocket",
             "model": &body.model,
-            "body": body,
+            "body": redacted_body,
         });
         if let Err(error) = self.debug_write_json(sequence, "request", &metadata) {
             tracing::warn!(
@@ -964,6 +966,21 @@ enum ErrorAction {
 const MAX_TRANSIENT_RETRIES: u32 = 5;
 const TRANSIENT_INITIAL_DELAY_MS: u64 = 200;
 const TRANSIENT_BACKOFF_FACTOR: f64 = 2.0;
+
+pub(crate) fn redact_image_data(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => values.iter_mut().for_each(redact_image_data),
+        serde_json::Value::Object(object) => {
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("input_image")
+                && let Some(image_url) = object.get_mut("image_url")
+            {
+                *image_url = serde_json::Value::String("[image data redacted]".to_owned());
+            }
+            object.values_mut().for_each(redact_image_data);
+        }
+        _ => {}
+    }
+}
 
 pub(crate) fn transient_backoff(attempt: u32) -> Duration {
     let exp = TRANSIENT_BACKOFF_FACTOR.powi(attempt.saturating_sub(1) as i32);

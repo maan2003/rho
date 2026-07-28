@@ -50,6 +50,7 @@ actions!(
     rho_gui,
     [
         SubmitPrompt,
+        PastePrompt,
         AgentPrevious,
         AgentNext,
         AgentNew,
@@ -447,6 +448,14 @@ fn bind_rho_key_overrides(cx: &mut App) {
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoDiffView")),
+        // Preserve Vim's normal-mode Ctrl-V (visual block). Clipboard paste
+        // is intercepted only while editing a prompt.
+        KeyBinding::new(
+            "ctrl-v",
+            PastePrompt,
+            Some("RhoGui > Editor && vim_mode == insert"),
+        ),
+        KeyBinding::new("ctrl-shift-v", PastePrompt, Some("RhoGui > Editor")),
         // A Comint-style shell submits complete input lines to the daemon;
         // its transcript remains an ordinary Vim-navigable editor buffer.
         KeyBinding::new(

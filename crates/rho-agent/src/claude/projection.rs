@@ -200,6 +200,23 @@ fn project_user_message(message: &rho_claude::SessionMessage) -> anyhow::Result<
     for content in message_content(&message.message) {
         match content.get("type").and_then(Value::as_str) {
             Some("text") => push_text(&mut text, content),
+            Some("image") => {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                let media_type = content
+                    .get("source")
+                    .and_then(|source| source.get("media_type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("image");
+                text.push_str(match media_type {
+                    "image/png" => "[image: PNG]",
+                    "image/jpeg" => "[image: JPEG]",
+                    "image/webp" => "[image: WebP]",
+                    "image/gif" => "[image: GIF]",
+                    _ => "[image]",
+                });
+            }
             Some("tool_result") => {
                 if let Some(result) = project_tool_result(content)? {
                     results.push(result);
@@ -368,6 +385,23 @@ mod tests {
             panic!("expected user message");
         };
         assert_eq!(text_content(content), "hello");
+    }
+
+    #[test]
+    fn projects_user_images_as_bounded_markers() {
+        let blocks = transcript_messages_to_context(&[session_message(
+            rho_claude::SessionMessageKind::User,
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "inspect"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "RAW_BASE64_MUST_NOT_PROJECT"}}
+            ]}),
+        )])
+        .unwrap();
+        let ContextBlock::UserMessage { content, .. } = blocks[0].as_ref() else {
+            panic!("expected user message");
+        };
+        assert_eq!(text_content(content), "inspect\n[image: PNG]");
+        assert!(!text_content(content).contains("RAW_BASE64"));
     }
 
     #[test]

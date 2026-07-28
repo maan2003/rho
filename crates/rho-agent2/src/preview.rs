@@ -47,6 +47,7 @@ pub(crate) fn text_of(content: &[ContentPart]) -> String {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => text.as_str(),
+            ContentPart::Image { .. } => "[image]",
         })
         .collect::<Vec<_>>()
         .join("\n")

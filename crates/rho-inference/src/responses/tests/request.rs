@@ -21,14 +21,26 @@ fn title_session_uses_luna_fast_profile() {
     let (_temp, auth) = test_oauth_file("token", None);
     let session = InferenceSession::new_title(Inference::new(auth), PromptCacheKey::generate());
 
-    assert_eq!(session.config.responses_config.model, ResponsesModel::Gpt56Luna);
+    assert_eq!(
+        session.config.responses_config.model,
+        ResponsesModel::Gpt56Luna
+    );
     assert_eq!(
         session.config.responses_config.reasoning_context,
         ReasoningContext::AllTurns
     );
-    assert_eq!(session.config.responses_config.effort, ResponsesEffort::Medium);
-    assert_eq!(session.config.responses_config.text_verbosity, TextVerbosity::Low);
-    assert_eq!(session.config.responses_config.service_tier, ServiceTier::Priority);
+    assert_eq!(
+        session.config.responses_config.effort,
+        ResponsesEffort::Medium
+    );
+    assert_eq!(
+        session.config.responses_config.text_verbosity,
+        TextVerbosity::Low
+    );
+    assert_eq!(
+        session.config.responses_config.service_tier,
+        ServiceTier::Priority
+    );
 }
 
 #[test]
@@ -112,6 +124,41 @@ fn omits_tool_choice_without_declared_tools() {
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("tool_choice").is_none());
+}
+
+#[test]
+fn renders_text_and_image_user_content() {
+    let request = inference_request(
+        vec![Arc::new(ContextBlock::UserMessage {
+            sender: rho_core::MessageSender::User,
+            content: vec![
+                ContentPart::Text {
+                    text: "inspect".to_owned(),
+                },
+                ContentPart::Image {
+                    media_type: "image/png".to_owned(),
+                    data: vec![1, 2, 3],
+                },
+            ],
+        })],
+        Vec::new(),
+    );
+    let body = ResponsesRequest::from_inference_request(
+        &test_inference_service("gpt-test").config,
+        request,
+        None,
+    );
+    let json = serde_json::to_value(body).unwrap();
+    assert_eq!(
+        json["input"][0]["content"][0],
+        json!({"type":"input_text", "text":"inspect"})
+    );
+    assert_eq!(
+        json["input"][0]["content"][1],
+        json!({
+            "type":"input_image", "image_url":"data:image/png;base64,AQID"
+        })
+    );
 }
 
 #[test]

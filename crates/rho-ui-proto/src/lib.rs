@@ -1256,6 +1256,27 @@ mod tests {
     }
 
     #[test]
+    fn image_user_message_round_trips() {
+        let message = ClientMessage::SendUserMessage {
+            agent_id: AgentId::from_counter(1, &AgentIdDomain(7)).unwrap(),
+            content: vec![
+                ContentPart::Text {
+                    text: "inspect".to_owned(),
+                },
+                ContentPart::Image {
+                    media_type: "image/gif".to_owned(),
+                    data: vec![1, 2, 3],
+                },
+            ],
+            delivery: MessageDelivery::NextRequest,
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
     fn shell_messages_round_trip() {
         let client = ClientMessage::ShellStart {
             request_id: 7,

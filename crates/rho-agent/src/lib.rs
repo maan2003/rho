@@ -776,18 +776,35 @@ impl Agent {
         self.send_user_message_with_source(text, delivery, None);
     }
 
+    pub fn send_user_content(&self, content: Vec<ContentPart>, delivery: MessageDelivery) {
+        self.send_user_content_with_source(content, delivery, None);
+    }
+
+    pub fn send_user_content_with_source(
+        &self,
+        content: Vec<ContentPart>,
+        delivery: MessageDelivery,
+        source_id: Option<InputSourceId>,
+    ) {
+        let _ = self.control.send(AgentControl::UserMessage {
+            sender: MessageSender::User,
+            content,
+            delivery,
+            source_id,
+        });
+    }
+
     pub fn send_user_message_with_source(
         &self,
         text: impl Into<String>,
         delivery: MessageDelivery,
         source_id: Option<InputSourceId>,
     ) {
-        let _ = self.control.send(AgentControl::UserMessage {
-            sender: MessageSender::User,
-            content: vec![ContentPart::Text { text: text.into() }],
+        self.send_user_content_with_source(
+            vec![ContentPart::Text { text: text.into() }],
             delivery,
             source_id,
-        });
+        );
     }
 
     /// Deliver mail from another agent. Enters context as a
@@ -2214,8 +2231,9 @@ pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
                 InferenceResponseItem::AssistantMessage { content, phase, .. }
                     if !want_final || *phase == Some(rho_core::MessagePhase::FinalAnswer) =>
                 {
-                    Some(content.iter().map(|part| match part {
-                        ContentPart::Text { text } => text.as_str(),
+                    Some(content.iter().filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        ContentPart::Image { .. } => None,
                     }))
                 }
                 _ => None,
@@ -2439,6 +2457,34 @@ mod tests {
     }
 
     #[test]
+    fn image_queue_survives_restore_and_delivery() {
+        let content = vec![ContentPart::Image {
+            media_type: "image/webp".to_owned(),
+            data: vec![1, 2, 3, 4],
+        }];
+        let restored = restore_events(vec![
+            AgentEvent::Queued(QueuedItem {
+                kind: QueuedItemKind::UserMessage {
+                    sender: MessageSender::User,
+                    content: Arc::new(content.clone()),
+                    source_id: None,
+                },
+                delivery: MessageDelivery::NextRequest,
+            }),
+            AgentEvent::Dequeued {
+                boundary: MessageDelivery::NextRequest,
+            },
+        ]);
+        assert_eq!(
+            restored.blocks[0].as_ref(),
+            &ContextBlock::UserMessage {
+                sender: MessageSender::User,
+                content,
+            }
+        );
+    }
+
+    #[test]
     fn drain_preserves_arrival_order_across_deliveries() {
         let item = |text: &str, delivery| QueuedItem {
             kind: QueuedItemKind::UserMessage {
@@ -2450,7 +2496,9 @@ mod tests {
         };
         let text = |item: &QueuedItem| match &item.kind {
             QueuedItemKind::UserMessage { content, .. } => {
-                let ContentPart::Text { text } = &content[0];
+                let ContentPart::Text { text } = &content[0] else {
+                    panic!("expected text content")
+                };
                 text.clone()
             }
             QueuedItemKind::Compaction | QueuedItemKind::ToolUpdate(_) => unreachable!(),

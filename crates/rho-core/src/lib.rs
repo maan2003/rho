@@ -237,7 +237,16 @@ pub enum InferenceResponseItem {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack)]
 pub enum ContentPart {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    /// An encoded image supplied by the user. The bytes are kept in the
+    /// shared vocabulary so queued inputs and persisted transcripts retain
+    /// the original attachment without provider-specific wrappers.
+    Image {
+        media_type: String,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
@@ -622,13 +631,25 @@ pub struct TokenUsage {
 
 /// Concatenate the text parts of a message.
 pub fn text_content(parts: &[ContentPart]) -> String {
-    parts
-        .iter()
-        .map(|part| match part {
-            ContentPart::Text { text } => text.as_str(),
-        })
-        .collect::<Vec<_>>()
-        .join("")
+    let mut output = String::new();
+    for part in parts {
+        match part {
+            ContentPart::Text { text } => output.push_str(text),
+            ContentPart::Image { media_type, .. } => {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(match media_type.as_str() {
+                    "image/png" => "[image: PNG]",
+                    "image/jpeg" => "[image: JPEG]",
+                    "image/webp" => "[image: WebP]",
+                    "image/gif" => "[image: GIF]",
+                    _ => "[image]",
+                });
+            }
+        }
+    }
+    output
 }
 
 #[cfg(test)]

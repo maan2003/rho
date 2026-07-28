@@ -15,6 +15,8 @@
 
 use std::ops::Range;
 
+use collections::HashSet;
+use editor::display_map::CustomBlockId;
 use editor::scroll::AutoscrollStrategy;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
@@ -22,6 +24,7 @@ use gpui::{Context, Entity, Subscription, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use project::InlayId;
+use rho_core::ContentPart;
 
 use crate::commands::WorkspaceCompletionProvider;
 use crate::highlights::apply_class_highlights;
@@ -77,6 +80,8 @@ pub struct DraftModel {
     start_target_hints: Vec<(String, String)>,
     body_buffer: Entity<Buffer>,
     body_end: text::Anchor,
+    attachments: Vec<ContentPart>,
+    attachment_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
     suppress_draft_activation: bool,
     /// Editors currently displaying the draft, weakly held: panes own
     /// their editors; the model reconciles whoever is still alive.
@@ -153,6 +158,8 @@ impl DraftModel {
             start_target_hints: Vec::new(),
             body_buffer,
             body_end,
+            attachments: Vec::new(),
+            attachment_blocks: Vec::new(),
             suppress_draft_activation: false,
             editors: Vec::new(),
             _subscriptions: subscriptions,
@@ -208,6 +215,7 @@ impl DraftModel {
         self.insert_body_gap_to(&editor, cx);
         self.pin_autoscroll_to(&editor, cx);
         self.apply_body_chrome_to(&editor, cx);
+        self.refresh_attachment_blocks(cx);
         self.apply_system_styles_to(&editor, cx);
         self.focus_body(&editor, window, cx);
         editor
@@ -321,6 +329,34 @@ impl DraftModel {
     pub fn body_text(&self, cx: &gpui::App) -> String {
         let buffer = self.body_buffer.read(cx);
         buffer.text_for_range(0..buffer.len()).collect()
+    }
+
+    pub fn content(&self, cx: &gpui::App) -> Option<Vec<ContentPart>> {
+        let text = self.body_text(cx).trim().to_owned();
+        if text.is_empty() && self.attachments.is_empty() {
+            return None;
+        }
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(ContentPart::Text { text });
+        }
+        content.extend(self.attachments.iter().cloned());
+        Some(content)
+    }
+
+    pub fn add_image(&mut self, media_type: String, data: Vec<u8>, cx: &mut Context<Self>) {
+        self.attachments
+            .push(ContentPart::Image { media_type, data });
+        self.update_body_chrome(cx);
+        self.refresh_attachment_blocks(cx);
+    }
+
+    pub fn clear_attachments(&mut self, cx: &mut Context<Self>) -> bool {
+        let had = !self.attachments.is_empty();
+        self.attachments.clear();
+        self.update_body_chrome(cx);
+        self.refresh_attachment_blocks(cx);
+        had
     }
 
     pub fn set_body_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -571,6 +607,39 @@ impl DraftModel {
             self.apply_body_chrome_to(&editor, cx);
         }
         cx.notify();
+    }
+
+    fn refresh_attachment_blocks(&mut self, cx: &mut Context<Self>) {
+        for (editor, block_id) in self.attachment_blocks.drain(..) {
+            if let Some(editor) = editor.upgrade() {
+                editor.update(cx, |editor, cx| {
+                    editor.remove_blocks(
+                        std::iter::once(block_id).collect::<HashSet<_>>(),
+                        None,
+                        cx,
+                    );
+                });
+            }
+        }
+        if self.attachments.is_empty() {
+            return;
+        }
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(self.body_end)
+        else {
+            return;
+        };
+        let block = style::attachment_block(anchor, &self.attachments);
+        for editor in self.live_editors() {
+            let block = block.clone();
+            let ids = editor.update(cx, |editor, cx| editor.insert_blocks([block], None, cx));
+            if let Some(block_id) = ids.into_iter().next() {
+                self.attachment_blocks.push((editor.downgrade(), block_id));
+            }
+        }
     }
 
     fn apply_body_chrome_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {

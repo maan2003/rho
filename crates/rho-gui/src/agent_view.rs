@@ -12,6 +12,8 @@
 
 use std::ops::Range;
 
+use collections::HashSet;
+use editor::display_map::CustomBlockId;
 use editor::scroll::AutoscrollStrategy;
 use editor::{
     Editor, EditorMode, EditorRightPrompt, HighlightKey, Inlay, SelectionEffects, SizingBehavior,
@@ -21,6 +23,7 @@ use gpui::{Context, Entity, Subscription, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
+use rho_core::ContentPart;
 use rho_ui_proto::remote::UiAgentState;
 
 use crate::commands::WorkspaceCompletionProvider;
@@ -51,6 +54,8 @@ pub struct AgentModel {
     /// for the dashboard preview and kept for the model's lifetime.
     preview_editor: Option<Entity<Editor>>,
     prompt_end: text::Anchor,
+    attachments: Vec<ContentPart>,
+    attachment_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
     status_spans: Vec<(String, gpui::HighlightStyle)>,
     workspace: WeakEntity<Workspace>,
     /// Full-multibuffer editors currently displaying this agent, weakly
@@ -121,6 +126,8 @@ impl AgentModel {
             document_multi_buffer,
             preview_editor: None,
             prompt_end,
+            attachments: Vec::new(),
+            attachment_blocks: Vec::new(),
             status_spans: Vec::new(),
             workspace,
             editors: Vec::new(),
@@ -219,6 +226,7 @@ impl AgentModel {
         self.apply_status_to(&editor, cx);
         self.apply_system_styles_to(&editor, cx);
         self.apply_prompt_chrome_to(&editor, cx);
+        self.refresh_attachment_blocks(cx);
         editor
     }
 
@@ -281,21 +289,43 @@ impl AgentModel {
     }
 
     /// Takes the trimmed prompt draft, clearing it. Returns `None` when empty.
-    pub fn take_prompt(&mut self, cx: &mut Context<Self>) -> Option<String> {
+    pub fn take_prompt(&mut self, cx: &mut Context<Self>) -> Option<Vec<ContentPart>> {
         let buffer = self.prompt_buffer.read(cx);
         let text = buffer
             .text_for_range(0..buffer.len())
             .collect::<String>()
             .trim()
             .to_owned();
-        if text.is_empty() {
+        if text.is_empty() && self.attachments.is_empty() {
             return None;
         }
         self.prompt_buffer.update(cx, |buffer, cx| {
             let len = buffer.len();
             buffer.edit([(0..len, "")], None, cx);
         });
-        Some(text)
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(ContentPart::Text { text });
+        }
+        content.append(&mut self.attachments);
+        self.update_prompt_chrome(cx);
+        self.refresh_attachment_blocks(cx);
+        Some(content)
+    }
+
+    pub fn add_image(&mut self, media_type: String, data: Vec<u8>, cx: &mut Context<Self>) {
+        self.attachments
+            .push(ContentPart::Image { media_type, data });
+        self.update_prompt_chrome(cx);
+        self.refresh_attachment_blocks(cx);
+    }
+
+    pub fn clear_attachments(&mut self, cx: &mut Context<Self>) -> bool {
+        let had = !self.attachments.is_empty();
+        self.attachments.clear();
+        self.update_prompt_chrome(cx);
+        self.refresh_attachment_blocks(cx);
+        had
     }
 
     /// Appends a local system notice that survives transcript re-renders.
@@ -459,6 +489,39 @@ impl AgentModel {
             self.apply_prompt_chrome_to(&editor, cx);
         }
         cx.notify();
+    }
+
+    fn refresh_attachment_blocks(&mut self, cx: &mut Context<Self>) {
+        for (editor, block_id) in self.attachment_blocks.drain(..) {
+            if let Some(editor) = editor.upgrade() {
+                editor.update(cx, |editor, cx| {
+                    editor.remove_blocks(
+                        std::iter::once(block_id).collect::<HashSet<_>>(),
+                        None,
+                        cx,
+                    );
+                });
+            }
+        }
+        if self.attachments.is_empty() {
+            return;
+        }
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(self.prompt_end)
+        else {
+            return;
+        };
+        let block = style::attachment_block(anchor, &self.attachments);
+        for editor in self.live_editors() {
+            let block = block.clone();
+            let ids = editor.update(cx, |editor, cx| editor.insert_blocks([block], None, cx));
+            if let Some(block_id) = ids.into_iter().next() {
+                self.attachment_blocks.push((editor.downgrade(), block_id));
+            }
+        }
     }
 
     fn apply_prompt_chrome_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {

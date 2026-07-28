@@ -70,6 +70,10 @@ impl InputMessage {
     pub(crate) fn user_with_uuid(text: impl Into<String>, uuid: String) -> Self {
         Self::User(UserInput::text(text, Some(uuid)))
     }
+
+    pub(crate) fn user_content_with_uuid(content: Vec<InputContent>, uuid: String) -> Self {
+        Self::User(UserInput::content(content, Some(uuid)))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -82,9 +86,16 @@ pub(crate) struct UserInput {
 
 impl UserInput {
     fn text(text: impl Into<String>, uuid: Option<String>) -> Self {
+        Self::content(vec![InputContent::Text { text: text.into() }], uuid)
+    }
+
+    fn content(content: Vec<InputContent>, uuid: Option<String>) -> Self {
         Self {
             session_id: String::new(),
-            message: ConversationMessage::user_text(text),
+            message: ConversationMessage {
+                role: Role::User,
+                content,
+            },
             parent_tool_use_id: None,
             uuid,
         }
@@ -97,15 +108,6 @@ struct ConversationMessage {
     content: Vec<InputContent>,
 }
 
-impl ConversationMessage {
-    fn user_text(text: impl Into<String>) -> Self {
-        Self {
-            role: Role::User,
-            content: vec![InputContent::Text { text: text.into() }],
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -115,8 +117,29 @@ pub enum Role {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum InputContent {
+pub(crate) enum InputContent {
     Text { text: String },
+    Image { source: ImageSource },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ImageSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: String,
+    data: String,
+}
+
+impl InputContent {
+    pub(crate) fn image(media_type: String, data: String) -> Self {
+        Self::Image {
+            source: ImageSource {
+                kind: "base64",
+                media_type,
+                data,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]

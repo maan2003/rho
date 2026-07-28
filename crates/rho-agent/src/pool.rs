@@ -726,6 +726,17 @@ impl RunningAgent {
         self.send_user_message_with_source(text, delivery, None);
     }
 
+    pub fn send_user_content(
+        &self,
+        content: Vec<rho_core::ContentPart>,
+        delivery: MessageDelivery,
+    ) {
+        match self {
+            Self::Rho(agent) => agent.send_user_content(content, delivery),
+            Self::Claude(agent) => agent.send_user_content(content),
+        }
+    }
+
     pub fn send_user_message_with_source(
         &self,
         text: String,

@@ -6,8 +6,14 @@
 //! editor highlight keys: one for settled transcript history (updated once
 //! per turn) and one for the live turn (updated per streaming event).
 
+use std::sync::Arc;
+
 use editor::HighlightKey;
-use gpui::{App, FontWeight, HighlightStyle, Hsla};
+use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle};
+use gpui::prelude::*;
+use gpui::{App, FontWeight, HighlightStyle, Hsla, div};
+use multi_buffer::Anchor;
+use rho_core::ContentPart;
 use theme::ActiveTheme as _;
 
 /// How much larger a user message renders than everything around it.
@@ -189,4 +195,57 @@ pub fn role_chip_style(family: RoleFamily, cx: &App) -> HighlightStyle {
         color: Some(color.into()),
         ..HighlightStyle::default()
     }
+}
+
+/// One editor row of compact media chips below a writable prompt.
+pub fn attachment_block(anchor: Anchor, attachments: &[ContentPart]) -> BlockProperties<Anchor> {
+    let labels = attachments
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Image { media_type, data } => Some(format!(
+                "{} · {} KB",
+                media_type
+                    .strip_prefix("image/")
+                    .unwrap_or(media_type)
+                    .to_ascii_uppercase(),
+                data.len().div_ceil(1024)
+            )),
+            ContentPart::Text { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    BlockProperties {
+        placement: BlockPlacement::Below(anchor),
+        height: Some(1),
+        style: BlockStyle::Fixed,
+        render: Arc::new(move |cx| render_attachment_block(&labels, cx).into_any_element()),
+        priority: 0,
+    }
+}
+
+fn render_attachment_block(labels: &[String], cx: &mut BlockContext<'_, '_>) -> impl IntoElement {
+    let text_style = cx.editor_style.text.clone();
+    let colors = cx.app.theme().colors();
+    let mut row = div()
+        .block_mouse_except_scroll()
+        .pl(cx.anchor_x)
+        .h(cx.line_height)
+        .flex()
+        .items_center()
+        .gap_1()
+        .font_family(text_style.font_family.clone())
+        .text_size(text_style.font_size)
+        .line_height(text_style.line_height);
+    for label in labels {
+        row = row.child(
+            div()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.element_background)
+                .text_color(colors.text_muted)
+                .child(format!("image · {label}")),
+        );
+    }
+    row
 }

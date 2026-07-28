@@ -13,7 +13,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use editor::display_map::{BlockContext, BlockStyle, DisplayRow, ToDisplayPoint as _};
+use editor::display_map::{
+    BlockContext, BlockStyle, CustomBlockId, DisplayRow, ToDisplayPoint as _,
+};
 use editor::hover_links::InlayHighlight;
 use editor::{
     DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, HighlightKey, Inlay,
@@ -24,6 +26,7 @@ use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
+use rho_core::ContentPart;
 use rho_ui_proto::{AgentId, UiAttention, WorkstreamId};
 use text::BufferId;
 use theme::ActiveTheme as _;
@@ -103,9 +106,13 @@ pub struct Dashboard {
     /// Keeps the workspace re-rendering on draft edits, so placeholder
     /// and gutter chrome track the text.
     reply_subscriptions: HashMap<AgentId, gpui::Subscription>,
+    reply_attachments: HashMap<AgentId, Vec<ContentPart>>,
     /// The inline new-agent draft, when open: its buffer plus the edit
     /// subscription that keeps chrome fresh.
     new_draft: Option<(Entity<Buffer>, gpui::Subscription, String)>,
+    new_draft_attachments: Vec<ContentPart>,
+    attachment_blocks: Vec<CustomBlockId>,
+    attachments_dirty: bool,
     /// Move the cursor into this key's buffer on the next sync — how a
     /// freshly opened reply draft receives the cursor.
     pending_cursor: Option<LineKey>,
@@ -155,7 +162,11 @@ impl Dashboard {
             targets: HashMap::new(),
             replies: Vec::new(),
             reply_subscriptions: HashMap::new(),
+            reply_attachments: HashMap::new(),
             new_draft: None,
+            new_draft_attachments: Vec::new(),
+            attachment_blocks: Vec::new(),
+            attachments_dirty: false,
             pending_cursor: None,
             lamp_ids: Vec::new(),
             placeholder_ids: Vec::new(),
@@ -256,13 +267,19 @@ impl Dashboard {
         cx.notify();
     }
 
-    /// Takes the new-agent draft's text and closes it. `None` when empty.
-    pub fn take_new_draft(&mut self, cx: &mut Context<Workspace>) -> Option<String> {
+    /// Takes the new-agent draft's content and closes it. `None` when empty.
+    pub fn take_new_draft(&mut self, cx: &mut Context<Workspace>) -> Option<Vec<ContentPart>> {
         let (buffer, _, _) = self.new_draft.take()?;
         let text = buffer.read(cx).text().trim().to_owned();
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(ContentPart::Text { text });
+        }
+        content.append(&mut self.new_draft_attachments);
         self.buffers.remove(&LineKey::NewDraft);
+        self.attachments_dirty = true;
         cx.notify();
-        (!text.is_empty()).then_some(text)
+        (!content.is_empty()).then_some(content)
     }
 
     /// Parks the cursor on an explicit agent row, or on its flattened
@@ -290,17 +307,70 @@ impl Dashboard {
         cx.notify();
     }
 
-    /// Takes a reply draft's text and closes it. `None` when the draft is
-    /// empty (nothing worth sending).
-    pub fn take_reply(&mut self, agent_id: AgentId, cx: &mut Context<Workspace>) -> Option<String> {
+    /// Takes a reply draft's content and closes it. `None` when empty.
+    pub fn take_reply(
+        &mut self,
+        agent_id: AgentId,
+        cx: &mut Context<Workspace>,
+    ) -> Option<Vec<ContentPart>> {
         let key = LineKey::Reply(agent_id);
         let buffer = self.buffers.get(&key)?;
         let text = buffer.read(cx).text().trim().to_owned();
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(ContentPart::Text { text });
+        }
+        content.append(&mut self.reply_attachments.remove(&agent_id).unwrap_or_default());
         self.replies.retain(|reply| *reply != agent_id);
         self.buffers.remove(&key);
         self.reply_subscriptions.remove(&agent_id);
+        self.attachments_dirty = true;
         cx.notify();
-        (!text.is_empty()).then_some(text)
+        (!content.is_empty()).then_some(content)
+    }
+
+    pub fn accepts_attachments(&self, cx: &mut Context<Workspace>) -> bool {
+        matches!(
+            self.cursor_target(cx),
+            Some(RowTarget::Reply(_) | RowTarget::NewDraft)
+        )
+    }
+
+    pub fn add_image(
+        &mut self,
+        media_type: String,
+        data: Vec<u8>,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let part = ContentPart::Image { media_type, data };
+        match self.cursor_target(cx) {
+            Some(RowTarget::Reply(agent_id)) => {
+                self.reply_attachments
+                    .entry(agent_id)
+                    .or_default()
+                    .push(part);
+            }
+            Some(RowTarget::NewDraft) => self.new_draft_attachments.push(part),
+            _ => return false,
+        }
+        self.attachments_dirty = true;
+        cx.notify();
+        true
+    }
+
+    pub fn clear_attachments(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let attachments = match self.cursor_target(cx) {
+            Some(RowTarget::Reply(agent_id)) => self.reply_attachments.entry(agent_id).or_default(),
+            Some(RowTarget::NewDraft) => &mut self.new_draft_attachments,
+            _ => return false,
+        };
+        let had = !attachments.is_empty();
+        attachments.clear();
+        if had {
+            self.attachments_dirty = true;
+            cx.notify();
+        }
+        had
     }
 
     /// Regenerates the listing from the registry: per-line buffers are
@@ -343,21 +413,30 @@ impl Dashboard {
                         .buffers
                         .get(&key)
                         .is_some_and(|buffer| buffer.read(cx).is_empty())
+                    && self
+                        .reply_attachments
+                        .get(agent_id)
+                        .is_none_or(Vec::is_empty)
             })
             .collect::<Vec<_>>();
         for agent_id in empty_replies {
             self.replies.retain(|reply| *reply != agent_id);
             self.buffers.remove(&LineKey::Reply(agent_id));
             self.reply_subscriptions.remove(&agent_id);
+            self.reply_attachments.remove(&agent_id);
+            self.attachments_dirty = true;
         }
         if self
             .new_draft
             .as_ref()
             .is_some_and(|(buffer, _, _)| buffer.read(cx).is_empty())
+            && self.new_draft_attachments.is_empty()
             && cursor_key != Some(LineKey::NewDraft)
             && pending != Some(LineKey::NewDraft)
         {
             self.new_draft = None;
+            self.new_draft_attachments.clear();
+            self.attachments_dirty = true;
             self.buffers.remove(&LineKey::NewDraft);
         }
 
@@ -490,6 +569,7 @@ impl Dashboard {
         self.apply_highlights(&lines, cx);
         self.apply_lamps(&lines, cx);
         self.apply_reply_chrome(registry, cx);
+        self.apply_attachment_blocks(cx);
     }
 
     fn apply_folds(&mut self, lines: &[Line]) {
@@ -733,6 +813,46 @@ impl Dashboard {
                 }
             }
         });
+    }
+
+    fn apply_attachment_blocks(&mut self, cx: &mut Context<Workspace>) {
+        if !self.attachments_dirty {
+            return;
+        }
+        self.attachments_dirty = false;
+        if !self.attachment_blocks.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks(
+                    std::mem::take(&mut self.attachment_blocks)
+                        .into_iter()
+                        .collect::<collections::HashSet<_>>(),
+                    None,
+                    cx,
+                );
+            });
+        }
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let drafts = self
+            .reply_attachments
+            .iter()
+            .map(|(agent_id, attachments)| (LineKey::Reply(*agent_id), attachments))
+            .chain(std::iter::once((
+                LineKey::NewDraft,
+                &self.new_draft_attachments,
+            )));
+        let blocks = drafts
+            .filter_map(|(key, attachments)| {
+                if attachments.is_empty() {
+                    return None;
+                }
+                let buffer = self.buffers.get(&key)?.read(cx);
+                let anchor = snapshot.anchor_in_excerpt(buffer.anchor_after(buffer.len()))?;
+                Some(crate::style::attachment_block(anchor, attachments))
+            })
+            .collect::<Vec<_>>();
+        self.attachment_blocks = self
+            .editor
+            .update(cx, |editor, cx| editor.insert_blocks(blocks, None, cx));
     }
 
     /// Reply-draft chrome: draft text in the user-message accent plus a
