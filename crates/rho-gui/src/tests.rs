@@ -393,6 +393,27 @@ fn display_text(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) ->
         .expect("read display text")
 }
 
+fn concealed_fold_ids(
+    workspace: &WindowHandle<Workspace>,
+    editor: &Entity<Editor>,
+    cx: &mut TestAppContext,
+) -> Vec<editor::display_map::FoldId> {
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                snapshot
+                    .folds_in_range(
+                        multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
+                    )
+                    .filter(|fold| fold.placeholder.is_concealed())
+                    .map(|fold| fold.id)
+                    .collect()
+            })
+        })
+        .expect("read concealment folds")
+}
+
 fn buffer_text(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
     let editor = active_editor(workspace, cx);
     workspace
@@ -1883,23 +1904,7 @@ fn prompt_typing_keeps_transcript_concealment_folds(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let editor = active_editor(&workspace, cx);
-    let fold_ids = |workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |_, window, cx| {
-                editor.update(cx, |editor, cx| {
-                    let snapshot = editor.snapshot(window, cx);
-                    snapshot
-                        .folds_in_range(
-                            multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
-                        )
-                        .filter(|fold| fold.placeholder.is_concealed())
-                        .map(|fold| fold.id)
-                        .collect::<Vec<_>>()
-                })
-            })
-            .expect("read concealment folds")
-    };
-    let before = fold_ids(&workspace, cx);
+    let before = concealed_fold_ids(&workspace, &editor, cx);
     assert!(!before.is_empty());
 
     workspace
@@ -1909,7 +1914,50 @@ fn prompt_typing_keeps_transcript_concealment_folds(cx: &mut TestAppContext) {
         .expect("type in prompt");
     cx.run_until_parked();
 
-    assert_eq!(fold_ids(&workspace, cx), before);
+    assert_eq!(concealed_fold_ids(&workspace, &editor, cx), before);
+}
+
+#[gpui::test]
+fn plain_assistant_streaming_keeps_existing_concealment_folds(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let original = "**bold** and `code`\n";
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant(original, Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+    cx.run_until_parked();
+
+    let editor = active_editor(&workspace, cx);
+    let before = concealed_fold_ids(&workspace, &editor, cx);
+    assert!(!before.is_empty());
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 1,
+                    block: UiBlockDiff::AssistantText(UiTextDiff {
+                        keep_bytes: original.len(),
+                        value: "more plain text\n".to_owned(),
+                    }),
+                }],
+            },
+            status: None,
+            context_used: None,
+        },
+    );
+    cx.run_until_parked();
+
+    assert_eq!(concealed_fold_ids(&workspace, &editor, cx), before);
 }
 
 /// The block map may not assume display elisions arrive sorted or apart:

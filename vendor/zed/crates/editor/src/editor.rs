@@ -637,6 +637,7 @@ struct SyntaxConcealment {
     scopes: Vec<Range<Anchor>>,
     buffer_ids: HashSet<BufferId>,
     covered: Vec<Range<MultiBufferOffset>>,
+    installed: Vec<Range<Anchor>>,
 }
 
 #[derive(Default)]
@@ -9574,6 +9575,7 @@ impl Editor {
                 scopes: Vec::new(),
                 buffer_ids: HashSet::default(),
                 covered: Vec::new(),
+                installed: Vec::new(),
             });
         let divergence = state
             .scopes
@@ -9588,11 +9590,6 @@ impl Editor {
         state.scopes = scopes;
         state.buffer_ids = buffer_ids;
         state.covered.clear();
-
-        let display_map = self.display_map.clone();
-        display_map.update(cx, |display_map, cx| {
-            display_map.replace_folds_with_type::<MultiBufferOffset>(type_id, Vec::new(), cx);
-        });
         cx.notify();
     }
 
@@ -9636,7 +9633,7 @@ impl Editor {
                     (!intersection.is_empty()).then_some((scope, intersection))
                 })
                 .collect::<Vec<_>>();
-            if intersections.is_empty() && state.covered.is_empty()
+            if intersections.is_empty() && state.covered.is_empty() && state.installed.is_empty()
                 || !intersections.is_empty()
                     && intersections.iter().all(|(_, intersection)| {
                         state.covered.iter().any(|covered| {
@@ -9657,7 +9654,20 @@ impl Editor {
                 .into_iter()
                 .map(|(_, intersection)| intersection)
                 .collect();
-            updates.push((*type_id, concealed));
+            let unchanged = concealed.len() == state.installed.len()
+                && concealed.iter().zip(&state.installed).all(|(new, old)| {
+                    new.start == old.start.to_offset(snapshot)
+                        && new.end == old.end.to_offset(snapshot)
+                });
+            if !unchanged {
+                state.installed = concealed
+                    .iter()
+                    .map(|range| {
+                        snapshot.anchor_after(range.start)..snapshot.anchor_before(range.end)
+                    })
+                    .collect();
+                updates.push((*type_id, concealed));
+            }
         }
 
         let display_map = self.display_map.clone();
