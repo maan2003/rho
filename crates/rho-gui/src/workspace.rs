@@ -1616,10 +1616,6 @@ impl Workspace {
         Some(agent_id)
     }
 
-    pub fn toggle_rail_tail(&mut self, cx: &mut Context<Self>) {
-        self.dashboard.toggle_rail_tail(cx);
-    }
-
     /// Jumps to the rail's most urgent agent (excluding the current one), so
     /// working through a backlog is one keystroke per agent.
     pub fn jump_to_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2568,6 +2564,29 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn dashboard_rail_tail_id(&self) -> Option<editor::DisplayElisionId> {
+        self.dashboard.rail_tail_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_open_reply(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        self.dashboard.open_reply(agent_id, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_rail_tail_ends_in_reply(&self, agent_id: AgentId) -> bool {
+        self.dashboard.rail_tail_ends_in_reply(agent_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_cursor_target(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::dashboard::RowTarget> {
+        self.dashboard.cursor_target(cx)
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_dashboard_mode(&self, window: &Window, cx: &App) -> bool {
         self.dashboard_mode(window, cx)
     }
@@ -3437,7 +3456,6 @@ impl Workspace {
                 ..
             })
             | Some(RowTarget::Agent(agent_id)) => self.open_agent(agent_id, window, cx),
-            Some(RowTarget::FoldToggle) => self.toggle_rail_tail(cx),
             // Enter sends the inline reply draft (and closes it); an empty
             // draft just closes. Disconnected, the draft stays parked
             // rather than being consumed into the void.

@@ -9,22 +9,25 @@
 //! the multibuffer, so refreshes can rearrange excerpts without eating typed
 //! drafts or leaving the cursor attached to a stale line number.
 
-use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use editor::display_map::{Crease, FoldPlaceholder};
+use editor::display_map::{BlockContext, BlockStyle, DisplayRow, ToDisplayPoint as _};
 use editor::hover_links::InlayHighlight;
-use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
+use editor::{
+    DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, HighlightKey, Inlay,
+    SizingBehavior,
+};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
 use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBuffer, MultiBufferOffset, PathKey};
+use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
 use rho_ui_proto::{AgentId, UiAttention, WorkstreamId};
 use text::BufferId;
 use theme::ActiveTheme as _;
+use ui::div;
 
 use crate::registry::{AgentRegistry, Workstream};
 use crate::workspace::Workspace;
@@ -41,20 +44,18 @@ const PLACEHOLDER_ID_BASE: usize = 1_000_000;
 const DRAFT_TEXT_KEY: HighlightKey =
     HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + 2 * DashClass::ALL.len());
 
-/// Fold type tag for the quiet tail. It is a display concern: its buffers
-/// stay in the multibuffer so cursor motion never has to rearrange excerpts.
-struct RailTailFold;
-
 /// Identity of one dashboard line; each key owns one buffer in the
 /// multibuffer. Cursor position and reply drafts survive re-sorts by
 /// following their key, not their line number.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LineKey {
     Iris,
-    Group(String),
+    Group {
+        name: String,
+        tail: bool,
+    },
     Stream(WorkstreamId),
     Agent(AgentId),
-    FoldToggle,
     Reply(AgentId),
     /// The inline new-agent draft, at the top of the listing.
     NewDraft,
@@ -81,7 +82,6 @@ pub enum RowTarget {
         root: Option<AgentId>,
     },
     Agent(AgentId),
-    FoldToggle,
     /// An inline reply draft addressed to this agent.
     Reply(AgentId),
     /// The inline new-agent draft.
@@ -117,10 +117,9 @@ pub struct Dashboard {
     folds: HashMap<AgentId, FoldSpec>,
     /// Expansion state keyed by stable parent identity.
     expanded_folds: Arc<Mutex<HashSet<AgentId>>>,
-    /// The quiet rail tail is always present in `order`; this only controls
-    /// whether its display-map crease conceals it.
-    rail_tail_expanded: bool,
-    rail_tail: Option<(LineKey, LineKey)>,
+    /// One editor-native elision owns the contiguous quiet tail. Updating the
+    /// same id preserves the editor's open/closed state across refreshes.
+    rail_tail: Option<(DisplayElisionId, (LineKey, LineKey))>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the per-line excerpts seamless.
@@ -162,7 +161,6 @@ impl Dashboard {
             placeholder_ids: Vec::new(),
             folds: HashMap::new(),
             expanded_folds: Arc::new(Mutex::new(HashSet::new())),
-            rail_tail_expanded: false,
             rail_tail: None,
             headers_disabled: std::collections::HashSet::new(),
         }
@@ -195,6 +193,18 @@ impl Dashboard {
     #[cfg(test)]
     pub(crate) fn fold_count(&self) -> usize {
         self.folds.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rail_tail_id(&self) -> Option<DisplayElisionId> {
+        self.rail_tail.as_ref().map(|(id, _)| *id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rail_tail_ends_in_reply(&self, agent_id: AgentId) -> bool {
+        self.rail_tail
+            .as_ref()
+            .is_some_and(|(_, (_, last))| *last == LineKey::Reply(agent_id))
     }
 
     pub fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
@@ -307,10 +317,7 @@ impl Dashboard {
             .expanded_folds
             .lock()
             .map_or_else(|_| HashSet::new(), |expanded| expanded.clone());
-        let mut lines = visible_lines(
-            generate_dashboard(registry, self.rail_tail_expanded),
-            &expanded,
-        );
+        let mut lines = visible_lines(generate_dashboard(registry), &expanded);
         for line in &mut lines {
             if line
                 .fold
@@ -361,9 +368,16 @@ impl Dashboard {
         if self.new_draft.is_some() {
             order.push(LineKey::NewDraft);
         }
+        let mut rail_tail = None::<(LineKey, LineKey)>;
         let mut orphans = self.replies.clone();
         for line in &lines {
             order.push(line.key.clone());
+            if line.tail {
+                let first = rail_tail
+                    .as_ref()
+                    .map_or_else(|| line.key.clone(), |(first, _)| first.clone());
+                rail_tail = Some((first, line.key.clone()));
+            }
             let reply = match line.target {
                 RowTarget::Stream {
                     root: Some(agent_id),
@@ -374,7 +388,13 @@ impl Dashboard {
             };
             if let Some(agent_id) = reply.filter(|agent_id| self.replies.contains(agent_id)) {
                 orphans.retain(|orphan| *orphan != agent_id);
-                order.push(LineKey::Reply(agent_id));
+                let reply = LineKey::Reply(agent_id);
+                order.push(reply.clone());
+                if line.tail
+                    && let Some((_, last)) = &mut rail_tail
+                {
+                    *last = reply;
+                }
             }
         }
         for agent_id in orphans {
@@ -461,17 +481,12 @@ impl Dashboard {
         };
         self.pending_cursor = None;
         self.order = order;
-        self.rail_tail = lines
-            .iter()
-            .position(|line| line.key == LineKey::FoldToggle)
-            .and_then(|toggle| lines.get(toggle + 1).zip(lines.last()))
-            .map(|(first, last)| (first.key.clone(), last.key.clone()));
         if let Some(key) = restore {
             self.move_cursor_to(&key, window, cx);
         }
 
         self.apply_folds(&lines);
-        self.apply_rail_tail_fold(cx);
+        self.apply_rail_tail_elision(rail_tail, order_changed, cx);
         self.apply_highlights(&lines, cx);
         self.apply_lamps(&lines, cx);
         self.apply_reply_chrome(registry, cx);
@@ -485,46 +500,54 @@ impl Dashboard {
             .collect::<HashMap<_, _>>();
     }
 
-    /// Conceal the quiet tail in the display map instead of dropping its
-    /// excerpts from the multibuffer. The latter made opening "n more"
-    /// change the physical neighbors of a cursor moving with `j`/`k`.
-    fn apply_rail_tail_fold(&self, cx: &mut Context<Workspace>) {
+    fn apply_rail_tail_elision(
+        &mut self,
+        boundary: Option<(LineKey, LineKey)>,
+        order_changed: bool,
+        cx: &mut Context<Workspace>,
+    ) {
+        if !order_changed
+            && self.rail_tail.as_ref().map(|(_, current)| current) == boundary.as_ref()
+        {
+            return;
+        }
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let range = (!self.rail_tail_expanded)
-            .then_some(self.rail_tail.as_ref())
-            .flatten()
-            .and_then(|(first, last)| {
-                let first = self.buffers.get(first)?;
-                let last = self.buffers.get(last)?;
-                let start = snapshot.anchor_in_excerpt(first.read(cx).anchor_before(0))?;
-                let end =
-                    snapshot.anchor_in_excerpt(last.read(cx).anchor_after(last.read(cx).len()))?;
-                Some(start..end)
-            });
-        let display_map = self.editor.read(cx).display_map.clone();
-        display_map.update(cx, |display_map, cx| {
-            display_map.remove_folds_with_type(
-                [MultiBufferOffset(0)..snapshot.len()],
-                TypeId::of::<RailTailFold>(),
-                cx,
-            );
-            if let Some(range) = range {
-                display_map.fold(
-                    vec![Crease::simple(
-                        range,
-                        FoldPlaceholder::concealed(TypeId::of::<RailTailFold>()),
-                    )],
-                    cx,
-                );
-            }
+        let properties = boundary.as_ref().and_then(|(first, last)| {
+            let first = self.buffers.get(first)?;
+            let last = self.buffers.get(last)?;
+            let start = snapshot.anchor_in_excerpt(first.read(cx).anchor_before(0))?;
+            let end =
+                snapshot.anchor_in_excerpt(last.read(cx).anchor_after(last.read(cx).len()))?;
+            Some(DisplayElisionProperties {
+                range: start..end,
+                tail_rows: 0,
+                height: Some(1),
+                style: BlockStyle::Flex,
+                render: Arc::new(|cx| render_rail_tail(cx).into_any_element()),
+                priority: 0,
+                type_tag: None,
+            })
         });
-    }
-
-    /// Opens or closes the display fold for the quiet tail. The next normal
-    /// dashboard sync reapplies the crease against fresh multibuffer anchors.
-    pub fn toggle_rail_tail(&mut self, cx: &mut Context<Workspace>) {
-        self.rail_tail_expanded = !self.rail_tail_expanded;
-        cx.notify();
+        match (self.rail_tail.take(), properties, boundary) {
+            (Some((id, _)), Some(properties), Some(boundary)) => {
+                self.editor.update(cx, |editor, cx| {
+                    editor.update_display_elisions([(id, properties)], None, cx)
+                });
+                self.rail_tail = Some((id, boundary));
+            }
+            (Some((id, _)), _, _) => {
+                self.editor.update(cx, |editor, cx| {
+                    editor.remove_display_elisions([id].into_iter().collect(), None, cx)
+                });
+            }
+            (None, Some(properties), Some(boundary)) => {
+                let ids = self.editor.update(cx, |editor, cx| {
+                    editor.insert_display_elisions([properties], None, cx)
+                });
+                self.rail_tail = ids.into_iter().next().map(|id| (id, boundary));
+            }
+            (None, _, _) => {}
+        }
     }
 
     /// Places the cursor at the start of a key's buffer.
@@ -570,8 +593,25 @@ impl Dashboard {
 
     /// The row under the cursor.
     pub fn cursor_target(&self, cx: &mut Context<Workspace>) -> Option<RowTarget> {
+        if self.cursor_on_rail_tail(cx) {
+            return None;
+        }
         let key = self.cursor_key(cx)?;
         self.targets.get(&key).cloned()
+    }
+
+    fn cursor_on_rail_tail(&self, cx: &mut Context<Workspace>) -> bool {
+        let Some((id, _)) = self.rail_tail else {
+            return false;
+        };
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let head = editor.selections.newest::<Point>(&snapshot).head();
+            let row = head.to_display_point(&snapshot).row();
+            snapshot
+                .display_elisions_in_range(row..DisplayRow(row.0 + 1))
+                .any(|candidate| candidate == id)
+        })
     }
 
     pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
@@ -796,6 +836,26 @@ impl Dashboard {
 
 /// Dashboard text classes: lamps and muted chrome. The cursor itself is
 /// the selection indicator — rows carry no selected styling.
+fn render_rail_tail(cx: &mut BlockContext<'_, '_>) -> impl IntoElement {
+    let text_style = cx.editor_style.text.clone();
+    let color = if cx.selected {
+        text_style.color
+    } else {
+        crate::style::hint_color(cx.app)
+    };
+    div()
+        .block_mouse_except_scroll()
+        .pl(cx.anchor_x)
+        .h(cx.line_height)
+        .flex()
+        .items_center()
+        .font_family(text_style.font_family)
+        .text_size(text_style.font_size)
+        .line_height(text_style.line_height)
+        .text_color(color)
+        .child("…")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashClass {
     Muted,
@@ -877,29 +937,15 @@ pub enum RailRow<'a> {
         topic: &'a Workstream,
         grouped: bool,
     },
-    /// The quiet tail's "n more" / "fold" toggle.
-    FoldToggle { folded_count: usize, expanded: bool },
 }
 
 /// Assembles the dashboard from the split rows: the whole structure as
 /// plain data, decided here and only serialized by the caller.
 ///
-/// Expansion merges the folded tail back before grouping, so a group split
-/// across the fold reunites instead of repeating its header. A group
-/// section anchors at its best-sorted member's position and gathers the
-/// rest of the group up to it; ungrouped rows stay put. A non-empty tail
-/// trails as the fold toggle.
-fn rail_rows<'a>(
-    listed: Vec<&'a Workstream>,
-    folded: Vec<&'a Workstream>,
-    expanded: bool,
-) -> Vec<RailRow<'a>> {
-    let folded_count = folded.len();
-    let display = if expanded {
-        listed.into_iter().chain(folded).collect()
-    } else {
-        listed
-    };
+/// A section anchors a group at its best-sorted member's position and gathers
+/// the rest of that section's group beneath it. Listed and quiet-tail rows
+/// are assembled separately so the tail remains one contiguous elision.
+fn rail_rows(display: Vec<&Workstream>) -> Vec<RailRow<'_>> {
     let mut rows = Vec::new();
     let mut seen_groups = std::collections::BTreeSet::new();
     for (index, topic) in display.iter().enumerate() {
@@ -925,12 +971,6 @@ fn rail_rows<'a>(
             }
         }
     }
-    if folded_count > 0 {
-        rows.push(RailRow::FoldToggle {
-            folded_count,
-            expanded,
-        });
-    }
     rows
 }
 
@@ -943,6 +983,7 @@ struct Line {
     lamp: Option<UiAttention>,
     target: RowTarget,
     fold: Option<FoldSpec>,
+    tail: bool,
 }
 
 impl Line {
@@ -954,6 +995,7 @@ impl Line {
             lamp: None,
             target,
             fold: None,
+            tail: false,
         }
     }
 
@@ -969,56 +1011,38 @@ impl Line {
 /// Serializes the registry into the dashboard listing.
 #[cfg(test)]
 fn generate(registry: &AgentRegistry) -> Vec<Line> {
-    generate_with_rail_tail(registry, false)
+    generate_dashboard(registry).into_iter().skip(1).collect()
 }
 
-fn generate_with_rail_tail(registry: &AgentRegistry, rail_tail_expanded: bool) -> Vec<Line> {
-    let mut lines = Vec::new();
+fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
+    let mut iris = Line::new(LineKey::Iris, RowTarget::Iris);
+    iris.text.push_str("iris · listening");
+    let mut lines = vec![iris];
     let (listed, folded) = registry.split_rows();
-    // Keep every rail row in its stable multibuffer position. The toggle sits
-    // immediately before the quiet tail; the display-map fold hides the rows
-    // after it rather than making expansion insert a new run of excerpts.
-    let tail_start = rail_rows(listed.clone(), Vec::new(), true).len();
-    let mut rows = rail_rows(listed, folded, true);
-    if let Some(toggle) = rows
-        .iter()
-        .position(|row| matches!(row, RailRow::FoldToggle { .. }))
-    {
-        let toggle = rows.remove(toggle);
-        rows.insert(tail_start, toggle);
-    }
-    for row in rows {
-        match row {
-            RailRow::GroupHeader(name) => {
-                let mut line = Line::new(LineKey::Group(name.to_owned()), RowTarget::None);
-                line.span(Some(DashClass::Muted), |text| text.push_str(name));
-                lines.push(line);
-            }
-            RailRow::Task { topic, grouped } => {
-                lines.extend(task_lines(topic, grouped, registry));
-            }
-            RailRow::FoldToggle { folded_count, .. } => {
-                let mut line = Line::new(LineKey::FoldToggle, RowTarget::FoldToggle);
-                line.span(Some(DashClass::Muted), |text| {
-                    if rail_tail_expanded {
-                        text.push_str("fold");
-                    } else {
-                        text.push_str(&format!("{folded_count} more"));
-                    }
-                });
-                lines.push(line);
+    for (section, tail) in [(listed, false), (folded, true)] {
+        for row in rail_rows(section) {
+            match row {
+                RailRow::GroupHeader(name) => {
+                    let mut line = Line::new(
+                        LineKey::Group {
+                            name: name.to_owned(),
+                            tail,
+                        },
+                        RowTarget::None,
+                    );
+                    line.span(Some(DashClass::Muted), |text| text.push_str(name));
+                    line.tail = tail;
+                    lines.push(line);
+                }
+                RailRow::Task { topic, grouped } => {
+                    let mut task = task_lines(topic, grouped, registry);
+                    task.iter_mut().for_each(|line| line.tail = tail);
+                    lines.extend(task);
+                }
             }
         }
     }
     lines
-}
-
-fn generate_dashboard(registry: &AgentRegistry, rail_tail_expanded: bool) -> Vec<Line> {
-    let mut iris = Line::new(LineKey::Iris, RowTarget::Iris);
-    iris.text.push_str("iris · listening");
-    std::iter::once(iris)
-        .chain(generate_with_rail_tail(registry, rail_tail_expanded))
-        .collect()
 }
 
 fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
@@ -1272,10 +1296,6 @@ mod tests {
                 RailRow::Task { topic, grouped } => {
                     format!("{}{}", if *grouped { "  " } else { "" }, topic.name)
                 }
-                RailRow::FoldToggle {
-                    folded_count,
-                    expanded,
-                } => format!("fold({folded_count},{expanded})"),
             })
             .collect()
     }
@@ -1286,7 +1306,7 @@ mod tests {
         let mut registry = AgentRegistry::default();
         install(&mut registry, &topic);
 
-        let lines = generate_dashboard(&registry, false);
+        let lines = generate_dashboard(&registry);
         assert_eq!(lines[0].key, LineKey::Iris);
         assert_eq!(lines[0].text, "iris · listening");
         assert_eq!(lines[0].target, RowTarget::Iris);
@@ -1308,7 +1328,7 @@ mod tests {
             stream(3, None),
             stream(4, Some("infra")),
         ];
-        let assembled = rail_rows(rows.iter().collect(), Vec::new(), false);
+        let assembled = rail_rows(rows.iter().collect());
         assert_eq!(
             ids(&assembled),
             ["ws-1", "[infra]", "  ws-2", "  ws-4", "ws-3"]
@@ -1348,28 +1368,26 @@ mod tests {
     }
 
     #[test]
-    fn expansion_reunites_a_group_split_across_the_fold() {
+    fn group_split_keeps_the_folded_section_contiguous() {
         let listed = [stream(1, Some("infra")), stream(2, None)];
         let folded = [stream(3, Some("infra"))];
 
-        let collapsed = rail_rows(listed.iter().collect(), folded.iter().collect(), false);
         assert_eq!(
-            ids(&collapsed),
-            ["[infra]", "  ws-1", "ws-2", "fold(1,false)"]
+            ids(&rail_rows(listed.iter().collect())),
+            ["[infra]", "  ws-1", "ws-2"]
         );
-
-        let expanded = rail_rows(listed.iter().collect(), folded.iter().collect(), true);
         assert_eq!(
-            ids(&expanded),
-            ["[infra]", "  ws-1", "  ws-3", "ws-2", "fold(1,true)"]
+            ids(&rail_rows(folded.iter().collect())),
+            ["[infra]", "  ws-3"]
         );
     }
 
     #[test]
-    fn empty_tail_gets_no_fold_toggle() {
+    fn empty_section_gets_no_rows() {
         let listed = [stream(1, None)];
-        let assembled = rail_rows(listed.iter().collect(), Vec::new(), false);
+        let assembled = rail_rows(listed.iter().collect());
         assert_eq!(ids(&assembled), ["ws-1"]);
+        assert!(rail_rows(Vec::new()).is_empty());
     }
 
     #[test]

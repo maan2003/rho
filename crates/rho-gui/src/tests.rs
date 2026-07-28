@@ -206,6 +206,133 @@ fn dashboard_elides_subagents_behind_inline_fold(cx: &mut TestAppContext) {
         .expect("inspect folded dashboard");
 }
 
+#[gpui::test]
+fn dashboard_quiet_tail_is_one_native_display_elision(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let workstreams = (1..=13)
+        .map(|id| UiWorkstream {
+            workstream_id: WorkstreamId(id),
+            name: format!("task {id}"),
+            labels: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let agents = (1..=13)
+        .map(|id| {
+            let mut summary = agent_summary(id, None);
+            summary.workstream = WorkstreamId(id);
+            summary
+        })
+        .collect::<Vec<_>>();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                ConnEvent::Ready {
+                    workstreams,
+                    agents,
+                    projects: Vec::new(),
+                    machine_seed: 0,
+                    agent_counter: 13,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("install dashboard tail");
+    cx.run_until_parked();
+
+    let dashboard = workspace
+        .update(cx, |workspace, _, _| workspace.dashboard_editor())
+        .expect("dashboard editor");
+    let (tail_id, tail_anchor) = workspace
+        .update(cx, |_, window, cx| {
+            dashboard.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let elisions = snapshot
+                    .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
+                    .filter_map(|(_, block)| match block {
+                        Block::DisplayElision(elision) => Some((elision.id, elision.range.start)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(elisions.len(), 1);
+                assert!(!editor.display_text(cx).contains("more"));
+                elisions[0]
+            })
+        })
+        .expect("inspect collapsed tail");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            dashboard.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = snapshot.text().find("task 4").expect("last listed row");
+                let anchor = snapshot.anchor_before(multi_buffer::MultiBufferOffset(offset));
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([anchor..anchor]);
+                });
+                editor.move_down(&Default::default(), window, cx);
+            });
+            assert_eq!(workspace.dashboard_cursor_target(cx), None);
+            dashboard.update(cx, |editor, cx| {
+                editor.move_up(&Default::default(), window, cx);
+            });
+            assert!(matches!(
+                workspace.dashboard_cursor_target(cx),
+                Some(crate::dashboard::RowTarget::Stream {
+                    workstream_id: WorkstreamId(4),
+                    ..
+                })
+            ));
+        })
+        .expect("move onto and back from native fold");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            dashboard.update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([tail_anchor..tail_anchor]);
+                });
+                editor.toggle_fold(&editor::actions::ToggleFold, window, cx);
+                assert!(editor.display_text(cx).contains("task 1"));
+            });
+            // Updating the same native elision id must preserve its open state.
+            workspace.sync_dashboard(window, cx);
+            assert_eq!(workspace.dashboard_rail_tail_id(), Some(tail_id));
+            dashboard.update(cx, |editor, cx| {
+                assert!(editor.display_text(cx).contains("task 1"));
+                let snapshot = editor.display_snapshot(cx);
+                let ids = snapshot
+                    .expanded_display_elisions_intersecting_range(
+                        multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
+                        true,
+                    )
+                    .into_iter()
+                    .collect::<rustc_hash::FxHashSet<_>>();
+                editor.set_display_elisions_expanded(ids, false, None, cx);
+                let snapshot = editor.display_snapshot(cx);
+                assert!(
+                    snapshot
+                        .folded_display_elisions_intersecting_range(
+                            multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
+                            true,
+                        )
+                        .contains(&tail_id)
+                );
+            });
+        })
+        .expect("open, refresh, and close native tail fold");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.dashboard_open_reply(agent(1), cx);
+            workspace.sync_dashboard(window, cx);
+            assert!(workspace.dashboard_rail_tail_ends_in_reply(agent(1)));
+            assert_eq!(workspace.dashboard_rail_tail_id(), Some(tail_id));
+        })
+        .expect("include the last folded agent's reply in the elision");
+}
+
 fn snapshot_frame(state: UiAgentState) -> AgentRemoteFrame {
     AgentRemoteFrame::Snapshot(state)
 }
