@@ -873,12 +873,6 @@ impl DisplayMap {
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
         self.block_map.read(snapshot, edits, None);
 
-        let (snapshot, edits) = fold_map.remove_all_folds_with_type(type_id);
-        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
-        self.block_map.read(snapshot, edits, None);
         let inline = creases.into_iter().filter_map(|crease| match crease {
             Crease::Inline {
                 range,
@@ -888,7 +882,7 @@ impl DisplayMap {
             } => Some((range, placeholder, elision_policy)),
             Crease::Block { .. } => None,
         });
-        let (snapshot, edits) = fold_map.fold(inline);
+        let (snapshot, edits) = fold_map.replace_folds_with_type(type_id, inline);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
         let (snapshot, edits) = self
             .wrap_map

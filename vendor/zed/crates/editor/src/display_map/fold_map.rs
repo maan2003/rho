@@ -4,6 +4,7 @@ use super::{
     ElisionPolicy, Highlights,
     inlay_map::{InlayBufferRows, InlayChunks, InlayEdit, InlayOffset, InlayPoint, InlaySnapshot},
 };
+use collections::HashMap;
 use gpui::{AnyElement, App, ElementId, HighlightStyle, Pixels, SharedString, Stateful, Window};
 use language::{Edit, HighlightId, LanguageAwareStyling, Point};
 use multi_buffer::{
@@ -53,6 +54,15 @@ impl Default for FoldPlaceholder {
 }
 
 impl FoldPlaceholder {
+    fn equivalent_for_replacement(&self, other: &Self) -> bool {
+        self.type_tag == other.type_tag
+            && self.constrain_width == other.constrain_width
+            && self.merge_adjacent == other.merge_adjacent
+            && self.collapsed_text == other.collapsed_text
+            && (Arc::ptr_eq(&self.render, &other.render)
+                || self.is_concealed() && other.is_concealed())
+    }
+
     /// Returns a styled `Div` container with the standard fold‐placeholder
     /// look (background, hover, active, rounded corners, full size).
     /// Callers add children and event handlers on top.
@@ -304,37 +314,104 @@ impl FoldMapWriter<'_> {
         )
     }
 
-    /// Removes every fold carrying `type_id`, including folds whose anchors
-    /// collapsed to an empty range after an edit.
-    pub(crate) fn remove_all_folds_with_type(
+    /// Replaces folds carrying `type_id`, preserving existing fold identities
+    /// wherever the desired range and placeholder are unchanged.
+    pub(crate) fn replace_folds_with_type<T: ToOffset, I: FoldInput<T>>(
         &mut self,
         type_id: TypeId,
+        ranges: impl IntoIterator<Item = I>,
     ) -> (FoldSnapshot, Vec<FoldEdit>) {
         let snapshot = self.0.snapshot.inlay_snapshot.clone();
         let buffer = &snapshot.buffer;
+        let mut desired = Vec::new();
+        for input in ranges {
+            let (range, placeholder, elision_policy) = input.into_parts();
+            let range = range.start.to_offset(buffer)..range.end.to_offset(buffer);
+            if range.is_empty() {
+                continue;
+            }
+            let anchors = buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
+            if buffer
+                .anchor_range_to_buffer_anchor_range(anchors.clone())
+                .is_some()
+            {
+                desired.push((range, FoldRange(anchors), placeholder, elision_policy));
+            }
+        }
+
+        let mut existing_by_range: HashMap<_, Vec<Fold>> = HashMap::default();
+        let mut folds = Vec::new();
         let mut cursor = self.0.snapshot.folds.cursor::<FoldRange>(buffer);
-        let mut kept = Vec::new();
-        let mut edits = Vec::new();
         cursor.next();
         while let Some(fold) = cursor.item() {
             if fold.placeholder.type_tag == Some(type_id) {
-                let range = fold.range.start.to_offset(buffer)..fold.range.end.to_offset(buffer);
-                if !range.is_empty() {
-                    let range =
-                        snapshot.to_inlay_offset(range.start)..snapshot.to_inlay_offset(range.end);
-                    edits.push(InlayEdit {
-                        old: range.clone(),
-                        new: range,
-                    });
-                }
-                self.0.snapshot.fold_metadata_by_id.remove(&fold.id);
+                existing_by_range
+                    .entry((
+                        fold.range.start.to_offset(buffer),
+                        fold.range.end.to_offset(buffer),
+                    ))
+                    .or_default()
+                    .push(fold.clone());
             } else {
-                kept.push(fold.clone());
+                folds.push(fold.clone());
             }
             cursor.next();
         }
         drop(cursor);
-        self.0.snapshot.folds = SumTree::from_iter(kept, buffer);
+
+        let mut edits = Vec::new();
+        for (range, anchors, placeholder, elision_policy) in desired {
+            let key = (range.start, range.end);
+            let existing = existing_by_range.get_mut(&key).and_then(|folds| {
+                folds
+                    .iter()
+                    .position(|fold| {
+                        fold.elision_policy == elision_policy
+                            && fold.placeholder.equivalent_for_replacement(&placeholder)
+                    })
+                    .map(|ix| folds.swap_remove(ix))
+            });
+            if let Some(existing) = existing {
+                folds.push(existing);
+            } else {
+                let fold = Fold {
+                    id: FoldId(post_inc(&mut self.0.next_fold_id.0)),
+                    range: anchors,
+                    placeholder,
+                    elision_policy,
+                };
+                self.0.snapshot.fold_metadata_by_id.insert(
+                    fold.id,
+                    FoldMetadata {
+                        range: fold.range.clone(),
+                        width: None,
+                    },
+                );
+                let range =
+                    snapshot.to_inlay_offset(range.start)..snapshot.to_inlay_offset(range.end);
+                edits.push(InlayEdit {
+                    old: range.clone(),
+                    new: range,
+                });
+                folds.push(fold);
+            }
+        }
+
+        for removed in existing_by_range.into_values().flatten() {
+            let range = removed.range.start.to_offset(buffer)..removed.range.end.to_offset(buffer);
+            if !range.is_empty() {
+                let range =
+                    snapshot.to_inlay_offset(range.start)..snapshot.to_inlay_offset(range.end);
+                edits.push(InlayEdit {
+                    old: range.clone(),
+                    new: range,
+                });
+            }
+            self.0.snapshot.fold_metadata_by_id.remove(&removed.id);
+        }
+
+        folds.sort_unstable_by(|a, b| sum_tree::SeekTarget::cmp(&a.range, &b.range, buffer));
+        self.0.snapshot.folds = SumTree::from_iter(folds, buffer);
         let edits = consolidate_inlay_edits(edits);
         let edits = self.0.sync(snapshot, edits);
         (self.0.snapshot.clone(), edits)
@@ -1947,6 +2024,80 @@ mod tests {
         );
         let (snapshot, _) = map.read(inlay_snapshot, vec![]);
         assert_eq!(snapshot.text(), "**bold** text\n");
+    }
+
+    #[gpui::test]
+    fn test_replace_concealed_folds_preserves_unchanged_ids(cx: &mut gpui::App) {
+        init_test(cx);
+        struct ConcealTag;
+        let type_id = TypeId::of::<ConcealTag>();
+        let buffer = MultiBuffer::build_simple("**bold** text\n", cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+
+        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
+        let (snapshot, _) = writer.replace_folds_with_type(
+            type_id,
+            [
+                (
+                    Point::new(0, 0)..Point::new(0, 2),
+                    FoldPlaceholder::concealed(type_id),
+                ),
+                (
+                    Point::new(0, 6)..Point::new(0, 8),
+                    FoldPlaceholder::concealed(type_id),
+                ),
+            ],
+        );
+        let initial_ids = snapshot
+            .folds_in_range(Point::new(0, 0)..Point::new(1, 0))
+            .map(|fold| fold.id)
+            .collect::<Vec<_>>();
+
+        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
+        let (snapshot, edits) = writer.replace_folds_with_type(
+            type_id,
+            [
+                (
+                    Point::new(0, 0)..Point::new(0, 2),
+                    FoldPlaceholder::concealed(type_id),
+                ),
+                (
+                    Point::new(0, 6)..Point::new(0, 8),
+                    FoldPlaceholder::concealed(type_id),
+                ),
+            ],
+        );
+        assert!(edits.is_empty());
+        assert_eq!(
+            snapshot
+                .folds_in_range(Point::new(0, 0)..Point::new(1, 0))
+                .map(|fold| fold.id)
+                .collect::<Vec<_>>(),
+            initial_ids
+        );
+
+        let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
+        let (snapshot, _) = writer.replace_folds_with_type(
+            type_id,
+            [
+                (
+                    Point::new(0, 0)..Point::new(0, 2),
+                    FoldPlaceholder::concealed(type_id),
+                ),
+                (
+                    Point::new(0, 7)..Point::new(0, 8),
+                    FoldPlaceholder::concealed(type_id),
+                ),
+            ],
+        );
+        let replacement_ids = snapshot
+            .folds_in_range(Point::new(0, 0)..Point::new(1, 0))
+            .map(|fold| fold.id)
+            .collect::<Vec<_>>();
+        assert_eq!(replacement_ids[0], initial_ids[0]);
+        assert_ne!(replacement_ids[1], initial_ids[1]);
     }
 
     #[gpui::test]

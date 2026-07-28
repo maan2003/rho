@@ -637,7 +637,7 @@ struct SyntaxConcealment {
     scopes: Vec<Range<Anchor>>,
     buffer_ids: HashSet<BufferId>,
     covered: Vec<Range<MultiBufferOffset>>,
-    installed: Vec<Range<Anchor>>,
+    dirty: bool,
 }
 
 #[derive(Default)]
@@ -9575,7 +9575,7 @@ impl Editor {
                 scopes: Vec::new(),
                 buffer_ids: HashSet::default(),
                 covered: Vec::new(),
-                installed: Vec::new(),
+                dirty: true,
             });
         let divergence = state
             .scopes
@@ -9590,6 +9590,7 @@ impl Editor {
         state.scopes = scopes;
         state.buffer_ids = buffer_ids;
         state.covered.clear();
+        state.dirty = true;
         cx.notify();
     }
 
@@ -9598,6 +9599,7 @@ impl Editor {
         for concealment in self.syntax_concealments.values_mut() {
             if buffer_id.is_none_or(|buffer_id| concealment.buffer_ids.contains(&buffer_id)) {
                 concealment.covered.clear();
+                concealment.dirty = true;
                 invalidated = true;
             }
         }
@@ -9633,13 +9635,15 @@ impl Editor {
                     (!intersection.is_empty()).then_some((scope, intersection))
                 })
                 .collect::<Vec<_>>();
-            if intersections.is_empty() && state.covered.is_empty() && state.installed.is_empty()
-                || !intersections.is_empty()
-                    && intersections.iter().all(|(_, intersection)| {
-                        state.covered.iter().any(|covered| {
-                            covered.start <= intersection.start && covered.end >= intersection.end
-                        })
-                    })
+            if !state.dirty
+                && (intersections.is_empty() && state.covered.is_empty()
+                    || !intersections.is_empty()
+                        && intersections.iter().all(|(_, intersection)| {
+                            state.covered.iter().any(|covered| {
+                                covered.start <= intersection.start
+                                    && covered.end >= intersection.end
+                            })
+                        }))
             {
                 continue;
             }
@@ -9654,20 +9658,8 @@ impl Editor {
                 .into_iter()
                 .map(|(_, intersection)| intersection)
                 .collect();
-            let unchanged = concealed.len() == state.installed.len()
-                && concealed.iter().zip(&state.installed).all(|(new, old)| {
-                    new.start == old.start.to_offset(snapshot)
-                        && new.end == old.end.to_offset(snapshot)
-                });
-            if !unchanged {
-                state.installed = concealed
-                    .iter()
-                    .map(|range| {
-                        snapshot.anchor_after(range.start)..snapshot.anchor_before(range.end)
-                    })
-                    .collect();
-                updates.push((*type_id, concealed));
-            }
+            state.dirty = false;
+            updates.push((*type_id, concealed));
         }
 
         let display_map = self.display_map.clone();
