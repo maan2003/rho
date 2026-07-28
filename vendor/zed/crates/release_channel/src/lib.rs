@@ -12,9 +12,9 @@ const ZED_DOCS_URL: &str = "https://zed.dev/docs";
 /// stable | dev | nightly | preview
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
     if cfg!(debug_assertions) {
-        env::var("ZED_RELEASE_CHANNEL").unwrap_or_else(|_| compile_time_release_channel_name())
+        env::var("ZED_RELEASE_CHANNEL").unwrap_or_else(|_| "dev".to_string())
     } else {
-        compile_time_release_channel_name()
+        "dev".to_string()
     }
 });
 
