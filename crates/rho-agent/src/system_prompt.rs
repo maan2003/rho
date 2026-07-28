@@ -417,9 +417,7 @@ Relative paths in commands and patches resolve against this directory.
             let binding = match workdir.kind {
                 WorkdirKind::Managed => "a Rho-managed jj workspace",
                 WorkdirKind::Sandbox => "a Rho-managed sandbox workspace",
-                WorkdirKind::Live => {
-                    "the live directory — edits are immediately visible to the user"
-                }
+                WorkdirKind::Live => "a live directory rather than a Rho-managed workspace",
             };
             out.push_str(&format!("- {} ({binding})\n", workdir.path));
         }
@@ -556,7 +554,7 @@ fn render_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
         }
     } else if managed == 0 && sandboxed == 0 {
         out.push_str(
-            "Your workdirs are live directories rather than Rho-managed jj workspaces. Edits there are immediately visible to the user and other processes using those directories.\n\n",
+            "Your workdirs are live directories rather than Rho-managed jj workspaces. Edits there are immediately visible to other processes using those directories.\n\n",
         );
     } else {
         out.push_str("Workspace management differs across your working set:\n");
@@ -571,7 +569,7 @@ fn render_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
         out.push('\n');
     }
     if managed > 0 {
-        out.push_str("Each Rho-managed jj workdir is a workspace: a checkout with its own working copy and working-copy commit, which `@` names inside that workdir. jj snapshots working-copy changes into `@` as you work; no separate Git-style commit is needed merely to keep them. Files and uncommitted changes already present are the starting state you were given, not leftovers to clean up.\n\nAgent views can mount different checkouts at the same absolute repository path, so the path alone does not tell you which other agents, if any, see your edits live. Your edits are not in the user's own checkout; they reach it only through an explicit jj operation. The repository and its operation log are shared even when working copies are not: rewrites, bookmark moves, and `jj abandon` are visible across workspaces.\n\nBecause this workdir is already a checkout of its own, working in place is the ordinary way to work here.\n\n");
+        out.push_str("Each Rho-managed jj workdir is a workspace: a checkout with its own working copy and working-copy commit, which `@` names inside that workdir. jj snapshots working-copy changes into `@` as you work; no separate Git-style commit is needed merely to keep them. Files and uncommitted changes already present are the starting state you were given, not leftovers to clean up.\n\n");
     }
     if sandboxed > 0 {
         out.push_str("A Rho-managed sandbox workspace masks the repository's original VCS metadata from commands and presents a separate synthetic Git baseline. Work with the checkout and VCS view provided inside the sandbox rather than assuming the origin checkout's metadata is available.\n\n");
@@ -645,8 +643,9 @@ mod tests {
         assert!(prompt.contains("working directory is a Rho-managed jj workspace"));
         assert!(prompt.contains("which `@` names inside that workdir"));
         assert!(prompt.contains("starting state you were given"));
-        assert!(prompt.contains("path alone does not tell you"));
-        assert!(prompt.contains("working in place is the ordinary way"));
+        assert!(!prompt.contains("Agent views"));
+        assert!(!prompt.contains("user's own checkout"));
+        assert!(!prompt.contains("working in place"));
         assert!(!prompt.contains("Delegated Engineer Isolation"));
         assert!(!prompt.contains("do not create"));
     }
@@ -655,7 +654,7 @@ mod tests {
     fn live_workspace_prompt_reports_management() {
         let prompt = render_workspace_prompt(&[workdir("/repo", WorkdirKind::Live)]);
         assert!(prompt.contains("live directories rather than Rho-managed jj workspaces"));
-        assert!(prompt.contains("immediately visible to the user"));
+        assert!(prompt.contains("immediately visible to other processes"));
     }
 
     #[test]
@@ -663,7 +662,7 @@ mod tests {
         let prompt = render_workspace_prompt(&[workdir("/repo", WorkdirKind::Sandbox)]);
         assert!(prompt.contains("Rho-managed sandbox workspace"));
         assert!(prompt.contains("masks the repository's original VCS metadata"));
-        assert!(!prompt.contains("immediately visible to the user"));
+        assert!(!prompt.contains("immediately visible to other processes"));
     }
 
     #[test]
@@ -765,6 +764,6 @@ mod tests {
         ]);
         assert!(prompt.contains("Working directory: /repo"));
         assert!(prompt.contains("- /lib (a Rho-managed jj workspace)"));
-        assert!(prompt.contains("- /docs (the live directory"));
+        assert!(prompt.contains("- /docs (a live directory"));
     }
 }
