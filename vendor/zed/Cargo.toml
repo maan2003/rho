@@ -763,7 +763,7 @@ reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "c15662
     "http2",
     "macos-system-configuration",
     "multipart",
-    "rustls-tls-native-roots",
+    "rustls-tls-native-roots-no-provider",
     "socks",
     "stream",
 ], package = "zed-reqwest", version = "0.12.15-zed" }
@@ -780,7 +780,7 @@ runtimelib = { version = "1.4.0", default-features = false, features = [
 rust-embed = { version = "8.11", features = ["include-exclude"] }
 rustc-hash = "2.1.0"
 rustix = { version = "1.1", features = ["fs"] }
-rustls = { version = "0.23.26" }
+rustls = { version = "0.23.26", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-platform-verifier = "0.5.0"
 # WARNING: If you change this, you must also publish a new version of zed-scap to crates.io
 scap = { git = "https://github.com/zed-industries/scap", rev = "4afea48c3b002197176fb19cd0f9b180dd36eaac", default-features = false, package = "zed-scap", version = "0.0.8-zed" }
@@ -891,10 +891,10 @@ js-sys = "0.3"
 console_error_panic_hook = "0.1.7"
 web-time = "1.1.0"
 webrtc-sys = "0.3.23"
-wgpu = "29.0.4"
+wgpu = "30.0.0"
 windows-core = "0.61"
 yaml-rust2 = "0.8"
-yawc = { git = "https://github.com/zed-industries/yawc", rev = "71a452f551cac178367eaac5d7418a09afa1f3a2", version = "0.3.3" }
+yawc = { git = "https://github.com/zed-industries/yawc", rev = "71a452f551cac178367eaac5d7418a09afa1f3a2", version = "0.3.3", default-features = false, features = ["rustls-aws-lc-rs"] }
 zeroize = "1.8"
 zstd = "0.11"
 
