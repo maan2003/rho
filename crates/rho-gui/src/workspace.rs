@@ -1617,8 +1617,7 @@ impl Workspace {
     }
 
     pub fn toggle_rail_tail(&mut self, cx: &mut Context<Self>) {
-        self.registry.toggle_rail_tail();
-        cx.notify();
+        self.dashboard.toggle_rail_tail(cx);
     }
 
     /// Jumps to the rail's most urgent agent (excluding the current one), so

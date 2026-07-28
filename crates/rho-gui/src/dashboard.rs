@@ -9,16 +9,18 @@
 //! the multibuffer, so refreshes can rearrange excerpts without eating typed
 //! drafts or leaving the cursor attached to a stale line number.
 
+use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+use editor::display_map::{Crease, FoldPlaceholder};
 use editor::hover_links::InlayHighlight;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
 use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBuffer, PathKey};
+use multi_buffer::{MultiBuffer, MultiBufferOffset, PathKey};
 use project::InlayId;
 use rho_ui_proto::{AgentId, UiAttention, WorkstreamId};
 use text::BufferId;
@@ -38,6 +40,10 @@ const PLACEHOLDER_ID_BASE: usize = 1_000_000;
 /// class and lamp key ranges.
 const DRAFT_TEXT_KEY: HighlightKey =
     HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + 2 * DashClass::ALL.len());
+
+/// Fold type tag for the quiet tail. It is a display concern: its buffers
+/// stay in the multibuffer so cursor motion never has to rearrange excerpts.
+struct RailTailFold;
 
 /// Identity of one dashboard line; each key owns one buffer in the
 /// multibuffer. Cursor position and reply drafts survive re-sorts by
@@ -111,6 +117,10 @@ pub struct Dashboard {
     folds: HashMap<AgentId, FoldSpec>,
     /// Expansion state keyed by stable parent identity.
     expanded_folds: Arc<Mutex<HashSet<AgentId>>>,
+    /// The quiet rail tail is always present in `order`; this only controls
+    /// whether its display-map crease conceals it.
+    rail_tail_expanded: bool,
+    rail_tail: Option<(LineKey, LineKey)>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the per-line excerpts seamless.
@@ -152,6 +162,8 @@ impl Dashboard {
             placeholder_ids: Vec::new(),
             folds: HashMap::new(),
             expanded_folds: Arc::new(Mutex::new(HashSet::new())),
+            rail_tail_expanded: false,
+            rail_tail: None,
             headers_disabled: std::collections::HashSet::new(),
         }
     }
@@ -295,7 +307,10 @@ impl Dashboard {
             .expanded_folds
             .lock()
             .map_or_else(|_| HashSet::new(), |expanded| expanded.clone());
-        let mut lines = visible_lines(generate_dashboard(registry), &expanded);
+        let mut lines = visible_lines(
+            generate_dashboard(registry, self.rail_tail_expanded),
+            &expanded,
+        );
         for line in &mut lines {
             if line
                 .fold
@@ -446,11 +461,17 @@ impl Dashboard {
         };
         self.pending_cursor = None;
         self.order = order;
+        self.rail_tail = lines
+            .iter()
+            .position(|line| line.key == LineKey::FoldToggle)
+            .and_then(|toggle| lines.get(toggle + 1).zip(lines.last()))
+            .map(|(first, last)| (first.key.clone(), last.key.clone()));
         if let Some(key) = restore {
             self.move_cursor_to(&key, window, cx);
         }
 
         self.apply_folds(&lines);
+        self.apply_rail_tail_fold(cx);
         self.apply_highlights(&lines, cx);
         self.apply_lamps(&lines, cx);
         self.apply_reply_chrome(registry, cx);
@@ -462,6 +483,48 @@ impl Dashboard {
             .filter_map(|line| line.fold.clone())
             .map(|fold| (fold.parent_agent, fold))
             .collect::<HashMap<_, _>>();
+    }
+
+    /// Conceal the quiet tail in the display map instead of dropping its
+    /// excerpts from the multibuffer. The latter made opening "n more"
+    /// change the physical neighbors of a cursor moving with `j`/`k`.
+    fn apply_rail_tail_fold(&self, cx: &mut Context<Workspace>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let range = (!self.rail_tail_expanded)
+            .then(|| self.rail_tail.as_ref())
+            .flatten()
+            .and_then(|(first, last)| {
+                let first = self.buffers.get(first)?;
+                let last = self.buffers.get(last)?;
+                let start = snapshot.anchor_in_excerpt(first.read(cx).anchor_before(0))?;
+                let end =
+                    snapshot.anchor_in_excerpt(last.read(cx).anchor_after(last.read(cx).len()))?;
+                Some(start..end)
+            });
+        let display_map = self.editor.read(cx).display_map.clone();
+        display_map.update(cx, |display_map, cx| {
+            display_map.remove_folds_with_type(
+                [MultiBufferOffset(0)..snapshot.len()],
+                TypeId::of::<RailTailFold>(),
+                cx,
+            );
+            if let Some(range) = range {
+                display_map.fold(
+                    vec![Crease::simple(
+                        range,
+                        FoldPlaceholder::concealed(TypeId::of::<RailTailFold>()),
+                    )],
+                    cx,
+                );
+            }
+        });
+    }
+
+    /// Opens or closes the display fold for the quiet tail. The next normal
+    /// dashboard sync reapplies the crease against fresh multibuffer anchors.
+    pub fn toggle_rail_tail(&mut self, cx: &mut Context<Workspace>) {
+        self.rail_tail_expanded = !self.rail_tail_expanded;
+        cx.notify();
     }
 
     /// Places the cursor at the start of a key's buffer.
@@ -905,9 +968,25 @@ impl Line {
 
 /// Serializes the registry into the dashboard listing.
 fn generate(registry: &AgentRegistry) -> Vec<Line> {
+    generate_with_rail_tail(registry, false)
+}
+
+fn generate_with_rail_tail(registry: &AgentRegistry, rail_tail_expanded: bool) -> Vec<Line> {
     let mut lines = Vec::new();
     let (listed, folded) = registry.split_rows();
-    for row in rail_rows(listed, folded, registry.rail_tail_expanded()) {
+    // Keep every rail row in its stable multibuffer position. The toggle sits
+    // immediately before the quiet tail; the display-map fold hides the rows
+    // after it rather than making expansion insert a new run of excerpts.
+    let tail_start = rail_rows(listed.clone(), Vec::new(), true).len();
+    let mut rows = rail_rows(listed, folded, true);
+    if let Some(toggle) = rows
+        .iter()
+        .position(|row| matches!(row, RailRow::FoldToggle { .. }))
+    {
+        let toggle = rows.remove(toggle);
+        rows.insert(tail_start, toggle);
+    }
+    for row in rows {
         match row {
             RailRow::GroupHeader(name) => {
                 let mut line = Line::new(LineKey::Group(name.to_owned()), RowTarget::None);
@@ -917,13 +996,10 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
             RailRow::Task { topic, grouped } => {
                 lines.extend(task_lines(topic, grouped, registry));
             }
-            RailRow::FoldToggle {
-                folded_count,
-                expanded,
-            } => {
+            RailRow::FoldToggle { folded_count, .. } => {
                 let mut line = Line::new(LineKey::FoldToggle, RowTarget::FoldToggle);
                 line.span(Some(DashClass::Muted), |text| {
-                    if expanded {
+                    if rail_tail_expanded {
                         text.push_str("fold");
                     } else {
                         text.push_str(&format!("{folded_count} more"));
@@ -936,10 +1012,12 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
     lines
 }
 
-fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
+fn generate_dashboard(registry: &AgentRegistry, rail_tail_expanded: bool) -> Vec<Line> {
     let mut iris = Line::new(LineKey::Iris, RowTarget::Iris);
     iris.text.push_str("iris · listening");
-    std::iter::once(iris).chain(generate(registry)).collect()
+    std::iter::once(iris)
+        .chain(generate_with_rail_tail(registry, rail_tail_expanded))
+        .collect()
 }
 
 fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
@@ -1207,7 +1285,7 @@ mod tests {
         let mut registry = AgentRegistry::default();
         install(&mut registry, &topic);
 
-        let lines = generate_dashboard(&registry);
+        let lines = generate_dashboard(&registry, false);
         assert_eq!(lines[0].key, LineKey::Iris);
         assert_eq!(lines[0].text, "iris · listening");
         assert_eq!(lines[0].target, RowTarget::Iris);

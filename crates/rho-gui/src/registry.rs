@@ -173,9 +173,6 @@ pub struct AgentRegistry {
     workstreams: Vec<Workstream>,
     /// Positions in `summaries`, used by all summary lookups.
     agent_locations: BTreeMap<AgentId, usize>,
-    /// The user clicked the rail's "n more" row: folded rows render in
-    /// place until toggled back.
-    rail_tail_expanded: bool,
     /// Workstreams announced with `AgentCreated`, bridging the gap until the
     /// next `Ready` refresh carries the agent's summary — so a fresh agent's
     /// workstream context resolves immediately instead of falling back to
@@ -690,14 +687,6 @@ impl AgentRegistry {
             }
         }
         (listed, folded)
-    }
-
-    pub fn rail_tail_expanded(&self) -> bool {
-        self.rail_tail_expanded
-    }
-
-    pub fn toggle_rail_tail(&mut self) {
-        self.rail_tail_expanded = !self.rail_tail_expanded;
     }
 
     pub fn mark_known(&mut self, agent_id: AgentId) {
