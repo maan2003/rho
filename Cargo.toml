@@ -38,6 +38,7 @@ exclude = [
   "vendor/brush",
   "vendor/jj",
   "vendor/noq",
+  "vendor/zed",
   "webui",
 ]
 resolver = "2"
@@ -59,7 +60,7 @@ async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
-buffer_diff = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+buffer_diff = { path = "vendor/zed/crates/buffer_diff" }
 camino = "1"
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
@@ -149,7 +150,7 @@ tracing = { version = "0.1", default-features = false, features = [
 ] }
 url = { version = "2", default-features = false }
 uuid = { version = "1", features = ["serde", "v4"] }
-worktree = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+worktree = { path = "vendor/zed/crates/worktree" }
 zip = { version = "2", default-features = false, features = [
   "deflate",
   "time",

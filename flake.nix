@@ -166,12 +166,7 @@
           pkgs.wayland
         ];
         guiLibraryPath = pkgs.lib.makeLibraryPath guiBuildInputs;
-        zedSrc = pkgs.fetchFromGitHub {
-          owner = "maan2003";
-          repo = "zed";
-          rev = "f08a95d674b49474912b8c03ef51917cb042c606";
-          hash = "sha256-0rgm2Wh26AQo0iAPo+KJTuj66Jf8SbLEig5Cwnm4kH4=";
-        };
+        zedSrc = ./vendor/zed;
         zedVendorManifest = pkgs.writeText "zed-vendor-Cargo.toml" ''
           [package]
           name = "zed"

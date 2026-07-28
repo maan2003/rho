@@ -13,35 +13,35 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-assets = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+assets = { path = "../../vendor/zed/crates/assets" }
 buffer_diff.workspace = true
 camino.workspace = true
 clap.workspace = true
-clock = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-collections = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-command_palette = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+clock = { path = "../../vendor/zed/crates/clock" }
+collections = { path = "../../vendor/zed/crates/collections" }
+command_palette = { path = "../../vendor/zed/crates/command_palette" }
 dirs.workspace = true
-editor = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-fs = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+editor = { path = "../../vendor/zed/crates/editor" }
+fs = { path = "../../vendor/zed/crates/fs" }
 futures.workspace = true
 iroh = { workspace = true, features = ["qlog", "tls-aws-lc-rs"] }
-gpui = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e", default-features = false, features = [
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "wayland",
 ] }
-gpui_platform = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e", default-features = false, features = [
+gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", default-features = false, features = [
   "font-kit",
   "wayland",
 ] }
-gpui_tokio = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 json-stream.workspace = true
-language = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-languages = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e", features = ["load-grammars"] }
-multi_buffer = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+language = { path = "../../vendor/zed/crates/language" }
+languages = { path = "../../vendor/zed/crates/languages", features = ["load-grammars"] }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 prefix-id = { workspace = true, features = ["redb"] }
-node_runtime = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+node_runtime = { path = "../../vendor/zed/crates/node_runtime" }
 octo-types.workspace = true
-project = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-release_channel = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+project = { path = "../../vendor/zed/crates/project" }
+release_channel = { path = "../../vendor/zed/crates/release_channel" }
 rho-core.workspace = true
 rho-iroh-auth.workspace = true
 rho-profiling.workspace = true
@@ -57,27 +57,27 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
   "wav",
 ] }
 rustc-hash = "2.1.0"
-search = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+search = { path = "../../vendor/zed/crates/search" }
 semver = { version = "1.0", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
-settings = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-text = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-theme = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-theme_settings = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+settings = { path = "../../vendor/zed/crates/settings" }
+text = { path = "../../vendor/zed/crates/text" }
+theme = { path = "../../vendor/zed/crates/theme" }
+theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
 tokio = { workspace = true, features = ["io-util", "net", "process", "rt"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tree-sitter = "0.26"
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
-ui = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-util = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-vim = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
-vim_mode_setting = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e" }
+ui = { path = "../../vendor/zed/crates/ui" }
+util = { path = "../../vendor/zed/crates/util" }
+vim = { path = "../../vendor/zed/crates/vim" }
+vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
 
 [dev-dependencies]
 backtrace = "0.3"
-gpui = { git = "https://github.com/maan2003/zed", rev = "43e188b4229e", default-features = false, features = [
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "test-support",
 ] }
 libc = "0.2"
