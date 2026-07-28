@@ -450,6 +450,13 @@ fn shell_command_argument_label(arguments: &str) -> String {
 }
 
 fn streaming_json_text_field(arguments: &str, key: &str) -> Option<String> {
+    // Completed historical calls should be parsed in one pass. The streaming
+    // parser repairs its partial result after every character, which is useful
+    // for live arguments but quadratic for a large completed command.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) {
+        return value.get(key)?.as_str().map(str::to_owned);
+    }
+
     let mut parser = json_stream::JsonStreamParser::new();
     for character in arguments.chars() {
         if parser.add_char(character).is_err() {

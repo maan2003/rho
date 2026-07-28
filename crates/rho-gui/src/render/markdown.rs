@@ -52,7 +52,9 @@ pub fn configure_buffer(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
         cx.set_global(MarkdownLanguagesRegistered);
     }
     buffer.set_language_registry(registry);
-    buffer.set_sync_parse_timeout(None);
+    // Keep Buffer's bounded synchronous parse budget. Small streaming edits
+    // should not paint an interpolated capture from the previous text; large
+    // initial parses still time out and continue in the background.
     buffer.set_language_async(Some(block.clone()), cx);
 }
 

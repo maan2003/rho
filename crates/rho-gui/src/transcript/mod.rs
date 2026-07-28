@@ -284,6 +284,8 @@ impl TranscriptModel {
         }
         self.turn_boundary = new_boundary;
 
+        self.refresh_markdown_root_scopes(cx);
+
         self.refresh_elision_plans(state, start);
         self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
         cx.notify();
@@ -371,6 +373,7 @@ impl TranscriptModel {
         } else {
             (&changed, &empty)
         };
+        self.refresh_markdown_root_scopes(cx);
         self.refresh_elision_plans(state, index);
         self.apply_to_attachments(now_ms, changed_history, changed_live, gutters_changed, cx);
         cx.notify();
@@ -391,6 +394,27 @@ impl TranscriptModel {
         self.records
             .iter()
             .any(|record| record.inlay.as_ref().is_some_and(InlayRecord::ticks))
+    }
+
+    fn refresh_markdown_root_scopes<V: 'static>(&self, cx: &mut Context<V>) {
+        let ranges = self
+            .records
+            .iter()
+            .filter(|record| record.markdown)
+            .map(|record| record.range.clone())
+            .collect::<Vec<_>>();
+        self.buffer.update(cx, |buffer, cx| {
+            // Root scopes grow with streaming inserts at their end, without
+            // changing the record anchors used to delimit adjacent blocks.
+            let scopes = ranges
+                .iter()
+                .map(|range| {
+                    buffer.anchor_before(range.start.to_offset(buffer))
+                        ..buffer.anchor_after(range.end.to_offset(buffer))
+                })
+                .collect();
+            buffer.set_syntax_root_scopes(Some(scopes), cx)
+        });
     }
 
     fn refresh_elision_plans(&mut self, state: &UiAgentState, first_changed_block: usize) {

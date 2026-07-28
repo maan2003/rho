@@ -456,6 +456,36 @@ fn styled_runs(
         .expect("read styled runs")
 }
 
+fn syntax_highlights_for_text(
+    workspace: &WindowHandle<Workspace>,
+    needle: &str,
+    cx: &mut TestAppContext,
+) -> Vec<Option<language::HighlightId>> {
+    let editor = active_editor(workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let text = snapshot.text();
+                let start = text
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle:?} in buffer text {text:?}"));
+                snapshot
+                    .chunks(
+                        multi_buffer::MultiBufferOffset(start)
+                            ..multi_buffer::MultiBufferOffset(start + needle.len()),
+                        language::LanguageAwareStyling {
+                            tree_sitter: true,
+                            diagnostics: false,
+                        },
+                    )
+                    .map(|chunk| chunk.syntax_highlight_id)
+                    .collect()
+            })
+        })
+        .expect("read buffer syntax highlights")
+}
+
 fn has_display_elision(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> bool {
     let editor = active_editor(workspace, cx);
     workspace
@@ -2069,6 +2099,95 @@ fn user_messages_render_larger_than_the_transcript_around_them(cx: &mut TestAppC
             })
         })
         .expect("read display snapshot");
+}
+
+#[gpui::test]
+fn streaming_replacement_does_not_inherit_previous_markdown_syntax(cx: &mut TestAppContext) {
+    let replaced = test_workspace(cx);
+    feed_frame(
+        &replaced,
+        cx,
+        agent(2),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant("**bold text**", None)],
+        )),
+    );
+
+    for _ in 0..64 {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+    }
+    feed_frame(
+        &replaced,
+        cx,
+        agent(2),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 1,
+                    block: UiBlockDiff::AssistantText(UiTextDiff {
+                        keep_bytes: 0,
+                        value: "plain text".to_owned(),
+                    }),
+                }],
+            },
+            status: None,
+            context_used: None,
+        },
+    );
+    let highlights = syntax_highlights_for_text(&replaced, "plain text", cx);
+    assert!(
+        highlights.iter().all(Option::is_none),
+        "replacement inherited the previous strong-emphasis highlight: {highlights:?}"
+    );
+}
+
+#[gpui::test]
+fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContext) {
+    let isolated = test_workspace(cx);
+    feed_frame(
+        &isolated,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant(
+                "target **bold text**",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
+    );
+
+    let after_unclosed_fence = test_workspace(cx);
+    feed_frame(
+        &after_unclosed_fence,
+        cx,
+        agent(2),
+        snapshot_frame(state(
+            vec![
+                user("first"),
+                assistant("```text\nunclosed", Some(UiMessagePhase::FinalAnswer)),
+                user("next"),
+            ],
+            vec![assistant(
+                "target **bold text**",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
+    );
+
+    for _ in 0..64 {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        syntax_highlights_for_text(&after_unclosed_fence, "target **bold text**", cx),
+        syntax_highlights_for_text(&isolated, "target **bold text**", cx),
+    );
 }
 
 /// Every row of a user message scales, not just the one its anchor starts
