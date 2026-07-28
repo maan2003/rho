@@ -32,6 +32,7 @@ async fn advertise_refs(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<ServiceQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     if !matches!(
         query.service.as_str(),
@@ -53,6 +54,8 @@ async fn advertise_refs(
         "info/refs",
         Some(&format!("service={}", query.service)),
         None,
+        headers.get("git-protocol"),
+        None,
     )
     .await
 }
@@ -60,6 +63,7 @@ async fn advertise_refs(
 async fn upload_pack(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
     let repo = repo.trim_end_matches(".git");
@@ -71,6 +75,8 @@ async fn upload_pack(
         "git-upload-pack",
         None,
         Some(reqwest::Body::wrap_stream(body.into_data_stream())),
+        headers.get("git-protocol"),
+        headers.get("content-encoding"),
     )
     .await
 }
@@ -78,6 +84,7 @@ async fn upload_pack(
 async fn receive_pack(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
     let repo = repo.trim_end_matches(".git");
@@ -90,10 +97,13 @@ async fn receive_pack(
         "git-receive-pack",
         None,
         Some(body),
+        headers.get("git-protocol"),
+        headers.get("content-encoding"),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn proxy(
     state: &AppState,
     method: reqwest::Method,
@@ -102,6 +112,8 @@ async fn proxy(
     endpoint: &str,
     query: Option<&str>,
     body: Option<reqwest::Body>,
+    git_protocol: Option<&axum::http::HeaderValue>,
+    content_encoding: Option<&axum::http::HeaderValue>,
 ) -> Result<Response, AppError> {
     let token = state.get_token().await?;
     let mut url = state.github_git_url(owner, repo, endpoint)?;
@@ -114,6 +126,12 @@ async fn proxy(
         .request(method, url)
         .header("Authorization", format!("Basic {credentials}"))
         .header("User-Agent", "octo");
+    if let Some(git_protocol) = git_protocol {
+        request = request.header("Git-Protocol", git_protocol);
+    }
+    if let Some(content_encoding) = content_encoding {
+        request = request.header("Content-Encoding", content_encoding);
+    }
     if let Some(body) = body {
         request = request
             .header("Content-Type", format!("application/x-{endpoint}-request"))
@@ -230,6 +248,70 @@ fn valid_rho_ref(reference: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn forwards_git_protocol_and_content_encoding() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen_tx = Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let upstream = Router::new().route(
+            "/acme/library.git/git-upload-pack",
+            post({
+                let seen_tx = seen_tx.clone();
+                move |headers: HeaderMap, body: Bytes| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        seen_tx
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .send((
+                                headers.get("git-protocol").cloned(),
+                                headers.get("content-encoding").cloned(),
+                                body,
+                            ))
+                            .unwrap();
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+
+        let octo = crate::router(
+            Arc::new(|| Ok("test-token".to_owned())),
+            reqwest::Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+        );
+        let octo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let octo_addr = octo_listener.local_addr().unwrap();
+        let octo_task =
+            tokio::spawn(async move { axum::serve(octo_listener, octo).await.unwrap() });
+
+        let body = Bytes::from_static(b"compressed git request");
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{octo_addr}/git/acme/library/git-upload-pack"
+            ))
+            .header("Git-Protocol", "version=2")
+            .header("Content-Encoding", "gzip")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (protocol, encoding, forwarded_body) = seen_rx.await.unwrap();
+        assert_eq!(protocol.unwrap(), "version=2");
+        assert_eq!(encoding.unwrap(), "gzip");
+        assert_eq!(forwarded_body, body);
+
+        octo_task.abort();
+        upstream_task.abort();
+    }
 
     fn packet(command: &str) -> Vec<u8> {
         let payload = format!("{command}\0 report-status\n");
