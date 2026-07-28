@@ -572,6 +572,11 @@
       "[": ["vim::PushHelixPrevious", { "around": true }],
       "ctrl-s": "editor::SaveLocation",
       "g q": "vim::PushRewrap",
+
+      // Fold-like display elision controls.
+      "z a": "editor::ToggleFold",
+      "z c": "editor::Fold",
+      "z o": "editor::UnfoldLines",
     },
   },
   {
@@ -1252,6 +1257,22 @@
     "bindings": {
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
+    },
+  },
+  {
+    "context": "RhoGui > Editor && vim_mode == insert && !showing_completions",
+    "use_key_equivalents": true,
+    "bindings": {
+      "shift-enter": "editor::Newline",
+      "enter": "rho_gui::SubmitPrompt",
+    },
+  },
+  {
+    "context": "RhoGui > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-k": "rho_gui::AgentPrevious",
+      "ctrl-j": "rho_gui::AgentNext",
     },
   },
 ]

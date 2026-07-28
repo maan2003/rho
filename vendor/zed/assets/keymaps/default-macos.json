@@ -424,6 +424,25 @@
     },
   },
   {
+    "context": "RhoGui > Editor && !showing_completions",
+    "use_key_equivalents": true,
+    "bindings": {
+      "shift-enter": "editor::Newline",
+      "enter": "rho_gui::SubmitPrompt",
+      "tab": "rho_gui::RoleCycle",
+      "shift-tab": "rho_gui::RoleCycleGroup",
+    },
+  },
+  {
+    "context": "RhoGui > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-k": "rho_gui::AgentPrevious",
+      "ctrl-j": "rho_gui::AgentNext",
+      "ctrl-shift-n": "rho_gui::AgentNew",
+    },
+  },
+  {
     "context": "ThreadHistory",
     "bindings": {
       "ctrl--": "pane::GoBack",
