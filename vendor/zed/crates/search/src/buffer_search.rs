@@ -224,9 +224,9 @@ impl Render for BufferSearchBar {
             |border_color| input_base_styles(border_color, |div| div.w(input_width));
 
         let input_style = if find_in_results {
-            filter_search_results_input(query_border, |div| div.w(input_width), cx)
+            filter_search_results_input(query_border.into(), |div| div.w(input_width), cx)
         } else {
-            input_base_styles(query_border)
+            input_base_styles(query_border.into())
         };
 
         let query_column = input_style
@@ -378,7 +378,7 @@ impl Render for BufferSearchBar {
             .child(mode_column);
 
         let replace_line = should_show_replace_input.then(|| {
-            let replace_column = input_base_styles(replacement_border).child(
+            let replace_column = input_base_styles(replacement_border.into()).child(
                 div()
                     .flex_1()
                     .py_1()

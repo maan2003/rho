@@ -1,6 +1,6 @@
 use crate::KeyBinding;
 use crate::prelude::*;
-use gpui::{AnyElement, App, BoxShadow, FontStyle, Hsla, IntoElement, Window};
+use gpui::{AnyElement, App, BoxShadow, Color as GpuiColor, FontStyle, IntoElement, Window};
 use theme::Appearance;
 
 /// Represents a hint for a keybinding, optionally with a prefix and suffix.
@@ -30,7 +30,7 @@ pub struct KeybindingHint {
     suffix: Option<SharedString>,
     keybinding: KeyBinding,
     size: Option<Pixels>,
-    background_color: Hsla,
+    background_color: GpuiColor,
 }
 
 impl KeybindingHint {
@@ -53,13 +53,13 @@ impl KeybindingHint {
     /// );
     /// # }
     /// ```
-    pub fn new(keybinding: KeyBinding, background_color: Hsla) -> Self {
+    pub fn new(keybinding: KeyBinding, background_color: impl Into<GpuiColor>) -> Self {
         Self {
             prefix: None,
             suffix: None,
             keybinding,
             size: None,
-            background_color,
+            background_color: background_color.into(),
         }
     }
 
@@ -86,14 +86,14 @@ impl KeybindingHint {
     pub fn with_prefix(
         prefix: impl Into<SharedString>,
         keybinding: KeyBinding,
-        background_color: Hsla,
+        background_color: impl Into<GpuiColor>,
     ) -> Self {
         Self {
             prefix: Some(prefix.into()),
             suffix: None,
             keybinding,
             size: None,
-            background_color,
+            background_color: background_color.into(),
         }
     }
 
@@ -120,14 +120,14 @@ impl KeybindingHint {
     pub fn with_suffix(
         keybinding: KeyBinding,
         suffix: impl Into<SharedString>,
-        background_color: Hsla,
+        background_color: impl Into<GpuiColor>,
     ) -> Self {
         Self {
             prefix: None,
             suffix: Some(suffix.into()),
             keybinding,
             size: None,
-            background_color,
+            background_color: background_color.into(),
         }
     }
 
@@ -242,7 +242,7 @@ impl RenderOnce for KeybindingHint {
                     .border_1()
                     .border_color(border_color)
                     .bg(bg_color)
-                    .shadow(vec![BoxShadow::new(px(0.), px(1.), shadow_color)])
+                    .shadow(vec![BoxShadow::new(px(0.), px(1.), shadow_color.into())])
                     .child(self.keybinding.size(rems_from_px(kb_size))),
             )
             .children(self.suffix)

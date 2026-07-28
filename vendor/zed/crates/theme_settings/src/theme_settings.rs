@@ -336,11 +336,11 @@ pub fn refine_theme(theme: &ThemeContent) -> Theme {
                 color: highlight
                     .color
                     .as_ref()
-                    .and_then(|color| try_parse_color(color).ok()),
+                    .and_then(|color| try_parse_color(color).ok().map(Into::into)),
                 background_color: highlight
                     .background_color
                     .as_ref()
-                    .and_then(|color| try_parse_color(color).ok()),
+                    .and_then(|color| try_parse_color(color).ok().map(Into::into)),
                 font_style: highlight.font_style.map(|s| s.into_gpui()),
                 font_weight: highlight.font_weight.map(|w| w.into_gpui()),
                 ..Default::default()

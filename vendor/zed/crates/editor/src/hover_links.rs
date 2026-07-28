@@ -546,7 +546,7 @@ pub fn show_link_definition(
                                 thickness: px(1.),
                                 ..UnderlineStyle::default()
                             }),
-                            color: Some(cx.theme().colors().link_text_hover),
+                            color: Some(cx.theme().colors().link_text_hover.into()),
                             ..HighlightStyle::default()
                         };
                         let highlight_range =
@@ -598,7 +598,7 @@ pub fn show_link_definition(
                             thickness: px(1.),
                             ..UnderlineStyle::default()
                         }),
-                        color: Some(cx.theme().colors().link_text_hover),
+                        color: Some(cx.theme().colors().link_text_hover.into()),
                         ..HighlightStyle::default()
                     };
                     editor.highlight_text(

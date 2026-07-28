@@ -1,7 +1,6 @@
 #![allow(missing_docs)]
 
-use gpui::{HighlightStyle, Hsla};
-use palette::FromColor;
+use gpui::{Color, HighlightStyle};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::IntoGpui;
@@ -47,11 +46,11 @@ pub fn syntax_overrides(this: &settings::ThemeStyleContent) -> Vec<(String, High
                     color: style
                         .color
                         .as_ref()
-                        .and_then(|color| theme::try_parse_color(color).ok()),
+                        .and_then(|color| theme::try_parse_color(color).ok().map(Into::into)),
                     background_color: style
                         .background_color
                         .as_ref()
-                        .and_then(|color| theme::try_parse_color(color).ok()),
+                        .and_then(|color| theme::try_parse_color(color).ok().map(Into::into)),
                     font_style: style.font_style.map(|s| s.into_gpui()),
                     font_weight: style.font_weight.map(|w| w.into_gpui()),
                     ..Default::default()
@@ -494,7 +493,7 @@ pub fn theme_colors_refinement(
             .and_then(|color| try_parse_color(color).ok())
             .or(panel_background
                 .zip(element_hover)
-                .map(|(panel_bg, hover_bg)| panel_bg.blend(hover_bg))
+                .map(|(panel_bg, hover_bg)| blend(panel_bg, hover_bg))
                 .map(ensure_opaque)),
         pane_focused_border: this
             .pane_focused_border
@@ -876,35 +875,36 @@ pub fn theme_colors_refinement(
     }
 }
 
-fn ensure_non_opaque(color: Hsla) -> Hsla {
+fn ensure_non_opaque(color: Color) -> Color {
     const MAXIMUM_OPACITY: f32 = 0.7;
     if color.a <= MAXIMUM_OPACITY {
         color
     } else {
-        Hsla {
-            a: MAXIMUM_OPACITY,
-            ..color
-        }
+        color.alpha(MAXIMUM_OPACITY)
     }
 }
 
-fn ensure_opaque(color: Hsla) -> Hsla {
-    Hsla { a: 1.0, ..color }
+fn ensure_opaque(color: Color) -> Color {
+    color.alpha(1.0)
 }
 
-fn try_parse_color(color: &str) -> anyhow::Result<Hsla> {
-    let rgba = gpui::Rgba::try_from(color)?;
-    let rgba = palette::rgb::Srgba::from_components((rgba.r, rgba.g, rgba.b, rgba.a));
-    let hsla = palette::Hsla::from_color(rgba);
+fn try_parse_color(color: &str) -> anyhow::Result<Color> {
+    Color::try_from(color)
+}
 
-    let hsla = gpui::hsla(
-        hsla.hue.into_positive_degrees() / 360.,
-        hsla.saturation,
-        hsla.lightness,
-        hsla.alpha,
-    );
-
-    Ok(hsla)
+fn blend(base: Color, overlay: Color) -> Color {
+    if overlay.a >= 1.0 {
+        overlay
+    } else if overlay.a <= 0.0 {
+        base
+    } else {
+        Color::linear_srgb(
+            (base.r * (1.0 - overlay.a)) + (overlay.r * overlay.a),
+            (base.g * (1.0 - overlay.a)) + (overlay.g * overlay.a),
+            (base.b * (1.0 - overlay.a)) + (overlay.b * overlay.a),
+            base.a,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1062,7 +1062,7 @@ mod tests {
         assert_eq!(refinement.editor_diff_hunk_deleted_hollow_border, None);
     }
 
-    fn parse_color(color: &str) -> gpui::Hsla {
+    fn parse_color(color: &str) -> gpui::Color {
         match try_parse_color(color) {
             Ok(color) => color,
             Err(error) => panic!("failed to parse color {color}: {error}"),

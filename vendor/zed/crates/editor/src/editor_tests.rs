@@ -7,7 +7,7 @@ use crate::{
     linked_editing_ranges::LinkedEditingRanges,
     mouse_context_menu::MenuPosition,
     runnables::RunnableTasks,
-    scroll::scroll_amount::ScrollAmount,
+    scroll::{Autoscroll, AutoscrollStrategy, scroll_amount::ScrollAmount},
     test::{
         assert_text_with_selections, build_editor, editor_content_with_blocks,
         editor_lsp_test_context::{EditorLspTestContext, git_commit_lang},
@@ -3646,6 +3646,114 @@ async fn test_exclude_overscroll_margin_clamps_scroll_position(cx: &mut TestAppC
             gpui::Point::new(0., max_scroll_top)
         );
     });
+}
+
+#[gpui::test]
+async fn test_autoscroll_pin_follows_target_until_user_scrolls_away(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.scroll_beyond_last_line = Some(ScrollBeyondLastLine::Off);
+    });
+
+    let mut cx = EditorTestContext::new(cx).await;
+    let line_height = cx.update_editor(|editor, window, cx| {
+        editor
+            .style(cx)
+            .text
+            .line_height_in_pixels(window.rem_size())
+    });
+    let window = cx.window;
+    cx.simulate_window_resize(window, size(px(1000.), 4. * line_height));
+    cx.set_state(
+        &r#"
+        ˇone
+        two
+        three
+        four
+        five
+        six
+        seven
+        eight
+        nine
+        ten
+        "#
+        .unindent(),
+    );
+
+    pin_to_buffer_end(&mut cx);
+    draw_editor(&mut cx);
+    assert_scrolled_to_bottom(&mut cx);
+
+    append_to_buffer(&mut cx, "eleven\ntwelve\n");
+    draw_editor(&mut cx);
+    assert_scrolled_to_bottom(&mut cx);
+
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(
+            SelectionEffects::scroll(Autoscroll::top()),
+            window,
+            cx,
+            |selections| {
+                selections.select_ranges([Point::zero()..Point::zero()]);
+            },
+        );
+    });
+    draw_editor(&mut cx);
+    assert_eq!(scroll_top(&mut cx), 0.);
+    append_to_buffer(&mut cx, "thirteen\nfourteen\n");
+    draw_editor(&mut cx);
+    assert_eq!(scroll_top(&mut cx), 0.);
+
+    cx.update_editor(|editor, window, cx| {
+        editor.set_scroll_position(gpui::Point::new(0., 0.), window, cx);
+    });
+    append_to_buffer(&mut cx, "fifteen\nsixteen\n");
+    draw_editor(&mut cx);
+    assert_eq!(scroll_top(&mut cx), 0.);
+
+    let bottom = max_scroll_top(&mut cx);
+    cx.update_editor(|editor, window, cx| {
+        editor.set_scroll_position(gpui::Point::new(0., bottom), window, cx);
+    });
+    append_to_buffer(&mut cx, "seventeen\neighteen\n");
+    draw_editor(&mut cx);
+    assert_scrolled_to_bottom(&mut cx);
+}
+
+fn pin_to_buffer_end(cx: &mut EditorTestContext) {
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchor = snapshot.anchor_after(snapshot.max_point());
+        editor.set_autoscroll_pin(anchor, AutoscrollStrategy::Bottom, cx);
+    });
+}
+
+fn append_to_buffer(cx: &mut EditorTestContext, text: &str) {
+    cx.update_multibuffer(|buffer, cx| {
+        let end = buffer.len(cx);
+        buffer.edit([(end..end, text)], None, cx);
+    });
+}
+
+fn draw_editor(cx: &mut EditorTestContext) {
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+}
+
+fn scroll_top(cx: &mut EditorTestContext) -> f64 {
+    cx.update_editor(|editor, _, cx| editor.scroll_position(cx).y)
+}
+
+fn max_scroll_top(cx: &mut EditorTestContext) -> f64 {
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        (snapshot.max_point().row().as_f64() - editor.visible_line_count().unwrap() + 1.).max(0.)
+    })
+}
+
+fn assert_scrolled_to_bottom(cx: &mut EditorTestContext) {
+    assert_eq!(scroll_top(cx), max_scroll_top(cx));
 }
 
 #[gpui::test]
@@ -7597,6 +7705,83 @@ fn test_manipulate_text_handles_cross_excerpt_edit_that_applies_differently(
         editor
     });
 }
+#[gpui::test]
+fn test_editing_commands_do_not_cross_readonly_excerpt_boundary(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let transcript = cx.new(|cx| {
+        let mut buffer = Buffer::local("readonly\n", cx);
+        buffer.set_capability(language::Capability::Read, cx);
+        buffer
+    });
+    let prompt = cx.new(|cx| Buffer::local("draft", cx));
+    let multibuffer = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::without_headers(ReadWrite);
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            transcript.clone(),
+            [Point::new(0, 0)..Point::new(1, 0)],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(1),
+            prompt.clone(),
+            [Point::new(0, 0)..Point::new(0, 5)],
+            0,
+            cx,
+        );
+        multibuffer
+    });
+
+    cx.add_window(|window, cx| {
+        let mut editor = build_editor(multibuffer, window, cx);
+
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 4)..Point::new(0, 4)]);
+        });
+        editor.prepare_for_insert(window, cx);
+        let selections = editor.selections.all::<Point>(&editor.display_snapshot(cx));
+        assert_eq!(selections[0].range(), Point::new(2, 0)..Point::new(2, 0));
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([Point::new(2, 0)..Point::new(2, 0)]);
+        });
+        editor.backspace(&Backspace, window, cx);
+        assert_eq!(transcript.read(cx).text(), "readonly\n");
+        assert_eq!(prompt.read(cx).text(), "draft");
+        let selections = editor.selections.all::<Point>(&editor.display_snapshot(cx));
+        assert_eq!(selections[0].range(), Point::new(2, 0)..Point::new(2, 0));
+        editor.set_restrict_navigation_to_editable_ranges(true);
+        editor.move_up(&MoveUp, window, cx);
+        let selections = editor.selections.all::<Point>(&editor.display_snapshot(cx));
+        assert_eq!(selections[0].range(), Point::new(2, 0)..Point::new(2, 0));
+
+        editor.set_restrict_navigation_to_editable_ranges(false);
+        editor.move_up(&MoveUp, window, cx);
+        let selections = editor.selections.all::<Point>(&editor.display_snapshot(cx));
+        assert_eq!(selections[0].range(), Point::new(1, 0)..Point::new(1, 0));
+
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([Point::new(2, 0)..Point::new(2, 0)]);
+        });
+
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 8)..Point::new(0, 8)]);
+        });
+        editor.delete(&Delete, window, cx);
+        assert_eq!(transcript.read(cx).text(), "readonly\n");
+        assert_eq!(prompt.read(cx).text(), "draft");
+
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 4)..Point::new(2, 2)]);
+        });
+        editor.insert("", window, cx);
+        assert_eq!(transcript.read(cx).text(), "readonly\n");
+        assert_eq!(prompt.read(cx).text(), "draft");
+
+        editor
+    });
+}
 
 #[gpui::test]
 async fn test_manipulate_text(cx: &mut TestAppContext) {
@@ -8190,6 +8375,191 @@ fn test_move_line_up_down_with_blocks(cx: &mut TestAppContext) {
             s.select_ranges([Point::new(2, 0)..Point::new(2, 0)])
         });
         editor.move_line_down(&MoveLineDown, window, cx);
+    });
+}
+
+#[gpui::test]
+fn test_display_elision_limited_and_collapsed_modes(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\nfour\nfive\nsix\nseven\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    let _ = editor.update(cx, |editor, window, cx| {
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let range =
+            snapshot.anchor_after(Point::new(0, 0))..snapshot.anchor_after(Point::new(4, 0));
+        let ids = editor.insert_display_elisions(
+            [DisplayElisionProperties {
+                range,
+                tail_rows: 5,
+                height: Some(1),
+                style: BlockStyle::Flex,
+                render: Arc::new(|_| div().child("⋯").into_any_element()),
+                priority: 0,
+                type_tag: None,
+            }],
+            None,
+            cx,
+        );
+        assert_eq!(
+            editor.display_text(cx),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\n"
+        );
+        let snapshot = editor.snapshot(window, cx);
+        assert!(
+            snapshot
+                .blocks_in_range(DisplayRow(0)..DisplayRow(10))
+                .all(|(_, block)| !matches!(block, Block::DisplayElision(_)))
+        );
+
+        editor.remove_display_elisions(ids.into_iter().collect(), None, cx);
+
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let range =
+            snapshot.anchor_after(Point::new(0, 0))..snapshot.anchor_after(Point::new(6, 0));
+        editor.insert_display_elisions(
+            [DisplayElisionProperties {
+                range,
+                tail_rows: 5,
+                height: Some(1),
+                style: BlockStyle::Flex,
+                render: Arc::new(|_| div().child("⋯").into_any_element()),
+                priority: 0,
+                type_tag: None,
+            }],
+            None,
+            cx,
+        );
+        assert_eq!(
+            editor.display_text(cx),
+            "\ntwo\nthree\nfour\nfive\nsix\nseven\n"
+        );
+        let snapshot = editor.snapshot(window, cx);
+        assert!(
+            snapshot
+                .blocks_in_range(DisplayRow(0)..DisplayRow(10))
+                .any(|(row, block)| row == DisplayRow(0)
+                    && matches!(block, Block::DisplayElision(_)))
+        );
+        assert_eq!(
+            snapshot
+                .point_to_display_point(Point::new(0, 0), text::Bias::Left)
+                .row(),
+            DisplayRow(0)
+        );
+        assert_eq!(
+            DisplayPoint::new(DisplayRow(0), 0).to_point(&snapshot),
+            Point::new(0, 0)
+        );
+
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 0)..Point::new(0, 0)])
+        });
+        editor.unfold_lines(&UnfoldLines, window, cx);
+        assert_eq!(
+            editor.display_text(cx),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\n"
+        );
+
+        editor.fold(&Fold, window, cx);
+        assert_eq!(
+            editor.display_text(cx),
+            "\ntwo\nthree\nfour\nfive\nsix\nseven\n"
+        );
+    });
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    let _ = editor.update(cx, |editor, window, cx| {
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let range =
+            snapshot.anchor_after(Point::new(0, 0))..snapshot.anchor_after(Point::new(1, 0));
+        editor.insert_display_elisions(
+            [DisplayElisionProperties {
+                range,
+                tail_rows: 0,
+                height: Some(1),
+                style: BlockStyle::Flex,
+                render: Arc::new(|_| div().child("⋯").into_any_element()),
+                priority: 0,
+                type_tag: None,
+            }],
+            None,
+            cx,
+        );
+        assert_eq!(editor.display_text(cx), "\ntwo\nthree\n");
+        let snapshot = editor.snapshot(window, cx);
+        assert!(
+            snapshot
+                .blocks_in_range(DisplayRow(0)..DisplayRow(10))
+                .any(|(row, block)| row == DisplayRow(0)
+                    && matches!(block, Block::DisplayElision(_)))
+        );
+    });
+}
+
+#[gpui::test]
+fn test_display_elision_updates_when_buffer_is_edited(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\nfour\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    let _ = editor.update(cx, |editor, window, cx| {
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let range =
+            snapshot.anchor_before(Point::new(0, 0))..snapshot.anchor_before(Point::new(3, 0));
+        editor.insert_display_elisions(
+            [DisplayElisionProperties {
+                range,
+                tail_rows: 5,
+                height: Some(1),
+                style: BlockStyle::Flex,
+                render: Arc::new(|_| div().child("⋯").into_any_element()),
+                priority: 0,
+                type_tag: None,
+            }],
+            None,
+            cx,
+        );
+
+        assert_eq!(editor.display_text(cx), "one\ntwo\nthree\nfour\n");
+        let snapshot = editor.snapshot(window, cx);
+        assert!(
+            snapshot
+                .blocks_in_range(DisplayRow(0)..DisplayRow(10))
+                .all(|(_, block)| !matches!(block, Block::DisplayElision(_)))
+        );
+
+        editor.buffer.update(cx, |buffer, cx| {
+            let snapshot = buffer.snapshot(cx);
+            let offset = snapshot.anchor_after(Point::new(2, 0)).to_offset(&snapshot);
+            buffer.edit(
+                [(offset..offset, "inserted-a\ninserted-b\ninserted-c\n")],
+                None,
+                cx,
+            );
+        });
+
+        assert_eq!(
+            editor.display_text(cx),
+            "\ntwo\ninserted-a\ninserted-b\ninserted-c\nthree\nfour\n"
+        );
+        let snapshot = editor.snapshot(window, cx);
+        assert!(
+            snapshot
+                .blocks_in_range(DisplayRow(0)..DisplayRow(10))
+                .any(|(row, block)| row == DisplayRow(0)
+                    && matches!(block, Block::DisplayElision(_)))
+        );
     });
 }
 
@@ -30935,7 +31305,7 @@ async fn test_edit_prediction_text(cx: &mut TestAppContext) {
             assert_eq!(highlighted_edits.highlights[0].0, 6..16);
             assert_eq!(
                 highlighted_edits.highlights[0].1.background_color,
-                Some(cx.theme().status().created_background)
+                Some(cx.theme().status().created_background.into())
             );
         },
     )
@@ -30953,7 +31323,7 @@ async fn test_edit_prediction_text(cx: &mut TestAppContext) {
             assert_eq!(highlighted_edits.highlights[0].0, 0..4);
             assert_eq!(
                 highlighted_edits.highlights[0].1.background_color,
-                Some(cx.theme().status().created_background)
+                Some(cx.theme().status().created_background.into())
             );
         },
     )
@@ -30975,11 +31345,11 @@ async fn test_edit_prediction_text(cx: &mut TestAppContext) {
             assert_eq!(highlighted_edits.highlights[1].0, 16..29);
             assert_eq!(
                 highlighted_edits.highlights[0].1.background_color,
-                Some(cx.theme().status().created_background)
+                Some(cx.theme().status().created_background.into())
             );
             assert_eq!(
                 highlighted_edits.highlights[1].1.background_color,
-                Some(cx.theme().status().created_background)
+                Some(cx.theme().status().created_background.into())
             );
         },
     )
@@ -31010,7 +31380,7 @@ async fn test_edit_prediction_text(cx: &mut TestAppContext) {
             for highlight in &highlighted_edits.highlights {
                 assert_eq!(
                     highlight.1.background_color,
-                    Some(cx.theme().status().created_background)
+                    Some(cx.theme().status().created_background.into())
                 );
             }
         },
@@ -31034,7 +31404,7 @@ async fn test_edit_prediction_text_with_deletions(cx: &mut TestAppContext) {
             assert_eq!(highlighted_edits.highlights[0].0, 5..11);
             assert_eq!(
                 highlighted_edits.highlights[0].1.background_color,
-                Some(cx.theme().status().deleted_background)
+                Some(cx.theme().status().deleted_background.into())
             );
         },
     )
@@ -31051,7 +31421,7 @@ async fn test_edit_prediction_text_with_deletions(cx: &mut TestAppContext) {
             assert_eq!(highlighted_edits.highlights[0].0, 6..14);
             assert_eq!(
                 highlighted_edits.highlights[0].1.background_color,
-                Some(cx.theme().status().created_background)
+                Some(cx.theme().status().created_background.into())
             );
         },
     )

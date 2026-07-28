@@ -246,7 +246,7 @@ impl Editor {
                         }
                         let settings = ThemeSettings::get_global(cx);
                         let style = TextStyle {
-                            color: cx.theme().colors().text,
+                            color: cx.theme().colors().text.into(),
                             font_family: settings.buffer_font.family.clone(),
                             font_fallbacks: settings.buffer_font.fallbacks.clone(),
                             font_features: settings.buffer_font.features.clone(),

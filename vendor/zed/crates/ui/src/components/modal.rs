@@ -1,4 +1,4 @@
-use crate::{IconButtonShape, prelude::*};
+use crate::{Color, IconButtonShape, prelude::*};
 
 use gpui::{prelude::FluentBuilder, *};
 use smallvec::SmallVec;

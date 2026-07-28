@@ -273,7 +273,12 @@ impl Vim {
             editor.highlight_background(
                 HighlightKey::VimExchange,
                 &ranges,
-                |_, theme| theme.colors().editor_document_highlight_read_background,
+                |_, theme| {
+                    theme
+                        .colors()
+                        .editor_document_highlight_read_background
+                        .into()
+                },
                 cx,
             );
         }

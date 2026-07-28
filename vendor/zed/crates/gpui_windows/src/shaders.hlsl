@@ -130,54 +130,11 @@ float3 srgb_to_linear(float3 color) {
     return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
 }
 
-/// Hsla to linear RGBA conversion.
-float4 hsla_to_rgba(Hsla hsla) {
-    float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
-    float s = hsla.s;
-    float l = hsla.l;
-    float a = hsla.a;
-
-    float c = (1.0 - abs(2.0 * l - 1.0)) * s;
-    float x = c * (1.0 - abs(fmod(h, 2.0) - 1.0));
-    float m = l - c / 2.0;
-
-    float r = 0.0;
-    float g = 0.0;
-    float b = 0.0;
-
-    if (h >= 0.0 && h < 1.0) {
-        r = c;
-        g = x;
-        b = 0.0;
-    } else if (h >= 1.0 && h < 2.0) {
-        r = x;
-        g = c;
-        b = 0.0;
-    } else if (h >= 2.0 && h < 3.0) {
-        r = 0.0;
-        g = c;
-        b = x;
-    } else if (h >= 3.0 && h < 4.0) {
-        r = 0.0;
-        g = x;
-        b = c;
-    } else if (h >= 4.0 && h < 5.0) {
-        r = x;
-        g = 0.0;
-        b = c;
-    } else {
-        r = c;
-        g = 0.0;
-        b = x;
-    }
-
-    float4 rgba;
-    rgba.x = (r + m);
-    rgba.y = (g + m);
-    rgba.z = (b + m);
-    rgba.w = a;
-    return rgba;
+/// GPUI colors are stored as extended linear sRGB / scRGB RGBA.
+float4 hsla_to_rgba(Hsla color) {
+    return float4(color.h, color.s, color.l, color.a);
 }
+
 
 // Converts a sRGB color to the Oklab color space.
 // Reference: https://bottosson.github.io/posts/oklab/#converting-from-linear-srgb-to-oklab

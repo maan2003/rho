@@ -1,5 +1,5 @@
 #![allow(missing_docs)]
-use gpui::{App, Hsla, SharedString};
+use gpui::{App, Color, Hsla, SharedString};
 
 use crate::{ActiveTheme, Appearance};
 
@@ -55,9 +55,9 @@ impl FromIterator<Hsla> for ColorScale {
 impl ColorScale {
     /// Returns the specified step in the [`ColorScale`].
     #[inline]
-    pub fn step(&self, step: ColorScaleStep) -> Hsla {
+    pub fn step(&self, step: ColorScaleStep) -> Color {
         // Steps are one-based, so we need convert to the zero-based vec index.
-        self.0[step.0 - 1]
+        self.0[step.0 - 1].into()
     }
 
     /// `Step 1` - Used for main application backgrounds.
@@ -65,7 +65,7 @@ impl ColorScale {
     /// This step provides a neutral base for any overlaying components, ideal for applications' main backdrop or empty spaces such as canvas areas.
     ///
     #[inline]
-    pub fn step_1(&self) -> Hsla {
+    pub fn step_1(&self) -> Color {
         self.step(ColorScaleStep::ONE)
     }
 
@@ -73,7 +73,7 @@ impl ColorScale {
     ///
     /// Like `Step 1`, this step allows variations in background styles, from striped tables, sidebar backgrounds, to card backgrounds.
     #[inline]
-    pub fn step_2(&self) -> Hsla {
+    pub fn step_2(&self) -> Color {
         self.step(ColorScaleStep::TWO)
     }
 
@@ -81,7 +81,7 @@ impl ColorScale {
     ///
     /// This step maintains accessibility by guaranteeing a contrast ratio of 4.5:1 with steps 11 and 12 for text. It could also suit hover states for transparent components.
     #[inline]
-    pub fn step_3(&self) -> Hsla {
+    pub fn step_3(&self) -> Color {
         self.step(ColorScaleStep::THREE)
     }
 
@@ -89,13 +89,13 @@ impl ColorScale {
     ///
     /// Also suited for pressed or selected states of components with a transparent background.
     #[inline]
-    pub fn step_4(&self) -> Hsla {
+    pub fn step_4(&self) -> Color {
         self.step(ColorScaleStep::FOUR)
     }
 
     /// `Step 5` - Used for UI component backgrounds in their pressed or selected states.
     #[inline]
-    pub fn step_5(&self) -> Hsla {
+    pub fn step_5(&self) -> Color {
         self.step(ColorScaleStep::FIVE)
     }
 
@@ -103,7 +103,7 @@ impl ColorScale {
     ///
     /// Its usage spans from sidebars' borders, headers' dividers, cards' outlines, to alerts' edges and separators.
     #[inline]
-    pub fn step_6(&self) -> Hsla {
+    pub fn step_6(&self) -> Color {
         self.step(ColorScaleStep::SIX)
     }
 
@@ -111,7 +111,7 @@ impl ColorScale {
     ///
     /// This step subtly delineates the boundary of elements users interact with.
     #[inline]
-    pub fn step_7(&self) -> Hsla {
+    pub fn step_7(&self) -> Color {
         self.step(ColorScaleStep::SEVEN)
     }
 
@@ -119,7 +119,7 @@ impl ColorScale {
     ///
     /// It strengthens the visibility and accessibility of active elements and their focus states.
     #[inline]
-    pub fn step_8(&self) -> Hsla {
+    pub fn step_8(&self) -> Color {
         self.step(ColorScaleStep::EIGHT)
     }
 
@@ -130,7 +130,7 @@ impl ColorScale {
     /// Due to its high chroma, `Step 9` is versatile and particularly useful for semantic colors such as
     /// error, warning, and success indicators.
     #[inline]
-    pub fn step_9(&self) -> Hsla {
+    pub fn step_9(&self) -> Color {
         self.step(ColorScaleStep::NINE)
     }
 
@@ -138,19 +138,19 @@ impl ColorScale {
     ///
     /// May also be used for extremely low contrast text. This should be used sparingly, as it may be difficult to read.
     #[inline]
-    pub fn step_10(&self) -> Hsla {
+    pub fn step_10(&self) -> Color {
         self.step(ColorScaleStep::TEN)
     }
 
     /// `Step 11` - Used for text and icons requiring low contrast or less emphasis.
     #[inline]
-    pub fn step_11(&self) -> Hsla {
+    pub fn step_11(&self) -> Color {
         self.step(ColorScaleStep::ELEVEN)
     }
 
     /// `Step 12` - Used for text and icons requiring high contrast or prominence.
     #[inline]
-    pub fn step_12(&self) -> Hsla {
+    pub fn step_12(&self) -> Color {
         self.step(ColorScaleStep::TWELVE)
     }
 }
@@ -282,14 +282,14 @@ impl ColorScaleSet {
         &self.dark_alpha
     }
 
-    pub fn step(&self, cx: &App, step: ColorScaleStep) -> Hsla {
+    pub fn step(&self, cx: &App, step: ColorScaleStep) -> Color {
         match cx.theme().appearance {
             Appearance::Light => self.light().step(step),
             Appearance::Dark => self.dark().step(step),
         }
     }
 
-    pub fn step_alpha(&self, cx: &App, step: ColorScaleStep) -> Hsla {
+    pub fn step_alpha(&self, cx: &App, step: ColorScaleStep) -> Color {
         match cx.theme().appearance {
             Appearance::Light => self.light_alpha.step(step),
             Appearance::Dark => self.dark_alpha.step(step),

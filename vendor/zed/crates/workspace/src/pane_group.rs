@@ -484,7 +484,7 @@ impl PaneLeaderDecorator for PaneRenderContext<'_> {
 
         LeaderDecoration {
             status_box,
-            border: Some(leader_color),
+            border: Some(leader_color.into()),
         }
     }
 

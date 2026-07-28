@@ -3,11 +3,11 @@ use super::*;
 pub fn make_suggestion_styles(cx: &App) -> EditPredictionStyles {
     EditPredictionStyles {
         insertion: HighlightStyle {
-            color: Some(cx.theme().status().predictive),
+            color: Some(cx.theme().status().predictive.into()),
             ..HighlightStyle::default()
         },
         whitespace: HighlightStyle {
-            background_color: Some(cx.theme().status().created_background),
+            background_color: Some(cx.theme().status().created_background.into()),
             ..HighlightStyle::default()
         },
     }
@@ -394,7 +394,12 @@ impl Editor {
                                 ));
                             self.highlight_rows::<EditPredictionPreview>(
                                 target..target,
-                                |cx| cx.theme().colors().editor_highlighted_line_background,
+                                |cx| {
+                                    cx.theme()
+                                        .colors()
+                                        .editor_highlighted_line_background
+                                        .into()
+                                },
                                 RowHighlightOptions {
                                     autoscroll: true,
                                     ..Default::default()
@@ -1028,7 +1033,7 @@ impl Editor {
                         HighlightKey::EditPredictionHighlight,
                         edits.iter().map(|(range, _)| range.clone()).collect(),
                         HighlightStyle {
-                            background_color: Some(background_color),
+                            background_color: Some(background_color.into()),
                             ..Default::default()
                         },
                         cx,
@@ -2345,13 +2350,13 @@ impl Editor {
     fn edit_prediction_line_popover_bg_color(cx: &App) -> Hsla {
         let accent_color = cx.theme().colors().text_accent;
         let editor_bg_color = cx.theme().colors().editor_background;
-        editor_bg_color.blend(accent_color.opacity(0.1))
+        editor_bg_color.blend(accent_color.opacity(0.1)).into()
     }
 
     fn edit_prediction_callout_popover_border_color(cx: &App) -> Hsla {
         let accent_color = cx.theme().colors().text_accent;
         let editor_bg_color = cx.theme().colors().editor_background;
-        editor_bg_color.blend(accent_color.opacity(0.6))
+        editor_bg_color.blend(accent_color.opacity(0.6)).into()
     }
 
     fn get_prediction_provider_icons(
@@ -2549,7 +2554,7 @@ fn edit_prediction_fallback_text(edits: &[(Range<Anchor>, Arc<str>)], cx: &App) 
     let mut highlights = Vec::new();
 
     let insertion_highlight_style = HighlightStyle {
-        color: Some(cx.theme().colors().text),
+        color: Some(cx.theme().colors().text.into()),
         ..Default::default()
     };
 

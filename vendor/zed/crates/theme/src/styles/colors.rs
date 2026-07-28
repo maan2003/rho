@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use gpui::{App, Hsla, SharedString, WindowBackgroundAppearance};
+use gpui::{App, Color, Hsla, SharedString, WindowBackgroundAppearance};
 use refineable::Refineable;
 use std::sync::Arc;
 use strum::{AsRefStr, EnumIter, IntoEnumIterator};
@@ -14,331 +14,331 @@ use crate::{
 #[refineable(Debug, serde::Deserialize)]
 pub struct ThemeColors {
     /// Border color. Used for most borders, is usually a high contrast color.
-    pub border: Hsla,
+    pub border: Color,
     /// Border color. Used for deemphasized borders, like a visual divider between two sections
-    pub border_variant: Hsla,
+    pub border_variant: Color,
     /// Border color. Used for focused elements, like keyboard focused list item.
-    pub border_focused: Hsla,
+    pub border_focused: Color,
     /// Border color. Used for selected elements, like an active search filter or selected checkbox.
-    pub border_selected: Hsla,
+    pub border_selected: Color,
     /// Border color. Used for transparent borders. Used for placeholder borders when an element gains a border on state change.
-    pub border_transparent: Hsla,
+    pub border_transparent: Color,
     /// Border color. Used for disabled elements, like a disabled input or button.
-    pub border_disabled: Hsla,
+    pub border_disabled: Color,
     /// Border color. Used for elevated surfaces, like a context menu, popup, or dialog.
-    pub elevated_surface_background: Hsla,
+    pub elevated_surface_background: Color,
     /// Background Color. Used for grounded surfaces like a panel or tab.
-    pub surface_background: Hsla,
+    pub surface_background: Color,
     /// Background Color. Used for the app background and blank panels or windows.
-    pub background: Hsla,
+    pub background: Color,
     /// Background Color. Used for the background of an element that should have a different background than the surface it's on.
     ///
     /// Elements might include: Buttons, Inputs, Checkboxes, Radio Buttons...
     ///
     /// For an element that should have the same background as the surface it's on, use `ghost_element_background`.
-    pub element_background: Hsla,
+    pub element_background: Color,
     /// Background Color. Used for the hover state of an element that should have a different background than the surface it's on.
     ///
     /// Hover states are triggered by the mouse entering an element, or a finger touching an element on a touch screen.
-    pub element_hover: Hsla,
+    pub element_hover: Color,
     /// Background Color. Used for the active state of an element that should have a different background than the surface it's on.
     ///
     /// Active states are triggered by the mouse button being pressed down on an element, or the Return button or other activator being pressed.
-    pub element_active: Hsla,
+    pub element_active: Color,
     /// Background Color. Used for the selected state of an element that should have a different background than the surface it's on.
     ///
     /// Selected states are triggered by the element being selected (or "activated") by the user.
     ///
     /// This could include a selected checkbox, a toggleable button that is toggled on, etc.
-    pub element_selected: Hsla,
+    pub element_selected: Color,
     /// Background Color. Used for the background of selections in a UI element.
-    pub element_selection_background: Hsla,
+    pub element_selection_background: Color,
     /// Background Color. Used for the disabled state of an element that should have a different background than the surface it's on.
     ///
     /// Disabled states are shown when a user cannot interact with an element, like a disabled button or input.
-    pub element_disabled: Hsla,
+    pub element_disabled: Color,
     /// Background Color. Used for the area that shows where a dragged element will be dropped.
-    pub drop_target_background: Hsla,
+    pub drop_target_background: Color,
     /// Border Color. Used for the border that shows where a dragged element will be dropped.
-    pub drop_target_border: Hsla,
+    pub drop_target_border: Color,
     /// Used for the background of a ghost element that should have the same background as the surface it's on.
     ///
     /// Elements might include: Buttons, Inputs, Checkboxes, Radio Buttons...
     ///
     /// For an element that should have a different background than the surface it's on, use `element_background`.
-    pub ghost_element_background: Hsla,
+    pub ghost_element_background: Color,
     /// Background Color. Used for the hover state of a ghost element that should have the same background as the surface it's on.
     ///
     /// Hover states are triggered by the mouse entering an element, or a finger touching an element on a touch screen.
-    pub ghost_element_hover: Hsla,
+    pub ghost_element_hover: Color,
     /// Background Color. Used for the active state of a ghost element that should have the same background as the surface it's on.
     ///
     /// Active states are triggered by the mouse button being pressed down on an element, or the Return button or other activator being pressed.
-    pub ghost_element_active: Hsla,
+    pub ghost_element_active: Color,
     /// Background Color. Used for the selected state of a ghost element that should have the same background as the surface it's on.
     ///
     /// Selected states are triggered by the element being selected (or "activated") by the user.
     ///
     /// This could include a selected checkbox, a toggleable button that is toggled on, etc.
-    pub ghost_element_selected: Hsla,
+    pub ghost_element_selected: Color,
     /// Background Color. Used for the disabled state of a ghost element that should have the same background as the surface it's on.
     ///
     /// Disabled states are shown when a user cannot interact with an element, like a disabled button or input.
-    pub ghost_element_disabled: Hsla,
+    pub ghost_element_disabled: Color,
     /// Text Color. Default text color used for most text.
-    pub text: Hsla,
+    pub text: Color,
     /// Text Color. Color of muted or deemphasized text. It is a subdued version of the standard text color.
-    pub text_muted: Hsla,
+    pub text_muted: Color,
     /// Text Color. Color of the placeholder text typically shown in input fields to guide the user to enter valid data.
-    pub text_placeholder: Hsla,
+    pub text_placeholder: Color,
     /// Text Color. Color used for text denoting disabled elements. Typically, the color is faded or grayed out to emphasize the disabled state.
-    pub text_disabled: Hsla,
+    pub text_disabled: Color,
     /// Text Color. Color used for emphasis or highlighting certain text, like an active filter or a matched character in a search.
-    pub text_accent: Hsla,
+    pub text_accent: Color,
     /// Fill Color. Used for the default fill color of an icon.
-    pub icon: Hsla,
+    pub icon: Color,
     /// Fill Color. Used for the muted or deemphasized fill color of an icon.
     ///
     /// This might be used to show an icon in an inactive pane, or to deemphasize a series of icons to give them less visual weight.
-    pub icon_muted: Hsla,
+    pub icon_muted: Color,
     /// Fill Color. Used for the disabled fill color of an icon.
     ///
     /// Disabled states are shown when a user cannot interact with an element, like a icon button.
-    pub icon_disabled: Hsla,
+    pub icon_disabled: Color,
     /// Fill Color. Used for the placeholder fill color of an icon.
     ///
     /// This might be used to show an icon in an input that disappears when the user enters text.
-    pub icon_placeholder: Hsla,
+    pub icon_placeholder: Color,
     /// Fill Color. Used for the accent fill color of an icon.
     ///
     /// This might be used to show when a toggleable icon button is selected.
-    pub icon_accent: Hsla,
+    pub icon_accent: Color,
     /// Color used to accent some debugger elements
     /// Is used by breakpoints
-    pub debugger_accent: Hsla,
+    pub debugger_accent: Color,
 
     // ===
     // UI Elements
     // ===
-    pub status_bar_background: Hsla,
-    pub title_bar_background: Hsla,
-    pub title_bar_inactive_background: Hsla,
-    pub toolbar_background: Hsla,
-    pub tab_bar_background: Hsla,
-    pub tab_inactive_background: Hsla,
-    pub tab_active_background: Hsla,
-    pub search_match_background: Hsla,
-    pub search_active_match_background: Hsla,
-    pub panel_background: Hsla,
-    pub panel_focused_border: Hsla,
-    pub panel_indent_guide: Hsla,
-    pub panel_indent_guide_hover: Hsla,
-    pub panel_indent_guide_active: Hsla,
+    pub status_bar_background: Color,
+    pub title_bar_background: Color,
+    pub title_bar_inactive_background: Color,
+    pub toolbar_background: Color,
+    pub tab_bar_background: Color,
+    pub tab_inactive_background: Color,
+    pub tab_active_background: Color,
+    pub search_match_background: Color,
+    pub search_active_match_background: Color,
+    pub panel_background: Color,
+    pub panel_focused_border: Color,
+    pub panel_indent_guide: Color,
+    pub panel_indent_guide_hover: Color,
+    pub panel_indent_guide_active: Color,
 
     /// The color of the overlay surface on top of panel.
-    pub panel_overlay_background: Hsla,
+    pub panel_overlay_background: Color,
     /// The color of the overlay surface on top of panel when hovered over.
-    pub panel_overlay_hover: Hsla,
+    pub panel_overlay_hover: Color,
 
-    pub pane_focused_border: Hsla,
-    pub pane_group_border: Hsla,
+    pub pane_focused_border: Color,
+    pub pane_group_border: Color,
     /// The color of the scrollbar thumb.
-    pub scrollbar_thumb_background: Hsla,
+    pub scrollbar_thumb_background: Color,
     /// The color of the scrollbar thumb when hovered over.
-    pub scrollbar_thumb_hover_background: Hsla,
+    pub scrollbar_thumb_hover_background: Color,
     /// The color of the scrollbar thumb whilst being actively dragged.
-    pub scrollbar_thumb_active_background: Hsla,
+    pub scrollbar_thumb_active_background: Color,
     /// The border color of the scrollbar thumb.
-    pub scrollbar_thumb_border: Hsla,
+    pub scrollbar_thumb_border: Color,
     /// The background color of the scrollbar track.
-    pub scrollbar_track_background: Hsla,
+    pub scrollbar_track_background: Color,
     /// The border color of the scrollbar track.
-    pub scrollbar_track_border: Hsla,
+    pub scrollbar_track_border: Color,
     /// The color of the minimap thumb.
-    pub minimap_thumb_background: Hsla,
+    pub minimap_thumb_background: Color,
     /// The color of the minimap thumb when hovered over.
-    pub minimap_thumb_hover_background: Hsla,
+    pub minimap_thumb_hover_background: Color,
     /// The color of the minimap thumb whilst being actively dragged.
-    pub minimap_thumb_active_background: Hsla,
+    pub minimap_thumb_active_background: Color,
     /// The border color of the minimap thumb.
-    pub minimap_thumb_border: Hsla,
+    pub minimap_thumb_border: Color,
 
     /// Background color for Vim Normal mode indicator.
-    pub vim_normal_background: Hsla,
+    pub vim_normal_background: Color,
     /// Background color for Vim Insert mode indicator.
-    pub vim_insert_background: Hsla,
+    pub vim_insert_background: Color,
     /// Background color for Vim Replace mode indicator.
-    pub vim_replace_background: Hsla,
+    pub vim_replace_background: Color,
     /// Background color for Vim Visual mode indicator.
-    pub vim_visual_background: Hsla,
+    pub vim_visual_background: Color,
     /// Background color for Vim Visual Line mode indicator.
-    pub vim_visual_line_background: Hsla,
+    pub vim_visual_line_background: Color,
     /// Background color for Vim Visual Block mode indicator.
-    pub vim_visual_block_background: Hsla,
+    pub vim_visual_block_background: Color,
     /// Background color for Vim yank highlight.
-    pub vim_yank_background: Hsla,
+    pub vim_yank_background: Color,
     /// Foreground color for Helix jump labels.
-    pub vim_helix_jump_label_foreground: Hsla,
+    pub vim_helix_jump_label_foreground: Color,
     /// Background color for Vim Helix Normal mode indicator.
-    pub vim_helix_normal_background: Hsla,
+    pub vim_helix_normal_background: Color,
     /// Background color for Vim Helix Select mode indicator.
-    pub vim_helix_select_background: Hsla,
+    pub vim_helix_select_background: Color,
     /// Foreground color for Vim Normal mode indicator.
-    pub vim_normal_foreground: Hsla,
+    pub vim_normal_foreground: Color,
     /// Foreground color for Vim Insert mode indicator.
-    pub vim_insert_foreground: Hsla,
+    pub vim_insert_foreground: Color,
     /// Foreground color for Vim Replace mode indicator.
-    pub vim_replace_foreground: Hsla,
+    pub vim_replace_foreground: Color,
     /// Foreground color for Vim Visual mode indicator.
-    pub vim_visual_foreground: Hsla,
+    pub vim_visual_foreground: Color,
     /// Foreground color for Vim Visual Line mode indicator.
-    pub vim_visual_line_foreground: Hsla,
+    pub vim_visual_line_foreground: Color,
     /// Foreground color for Vim Visual Block mode indicator.
-    pub vim_visual_block_foreground: Hsla,
+    pub vim_visual_block_foreground: Color,
     /// Foreground color for Vim Helix Normal mode indicator.
-    pub vim_helix_normal_foreground: Hsla,
+    pub vim_helix_normal_foreground: Color,
     /// Foreground color for Vim Helix Select mode indicator.
-    pub vim_helix_select_foreground: Hsla,
+    pub vim_helix_select_foreground: Color,
 
     // ===
     // Editor
     // ===
-    pub editor_foreground: Hsla,
-    pub editor_background: Hsla,
-    pub editor_gutter_background: Hsla,
-    pub editor_subheader_background: Hsla,
-    pub editor_active_line_background: Hsla,
-    pub editor_highlighted_line_background: Hsla,
+    pub editor_foreground: Color,
+    pub editor_background: Color,
+    pub editor_gutter_background: Color,
+    pub editor_subheader_background: Color,
+    pub editor_active_line_background: Color,
+    pub editor_highlighted_line_background: Color,
     /// Line color of the line a debugger is currently stopped at
-    pub editor_debugger_active_line_background: Hsla,
+    pub editor_debugger_active_line_background: Color,
     /// Text Color. Used for the text of the line number in the editor gutter.
-    pub editor_line_number: Hsla,
+    pub editor_line_number: Color,
     /// Text Color. Used for the text of the line number in the editor gutter when the line is highlighted.
-    pub editor_active_line_number: Hsla,
+    pub editor_active_line_number: Color,
     /// Text Color. Used for the text of the line number in the editor gutter when the line is hovered over.
-    pub editor_hover_line_number: Hsla,
+    pub editor_hover_line_number: Color,
     /// Text Color. Used to mark invisible characters in the editor.
     ///
     /// Example: spaces, tabs, carriage returns, etc.
-    pub editor_invisible: Hsla,
-    pub editor_wrap_guide: Hsla,
-    pub editor_active_wrap_guide: Hsla,
-    pub editor_indent_guide: Hsla,
-    pub editor_indent_guide_active: Hsla,
+    pub editor_invisible: Color,
+    pub editor_wrap_guide: Color,
+    pub editor_active_wrap_guide: Color,
+    pub editor_indent_guide: Color,
+    pub editor_indent_guide_active: Color,
     /// Read-access of a symbol, like reading a variable.
     ///
     /// A document highlight is a range inside a text document which deserves
     /// special attention. Usually a document highlight is visualized by changing
     /// the background color of its range.
-    pub editor_document_highlight_read_background: Hsla,
+    pub editor_document_highlight_read_background: Color,
     /// Read-access of a symbol, like reading a variable.
     ///
     /// A document highlight is a range inside a text document which deserves
     /// special attention. Usually a document highlight is visualized by changing
     /// the background color of its range.
-    pub editor_document_highlight_write_background: Hsla,
+    pub editor_document_highlight_write_background: Color,
     /// Highlighted brackets background color.
     ///
     /// Matching brackets in the cursor scope are highlighted with this background color.
-    pub editor_document_highlight_bracket_background: Hsla,
+    pub editor_document_highlight_bracket_background: Color,
     /// Filled background color for added diff hunk row highlights in the editor.
-    pub editor_diff_hunk_added_background: Hsla,
+    pub editor_diff_hunk_added_background: Color,
     /// Hollow background color for added diff hunk row highlights in the editor.
-    pub editor_diff_hunk_added_hollow_background: Hsla,
+    pub editor_diff_hunk_added_hollow_background: Color,
     /// Hollow border color for added diff hunk row highlights in the editor.
-    pub editor_diff_hunk_added_hollow_border: Hsla,
+    pub editor_diff_hunk_added_hollow_border: Color,
     /// Filled background color for deleted diff hunk row highlights in the editor.
-    pub editor_diff_hunk_deleted_background: Hsla,
+    pub editor_diff_hunk_deleted_background: Color,
     /// Hollow background color for deleted diff hunk row highlights in the editor.
-    pub editor_diff_hunk_deleted_hollow_background: Hsla,
+    pub editor_diff_hunk_deleted_hollow_background: Color,
     /// Hollow border color for deleted diff hunk row highlights in the editor.
-    pub editor_diff_hunk_deleted_hollow_border: Hsla,
+    pub editor_diff_hunk_deleted_hollow_border: Color,
 
     // ===
     // Terminal
     // ===
     /// Terminal layout background color.
-    pub terminal_background: Hsla,
+    pub terminal_background: Color,
     /// Terminal foreground color.
-    pub terminal_foreground: Hsla,
+    pub terminal_foreground: Color,
     /// Bright terminal foreground color.
-    pub terminal_bright_foreground: Hsla,
+    pub terminal_bright_foreground: Color,
     /// Dim terminal foreground color.
-    pub terminal_dim_foreground: Hsla,
+    pub terminal_dim_foreground: Color,
     /// Terminal ANSI background color.
-    pub terminal_ansi_background: Hsla,
+    pub terminal_ansi_background: Color,
     /// Black ANSI terminal color.
-    pub terminal_ansi_black: Hsla,
+    pub terminal_ansi_black: Color,
     /// Bright black ANSI terminal color.
-    pub terminal_ansi_bright_black: Hsla,
+    pub terminal_ansi_bright_black: Color,
     /// Dim black ANSI terminal color.
-    pub terminal_ansi_dim_black: Hsla,
+    pub terminal_ansi_dim_black: Color,
     /// Red ANSI terminal color.
-    pub terminal_ansi_red: Hsla,
+    pub terminal_ansi_red: Color,
     /// Bright red ANSI terminal color.
-    pub terminal_ansi_bright_red: Hsla,
+    pub terminal_ansi_bright_red: Color,
     /// Dim red ANSI terminal color.
-    pub terminal_ansi_dim_red: Hsla,
+    pub terminal_ansi_dim_red: Color,
     /// Green ANSI terminal color.
-    pub terminal_ansi_green: Hsla,
+    pub terminal_ansi_green: Color,
     /// Bright green ANSI terminal color.
-    pub terminal_ansi_bright_green: Hsla,
+    pub terminal_ansi_bright_green: Color,
     /// Dim green ANSI terminal color.
-    pub terminal_ansi_dim_green: Hsla,
+    pub terminal_ansi_dim_green: Color,
     /// Yellow ANSI terminal color.
-    pub terminal_ansi_yellow: Hsla,
+    pub terminal_ansi_yellow: Color,
     /// Bright yellow ANSI terminal color.
-    pub terminal_ansi_bright_yellow: Hsla,
+    pub terminal_ansi_bright_yellow: Color,
     /// Dim yellow ANSI terminal color.
-    pub terminal_ansi_dim_yellow: Hsla,
+    pub terminal_ansi_dim_yellow: Color,
     /// Blue ANSI terminal color.
-    pub terminal_ansi_blue: Hsla,
+    pub terminal_ansi_blue: Color,
     /// Bright blue ANSI terminal color.
-    pub terminal_ansi_bright_blue: Hsla,
+    pub terminal_ansi_bright_blue: Color,
     /// Dim blue ANSI terminal color.
-    pub terminal_ansi_dim_blue: Hsla,
+    pub terminal_ansi_dim_blue: Color,
     /// Magenta ANSI terminal color.
-    pub terminal_ansi_magenta: Hsla,
+    pub terminal_ansi_magenta: Color,
     /// Bright magenta ANSI terminal color.
-    pub terminal_ansi_bright_magenta: Hsla,
+    pub terminal_ansi_bright_magenta: Color,
     /// Dim magenta ANSI terminal color.
-    pub terminal_ansi_dim_magenta: Hsla,
+    pub terminal_ansi_dim_magenta: Color,
     /// Cyan ANSI terminal color.
-    pub terminal_ansi_cyan: Hsla,
+    pub terminal_ansi_cyan: Color,
     /// Bright cyan ANSI terminal color.
-    pub terminal_ansi_bright_cyan: Hsla,
+    pub terminal_ansi_bright_cyan: Color,
     /// Dim cyan ANSI terminal color.
-    pub terminal_ansi_dim_cyan: Hsla,
+    pub terminal_ansi_dim_cyan: Color,
     /// White ANSI terminal color.
-    pub terminal_ansi_white: Hsla,
+    pub terminal_ansi_white: Color,
     /// Bright white ANSI terminal color.
-    pub terminal_ansi_bright_white: Hsla,
+    pub terminal_ansi_bright_white: Color,
     /// Dim white ANSI terminal color.
-    pub terminal_ansi_dim_white: Hsla,
+    pub terminal_ansi_dim_white: Color,
 
     /// Represents a link text hover color.
-    pub link_text_hover: Hsla,
+    pub link_text_hover: Color,
 
     /// Represents an added entry or hunk in vcs, like git.
-    pub version_control_added: Hsla,
+    pub version_control_added: Color,
     /// Represents a deleted entry in version control systems.
-    pub version_control_deleted: Hsla,
+    pub version_control_deleted: Color,
     /// Represents a modified entry in version control systems.
-    pub version_control_modified: Hsla,
+    pub version_control_modified: Color,
     /// Represents a renamed entry in version control systems.
-    pub version_control_renamed: Hsla,
+    pub version_control_renamed: Color,
     /// Represents a conflicting entry in version control systems.
-    pub version_control_conflict: Hsla,
+    pub version_control_conflict: Color,
     /// Represents an ignored entry in version control systems.
-    pub version_control_ignored: Hsla,
+    pub version_control_ignored: Color,
     /// Represents an added word in a word diff.
-    pub version_control_word_added: Hsla,
+    pub version_control_word_added: Color,
     /// Represents a deleted word in a word diff.
-    pub version_control_word_deleted: Hsla,
+    pub version_control_word_deleted: Color,
     /// Represents the "ours" region of a merge conflict.
-    pub version_control_conflict_marker_ours: Hsla,
+    pub version_control_conflict_marker_ours: Color,
     /// Represents the "theirs" region of a merge conflict.
-    pub version_control_conflict_marker_theirs: Hsla,
+    pub version_control_conflict_marker_theirs: Color,
 }
 
 #[derive(EnumIter, Debug, Clone, Copy, AsRefStr)]
@@ -458,7 +458,7 @@ pub enum ThemeColorField {
 }
 
 impl ThemeColors {
-    pub fn color(&self, field: ThemeColorField) -> Hsla {
+    pub fn color(&self, field: ThemeColorField) -> Color {
         match field {
             ThemeColorField::Border => self.border,
             ThemeColorField::BorderVariant => self.border_variant,
@@ -584,11 +584,11 @@ impl ThemeColors {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (ThemeColorField, Hsla)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (ThemeColorField, Color)> + '_ {
         ThemeColorField::iter().map(move |field| (field, self.color(field)))
     }
 
-    pub fn to_vec(&self) -> Vec<(ThemeColorField, Hsla)> {
+    pub fn to_vec(&self) -> Vec<(ThemeColorField, Color)> {
         self.iter().collect()
     }
 }
@@ -599,7 +599,7 @@ pub fn all_theme_colors(cx: &mut App) -> Vec<(Hsla, SharedString)> {
         .map(|field| {
             let color = theme.colors().color(field);
             let name = field.as_ref().to_string();
-            (color, SharedString::from(name))
+            (color.into(), SharedString::from(name))
         })
         .collect()
 }
@@ -635,7 +635,7 @@ mod tests {
     fn override_a_single_theme_color() {
         let mut colors = ThemeColors::light();
 
-        let magenta: Hsla = gpui::rgb(0xff00ff).into();
+        let magenta: Color = gpui::rgb(0xff00ff).into();
 
         assert_ne!(colors.text, magenta);
 
@@ -653,8 +653,8 @@ mod tests {
     fn override_multiple_theme_colors() {
         let mut colors = ThemeColors::light();
 
-        let magenta: Hsla = gpui::rgb(0xff00ff).into();
-        let green: Hsla = gpui::rgb(0x00ff00).into();
+        let magenta: Color = gpui::rgb(0xff00ff).into();
+        let green: Color = gpui::rgb(0x00ff00).into();
 
         assert_ne!(colors.text, magenta);
         assert_ne!(colors.background, green);

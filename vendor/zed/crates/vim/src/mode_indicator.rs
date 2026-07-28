@@ -138,7 +138,7 @@ impl Render for ModeIndicator {
                 .pending_keys
                 .as_ref()
                 .unwrap_or(&current_operators_description);
-            let mode = if bg_color != system_transparent {
+            let mode = if bg_color != system_transparent.into() {
                 mode_str.into()
             } else {
                 format!("-- {} --", mode_str).into()
@@ -157,7 +157,7 @@ impl Render for ModeIndicator {
             .when_some(mode, |el, mode| {
                 el.child(
                     v_flex()
-                        .when(bg_color != system_transparent, |el| el.px_2())
+                        .when(bg_color != system_transparent.into(), |el| el.px_2())
                         // match with other icons at the bottom that use default buttons
                         .h(ButtonSize::Default.rems())
                         .justify_center()
@@ -169,8 +169,8 @@ impl Render for ModeIndicator {
                                 .line_height_style(LineHeightStyle::UiLabel)
                                 .weight(FontWeight::MEDIUM)
                                 .when(
-                                    bg_color != system_transparent
-                                        && vim_mode_text != system_transparent,
+                                    bg_color != system_transparent.into()
+                                        && vim_mode_text != system_transparent.into(),
                                     |el| el.color(Color::Custom(vim_mode_text)),
                                 ),
                         ),

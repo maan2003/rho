@@ -836,11 +836,11 @@ impl EditPreview {
         let mut offset_in_preview_snapshot = visible_range_in_preview_snapshot.start;
 
         let insertion_highlight_style = HighlightStyle {
-            background_color: Some(cx.theme().status().created_background),
+            background_color: Some(cx.theme().status().created_background.into()),
             ..Default::default()
         };
         let deletion_highlight_style = HighlightStyle {
-            background_color: Some(cx.theme().status().deleted_background),
+            background_color: Some(cx.theme().status().deleted_background.into()),
             ..Default::default()
         };
         let syntax_theme = cx.theme().syntax();

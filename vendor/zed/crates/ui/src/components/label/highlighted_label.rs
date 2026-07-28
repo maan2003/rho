@@ -213,13 +213,13 @@ impl RenderOnce for HighlightedLabel {
             &self.label,
             &self.highlight_indices,
             HighlightStyle {
-                color: Some(highlight_color),
+                color: Some(highlight_color.into()),
                 ..Default::default()
             },
         );
 
         let mut text_style = window.text_style();
-        text_style.color = self.base.color.color(cx);
+        text_style.color = self.base.color.color(cx).into();
 
         self.base
             .child(StyledText::new(self.label).with_default_highlights(&text_style, highlights))

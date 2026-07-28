@@ -1,4 +1,6 @@
-use gpui::{Hsla, IntoElement, PathBuilder, Refineable as _, StyleRefinement, canvas, point};
+use gpui::{
+    Color as GpuiColor, IntoElement, PathBuilder, Refineable as _, StyleRefinement, canvas, point,
+};
 
 use crate::prelude::*;
 
@@ -24,7 +26,7 @@ pub enum DividerColor {
 }
 
 impl DividerColor {
-    pub fn hsla(self, cx: &mut App) -> Hsla {
+    pub fn hsla(self, cx: &mut App) -> GpuiColor {
         match self {
             DividerColor::Border => cx.theme().colors().border,
             DividerColor::BorderFaded => cx.theme().colors().border.opacity(0.6),

@@ -267,7 +267,7 @@ impl RenderOnce for Label {
                     (
                         range.clone(),
                         HighlightStyle {
-                            background_color: Some(background_color),
+                            background_color: Some(background_color.into()),
                             ..Default::default()
                         },
                     )

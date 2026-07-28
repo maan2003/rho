@@ -422,9 +422,9 @@ fn show_hover(
                 Some(DiagnosticPopover {
                     local_diagnostic,
                     markdown,
-                    border_color,
+                    border_color: border_color.into(),
                     scroll_handle,
-                    background_color,
+                    background_color: background_color.into(),
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor,
                     last_bounds: Rc::new(Cell::new(None)),
@@ -597,7 +597,7 @@ fn show_hover(
                     editor.highlight_background(
                         HighlightKey::HoverState,
                         &hover_highlights,
-                        |_, theme| theme.colors().element_hover, // todo update theme
+                        |_, theme| theme.colors().element_hover.into(), // todo update theme
                         cx,
                     );
                 }
@@ -698,7 +698,7 @@ pub fn hover_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
         font_family: Some(ui_font_family),
         font_features: Some(ui_font_features),
         font_fallbacks: ui_font_fallbacks,
-        color: Some(cx.theme().colors().editor_foreground),
+        color: Some(cx.theme().colors().editor_foreground.into()),
         ..Default::default()
     });
     MarkdownStyle {
@@ -709,30 +709,30 @@ pub fn hover_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
             .font_features(buffer_font_features.clone())
             .font_weight(buffer_font_weight),
         inline_code: TextStyleRefinement {
-            background_color: Some(cx.theme().colors().background),
+            background_color: Some(cx.theme().colors().background.into()),
             font_family: Some(buffer_font_family),
             font_features: Some(buffer_font_features),
             font_fallbacks: buffer_font_fallbacks,
             font_weight: Some(buffer_font_weight),
             ..Default::default()
         },
-        rule_color: cx.theme().colors().border,
-        block_quote_border_color: Color::Muted.color(cx),
+        rule_color: cx.theme().colors().border.into(),
+        block_quote_border_color: Color::Muted.color(cx).into(),
         block_quote: TextStyleRefinement {
-            color: Some(Color::Muted.color(cx)),
+            color: Some(Color::Muted.color(cx).into()),
             ..Default::default()
         },
         link: TextStyleRefinement {
-            color: Some(cx.theme().colors().editor_foreground),
+            color: Some(cx.theme().colors().editor_foreground.into()),
             underline: Some(gpui::UnderlineStyle {
                 thickness: px(1.),
-                color: Some(cx.theme().colors().editor_foreground),
+                color: Some(cx.theme().colors().editor_foreground.into()),
                 wavy: false,
             }),
             ..Default::default()
         },
         syntax: cx.theme().syntax().clone(),
-        selection_background_color: cx.theme().colors().element_selection_background,
+        selection_background_color: cx.theme().colors().element_selection_background.into(),
         heading: StyleRefinement::default()
             .font_weight(FontWeight::BOLD)
             .text_base()
@@ -757,36 +757,36 @@ pub fn diagnostics_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
         font_family: Some(ui_font_family),
         font_features: Some(ui_font_features),
         font_fallbacks: ui_font_fallbacks,
-        color: Some(cx.theme().colors().editor_foreground),
+        color: Some(cx.theme().colors().editor_foreground.into()),
         ..Default::default()
     });
     MarkdownStyle {
         base_text_style,
         code_block: StyleRefinement::default().my(rems(1.)).font_buffer(cx),
         inline_code: TextStyleRefinement {
-            background_color: Some(cx.theme().colors().editor_background.opacity(0.5)),
+            background_color: Some(cx.theme().colors().editor_background.opacity(0.5).into()),
             font_family: Some(buffer_font_family),
             font_features: Some(buffer_font_features),
             font_fallbacks: buffer_font_fallbacks,
             ..Default::default()
         },
-        rule_color: cx.theme().colors().border,
-        block_quote_border_color: Color::Muted.color(cx),
+        rule_color: cx.theme().colors().border.into(),
+        block_quote_border_color: Color::Muted.color(cx).into(),
         block_quote: TextStyleRefinement {
-            color: Some(Color::Muted.color(cx)),
+            color: Some(Color::Muted.color(cx).into()),
             ..Default::default()
         },
         link: TextStyleRefinement {
-            color: Some(cx.theme().colors().editor_foreground),
+            color: Some(cx.theme().colors().editor_foreground.into()),
             underline: Some(gpui::UnderlineStyle {
                 thickness: px(1.),
-                color: Some(cx.theme().colors().editor_foreground),
+                color: Some(cx.theme().colors().editor_foreground.into()),
                 wavy: false,
             }),
             ..Default::default()
         },
         syntax: cx.theme().syntax().clone(),
-        selection_background_color: cx.theme().colors().element_selection_background,
+        selection_background_color: cx.theme().colors().element_selection_background.into(),
         height_is_multiple_of_line_height: true,
         heading: StyleRefinement::default()
             .font_weight(FontWeight::BOLD)

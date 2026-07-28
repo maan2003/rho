@@ -118,7 +118,7 @@ const AVATAR_URL: &str = "https://avatars.githubusercontent.com/u/1714999?v=4";
 
 impl ThemePreview {
     fn preview_bg(window: &mut Window, cx: &mut App) -> Hsla {
-        cx.theme().colors().editor_background
+        cx.theme().colors().editor_background.into()
     }
 
     fn render_text(
@@ -130,7 +130,7 @@ impl ThemePreview {
         let bg = layer.bg(cx);
 
         let label_with_contrast = |label: &str, fg: Hsla| {
-            let contrast = calculate_contrast_ratio(fg, bg);
+            let contrast = calculate_contrast_ratio(fg, bg.into());
             format!("{} ({:.2})", label, contrast)
         };
 
@@ -158,119 +158,119 @@ impl ThemePreview {
                             .child(
                                 Label::new(label_with_contrast(
                                     "Default Text",
-                                    Color::Default.color(cx),
+                                    Color::Default.color(cx).into(),
                                 ))
                                 .color(Color::Default),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Accent Text",
-                                    Color::Accent.color(cx),
+                                    Color::Accent.color(cx).into(),
                                 ))
                                 .color(Color::Accent),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Conflict Text",
-                                    Color::Conflict.color(cx),
+                                    Color::Conflict.color(cx).into(),
                                 ))
                                 .color(Color::Conflict),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Created Text",
-                                    Color::Created.color(cx),
+                                    Color::Created.color(cx).into(),
                                 ))
                                 .color(Color::Created),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Deleted Text",
-                                    Color::Deleted.color(cx),
+                                    Color::Deleted.color(cx).into(),
                                 ))
                                 .color(Color::Deleted),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Disabled Text",
-                                    Color::Disabled.color(cx),
+                                    Color::Disabled.color(cx).into(),
                                 ))
                                 .color(Color::Disabled),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Error Text",
-                                    Color::Error.color(cx),
+                                    Color::Error.color(cx).into(),
                                 ))
                                 .color(Color::Error),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Hidden Text",
-                                    Color::Hidden.color(cx),
+                                    Color::Hidden.color(cx).into(),
                                 ))
                                 .color(Color::Hidden),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Hint Text",
-                                    Color::Hint.color(cx),
+                                    Color::Hint.color(cx).into(),
                                 ))
                                 .color(Color::Hint),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Ignored Text",
-                                    Color::Ignored.color(cx),
+                                    Color::Ignored.color(cx).into(),
                                 ))
                                 .color(Color::Ignored),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Info Text",
-                                    Color::Info.color(cx),
+                                    Color::Info.color(cx).into(),
                                 ))
                                 .color(Color::Info),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Modified Text",
-                                    Color::Modified.color(cx),
+                                    Color::Modified.color(cx).into(),
                                 ))
                                 .color(Color::Modified),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Muted Text",
-                                    Color::Muted.color(cx),
+                                    Color::Muted.color(cx).into(),
                                 ))
                                 .color(Color::Muted),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Placeholder Text",
-                                    Color::Placeholder.color(cx),
+                                    Color::Placeholder.color(cx).into(),
                                 ))
                                 .color(Color::Placeholder),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Selected Text",
-                                    Color::Selected.color(cx),
+                                    Color::Selected.color(cx).into(),
                                 ))
                                 .color(Color::Selected),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Success Text",
-                                    Color::Success.color(cx),
+                                    Color::Success.color(cx).into(),
                                 ))
                                 .color(Color::Success),
                             )
                             .child(
                                 Label::new(label_with_contrast(
                                     "Warning Text",
-                                    Color::Warning.color(cx),
+                                    Color::Warning.color(cx).into(),
                                 ))
                                 .color(Color::Warning),
                             )

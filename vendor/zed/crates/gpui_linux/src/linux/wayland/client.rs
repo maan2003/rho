@@ -36,6 +36,10 @@ use wayland_client::{
         wl_shm_pool, wl_surface,
     },
 };
+use wayland_protocols::wp::color_management::v1::client::{
+    wp_color_management_surface_v1, wp_color_manager_v1, wp_image_description_creator_params_v1,
+    wp_image_description_v1,
+};
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
@@ -203,6 +207,8 @@ pub struct Globals {
     pub qh: QueueHandle<WaylandClientStatePtr>,
     pub activation: Option<xdg_activation_v1::XdgActivationV1>,
     pub compositor: wl_compositor::WlCompositor,
+    pub color_manager: Option<wp_color_manager_v1::WpColorManagerV1>,
+    pub color_manager_capabilities: Rc<RefCell<ColorManagerCapabilities>>,
     pub cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
     pub data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     pub primary_selection_manager:
@@ -223,6 +229,16 @@ pub struct Globals {
     pub executor: ForegroundExecutor,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ColorManagerCapabilities {
+    pub supports_parametric: bool,
+    pub supports_srgb_transfer: bool,
+    pub supports_display_p3_primaries: bool,
+    pub supports_bt2020_primaries: bool,
+    pub supports_perceptual_intent: bool,
+    pub done: bool,
+}
+
 impl Globals {
     fn new(
         globals: GlobalList,
@@ -231,6 +247,7 @@ impl Globals {
         seat: wl_seat::WlSeat,
     ) -> Self {
         let dialog_v = XdgWmDialogV1::interface().version;
+        let color_manager_capabilities = Rc::new(RefCell::new(ColorManagerCapabilities::default()));
         Globals {
             activation: globals.bind(&qh, 1..=1, ()).ok(),
             compositor: globals
@@ -241,6 +258,8 @@ impl Globals {
                     (),
                 )
                 .unwrap(),
+            color_manager: globals.bind(&qh, 1..=3, ()).ok(),
+            color_manager_capabilities,
             cursor_shape_manager: globals.bind(&qh, 1..=1, ()).ok(),
             data_device_manager: globals
                 .bind(
@@ -638,7 +657,8 @@ impl WaylandClient {
         let startup_activation_token = take_startup_activation_token_from_environment();
         let conn = Connection::connect_to_env().unwrap();
 
-        let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn).unwrap();
+        let (globals, mut event_queue) =
+            registry_queue_init::<WaylandClientStatePtr>(&conn).unwrap();
         let qh = event_queue.handle();
 
         let mut seat: Option<wl_seat::WlSeat> = None;
@@ -845,6 +865,10 @@ impl WaylandClient {
             event_loop: Some(event_loop),
             ime_enabled: None,
         }));
+
+        event_queue
+            .roundtrip(&mut WaylandClientStatePtr(Rc::downgrade(&state)))
+            .log_err();
 
         WaylandSource::new(conn, event_queue)
             .insert(handle)
@@ -1293,6 +1317,8 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
 
 delegate_noop!(WaylandClientStatePtr: ignore xdg_activation_v1::XdgActivationV1);
 delegate_noop!(WaylandClientStatePtr: ignore xdg_system_bell_v1::XdgSystemBellV1);
+delegate_noop!(WaylandClientStatePtr: ignore wp_color_management_surface_v1::WpColorManagementSurfaceV1);
+delegate_noop!(WaylandClientStatePtr: ignore wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1);
 delegate_noop!(WaylandClientStatePtr: ignore wl_compositor::WlCompositor);
 delegate_noop!(WaylandClientStatePtr: ignore wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
 delegate_noop!(WaylandClientStatePtr: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
@@ -1311,6 +1337,61 @@ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextI
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+
+impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &wp_color_manager_v1::WpColorManagerV1,
+        event: <wp_color_manager_v1::WpColorManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let capabilities = client.borrow().globals.color_manager_capabilities.clone();
+        let mut capabilities = capabilities.borrow_mut();
+        match event {
+            wp_color_manager_v1::Event::SupportedIntent { render_intent } => {
+                if matches!(
+                    render_intent,
+                    WEnum::Value(wp_color_manager_v1::RenderIntent::Perceptual)
+                ) {
+                    capabilities.supports_perceptual_intent = true;
+                }
+            }
+            wp_color_manager_v1::Event::SupportedFeature { feature } => {
+                if matches!(
+                    feature,
+                    WEnum::Value(wp_color_manager_v1::Feature::Parametric)
+                ) {
+                    capabilities.supports_parametric = true;
+                }
+            }
+            wp_color_manager_v1::Event::SupportedTfNamed { tf } => {
+                if matches!(
+                    tf,
+                    WEnum::Value(wp_color_manager_v1::TransferFunction::Srgb)
+                ) {
+                    capabilities.supports_srgb_transfer = true;
+                }
+            }
+            wp_color_manager_v1::Event::SupportedPrimariesNamed { primaries } => match primaries {
+                WEnum::Value(wp_color_manager_v1::Primaries::DisplayP3) => {
+                    capabilities.supports_display_p3_primaries = true;
+                }
+                WEnum::Value(wp_color_manager_v1::Primaries::Bt2020) => {
+                    capabilities.supports_bt2020_primaries = true;
+                }
+                _ => {}
+            },
+            wp_color_manager_v1::Event::Done => {
+                capabilities.done = true;
+                log::info!("Wayland color-manager capabilities: {capabilities:?}");
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(
@@ -2369,6 +2450,27 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
                 });
                 drop(state);
                 window.handle_input(input);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ObjectId> for WaylandClientStatePtr {
+    fn event(
+        _this: &mut Self,
+        _image_description: &wp_image_description_v1::WpImageDescriptionV1,
+        event: <wp_image_description_v1::WpImageDescriptionV1 as Proxy>::Event,
+        surface_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_image_description_v1::Event::Ready { .. } => {
+                log::debug!("Wayland image description for surface {surface_id:?} is ready");
+            }
+            wp_image_description_v1::Event::Failed { cause, msg } => {
+                log::warn!("Wayland wide-gamut image description failed ({cause:?}): {msg}");
             }
             _ => {}
         }

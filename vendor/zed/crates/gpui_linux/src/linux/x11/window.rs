@@ -729,6 +729,7 @@ impl X11WindowState {
                     // too
                     transparent: false,
                     preferred_present_mode: None,
+                    wide_gamut_color_space: None,
                 };
                 WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
             };

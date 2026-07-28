@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpui::{Hsla, IntoElement, Point, svg};
+use gpui::{Color as GpuiColor, IntoElement, Point, svg};
 use strum::{EnumIter, EnumString, IntoStaticStr};
 
 use crate::prelude::*;
@@ -60,9 +60,9 @@ impl IconDecorationKind {
 #[derive(IntoElement)]
 pub struct IconDecoration {
     kind: IconDecorationKind,
-    color: Hsla,
-    knockout_color: Hsla,
-    knockout_hover_color: Hsla,
+    color: GpuiColor,
+    knockout_color: GpuiColor,
+    knockout_hover_color: GpuiColor,
     size: Pixels,
     position: Point<Pixels>,
     group_name: Option<SharedString>,
@@ -70,7 +70,7 @@ pub struct IconDecoration {
 
 impl IconDecoration {
     /// Creates a new [`IconDecoration`].
-    pub fn new(kind: IconDecorationKind, knockout_color: Hsla, cx: &App) -> Self {
+    pub fn new(kind: IconDecorationKind, knockout_color: GpuiColor, cx: &App) -> Self {
         let color = cx.theme().colors().icon;
         let position = Point::default();
 
@@ -92,7 +92,7 @@ impl IconDecoration {
     }
 
     /// Sets the color of the decoration.
-    pub fn color(mut self, color: Hsla) -> Self {
+    pub fn color(mut self, color: GpuiColor) -> Self {
         self.color = color;
         self
     }
@@ -101,13 +101,13 @@ impl IconDecoration {
     ///
     /// Match this to the background of the element the icon will be rendered
     /// on.
-    pub fn knockout_color(mut self, color: Hsla) -> Self {
+    pub fn knockout_color(mut self, color: GpuiColor) -> Self {
         self.knockout_color = color;
         self
     }
 
     /// Sets the color of the decoration that is used on hover.
-    pub fn knockout_hover_color(mut self, color: Hsla) -> Self {
+    pub fn knockout_hover_color(mut self, color: GpuiColor) -> Self {
         self.knockout_hover_color = color;
         self
     }

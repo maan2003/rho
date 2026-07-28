@@ -1,5 +1,5 @@
 use documented::Documented;
-use gpui::Hsla;
+use gpui::Color as GpuiColor;
 
 use crate::components::Label;
 use crate::prelude::*;
@@ -12,9 +12,9 @@ pub struct ProgressBar {
     id: ElementId,
     value: f32,
     max_value: f32,
-    bg_color: Hsla,
-    over_color: Hsla,
-    fg_color: Hsla,
+    bg_color: GpuiColor,
+    over_color: GpuiColor,
+    fg_color: GpuiColor,
 }
 
 impl ProgressBar {
@@ -42,19 +42,19 @@ impl ProgressBar {
     }
 
     /// Sets the background color of the progress bar.
-    pub fn bg_color(mut self, color: Hsla) -> Self {
+    pub fn bg_color(mut self, color: GpuiColor) -> Self {
         self.bg_color = color;
         self
     }
 
     /// Sets the foreground color of the progress bar.
-    pub fn fg_color(mut self, color: Hsla) -> Self {
+    pub fn fg_color(mut self, color: GpuiColor) -> Self {
         self.fg_color = color;
         self
     }
 
     /// Sets the over limit color of the progress bar.
-    pub fn over_color(mut self, color: Hsla) -> Self {
+    pub fn over_color(mut self, color: GpuiColor) -> Self {
         self.over_color = color;
         self
     }

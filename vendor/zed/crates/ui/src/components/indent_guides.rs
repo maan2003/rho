@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, ops::Range, rc::Rc};
 
-use gpui::{AnyElement, App, Bounds, Entity, Hsla, Point, fill, point, size};
+use gpui::{AnyElement, App, Bounds, Color as GpuiColor, Entity, Point, fill, point, size};
 use gpui::{DispatchPhase, Hitbox, HitboxBehavior, MouseButton, MouseDownEvent, MouseMoveEvent};
 use smallvec::SmallVec;
 
@@ -10,11 +10,11 @@ use crate::prelude::*;
 #[derive(Debug, Clone)]
 pub struct IndentGuideColors {
     /// The color of the indent guide when it's neither active nor hovered.
-    pub default: Hsla,
+    pub default: GpuiColor,
     /// The color of the indent guide when it's hovered.
-    pub hover: Hsla,
+    pub hover: GpuiColor,
     /// The color of the indent guide when it's active.
-    pub active: Hsla,
+    pub active: GpuiColor,
 }
 
 impl IndentGuideColors {

@@ -1,5 +1,5 @@
 use documented::Documented;
-use gpui::{Hsla, PathBuilder, canvas, point};
+use gpui::{Color as GpuiColor, PathBuilder, canvas, point};
 use std::f32::consts::PI;
 
 use crate::prelude::*;
@@ -12,8 +12,8 @@ pub struct CircularProgress {
     size: Pixels,
     stroke_width: Pixels,
     radius: Option<Pixels>,
-    bg_color: Hsla,
-    progress_color: Hsla,
+    bg_color: GpuiColor,
+    progress_color: GpuiColor,
 }
 
 impl CircularProgress {
@@ -64,13 +64,13 @@ impl CircularProgress {
     }
 
     /// Sets the background circle color.
-    pub fn bg_color(mut self, color: Hsla) -> Self {
+    pub fn bg_color(mut self, color: GpuiColor) -> Self {
         self.bg_color = color;
         self
     }
 
     /// Sets the progress arc color.
-    pub fn progress_color(mut self, color: Hsla) -> Self {
+    pub fn progress_color(mut self, color: GpuiColor) -> Self {
         self.progress_color = color;
         self
     }

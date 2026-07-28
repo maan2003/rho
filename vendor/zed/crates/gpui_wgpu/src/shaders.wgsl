@@ -80,6 +80,8 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
+    output_color_space: u32,
+    framebuffer_is_srgb: u32,
     pad: u32,
 }
 
@@ -222,9 +224,13 @@ fn srgb_to_linear_component(a: f32) -> f32 {
 }
 
 fn linear_to_srgb(linear: vec3<f32>) -> vec3<f32> {
-    let cutoff = linear < vec3<f32>(0.0031308);
-    let higher = vec3<f32>(1.055) * pow(linear, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
-    let lower = linear * vec3<f32>(12.92);
+    // SDR swapchains use unorm formats today, so clamp out-of-gamut extended
+    // linear values before applying the sRGB transfer function. Without this,
+    // negative Display P3 components can produce NaNs through pow().
+    let clamped_linear = max(linear, vec3<f32>(0.0));
+    let cutoff = clamped_linear < vec3<f32>(0.0031308);
+    let higher = vec3<f32>(1.055) * pow(clamped_linear, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    let lower = clamped_linear * vec3<f32>(12.92);
     return select(higher, lower, cutoff);
 }
 
@@ -238,39 +244,94 @@ fn srgba_to_linear(color: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(srgb_to_linear(color.rgb), color.a);
 }
 
-/// Hsla to linear RGBA conversion.
-fn hsla_to_rgba(hsla: Hsla) -> vec4<f32> {
-    let h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
-    let s = hsla.s;
-    let l = hsla.l;
-    let a = hsla.a;
+/// GPUI colors are stored as linear Display P3 RGBA.
+fn hsla_to_rgba(color: Hsla) -> vec4<f32> {
+    return vec4<f32>(color.h, color.s, color.l, color.a);
+}
 
-    let c = (1.0 - abs(2.0 * l - 1.0)) * s;
-    let x = c * (1.0 - abs(h % 2.0 - 1.0));
-    let m = l - c / 2.0;
-    var color = vec3<f32>(m);
+fn linear_srgb_to_linear_display_p3(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        0.8224621 * color.r + 0.1775380 * color.g,
+        0.0331941 * color.r + 0.9668058 * color.g,
+        0.0170827 * color.r + 0.0723974 * color.g + 0.9105199 * color.b,
+        color.a,
+    );
+}
 
-    if (h >= 0.0 && h < 1.0) {
-        color.r += c;
-        color.g += x;
-    } else if (h >= 1.0 && h < 2.0) {
-        color.r += x;
-        color.g += c;
-    } else if (h >= 2.0 && h < 3.0) {
-        color.g += c;
-        color.b += x;
-    } else if (h >= 3.0 && h < 4.0) {
-        color.g += x;
-        color.b += c;
-    } else if (h >= 4.0 && h < 5.0) {
-        color.r += x;
-        color.b += c;
-    } else {
-        color.r += c;
-        color.b += x;
+fn linear_display_p3_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        1.2247455 * color.r - 0.22490445 * color.g,
+        -0.04205808 * color.r + 1.0420810 * color.g,
+        -0.01964226 * color.r - 0.07865488 * color.g + 1.0985371 * color.b,
+        color.a,
+    );
+}
+
+fn linear_srgb_to_linear_bt2020(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        0.6275037 * color.r + 0.3292755 * color.g + 0.0433027 * color.b,
+        0.0691084 * color.r + 0.9195192 * color.g + 0.0113596 * color.b,
+        0.0163941 * color.r + 0.0880113 * color.g + 0.8953804 * color.b,
+        color.a,
+    );
+}
+
+fn linear_bt2020_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        1.6602271 * color.r - 0.5875478 * color.g - 0.0728383 * color.b,
+        -0.1245536 * color.r + 1.1329261 * color.g - 0.0083496 * color.b,
+        -0.0181551 * color.r - 0.1006030 * color.g + 1.1189981 * color.b,
+        color.a,
+    );
+}
+
+fn linear_display_p3_to_linear_bt2020(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        0.7538330 * color.r + 0.1985974 * color.g + 0.0475696 * color.b,
+        0.0457438 * color.r + 0.9417772 * color.g + 0.0124789 * color.b,
+        -0.0012103 * color.r + 0.0176017 * color.g + 0.9836086 * color.b,
+        color.a,
+    );
+}
+
+fn linear_srgb_to_framebuffer_linear(color: vec4<f32>) -> vec4<f32> {
+    if (globals.output_color_space == 1u) {
+        return linear_srgb_to_linear_display_p3(color);
     }
+    if (globals.output_color_space == 2u) {
+        return linear_srgb_to_linear_bt2020(color);
+    }
+    return color;
+}
 
-    return vec4<f32>(color, a);
+/// Convert an sRGB-encoded asset color (emoji/image atlas) to the current framebuffer representation.
+fn srgba_asset_to_framebuffer(color: vec4<f32>) -> vec4<f32> {
+    let linear_color = linear_srgb_to_framebuffer_linear(srgba_to_linear(color));
+    if (globals.framebuffer_is_srgb != 0u) {
+        return linear_color;
+    }
+    return linear_to_srgba(linear_color);
+}
+
+/// Convert a GPUI color to the current framebuffer colorimetry.
+fn gpui_color_to_framebuffer_linear(color: Hsla) -> vec4<f32> {
+    let linear_display_p3 = hsla_to_rgba(color);
+    if (globals.output_color_space == 1u) {
+        return linear_display_p3;
+    }
+    if (globals.output_color_space == 2u) {
+        return linear_display_p3_to_linear_bt2020(linear_display_p3);
+    }
+    return linear_display_p3_to_linear_srgb(linear_display_p3);
+}
+
+/// Convert a GPUI color to the current framebuffer representation.
+fn gpui_color_to_framebuffer(color: Hsla) -> vec4<f32> {
+    let linear_color = gpui_color_to_framebuffer_linear(color);
+    if (globals.framebuffer_is_srgb != 0u) {
+        return linear_color;
+    }
+    return linear_to_srgba(linear_color);
 }
 
 /// Convert a linear sRGB to Oklab space.
@@ -292,6 +353,16 @@ fn linear_srgb_to_oklab(color: vec4<f32>) -> vec4<f32> {
 	);
 }
 
+fn linear_framebuffer_to_oklab(color: vec4<f32>) -> vec4<f32> {
+    if (globals.output_color_space == 1u) {
+        return linear_srgb_to_oklab(linear_display_p3_to_linear_srgb(color));
+    }
+    if (globals.output_color_space == 2u) {
+        return linear_srgb_to_oklab(linear_bt2020_to_linear_srgb(color));
+    }
+    return linear_srgb_to_oklab(color);
+}
+
 /// Convert an Oklab color to linear sRGB space.
 fn oklab_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
 	let l_ = color.r + 0.3963377774 * color.g + 0.2158037573 * color.b;
@@ -308,6 +379,17 @@ fn oklab_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
 		-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
 		color.a
 	);
+}
+
+fn oklab_to_linear_framebuffer(color: vec4<f32>) -> vec4<f32> {
+    let linear_srgb = oklab_to_linear_srgb(color);
+    if (globals.output_color_space == 1u) {
+        return linear_srgb_to_linear_display_p3(linear_srgb);
+    }
+    if (globals.output_color_space == 2u) {
+        return linear_srgb_to_linear_bt2020(linear_srgb);
+    }
+    return linear_srgb;
 }
 
 fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
@@ -406,7 +488,7 @@ fn prepare_gradient_color(tag: u32, color_space: u32,
     var result = GradientColor();
 
     if (tag == 0u || tag == 2u || tag == 3u) {
-        result.solid = hsla_to_rgba(solid);
+        result.solid = gpui_color_to_framebuffer(solid);
     } else if (tag == 1u) {
         // The hsla_to_rgba is returns a linear sRGB color
         result.color0 = hsla_to_rgba(colors[0].color);
@@ -470,11 +552,16 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
             switch (background.color_space) {
                 default: {
-                    background_color = srgba_to_linear(mix(color0, color1, t));
+                    background_color = mix(color0, color1, t);
                 }
                 case 1u: {
                     let oklab_color = mix(color0, color1, t);
-                    background_color = oklab_to_linear_srgb(oklab_color);
+                    let linear_color = oklab_to_linear_framebuffer(oklab_color);
+                    if (globals.framebuffer_is_srgb != 0u) {
+                        background_color = linear_color;
+                    } else {
+                        background_color = linear_to_srgba(linear_color);
+                    }
                 }
             }
         }
@@ -556,7 +643,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_solid = gradient.solid;
     out.background_color0 = gradient.color0;
     out.background_color1 = gradient.color1;
-    out.border_color = hsla_to_rgba(quad.border_color);
+    out.border_color = gpui_color_to_framebuffer(quad.border_color);
     out.quad_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
     return out;
@@ -992,7 +1079,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
 
     var out = ShadowVarying();
     out.position = to_device_position(unit_vertex, geometry);
-    out.color = hsla_to_rgba(shadow.color);
+    out.color = gpui_color_to_framebuffer(shadow.color);
     out.shadow_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
     return out;
@@ -1174,7 +1261,7 @@ fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
 
     var out = UnderlineVarying();
     out.position = to_device_position(unit_vertex, underline.bounds);
-    out.color = hsla_to_rgba(underline.color);
+    out.color = gpui_color_to_framebuffer(underline.color);
     out.underline_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
     return out;
@@ -1241,7 +1328,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
-    out.color = hsla_to_rgba(sprite.color);
+    out.color = gpui_color_to_framebuffer(sprite.color);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
@@ -1309,7 +1396,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+    return blend_color(srgba_asset_to_framebuffer(color), sprite.opacity * saturate(0.5 - distance));
 }
 
 // --- surfaces --- //

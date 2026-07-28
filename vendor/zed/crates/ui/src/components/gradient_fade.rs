@@ -1,13 +1,13 @@
-use gpui::{Hsla, Pixels, SharedString, linear_color_stop, linear_gradient, px};
+use gpui::{Color as GpuiColor, Pixels, SharedString, linear_color_stop, linear_gradient, px};
 
 use crate::prelude::*;
 
 /// A gradient overlay that fades from a solid color to transparent.
 #[derive(IntoElement)]
 pub struct GradientFade {
-    base_bg: Hsla,
-    hover_bg: Hsla,
-    active_bg: Hsla,
+    base_bg: GpuiColor,
+    hover_bg: GpuiColor,
+    active_bg: GpuiColor,
     width: Pixels,
     width_hovered: Option<Pixels>,
     right: Pixels,
@@ -16,7 +16,7 @@ pub struct GradientFade {
 }
 
 impl GradientFade {
-    pub fn new(base_bg: Hsla, hover_bg: Hsla, active_bg: Hsla) -> Self {
+    pub fn new(base_bg: GpuiColor, hover_bg: GpuiColor, active_bg: GpuiColor) -> Self {
         Self {
             base_bg,
             hover_bg,

@@ -5,7 +5,7 @@ use gpui::{
     PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
     Underline, get_gamma_correction_ratios,
 };
-use log::warn;
+use log::{info, warn};
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex};
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
+    output_color_space: u32,
+    framebuffer_is_srgb: u32,
     pad: u32,
 }
 
@@ -79,6 +81,14 @@ pub struct WgpuSurfaceConfig {
     /// Mobile platforms may prefer `Mailbox` (triple-buffering) to avoid
     /// blocking in `get_current_texture()` during lifecycle transitions.
     pub preferred_present_mode: Option<wgpu::PresentMode>,
+    /// Wide-gamut color space to render into when the platform can tag the surface accordingly.
+    pub wide_gamut_color_space: Option<WgpuOutputColorSpace>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WgpuOutputColorSpace {
+    DisplayP3,
+    Bt2020,
 }
 
 struct WgpuPipelines {
@@ -266,22 +276,30 @@ impl WgpuRenderer {
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
         let surface_caps = surface.get_capabilities(&context.adapter);
-        let preferred_formats = [
-            wgpu::TextureFormat::Bgra8Unorm,
-            wgpu::TextureFormat::Rgba8Unorm,
-        ];
-        let surface_format = preferred_formats
-            .iter()
-            .find(|f| surface_caps.formats.contains(f))
-            .copied()
-            .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
-            .or_else(|| surface_caps.formats.first().copied())
+        let (surface_format, surface_color_space, output_color_space) =
+            Self::select_surface_format_and_color_space(
+                &surface_caps,
+                config.wide_gamut_color_space,
+            )
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Surface reports no supported texture formats for adapter {:?}",
                     context.adapter.get_info().name
                 )
             })?;
+        info!(
+            "Selected WGPU surface format {:?} and color space {:?} (requested_wide_gamut={:?}, supported_formats={:?}, format_capabilities={:?})",
+            surface_format,
+            surface_color_space,
+            config.wide_gamut_color_space,
+            surface_caps.formats,
+            surface_caps.format_capabilities
+        );
+        if config.wide_gamut_color_space.is_some() && output_color_space.is_none() {
+            warn!(
+                "Wide-gamut surface requested, but the WGPU surface does not support Display P3 for any preferred format; falling back to sRGB output."
+            );
+        }
 
         let pick_alpha_mode =
             |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
@@ -333,6 +351,7 @@ impl WgpuRenderer {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: surface_color_space,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
             present_mode: config
@@ -350,7 +369,13 @@ impl WgpuRenderer {
         let queue = Arc::clone(&context.queue);
         let dual_source_blending = context.supports_dual_source_blending();
 
-        let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
+        let rendering_params =
+            RenderingParameters::new(&context.adapter, surface_format, output_color_space);
+        info!(
+            "Selected output color space {:?} (framebuffer_is_srgb={})",
+            rendering_params.output_color_space,
+            surface_format.is_srgb()
+        );
         let bind_group_layouts = Self::create_bind_group_layouts(&device);
         let pipelines = Self::create_pipelines(
             &device,
@@ -489,6 +514,50 @@ impl WgpuRenderer {
             surface_configured: true,
             needs_redraw: false,
         })
+    }
+
+    fn select_surface_format_and_color_space(
+        surface_caps: &wgpu::SurfaceCapabilities,
+        requested_wide_gamut: Option<WgpuOutputColorSpace>,
+    ) -> Option<(
+        wgpu::TextureFormat,
+        wgpu::SurfaceColorSpace,
+        Option<WgpuOutputColorSpace>,
+    )> {
+        let preferred_formats = &[
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ];
+
+        if matches!(requested_wide_gamut, Some(WgpuOutputColorSpace::DisplayP3)) {
+            if let Some(format) = preferred_formats.iter().copied().find(|format| {
+                surface_caps
+                    .color_spaces(*format)
+                    .contains(wgpu::SurfaceColorSpaces::DISPLAY_P3)
+            }) {
+                return Some((
+                    format,
+                    wgpu::SurfaceColorSpace::DisplayP3,
+                    Some(WgpuOutputColorSpace::DisplayP3),
+                ));
+            }
+        }
+
+        if let Some(format) = preferred_formats.iter().copied().find(|format| {
+            surface_caps
+                .color_spaces(*format)
+                .contains(wgpu::SurfaceColorSpaces::SRGB)
+        }) {
+            return Some((format, wgpu::SurfaceColorSpace::Srgb, None));
+        }
+
+        surface_caps
+            .formats
+            .first()
+            .copied()
+            .map(|format| (format, wgpu::SurfaceColorSpace::Auto, None))
     }
 
     fn create_bind_group_layouts(device: &wgpu::Device) -> WgpuBindGroupLayouts {
@@ -1025,6 +1094,14 @@ impl WgpuRenderer {
         self.is_bgr = is_bgr;
     }
 
+    pub fn wide_gamut_output_color_space(&self) -> Option<WgpuOutputColorSpace> {
+        match self.rendering_params.output_color_space {
+            OutputColorSpace::Srgb => None,
+            OutputColorSpace::DisplayP3 => Some(WgpuOutputColorSpace::DisplayP3),
+            OutputColorSpace::Bt2020 => Some(WgpuOutputColorSpace::Bt2020),
+        }
+    }
+
     pub fn update_transparency(&mut self, transparent: bool) {
         let new_alpha_mode = if transparent {
             self.transparent_alpha_mode
@@ -1175,6 +1252,8 @@ impl WgpuRenderer {
             } else {
                 0
             },
+            output_color_space: self.rendering_params.output_color_space as u32,
+            framebuffer_is_srgb: self.surface_config.format.is_srgb() as u32,
             pad: 0,
         };
 
@@ -1324,7 +1403,7 @@ impl WgpuRenderer {
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
-                    frame.present();
+                    self.resources().queue.present(frame);
                     return true;
                 }
                 self.grow_instance_buffer();
@@ -1334,7 +1413,7 @@ impl WgpuRenderer {
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
-            frame.present();
+            self.resources().queue.present(frame);
             return true;
         }
     }
@@ -1829,6 +1908,7 @@ impl WgpuRenderer {
             },
             transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
             preferred_present_mode: Some(self.surface_config.present_mode),
+            wide_gamut_color_space: self.wide_gamut_output_color_space(),
         };
         let gpu_context = Rc::clone(gpu_context);
         let ctx_ref = gpu_context.borrow();
@@ -1867,7 +1947,15 @@ fn create_surface(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputColorSpace {
+    Srgb = 0,
+    DisplayP3 = 1,
+    Bt2020 = 2,
+}
+
 struct RenderingParameters {
+    output_color_space: OutputColorSpace,
     path_sample_count: u32,
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
@@ -1875,7 +1963,11 @@ struct RenderingParameters {
 }
 
 impl RenderingParameters {
-    fn new(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> Self {
+    fn new(
+        adapter: &wgpu::Adapter,
+        surface_format: wgpu::TextureFormat,
+        output_color_space: Option<WgpuOutputColorSpace>,
+    ) -> Self {
         use std::env;
 
         let format_features = adapter.get_texture_format_features(surface_format);
@@ -1904,6 +1996,11 @@ impl RenderingParameters {
             .max(0.0);
 
         Self {
+            output_color_space: match output_color_space {
+                Some(WgpuOutputColorSpace::DisplayP3) => OutputColorSpace::DisplayP3,
+                Some(WgpuOutputColorSpace::Bt2020) => OutputColorSpace::Bt2020,
+                None => OutputColorSpace::Srgb,
+            },
             path_sample_count,
             gamma_ratios,
             grayscale_enhanced_contrast,

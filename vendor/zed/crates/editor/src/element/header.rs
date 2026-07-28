@@ -281,7 +281,7 @@ impl EditorElement {
                     .map(|delta| delta.unsigned_abs() as u32)
                     .unwrap_or(start_point.row + 1);
                 let color = cx.theme().colors().editor_line_number;
-                self.shape_line_number(SharedString::from(number.to_string()), color, window)
+                self.shape_line_number(SharedString::from(number.to_string()), color.into(), window)
             });
 
             lines.push(StickyHeaderLine::new(
@@ -306,7 +306,7 @@ impl EditorElement {
 
         Some(StickyHeaders {
             lines,
-            gutter_background: cx.theme().colors().editor_gutter_background,
+            gutter_background: cx.theme().colors().editor_gutter_background.into(),
             content_background: self.style.background,
             gutter_right_padding: gutter_dimensions.right_padding,
         })

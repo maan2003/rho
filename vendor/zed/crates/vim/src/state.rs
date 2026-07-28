@@ -1313,7 +1313,7 @@ impl PickerDelegate for RegistersViewDelegate {
         output.push(register_match.name);
         runs.push((
             0..output.len(),
-            HighlightStyle::color(cx.theme().colors().text_accent),
+            HighlightStyle::color(cx.theme().colors().text_accent.into()),
         ));
         output.push(' ');
         output.push(' ');
@@ -1342,14 +1342,14 @@ impl PickerDelegate for RegistersViewDelegate {
             output.push_str(&replace);
             runs.push((
                 base + ix..base + ix + replace.len(),
-                HighlightStyle::color(cx.theme().colors().text_muted),
+                HighlightStyle::color(cx.theme().colors().text_muted.into()),
             ));
             base += replace.len() - c.len_utf8();
         }
 
         let theme = ThemeSettings::get_global(cx);
         let text_style = TextStyle {
-            color: cx.theme().colors().editor_foreground,
+            color: cx.theme().colors().editor_foreground.into(),
             font_family: theme.buffer_font.family.clone(),
             font_features: theme.buffer_font.features.clone(),
             font_fallbacks: theme.buffer_font.fallbacks.clone(),
@@ -1710,7 +1710,7 @@ impl PickerDelegate for MarksViewDelegate {
         left_output.push_str(&mark_match.name);
         left_runs.push((
             0..left_output.len(),
-            HighlightStyle::color(cx.theme().colors().text_accent),
+            HighlightStyle::color(cx.theme().colors().text_accent.into()),
         ));
         left_output.push(' ');
         left_output.push(' ');
@@ -1729,14 +1729,17 @@ impl PickerDelegate for MarksViewDelegate {
                 let s = path.to_string_lossy().into_owned();
                 (
                     s.clone(),
-                    vec![(0..s.len(), HighlightStyle::color(cx.theme().colors().text))],
+                    vec![(
+                        0..s.len(),
+                        HighlightStyle::color(cx.theme().colors().text.into()),
+                    )],
                 )
             }
             MarksMatchInfo::Title(title) => (
                 title.clone(),
                 vec![(
                     0..title.len(),
-                    HighlightStyle::color(cx.theme().colors().text),
+                    HighlightStyle::color(cx.theme().colors().text.into()),
                 )],
             ),
             MarksMatchInfo::Content { line, highlights } => (line.clone(), highlights.clone()),
@@ -1744,7 +1747,7 @@ impl PickerDelegate for MarksViewDelegate {
 
         let theme = ThemeSettings::get_global(cx);
         let text_style = TextStyle {
-            color: cx.theme().colors().editor_foreground,
+            color: cx.theme().colors().editor_foreground.into(),
             font_family: theme.buffer_font.family.clone(),
             font_features: theme.buffer_font.features.clone(),
             font_fallbacks: theme.buffer_font.fallbacks.clone(),

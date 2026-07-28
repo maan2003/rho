@@ -1,7 +1,6 @@
 #![allow(missing_docs)]
 
-use gpui::Hsla;
-use palette::FromColor;
+use gpui::Color;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -13,18 +12,7 @@ pub enum AppearanceContent {
     Dark,
 }
 
-/// Parses a color string into an [`Hsla`] value.
-pub fn try_parse_color(color: &str) -> anyhow::Result<Hsla> {
-    let rgba = gpui::Rgba::try_from(color)?;
-    let rgba = palette::rgb::Srgba::from_components((rgba.r, rgba.g, rgba.b, rgba.a));
-    let hsla = palette::Hsla::from_color(rgba);
-
-    let hsla = gpui::hsla(
-        hsla.hue.into_positive_degrees() / 360.,
-        hsla.saturation,
-        hsla.lightness,
-        hsla.alpha,
-    );
-
-    Ok(hsla)
+/// Parses a color string into a [`Color`] value.
+pub fn try_parse_color(color: &str) -> anyhow::Result<Color> {
+    Color::try_from(color)
 }

@@ -1,15 +1,15 @@
 #![allow(missing_docs)]
 
-use gpui::Hsla;
+use gpui::{Color, Hsla};
 use serde::Deserialize;
 
 use crate::{amber, blue, jade, lime, orange, pink, purple, red};
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq)]
 pub struct PlayerColor {
-    pub cursor: Hsla,
-    pub background: Hsla,
-    pub selection: Hsla,
+    pub cursor: Color,
+    pub background: Color,
+    pub selection: Color,
 }
 
 /// A collection of colors that are used to color players in the editor.
@@ -138,9 +138,9 @@ impl PlayerColors {
     pub fn read_only(&self) -> PlayerColor {
         let local = self.local();
         PlayerColor {
-            cursor: local.cursor.grayscale(),
-            background: local.background.grayscale(),
-            selection: local.selection.grayscale(),
+            cursor: grayscale(local.cursor),
+            background: grayscale(local.background),
+            selection: grayscale(local.selection),
         }
     }
 
@@ -148,4 +148,8 @@ impl PlayerColors {
         let len = self.0.len() - 1;
         self.0[(participant_index as usize % len) + 1]
     }
+}
+
+fn grayscale(color: Color) -> Color {
+    Hsla::from(color).grayscale().into()
 }

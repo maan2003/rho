@@ -1819,9 +1819,9 @@ impl ProjectSearchView {
                 match_ranges,
                 move |index, theme| {
                     if active_index == Some(*index) {
-                        theme.colors().search_active_match_background
+                        theme.colors().search_active_match_background.into()
                     } else {
-                        theme.colors().search_match_background
+                        theme.colors().search_match_background.into()
                     }
                 },
                 cx,
@@ -1894,9 +1894,9 @@ impl ProjectSearchView {
 
     fn border_color_for(&self, panel: InputPanel, cx: &App) -> Hsla {
         if self.panels_with_errors.contains_key(&panel) {
-            Color::Error.color(cx)
+            Color::Error.color(cx).into()
         } else {
-            cx.theme().colors().border
+            cx.theme().colors().border.into()
         }
     }
 

@@ -3277,22 +3277,22 @@ pub fn get_color_at_index(index: usize, theme: &Theme) -> Hsla {
 
     match index {
         // 0-15 are the same as the named colors above
-        0 => colors.terminal_ansi_black,
-        1 => colors.terminal_ansi_red,
-        2 => colors.terminal_ansi_green,
-        3 => colors.terminal_ansi_yellow,
-        4 => colors.terminal_ansi_blue,
-        5 => colors.terminal_ansi_magenta,
-        6 => colors.terminal_ansi_cyan,
-        7 => colors.terminal_ansi_white,
-        8 => colors.terminal_ansi_bright_black,
-        9 => colors.terminal_ansi_bright_red,
-        10 => colors.terminal_ansi_bright_green,
-        11 => colors.terminal_ansi_bright_yellow,
-        12 => colors.terminal_ansi_bright_blue,
-        13 => colors.terminal_ansi_bright_magenta,
-        14 => colors.terminal_ansi_bright_cyan,
-        15 => colors.terminal_ansi_bright_white,
+        0 => colors.terminal_ansi_black.into(),
+        1 => colors.terminal_ansi_red.into(),
+        2 => colors.terminal_ansi_green.into(),
+        3 => colors.terminal_ansi_yellow.into(),
+        4 => colors.terminal_ansi_blue.into(),
+        5 => colors.terminal_ansi_magenta.into(),
+        6 => colors.terminal_ansi_cyan.into(),
+        7 => colors.terminal_ansi_white.into(),
+        8 => colors.terminal_ansi_bright_black.into(),
+        9 => colors.terminal_ansi_bright_red.into(),
+        10 => colors.terminal_ansi_bright_green.into(),
+        11 => colors.terminal_ansi_bright_yellow.into(),
+        12 => colors.terminal_ansi_bright_blue.into(),
+        13 => colors.terminal_ansi_bright_magenta.into(),
+        14 => colors.terminal_ansi_bright_cyan.into(),
+        15 => colors.terminal_ansi_bright_white.into(),
         // 16-231 are a 6x6x6 RGB color cube, mapped to 0-255 using steps defined by XTerm.
         // See: https://github.com/xterm-x11/xterm-snapshots/blob/master/256colres.pl
         16..=231 => {
@@ -3311,19 +3311,19 @@ pub fn get_color_at_index(index: usize, theme: &Theme) -> Hsla {
         }
         // For compatibility with the alacritty::Colors interface
         // See: https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/color.rs
-        256 => colors.terminal_foreground,
-        257 => colors.terminal_background,
-        258 => theme.players().local().cursor,
-        259 => colors.terminal_ansi_dim_black,
-        260 => colors.terminal_ansi_dim_red,
-        261 => colors.terminal_ansi_dim_green,
-        262 => colors.terminal_ansi_dim_yellow,
-        263 => colors.terminal_ansi_dim_blue,
-        264 => colors.terminal_ansi_dim_magenta,
-        265 => colors.terminal_ansi_dim_cyan,
-        266 => colors.terminal_ansi_dim_white,
-        267 => colors.terminal_bright_foreground,
-        268 => colors.terminal_ansi_black, // 'Dim Background', non-standard color
+        256 => colors.terminal_foreground.into(),
+        257 => colors.terminal_background.into(),
+        258 => theme.players().local().cursor.into(),
+        259 => colors.terminal_ansi_dim_black.into(),
+        260 => colors.terminal_ansi_dim_red.into(),
+        261 => colors.terminal_ansi_dim_green.into(),
+        262 => colors.terminal_ansi_dim_yellow.into(),
+        263 => colors.terminal_ansi_dim_blue.into(),
+        264 => colors.terminal_ansi_dim_magenta.into(),
+        265 => colors.terminal_ansi_dim_cyan.into(),
+        266 => colors.terminal_ansi_dim_white.into(),
+        267 => colors.terminal_bright_foreground.into(),
+        268 => colors.terminal_ansi_black.into(), // 'Dim Background', non-standard color
 
         _ => black(),
     }

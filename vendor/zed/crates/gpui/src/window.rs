@@ -3,7 +3,7 @@ use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    Capslock, Color, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
@@ -3892,7 +3892,7 @@ impl Window {
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
                 corner_radii: corner_radii.scale(scale_factor),
-                color: shadow.color.opacity(opacity),
+                color: Color::from(shadow.color.opacity(opacity)),
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
@@ -3937,7 +3937,7 @@ impl Window {
                 bounds: self.cover_bounds(hole),
                 content_mask,
                 corner_radii: hole_corner_radii.scale(scale_factor),
-                color: shadow.color.opacity(opacity),
+                color: Color::from(shadow.color.opacity(opacity)),
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
@@ -3966,7 +3966,7 @@ impl Window {
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
-            border_color: quad.border_color.opacity(opacity),
+            border_color: Color::from(quad.border_color.opacity(opacity)),
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
@@ -4088,7 +4088,7 @@ impl Window {
             pad: 0,
             bounds,
             content_mask: self.snapped_content_mask(),
-            color: style.color.unwrap_or_default().opacity(element_opacity),
+            color: Color::from(style.color.unwrap_or_default().opacity(element_opacity)),
             thickness,
             wavy: style.wavy.into(),
         });
@@ -4119,7 +4119,7 @@ impl Window {
             bounds,
             content_mask: self.snapped_content_mask(),
             thickness: self.snap_stroke(style.thickness),
-            color: style.color.unwrap_or_default().opacity(opacity),
+            color: Color::from(style.color.unwrap_or_default().opacity(opacity)),
             wavy: false.into(),
         });
     }
@@ -4191,7 +4191,7 @@ impl Window {
                     pad: 0,
                     bounds,
                     content_mask,
-                    color: color.opacity(element_opacity),
+                    color: Color::from(color.opacity(element_opacity)),
                     tile,
                     transformation: TransformationMatrix::unit(),
                 });
@@ -4201,7 +4201,7 @@ impl Window {
                     pad: 0,
                     bounds,
                     content_mask,
-                    color: color.opacity(element_opacity),
+                    color: Color::from(color.opacity(element_opacity)),
                     tile,
                     transformation: TransformationMatrix::unit(),
                 });
@@ -4348,7 +4348,7 @@ impl Window {
             pad: 0,
             bounds: final_bounds,
             content_mask,
-            color: color.opacity(element_opacity),
+            color: Color::from(color.opacity(element_opacity)),
             tile,
             transformation,
         });

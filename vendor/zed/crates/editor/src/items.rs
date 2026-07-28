@@ -1694,9 +1694,9 @@ impl SearchableItem for Editor {
             matches,
             move |index, theme| {
                 if active_match_index == Some(*index) {
-                    theme.colors().search_active_match_background
+                    theme.colors().search_active_match_background.into()
                 } else {
-                    theme.colors().search_match_background
+                    theme.colors().search_match_background.into()
                 }
             },
             cx,

@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use gpui::{AnyElement, AnyView, Hsla, IntoElement, ParentElement, Styled};
+use gpui::{AnyElement, AnyView, Color as GpuiColor, IntoElement, ParentElement, Styled};
 
 /// Chips provide a container for an informative label.
 ///
@@ -17,8 +17,8 @@ pub struct Chip {
     label_size: LabelSize,
     icon: Option<IconName>,
     icon_color: Color,
-    bg_color: Option<Hsla>,
-    border_color: Option<Hsla>,
+    bg_color: Option<GpuiColor>,
+    border_color: Option<GpuiColor>,
     height: Option<Pixels>,
     truncate: bool,
     tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
@@ -66,13 +66,13 @@ impl Chip {
     }
 
     /// Sets a custom background color for the callout content.
-    pub fn bg_color(mut self, color: Hsla) -> Self {
+    pub fn bg_color(mut self, color: GpuiColor) -> Self {
         self.bg_color = Some(color);
         self
     }
 
     /// Sets a custom border color for the chip.
-    pub fn border_color(mut self, color: Hsla) -> Self {
+    pub fn border_color(mut self, color: GpuiColor) -> Self {
         self.border_color = Some(color);
         self
     }

@@ -1,7 +1,7 @@
 use crate::{CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
 
 use gpui::{
-    Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString,
+    Animation, AnimationExt, ClickEvent, Color as GpuiColor, MouseButton, SharedString,
     WindowBackgroundAppearance, pulsating_between,
 };
 use itertools::Itertools as _;
@@ -63,7 +63,7 @@ pub struct ThreadItem {
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
-    base_bg: Option<Hsla>,
+    base_bg: Option<GpuiColor>,
 }
 
 impl ThreadItem {
@@ -242,7 +242,7 @@ impl ThreadItem {
         self
     }
 
-    pub fn base_bg(mut self, color: Hsla) -> Self {
+    pub fn base_bg(mut self, color: GpuiColor) -> Self {
         self.base_bg = Some(color);
         self
     }

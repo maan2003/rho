@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use gpui::Hsla;
+use gpui::{Color, Hsla};
 use refineable::Refineable;
 
 use crate::{blue, grass, neutral, red, yellow};
@@ -10,74 +10,74 @@ use crate::{blue, grass, neutral, red, yellow};
 pub struct StatusColors {
     /// Indicates some kind of conflict, like a file changed on disk while it was open, or
     /// merge conflicts in a Git repository.
-    pub conflict: Hsla,
-    pub conflict_background: Hsla,
-    pub conflict_border: Hsla,
+    pub conflict: Color,
+    pub conflict_background: Color,
+    pub conflict_border: Color,
 
     /// Indicates something new, like a new file added to a Git repository.
-    pub created: Hsla,
-    pub created_background: Hsla,
-    pub created_border: Hsla,
+    pub created: Color,
+    pub created_background: Color,
+    pub created_border: Color,
 
     /// Indicates that something no longer exists, like a deleted file.
-    pub deleted: Hsla,
-    pub deleted_background: Hsla,
-    pub deleted_border: Hsla,
+    pub deleted: Color,
+    pub deleted_background: Color,
+    pub deleted_border: Color,
 
     /// Indicates a system error, a failed operation or a diagnostic error.
-    pub error: Hsla,
-    pub error_background: Hsla,
-    pub error_border: Hsla,
+    pub error: Color,
+    pub error_background: Color,
+    pub error_border: Color,
 
     /// Represents a hidden status, such as a file being hidden in a file tree.
-    pub hidden: Hsla,
-    pub hidden_background: Hsla,
-    pub hidden_border: Hsla,
+    pub hidden: Color,
+    pub hidden_background: Color,
+    pub hidden_border: Color,
 
     /// Indicates a hint or some kind of additional information.
-    pub hint: Hsla,
-    pub hint_background: Hsla,
-    pub hint_border: Hsla,
+    pub hint: Color,
+    pub hint_background: Color,
+    pub hint_border: Color,
 
     /// Indicates that something is deliberately ignored, such as a file or operation ignored by Git.
-    pub ignored: Hsla,
-    pub ignored_background: Hsla,
-    pub ignored_border: Hsla,
+    pub ignored: Color,
+    pub ignored_background: Color,
+    pub ignored_border: Color,
 
     /// Represents informational status updates or messages.
-    pub info: Hsla,
-    pub info_background: Hsla,
-    pub info_border: Hsla,
+    pub info: Color,
+    pub info_background: Color,
+    pub info_border: Color,
 
     /// Indicates a changed or altered status, like a file that has been edited.
-    pub modified: Hsla,
-    pub modified_background: Hsla,
-    pub modified_border: Hsla,
+    pub modified: Color,
+    pub modified_background: Color,
+    pub modified_border: Color,
 
     /// Indicates something that is predicted, like automatic code completion, or generated code.
-    pub predictive: Hsla,
-    pub predictive_background: Hsla,
-    pub predictive_border: Hsla,
+    pub predictive: Color,
+    pub predictive_background: Color,
+    pub predictive_border: Color,
 
     /// Represents a renamed status, such as a file that has been renamed.
-    pub renamed: Hsla,
-    pub renamed_background: Hsla,
-    pub renamed_border: Hsla,
+    pub renamed: Color,
+    pub renamed_background: Color,
+    pub renamed_border: Color,
 
     /// Indicates a successful operation or task completion.
-    pub success: Hsla,
-    pub success_background: Hsla,
-    pub success_border: Hsla,
+    pub success: Color,
+    pub success_background: Color,
+    pub success_border: Color,
 
     /// Indicates some kind of unreachable status, like a block of code that can never be reached.
-    pub unreachable: Hsla,
-    pub unreachable_background: Hsla,
-    pub unreachable_border: Hsla,
+    pub unreachable: Color,
+    pub unreachable_background: Color,
+    pub unreachable_border: Color,
 
     /// Represents a warning status, like an operation that is about to fail.
-    pub warning: Hsla,
-    pub warning_background: Hsla,
-    pub warning_border: Hsla,
+    pub warning: Color,
+    pub warning_background: Color,
+    pub warning_border: Color,
 }
 
 pub struct DiagnosticColors {
@@ -183,9 +183,9 @@ impl StatusColors {
 
     pub fn diagnostic(&self) -> DiagnosticColors {
         DiagnosticColors {
-            error: self.error,
-            warning: self.warning,
-            info: self.info,
+            error: self.error.into(),
+            warning: self.warning.into(),
+            info: self.info.into(),
         }
     }
 }

@@ -1,13 +1,12 @@
 use crate::{Label, LabelCommon, component_prelude::*, v_flex};
 use documented::{DocumentedFields, DocumentedVariants};
-use gpui::{App, Hsla, IntoElement, ParentElement, Styled};
+use gpui::{App, Color as GpuiColor, Hsla, IntoElement, ParentElement, Styled};
 use theme::ActiveTheme;
 
 /// Sets a color that has a consistent meaning across all themes.
 #[derive(
     Debug,
     Default,
-    Eq,
     PartialEq,
     Copy,
     Clone,
@@ -34,7 +33,7 @@ pub enum Color {
     /// means detaching it from any semantic meaning across themes.
     ///
     /// A custom color specified by an HSLA value.
-    Custom(Hsla),
+    Custom(GpuiColor),
     /// A color used for all debugger UI elements.
     Debugger,
     /// A color used to indicate a deleted item, such as a file removed from version control.
@@ -87,7 +86,7 @@ pub enum Color {
 
 impl Color {
     /// Returns the Color's HSLA value.
-    pub fn color(&self, cx: &App) -> Hsla {
+    pub fn color(&self, cx: &App) -> GpuiColor {
         match self {
             Color::Default => cx.theme().colors().text,
             Color::Muted => cx.theme().colors().text_muted,
@@ -120,6 +119,12 @@ impl Color {
 
 impl From<Hsla> for Color {
     fn from(color: Hsla) -> Self {
+        Color::Custom(color.into())
+    }
+}
+
+impl From<GpuiColor> for Color {
+    fn from(color: GpuiColor) -> Self {
         Color::Custom(color)
     }
 }

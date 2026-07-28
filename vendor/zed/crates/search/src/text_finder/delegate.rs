@@ -1315,7 +1315,7 @@ fn matched_line_window(
 fn render_matched_line(search_match: &SearchMatch, cx: &App) -> StyledText {
     let settings = ThemeSettings::get_global(cx);
     let text_style = TextStyle {
-        color: cx.theme().colors().text,
+        color: cx.theme().colors().text.into(),
         font_family: settings.buffer_font.family.clone(),
         font_features: settings.buffer_font.features.clone(),
         font_fallbacks: settings.buffer_font.fallbacks.clone(),
@@ -1325,7 +1325,7 @@ fn render_matched_line(search_match: &SearchMatch, cx: &App) -> StyledText {
         ..Default::default()
     };
     let search_match_style = HighlightStyle {
-        background_color: Some(cx.theme().colors().search_match_background),
+        background_color: Some(cx.theme().colors().search_match_background.into()),
         font_weight: Some(gpui::FontWeight::BOLD),
         ..Default::default()
     };

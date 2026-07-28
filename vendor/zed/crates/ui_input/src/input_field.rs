@@ -154,9 +154,9 @@ impl Render for InputField {
         let theme_color = cx.theme().colors();
 
         let style = InputFieldStyle {
-            text_color: theme_color.text,
-            background_color: theme_color.editor_background,
-            border_color: theme_color.border_variant,
+            text_color: theme_color.text.into(),
+            background_color: theme_color.editor_background.into(),
+            border_color: theme_color.border_variant.into(),
         };
 
         let focus_handle = self.editor.focus_handle(cx);

@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, AnyView, ClickEvent, ElementId, Hsla, IntoElement, KeybindingKeystroke, Keystroke,
-    Role, Styled, Toggled, Window, div, hsla, prelude::*,
+    AnyElement, AnyView, ClickEvent, Color as GpuiColor, ElementId, Hsla, IntoElement,
+    KeybindingKeystroke, Keystroke, Role, Styled, Toggled, Window, div, hsla, prelude::*,
 };
 use std::{rc::Rc, sync::Arc};
 
@@ -154,19 +154,19 @@ impl Checkbox {
 }
 
 impl Checkbox {
-    fn bg_color(&self, cx: &App) -> Hsla {
+    fn bg_color(&self, cx: &App) -> GpuiColor {
         let style = self.style.clone();
         match (style, self.filled) {
             (ToggleStyle::Ghost, false) => cx.theme().colors().ghost_element_background,
             (ToggleStyle::Ghost, true) => cx.theme().colors().element_background,
-            (ToggleStyle::ElevationBased(_), false) => gpui::transparent_black(),
+            (ToggleStyle::ElevationBased(_), false) => gpui::transparent_black().into(),
             (ToggleStyle::ElevationBased(elevation), true) => elevation.darker_bg(cx),
-            (ToggleStyle::Custom(_), false) => gpui::transparent_black(),
-            (ToggleStyle::Custom(color), true) => color.opacity(0.2),
+            (ToggleStyle::Custom(_), false) => gpui::transparent_black().into(),
+            (ToggleStyle::Custom(color), true) => color.opacity(0.2).into(),
         }
     }
 
-    fn border_color(&self, cx: &App) -> Hsla {
+    fn border_color(&self, cx: &App) -> GpuiColor {
         if self.disabled {
             return cx.theme().colors().border_variant;
         }
@@ -174,7 +174,7 @@ impl Checkbox {
         match self.style.clone() {
             ToggleStyle::Ghost => cx.theme().colors().border,
             ToggleStyle::ElevationBased(_) => cx.theme().colors().border,
-            ToggleStyle::Custom(color) => color.opacity(0.3),
+            ToggleStyle::Custom(color) => color.opacity(0.3).into(),
         }
     }
 
@@ -287,15 +287,15 @@ impl RenderOnce for Checkbox {
 }
 
 /// Defines the color for a switch component.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Default)]
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
 pub enum SwitchColor {
     #[default]
     Accent,
-    Custom(Hsla),
+    Custom(GpuiColor),
 }
 
 impl SwitchColor {
-    fn get_colors(&self, is_on: bool, cx: &App) -> (Hsla, Hsla) {
+    fn get_colors(&self, is_on: bool, cx: &App) -> (GpuiColor, GpuiColor) {
         if !is_on {
             return (
                 cx.theme().colors().element_disabled,
@@ -503,7 +503,7 @@ impl RenderOnce for Switch {
                 |this, tab_index| {
                     this.tab_index(tab_index)
                         .focus_visible(|mut style| {
-                            style.border_color = Some(cx.theme().colors().border_focused);
+                            style.border_color = Some(cx.theme().colors().border_focused.into());
                             style
                         })
                         .when_some(self.on_click.clone(), |this, on_click| {
@@ -1023,7 +1023,9 @@ impl Component for Switch {
                         single_example(
                             "Custom",
                             Switch::new("switch_custom_style", ToggleState::Selected)
-                                .color(SwitchColor::Custom(hsla(300.0 / 360.0, 0.6, 0.6, 1.0)))
+                                .color(SwitchColor::Custom(
+                                    hsla(300.0 / 360.0, 0.6, 0.6, 1.0).into(),
+                                ))
                                 .on_click(|_, _, _cx| {})
                                 .into_any_element(),
                         ),

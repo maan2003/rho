@@ -212,24 +212,24 @@ impl MarkdownStyle {
                 ui_font_size.into()
             }),
             line_height: Some(line_height.into()),
-            color: Some(colors.text),
+            color: Some(colors.text.into()),
             ..Default::default()
         });
 
         let style = MarkdownStyle {
             base_text_style: text_style.clone(),
             syntax: syntax.clone(),
-            selection_background_color: colors.element_selection_background,
-            rule_color: colors.border,
-            block_quote_border_color: colors.border,
+            selection_background_color: colors.element_selection_background.into(),
+            rule_color: colors.border.into(),
+            block_quote_border_color: colors.border.into(),
             block_quote_kind_colors: {
                 let status = cx.theme().status();
                 BlockQuoteKindColors {
-                    note: status.info,
-                    tip: status.success,
-                    important: status.info,
-                    warning: status.warning,
-                    caution: status.error,
+                    note: status.info.into(),
+                    tip: status.success.into(),
+                    important: status.info.into(),
+                    warning: status.warning.into(),
+                    caution: status.error.into(),
                 }
             },
             code_block_overflow_x_scroll: true,
@@ -253,7 +253,7 @@ impl MarkdownStyle {
                     right: Some(AbsoluteLength::Pixels(px(1.))),
                     bottom: Some(AbsoluteLength::Pixels(px(1.))),
                 },
-                border_color: Some(colors.border_variant),
+                border_color: Some(colors.border_variant.into()),
                 background: Some(colors.editor_background.into()),
                 text: TextStyleRefinement {
                     font_family: Some(code_font_family.clone()),
@@ -271,14 +271,14 @@ impl MarkdownStyle {
                 font_features: Some(theme_settings.buffer_font.features.clone()),
                 font_size: Some(buffer_font_size.into()),
                 font_weight: Some(buffer_font_weight),
-                background_color: Some(colors.editor_foreground.opacity(0.08)),
+                background_color: Some(colors.editor_foreground.opacity(0.08).into()),
                 ..Default::default()
             },
             link: TextStyleRefinement {
-                background_color: Some(colors.editor_foreground.opacity(0.025)),
-                color: Some(colors.text_accent),
+                background_color: Some(colors.editor_foreground.opacity(0.025).into()),
+                color: Some(colors.text_accent.into()),
                 underline: Some(UnderlineStyle {
-                    color: Some(colors.text_accent.opacity(0.5)),
+                    color: Some(colors.text_accent.opacity(0.5).into()),
                     thickness: px(1.),
                     ..Default::default()
                 }),
@@ -328,9 +328,9 @@ impl MarkdownStyle {
         self.base_text_style.font_size = body_font_size.into();
         self.container_style.text.font_size = Some(body_font_size.into());
 
-        self.base_text_style.color = colors.text_muted.blend(colors.text.opacity(0.25));
-        self.inline_code.color = Some(colors.text);
-        self.heading.text.color = Some(colors.text);
+        self.base_text_style.color = colors.text_muted.blend(colors.text.opacity(0.25)).into();
+        self.inline_code.color = Some(colors.text.into());
+        self.heading.text.color = Some(colors.text.into());
 
         self.heading_level_styles = Some(HeadingLevelStyles {
             h1: Some(TextStyleRefinement {
@@ -359,7 +359,7 @@ impl MarkdownStyle {
             }),
         });
 
-        self.heading_border_color = Some(colors.border_variant);
+        self.heading_border_color = Some(colors.border_variant.into());
 
         self
     }
@@ -384,7 +384,7 @@ impl MarkdownStyle {
 
     pub fn with_muted_text(mut self, cx: &App) -> Self {
         let colors = cx.theme().colors();
-        self.base_text_style.color = colors.text_muted;
+        self.base_text_style.color = colors.text_muted.into();
         self
     }
 }
@@ -1588,11 +1588,11 @@ impl MarkdownElement {
                 .child(
                     Icon::new(icon_name)
                         .size(IconSize::Small)
-                        .color(Color::Custom(border_color)),
+                        .color(Color::Custom(border_color.into())),
                 )
                 .child(
                     Label::new(label)
-                        .color(Color::Custom(border_color))
+                        .color(Color::Custom(border_color.into()))
                         .weight(FontWeight::BOLD),
                 )
                 .into_any_element()
@@ -1708,7 +1708,7 @@ impl MarkdownElement {
 
         let text_style = if cell_style.is_key {
             TextStyleRefinement {
-                color: Some(cx.theme().colors().text_muted),
+                color: Some(cx.theme().colors().text_muted.into()),
                 font_weight: Some(FontWeight::SEMIBOLD),
                 ..Default::default()
             }
@@ -2199,8 +2199,8 @@ impl Element for MarkdownElement {
                     if self.show_root_block_markers {
                         builder.pop_root_block(
                             active_root_block == Some(*root_block_index),
-                            cx.theme().colors().border,
-                            cx.theme().colors().border_variant,
+                            cx.theme().colors().border.into(),
+                            cx.theme().colors().border_variant.into(),
                         );
                     }
                 }
@@ -2445,7 +2445,7 @@ impl Element for MarkdownElement {
                         }),
                         MarkdownTag::Strong => builder.push_text_style(TextStyleRefinement {
                             font_weight: Some(FontWeight::BOLD),
-                            color: Some(cx.theme().colors().text),
+                            color: Some(cx.theme().colors().text.into()),
                             ..Default::default()
                         }),
                         MarkdownTag::Strikethrough => {

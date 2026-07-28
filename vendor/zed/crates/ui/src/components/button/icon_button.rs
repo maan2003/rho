@@ -1,4 +1,4 @@
-use gpui::{AnyView, DefiniteLength, Hsla};
+use gpui::{AnyView, Color as GpuiColor, DefiniteLength};
 
 use super::button_like::{ButtonCommon, ButtonLike, ButtonSize, ButtonStyle};
 use crate::{
@@ -25,7 +25,7 @@ pub struct IconButton {
     selected_icon_color: Option<Color>,
     selected_style: Option<ButtonStyle>,
     indicator: Option<Indicator>,
-    indicator_border_color: Option<Hsla>,
+    indicator_border_color: Option<GpuiColor>,
     alpha: Option<f32>,
 }
 
@@ -119,7 +119,7 @@ impl IconButton {
         self
     }
 
-    pub fn indicator_border_color(mut self, color: Option<Hsla>) -> Self {
+    pub fn indicator_border_color(mut self, color: Option<GpuiColor>) -> Self {
         self.indicator_border_color = color;
 
         self

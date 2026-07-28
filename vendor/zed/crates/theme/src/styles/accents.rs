@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpui::Hsla;
+use gpui::Color;
 use serde::Deserialize;
 
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
 
 /// A collection of colors that are used to color indent aware lines in the editor.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-pub struct AccentColors(pub Arc<[Hsla]>);
+pub struct AccentColors(pub Arc<[Color]>);
 
 impl Default for AccentColors {
     /// Don't use this!
@@ -62,7 +62,7 @@ impl AccentColors {
 
 impl AccentColors {
     /// Returns the color for the given index.
-    pub fn color_for_index(&self, index: u32) -> Hsla {
+    pub fn color_for_index(&self, index: u32) -> Color {
         self.0[index as usize % self.0.len()]
     }
 }

@@ -110,7 +110,7 @@ pub(crate) fn render_text_input(
 
     let settings = ThemeSettings::get_global(app);
     let text_style = TextStyle {
-        color,
+        color: color.into(),
         font_family: settings.buffer_font.family.clone(),
         font_features: settings.buffer_font.features.clone(),
         font_fallbacks: settings.buffer_font.fallbacks.clone(),
@@ -121,7 +121,7 @@ pub(crate) fn render_text_input(
     };
 
     let mut editor_style = EditorStyle {
-        background: app.theme().colors().toolbar_background,
+        background: app.theme().colors().toolbar_background.into(),
         local_player: app.theme().players().local(),
         text: text_style,
         ..EditorStyle::default()

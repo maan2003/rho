@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
+    AtlasTextureId, AtlasTile, Background, Bounds, Color, ContentMask, Corners, Edges, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
@@ -538,7 +538,7 @@ pub struct Quad {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub background: Background,
-    pub border_color: Hsla,
+    pub border_color: Color,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
 }
@@ -557,7 +557,7 @@ pub struct Underline {
     pub pad: u32, // align to 8 bytes
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub color: Hsla,
+    pub color: Color,
     pub thickness: ScaledPixels,
     pub wavy: PaddedBool32,
 }
@@ -577,7 +577,7 @@ pub struct Shadow {
     pub bounds: Bounds<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub color: Hsla,
+    pub color: Color,
     pub element_bounds: Bounds<ScaledPixels>,
     pub element_corner_radii: Corners<ScaledPixels>,
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
@@ -713,7 +713,7 @@ pub struct MonochromeSprite {
     pub pad: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub color: Hsla,
+    pub color: Color,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
 }
@@ -732,7 +732,7 @@ pub struct SubpixelSprite {
     pub pad: u32, // align to 8 bytes
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub color: Hsla,
+    pub color: Color,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
 }

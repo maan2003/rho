@@ -997,7 +997,7 @@ impl CompletionsMenu {
                                         thickness: 1.0.into(),
                                         ..Default::default()
                                     });
-                                    highlight.color = Some(cx.theme().colors().text_muted);
+                                    highlight.color = Some(cx.theme().colors().text_muted.into());
                                 }
 
                                 (range, highlight)
@@ -1067,9 +1067,7 @@ impl CompletionsMenu {
                                     Icon::from_path(path)
                                         .size(IconSize::XSmall)
                                         .color(
-                                            completion
-                                                .icon_color
-                                                .map_or(Color::Muted, Color::Custom),
+                                            completion.icon_color.map_or(Color::Muted, Into::into),
                                         )
                                         .into_any_element()
                                 })

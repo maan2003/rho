@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use decorated_icon::*;
-use gpui::{AnimationElement, AnyElement, Hsla, IntoElement, Rems, Transformation, img, svg};
+use gpui::{
+    AnimationElement, AnyElement, Color as GpuiColor, IntoElement, Rems, Transformation, img, svg,
+};
 pub use icon_decoration::*;
 pub use icons::*;
 
@@ -228,7 +230,7 @@ impl RenderOnce for Icon {
 pub struct IconWithIndicator {
     icon: Icon,
     indicator: Option<Indicator>,
-    indicator_border_color: Option<Hsla>,
+    indicator_border_color: Option<GpuiColor>,
 }
 
 impl IconWithIndicator {
@@ -252,7 +254,7 @@ impl IconWithIndicator {
         self
     }
 
-    pub fn indicator_border_color(mut self, color: Option<Hsla>) -> Self {
+    pub fn indicator_border_color(mut self, color: Option<GpuiColor>) -> Self {
         self.indicator_border_color = color;
         self
     }

@@ -3,45 +3,10 @@
 
 using namespace metal;
 
-float4 hsla_to_rgba(Hsla hsla);
-float3 srgb_to_linear(float3 color);
-float3 linear_to_srgb(float3 color);
-float4 srgb_to_oklab(float4 color);
-float4 oklab_to_srgb(float4 color);
-float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                          constant Size_DevicePixels *viewport_size);
-float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                          TransformationMatrix transformation,
-                          constant Size_DevicePixels *input_viewport_size);
-
-float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
-                        constant Size_DevicePixels *atlas_size);
-float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                               Bounds_ScaledPixels clip_bounds);
-float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                               Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation);
-float corner_dash_velocity(float dv1, float dv2);
-float dash_alpha(float t, float period, float length, float dash_velocity,
-                 float antialias_threshold);
-float quarter_ellipse_sdf(float2 point, float2 radii);
-float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
-float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
-               Corners_ScaledPixels corner_radii);
-float quad_sdf_impl(float2 center_to_point, float corner_radius);
-float gaussian(float x, float sigma);
-float2 erf(float2 x);
-float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size);
-float4 over(float4 below, float4 above);
-float radians(float degrees);
-float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
-  float4 solid_color, float4 color0, float4 color1);
-
-struct GradientColor {
-  float4 solid;
-  float4 color0;
-  float4 color1;
-};
+float4 hsla_to_rgba(Hsla color) {
+  return float4(color.h, color.s, color.l, color.a);
+}
+;
 GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid, Hsla color0, Hsla color1);
 
 struct QuadVertexOutput {

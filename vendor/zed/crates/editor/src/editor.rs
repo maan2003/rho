@@ -82,10 +82,16 @@ pub(crate) use completions::split_words;
 use diagnostics::{ActiveDiagnostic, GlobalDiagnosticRenderer, InlineDiagnostic};
 pub use diagnostics::{DiagnosticRenderer, set_diagnostic_renderer};
 pub use display_map::{
-    ChunkRenderer, ChunkRendererContext, DisplayPoint, FoldPlaceholder, HighlightKey,
-    NavigationOverlayKey, SemanticTokenHighlight,
+    ChunkRenderer, ChunkRendererContext, DisplayElisionId, DisplayElisionProperties, DisplayPoint,
+    FoldPlaceholder, HighlightKey, NavigationOverlayKey, SemanticTokenHighlight,
 };
 pub use edit_prediction::make_suggestion_styles;
+
+#[derive(Clone)]
+pub struct EditorRightPrompt {
+    pub anchor: Anchor,
+    pub spans: Vec<(String, HighlightStyle)>,
+}
 pub(crate) use edit_prediction::{
     EditDisplayMode, EditPrediction, EditPredictionPreview, EditPredictionSettings,
     EditPredictionState, MenuEditPredictionsPolicy, RegisteredEditPredictionDelegate,
@@ -574,7 +580,7 @@ pub fn make_inlay_hints_style(cx: &App) -> HighlightStyle {
         .unwrap_or_default();
 
     if style.color.is_none() {
-        style.color = Some(cx.theme().status().hint);
+        style.color = Some(cx.theme().status().hint.into());
     }
 
     if !show_background {
@@ -583,7 +589,7 @@ pub fn make_inlay_hints_style(cx: &App) -> HighlightStyle {
     }
 
     if style.background_color.is_none() {
-        style.background_color = Some(cx.theme().status().hint_background);
+        style.background_color = Some(cx.theme().status().hint_background.into());
     }
 
     style
@@ -615,6 +621,11 @@ impl EditorActionId {
         Self(answer)
     }
 }
+
+type PrepareForInsert = Rc<dyn Fn(&mut Editor, &mut Window, &mut Context<Editor>)>;
+
+// type GetFieldEditorTheme = dyn Fn(&theme::Theme) -> theme::FieldEditor;
+// type OverrideTextStyle = dyn Fn(&EditorStyle) -> Option<HighlightStyle>;
 
 type BackgroundHighlight = (
     Arc<dyn Fn(&usize, &Theme) -> Hsla + Send + Sync>,
@@ -969,9 +980,14 @@ pub struct Editor {
     show_cursor_names: bool,
     hovered_cursors: HashMap<HoveredCursor, Task<()>>,
     pub show_local_selections: bool,
+    prepare_for_insert: Option<PrepareForInsert>,
+    mouse_click_selection_enabled: bool,
+    restrict_navigation_to_editable_ranges: bool,
+    right_prompt: Option<EditorRightPrompt>,
     mode: EditorMode,
     breadcrumbs_visibility: BreadcrumbsVisibility,
     show_gutter: bool,
+    show_compact_gutter: bool,
     show_scrollbars: ScrollbarAxes,
     minimap_visibility: MinimapVisibility,
     offset_content: bool,
@@ -1209,6 +1225,7 @@ impl NextScrollCursorCenterTopBottom {
 pub struct EditorSnapshot {
     pub mode: EditorMode,
     show_gutter: bool,
+    show_compact_gutter: bool,
     offset_content: bool,
     show_line_numbers: Option<bool>,
     number_deleted_lines: bool,
@@ -1822,6 +1839,8 @@ impl Editor {
             .clone_state(&self.scroll_manager, &my_snapshot, &clone_snapshot, cx);
         clone.searchable = self.searchable;
         clone.read_only = self.read_only;
+        clone.restrict_navigation_to_editable_ranges = self.restrict_navigation_to_editable_ranges;
+        clone.right_prompt = self.right_prompt.clone();
         clone.buffers_with_disabled_indent_guides =
             self.buffers_with_disabled_indent_guides.clone();
         clone.enable_mouse_wheel_zoom = self.enable_mouse_wheel_zoom;
@@ -2273,6 +2292,10 @@ impl Editor {
             project,
             blink_manager: blink_manager.clone(),
             show_local_selections: true,
+            prepare_for_insert: None,
+            mouse_click_selection_enabled: true,
+            restrict_navigation_to_editable_ranges: false,
+            right_prompt: None,
             show_scrollbars: ScrollbarAxes {
                 horizontal: full_mode,
                 vertical: full_mode,
@@ -2281,6 +2304,7 @@ impl Editor {
             offset_content: !matches!(mode, EditorMode::SingleLine),
             breadcrumbs_visibility: BreadcrumbsVisibility::from_settings(cx),
             show_gutter: full_mode,
+            show_compact_gutter: false,
             show_line_numbers: (!full_mode).then_some(false),
             use_relative_line_numbers: None,
             disable_expand_excerpt_buttons: !full_mode,
@@ -2987,6 +3011,7 @@ impl Editor {
         EditorSnapshot {
             mode: self.mode.clone(),
             show_gutter: self.show_gutter,
+            show_compact_gutter: self.show_compact_gutter,
             offset_content: self.offset_content,
             show_line_numbers: self.show_line_numbers,
             number_deleted_lines: self.number_deleted_lines,
@@ -3191,6 +3216,110 @@ impl Editor {
 
     pub fn read_only(&self, cx: &App) -> bool {
         self.read_only || self.buffer.read(cx).read_only()
+    }
+
+    pub fn point_is_editable(snapshot: &MultiBufferSnapshot, point: Point) -> bool {
+        snapshot
+            .point_to_buffer_point(point)
+            .is_some_and(|(buffer, _)| buffer.capability.editable())
+    }
+
+    pub fn range_is_editable(snapshot: &MultiBufferSnapshot, range: Range<Point>) -> bool {
+        if range.end < range.start {
+            return false;
+        }
+
+        if range.start == range.end {
+            return Self::point_is_editable(snapshot, range.start);
+        }
+
+        let buffer_ranges = snapshot.range_to_buffer_ranges(range);
+        !buffer_ranges.is_empty()
+            && buffer_ranges
+                .into_iter()
+                .all(|(buffer, range, _)| buffer.capability.editable() && range.start < range.end)
+    }
+
+    pub fn constrain_to_editable_range(
+        snapshot: &MultiBufferSnapshot,
+        origin: Point,
+        proposed: Point,
+    ) -> Point {
+        let range = if origin <= proposed {
+            origin..proposed
+        } else {
+            proposed..origin
+        };
+
+        if Self::point_is_editable(snapshot, proposed) && Self::range_is_editable(snapshot, range) {
+            proposed
+        } else {
+            origin
+        }
+    }
+
+    pub fn set_restrict_navigation_to_editable_ranges(&mut self, restrict: bool) {
+        self.restrict_navigation_to_editable_ranges = restrict;
+    }
+
+    pub fn set_right_prompt(
+        &mut self,
+        right_prompt: Option<EditorRightPrompt>,
+        cx: &mut Context<Self>,
+    ) {
+        self.right_prompt = right_prompt;
+        cx.notify();
+    }
+
+    pub fn nearest_editable_point(snapshot: &DisplaySnapshot, point: Point) -> Option<Point> {
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        if Self::point_is_editable(buffer_snapshot, point) {
+            return Some(point);
+        }
+
+        let mut left = point.to_display_point(snapshot);
+        let mut right = left;
+        loop {
+            let next_left = movement::left(snapshot, left);
+            let next_right = movement::right(snapshot, right);
+            let left_changed = next_left != left;
+            let right_changed = next_right != right;
+
+            if left_changed {
+                left = next_left;
+                let point = left.to_point(snapshot);
+                if Self::point_is_editable(buffer_snapshot, point) {
+                    return Some(point);
+                }
+            }
+
+            if right_changed {
+                right = next_right;
+                let point = right.to_point(snapshot);
+                if Self::point_is_editable(buffer_snapshot, point) {
+                    return Some(point);
+                }
+            }
+
+            if !left_changed && !right_changed {
+                return None;
+            }
+        }
+    }
+
+    pub fn move_to_nearest_editable_points(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.move_cursors_with(&mut |map, cursor, goal| {
+                let point = cursor.to_point(map);
+                if Self::point_is_editable(map.buffer_snapshot(), point) {
+                    (cursor, goal)
+                } else if let Some(point) = Self::nearest_editable_point(map, point) {
+                    (point.to_display_point(map), SelectionGoal::None)
+                } else {
+                    (cursor, goal)
+                }
+            })
+        });
     }
 
     pub fn set_read_only(&mut self, read_only: bool) {
@@ -3471,7 +3600,7 @@ impl Editor {
                 editor.highlight_background(
                     HighlightKey::Editor,
                     &ranges_to_highlight,
-                    |_, theme| theme.colors().editor_highlighted_line_background,
+                    |_, theme| theme.colors().editor_highlighted_line_background.into(),
                     cx,
                 );
             });
@@ -3567,13 +3696,23 @@ impl Editor {
                     this.highlight_background(
                         HighlightKey::DocumentHighlightRead,
                         &read_ranges,
-                        |_, theme| theme.colors().editor_document_highlight_read_background,
+                        |_, theme| {
+                            theme
+                                .colors()
+                                .editor_document_highlight_read_background
+                                .into()
+                        },
                         cx,
                     );
                     this.highlight_background(
                         HighlightKey::DocumentHighlightWrite,
                         &write_ranges,
-                        |_, theme| theme.colors().editor_document_highlight_write_background,
+                        |_, theme| {
+                            theme
+                                .colors()
+                                .editor_document_highlight_write_background
+                                .into()
+                        },
                         cx,
                     );
                     cx.notify();
@@ -3705,7 +3844,12 @@ impl Editor {
                         editor.highlight_background(
                             HighlightKey::SelectedTextHighlight,
                             &match_ranges,
-                            |_, theme| theme.colors().editor_document_highlight_bracket_background,
+                            |_, theme| {
+                                theme
+                                    .colors()
+                                    .editor_document_highlight_bracket_background
+                                    .into()
+                            },
                             cx,
                         )
                     }
@@ -4951,6 +5095,7 @@ impl Editor {
             let linked_edits = this.linked_edits_for_selections(Arc::from(""), cx);
 
             let display_map = this.display_map.update(cx, |map, cx| map.snapshot(cx));
+            let buffer_snapshot = display_map.buffer_snapshot();
             let mut selections = this.selections.all::<MultiBufferPoint>(&display_map);
             for selection in &mut selections {
                 if selection.is_empty() {
@@ -4981,6 +5126,8 @@ impl Editor {
                         }
                     }
 
+                    new_head =
+                        Self::constrain_to_editable_range(buffer_snapshot, old_head, new_head);
                     selection.set_head(new_head, SelectionGoal::None);
                 }
             }
@@ -5007,7 +5154,14 @@ impl Editor {
             this.change_selections(Default::default(), window, cx, |s| {
                 s.move_with(&mut |map, selection| {
                     if selection.is_empty() {
-                        let cursor = movement::right(map, selection.head());
+                        let old_head = selection.head().to_point(map);
+                        let cursor = movement::right(map, selection.head()).to_point(map);
+                        let cursor = Self::constrain_to_editable_range(
+                            map.buffer_snapshot(),
+                            old_head,
+                            cursor,
+                        )
+                        .to_display_point(map);
                         selection.end = cursor;
                         selection.reversed = true;
                         selection.goal = SelectionGoal::None;
@@ -6427,7 +6581,12 @@ impl Editor {
 
             self.go_to_line::<ActiveDebugLine>(
                 multibuffer_anchor,
-                |cx| cx.theme().colors().editor_debugger_active_line_background,
+                |cx| {
+                    cx.theme()
+                        .colors()
+                        .editor_debugger_active_line_background
+                        .into()
+                },
                 window,
                 cx,
             );
@@ -7897,7 +8056,7 @@ impl Editor {
                                         .child(EditorElement::new(
                                             &rename_editor,
                                             EditorStyle {
-                                                background: cx.theme().system().transparent,
+                                                background: cx.theme().system().transparent.into(),
                                                 local_player: cx.editor_style.local_player,
                                                 text: text_style,
                                                 scrollbar_width: cx.editor_style.scrollbar_width,
@@ -8438,6 +8597,70 @@ impl Editor {
         }
         cx.notify();
         blocks
+    }
+
+    pub fn insert_display_elisions(
+        &mut self,
+        elisions: impl IntoIterator<Item = DisplayElisionProperties<Anchor>>,
+        autoscroll: Option<Autoscroll>,
+        cx: &mut Context<Self>,
+    ) -> Vec<DisplayElisionId> {
+        let elisions = self.display_map.update(cx, |display_map, cx| {
+            display_map.insert_display_elisions(elisions, cx)
+        });
+        if let Some(autoscroll) = autoscroll {
+            self.request_autoscroll(autoscroll, cx);
+        }
+        cx.notify();
+        elisions
+    }
+
+    pub fn remove_display_elisions(
+        &mut self,
+        ids: HashSet<DisplayElisionId>,
+        autoscroll: Option<Autoscroll>,
+        cx: &mut Context<Self>,
+    ) {
+        self.display_map.update(cx, |display_map, cx| {
+            display_map.remove_display_elisions(ids, cx)
+        });
+        if let Some(autoscroll) = autoscroll {
+            self.request_autoscroll(autoscroll, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn update_display_elisions(
+        &mut self,
+        elisions: impl IntoIterator<Item = (DisplayElisionId, DisplayElisionProperties<Anchor>)>,
+        autoscroll: Option<Autoscroll>,
+        cx: &mut Context<Self>,
+    ) {
+        self.display_map.update(cx, |display_map, cx| {
+            display_map.update_display_elisions(elisions, cx)
+        });
+        if let Some(autoscroll) = autoscroll {
+            self.request_autoscroll(autoscroll, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn set_display_elisions_expanded(
+        &mut self,
+        ids: HashSet<DisplayElisionId>,
+        expanded: bool,
+        autoscroll: Option<Autoscroll>,
+        cx: &mut Context<Self>,
+    ) {
+        self.display_map.update(cx, |display_map, cx| {
+            display_map.set_display_elisions_expanded(ids, expanded, cx)
+        });
+        if let Some(autoscroll) = autoscroll
+            && !self.has_active_autoscroll_pin()
+        {
+            self.request_autoscroll(autoscroll, cx);
+        }
+        cx.notify();
     }
 
     pub fn resize_blocks(
@@ -9033,7 +9256,12 @@ impl Editor {
         self.highlight_background(
             HighlightKey::SearchWithinRange,
             ranges,
-            |_, colors| colors.colors().editor_document_highlight_read_background,
+            |_, colors| {
+                colors
+                    .colors()
+                    .editor_document_highlight_read_background
+                    .into()
+            },
             cx,
         )
     }
@@ -9185,6 +9413,18 @@ impl Editor {
         let start = buffer.anchor_before(MultiBufferOffset(0));
         let end = buffer.anchor_after(buffer.len());
         self.sorted_background_highlights_in_range(start..end, &snapshot, cx.theme())
+    }
+
+    pub fn all_gutter_highlights(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<(Range<DisplayPoint>, Hsla)> {
+        let snapshot = self.snapshot(window, cx);
+        let buffer = snapshot.buffer_snapshot();
+        let start = buffer.anchor_before(MultiBufferOffset(0));
+        let end = buffer.anchor_after(buffer.len());
+        self.gutter_highlights_in_range(start..end, &snapshot.display_snapshot, cx)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -9454,7 +9694,9 @@ impl Editor {
     }
 
     pub fn show_local_cursors(&self, window: &mut Window, cx: &mut App) -> bool {
-        (self.read_only(cx) || self.blink_manager.read(cx).visible())
+        (self.read_only(cx)
+            || self.cursor_shape == CursorShape::Block
+            || self.blink_manager.read(cx).visible())
             && self.focus_handle.is_focused(window)
     }
 
@@ -10903,7 +11145,7 @@ impl Editor {
 
         let mut text_style = match self.mode {
             EditorMode::SingleLine | EditorMode::AutoHeight { .. } => TextStyle {
-                color: cx.theme().colors().editor_foreground,
+                color: cx.theme().colors().editor_foreground.into(),
                 font_family: settings.ui_font.family.clone(),
                 font_features: settings.ui_font.features.clone(),
                 font_fallbacks: settings.ui_font.fallbacks.clone(),
@@ -10913,7 +11155,7 @@ impl Editor {
                 ..Default::default()
             },
             EditorMode::Full { .. } | EditorMode::Minimap { .. } => TextStyle {
-                color: cx.theme().colors().editor_foreground,
+                color: cx.theme().colors().editor_foreground.into(),
                 font_family: settings.buffer_font.family.clone(),
                 font_features: settings.buffer_font.features.clone(),
                 font_fallbacks: settings.buffer_font.fallbacks.clone(),
@@ -10935,8 +11177,8 @@ impl Editor {
         };
 
         EditorStyle {
-            background,
-            border: cx.theme().colors().border,
+            background: background.into(),
+            border: cx.theme().colors().border.into(),
             local_player: cx.theme().players().local(),
             text: text_style,
             scrollbar_width: EditorElement::SCROLLBAR_WIDTH,
@@ -11606,7 +11848,14 @@ impl EditorSnapshot {
         window: &mut Window,
         cx: &App,
     ) -> GutterDimensions {
-        if self.show_gutter
+        if self.show_compact_gutter
+            && let Some(ch_width) = cx.text_system().ch_width(font_id, font_size).log_err()
+        {
+            GutterDimensions {
+                width: ch_width * 0.5,
+                ..Default::default()
+            }
+        } else if self.show_gutter
             && let Some(ch_width) = cx.text_system().ch_width(font_id, font_size).log_err()
             && let Some(ch_advance) = cx.text_system().ch_advance(font_id, font_size).log_err()
         {
@@ -12024,11 +12273,11 @@ impl ui_input::ErasedEditor for ErasedEditorImpl {
             font_weight: settings.ui_font.weight,
             font_style: FontStyle::Normal,
             line_height: relative(1.2),
-            color: theme_color.text,
+            color: theme_color.text.into(),
             ..Default::default()
         };
         let editor_style = EditorStyle {
-            background: theme_color.ghost_element_background,
+            background: theme_color.ghost_element_background.into(),
             local_player: cx.theme().players().local(),
             syntax: cx.theme().syntax().clone(),
             text: text_style,
@@ -12140,12 +12389,12 @@ pub fn styled_runs_for_code_label<'a>(
             .flat_map(move |(ix, (range, highlight_id))| {
                 let style = if *highlight_id == language::HighlightId::TABSTOP_INSERT_ID {
                     HighlightStyle {
-                        color: Some(local_player.cursor),
+                        color: Some(local_player.cursor.into()),
                         ..Default::default()
                     }
                 } else if *highlight_id == language::HighlightId::TABSTOP_REPLACE_ID {
                     HighlightStyle {
-                        background_color: Some(local_player.selection),
+                        background_color: Some(local_player.selection.into()),
                         ..Default::default()
                     }
                 } else if let Some(style) = syntax_theme.get(*highlight_id).cloned() {
@@ -12416,9 +12665,9 @@ impl PromptEditor {
         let settings = ThemeSettings::get_global(cx);
         let text_style = TextStyle {
             color: if self.prompt.read(cx).read_only(cx) {
-                cx.theme().colors().text_disabled
+                cx.theme().colors().text_disabled.into()
             } else {
-                cx.theme().colors().text
+                cx.theme().colors().text.into()
             },
             font_family: settings.buffer_font.family.clone(),
             font_fallbacks: settings.buffer_font.fallbacks.clone(),
@@ -12430,7 +12679,7 @@ impl PromptEditor {
         EditorElement::new(
             &self.prompt,
             EditorStyle {
-                background: cx.theme().colors().editor_background,
+                background: cx.theme().colors().editor_background.into(),
                 local_player: cx.theme().players().local(),
                 text: text_style,
                 ..Default::default()

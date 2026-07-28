@@ -1,7 +1,7 @@
 use collections::HashMap;
 use gpui::{
-    Animation, AnimationExt, AnyElement, ClipboardItem, Context, Entity, ImageSource, RenderImage,
-    StyledText, Task, img, pulsating_between,
+    Animation, AnimationExt, AnyElement, ClipboardItem, Context, Entity, Hsla, ImageSource,
+    RenderImage, StyledText, Task, img, pulsating_between,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -173,41 +173,43 @@ fn build_mermaid_theme(cx: &Context<Markdown>) -> mermaid_render::MermaidTheme {
     let is_dark = !cx.theme().appearance.is_light();
 
     let players = cx.theme().players();
-    let git_branch_colors = std::array::from_fn(|i| players.0[i % players.0.len()].cursor);
-    let git_branch_label_colors = git_branch_colors.map(mermaid_render::text_color_for_background);
+    let git_branch_colors: [Hsla; 8] =
+        std::array::from_fn(|i| players.0[i % players.0.len()].cursor.into());
+    let git_branch_label_colors =
+        git_branch_colors.map(|color| mermaid_render::text_color_for_background(color.into()));
 
     mermaid_render::MermaidTheme {
         dark_mode: is_dark,
         font_family: mermaid_font_family(theme_settings.ui_font.family.as_ref()),
-        background: colors.editor_background,
-        primary_color: colors.surface_background,
-        primary_text_color: colors.text,
-        primary_border_color: colors.border,
-        secondary_color: colors.element_background,
-        tertiary_color: colors.ghost_element_hover,
-        line_color: colors.border,
-        text_color: colors.text,
-        edge_label_background: colors.editor_background,
-        cluster_background: colors.panel_background,
-        cluster_border: colors.border_variant,
-        note_background: colors.surface_background,
-        note_border: colors.border_variant,
-        actor_background: colors.element_background,
-        actor_border: colors.border,
-        activation_background: colors.ghost_element_hover,
-        activation_border: colors.border,
+        background: colors.editor_background.into(),
+        primary_color: colors.surface_background.into(),
+        primary_text_color: colors.text.into(),
+        primary_border_color: colors.border.into(),
+        secondary_color: colors.element_background.into(),
+        tertiary_color: colors.ghost_element_hover.into(),
+        line_color: colors.border.into(),
+        text_color: colors.text.into(),
+        edge_label_background: colors.editor_background.into(),
+        cluster_background: colors.panel_background.into(),
+        cluster_border: colors.border_variant.into(),
+        note_background: colors.surface_background.into(),
+        note_border: colors.border_variant.into(),
+        actor_background: colors.element_background.into(),
+        actor_border: colors.border.into(),
+        activation_background: colors.ghost_element_hover.into(),
+        activation_border: colors.border.into(),
         git_branch_colors,
         git_branch_label_colors,
-        er_attr_bg_odd: colors.surface_background,
-        er_attr_bg_even: colors.element_background,
-        error_color: cx.theme().status().error,
-        warning_color: cx.theme().status().warning,
+        er_attr_bg_odd: colors.surface_background.into(),
+        er_attr_bg_even: colors.element_background.into(),
+        error_color: cx.theme().status().error.into(),
+        warning_color: cx.theme().status().warning.into(),
         accent_colors: players
             .0
             .iter()
             .map(|player| mermaid_render::AccentColor {
-                foreground: player.cursor,
-                background: player.background,
+                foreground: player.cursor.into(),
+                background: player.background.into(),
             })
             .collect(),
     }

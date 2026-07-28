@@ -6,14 +6,14 @@ use std::{
 };
 
 use gpui::{
-    Along, Anchor, App, AppContext as _, Axis as ScrollbarAxis, BorderStyle, Bounds, ContentMask,
-    Context, Corners, CursorStyle, DispatchPhase, Div, Edges, Element, ElementId, Entity, EntityId,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero,
-    LayoutId, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Pixels, Point, Position, Render, ScrollHandle, ScrollWheelEvent, Size, Stateful,
-    StatefulInteractiveElement, Style, Styled, Task, UniformListDecoration,
-    UniformListScrollHandle, Window, ease_in_out, prelude::FluentBuilder as _, px, quad, relative,
-    size,
+    Along, Anchor, App, AppContext as _, Axis as ScrollbarAxis, BorderStyle, Bounds,
+    Color as GpuiColor, ContentMask, Context, Corners, CursorStyle, DispatchPhase, Div, Edges,
+    Element, ElementId, Entity, EntityId, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+    InteractiveElement, IntoElement, IsZero, LayoutId, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Position, Render, ScrollHandle,
+    ScrollWheelEvent, Size, Stateful, StatefulInteractiveElement, Style, Styled, Task,
+    UniformListDecoration, UniformListScrollHandle, Window, ease_in_out,
+    prelude::FluentBuilder as _, px, quad, relative, size,
 };
 use gpui_util::ResultExt;
 use smallvec::SmallVec;
@@ -372,7 +372,7 @@ pub struct Scrollbars<T: ScrollableHandle = ScrollHandle> {
     scrollable_handle: Handle<T>,
     visibility: Point<ReservedSpace>,
     style: Option<ScrollbarStyle>,
-    track_color: Option<Hsla>,
+    track_color: Option<GpuiColor>,
     border: bool,
 }
 
@@ -467,15 +467,23 @@ impl<ScrollHandle: ScrollableHandle> Scrollbars<ScrollHandle> {
         self
     }
 
-    pub fn with_track_along(mut self, along: ScrollAxes, background_color: Hsla) -> Self {
+    pub fn with_track_along(
+        mut self,
+        along: ScrollAxes,
+        background_color: impl Into<GpuiColor>,
+    ) -> Self {
         self.visibility = along.apply_to(self.visibility, ReservedSpace::Track);
-        self.track_color = Some(background_color);
+        self.track_color = Some(background_color.into());
         self
     }
 
-    pub fn with_stable_track_along(mut self, along: ScrollAxes, background_color: Hsla) -> Self {
+    pub fn with_stable_track_along(
+        mut self,
+        along: ScrollAxes,
+        background_color: impl Into<GpuiColor>,
+    ) -> Self {
         self.visibility = along.apply_to(self.visibility, ReservedSpace::StableTrack);
-        self.track_color = Some(background_color);
+        self.track_color = Some(background_color.into());
         self.border = true;
         self
     }
@@ -598,7 +606,7 @@ enum ParentHoverEvent {
 
 #[derive(Clone)]
 struct TrackColors {
-    background: Hsla,
+    background: GpuiColor,
     has_border: bool,
 }
 
@@ -821,7 +829,7 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
         }
     }
 
-    fn update_colors(&mut self, track_color: Option<Hsla>, has_border: bool) {
+    fn update_colors(&mut self, track_color: Option<GpuiColor>, has_border: bool) {
         self.track_color = track_color.map(|color| TrackColors {
             background: color,
             has_border,
@@ -1367,7 +1375,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                     let blending_color = if hovered || reserved_space.needs_scroll_track() {
                         blend_color
                     } else {
-                        blend_color.min(blend_color.alpha(MAXIMUM_OPACITY))
+                        blend_color.alpha(blend_color.a.min(MAXIMUM_OPACITY))
                     };
 
                     let mut thumb_color = blending_color.blend(thumb_base_color);
@@ -1402,7 +1410,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                         let border_color = if has_border {
                             cx.theme().colors().border_variant.opacity(0.6)
                         } else {
-                            Hsla::transparent_black()
+                            Hsla::transparent_black().into()
                         };
 
                         window.paint_quad(quad(
