@@ -161,6 +161,12 @@ impl SvgRenderer {
                 select_font: font_resolver,
                 select_fallback: fallback_selection,
             },
+            image_href_resolver: usvg::ImageHrefResolver {
+                resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+                // SVG bytes have no base path. Resolving arbitrary hrefs would
+                // therefore give them access to the process's filesystem.
+                resolve_string: Box::new(|_, _| None),
+            },
             ..Default::default()
         };
         Self {
@@ -353,6 +359,18 @@ mod tests {
         // "removal index (is 5) should be < len (is 5)".
         usvg::Tree::from_data(svg.as_bytes(), &options)
             .expect("SVG with mixed-font text should parse");
+    }
+
+    #[test]
+    fn external_image_hrefs_are_not_resolved() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        assert!(
+            (renderer.usvg_options.image_href_resolver.resolve_string)(
+                "/tmp/image.png",
+                &renderer.usvg_options,
+            )
+            .is_none()
+        );
     }
 
     #[test]
