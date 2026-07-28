@@ -389,7 +389,8 @@ AI APIs.
   arbitrary interactive input, `/dev/tty`, persistent job-control terminal
   semantics, a terminal screen, or hidden password entry belong in the raw
   terminal.
-- Pager-aware commands receive `rho-pager` through `PAGER` and `GIT_PAGER`.
+- Pager-aware commands receive `rho-pager` through `PAGER`, `GIT_PAGER`, and
+  `JJ_PAGER`.
   The sidecar binds one Unix socket below the user-private `XDG_RUNTIME_DIR`
   and requires both a random shell-lifetime token and a fresh random execution
   token from the pager's inherited environment. Pager frames are independently

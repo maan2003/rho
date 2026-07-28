@@ -783,7 +783,7 @@ fn relay_output(
     let _ = done.send(());
 }
 
-/// Runs the pager helper selected through `PAGER`/`GIT_PAGER`.
+/// Runs the pager helper selected through `PAGER`/`GIT_PAGER`/`JJ_PAGER`.
 ///
 /// Output remains ordinary stdout. The private socket carries only page-credit
 /// control, and any missing or lost control connection degrades to `cat`.

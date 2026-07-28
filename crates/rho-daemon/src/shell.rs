@@ -1060,6 +1060,7 @@ impl Session {
             .env_remove("NO_COLOR")
             .env("PAGER", &spawn.pager_program)
             .env("GIT_PAGER", &spawn.pager_program)
+            .env("JJ_PAGER", &spawn.pager_program)
             .env("COLUMNS", SHELL_COLS.to_string())
             .env("LINES", SHELL_ROWS.to_string());
         spawn
@@ -2038,6 +2039,13 @@ mod tests {
             1,
             "the sideband protocol is the only source of accepted input"
         );
+
+        first
+            .submit
+            .send("printf 'pager-env-%s-%s-%s' \"$PAGER\" \"$GIT_PAGER\" \"$JJ_PAGER\"".to_owned())
+            .await
+            .unwrap();
+        wait_for_text(&mut first, &mut first_state, "pager-env-cat-cat-cat").await;
 
         // Brush owns one persistent evaluator, including variables, functions,
         // working directory, startup configuration, and prompt hooks.
