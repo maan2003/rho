@@ -47,6 +47,8 @@ struct TranscriptEntry {
     session_id: Option<Uuid>,
     #[serde(alias = "parent_uuid")]
     parent_uuid: Option<Uuid>,
+    #[serde(alias = "logical_parent_uuid")]
+    logical_parent_uuid: Option<Uuid>,
     #[serde(default)]
     message: Value,
     request_id: Option<String>,
@@ -77,23 +79,13 @@ enum TranscriptEntryKind {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactMetadata {
-    preserved_messages: Option<PreservedMessages>,
     preserved_segment: Option<PreservedSegment>,
     post_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PreservedMessages {
-    anchor_uuid: Uuid,
-    uuids: Vec<Uuid>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct PreservedSegment {
-    anchor_uuid: Uuid,
-    head_uuid: Uuid,
     tail_uuid: Uuid,
 }
 
@@ -331,10 +323,9 @@ async fn non_empty_file(path: &Utf8Path) -> Result<bool> {
 }
 
 fn session_messages(
-    mut entries: Vec<TranscriptEntry>,
+    entries: Vec<TranscriptEntry>,
     options: SessionMessagesOptions,
 ) -> Vec<SessionMessage> {
-    apply_compact_boundaries(&mut entries);
     let chain = latest_chain(&entries);
     let messages = chain
         .into_iter()
@@ -345,65 +336,6 @@ fn session_messages(
     match options.limit {
         Some(limit) if limit > 0 => messages.into_iter().skip(offset).take(limit).collect(),
         _ => messages.into_iter().skip(offset).collect(),
-    }
-}
-
-fn apply_compact_boundaries(entries: &mut [TranscriptEntry]) {
-    let mut by_uuid = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| entry.uuid().map(|uuid| (uuid, index)))
-        .collect::<HashMap<_, _>>();
-
-    for index in 0..entries.len() {
-        let entry = entries[index].clone();
-        if entry.kind != TranscriptEntryKind::System
-            || entry.subtype.as_deref() != Some("compact_boundary")
-        {
-            continue;
-        }
-        let Some(metadata) = entry.compact_metadata else {
-            continue;
-        };
-        if let Some(preserved) = metadata.preserved_messages {
-            if preserved.uuids.is_empty()
-                || preserved
-                    .uuids
-                    .iter()
-                    .any(|uuid| !by_uuid.contains_key(uuid))
-            {
-                continue;
-            }
-            let mut parent = preserved.anchor_uuid;
-            for uuid in &preserved.uuids {
-                let entry_index = by_uuid[uuid];
-                entries[entry_index].parent_uuid = Some(parent);
-                parent = *uuid;
-            }
-            let first = preserved.uuids[0];
-            let last = *preserved.uuids.last().expect("not empty");
-            for entry in entries.iter_mut() {
-                if entry.parent_uuid == Some(preserved.anchor_uuid) && entry.uuid != Some(first) {
-                    entry.parent_uuid = Some(last);
-                }
-            }
-        } else if let Some(preserved) = metadata.preserved_segment
-            && let Some(head_index) = by_uuid.get(&preserved.head_uuid).copied()
-        {
-            entries[head_index].parent_uuid = Some(preserved.anchor_uuid);
-            for entry in entries.iter_mut() {
-                if entry.parent_uuid == Some(preserved.anchor_uuid)
-                    && entry.uuid != Some(preserved.head_uuid)
-                {
-                    entry.parent_uuid = Some(preserved.tail_uuid);
-                }
-            }
-        }
-        by_uuid = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| entry.uuid().map(|uuid| (uuid, index)))
-            .collect();
     }
 }
 
@@ -431,7 +363,27 @@ fn latest_chain(entries: &[TranscriptEntry]) -> Vec<&TranscriptEntry> {
             break;
         }
         chain.push(current);
-        let Some(parent_uuid) = current.parent_uuid else {
+        // Compaction starts a new physical parent chain at the summary, but
+        // `logicalParentUuid` retains the previous visible history. Follow it
+        // so transcript consumers see the full active branch rather than only
+        // the tail since the latest compaction.
+        let parent_uuid = if current.kind == TranscriptEntryKind::System
+            && current.subtype.as_deref() == Some("compact_boundary")
+        {
+            current
+                .logical_parent_uuid
+                .or_else(|| {
+                    current
+                        .compact_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.preserved_segment.as_ref())
+                        .map(|segment| segment.tail_uuid)
+                })
+                .or(current.parent_uuid)
+        } else {
+            current.parent_uuid
+        };
+        let Some(parent_uuid) = parent_uuid else {
             break;
         };
         let Some(parent) = by_uuid.get(&parent_uuid).copied() else {
@@ -573,6 +525,7 @@ mod tests {
             uuid: Some(uuid),
             session_id: Some(uuid::uuid!("00000000-0000-4000-8000-000000000001")),
             parent_uuid,
+            logical_parent_uuid: None,
             message: json!({"role": "user", "content": "hello"}),
             request_id: None,
             timestamp: None,
@@ -597,7 +550,6 @@ mod tests {
         let mut compact = entry(TranscriptEntryKind::System, b, Some(a));
         compact.subtype = Some("compact_boundary".to_owned());
         compact.compact_metadata = Some(CompactMetadata {
-            preserved_messages: None,
             preserved_segment: None,
             post_tokens: Some(7),
         });
@@ -747,6 +699,37 @@ mod tests {
                 .map(|message| message.uuid)
                 .collect::<Vec<_>>(),
             [a, b, c]
+        );
+    }
+
+    #[test]
+    fn follows_history_across_compaction_boundary() {
+        let user = uuid::uuid!("00000000-0000-4000-8000-00000000000a");
+        let assistant = uuid::uuid!("00000000-0000-4000-8000-00000000000b");
+        let compact = uuid::uuid!("00000000-0000-4000-8000-00000000000c");
+        let summary = uuid::uuid!("00000000-0000-4000-8000-00000000000d");
+        let latest = uuid::uuid!("00000000-0000-4000-8000-00000000000e");
+
+        let mut boundary = entry(TranscriptEntryKind::System, compact, None);
+        boundary.subtype = Some("compact_boundary".to_owned());
+        boundary.logical_parent_uuid = Some(assistant);
+        let messages = session_messages(
+            vec![
+                entry(TranscriptEntryKind::User, user, None),
+                entry(TranscriptEntryKind::Assistant, assistant, Some(user)),
+                boundary,
+                entry(TranscriptEntryKind::User, summary, Some(compact)),
+                entry(TranscriptEntryKind::Assistant, latest, Some(summary)),
+            ],
+            SessionMessagesOptions::default(),
+        );
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.uuid)
+                .collect::<Vec<_>>(),
+            [user, assistant, summary, latest]
         );
     }
 
