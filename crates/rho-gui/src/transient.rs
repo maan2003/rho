@@ -493,6 +493,9 @@ fn usage_chart(
     canvas(
         move |_, _, _| {},
         move |bounds, _, window, _| {
+            const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+            let now = crate::workspace::now_ms();
+            let start = now.saturating_sub(days * DAY_MS);
             let pixels_per_percent = bounds.size.height / 100.0;
             for percent in (0..=100).step_by(10) {
                 let y = bounds.origin.y + pixels_per_percent * (100.0 - percent as f32);
@@ -503,9 +506,23 @@ fn usage_chart(
                     window.paint_path(path, grid);
                 }
             }
+            let mut midnight = start.div_ceil(DAY_MS) * DAY_MS;
+            if midnight == start {
+                midnight = midnight.saturating_add(DAY_MS);
+            }
+            while midnight < now {
+                let x_ratio = midnight.saturating_sub(start) as f64
+                    / now.saturating_sub(start).max(1) as f64;
+                let x = bounds.origin.x + bounds.size.width * x_ratio as f32;
+                paint_grid_line(
+                    point(x, bounds.origin.y),
+                    point(x, bounds.bottom()),
+                    grid,
+                    window,
+                );
+                midnight = midnight.saturating_add(DAY_MS);
+            }
 
-            let now = crate::workspace::now_ms();
-            let start = now.saturating_sub(days * 24 * 60 * 60 * 1_000);
             for model in &series {
                 let color = match model.model.as_str() {
                     "claude" => claude,
@@ -655,7 +672,8 @@ fn global_usage_chart(
         move |_, _, _| {},
         move |bounds, _, window, _| {
             const BUCKET_MS: u64 = 5 * 60 * 1_000;
-            let window_ms = days * 24 * 60 * 60 * 1_000;
+            const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+            let window_ms = days * DAY_MS;
             let start = now.saturating_sub(window_ms);
             let mut costs = HashMap::<u64, (f64, f64)>::new();
             for provider in &series {
@@ -745,15 +763,20 @@ fn global_usage_chart(
                     window,
                 );
             }
-            let vertical_steps = if days <= 7 { days } else { 6 };
-            for step in 1..vertical_steps {
-                let x = bounds.origin.x + bounds.size.width * (step as f32 / vertical_steps as f32);
+            let mut midnight = start.div_ceil(DAY_MS) * DAY_MS;
+            if midnight == start {
+                midnight = midnight.saturating_add(DAY_MS);
+            }
+            while midnight < now {
+                let x_ratio = midnight.saturating_sub(start) as f64 / window_ms.max(1) as f64;
+                let x = bounds.origin.x + bounds.size.width * x_ratio as f32;
                 paint_grid_line(
                     point(x, bounds.origin.y),
                     point(x, bounds.bottom()),
                     grid,
                     window,
                 );
+                midnight = midnight.saturating_add(DAY_MS);
             }
         },
     )
