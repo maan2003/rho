@@ -635,6 +635,7 @@ type GutterHighlight = (fn(&App) -> Hsla, Vec<Range<Anchor>>);
 
 struct SyntaxConcealment {
     scopes: Vec<Range<Anchor>>,
+    buffer_ids: HashSet<BufferId>,
     covered: Vec<Range<MultiBufferOffset>>,
 }
 
@@ -9561,11 +9562,17 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let type_id = TypeId::of::<T>();
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let buffer_ids = scopes
+            .iter()
+            .flat_map(|scope| snapshot.buffer_ids_for_range(scope.clone()))
+            .collect();
         let state = self
             .syntax_concealments
             .entry(type_id)
             .or_insert_with(|| SyntaxConcealment {
                 scopes: Vec::new(),
+                buffer_ids: HashSet::default(),
                 covered: Vec::new(),
             });
         let divergence = state
@@ -9579,6 +9586,7 @@ impl Editor {
         }
 
         state.scopes = scopes;
+        state.buffer_ids = buffer_ids;
         state.covered.clear();
 
         let display_map = self.display_map.clone();
@@ -9586,6 +9594,17 @@ impl Editor {
             display_map.replace_folds_with_type::<MultiBufferOffset>(type_id, Vec::new(), cx);
         });
         cx.notify();
+    }
+
+    fn invalidate_syntax_concealments(&mut self, buffer_id: Option<BufferId>) -> bool {
+        let mut invalidated = false;
+        for concealment in self.syntax_concealments.values_mut() {
+            if buffer_id.is_none_or(|buffer_id| concealment.buffer_ids.contains(&buffer_id)) {
+                concealment.covered.clear();
+                invalidated = true;
+            }
+        }
+        invalidated
     }
 
     fn refresh_visible_syntax_concealments(&mut self, cx: &mut Context<Self>) {
@@ -9608,26 +9627,36 @@ impl Editor {
 
         let mut updates = Vec::new();
         for (type_id, state) in &mut self.syntax_concealments {
-            if state
-                .covered
+            let intersections = state
+                .scopes
                 .iter()
-                .any(|covered| covered.start <= visible.start && covered.end >= visible.end)
+                .filter_map(|scope| {
+                    let scope = scope.start.to_offset(snapshot)..scope.end.to_offset(snapshot);
+                    let intersection = scope.start.max(visible.start)..scope.end.min(visible.end);
+                    (!intersection.is_empty()).then_some((scope, intersection))
+                })
+                .collect::<Vec<_>>();
+            if intersections.is_empty() && state.covered.is_empty()
+                || !intersections.is_empty()
+                    && intersections.iter().all(|(_, intersection)| {
+                        state.covered.iter().any(|covered| {
+                            covered.start <= intersection.start && covered.end >= intersection.end
+                        })
+                    })
             {
                 continue;
             }
 
             let mut concealed = Vec::new();
-            for scope in &state.scopes {
-                let scope = scope.start.to_offset(snapshot)..scope.end.to_offset(snapshot);
-                let intersection = scope.start.max(visible.start)..scope.end.min(visible.end);
-                if !intersection.is_empty() {
-                    concealed.extend(snapshot.concealed_ranges(intersection, scope));
-                }
+            for (scope, intersection) in &intersections {
+                concealed.extend(snapshot.concealed_ranges(intersection.clone(), scope.clone()));
             }
             concealed.sort_unstable_by_key(|range| (range.start, range.end));
             concealed.dedup();
-            state.covered.clear();
-            state.covered.push(visible.clone());
+            state.covered = intersections
+                .into_iter()
+                .map(|(_, intersection)| intersection)
+                .collect();
             updates.push((*type_id, concealed));
         }
 
@@ -9914,9 +9943,10 @@ impl Editor {
                 edited_buffer,
                 source,
             } => {
-                for concealment in self.syntax_concealments.values_mut() {
-                    concealment.covered.clear();
-                }
+                let edited_buffer_id = edited_buffer
+                    .as_ref()
+                    .map(|buffer| buffer.read(cx).remote_id());
+                self.invalidate_syntax_concealments(edited_buffer_id);
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
                 self.refresh_active_diagnostics(cx);
@@ -9966,9 +9996,7 @@ impl Editor {
                 ranges,
                 path_key,
             } => {
-                for concealment in self.syntax_concealments.values_mut() {
-                    concealment.covered.clear();
-                }
+                self.invalidate_syntax_concealments(None);
                 if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
                     hovered_link_state.symbol_range = None;
                 }
@@ -10039,10 +10067,9 @@ impl Editor {
                 });
             }
             multi_buffer::Event::Reparsed(buffer_id) => {
-                for concealment in self.syntax_concealments.values_mut() {
-                    concealment.covered.clear();
+                if self.invalidate_syntax_concealments(Some(*buffer_id)) {
+                    cx.notify();
                 }
-                cx.notify();
                 self.refresh_runnables(Some(*buffer_id), window, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
@@ -10054,9 +10081,7 @@ impl Editor {
                 self.refresh_runnables(None, window, cx);
             }
             multi_buffer::Event::LanguageChanged(buffer_id, is_fresh_language) => {
-                for concealment in self.syntax_concealments.values_mut() {
-                    concealment.covered.clear();
-                }
+                self.invalidate_syntax_concealments(Some(*buffer_id));
                 if !is_fresh_language {
                     self.registered_buffers.remove(&buffer_id);
                 }

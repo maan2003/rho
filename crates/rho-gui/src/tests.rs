@@ -1865,6 +1865,53 @@ fn long_transcripts_conceal_their_visible_tail_after_parsing(cx: &mut TestAppCon
     );
 }
 
+#[gpui::test]
+fn prompt_typing_keeps_transcript_concealment_folds(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![assistant(
+                "**bold** and `code`\n",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
+    );
+    cx.run_until_parked();
+
+    let editor = active_editor(&workspace, cx);
+    let fold_ids = |workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let snapshot = editor.snapshot(window, cx);
+                    snapshot
+                        .folds_in_range(
+                            multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
+                        )
+                        .filter(|fold| fold.placeholder.is_concealed())
+                        .map(|fold| fold.id)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .expect("read concealment folds")
+    };
+    let before = fold_ids(&workspace, cx);
+    assert!(!before.is_empty());
+
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("x", window, cx));
+        })
+        .expect("type in prompt");
+    cx.run_until_parked();
+
+    assert_eq!(fold_ids(&workspace, cx), before);
+}
+
 /// The block map may not assume display elisions arrive sorted or apart:
 /// they are held in the order they were inserted, and two of them can cover
 /// rows that meet or overlap. Composing an edit per elision assumed both,
