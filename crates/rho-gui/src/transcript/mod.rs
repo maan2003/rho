@@ -279,12 +279,20 @@ impl TranscriptModel {
                 .first()
                 .map(|record| record.range.start.to_offset(buffer))
                 .unwrap_or_else(|| buffer.len());
-            if start_offset < buffer.len() {
-                buffer.edit([(start_offset..buffer.len(), "")], None, cx);
+            // One edit keeps attached editors from synchronizing their display maps once per
+            // transcript block while a large agent is materialized.
+            let replacement = rendered_blocks
+                .iter()
+                .map(rendered_text)
+                .collect::<String>();
+            if start_offset < buffer.len() || !replacement.is_empty() {
+                buffer.edit([(start_offset..buffer.len(), replacement)], None, cx);
             }
 
+            let mut offset = start_offset;
             for rendered in rendered_blocks {
-                let record = append_block(buffer, cx, rendered);
+                let record = block_record(buffer, offset, rendered);
+                offset += record.text.len();
                 gutters_changed |= record.gutter.is_some();
                 self.records.push(record);
             }
@@ -735,13 +743,9 @@ fn plan_anchor_range(records: &[BlockRecord], plan: &ElisionPlan) -> Option<Rang
     Some(start..end)
 }
 
-fn append_block(
-    buffer: &mut Buffer,
-    cx: &mut Context<Buffer>,
-    rendered: RenderedBlock,
-) -> BlockRecord {
-    let start = buffer.len();
-    let (span_ranges, inlay, gutter, visualizations) = append_spans(buffer, cx, &rendered);
+fn block_record(buffer: &Buffer, start: usize, rendered: RenderedBlock) -> BlockRecord {
+    let (span_ranges, inlay, gutter, visualizations) = spans_for_rendered(buffer, start, &rendered);
+    let text = rendered_text(&rendered);
     let styles = rendered
         .spans
         .iter()
@@ -750,10 +754,10 @@ fn append_block(
         .map(|(span, range)| (span.class, range.clone()))
         .collect();
     BlockRecord {
-        range: buffer.anchor_before(start)..buffer.anchor_before(buffer.len()),
+        range: buffer.anchor_before(start)..buffer.anchor_before(start + text.len()),
         kind: rendered.kind,
         visible: rendered.visible(),
-        text: rendered_text(&rendered),
+        text,
         gutter,
         inlay,
         styles,
@@ -850,27 +854,6 @@ fn changed_style_classes(
         .filter(|class| old.get(class) != new.get(class))
         .copied()
         .collect()
-}
-
-/// Appends a rendered block's text at the end of the buffer and returns the
-/// anchor range of each span. The inlay span is empty; its position anchors
-/// the block's custom inlay (running duration or queue label).
-fn append_spans(
-    buffer: &mut Buffer,
-    cx: &mut Context<Buffer>,
-    rendered: &RenderedBlock,
-) -> PlacedSpans {
-    let start = buffer.len();
-    let text = rendered
-        .spans
-        .iter()
-        .map(|span| span.text.as_str())
-        .collect::<String>();
-    if !text.is_empty() {
-        buffer.edit([(start..start, text)], None, cx);
-    }
-
-    spans_for_rendered(buffer, start, rendered)
 }
 
 fn spans_for_rendered(buffer: &Buffer, start: usize, rendered: &RenderedBlock) -> PlacedSpans {
