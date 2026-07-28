@@ -1,6 +1,6 @@
 use super::{
     Highlights,
-    fold_map::{self, Chunk, FoldChunks, FoldEdit, FoldPoint, FoldSnapshot},
+    fold_map::{self, Chunk, FoldChunks, FoldEdit, FoldOffset, FoldPoint, FoldSnapshot},
 };
 
 use language::{LanguageAwareStyling, Point};
@@ -90,7 +90,20 @@ impl TabMap {
         // the line, extending the edit to include the first subsequent tab (whose
         // rendered width may have changed) and the last tab that crossed the
         // expansion boundary (transitioning between expanded and non-expanded).
+        // The tail of a line that was scanned without finding a tab. Edits
+        // arrive in order and a line often carries many of them - folded
+        // markup puts one per hidden run - so an edit inside that tail
+        // already knows its own scan would come up empty, and skips both
+        // the scan and the point conversions it would need.
+        let mut scanned_tabless_tail: Option<Range<FoldOffset>> = None;
+
         for fold_edit in &mut fold_edits {
+            if let Some(scanned) = &scanned_tabless_tail
+                && scanned.contains(&fold_edit.old.end)
+            {
+                continue;
+            }
+
             let old_end = fold_edit.old.end.to_point(&old_snapshot.fold_snapshot);
             let old_end_row_successor_offset =
                 cmp::min(FoldPoint::new(old_end.row() + 1, 0), old_fold_max_point)
@@ -137,9 +150,17 @@ impl TabMap {
                 }
             }
 
-            if let Some(offset) = last_tab_with_changed_expansion_offset.or(first_tab_offset) {
-                fold_edit.old.end.0 += offset as usize + 1;
-                fold_edit.new.end.0 += offset as usize + 1;
+            match last_tab_with_changed_expansion_offset.or(first_tab_offset) {
+                Some(offset) => {
+                    fold_edit.old.end.0 += offset as usize + 1;
+                    fold_edit.new.end.0 += offset as usize + 1;
+                    scanned_tabless_tail = None;
+                }
+                // The scan reached the end of the line, or the point past
+                // which tabs no longer expand, without meeting a tab.
+                None => {
+                    scanned_tabless_tail = Some(fold_edit.old.end..old_end_row_successor_offset);
+                }
             }
         }
 

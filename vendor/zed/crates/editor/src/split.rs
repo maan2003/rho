@@ -1714,6 +1714,9 @@ impl SplittableEditor {
                     Block::Custom(custom) => {
                         ("CUSTOM_BLOCK".to_string(), custom.height.unwrap_or(1))
                     }
+                    Block::DisplayElision(elision) => {
+                        ("DISPLAY_ELISION".to_string(), elision.height.unwrap_or(1))
+                    }
                 };
                 for offset in 0..height {
                     block_map.insert(start_row.0 + offset, block_type.clone());

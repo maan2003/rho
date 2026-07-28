@@ -139,6 +139,7 @@ pub enum Crease<T> {
     Inline {
         range: Range<T>,
         placeholder: FoldPlaceholder,
+        elision_policy: ElisionPolicy,
         render_toggle: Option<RenderToggleFn>,
         render_trailer: Option<RenderTrailerFn>,
         metadata: Option<CreaseMetadata>,
@@ -160,12 +161,20 @@ pub struct CreaseMetadata {
     pub label: SharedString,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElisionPolicy {
+    Visible,
+    Hidden,
+    Tail { rows: u32 },
+}
+
 impl<T> Crease<T> {
     #[ztracing::instrument(skip_all)]
     pub fn simple(range: Range<T>, placeholder: FoldPlaceholder) -> Self {
         Crease::Inline {
             range,
             placeholder,
+            elision_policy: ElisionPolicy::Hidden,
             render_toggle: None,
             render_trailer: None,
             metadata: None,
@@ -214,6 +223,7 @@ impl<T> Crease<T> {
         Crease::Inline {
             range,
             placeholder,
+            elision_policy: ElisionPolicy::Hidden,
             render_toggle: Some(Arc::new(move |row, folded, toggle, window, cx| {
                 render_toggle(row, folded, toggle, window, cx).into_any_element()
             })),
@@ -225,17 +235,41 @@ impl<T> Crease<T> {
     }
 
     #[ztracing::instrument(skip_all)]
-    pub fn with_metadata(self, metadata: CreaseMetadata) -> Self {
+    pub fn with_elision_policy(self, elision_policy: ElisionPolicy) -> Self {
         match self {
             Crease::Inline {
                 range,
                 placeholder,
                 render_toggle,
                 render_trailer,
+                metadata,
                 ..
             } => Crease::Inline {
                 range,
                 placeholder,
+                elision_policy,
+                render_toggle,
+                render_trailer,
+                metadata,
+            },
+            Crease::Block { .. } => self,
+        }
+    }
+
+    #[ztracing::instrument(skip_all)]
+    pub fn with_metadata(self, metadata: CreaseMetadata) -> Self {
+        match self {
+            Crease::Inline {
+                range,
+                placeholder,
+                elision_policy,
+                render_toggle,
+                render_trailer,
+                ..
+            } => Crease::Inline {
+                range,
+                placeholder,
+                elision_policy,
                 render_toggle,
                 render_trailer,
                 metadata: Some(metadata),

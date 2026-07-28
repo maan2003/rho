@@ -3,6 +3,7 @@ use gpui::HighlightStyle;
 use language::{Chunk, LanguageAwareStyling};
 use multi_buffer::{MultiBufferChunks, MultiBufferOffset, MultiBufferSnapshot};
 use std::{cmp, ops::Range};
+use text::Bias;
 
 use crate::display_map::{HighlightKey, SemanticTokensHighlights, TextHighlights};
 
@@ -12,7 +13,16 @@ pub struct CustomHighlightsChunks<'a> {
     offset: MultiBufferOffset,
     multibuffer_snapshot: &'a MultiBufferSnapshot,
 
+    /// Endpoints for `highlighted_range`, in ascending offset order,
+    /// and how many of them `active_highlights` already reflects.
     highlight_endpoints: Vec<HighlightEndpoint>,
+    applied_endpoints: usize,
+    /// The range `highlight_endpoints` covers. Seeking within it replays
+    /// the list instead of rebuilding it: every fold makes the chunk
+    /// iterator seek past the folded text, and a rebuild costs a binary
+    /// search over anchors per highlight tag, which a line of concealed
+    /// markup would otherwise pay once per hidden run.
+    highlighted_range: Range<MultiBufferOffset>,
     active_highlights: BTreeMap<HighlightKey, HighlightStyle>,
     text_highlights: Option<&'a TextHighlights>,
     semantic_token_highlights: Option<&'a SemanticTokensHighlights>,
@@ -48,6 +58,8 @@ impl<'a> CustomHighlightsChunks<'a> {
             offset: range.start,
             text_highlights,
             highlight_endpoints,
+            applied_endpoints: 0,
+            highlighted_range: range,
             active_highlights: Default::default(),
             multibuffer_snapshot,
             semantic_token_highlights,
@@ -56,17 +68,54 @@ impl<'a> CustomHighlightsChunks<'a> {
 
     #[ztracing::instrument(skip_all)]
     pub fn seek(&mut self, new_range: Range<MultiBufferOffset>) {
-        create_highlight_endpoints(
-            &new_range,
-            self.text_highlights,
-            self.semantic_token_highlights,
-            self.multibuffer_snapshot,
-            &mut self.highlight_endpoints,
-        );
+        // A seek that stays inside the covered range replays the endpoints
+        // already collected. Seeking forward only has to apply the ones it
+        // skipped, which `next` does anyway; seeking back replays from the
+        // start, which still beats rebuilding the list.
+        if new_range.start >= self.highlighted_range.start
+            && new_range.end <= self.highlighted_range.end
+        {
+            if new_range.start < self.offset {
+                self.applied_endpoints = 0;
+                self.active_highlights.clear();
+            }
+        } else {
+            let covered = new_range.start..self.lookahead_end(&new_range);
+            create_highlight_endpoints(
+                &covered,
+                self.text_highlights,
+                self.semantic_token_highlights,
+                self.multibuffer_snapshot,
+                &mut self.highlight_endpoints,
+            );
+            self.highlighted_range = covered;
+            self.applied_endpoints = 0;
+            self.active_highlights.clear();
+        }
         self.offset = new_range.start;
         self.buffer_chunks.seek(new_range);
         self.buffer_chunk.take();
-        self.active_highlights.clear()
+    }
+
+    /// Collect endpoints past what this seek asks for. Seeks come one per
+    /// fold, so covering a window's worth of text pays the anchor searches
+    /// once for the whole window instead of once per fold.
+    fn lookahead_end(&self, new_range: &Range<MultiBufferOffset>) -> MultiBufferOffset {
+        const LOOKAHEAD: usize = 8192;
+
+        cmp::max(
+            new_range.end,
+            self.multibuffer_snapshot.clip_offset(
+                MultiBufferOffset(
+                    new_range
+                        .start
+                        .0
+                        .saturating_add(LOOKAHEAD)
+                        .min(self.multibuffer_snapshot.len().0),
+                ),
+                Bias::Right,
+            ),
+        )
     }
 }
 
@@ -197,7 +246,7 @@ fn create_highlight_endpoints(
             );
         }
     }
-    highlight_endpoints.sort_by(|a, b| a.cmp(b).reverse());
+    highlight_endpoints.sort_unstable();
 }
 
 impl<'a> Iterator for CustomHighlightsChunks<'a> {
@@ -206,14 +255,18 @@ impl<'a> Iterator for CustomHighlightsChunks<'a> {
     #[ztracing::instrument(skip_all)]
     fn next(&mut self) -> Option<Self::Item> {
         let mut next_highlight_endpoint = MultiBufferOffset(usize::MAX);
-        while let Some(endpoint) = self.highlight_endpoints.last().copied() {
+        while let Some(endpoint) = self
+            .highlight_endpoints
+            .get(self.applied_endpoints)
+            .copied()
+        {
             if endpoint.offset <= self.offset {
                 if let Some(style) = endpoint.style {
                     self.active_highlights.insert(endpoint.tag, style);
                 } else {
                     self.active_highlights.remove(&endpoint.tag);
                 }
-                self.highlight_endpoints.pop();
+                self.applied_endpoints += 1;
             } else {
                 next_highlight_endpoint = endpoint.offset;
                 break;
@@ -280,9 +333,32 @@ mod tests {
 
     use super::*;
     use crate::MultiBuffer;
+    use collections::HashMap;
     use gpui::App;
     use rand::prelude::*;
     use util::RandomCharIter;
+
+    #[gpui::test]
+    fn test_seek_lookahead_ends_at_char_boundary(cx: &mut App) {
+        let text = format!("{}—", "a".repeat(8191));
+        let buffer = MultiBuffer::build_simple(&text, cx);
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let highlights = Arc::new(HashMap::default());
+        let mut chunks = CustomHighlightsChunks::new(
+            MultiBufferOffset(0)..MultiBufferOffset(1),
+            LanguageAwareStyling {
+                tree_sitter: false,
+                diagnostics: false,
+            },
+            Some(&highlights),
+            None,
+            &snapshot,
+        );
+
+        chunks.seek(MultiBufferOffset(0)..MultiBufferOffset(2));
+
+        assert_eq!(chunks.highlighted_range.end, snapshot.len());
+    }
 
     #[gpui::test(iterations = 100)]
     fn test_random_chunk_bitmaps(cx: &mut App, mut rng: StdRng) {

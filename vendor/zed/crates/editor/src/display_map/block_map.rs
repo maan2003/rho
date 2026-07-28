@@ -16,6 +16,7 @@ use multi_buffer::{
 };
 use parking_lot::Mutex;
 use std::{
+    any::TypeId,
     cell::{Cell, RefCell},
     cmp::{self, Ordering},
     fmt::Debug,
@@ -38,7 +39,9 @@ const BULLETS: &[u8; rope::Chunk::MASK_BITS] = &[b'*'; _];
 pub struct BlockMap {
     pub(super) wrap_snapshot: RefCell<WrapSnapshot>,
     next_block_id: AtomicUsize,
+    next_elision_id: AtomicUsize,
     custom_blocks: Vec<Arc<CustomBlock>>,
+    display_elisions: Vec<Arc<DisplayElision>>,
     custom_blocks_by_id: TreeMap<CustomBlockId, Arc<CustomBlock>>,
     transforms: RefCell<SumTree<Transform>>,
     buffer_header_height: u32,
@@ -76,6 +79,7 @@ pub struct BlockSnapshot {
     pub(super) wrap_snapshot: WrapSnapshot,
     transforms: SumTree<Transform>,
     custom_blocks_by_id: TreeMap<CustomBlockId, Arc<CustomBlock>>,
+    display_elisions: Vec<Arc<DisplayElision>>,
     pub(super) buffer_header_height: u32,
     pub(super) excerpt_header_height: u32,
     pub(super) buffers_with_disabled_headers: HashSet<BufferId>,
@@ -91,6 +95,9 @@ impl Deref for BlockSnapshot {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CustomBlockId(pub usize);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DisplayElisionId(pub usize);
 
 impl From<CustomBlockId> for ElementId {
     fn from(val: CustomBlockId) -> Self {
@@ -279,6 +286,19 @@ pub struct CustomBlock {
 }
 
 #[derive(Clone)]
+pub struct DisplayElision {
+    pub id: DisplayElisionId,
+    pub range: Range<Anchor>,
+    pub tail_rows: u32,
+    pub height: Option<u32>,
+    pub style: BlockStyle,
+    render: Arc<Mutex<RenderBlock>>,
+    pub priority: usize,
+    pub type_tag: Option<TypeId>,
+    pub expanded: bool,
+}
+
+#[derive(Clone)]
 pub struct BlockProperties<P> {
     pub placement: BlockPlacement<P>,
     // None if the block takes up no space
@@ -287,6 +307,17 @@ pub struct BlockProperties<P> {
     pub style: BlockStyle,
     pub render: RenderBlock,
     pub priority: usize,
+}
+
+#[derive(Clone)]
+pub struct DisplayElisionProperties<P> {
+    pub range: Range<P>,
+    pub tail_rows: u32,
+    pub height: Option<u32>,
+    pub style: BlockStyle,
+    pub render: RenderBlock,
+    pub priority: usize,
+    pub type_tag: Option<TypeId>,
 }
 
 impl<P: Debug> Debug for BlockProperties<P> {
@@ -340,6 +371,7 @@ pub enum BlockId {
     ExcerptBoundary(Anchor),
     FoldedBuffer(BufferId),
     Custom(CustomBlockId),
+    DisplayElision(DisplayElisionId),
     Spacer(SpacerId),
 }
 
@@ -347,6 +379,7 @@ impl From<BlockId> for ElementId {
     fn from(value: BlockId) -> Self {
         match value {
             BlockId::Custom(CustomBlockId(id)) => ("Block", id).into(),
+            BlockId::DisplayElision(DisplayElisionId(id)) => ("DisplayElision", id).into(),
             BlockId::ExcerptBoundary(anchor) => anchor.opaque_id().unwrap().into(),
             BlockId::FoldedBuffer(id) => ("FoldedBuffer", EntityId::from(id.to_proto())).into(),
             BlockId::Spacer(SpacerId(id)) => ("Spacer", id).into(),
@@ -358,6 +391,7 @@ impl std::fmt::Display for BlockId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Custom(id) => write!(f, "Block({id:?})"),
+            Self::DisplayElision(id) => write!(f, "DisplayElision({id:?})"),
             Self::ExcerptBoundary(id) => write!(f, "ExcerptBoundary({id:?})"),
             Self::FoldedBuffer(id) => write!(f, "FoldedBuffer({id:?})"),
             Self::Spacer(id) => write!(f, "Spacer({id:?})"),
@@ -376,6 +410,7 @@ struct Transform {
 #[derive(Clone)]
 pub enum Block {
     Custom(Arc<CustomBlock>),
+    DisplayElision(Arc<DisplayElision>),
     FoldedBuffer {
         first_excerpt: ExcerptBoundaryInfo,
         height: u32,
@@ -399,6 +434,7 @@ impl Block {
     pub fn id(&self) -> BlockId {
         match self {
             Block::Custom(block) => BlockId::Custom(block.id),
+            Block::DisplayElision(block) => BlockId::DisplayElision(block.id),
             Block::ExcerptBoundary {
                 excerpt: next_excerpt,
                 ..
@@ -417,6 +453,7 @@ impl Block {
     pub fn has_height(&self) -> bool {
         match self {
             Block::Custom(block) => block.height.is_some(),
+            Block::DisplayElision(block) => block.height.is_some(),
             Block::ExcerptBoundary { .. }
             | Block::FoldedBuffer { .. }
             | Block::BufferHeader { .. }
@@ -427,6 +464,7 @@ impl Block {
     pub fn height(&self) -> u32 {
         match self {
             Block::Custom(block) => block.height.unwrap_or(0),
+            Block::DisplayElision(block) => block.height.unwrap_or(0),
             Block::ExcerptBoundary { height, .. }
             | Block::FoldedBuffer { height, .. }
             | Block::BufferHeader { height, .. }
@@ -437,6 +475,7 @@ impl Block {
     pub fn style(&self) -> BlockStyle {
         match self {
             Block::Custom(block) => block.style,
+            Block::DisplayElision(block) => block.style,
             Block::ExcerptBoundary { .. }
             | Block::FoldedBuffer { .. }
             | Block::BufferHeader { .. } => BlockStyle::Sticky,
@@ -447,6 +486,7 @@ impl Block {
     fn place_above(&self) -> bool {
         match self {
             Block::Custom(block) => matches!(block.placement, BlockPlacement::Above(_)),
+            Block::DisplayElision(_) => false,
             Block::FoldedBuffer { .. } => false,
             Block::ExcerptBoundary { .. } => true,
             Block::BufferHeader { .. } => true,
@@ -457,6 +497,7 @@ impl Block {
     pub fn place_near(&self) -> bool {
         match self {
             Block::Custom(block) => matches!(block.placement, BlockPlacement::Near(_)),
+            Block::DisplayElision(_) => false,
             Block::FoldedBuffer { .. } => false,
             Block::ExcerptBoundary { .. } => false,
             Block::BufferHeader { .. } => false,
@@ -470,6 +511,7 @@ impl Block {
                 block.placement,
                 BlockPlacement::Below(_) | BlockPlacement::Near(_)
             ),
+            Block::DisplayElision(_) => false,
             Block::FoldedBuffer { .. } => false,
             Block::ExcerptBoundary { .. } => false,
             Block::BufferHeader { .. } => false,
@@ -480,6 +522,7 @@ impl Block {
     fn is_replacement(&self) -> bool {
         match self {
             Block::Custom(block) => matches!(block.placement, BlockPlacement::Replace(_)),
+            Block::DisplayElision(_) => true,
             Block::FoldedBuffer { .. } => true,
             Block::ExcerptBoundary { .. } => false,
             Block::BufferHeader { .. } => false,
@@ -489,7 +532,7 @@ impl Block {
 
     fn is_header(&self) -> bool {
         match self {
-            Block::Custom(_) => false,
+            Block::Custom(_) | Block::DisplayElision(_) => false,
             Block::FoldedBuffer { .. } => true,
             Block::ExcerptBoundary { .. } => true,
             Block::BufferHeader { .. } => true,
@@ -499,7 +542,7 @@ impl Block {
 
     pub fn is_buffer_header(&self) -> bool {
         match self {
-            Block::Custom(_) => false,
+            Block::Custom(_) | Block::DisplayElision(_) => false,
             Block::FoldedBuffer { .. } => true,
             Block::ExcerptBoundary { .. } => false,
             Block::BufferHeader { .. } => true,
@@ -512,6 +555,13 @@ impl Debug for Block {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Custom(block) => f.debug_struct("Custom").field("block", block).finish(),
+            Self::DisplayElision(block) => f
+                .debug_struct("DisplayElision")
+                .field("id", &block.id)
+                .field("range", &block.range)
+                .field("tail_rows", &block.tail_rows)
+                .field("expanded", &block.expanded)
+                .finish(),
             Self::FoldedBuffer {
                 first_excerpt,
                 height,
@@ -660,7 +710,9 @@ impl BlockMap {
         push_isomorphic(&mut transforms, row_count - WrapRow(0), &wrap_snapshot);
         let map = Self {
             next_block_id: AtomicUsize::new(0),
+            next_elision_id: AtomicUsize::new(0),
             custom_blocks: Vec::new(),
+            display_elisions: Vec::new(),
             custom_blocks_by_id: TreeMap::default(),
             folded_buffers: HashSet::default(),
             buffers_with_disabled_headers: HashSet::default(),
@@ -696,6 +748,7 @@ impl BlockMap {
                 wrap_snapshot,
                 transforms: self.transforms.borrow().clone(),
                 custom_blocks_by_id: self.custom_blocks_by_id.clone(),
+                display_elisions: self.display_elisions.clone(),
                 buffer_header_height: self.buffer_header_height,
                 excerpt_header_height: self.excerpt_header_height,
                 buffers_with_disabled_headers: self.buffers_with_disabled_headers.clone(),
@@ -803,6 +856,24 @@ impl BlockMap {
     }
 
     #[ztracing::instrument(skip_all, fields(edits = ?edits))]
+    /// The rows an elision covers, or `None` if it covers nothing.
+    fn elision_wrap_rows(
+        &self,
+        elision: &DisplayElision,
+        wrap_snapshot: &WrapSnapshot,
+    ) -> Option<Range<WrapRow>> {
+        let buffer = wrap_snapshot.buffer_snapshot();
+        let mut start = elision.range.start.to_point(buffer);
+        let end = elision.range.end.to_point(buffer);
+        if start >= end {
+            return None;
+        }
+        start.column = 0;
+        let start_row = wrap_snapshot.make_wrap_point(start, Bias::Left).row();
+        let end_row = wrap_snapshot.make_wrap_point(end, Bias::Left).row() + WrapRow(1);
+        Some(start_row..end_row)
+    }
+
     fn sync(
         &self,
         wrap_snapshot: &WrapSnapshot,
@@ -828,6 +899,46 @@ impl BlockMap {
             edits = edits.compose([WrapEdit {
                 old: edit_start..edit_end,
                 new: edit_start..edit_end,
+            }]);
+        }
+
+        // An elision replaces a run of rows with one block, so an edit inside
+        // one invalidates the whole elision, not just the rows it landed on.
+        // Widening the edit to span the elisions it touches is enough, and
+        // widening it to the whole document instead - which is what elisions
+        // that may overlap each other tempt you into - would make every
+        // keystroke cost the length of the transcript.
+        let touched = (!edits.is_empty())
+            .then(|| {
+                self.display_elisions
+                    .iter()
+                    .filter(|elision| !elision.expanded)
+                    .filter_map(|elision| self.elision_wrap_rows(elision, wrap_snapshot))
+                    .filter(|rows| {
+                        edits
+                            .edits()
+                            .iter()
+                            .any(|edit| edit.new.start < rows.end && rows.start < edit.new.end)
+                    })
+                    .reduce(|bounds, rows| bounds.start.min(rows.start)..bounds.end.max(rows.end))
+            })
+            .flatten();
+        if let Some(touched) = touched {
+            // One edit, so there is nothing for it to overlap or sort against.
+            // The rows outside the patch did not change, they only moved by a
+            // fixed number of rows, so the outermost edits carry the widened
+            // bounds from new coordinates back to old ones.
+            let first = edits.edits().first().expect("edits is not empty").clone();
+            let last = edits.edits().last().expect("edits is not empty").clone();
+            // The unchanged rows ahead of the first edit run out where old
+            // coordinates do, which is the furthest back this can reach.
+            let floor = WrapRow(first.new.start.0.saturating_sub(first.old.start.0));
+            let new_start = touched.start.clamp(floor, first.new.start);
+            let new_end = touched.end.max(last.new.end);
+            edits = Patch::new(vec![WrapEdit {
+                old: (first.old.start - (first.new.start - new_start))
+                    ..(last.old.end + (new_end - last.new.end)),
+                new: new_start..new_end,
             }]);
         }
 
@@ -1100,6 +1211,42 @@ impl BlockMap {
                         Some((placement, Block::Custom(block.clone())))
                     }),
             );
+
+            blocks_in_edit.extend(self.display_elisions.iter().filter_map(|elision| {
+                if elision.expanded {
+                    return None;
+                }
+
+                let buffer = wrap_snapshot.buffer_snapshot();
+                let mut start = elision.range.start.to_point(buffer);
+                let end = elision.range.end.to_point(buffer);
+                if start >= end {
+                    return None;
+                }
+
+                start.column = 0;
+                let start_wrap_row = wrap_snapshot.make_wrap_point(start, Bias::Left).row();
+                let end_wrap_point = wrap_snapshot.make_wrap_point(end, Bias::Left);
+                let end_wrap_row = if end_wrap_point.column() > 0 || end_wrap_point == max_point {
+                    end_wrap_point.row() + WrapRow(1)
+                } else {
+                    end_wrap_point.row()
+                };
+                let total_rows = end_wrap_row.0.saturating_sub(start_wrap_row.0);
+                if total_rows <= elision.tail_rows {
+                    return None;
+                }
+
+                let replace_end = WrapRow(end_wrap_row.0 - elision.tail_rows - 1);
+                if replace_end < new_start || start_wrap_row >= new_end {
+                    return None;
+                }
+
+                Some((
+                    BlockPlacement::Replace(start_wrap_row..=replace_end),
+                    Block::DisplayElision(elision.clone()),
+                ))
+            }));
 
             blocks_in_edit.extend(self.header_and_footer_blocks(
                 buffer,
@@ -1608,18 +1755,33 @@ impl BlockMap {
                         .cmp(&Some(excerpt_b.start_text_anchor().opaque_id())),
                     (
                         Block::ExcerptBoundary { .. } | Block::BufferHeader { .. },
-                        Block::Spacer { .. } | Block::Custom(_),
+                        Block::Spacer { .. } | Block::Custom(_) | Block::DisplayElision(_),
                     ) => Ordering::Less,
                     (
-                        Block::Spacer { .. } | Block::Custom(_),
+                        Block::Spacer { .. } | Block::Custom(_) | Block::DisplayElision(_),
                         Block::ExcerptBoundary { .. } | Block::BufferHeader { .. },
                     ) => Ordering::Greater,
-                    (Block::Spacer { .. }, Block::Custom(_)) => Ordering::Less,
-                    (Block::Custom(_), Block::Spacer { .. }) => Ordering::Greater,
+                    (Block::Spacer { .. }, Block::Custom(_) | Block::DisplayElision(_)) => {
+                        Ordering::Less
+                    }
+                    (Block::Custom(_) | Block::DisplayElision(_), Block::Spacer { .. }) => {
+                        Ordering::Greater
+                    }
                     (Block::Custom(block_a), Block::Custom(block_b)) => block_a
                         .priority
                         .cmp(&block_b.priority)
                         .then_with(|| block_a.id.cmp(&block_b.id)),
+                    (Block::DisplayElision(block_a), Block::DisplayElision(block_b)) => block_a
+                        .priority
+                        .cmp(&block_b.priority)
+                        .then_with(|| block_a.id.cmp(&block_b.id)),
+                    (Block::Custom(block_a), Block::DisplayElision(block_b)) => {
+                        block_a.priority.cmp(&block_b.priority).then(Ordering::Less)
+                    }
+                    (Block::DisplayElision(block_a), Block::Custom(block_b)) => block_a
+                        .priority
+                        .cmp(&block_b.priority)
+                        .then(Ordering::Greater),
                     _ => {
                         unreachable!("comparing blocks: {block_a:?} vs {block_b:?}")
                     }
@@ -1812,6 +1974,101 @@ impl BlockMapWriterCompanion<'_> {
 }
 
 impl BlockMapWriter<'_> {
+    pub fn insert_elisions(
+        &mut self,
+        elisions: impl IntoIterator<Item = DisplayElisionProperties<Anchor>>,
+    ) -> Vec<DisplayElisionId> {
+        let mut ids = Vec::new();
+        for elision in elisions {
+            let id = DisplayElisionId(self.block_map.next_elision_id.fetch_add(1, SeqCst));
+            ids.push(id);
+            self.block_map
+                .display_elisions
+                .push(Arc::new(DisplayElision {
+                    id,
+                    range: elision.range,
+                    tail_rows: elision.tail_rows,
+                    height: elision.height,
+                    style: elision.style,
+                    render: Arc::new(Mutex::new(elision.render)),
+                    priority: elision.priority,
+                    type_tag: elision.type_tag,
+                    expanded: false,
+                }));
+        }
+        self.block_map.deferred_edits.set(Patch::new(vec![Edit {
+            old: WrapRow(0)..self.block_map.wrap_snapshot.borrow().max_point().row() + WrapRow(1),
+            new: WrapRow(0)..self.block_map.wrap_snapshot.borrow().max_point().row() + WrapRow(1),
+        }]));
+        ids
+    }
+
+    pub fn remove_elisions(&mut self, ids: HashSet<DisplayElisionId>) {
+        self.block_map
+            .display_elisions
+            .retain(|elision| !ids.contains(&elision.id));
+        self.block_map.deferred_edits.set(Patch::new(vec![Edit {
+            old: WrapRow(0)..self.block_map.wrap_snapshot.borrow().max_point().row() + WrapRow(1),
+            new: WrapRow(0)..self.block_map.wrap_snapshot.borrow().max_point().row() + WrapRow(1),
+        }]));
+    }
+
+    pub fn update_elisions(
+        &mut self,
+        elisions: impl IntoIterator<Item = (DisplayElisionId, DisplayElisionProperties<Anchor>)>,
+    ) {
+        for (id, properties) in elisions {
+            if let Some(elision) = self
+                .block_map
+                .display_elisions
+                .iter_mut()
+                .find(|elision| elision.id == id)
+            {
+                let expanded = elision.expanded;
+                *elision = Arc::new(DisplayElision {
+                    id,
+                    range: properties.range,
+                    tail_rows: properties.tail_rows,
+                    height: properties.height,
+                    style: properties.style,
+                    render: Arc::new(Mutex::new(properties.render)),
+                    priority: properties.priority,
+                    type_tag: properties.type_tag,
+                    expanded,
+                });
+            }
+        }
+        self.block_map.deferred_edits.set(Patch::new(vec![Edit {
+            old: WrapRow(0)..self.block_map.wrap_snapshot.borrow().max_point().row() + WrapRow(1),
+            new: WrapRow(0)..self.block_map.wrap_snapshot.borrow().max_point().row() + WrapRow(1),
+        }]));
+    }
+
+    pub fn set_elisions_expanded(&mut self, ids: HashSet<DisplayElisionId>, expanded: bool) {
+        if ids.is_empty() {
+            return;
+        }
+
+        let mut changed = false;
+        for elision in &mut self.block_map.display_elisions {
+            if ids.contains(&elision.id) && elision.expanded != expanded {
+                let mut updated = (**elision).clone();
+                updated.expanded = expanded;
+                *elision = Arc::new(updated);
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.block_map.deferred_edits.set(Patch::new(vec![Edit {
+                old: WrapRow(0)
+                    ..self.block_map.wrap_snapshot.borrow().max_point().row() + WrapRow(1),
+                new: WrapRow(0)
+                    ..self.block_map.wrap_snapshot.borrow().max_point().row() + WrapRow(1),
+            }]));
+        }
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn insert(
         &mut self,
@@ -2114,10 +2371,17 @@ impl BlockMapWriter<'_> {
         let mut ranges = Vec::new();
         let mut companion_buffer_ids = HashSet::default();
         for buffer_id in buffer_ids {
-            if fold {
-                self.block_map.folded_buffers.insert(buffer_id);
+            // A buffer that was already in the asked-for state needs no
+            // resync. Editing a buffer unfolds it, so without this an edit
+            // rebuilds every block over that buffer's range - on every
+            // keystroke, for a buffer nobody ever folded.
+            let toggled = if fold {
+                self.block_map.folded_buffers.insert(buffer_id)
             } else {
-                self.block_map.folded_buffers.remove(&buffer_id);
+                self.block_map.folded_buffers.remove(&buffer_id)
+            };
+            if !toggled {
+                continue;
             }
             ranges.extend(multi_buffer_snapshot.range_for_buffer(buffer_id));
             if let Some(companion) = &self.companion
@@ -2133,6 +2397,9 @@ impl BlockMapWriter<'_> {
                     companion_buffer_ids.insert(companion_buffer_id);
                 }
             }
+        }
+        if ranges.is_empty() && companion_buffer_ids.is_empty() {
+            return;
         }
         ranges.sort_unstable_by_key(|range| range.start);
 
@@ -2355,6 +2622,19 @@ impl BlockSnapshot {
                 let custom_block = self.custom_blocks_by_id.get(&custom_block_id)?;
                 return Some(Block::Custom(custom_block.clone()));
             }
+            BlockId::DisplayElision(display_elision_id) => {
+                return self
+                    .blocks_in_range(BlockRow(0)..BlockRow(u32::MAX))
+                    .find_map(|(_, block)| {
+                        if let Block::DisplayElision(elision) = block
+                            && elision.id == display_elision_id
+                        {
+                            Some(Block::DisplayElision(elision.clone()))
+                        } else {
+                            None
+                        }
+                    });
+            }
             BlockId::ExcerptBoundary(start_anchor) => {
                 let start_point = start_anchor.to_point(&buffer);
                 self.wrap_snapshot.make_wrap_point(start_point, Bias::Left)
@@ -2385,6 +2665,64 @@ impl BlockSnapshot {
         }
 
         None
+    }
+
+    pub fn expanded_display_elisions_intersecting_range(
+        &self,
+        range: Range<MultiBufferOffset>,
+        inclusive: bool,
+    ) -> Vec<DisplayElisionId> {
+        if range.is_empty() && !inclusive {
+            return Vec::new();
+        }
+
+        let buffer = self.wrap_snapshot.buffer_snapshot();
+        self.display_elisions
+            .iter()
+            .filter_map(|elision| {
+                if !elision.expanded {
+                    return None;
+                }
+
+                let elision_range =
+                    elision.range.start.to_offset(buffer)..elision.range.end.to_offset(buffer);
+                let intersects = if inclusive {
+                    elision_range.start <= range.end && range.start <= elision_range.end
+                } else {
+                    elision_range.start < range.end && range.start < elision_range.end
+                };
+                intersects.then_some(elision.id)
+            })
+            .collect()
+    }
+
+    pub fn folded_display_elisions_intersecting_range(
+        &self,
+        range: Range<MultiBufferOffset>,
+        inclusive: bool,
+    ) -> Vec<DisplayElisionId> {
+        if range.is_empty() && !inclusive {
+            return Vec::new();
+        }
+
+        let buffer = self.wrap_snapshot.buffer_snapshot();
+        self.display_elisions
+            .iter()
+            .filter_map(|elision| {
+                if elision.expanded {
+                    return None;
+                }
+
+                let elision_range =
+                    elision.range.start.to_offset(buffer)..elision.range.end.to_offset(buffer);
+                let intersects = if inclusive {
+                    elision_range.start <= range.end && range.start <= elision_range.end
+                } else {
+                    elision_range.start < range.end && range.start < elision_range.end
+                };
+                intersects.then_some(elision.id)
+            })
+            .collect()
     }
 
     #[ztracing::instrument(skip_all)]
@@ -2913,6 +3251,13 @@ impl CustomBlock {
             }),
             priority: self.priority,
         }
+    }
+}
+
+impl DisplayElision {
+    #[ztracing::instrument(skip_all)]
+    pub fn render(&self, cx: &mut BlockContext) -> AnyElement {
+        self.render.lock()(cx)
     }
 }
 

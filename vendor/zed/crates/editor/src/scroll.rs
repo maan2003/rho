@@ -215,6 +215,7 @@ pub struct ScrollManager {
     /// (true) or remote (false). Local requests are initiated by user actions,
     /// while remote requests come from external sources.
     autoscroll_request: Option<(Autoscroll, bool)>,
+    autoscroll_pin: Option<AutoscrollPin>,
     last_autoscroll: Option<(
         gpui::Point<ScrollOffset>,
         ScrollOffset,
@@ -232,6 +233,26 @@ pub struct ScrollManager {
     _save_scroll_position_task: Task<()>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AutoscrollPin {
+    anchor: Anchor,
+    strategy: AutoscrollStrategy,
+    active: bool,
+}
+
+fn autoscroll_target_is_visible(
+    anchor: Anchor,
+    scroll_top: ScrollOffset,
+    visible_line_count: Option<f64>,
+    display_map: &DisplaySnapshot,
+) -> bool {
+    let Some(visible_line_count) = visible_line_count else {
+        return true;
+    };
+    let target_top = anchor.to_display_point(display_map).row().as_f64();
+    let target_bottom = target_top + 1.;
+    target_top >= scroll_top && target_bottom <= scroll_top + visible_line_count
+}
 impl ScrollManager {
     pub fn new(cx: &mut Context<Editor>) -> Self {
         let anchor = cx.new(|_| SharedScrollAnchor {
@@ -244,10 +265,11 @@ impl ScrollManager {
             scroll_max_x: None,
             ongoing: OngoingScroll::new(),
             autoscroll_request: None,
+            autoscroll_pin: None,
+            last_autoscroll: None,
             show_scrollbars: true,
             hide_scrollbar_task: None,
             active_scrollbar: None,
-            last_autoscroll: None,
             visible_line_count: None,
             visible_column_count: None,
             forbid_vertical_scroll: false,
@@ -479,8 +501,19 @@ impl ScrollManager {
         };
 
         self.scroll_max_x.take();
+        if local {
+            let visible_line_count = self.visible_line_count;
+            let scroll_position = adjusted_anchor.scroll_position(display_map);
+            if let Some(pin) = &mut self.autoscroll_pin {
+                pin.active = autoscroll_target_is_visible(
+                    pin.anchor,
+                    scroll_position.y,
+                    visible_line_count,
+                    display_map,
+                );
+            }
+        }
         self.autoscroll_request.take();
-
         let current = self.anchor.read(cx);
         if current.scroll_anchor == adjusted_anchor {
             return WasScrolled(false);
@@ -548,12 +581,32 @@ impl ScrollManager {
 
     pub fn has_autoscroll_request(&self) -> bool {
         self.autoscroll_request.is_some()
+            || self.autoscroll_pin.as_ref().is_some_and(|pin| pin.active)
     }
 
+    pub fn has_active_autoscroll_pin(&self) -> bool {
+        self.autoscroll_pin.as_ref().is_some_and(|pin| pin.active)
+    }
+
+    pub fn set_autoscroll_pin(&mut self, anchor: Anchor, strategy: AutoscrollStrategy) {
+        self.autoscroll_pin = Some(AutoscrollPin {
+            anchor,
+            strategy,
+            active: true,
+        });
+    }
+
+    pub fn clear_autoscroll_pin(&mut self) {
+        self.autoscroll_pin = None;
+    }
     pub fn take_autoscroll_request(&mut self) -> Option<(Autoscroll, bool)> {
-        self.autoscroll_request.take()
+        self.autoscroll_request.take().or_else(|| {
+            self.autoscroll_pin
+                .as_ref()
+                .filter(|pin| pin.active)
+                .map(|pin| (Autoscroll::Strategy(pin.strategy, Some(pin.anchor)), true))
+        })
     }
-
     pub fn active_scrollbar_state(&self) -> Option<&ActiveScrollbarState> {
         self.active_scrollbar.as_ref()
     }
@@ -663,6 +716,25 @@ impl ScrollManager {
 impl Editor {
     pub fn has_autoscroll_request(&self) -> bool {
         self.scroll_manager.has_autoscroll_request()
+    }
+
+    pub fn has_active_autoscroll_pin(&self) -> bool {
+        self.scroll_manager.has_active_autoscroll_pin()
+    }
+
+    pub fn set_autoscroll_pin(
+        &mut self,
+        anchor: Anchor,
+        strategy: AutoscrollStrategy,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_manager.set_autoscroll_pin(anchor, strategy);
+        cx.notify();
+    }
+
+    pub fn clear_autoscroll_pin(&mut self, cx: &mut Context<Self>) {
+        self.scroll_manager.clear_autoscroll_pin();
+        cx.notify();
     }
 
     pub fn set_forbid_vertical_scroll(&mut self, forbid: bool) {

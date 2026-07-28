@@ -287,6 +287,15 @@ pub fn editor_content_with_blocks_and_size(
                     lines[row as usize].push_str("§ spacer");
                 }
             }
+            Block::DisplayElision(elision) => {
+                let height = elision.height.unwrap_or(1);
+                for row in row.0..row.0 + height {
+                    while lines.len() <= row as usize {
+                        lines.push(String::new());
+                    }
+                    lines[row as usize].push_str("§ display elision");
+                }
+            }
         }
     }
     lines.join("\n")

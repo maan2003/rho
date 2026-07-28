@@ -1,7 +1,7 @@
 use crate::display_map::inlay_map::InlayChunk;
 
 use super::{
-    Highlights,
+    ElisionPolicy, Highlights,
     inlay_map::{InlayBufferRows, InlayChunks, InlayEdit, InlayOffset, InlayPoint, InlaySnapshot},
 };
 use gpui::{AnyElement, App, ElementId, HighlightStyle, Pixels, SharedString, Stateful, Window};
@@ -35,6 +35,8 @@ pub struct FoldPlaceholder {
     pub type_tag: Option<TypeId>,
     /// Text provided by the language server to display in place of the folded range.
     /// When set, this is used instead of the default "⋯" ellipsis.
+    /// Empty text conceals: the folded range takes no display columns and
+    /// produces no chunk at all. See [`FoldPlaceholder::concealed`].
     pub collapsed_text: Option<SharedString>,
 }
 
@@ -69,6 +71,31 @@ impl FoldPlaceholder {
             .active(|style| style.bg(cx.theme().colors().ghost_element_active))
             .rounded_xs()
             .size_full()
+    }
+
+    /// Whether this placeholder conceals: displays nothing in place of the
+    /// folded text. Concealed folds are decoration rather than something the
+    /// reader folded, so unfold commands leave them alone.
+    pub fn is_concealed(&self) -> bool {
+        self.collapsed_text
+            .as_ref()
+            .is_some_and(|text| text.is_empty())
+    }
+
+    /// A fold that hides its range outright, with no placeholder standing in
+    /// for it: the buffer text stays as it is (selections, copy and search
+    /// still see it) while the display skips it. Suited to markup that only
+    /// carries styling, like the `**` around bold markdown.
+    pub fn concealed(type_tag: TypeId) -> Self {
+        Self {
+            render: Arc::new(|_, _, _| gpui::Empty.into_any_element()),
+            constrain_width: true,
+            // Concealed ranges are placed and replaced individually; merging
+            // them would fold the text between two adjacent ones.
+            merge_adjacent: false,
+            type_tag: Some(type_tag),
+            collapsed_text: Some(SharedString::default()),
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -167,16 +194,33 @@ impl<'a> sum_tree::Dimension<'a, TransformSummary> for FoldPoint {
 
 pub(crate) struct FoldMapWriter<'a>(&'a mut FoldMap);
 
+pub(crate) trait FoldInput<T> {
+    fn into_parts(self) -> (Range<T>, FoldPlaceholder, ElisionPolicy);
+}
+
+impl<T> FoldInput<T> for (Range<T>, FoldPlaceholder) {
+    fn into_parts(self) -> (Range<T>, FoldPlaceholder, ElisionPolicy) {
+        (self.0, self.1, ElisionPolicy::Hidden)
+    }
+}
+
+impl<T> FoldInput<T> for (Range<T>, FoldPlaceholder, ElisionPolicy) {
+    fn into_parts(self) -> (Range<T>, FoldPlaceholder, ElisionPolicy) {
+        self
+    }
+}
+
 impl FoldMapWriter<'_> {
     #[ztracing::instrument(skip_all)]
-    pub(crate) fn fold<T: ToOffset>(
+    pub(crate) fn fold<T: ToOffset, I: FoldInput<T>>(
         &mut self,
-        ranges: impl IntoIterator<Item = (Range<T>, FoldPlaceholder)>,
+        ranges: impl IntoIterator<Item = I>,
     ) -> (FoldSnapshot, Vec<FoldEdit>) {
         let mut edits = Vec::new();
         let mut folds = Vec::new();
         let snapshot = self.0.snapshot.inlay_snapshot.clone();
-        for (range, fold_text) in ranges.into_iter() {
+        for input in ranges.into_iter() {
+            let (range, fold_text, elision_policy) = input.into_parts();
             let buffer = &snapshot.buffer;
             let range = range.start.to_offset(buffer)..range.end.to_offset(buffer);
 
@@ -198,6 +242,7 @@ impl FoldMapWriter<'_> {
                 id: FoldId(post_inc(&mut self.0.next_fold_id.0)),
                 range: FoldRange(fold_range),
                 placeholder: fold_text,
+                elision_policy,
             });
 
             let inlay_range =
@@ -214,6 +259,12 @@ impl FoldMapWriter<'_> {
         self.0.snapshot.folds = {
             let mut new_tree = SumTree::new(buffer);
             let mut cursor = self.0.snapshot.folds.cursor::<FoldRange>(buffer);
+            // Folds with no existing fold between them are built as one
+            // bulk run rather than appended one at a time: concealing a
+            // transcript's markup inserts thousands in a single batch, and
+            // a tree built from a run costs a pass instead of a merge per
+            // fold.
+            let mut run = Vec::new();
             for fold in folds {
                 self.0.snapshot.fold_metadata_by_id.insert(
                     fold.id,
@@ -222,9 +273,14 @@ impl FoldMapWriter<'_> {
                         width: None,
                     },
                 );
-                new_tree.append(cursor.slice(&fold.range, Bias::Right), buffer);
-                new_tree.push(fold, buffer);
+                let preceding = cursor.slice(&fold.range, Bias::Right);
+                if !preceding.is_empty() {
+                    new_tree.extend(run.drain(..), buffer);
+                    new_tree.append(preceding, buffer);
+                }
+                run.push(fold);
             }
+            new_tree.extend(run, buffer);
             new_tree.append(cursor.suffix(), buffer);
             new_tree
         };
@@ -248,14 +304,16 @@ impl FoldMapWriter<'_> {
         )
     }
 
-    /// Removes any folds whose ranges intersect the given ranges.
+    /// Removes any folds whose ranges intersect the given ranges. Concealed
+    /// folds stay: they hide markup rather than content, so unfolding a
+    /// region is not a request to reveal them.
     #[ztracing::instrument(skip_all)]
     pub(crate) fn unfold_intersecting<T: ToOffset>(
         &mut self,
         ranges: impl IntoIterator<Item = Range<T>>,
         inclusive: bool,
     ) -> (FoldSnapshot, Vec<FoldEdit>) {
-        self.remove_folds_with(ranges, |_| true, inclusive)
+        self.remove_folds_with(ranges, |fold| !fold.placeholder.is_concealed(), inclusive)
     }
 
     /// Removes any folds that intersect the given ranges and for which the given predicate
@@ -544,6 +602,8 @@ impl FoldMap {
                     while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
                         next_fold_range.start < fold_range.end
                             || (next_fold_range.start == fold_range.end
+                                && fold.elision_policy == ElisionPolicy::Hidden
+                                && next_fold.elision_policy == ElisionPolicy::Hidden
                                 && fold.placeholder.merge_adjacent
                                 && next_fold.placeholder.merge_adjacent)
                     }) {
@@ -559,7 +619,10 @@ impl FoldMap {
                         push_isomorphic(&mut new_transforms, text_summary);
                     }
 
-                    if fold_range.end > fold_range.start {
+                    let (placeholder_range, visible_tail_range) =
+                        elided_ranges(&inlay_snapshot, fold_range, fold.elision_policy);
+
+                    if let Some(fold_range) = placeholder_range {
                         const ELLIPSIS: &str = "⋯";
 
                         let placeholder_text: SharedString = fold
@@ -600,6 +663,11 @@ impl FoldMap {
                             },
                             (),
                         );
+                    }
+
+                    if let Some(tail_range) = visible_tail_range {
+                        let text_summary = inlay_snapshot.text_summary_for_range(tail_range);
+                        push_isomorphic(&mut new_transforms, text_summary);
                     }
                 }
 
@@ -897,7 +965,9 @@ impl FoldSnapshot {
                     let buffer_point = self.inlay_snapshot.to_buffer_point(inlay_point);
                     if buffer_point.row != buffer_row.0 {
                         return false;
-                    } else if transform.placeholder.is_some() {
+                    } else if transform.is_fold() && !transform.conceals() {
+                        // Concealed markup is not a folded line: the row
+                        // reads whole, and there is nothing to unfold.
                         return true;
                     }
                 }
@@ -1075,6 +1145,48 @@ fn push_isomorphic(transforms: &mut SumTree<Transform>, summary: MBTextSummary) 
     }
 }
 
+fn elided_ranges(
+    inlay_snapshot: &InlaySnapshot,
+    fold_range: Range<InlayOffset>,
+    elision_policy: ElisionPolicy,
+) -> (Option<Range<InlayOffset>>, Option<Range<InlayOffset>>) {
+    if fold_range.start >= fold_range.end {
+        return (None, None);
+    }
+
+    match elision_policy {
+        ElisionPolicy::Visible => (None, Some(fold_range)),
+        ElisionPolicy::Hidden => (Some(fold_range), None),
+        ElisionPolicy::Tail { rows } => {
+            if rows == 0 {
+                return (Some(fold_range), None);
+            }
+
+            let start_point = inlay_snapshot.to_point(fold_range.start);
+            let end_point = inlay_snapshot.to_point(fold_range.end);
+            let tail_start_row = end_point
+                .row()
+                .saturating_sub(rows.saturating_sub(1))
+                .max(start_point.row());
+            let tail_start = inlay_snapshot
+                .to_offset(InlayPoint(Point::new(tail_start_row, 0)))
+                .max(fold_range.start)
+                .min(fold_range.end);
+
+            if tail_start <= fold_range.start {
+                (None, Some(fold_range))
+            } else if tail_start >= fold_range.end {
+                (Some(fold_range), None)
+            } else {
+                (
+                    Some(fold_range.start..tail_start),
+                    Some(tail_start..fold_range.end),
+                )
+            }
+        }
+    }
+}
+
 fn intersecting_folds<'a>(
     inlay_snapshot: &'a InlaySnapshot,
     folds: &'a SumTree<Fold>,
@@ -1098,6 +1210,12 @@ fn intersecting_folds<'a>(
     cursor
 }
 
+/// Edits closer together than this are merged into one. Every edit costs
+/// each downstream map a pass of its own, so folding a run of markup is
+/// cheaper as one edit spanning the run than as one edit per fold, and the
+/// text swept up in between is re-examined either way.
+const EDIT_PROXIMITY: usize = 256;
+
 fn consolidate_inlay_edits(mut edits: Vec<InlayEdit>) -> Vec<InlayEdit> {
     edits.sort_unstable_by(|a, b| {
         a.old
@@ -1114,7 +1232,7 @@ fn consolidate_inlay_edits(mut edits: Vec<InlayEdit>) -> Vec<InlayEdit> {
         #[allow(clippy::filter_map_identity)]
         let mut v: Vec<_> = inlay_edits
             .scan(&mut first_edit, |prev_edit, edit| {
-                if prev_edit.old.end >= edit.old.start {
+                if prev_edit.old.end.0.0 + EDIT_PROXIMITY >= edit.old.start.0.0 {
                     prev_edit.old.end = prev_edit.old.end.max(edit.old.end);
                     prev_edit.new.start = prev_edit.new.start.min(edit.new.start);
                     prev_edit.new.end = prev_edit.new.end.max(edit.new.end);
@@ -1149,7 +1267,7 @@ fn consolidate_fold_edits(mut edits: Vec<FoldEdit>) -> Vec<FoldEdit> {
         #[allow(clippy::filter_map_identity)]
         let mut v: Vec<_> = fold_edits
             .scan(&mut first_edit, |prev_edit, edit| {
-                if prev_edit.old.end >= edit.old.start {
+                if prev_edit.old.end.0.0 + EDIT_PROXIMITY >= edit.old.start.0.0 {
                     prev_edit.old.end = prev_edit.old.end.max(edit.old.end);
                     prev_edit.new.start = prev_edit.new.start.min(edit.new.start);
                     prev_edit.new.end = prev_edit.new.end.max(edit.new.end);
@@ -1184,6 +1302,13 @@ struct TransformPlaceholder {
 impl Transform {
     fn is_fold(&self) -> bool {
         self.placeholder.is_some()
+    }
+
+    /// Whether this fold displays nothing at all in place of its text.
+    fn conceals(&self) -> bool {
+        self.placeholder
+            .as_ref()
+            .is_some_and(|placeholder| placeholder.text.is_empty())
     }
 }
 
@@ -1226,6 +1351,7 @@ pub struct Fold {
     pub id: FoldId,
     pub range: FoldRange,
     pub placeholder: FoldPlaceholder,
+    pub elision_policy: ElisionPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1522,15 +1648,18 @@ impl<'a> Iterator for FoldChunks<'a> {
 
     #[ztracing::instrument(skip_all)]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.output_offset >= self.max_output_offset {
-            return None;
-        }
+        loop {
+            if self.output_offset >= self.max_output_offset {
+                return None;
+            }
 
-        let transform = self.transform_cursor.item()?;
+            let transform = self.transform_cursor.item()?;
 
-        // If we're in a fold, then return the fold's display text and
-        // advance the transform and buffer cursors to the end of the fold.
-        if let Some(placeholder) = transform.placeholder.as_ref() {
+            // If we're in a fold, then return the fold's display text and
+            // advance the transform and buffer cursors to the end of the fold.
+            let Some(placeholder) = transform.placeholder.as_ref() else {
+                break;
+            };
             self.inlay_chunk.take();
             self.inlay_offset += InlayOffset(transform.summary.input.len);
 
@@ -1541,6 +1670,12 @@ impl<'a> Iterator for FoldChunks<'a> {
             }
 
             self.output_offset.0 += placeholder.text.len();
+            // A concealing fold displays as nothing at all: it consumes its
+            // input but contributes no chunk, so nothing downstream has to
+            // handle an empty one.
+            if placeholder.text.is_empty() {
+                continue;
+            }
             return Some(Chunk {
                 text: &placeholder.text,
                 chars: placeholder.chars,
@@ -1745,6 +1880,40 @@ mod tests {
     use util::test::sample_text;
 
     #[gpui::test]
+    fn test_concealed_folds(cx: &mut gpui::App) {
+        init_test(cx);
+        struct ConcealTag;
+        let buffer = MultiBuffer::build_simple("**bold** text\n", cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+
+        let placeholder = FoldPlaceholder::concealed(TypeId::of::<ConcealTag>());
+        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
+        let (snapshot, _) = writer.fold(vec![
+            (Point::new(0, 0)..Point::new(0, 2), placeholder.clone()),
+            (Point::new(0, 6)..Point::new(0, 8), placeholder.clone()),
+        ]);
+        assert_eq!(snapshot.text(), "bold text\n");
+        // The markup is display-only: it neither folds its line nor answers
+        // to an unfold.
+        assert!(!snapshot.is_line_folded(MultiBufferRow(0)));
+
+        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
+        writer.unfold_intersecting(Some(Point::new(0, 0)..Point::new(0, 13)), true);
+        let (snapshot, _) = map.read(inlay_snapshot.clone(), vec![]);
+        assert_eq!(snapshot.text(), "bold text\n");
+
+        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
+        writer.remove_folds(
+            Some(Point::new(0, 0)..Point::new(0, 13)),
+            TypeId::of::<ConcealTag>(),
+        );
+        let (snapshot, _) = map.read(inlay_snapshot, vec![]);
+        assert_eq!(snapshot.text(), "**bold** text\n");
+    }
+
+    #[gpui::test]
     fn test_basic_folds(cx: &mut gpui::App) {
         init_test(cx);
         let buffer = MultiBuffer::build_simple(&sample_text(5, 6, 'a'), cx);
@@ -1821,6 +1990,25 @@ mod tests {
         writer.unfold_intersecting(Some(Point::new(0, 4)..Point::new(0, 4)), true);
         let (snapshot6, _) = map.read(inlay_snapshot, vec![]);
         assert_eq!(snapshot6.text(), "123aaaaa\nbbbbbb\nccc123456eee");
+    }
+
+    #[gpui::test]
+    fn test_tail_elision(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\nfour\nfive", cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+
+        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
+        writer.fold(vec![(
+            Point::new(0, 0)..Point::new(4, 4),
+            FoldPlaceholder::test(),
+            ElisionPolicy::Tail { rows: 2 },
+        )]);
+
+        let (snapshot, _) = map.read(inlay_snapshot, vec![]);
+        assert_eq!(snapshot.text(), "⋯four\nfive");
     }
 
     #[gpui::test]
