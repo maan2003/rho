@@ -906,7 +906,7 @@ impl AgentRoleSessionProfile for AgentRole {
                 intelligence: EngineerIntelligence::Alt,
                 ..
             } => SessionBinding::ClaudeOpus {
-                effort: ClaudeEffort::High,
+                effort: ClaudeEffort::Medium,
             },
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Medium,

@@ -328,7 +328,7 @@ fn agent_role_resolves_opinionated_bindings() {
     assert_eq!(
         profile(EngineerIntelligence::Alt),
         SessionBinding::ClaudeOpus {
-            effort: ClaudeEffort::High
+            effort: ClaudeEffort::Medium
         }
     );
     assert_eq!(
