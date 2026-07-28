@@ -602,7 +602,7 @@ impl TranscriptModel {
                     .map(|range| (range, crate::style::USER_MESSAGE_SCALE))
                     .collect::<Vec<_>>();
                 let display_map = editor.read(cx).display_map.clone();
-                display_map.update(cx, |display_map, _| display_map.set_row_scales(scales));
+                display_map.update(cx, |display_map, cx| display_map.set_row_scales(scales, cx));
             }
             let (history_styles, live_styles) = if refresh {
                 (&full_history_styles, &full_live_styles)

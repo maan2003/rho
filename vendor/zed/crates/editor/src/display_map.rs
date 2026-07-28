@@ -75,6 +75,7 @@ mod custom_highlights;
 mod fold_map;
 mod inlay_map;
 mod invisibles;
+mod row_scale_map;
 mod tab_map;
 mod wrap_map;
 
@@ -236,7 +237,7 @@ pub struct DisplayMap {
     crease_map: CreaseMap,
     /// Rows that render at a multiple of the editor's font size, as anchors
     /// so they follow the text they cover. See [`Self::set_row_scales`].
-    row_scales: Vec<(Range<Anchor>, f32)>,
+    row_scales: row_scale_map::RowScaleSnapshot,
     pub(crate) fold_placeholder: FoldPlaceholder,
     pub clip_at_line_ends: bool,
     pub(crate) masked: bool,
@@ -384,6 +385,7 @@ impl DisplayMap {
         // those edits would be captured but the InlayMap would already be at the
         // post-edit state, causing a desync.
         let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let row_scales = row_scale_map::RowScaleSnapshot::new(Vec::new(), &buffer_snapshot);
         let buffer_subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
         let crease_map = CreaseMap::new(&buffer_snapshot);
         let (inlay_map, snapshot) = InlayMap::new(buffer_snapshot);
@@ -404,7 +406,7 @@ impl DisplayMap {
             wrap_map,
             block_map,
             crease_map,
-            row_scales: Vec::new(),
+            row_scales,
             fold_placeholder,
             diagnostics_max_severity,
             text_highlights: Default::default(),
@@ -568,42 +570,13 @@ impl DisplayMap {
     /// inclusive. They must be ascending and non-overlapping. Rows re-wrap
     /// when they are edited, so a caller that scales rows it has already
     /// written needs [`Self::rewrap`] to follow.
-    pub fn set_row_scales(&mut self, row_scales: Vec<(Range<Anchor>, f32)>) {
-        self.row_scales = row_scales;
-    }
-
-    fn buffer_row_scales(&self, cx: &App) -> Arc<[(Range<u32>, f32)]> {
-        if self.row_scales.is_empty() {
-            return Arc::from([]);
-        }
-        let buffer = self.buffer.read(cx).snapshot(cx);
-        self.resolve_row_scales(&buffer, |row| row)
-    }
-
-    fn resolve_row_scales(
-        &self,
-        buffer: &MultiBufferSnapshot,
-        map_row: impl Fn(u32) -> u32,
-    ) -> Arc<[(Range<u32>, f32)]> {
-        let mut resolved = Vec::with_capacity(self.row_scales.len());
-        for (range, scale) in &self.row_scales {
-            let start = range.start.to_point(buffer);
-            let end = range.end.to_point(buffer);
-            if end < start {
-                continue;
-            }
-            let rows = map_row(start.row)..map_row(end.row) + 1;
-            // Rows a fold joined can land in two ranges at once; the first
-            // one to claim a row wins, which keeps the list searchable.
-            match resolved.last_mut() {
-                Some((last, _)) if *last == rows => continue,
-                Some((last @ Range { .. }, _)) if last.end > rows.start => {
-                    last.end = last.end.max(rows.end);
-                }
-                _ => resolved.push((rows, *scale)),
-            }
-        }
-        Arc::from(resolved)
+    pub fn set_row_scales(
+        &mut self,
+        row_scales: Vec<(Range<Anchor>, f32)>,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        self.row_scales = row_scale_map::RowScaleSnapshot::new(row_scales, &snapshot);
     }
 
     fn sync_through_wrap(&mut self, cx: &mut App) -> (WrapSnapshot, WrapPatch) {
@@ -614,16 +587,7 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let row_scales = if self.row_scales.is_empty() {
-            Arc::from([])
-        } else {
-            let buffer = snapshot.buffer_snapshot().clone();
-            self.resolve_row_scales(&buffer, |row| {
-                snapshot
-                    .point_to_tab_point(Point::new(row, 0), Bias::Left)
-                    .row()
-            })
-        };
+        let row_scales = self.row_scales.clone();
         self.wrap_map.update(cx, |map, cx| {
             map.set_row_scales(row_scales);
             map.sync(snapshot, edits, cx)
@@ -725,7 +689,7 @@ impl DisplayMap {
             semantic_token_highlights: self.semantic_token_highlights.clone(),
             clip_at_line_ends: self.clip_at_line_ends,
             masked: self.masked,
-            row_scales: self.buffer_row_scales(cx),
+            row_scales: self.row_scales.clone(),
             use_lsp_folding_ranges: !self.lsp_folding_crease_ids.is_empty(),
             fold_placeholder: self.fold_placeholder.clone(),
         }
@@ -750,7 +714,7 @@ impl DisplayMap {
             semantic_token_highlights: self.semantic_token_highlights.clone(),
             clip_at_line_ends: self.clip_at_line_ends,
             masked: self.masked,
-            row_scales: self.buffer_row_scales(cx),
+            row_scales: self.row_scales.clone(),
             use_lsp_folding_ranges: !self.lsp_folding_crease_ids.is_empty(),
             fold_placeholder: self.fold_placeholder.clone(),
         }
@@ -1689,10 +1653,9 @@ pub struct DisplaySnapshot {
     clip_at_line_ends: bool,
     masked: bool,
     diagnostics_max_severity: DiagnosticSeverity,
-    /// Buffer rows that render at a multiple of the editor's font size,
-    /// ascending. Resolved once per snapshot so painting a row costs a
-    /// search rather than an anchor resolution.
-    row_scales: Arc<[(Range<u32>, f32)]>,
+    /// Anchored source ranges that render at a multiple of the editor's font
+    /// size. Only the range near a painted row is resolved.
+    row_scales: row_scale_map::RowScaleSnapshot,
     pub(crate) fold_placeholder: FoldPlaceholder,
     /// When true, LSP folding ranges are used via the crease map and the
     /// indent-based fallback in `crease_for_buffer_row` is skipped.
@@ -1917,11 +1880,9 @@ impl DisplaySnapshot {
 
     /// The multiple of the editor's font size this row renders at.
     pub fn row_scale(&self, row: DisplayRow) -> f32 {
-        if self.row_scales.is_empty() {
-            return 1.0;
-        }
         let point = self.display_point_to_point(DisplayPoint::new(row, 0), Bias::Left);
-        crate::display_map::wrap_map::scale_for(&self.row_scales, point.row)
+        self.row_scales
+            .scale_for_buffer_row(self.buffer_snapshot(), point.row)
     }
 
     pub fn display_point_to_point(&self, point: DisplayPoint, bias: Bias) -> Point {

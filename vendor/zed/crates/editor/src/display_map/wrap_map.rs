@@ -2,6 +2,7 @@ use super::{
     Highlights,
     dimensions::RowDelta,
     fold_map::{Chunk, FoldRows},
+    row_scale_map::RowScaleSnapshot,
     tab_map::{self, TabEdit, TabPoint, TabSnapshot},
 };
 
@@ -9,14 +10,7 @@ use futures_lite::future::yield_now;
 use gpui::{App, AppContext as _, Context, Entity, Font, LineWrapper, Pixels, Task};
 use language::{LanguageAwareStyling, Point};
 use multi_buffer::RowInfo;
-use std::{
-    cmp,
-    collections::VecDeque,
-    mem,
-    ops::Range,
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::{cmp, collections::VecDeque, mem, ops::Range, sync::LazyLock, time::Duration};
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
 use text::Patch;
 
@@ -30,16 +24,6 @@ pub type WrapPatch = text::Patch<WrapRow>;
 /// Every glyph advance scales with the font size, so a row drawn at `scale`
 /// fits the same text in `wrap_width / scale`. Wrapping against that width
 /// costs nothing beyond the division and needs no second `LineWrapper`.
-pub type RowScales = Arc<[(Range<u32>, f32)]>;
-
-pub(crate) fn scale_for(scales: &[(Range<u32>, f32)], row: u32) -> f32 {
-    let ix = scales.partition_point(|(rows, _)| rows.end <= row);
-    match scales.get(ix) {
-        Some((rows, scale)) if rows.start <= row => *scale,
-        _ => 1.0,
-    }
-}
-
 #[derive(Copy, Clone, Debug, Default, Eq, Ord, PartialOrd, PartialEq)]
 pub struct WrapRow(pub u32);
 
@@ -54,13 +38,13 @@ impl_for_row_types! {
 /// See the [`display_map` module documentation](crate::display_map) for more information.
 pub struct WrapMap {
     snapshot: WrapSnapshot,
-    pending_edits: VecDeque<(TabSnapshot, Vec<TabEdit>)>,
+    pending_edits: VecDeque<(TabSnapshot, RowScaleSnapshot, Vec<TabEdit>)>,
     interpolated_edits: WrapPatch,
     edits_since_sync: WrapPatch,
     wrap_width: Option<Pixels>,
     background_task: Option<Task<()>>,
     font_with_size: (Font, Pixels),
-    row_scales: RowScales,
+    row_scales: RowScaleSnapshot,
 }
 
 #[derive(Clone)]
@@ -143,6 +127,7 @@ impl WrapMap {
         wrap_width: Option<Pixels>,
         cx: &mut App,
     ) -> (Entity<Self>, WrapSnapshot) {
+        let row_scales = RowScaleSnapshot::new(Vec::new(), tab_snapshot.buffer_snapshot());
         let handle = cx.new(|cx| {
             let mut this = Self {
                 font_with_size: (font, font_size),
@@ -152,7 +137,7 @@ impl WrapMap {
                 edits_since_sync: Default::default(),
                 snapshot: WrapSnapshot::new(tab_snapshot),
                 background_task: None,
-                row_scales: Arc::from([]),
+                row_scales,
             };
             this.set_wrap_width(wrap_width, cx);
             mem::take(&mut this.edits_since_sync);
@@ -175,7 +160,8 @@ impl WrapMap {
         cx: &mut Context<Self>,
     ) -> (WrapSnapshot, WrapPatch) {
         if self.wrap_width.is_some() {
-            self.pending_edits.push_back((tab_snapshot, edits));
+            self.pending_edits
+                .push_back((tab_snapshot, self.row_scales.clone(), edits));
             self.flush_edits(cx);
         } else {
             self.edits_since_sync = self
@@ -212,7 +198,7 @@ impl WrapMap {
     /// rewrites - which is how a transcript uses them, since a record's scale
     /// is decided as the record is rendered. Scaling rows that are already
     /// laid out needs a [`Self::rewrap`] to follow.
-    pub fn set_row_scales(&mut self, row_scales: RowScales) {
+    pub fn set_row_scales(&mut self, row_scales: RowScaleSnapshot) {
         self.row_scales = row_scales;
     }
 
@@ -320,7 +306,7 @@ impl WrapMap {
     fn flush_edits(&mut self, cx: &mut Context<Self>) {
         if !self.snapshot.interpolated {
             let mut to_remove_len = 0;
-            for (tab_snapshot, _) in &self.pending_edits {
+            for (tab_snapshot, _, _) in &self.pending_edits {
                 if tab_snapshot.version <= self.snapshot.tab_snapshot.version {
                     to_remove_len += 1;
                 } else {
@@ -342,14 +328,12 @@ impl WrapMap {
             let text_system = cx.text_system().clone();
             let (font, font_size) = self.font_with_size.clone();
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
-            let row_scales = self.row_scales.clone();
-
             if pending_edits.len() == 1
-                && let Some((_, tab_edits)) = pending_edits.back()
+                && let Some((_, _, tab_edits)) = pending_edits.back()
                 && let [edit] = &**tab_edits
                 && ((edit.new.end.row().saturating_sub(edit.new.start.row()) + 1) as usize)
                     < WRAP_YIELD_ROW_INTERVAL
-                && let Some((tab_snapshot, tab_edits)) = pending_edits.pop_back()
+                && let Some((tab_snapshot, row_scales, tab_edits)) = pending_edits.pop_back()
             {
                 let wrap_edits = gpui::block_on(snapshot.update(
                     tab_snapshot,
@@ -363,7 +347,7 @@ impl WrapMap {
             } else {
                 let update_task = cx.background_spawn(async move {
                     let mut edits = Patch::default();
-                    for (tab_snapshot, tab_edits) in pending_edits {
+                    for (tab_snapshot, row_scales, tab_edits) in pending_edits {
                         let wrap_edits = snapshot
                             .update(
                                 tab_snapshot,
@@ -408,7 +392,7 @@ impl WrapMap {
 
         let was_interpolated = self.snapshot.interpolated;
         let mut to_remove_len = 0;
-        for (tab_snapshot, edits) in &self.pending_edits {
+        for (tab_snapshot, _, edits) in &self.pending_edits {
             if tab_snapshot.version <= self.snapshot.tab_snapshot.version {
                 to_remove_len += 1;
             } else {
@@ -516,7 +500,7 @@ impl WrapSnapshot {
         new_tab_snapshot: TabSnapshot,
         tab_edits: &[TabEdit],
         wrap_width: Pixels,
-        row_scales: &[(Range<u32>, f32)],
+        row_scales: &RowScaleSnapshot,
         line_wrapper: &mut LineWrapper,
     ) -> WrapPatch {
         #[derive(Debug)]
@@ -614,7 +598,8 @@ impl WrapSnapshot {
                     // would. Element fragments carry pixel widths that do not
                     // scale with the font, so a row mixing both wraps early;
                     // no such row exists today.
-                    let row_scale = scale_for(row_scales, edit.new_rows.start + i as u32);
+                    let row_scale = row_scales
+                        .scale_for_tab_row(&new_tab_snapshot, edit.new_rows.start + i as u32);
                     let mut prev_boundary_ix = 0;
                     for boundary in line_wrapper.wrap_line(&line_fragments, wrap_width / row_scale)
                     {
