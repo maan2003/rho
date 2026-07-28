@@ -604,6 +604,12 @@ impl EditorElement {
         }
 
         let text_hitbox = &position_map.text_hitbox;
+        if !editor.mouse_click_selection_enabled {
+            if text_hitbox.is_hovered(window) {
+                cx.stop_propagation();
+            }
+            return;
+        }
         let gutter_hitbox = &position_map.gutter_hitbox;
         let point_for_position = position_map.point_for_position(event.position);
         let mut click_count = event.click_count;
@@ -818,7 +824,10 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        if !position_map.text_hitbox.is_hovered(window) || window.default_prevented() {
+        if !position_map.text_hitbox.is_hovered(window)
+            || window.default_prevented()
+            || !editor.mouse_click_selection_enabled
+        {
             return;
         }
 
@@ -844,6 +853,10 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
+        if !editor.mouse_click_selection_enabled && !editor.has_pending_selection() {
+            return;
+        }
+
         // Handle diff review drag completion
         if editor.diff_review_drag_state.is_some() {
             editor.end_diff_review_drag(window, cx);
@@ -950,6 +963,10 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
+        if !editor.mouse_click_selection_enabled {
+            return;
+        }
+
         let text_hitbox = &position_map.text_hitbox;
         let pending_nonempty_selections = editor.has_pending_nonempty_selection();
 
@@ -985,6 +1002,10 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
+        if !editor.mouse_click_selection_enabled {
+            return;
+        }
+
         let text_hitbox = &position_map.text_hitbox;
         let force_click_possible =
             matches!(editor.prev_pressure_stage, Some(PressureStage::Normal))
@@ -1007,9 +1028,32 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        if editor.has_autoscroll_request()
-            || !editor.has_pending_selection()
-                && matches!(editor.selection_drag_state, SelectionDragState::None)
+        if !editor.mouse_click_selection_enabled
+            && !editor.has_pending_selection()
+            && event.pressed_button == Some(MouseButton::Left)
+        {
+            let Some(mouse_down) = editor
+                .pending_mouse_down
+                .as_ref()
+                .and_then(|mouse_down| mouse_down.borrow().clone())
+            else {
+                return;
+            };
+            let point_for_mouse_down = position_map.point_for_position(mouse_down.position);
+            editor.select(
+                SelectPhase::Begin {
+                    position: point_for_mouse_down.nearest_valid,
+                    add: Editor::is_alt_pressed(&mouse_down.modifiers, cx),
+                    click_count: mouse_down.click_count,
+                },
+                window,
+                cx,
+            );
+        }
+
+        if !editor.has_autoscroll_request()
+            && !editor.has_pending_selection()
+            && matches!(editor.selection_drag_state, SelectionDragState::None)
         {
             return;
         }

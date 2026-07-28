@@ -57,6 +57,34 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_mouse_click_selection_enabled(
+        &mut self,
+        mouse_click_selection_enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.mouse_click_selection_enabled = mouse_click_selection_enabled;
+        cx.notify();
+    }
+
+    pub fn set_prepare_for_insert(
+        &mut self,
+        prepare_for_insert: Option<
+            impl Fn(&mut Editor, &mut Window, &mut Context<Editor>) + 'static,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        self.prepare_for_insert =
+            prepare_for_insert.map(|callback| Rc::new(callback) as PrepareForInsert);
+        cx.notify();
+    }
+
+    pub fn prepare_for_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(callback) = self.prepare_for_insert.clone() {
+            callback(self, window, cx);
+        }
+        self.move_to_nearest_editable_points(window, cx);
+    }
+
     pub fn set_show_indent_guides(&mut self, show_indent_guides: bool, cx: &mut Context<Self>) {
         self.show_indent_guides = Some(show_indent_guides);
         cx.notify();
@@ -108,6 +136,13 @@ impl Editor {
 
     pub fn set_show_gutter(&mut self, show_gutter: bool, cx: &mut Context<Self>) {
         self.show_gutter = show_gutter;
+        cx.notify();
+    }
+
+    /// Shows only the gutter strip used for gutter highlights, without reserving
+    /// space for line numbers, folds, git hunks, or other gutter indicators.
+    pub fn set_show_compact_gutter(&mut self, show_compact_gutter: bool, cx: &mut Context<Self>) {
+        self.show_compact_gutter = show_compact_gutter;
         cx.notify();
     }
 

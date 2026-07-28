@@ -623,10 +623,23 @@ impl Vim {
                 window,
                 cx,
                 |s| {
+                    let constrain_to_editable_range = vim.mode == Mode::Insert;
                     s.move_cursors_with(&mut |map, cursor, goal| {
-                        motion
+                        let (new_cursor, new_goal) = motion
                             .move_point(map, cursor, goal, times, &text_layout_details)
-                            .unwrap_or((cursor, goal))
+                            .unwrap_or((cursor, goal));
+                        if constrain_to_editable_range {
+                            let cursor = cursor.to_point(map);
+                            let new_cursor = Editor::constrain_to_editable_range(
+                                map.buffer_snapshot(),
+                                cursor,
+                                new_cursor.to_point(map),
+                            )
+                            .to_display_point(map);
+                            (new_cursor, new_goal)
+                        } else {
+                            (new_cursor, new_goal)
+                        }
                     })
                 },
             );
@@ -639,6 +652,7 @@ impl Vim {
 
     fn insert_after(&mut self, _: &InsertAfter, window: &mut Window, cx: &mut Context<Self>) {
         self.start_recording(cx);
+        self.prepare_for_insert(window, cx);
         self.switch_mode(Mode::Insert, false, window, cx);
         self.update_editor(cx, |_, editor, cx| {
             editor.change_selections(Default::default(), window, cx, |s| {
@@ -651,6 +665,7 @@ impl Vim {
 
     fn insert_before(&mut self, _: &InsertBefore, window: &mut Window, cx: &mut Context<Self>) {
         self.start_recording(cx);
+        self.prepare_for_insert(window, cx);
         if self.mode.is_visual() {
             let current_mode = self.mode;
             self.update_editor(cx, |_, editor, cx| {
@@ -676,6 +691,7 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.start_recording(cx);
+        self.prepare_for_insert(window, cx);
         self.switch_mode(Mode::Insert, false, window, cx);
         self.update_editor(cx, |_, editor, cx| {
             editor.change_selections(Default::default(), window, cx, |s| {
@@ -696,6 +712,7 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.start_recording(cx);
+        self.prepare_for_insert(window, cx);
         self.switch_mode(Mode::Insert, false, window, cx);
         self.update_editor(cx, |_, editor, cx| {
             editor.change_selections(Default::default(), window, cx, |s| {

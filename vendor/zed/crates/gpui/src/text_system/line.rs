@@ -79,6 +79,19 @@ impl ShapedLine {
         self
     }
 
+    /// Returns the foreground color for the decoration run containing the given byte index.
+    pub fn color_for_index(&self, index: usize) -> Option<Hsla> {
+        let mut run_start = 0usize;
+        for decoration in &self.decoration_runs {
+            let run_end = run_start + decoration.len as usize;
+            if index < run_end {
+                return Some(decoration.color);
+            }
+            run_start = run_end;
+        }
+        None
+    }
+
     /// Paint the line of text to the window.
     pub fn paint(
         &self,
@@ -787,6 +800,56 @@ mod tests {
             text: SharedString::new(text),
             decoration_runs: SmallVec::from(decorations.to_vec()),
         }
+    }
+
+    #[test]
+    fn test_color_for_index_uses_decoration_runs() {
+        let red = Hsla {
+            h: 0.0,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        let green = Hsla {
+            h: 0.3,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        let line = make_shaped_line(
+            "abcdef",
+            &[
+                (0, 0.0),
+                (1, 10.0),
+                (2, 20.0),
+                (3, 30.0),
+                (4, 40.0),
+                (5, 50.0),
+            ],
+            60.0,
+            &[
+                DecorationRun {
+                    len: 2,
+                    color: red,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                },
+                DecorationRun {
+                    len: 4,
+                    color: green,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                },
+            ],
+        );
+
+        assert_eq!(line.color_for_index(0), Some(red));
+        assert_eq!(line.color_for_index(1), Some(red));
+        assert_eq!(line.color_for_index(2), Some(green));
+        assert_eq!(line.color_for_index(5), Some(green));
+        assert_eq!(line.color_for_index(6), None);
     }
 
     #[test]

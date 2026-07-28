@@ -2609,6 +2609,10 @@ fn matching(
     display_point: DisplayPoint,
     match_quotes: bool,
 ) -> DisplayPoint {
+    if !map.is_singleton() {
+        return display_point;
+    }
+
     // https://github.com/vim/vim/blob/1d87e11a1ef201b26ed87585fba70182ad0c468a/runtime/doc/motion.txt#L1200
     let display_point = map.clip_at_line_end(display_point);
     let point = display_point.to_point(map);

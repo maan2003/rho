@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 use collections::HashMap;
 use command_palette::CommandPalette;
 use editor::{
-    AnchorRangeExt, DisplayPoint, Editor, EditorMode, MultiBuffer, MultiBufferOffset,
+    DisplayPoint, Editor, EditorMode, MultiBuffer, MultiBufferOffset,
     actions::{DeleteLine, WrapSelectionsInTag},
     code_context_menus::CodeContextMenu,
     display_map::DisplayRow,

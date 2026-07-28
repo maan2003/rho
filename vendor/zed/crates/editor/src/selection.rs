@@ -58,12 +58,17 @@ impl Editor {
         change: impl FnOnce(&mut MutableSelectionsCollection<'_, '_>) -> R,
     ) -> R {
         let snapshot = self.display_snapshot(cx);
-        if let Some(state) = &mut self.deferred_selection_effects_state {
-            state.effects.scroll = effects.scroll.or(state.effects.scroll);
-            state.effects.completions = effects.completions;
-            state.effects.nav_history = effects.nav_history.or(state.effects.nav_history);
+        if self.deferred_selection_effects_state.is_some() {
+            if let Some(state) = &mut self.deferred_selection_effects_state {
+                state.effects.scroll = effects.scroll.or(state.effects.scroll);
+                state.effects.completions = effects.completions;
+                state.effects.nav_history = effects.nav_history.or(state.effects.nav_history);
+            }
             let (changed, result) = self.selections.change_with(&snapshot, change);
-            state.changed |= changed;
+            let constrained = self.constrain_selections_to_editable_ranges(&snapshot);
+            if let Some(state) = &mut self.deferred_selection_effects_state {
+                state.changed |= changed || constrained;
+            }
             return result;
         }
         let mut state = DeferredSelectionEffectsState {
@@ -78,13 +83,41 @@ impl Editor {
             },
         };
         let (changed, result) = self.selections.change_with(&snapshot, change);
-        state.changed = state.changed || changed;
+        let constrained = self.constrain_selections_to_editable_ranges(&snapshot);
+        state.changed = state.changed || changed || constrained;
         if self.defer_selection_effects {
             self.deferred_selection_effects_state = Some(state);
         } else {
             self.apply_selection_effects(state, window, cx);
         }
         result
+    }
+
+    fn constrain_selections_to_editable_ranges(&mut self, snapshot: &DisplaySnapshot) -> bool {
+        if !self.restrict_navigation_to_editable_ranges {
+            return false;
+        }
+
+        let (changed, ()) = self.selections.change_with(snapshot, |selections| {
+            selections.move_with(&mut |map, selection| {
+                let start = selection.start.to_point(map);
+                let end = selection.end.to_point(map);
+                let range = if start <= end { start..end } else { end..start };
+                let buffer_snapshot = map.buffer_snapshot();
+                if Self::point_is_editable(buffer_snapshot, start)
+                    && Self::point_is_editable(buffer_snapshot, end)
+                    && Self::range_is_editable(buffer_snapshot, range)
+                {
+                    return;
+                }
+
+                let head = selection.head();
+                if let Some(point) = Self::nearest_editable_point(map, head.to_point(map)) {
+                    selection.collapse_to(point.to_display_point(map), SelectionGoal::None);
+                }
+            });
+        });
+        changed
     }
 
     /// Defers the effects of selection change, so that the effects of multiple calls to
