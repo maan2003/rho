@@ -569,7 +569,7 @@ fn render_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
         out.push('\n');
     }
     if managed > 0 {
-        out.push_str("Each Rho-managed jj workdir is a workspace: a checkout with its own working copy and working-copy commit, which `@` names inside that workdir. jj snapshots working-copy changes into `@` as you work; no separate Git-style commit is needed merely to keep them. Files and uncommitted changes already present are the starting state you were given, not leftovers to clean up.\n\n");
+        out.push_str("Each Rho-managed jj workdir is a workspace: the checkout you are working in, with a working-copy commit named `@`. jj records your edits into `@` as you work, so keeping them takes no extra step. Files and uncommitted changes already present are the starting state you were given, not leftovers to clean up. Other workspaces have their own working-copy commits; leave commits you did not create alone unless the task is to work on them.\n\n");
     }
     if sandboxed > 0 {
         out.push_str("A Rho-managed sandbox workspace masks the repository's original VCS metadata from commands and presents a separate synthetic Git baseline. Work with the checkout and VCS view provided inside the sandbox rather than assuming the origin checkout's metadata is available.\n\n");
@@ -641,8 +641,10 @@ mod tests {
         let prompt = render_workspace_prompt(&[workdir("/repo", WorkdirKind::Managed)]);
         assert!(prompt.contains("## Workspace Context"));
         assert!(prompt.contains("working directory is a Rho-managed jj workspace"));
-        assert!(prompt.contains("which `@` names inside that workdir"));
+        assert!(prompt.contains("working-copy commit named `@`"));
+        assert!(prompt.contains("keeping them takes no extra step"));
         assert!(prompt.contains("starting state you were given"));
+        assert!(prompt.contains("leave commits you did not create alone"));
         assert!(!prompt.contains("Agent views"));
         assert!(!prompt.contains("user's own checkout"));
         assert!(!prompt.contains("working in place"));
