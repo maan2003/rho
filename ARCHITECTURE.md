@@ -18,6 +18,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   workspace-backed execution context (view, prompt, and tools) initializes
   lazily at first inference. It depends directly on the concrete
   `rho-inference` session.
+- `rho-claude-usage` is an isolated Claude Code subscription-quota adapter. It
+  owns the hardened PTY process, `/usage` interaction, terminal emulation,
+  parsing, polling cadence, and retry policy. The daemon only consumes parsed
+  snapshots and persists them through its existing quota store.
 - `rho-agent2` is an isolated experimental harness with only native inference,
   durable transcript/queue state, pull-based tool and peer-mail scheduling,
   streaming observation, and cancellation. It intentionally has no code mode,

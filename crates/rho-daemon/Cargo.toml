@@ -25,6 +25,7 @@ prefix-id.workspace = true
 redb.workspace = true
 rho-agent = { workspace = true, features = ["code-mode"] }
 rho-claude.workspace = true
+rho-claude-usage.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
 rho-shell-proto.workspace = true

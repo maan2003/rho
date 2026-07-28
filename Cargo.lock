@@ -13511,6 +13511,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-claude-usage"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "chrono",
+ "libc",
+ "rustix-openpty",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rho-cli"
 version = "0.1.0"
 dependencies = [
@@ -13598,6 +13611,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rho-agent",
  "rho-claude",
+ "rho-claude-usage",
  "rho-core",
  "rho-db",
  "rho-inference",

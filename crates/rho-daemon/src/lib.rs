@@ -327,6 +327,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default(),
     };
+    let quota_path_overrides = path_overrides.clone();
     let iroh = if args.iroh {
         let secret = load_or_create_iroh_secret(&db).await?;
         let iroh_auth = rho_iroh_auth::IrohAuth::new(db.clone(), secret.public());
@@ -350,6 +351,23 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     agents.install_iris_tool_host();
     agents.resume_platform_integrations();
     spawn_chatgpt_quota_poller(quota_auth_name, agents.db.clone(), agents.events.clone());
+    let quota_environment = agents.user_environment.clone();
+    spawn_claude_quota_recorder(
+        rho_claude_usage::spawn_poller(
+            move || {
+                let mut command = tokio::process::Command::new("claude");
+                quota_environment.apply(&mut command);
+                let path = quota_environment
+                    .get("PATH")
+                    .context("user environment has no PATH")?;
+                command.env("PATH", quota_path_overrides.add_to(path));
+                Ok(command)
+            },
+            default_db_path()?.with_file_name("claude-quota-probe"),
+        ),
+        agents.db.clone(),
+        agents.events.clone(),
+    );
 
     if let Some((secret, iroh_auth)) = iroh {
         let mut transport = iroh::endpoint::QuicTransportConfig::builder()
@@ -2280,6 +2298,46 @@ fn spawn_chatgpt_quota_poller(
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(10 * 60)).await;
+        }
+    });
+}
+
+fn spawn_claude_quota_recorder(
+    mut updates: tokio::sync::mpsc::Receiver<anyhow::Result<rho_claude_usage::ClaudeUsage>>,
+    db: RhoDb,
+    events: broadcast::Sender<ServerMessage>,
+) {
+    tokio::spawn(async move {
+        while let Some(update) = updates.recv().await {
+            let usage = match update {
+                Ok(usage) => usage,
+                Err(error) => {
+                    tracing::warn!(%error, "Claude quota probe failed");
+                    continue;
+                }
+            };
+            let observed_at = rho_core::UnixMs::now();
+            let mut write = db.write().await;
+            let mut changed = write.record_quota_observation(QuotaObservationRecord {
+                provider: QuotaProvider::Claude,
+                model: QuotaModel::OPUS,
+                observed_at,
+                used_percent: usage.all_models.used_percent,
+                reset_at_unix: Some(usage.all_models.reset_at_unix),
+            });
+            changed |= write.record_quota_observation(QuotaObservationRecord {
+                provider: QuotaProvider::Claude,
+                model: QuotaModel::FABLE,
+                observed_at,
+                used_percent: usage.fable.used_percent,
+                reset_at_unix: Some(usage.fable.reset_at_unix),
+            });
+            write.commit();
+            if changed {
+                let _ = events.send(ServerMessage::QuotaUsage {
+                    summaries: quota_summaries(&db),
+                });
+            }
         }
     });
 }

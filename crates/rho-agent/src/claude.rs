@@ -1193,24 +1193,7 @@ impl ClaudeLoop {
                         .await;
                 }
             }
-            rho_claude::ClaudeEvent::RateLimitEvent(event) => {
-                let info = event.rate_limit_info;
-                let model = claude_weekly_quota_model(info.rate_limit_type.as_deref());
-                if let Some(model) = model
-                    && let Some(utilization) = info.utilization
-                    && utilization.is_finite()
-                {
-                    self.state.write().expect("poison").quota_observation =
-                        Some(crate::QuotaObservation {
-                            provider: crate::QuotaProvider::Claude,
-                            model: model.to_owned(),
-                            observed_at: rho_core::UnixMs::now(),
-                            used_percent: (utilization.clamp(0.0, 1.0) * 100.0).round() as u8,
-                            reset_at_unix: info.resets_at,
-                        });
-                    self.notify.notify_waiters();
-                }
-            }
+            rho_claude::ClaudeEvent::RateLimitEvent(_) => {}
             rho_claude::ClaudeEvent::CommandLifecycle(message) => {
                 self.handle_command_lifecycle(message);
             }
@@ -1518,14 +1501,6 @@ fn remove_compact_commands(inputs: &mut InputQueues) {
     });
 }
 
-fn claude_weekly_quota_model(rate_limit_type: Option<&str>) -> Option<&'static str> {
-    match rate_limit_type {
-        Some("seven_day_opus") => Some("opus"),
-        Some("seven_day_fable") => Some("fable"),
-        _ => None,
-    }
-}
-
 fn promote_queued_user_message(state: &mut AgentState, content: &[ContentPart]) -> bool {
     let matched = state.queued_inputs.remove_first(|queued| {
         matches!(
@@ -1560,25 +1535,6 @@ fn is_compact_command(content: &[ContentPart]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn weekly_quota_uses_the_provider_bucket_not_the_running_model() {
-        assert_eq!(claude_weekly_quota_model(Some("seven_day")), None);
-        assert_eq!(
-            claude_weekly_quota_model(Some("seven_day_fable")),
-            Some("fable")
-        );
-        assert_eq!(claude_weekly_quota_model(Some("five_hour")), None);
-        assert_eq!(
-            claude_weekly_quota_model(Some("seven_day_opus")),
-            Some("opus")
-        );
-        assert_eq!(claude_weekly_quota_model(Some("seven_day_sonnet")), None);
-        assert_eq!(
-            claude_weekly_quota_model(Some("seven_day_overage_included")),
-            None
-        );
-    }
 
     #[test]
     fn raw_image_queue_matches_claude_textual_echo() {

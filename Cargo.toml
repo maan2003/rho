@@ -9,6 +9,7 @@ members = [
   "crates/rho-agent2",
   "crates/rho-ci",
   "crates/rho-claude",
+  "crates/rho-claude-usage",
   "crates/rho-cli",
   "crates/rho-code-mode",
   "crates/rho-context-config",
@@ -94,6 +95,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 rho-agent = { path = "crates/rho-agent", default-features = false }
 rho-ci = { path = "crates/rho-ci" }
 rho-claude = { path = "crates/rho-claude" }
+rho-claude-usage = { path = "crates/rho-claude-usage" }
 rho-cli = { path = "crates/rho-cli" }
 rho-code-mode = { path = "crates/rho-code-mode" }
 rho-context-config = { path = "crates/rho-context-config" }

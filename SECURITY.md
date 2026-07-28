@@ -345,6 +345,15 @@ AI APIs.
   startup. Every daemon-owned subprocess clears the daemon environment before
   applying that snapshot, so service credentials and other incidental daemon
   variables are not inherited.
+- The daemon's centralized Claude quota poller is a deliberate exception to
+  project-scoped Claude startup. The isolated `rho-claude-usage` crate runs
+  Claude Code directly in a dedicated, empty `0700` state directory, with safe
+  mode, tools, hooks, plugins, MCP, and transcript history disabled. It
+  automatically accepts Claude's trust prompt only for that verified-empty
+  directory. The bounded PTY probe uses the snapshotted user environment and
+  configured PATH overrides so it shares Claude's user auth without loading
+  project configuration or `direnv`; timeout cleanup terminates and reaps the
+  probe's process group.
 - Internal workspace-management commands receive only that user environment.
   Agent shell commands and Claude Code additionally run through `direnv exec`
   in their project directory. Project `.envrc` files are trusted local code and
