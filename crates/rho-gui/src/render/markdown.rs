@@ -104,7 +104,8 @@ fn markdown_language(cx: &App) -> Option<&'static Arc<Language>> {
                     matcher: LanguageMatcher {
                         path_suffixes: vec!["md".into()],
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..LanguageConfig::default()
                 },
                 Some(tree_sitter_md::LANGUAGE.into()),

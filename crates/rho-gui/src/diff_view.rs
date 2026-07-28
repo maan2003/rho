@@ -585,20 +585,18 @@ fn build_editor(
     cx.new(|cx| {
         let mut editor = editor::Editor::for_multibuffer(multibuffer, None, window, cx);
         crate::editor_config::configure_diff(&mut editor, window, cx);
-        editor.start_temporary_diff_override();
-        editor.disable_diagnostics(cx);
-        editor.set_expand_all_diff_hunks(cx);
-        editor.set_render_diff_hunks_as_unstaged(true, cx);
-        editor.set_render_diff_hunk_controls(
-            Arc::new(|_, _, _, _, _, _, _, _| gpui::Empty.into_any_element()),
+        editor.set_diff_hunk_delegate(
+            Some(Arc::new(editor::RestoreOnlyUnstagedDiffHunkDelegate)),
             cx,
         );
+        editor.disable_diagnostics(cx);
+        editor.set_expand_all_diff_hunks(cx);
         editor
     })
 }
 
 fn diff_path_key(path: &Utf8Path) -> PathKey {
-    let path = RelPath::unix(path.as_str())
+    let path = RelPath::from_unix_str(path.as_str())
         .expect("jj repository paths are valid relative paths")
         .into_arc();
     // All entries share a prefix so lexical repository path determines order;
