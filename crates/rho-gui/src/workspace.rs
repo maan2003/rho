@@ -3657,12 +3657,12 @@ impl Workspace {
             if index > 0 {
                 stats = stats.child(div().text_color(text_style.color.opacity(0.55)).child("·"));
             }
-            let days = summary
+            let reset_in = summary
                 .reset_at_unix
-                .map(|reset| ((reset as f64 - now).max(0.0)) / 86_400.0)
-                .unwrap_or(0.0);
+                .map(|reset| reset as f64 - now)
+                .filter(|seconds| *seconds > 0.0);
             let provider_color: gpui::Hsla = match summary.model.as_str() {
-                "claude" => colors.terminal_ansi_magenta.into(),
+                "opus" => colors.terminal_ansi_magenta.into(),
                 "fable" => gpui::rgb(0xd97757).into(),
                 _ => colors.terminal_ansi_cyan.into(),
             };
@@ -3672,7 +3672,15 @@ impl Workspace {
                         .text_color(provider_color)
                         .child(summary.model.clone()),
                 )
-                .child(format!("{}% {:.1}d", summary.remaining_percent, days));
+                .child(match reset_in {
+                    Some(seconds) => format!(
+                        "{}% {:.1}d",
+                        summary.remaining_percent,
+                        seconds / 86_400.0
+                    ),
+                    None if summary.reset_at_unix.is_some() => "100%".to_owned(),
+                    None => format!("{}%", summary.remaining_percent),
+                });
         }
         div()
             .w_full()

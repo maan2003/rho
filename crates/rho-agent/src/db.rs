@@ -98,13 +98,13 @@ pub struct QuotaModel(u8);
 impl QuotaModel {
     pub const GPT: Self = Self(1);
     pub const FABLE: Self = Self(2);
-    pub const CLAUDE: Self = Self(3);
+    pub const OPUS: Self = Self(3);
 
     pub fn name(self) -> &'static str {
         match self {
             Self::GPT => "gpt",
             Self::FABLE => "fable",
-            Self::CLAUDE => "claude",
+            Self::OPUS => "opus",
             _ => "unknown",
         }
     }

@@ -2020,15 +2020,6 @@ where
     Ok(())
 }
 
-/// Mid-turn from the rail's point of view: the states that render as a
-/// running lamp rather than a settled one.
-fn is_working(kind: &AgentStateKind) -> bool {
-    matches!(
-        kind,
-        AgentStateKind::ApiStreaming { .. } | AgentStateKind::ToolCalling { .. }
-    )
-}
-
 /// Stuck rather than finished: the agent cannot proceed without the user.
 fn is_blocked(kind: &AgentStateKind) -> bool {
     matches!(
@@ -2043,7 +2034,7 @@ fn is_blocked(kind: &AgentStateKind) -> bool {
 /// sub-agent turn ends never set it to Pending (see the watcher), so
 /// children stay quiet by construction.
 fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition) -> UiAttention {
-    if kind.is_some_and(is_working) {
+    if kind.is_some_and(AgentStateKind::is_working) {
         return UiAttention::Working;
     }
     let pending = match disposition {
@@ -2079,7 +2070,7 @@ fn spawn_attention_watcher(
         let changes = agent.subscribe();
         futures::pin_mut!(changes);
         let initial_state = agent.state();
-        let mut was_working = is_working(&initial_state.kind);
+        let mut was_working = initial_state.kind.is_working();
         let mut last_reported_response_count = inference_response_count(&initial_state);
         let mut last_sent = None;
         let mut last_quota = None;
@@ -2090,7 +2081,7 @@ fn spawn_attention_watcher(
                     let model = match observation.model.as_str() {
                         "gpt" => QuotaModel::GPT,
                         "fable" => QuotaModel::FABLE,
-                        "claude" => QuotaModel::CLAUDE,
+                        "opus" => QuotaModel::OPUS,
                         _ => continue,
                     };
                     let provider = match observation.provider {
@@ -2113,7 +2104,7 @@ fn spawn_attention_watcher(
                     }
                 }
             }
-            let working = is_working(&state.kind);
+            let working = state.kind.is_working();
             if !working && was_working {
                 pool.flush_agent_usage(Some(agent_id)).await;
                 if !is_child {
@@ -2152,20 +2143,38 @@ fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
     let now = rho_core::UnixMs::now().0;
     let since = rho_core::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
     let read = db.read();
-    [QuotaModel::GPT, QuotaModel::CLAUDE, QuotaModel::FABLE]
+    [QuotaModel::GPT, QuotaModel::OPUS, QuotaModel::FABLE]
         .into_iter()
         .filter_map(|model| {
             let observations = read.quota_observations(model, since);
             let samples = observations.iter().collect::<Vec<_>>();
             let latest = samples.last()?;
+            let reset_expired = latest
+                .reset_at_unix
+                .is_some_and(|reset| reset <= (now / 1_000) as i64);
+            let burn = |duration| {
+                if reset_expired {
+                    0
+                } else {
+                    quota_burn(&samples, now, duration)
+                }
+            };
             Some(QuotaSummary {
                 model: model.name().to_owned(),
-                remaining_percent: 100u8.saturating_sub(latest.used_percent),
-                burn_10m: quota_burn(&samples, now, 10 * 60 * 1_000),
-                burn_2h: quota_burn(&samples, now, 2 * 60 * 60 * 1_000),
-                burn_1d: quota_burn(&samples, now, 24 * 60 * 60 * 1_000),
-                burn_3d: quota_burn(&samples, now, 3 * 24 * 60 * 60 * 1_000),
-                reset_at_unix: latest.reset_at_unix,
+                remaining_percent: if reset_expired {
+                    100
+                } else {
+                    100u8.saturating_sub(latest.used_percent)
+                },
+                burn_10m: burn(10 * 60 * 1_000),
+                burn_2h: burn(2 * 60 * 60 * 1_000),
+                burn_1d: burn(24 * 60 * 60 * 1_000),
+                burn_3d: burn(3 * 24 * 60 * 60 * 1_000),
+                reset_at_unix: if reset_expired {
+                    None
+                } else {
+                    latest.reset_at_unix
+                },
             })
         })
         .collect()
@@ -2187,7 +2196,7 @@ fn quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
     let now = rho_core::UnixMs::now().0;
     let since = rho_core::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
     let read = db.read();
-    [QuotaModel::GPT, QuotaModel::CLAUDE, QuotaModel::FABLE]
+    [QuotaModel::GPT, QuotaModel::OPUS, QuotaModel::FABLE]
         .into_iter()
         .filter_map(|model| {
             let points = read
@@ -3657,7 +3666,8 @@ mod tests {
     use super::{
         GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
         configure_octo_git_transport, inference_response_count, latest_final_response,
-        load_or_create_iroh_secret, quota_burn, quota_history, validate_image_content,
+        load_or_create_iroh_secret, quota_burn, quota_history, quota_summaries,
+        validate_image_content,
     };
 
     #[test]
@@ -3740,7 +3750,7 @@ mod tests {
         }
         assert!(write.record_quota_observation(QuotaObservationRecord {
             provider: QuotaProvider::Claude,
-            model: QuotaModel::CLAUDE,
+            model: QuotaModel::OPUS,
             observed_at: rho_core::UnixMs(now),
             used_percent: 25,
             reset_at_unix: Some(456),
@@ -3757,11 +3767,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             [100, 99, 98, 97, 96]
         );
-        let claude = history
+        let opus = history
             .iter()
-            .find(|series| series.model == "claude")
+            .find(|series| series.model == "opus")
             .unwrap();
-        assert_eq!(claude.points[0].remaining_percent, 75);
+        assert_eq!(opus.points[0].remaining_percent, 75);
+    }
+
+    #[tokio::test]
+    async fn quota_summary_expires_stale_provider_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(temp.path().join("rho.redb"));
+        let now = rho_core::UnixMs::now();
+        let mut write = db.write().await;
+        assert!(write.record_quota_observation(QuotaObservationRecord {
+            provider: QuotaProvider::Claude,
+            model: QuotaModel::FABLE,
+            observed_at: now,
+            used_percent: 99,
+            reset_at_unix: Some(1),
+        }));
+        write.commit();
+
+        let summary = quota_summaries(&db)
+            .into_iter()
+            .find(|summary| summary.model == "fable")
+            .unwrap();
+        assert_eq!(summary.remaining_percent, 100);
+        assert_eq!(summary.burn_10m, 0);
+        assert_eq!(summary.reset_at_unix, None);
     }
 
     fn environment_value<'a>(

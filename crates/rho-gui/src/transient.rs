@@ -159,7 +159,7 @@ impl Transient {
             let series = series.clone();
             let days = self.usage_days;
             let gpt: Hsla = colors.terminal_ansi_cyan.into();
-            let claude: Hsla = colors.terminal_ansi_magenta.into();
+            let opus: Hsla = colors.terminal_ansi_magenta.into();
             let fable: Hsla = rgb(0xd97757).into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
             return bottom_strip(text_style, cx)
@@ -175,7 +175,7 @@ impl Transient {
                         .gap_4()
                         .px_2()
                         .child(div().text_color(gpt).child("gpt"))
-                        .child(div().text_color(claude).child("claude"))
+                        .child(div().text_color(opus).child("opus"))
                         .child(div().text_color(fable).child("fable")),
                 )
                 .child(
@@ -202,7 +202,7 @@ impl Transient {
                                     .flex_col()
                                     .child(
                                         div().w(px(832.)).h(px(240.)).child(usage_chart(
-                                            series, days, gpt, claude, fable, grid,
+                                            series, days, gpt, opus, fable, grid,
                                         )),
                                     )
                                     .child(
@@ -499,7 +499,7 @@ fn usage_chart(
     series: Vec<rho_ui_proto::QuotaSeries>,
     days: u64,
     gpt: Hsla,
-    claude: Hsla,
+    opus: Hsla,
     fable: Hsla,
     grid: Hsla,
 ) -> impl IntoElement {
@@ -538,7 +538,7 @@ fn usage_chart(
 
             for model in &series {
                 let color = match model.model.as_str() {
-                    "claude" => claude,
+                    "opus" => opus,
                     "fable" => fable,
                     _ => gpt,
                 };

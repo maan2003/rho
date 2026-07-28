@@ -226,7 +226,7 @@ async fn quota_history_deduplicates_unchanged_samples() {
         ..sample.clone()
     }));
     assert!(write.record_quota_observation(QuotaObservationRecord {
-        model: QuotaModel::CLAUDE,
+        model: QuotaModel::OPUS,
         observed_at: UnixMs(3),
         used_percent: 30,
         ..sample.clone()
@@ -244,7 +244,7 @@ async fn quota_history_deduplicates_unchanged_samples() {
     assert_eq!(history[0].used_percent, 20);
     assert_eq!(history[2].used_percent, 22);
     assert_eq!(
-        db.read().quota_observations(QuotaModel::CLAUDE, UnixMs(0))[0].used_percent,
+        db.read().quota_observations(QuotaModel::OPUS, UnixMs(0))[0].used_percent,
         30
     );
     assert_eq!(

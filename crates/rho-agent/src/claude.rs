@@ -1520,7 +1520,7 @@ fn remove_compact_commands(inputs: &mut InputQueues) {
 
 fn claude_weekly_quota_model(rate_limit_type: Option<&str>) -> Option<&'static str> {
     match rate_limit_type {
-        Some("seven_day") => Some("claude"),
+        Some("seven_day_opus") => Some("opus"),
         Some("seven_day_fable") => Some("fable"),
         _ => None,
     }
@@ -1563,13 +1563,21 @@ mod tests {
 
     #[test]
     fn weekly_quota_uses_the_provider_bucket_not_the_running_model() {
-        assert_eq!(claude_weekly_quota_model(Some("seven_day")), Some("claude"));
+        assert_eq!(claude_weekly_quota_model(Some("seven_day")), None);
         assert_eq!(
             claude_weekly_quota_model(Some("seven_day_fable")),
             Some("fable")
         );
         assert_eq!(claude_weekly_quota_model(Some("five_hour")), None);
-        assert_eq!(claude_weekly_quota_model(Some("seven_day_opus")), None);
+        assert_eq!(
+            claude_weekly_quota_model(Some("seven_day_opus")),
+            Some("opus")
+        );
+        assert_eq!(claude_weekly_quota_model(Some("seven_day_sonnet")), None);
+        assert_eq!(
+            claude_weekly_quota_model(Some("seven_day_overage_included")),
+            None
+        );
     }
 
     #[test]

@@ -576,6 +576,7 @@ mod tests {
             event.rate_limit_info.rate_limit_type.as_deref(),
             Some("seven_day_fable")
         );
+        assert_eq!(event.rate_limit_info.resets_at, Some(1_783_173_000));
         assert_eq!(event.rate_limit_info.utilization, Some(0.496));
     }
 

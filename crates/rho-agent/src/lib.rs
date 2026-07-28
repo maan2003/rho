@@ -314,6 +314,13 @@ pub enum AgentStateKind {
     Idle,
 }
 
+impl AgentStateKind {
+    /// Whether the agent is actively executing a turn.
+    pub fn is_working(&self) -> bool {
+        matches!(self, Self::ApiStreaming { .. } | Self::ToolCalling { .. })
+    }
+}
+
 struct RestoreToolTurn {
     outstanding_calls: Vec<ToolCall>,
     completed_tool_calls: Vec<ToolResult>,

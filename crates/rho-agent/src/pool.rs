@@ -28,7 +28,7 @@ use crate::{Agent, AgentInputId, AgentState, InputSourceId, MessageDelivery, Sta
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
-const MAX_LIVE_CHILDREN: usize = 50;
+const MAX_WORKING_CHILDREN: usize = 20;
 const ID_LABEL_HEADROOM: u64 = 200;
 
 pub struct AgentPool {
@@ -407,10 +407,10 @@ impl AgentPool {
         workdirs: Vec<SpawnWorkdir>,
         config: AgentRole,
     ) -> anyhow::Result<AgentId> {
+        self.enforce_spawn_limits(parent).await?;
         let (workstream, parent_workdirs, parent_role) = {
             let read = self.db.read();
             let record = read.get_agent(parent);
-            self.enforce_spawn_limits(&read, parent)?;
             (record.workstream, record.workdirs, record.role)
         };
         let workdirs = if workdirs.is_empty() {
@@ -485,28 +485,37 @@ impl AgentPool {
         Ok(child_id)
     }
 
-    fn enforce_spawn_limits(&self, read: &rho_db::ReadTxn, parent: AgentId) -> anyhow::Result<()> {
-        let mut depth = 0;
-        let mut cursor = Some(parent);
-        while let Some(id) = cursor {
-            depth += 1;
-            if depth > MAX_SPAWN_DEPTH {
-                anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
+    async fn enforce_spawn_limits(&self, parent: AgentId) -> anyhow::Result<()> {
+        let child_ids = {
+            let read = self.db.read();
+            let mut depth = 0;
+            let mut cursor = Some(parent);
+            while let Some(id) = cursor {
+                depth += 1;
+                if depth > MAX_SPAWN_DEPTH {
+                    anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
+                }
+                cursor = read.get_agent(id).parent_agent;
             }
-            cursor = read.get_agent(id).parent_agent;
-        }
-        let live_children = read
-            .list_agents()
+            read.list_agents()
+                .into_iter()
+                .filter(|(_, record)| {
+                    record.parent_agent == Some(parent)
+                        && record.disposition != AgentDisposition::Hidden
+                })
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        let agents = self.agents.lock().await;
+        let working_children = child_ids
             .into_iter()
-            .filter(|(_, record)| {
-                record.parent_agent == Some(parent)
-                    && record.disposition != AgentDisposition::Hidden
-            })
+            .filter_map(|id| agents.get(&id))
+            .filter(|agent| agent.state().kind.is_working())
             .count();
-        if live_children >= MAX_LIVE_CHILDREN {
+        if working_children >= MAX_WORKING_CHILDREN {
             anyhow::bail!(
-                "live sub-agent limit ({MAX_LIVE_CHILDREN}) reached; hide or finish existing \
-                 sub-agents first"
+                "working sub-agent limit ({MAX_WORKING_CHILDREN}) reached; wait for an existing \
+                 sub-agent to finish"
             );
         }
         Ok(())
