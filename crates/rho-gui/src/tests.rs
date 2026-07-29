@@ -1964,7 +1964,7 @@ fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn total_usage_and_cost_show_in_status_chips(cx: &mut TestAppContext) {
+fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -2011,8 +2011,8 @@ fn total_usage_and_cost_show_in_status_chips(cx: &mut TestAppContext) {
         })
         .expect("read spans");
     assert!(
-        spans.contains("4.0M tok · $73.50"),
-        "total usage chip missing from status spans: {spans:?}"
+        spans.contains("$73.50") && !spans.contains("tok"),
+        "cost-only chip missing from status spans: {spans:?}"
     );
 }
 

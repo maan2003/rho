@@ -2701,14 +2701,8 @@ impl Workspace {
         let workspace_label = self.registry.workspace_id_label(*agent_id);
         let usage_label = self.store.get(agent_id).map(|state| {
             let usage = &state.usage.total;
-            let tokens = usage
-                .input_tokens
-                .saturating_add(usage.cache_read_tokens)
-                .saturating_add(usage.cache_write_tokens)
-                .saturating_add(usage.output_tokens);
             format!(
-                "{} tok · ${:.2}",
-                crate::agent_view::format_token_count(tokens),
+                "${:.2}",
                 crate::transient::bucket_cost_usd(usage, &state.usage.provider)
             )
         });
