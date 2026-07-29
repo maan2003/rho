@@ -407,7 +407,7 @@ impl Render for HelloWeb {
 
 fn main() {
     gpui_platform::web_init();
-    gpui_platform::application().run(|cx: &mut App| {
+    let app = gpui_platform::application().run_embedded(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(640.), px(560.)), cx);
         cx.open_window(
             WindowOptions {
@@ -419,4 +419,5 @@ fn main() {
         .expect("failed to open window");
         cx.activate(true);
     });
+    std::mem::forget(app);
 }
