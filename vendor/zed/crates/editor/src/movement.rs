@@ -8,8 +8,11 @@ use crate::{
 };
 use gpui::{Pixels, WindowTextSystem};
 use language::{CharClassifier, Point};
+#[cfg(not(feature = "native"))]
+use language::Direction;
 use multi_buffer::{MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot};
 use serde::Deserialize;
+#[cfg(feature = "native")]
 use workspace::searchable::Direction;
 
 use std::{ops::Range, sync::Arc};

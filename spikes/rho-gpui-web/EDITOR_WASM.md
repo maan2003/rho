@@ -292,7 +292,13 @@ the implementation crate.
   `new_internal` implementation by conditionally omitting the project handle;
   the real `MultiBuffer`, `DisplayMap`, selection collection, blink manager,
   focus subscriptions, and style machinery are still initialized.
-- The release wasm check is down to 83 errors. Remaining clusters are the
+- The release wasm check is down to 76 errors. The split companion conversion
+  callbacks are now native-only while the complete display-map stack remains
+  portable, and movement now uses the portable `language::Direction` directly.
+  Remaining diagnostic locations are concentrated in `Editor` (94),
+  `EditorElement` (21), fold persistence (12), selection (9), input (8),
+  element mouse handling (4), and two each in scroll, clipboard, and actions,
+  plus one config setting hook. Remaining clusters are the
   native contributions interleaved in `EditorElement`/mouse, persistence hooks
   in fold/selection/scroll, split companion conversion in `DisplayMap`, and a
   smaller set of settings/event methods in `Editor` and input. No portable

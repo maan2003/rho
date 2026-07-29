@@ -277,6 +277,7 @@ impl Companion {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn convert_rows_to_companion(
         &self,
         display_map_id: EntityId,
@@ -291,6 +292,7 @@ impl Companion {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn convert_point_from_companion(
         &self,
         display_map_id: EntityId,
@@ -316,6 +318,7 @@ impl Companion {
         excerpt.patch.edit_for_old_position(point).new
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn convert_point_to_companion(
         &self,
         display_map_id: EntityId,
