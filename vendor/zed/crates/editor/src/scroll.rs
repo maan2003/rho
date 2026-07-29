@@ -7,9 +7,9 @@ use crate::{
     Anchor, DisplayPoint, DisplayRow, Editor, EditorEvent, EditorMode, EditorSettings,
     MultiBufferSnapshot, RowExt, SelectionEffects, SizingBehavior, ToPoint,
     display_map::{DisplaySnapshot, ToDisplayPoint},
-    hover_popover::hide_hover,
-    persistence::EditorDb,
 };
+#[cfg(feature = "native")]
+use crate::{hover_popover::hide_hover, persistence::EditorDb};
 pub use autoscroll::{Autoscroll, AutoscrollStrategy};
 use core::fmt::Debug;
 use gpui::{
@@ -25,7 +25,10 @@ use std::{
 };
 use ui::scrollbars::ScrollbarAutoHide;
 use util::ResultExt;
+#[cfg(feature = "native")]
 use workspace::{ItemId, WorkspaceId};
+#[cfg(not(feature = "native"))]
+type WorkspaceId = ();
 
 pub const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
 const SCROLLBAR_SHOW_INTERVAL: Duration = Duration::from_secs(1);
@@ -526,6 +529,7 @@ impl ScrollManager {
         });
         cx.emit(EditorEvent::ScrollPositionChanged { local, autoscroll });
         self.show_scrollbars(window, cx);
+        #[cfg(feature = "native")]
         if let Some(workspace_id) = workspace_id {
             let item_id = cx.entity().entity_id().as_u64() as ItemId;
             let executor = cx.background_executor().clone();
@@ -879,8 +883,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> WasScrolled {
+        #[cfg(feature = "native")]
         hide_hover(self, cx);
+        #[cfg(feature = "native")]
         let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
+        #[cfg(not(feature = "native"))]
+        let workspace_id = None;
 
         self.edit_prediction_preview
             .set_previous_scroll_position(None);
@@ -915,6 +923,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "native")]
         hide_hover(self, cx);
         let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
@@ -940,6 +949,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "native")]
         hide_hover(self, cx);
         let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
         let buffer_snapshot = self.buffer().read(cx).snapshot(cx);
@@ -1102,6 +1112,7 @@ impl Editor {
         Ordering::Greater
     }
 
+    #[cfg(feature = "native")]
     pub fn read_scroll_position_from_db(
         &mut self,
         item_id: u64,

@@ -1634,6 +1634,8 @@ impl Editor {
                 self.register_buffer(anchor.buffer_id, cx);
             }
 
+            #[cfg(feature = "native")]
+            {
             let mut context_menu = self.context_menu.borrow_mut();
             let completion_menu = match context_menu.as_ref() {
                 Some(CodeContextMenu::Completions(menu)) => Some(menu),
@@ -1691,6 +1693,13 @@ impl Editor {
             if self.git_blame_inline_enabled {
                 self.start_inline_blame_timer(window, cx);
             }
+            }
+
+            #[cfg(not(feature = "native"))]
+            {
+                self.refresh_selected_text_highlights(&display_map, false, window, cx);
+                self.refresh_matching_bracket_highlights(&display_map, cx);
+            }
         }
 
         self.blink_manager.update(cx, BlinkManager::pause_blinking);
@@ -1718,6 +1727,7 @@ impl Editor {
                 data.selections = inmemory_selections;
             });
 
+            #[cfg(feature = "native")]
             if WorkspaceSettings::get(None, cx).restore_on_startup
                 != RestoreOnStartupBehavior::EmptyTab
                 && let Some(workspace_id) = self.workspace_serialization_id(cx)

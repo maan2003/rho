@@ -155,7 +155,7 @@ impl Editor {
             return;
         }
 
-        if self.buffer_kind(cx) == ItemBufferKind::Singleton {
+        if self.buffer().read(cx).is_singleton() {
             let selection = self.selections.newest::<Point>(&display_map);
 
             let range = if selection.is_empty() {
@@ -232,7 +232,7 @@ impl Editor {
             return;
         }
 
-        if self.buffer_kind(cx) == ItemBufferKind::Singleton {
+        if self.buffer().read(cx).is_singleton() {
             let mut to_fold = Vec::new();
             let selections = self.selections.all_adjusted(&display_map);
 
@@ -514,7 +514,7 @@ impl Editor {
             return;
         }
 
-        if self.buffer_kind(cx) == ItemBufferKind::Singleton {
+        if self.buffer().read(cx).is_singleton() {
             let buffer = display_map.buffer_snapshot();
             let selections = self.selections.all::<Point>(&display_map);
             let ranges = selections
@@ -886,9 +886,12 @@ impl Editor {
     pub(super) fn folds_did_change(&mut self, cx: &mut Context<Self>) {
         use text::ToOffset as _;
 
-        if self.mode.is_minimap()
-            || WorkspaceSettings::get(None, cx).restore_on_startup
-                == RestoreOnStartupBehavior::EmptyTab
+        if self.mode.is_minimap() {
+            return;
+        }
+        #[cfg(feature = "native")]
+        if WorkspaceSettings::get(None, cx).restore_on_startup
+            == RestoreOnStartupBehavior::EmptyTab
         {
             return;
         }
@@ -911,6 +914,8 @@ impl Editor {
             data.folds = inmemory_folds;
         });
 
+        #[cfg(feature = "native")]
+        {
         let Some(workspace_id) = self.workspace_serialization_id(cx) else {
             return;
         };
@@ -976,6 +981,7 @@ impl Editor {
                     .log_err();
             }
         });
+        }
     }
 
     pub(super) fn refresh_single_line_folds(
@@ -1056,6 +1062,7 @@ impl Editor {
 
     /// Load folds from the file_folds database table by file path.
     /// Used when manually opening a file that was previously closed.
+    #[cfg(feature = "native")]
     pub(super) fn load_folds_from_db(
         &mut self,
         workspace_id: WorkspaceId,

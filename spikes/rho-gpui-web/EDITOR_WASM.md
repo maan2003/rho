@@ -304,6 +304,21 @@ the implementation crate.
   smaller set of settings/event methods in `Editor` and input. No portable
   editing or painting module has been gated wholesale.
 
+### Stage 4 — portable runtime state versus native persistence (in progress)
+
+- Kept folding, selection updates, and scrolling portable while gating their
+  workspace-database persistence calls. In-memory fold restoration data is
+  still updated on wasm; only file/workspace serialization and database reload
+  entry points are native.
+- Replaced three workspace `ItemBufferKind` checks in folding commands with
+  the equivalent portable `MultiBuffer::is_singleton` query. Fold toggling and
+  range transforms remain available in the browser editor.
+- Kept selected-text/bracket highlights on selection changes while gating the
+  native completion, LSP, Git, navigation-history, and hover side effects.
+- The release wasm check is down from 76 to 53 errors. Remaining diagnostics
+  are concentrated in `EditorElement` and mouse native render contributions,
+  followed by narrow native settings/delegate methods in `Editor` and input.
+
 ### Reproduction
 
 ```sh
