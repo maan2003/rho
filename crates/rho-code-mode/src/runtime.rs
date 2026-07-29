@@ -315,6 +315,8 @@ async fn run(
                         "awaitPromise": true,
                     })),
                 );
+                // Drain the REPL promise callback before V8 can collect it.
+                runtime.v8_isolate().perform_microtask_checkpoint();
                 let _ = runtime.execute_script("rho:end-cell", "__rhoBeginCell(0);");
             }
         }
@@ -336,6 +338,9 @@ fn evaluation_outcome(cell: &CellShared, response: &JsonValue) -> CellStatus {
             .get("message")
             .and_then(JsonValue::as_str)
             .unwrap_or("script evaluation failed");
+        if exited {
+            return CellStatus::Completed { error: None };
+        }
         if terminated {
             return CellStatus::Terminated;
         }
