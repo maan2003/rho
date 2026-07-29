@@ -250,6 +250,48 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn advertises_all_upstream_refs() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let refs = Bytes::from_static(
+            b"master refs/heads/master\nrho refs/heads/rho/change\ntag refs/tags/v1\n",
+        );
+        let upstream = Router::new().route(
+            "/acme/library.git/info/refs",
+            get({
+                let refs = refs.clone();
+                move || {
+                    let refs = refs.clone();
+                    async move { (StatusCode::OK, refs) }
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task =
+            tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+
+        let octo = crate::router(
+            Arc::new(|| Ok("test-token".to_owned())),
+            reqwest::Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+        );
+        let octo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let octo_addr = octo_listener.local_addr().unwrap();
+        let octo_task =
+            tokio::spawn(async move { axum::serve(octo_listener, octo).await.unwrap() });
+
+        let response = reqwest::get(format!(
+            "http://{octo_addr}/git/acme/library.git/info/refs?service=git-upload-pack"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), refs);
+
+        octo_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn forwards_git_protocol_and_content_encoding() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();

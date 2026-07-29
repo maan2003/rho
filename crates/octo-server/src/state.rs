@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -151,22 +151,39 @@ impl AppState {
         }
     }
 
-    pub async fn proxy_github_get(
-        &self,
-        segments: &[&str],
-        query: Option<&str>,
-    ) -> Result<Response, AppError> {
+    pub async fn proxy_github_redirect_get(&self, segments: &[&str]) -> Result<Response, AppError> {
         let token = self.get_token().await?;
-        let url = self.build_url(segments, query);
-
-        let resp = self
+        let url = self.build_url(segments, None);
+        let response = self
             .client
             .get(url)
             .headers(Self::github_headers(&token))
             .send()
             .await?;
+        if !response.status().is_redirection() {
+            return Self::reqwest_to_response(response).await;
+        }
 
-        Self::reqwest_to_response(resp).await
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| anyhow::anyhow!("GitHub redirect omitted Location"))?
+            .to_str()
+            .context("GitHub redirect Location is not valid UTF-8")?;
+        let redirect_url = response.url().join(location)?;
+        if redirect_url.scheme() != self.github_api_url.scheme() {
+            return Err(anyhow::anyhow!("GitHub redirect changed URL scheme").into());
+        }
+
+        // The signed archive URL carries its own short-lived authorization.
+        // Do not forward the GitHub token to its (normally different) host.
+        let response = self
+            .client
+            .get(redirect_url)
+            .header("User-Agent", "octo")
+            .send()
+            .await?;
+        Self::reqwest_to_response(response).await
     }
 
     pub async fn proxy_github_post(&self, segments: &[&str]) -> Result<Response, AppError> {
@@ -302,6 +319,10 @@ impl AppState {
 mod tests {
     use std::sync::Arc;
 
+    use axum::Router;
+    use axum::body::to_bytes;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::get;
     use reqwest::Url;
 
     use super::AppState;
@@ -346,6 +367,60 @@ mod tests {
                 .as_str(),
             "https://github.com/fedimint/fedimint.git/info/refs"
         );
+    }
+
+    #[tokio::test]
+    async fn follows_signed_download_without_forwarding_token() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let archive = Router::new().route(
+            "/archive.zip",
+            get(|headers: HeaderMap| async move {
+                assert!(headers.get("authorization").is_none());
+                (StatusCode::OK, b"logs".as_slice())
+            }),
+        );
+        let archive_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let archive_url = format!(
+            "http://{}/archive.zip",
+            archive_listener.local_addr().unwrap()
+        );
+        let archive_task =
+            tokio::spawn(async move { axum::serve(archive_listener, archive).await.unwrap() });
+
+        let api = Router::new().fallback(get(move |headers: HeaderMap| {
+            let archive_url = archive_url.clone();
+            async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer token");
+                (
+                    StatusCode::FOUND,
+                    [(reqwest::header::LOCATION, archive_url)],
+                )
+            }
+        }));
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url =
+            Url::parse(&format!("http://{}", api_listener.local_addr().unwrap())).unwrap();
+        let api_task = tokio::spawn(async move { axum::serve(api_listener, api).await.unwrap() });
+
+        let state = AppState {
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            token_provider: Arc::new(|| Ok("token".to_owned())),
+            github_api_url: api_url,
+        };
+        let response = state
+            .proxy_github_redirect_get(&[
+                "repos", "acme", "project", "actions", "runs", "1", "logs",
+            ])
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_bytes(response.into_body(), 16).await.unwrap(), "logs");
+
+        api_task.abort();
+        archive_task.abort();
     }
 
     #[test]

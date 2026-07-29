@@ -160,18 +160,15 @@ async fn get_ci_logs(
     Path((owner, repo, run_id)): Path<(PathSegment, PathSegment, u64)>,
 ) -> Result<Response, AppError> {
     state
-        .proxy_github_get(
-            &[
-                "repos",
-                owner.as_str(),
-                repo.as_str(),
-                "actions",
-                "runs",
-                &run_id.to_string(),
-                "logs",
-            ],
-            None,
-        )
+        .proxy_github_redirect_get(&[
+            "repos",
+            owner.as_str(),
+            repo.as_str(),
+            "actions",
+            "runs",
+            &run_id.to_string(),
+            "logs",
+        ])
         .await
 }
 
