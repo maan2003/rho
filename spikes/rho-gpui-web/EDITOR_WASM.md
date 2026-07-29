@@ -386,6 +386,12 @@ the implementation crate.
 - Clipboard string data and selection metadata, including real cut/copy/paste
   buffer edits, remain portable. Completion/edit-prediction triggers and the
   project-worktree Markdown image-paste path are native-only, leaving 124.
+- Input insertion, deletion, newline indentation, autoclose handling, hard wrapping,
+  direct snippet bodies, and IME edits remain portable. Linked-edit accumulation
+  is a native producer/consumer island with a wasm no-op accumulator; completion,
+  signature-help, on-type formatting, edit-prediction, and named project snippets
+  are native hooks. Resolving the full input frontier leaves 108 errors, beginning
+  with selection side effects and then the remaining interleaved `Editor` hooks.
 
 ### Reproduction
 

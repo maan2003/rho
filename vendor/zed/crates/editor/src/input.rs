@@ -5,8 +5,10 @@ struct LinkedEdits;
 
 #[cfg(not(feature = "native"))]
 impl LinkedEdits {
-    fn new() -> Self { Self }
-    fn push(&mut self, _: &Editor, _: Range<Anchor>, _: Arc<str>, _: &App) {}
+    fn new() -> Self {
+        Self
+    }
+    fn push(&mut self, _: &Editor, _: Range<text::Anchor>, _: Arc<str>, _: &App) {}
     fn apply(self, _: &mut Context<Editor>) {}
 }
 
@@ -383,6 +385,7 @@ impl Editor {
                 snapshot.anchor_after(selection.end)
             };
 
+            #[cfg(feature = "native")]
             if !self.linked_edit_ranges.is_empty() {
                 let start_anchor = snapshot.anchor_before(selection.start);
                 let classifier = snapshot
@@ -423,6 +426,7 @@ impl Editor {
         drop(snapshot);
 
         self.transact(window, cx, |this, window, cx| {
+            #[cfg(feature = "native")]
             if clear_linked_edit_ranges {
                 this.linked_edit_ranges.clear();
             }
@@ -486,6 +490,7 @@ impl Editor {
                 );
             }
 
+            #[cfg(feature = "native")]
             let had_active_edit_prediction = this.has_active_edit_prediction();
             this.change_selections(
                 SelectionEffects::scroll(Autoscroll::fit()).completions(false),
@@ -494,6 +499,7 @@ impl Editor {
                 |s| s.select(new_selections),
             );
 
+            #[cfg(feature = "native")]
             if !bracket_inserted
                 && let Some(on_type_format_task) =
                     this.trigger_on_type_formatting(text.to_string(), window, cx)
@@ -501,7 +507,9 @@ impl Editor {
                 on_type_format_task.detach_and_log_err(cx);
             }
 
+            #[cfg(feature = "native")]
             let editor_settings = EditorSettings::get_global(cx);
+            #[cfg(feature = "native")]
             if bracket_inserted
                 && (editor_settings.auto_signature_help
                     || editor_settings.show_signature_help_after_edits)
@@ -509,6 +517,7 @@ impl Editor {
                 this.show_signature_help(&ShowSignatureHelp, window, cx);
             }
 
+            #[cfg(feature = "native")]
             let trigger_in_words =
                 this.show_edit_predictions_in_menu() || !had_active_edit_prediction;
             if this.hard_wrap.is_some() {
@@ -531,6 +540,7 @@ impl Editor {
                     )
                 }
             }
+            #[cfg(feature = "native")]
             this.trigger_completion_on_input(&text, trigger_in_words, window, cx);
             #[cfg(feature = "native")]
             refresh_linked_ranges(this, window, cx);
@@ -792,6 +802,7 @@ impl Editor {
                 window,
                 cx,
             );
+            #[cfg(feature = "native")]
             if let Some(task) = this.trigger_on_type_formatting("\n".to_owned(), window, cx) {
                 task.detach_and_log_err(cx);
             }
@@ -861,6 +872,7 @@ impl Editor {
                 }
             }
             editor.edit(indent_edits, cx);
+            #[cfg(feature = "native")]
             if let Some(format) = editor.trigger_on_type_formatting("\n".to_owned(), window, cx) {
                 format.detach_and_log_err(cx);
             }
@@ -945,6 +957,7 @@ impl Editor {
                 }
             }
             editor.edit(indent_edits, cx);
+            #[cfg(feature = "native")]
             if let Some(format) = editor.trigger_on_type_formatting("\n".to_owned(), window, cx) {
                 format.detach_and_log_err(cx);
             }
@@ -963,6 +976,7 @@ impl Editor {
     pub fn linked_edits_for_selections(&self, text: Arc<str>, cx: &App) -> LinkedEdits {
         let multibuffer_snapshot = self.buffer().read(cx).snapshot(cx);
         let mut linked_edits = LinkedEdits::new();
+        #[cfg(feature = "native")]
         if !self.linked_edit_ranges.is_empty() {
             for selection in self.selections.disjoint_anchors() {
                 let Some((_, range)) =
@@ -1902,6 +1916,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(super) fn linked_editing_ranges_for(
         &self,
         query_range: Range<text::Anchor>,
@@ -2264,14 +2279,19 @@ impl Editor {
                 bail!("`snippet` is mutually exclusive with `language` and `name`")
             }
         } else if let Some(name) = &action.name {
-            let project = self.project().context("no project")?;
-            let snippet_store = project.read(cx).snippets().read(cx);
-            let snippet = snippet_store
-                .snippets_for(action.language.clone(), cx)
-                .into_iter()
-                .find(|snippet| snippet.name == *name)
-                .context("snippet not found")?;
-            Snippet::parse(&snippet.body)?
+            #[cfg(not(feature = "native"))]
+            bail!("named snippets require the native project integration");
+            #[cfg(feature = "native")]
+            {
+                let project = self.project().context("no project")?;
+                let snippet_store = project.read(cx).snippets().read(cx);
+                let snippet = snippet_store
+                    .snippets_for(action.language.clone(), cx)
+                    .into_iter()
+                    .find(|snippet| snippet.name == *name)
+                    .context("snippet not found")?;
+                Snippet::parse(&snippet.body)?
+            }
         } else {
             // todo(andrew): open modal to select snippet
             bail!("`name` or `snippet` is required")
