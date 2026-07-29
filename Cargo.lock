@@ -13889,7 +13889,7 @@ dependencies = [
  "futures 0.3.33",
  "rho-core",
  "rho-shell-proto",
- "rho-workspaces",
+ "rho-workspaces-types",
  "senax-encoder",
  "tokio",
 ]
@@ -13945,6 +13945,7 @@ dependencies = [
  "libc",
  "prefix-id",
  "rho-context-config",
+ "rho-workspaces-types",
  "rustix 1.1.4",
  "senax-encoder",
  "serde",
@@ -13952,6 +13953,16 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "rho-workspaces-types"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "camino",
+ "prefix-id",
+ "senax-encoder",
 ]
 
 [[package]]

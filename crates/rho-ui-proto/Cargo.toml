@@ -12,10 +12,16 @@ anyhow.workspace = true
 async-stream.workspace = true
 bytes.workspace = true
 camino.workspace = true
-dirs.workspace = true
 futures.workspace = true
 rho-core.workspace = true
 rho-shell-proto.workspace = true
-rho-workspaces.workspace = true
+rho-workspaces-types.workspace = true
 senax-encoder.workspace = true
+tokio = { version = "1", features = ["io-util"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+dirs.workspace = true
+tokio = { version = "1", features = ["net"] }
+
+[dev-dependencies]
 tokio.workspace = true

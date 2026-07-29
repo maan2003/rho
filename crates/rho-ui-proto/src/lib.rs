@@ -14,15 +14,17 @@ pub use rho_core::{
     AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
     MessageDelivery, WorkstreamId,
 };
-pub use rho_workspaces::{
+pub use rho_workspaces_types::{
     WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
     WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
 };
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
+#[cfg(not(target_family = "wasm"))]
 pub mod client;
 pub mod realtime;
 pub mod remote;
+#[cfg(not(target_family = "wasm"))]
 pub mod server;
 pub mod shell;
 pub mod term;
@@ -35,9 +37,11 @@ pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
 pub const IROH_ALPN: &[u8] = b"rho/ui/2";
 const FRAME_LEN_BYTES: u64 = size_of::<u32>() as u64;
+#[cfg(not(target_family = "wasm"))]
 const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP2";
 
 /// Fixed per-user daemon socket used by normal CLI and Git helper clients.
+#[cfg(not(target_family = "wasm"))]
 pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
     let base = dirs::runtime_dir()
         .or_else(dirs::state_dir)
@@ -1034,6 +1038,7 @@ pub enum ProtocolLogDirection {
     ServerToClient,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl ProtocolLogDirection {
     fn byte(self) -> u8 {
         match self {
@@ -1073,6 +1078,7 @@ where
     Ok(frame)
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub fn append_protocol_log_record(
     writer: &mut impl std::io::Write,
     unix_ms: u128,
@@ -1094,6 +1100,7 @@ pub fn append_protocol_log_record(
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub fn print_protocol_log(
     path: impl AsRef<std::path::Path>,
     output: &mut impl std::io::Write,
@@ -1136,6 +1143,7 @@ pub fn print_protocol_log(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn read_protocol_log_record(
     input: &mut impl std::io::Read,
 ) -> anyhow::Result<Option<(u64, ProtocolLogDirection, Vec<u8>)>> {

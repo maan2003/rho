@@ -17,6 +17,7 @@ jj-cli.workspace = true
 libc.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
 rho-context-config.workspace = true
+rho-workspaces-types.workspace = true
 rustix = { version = "1", features = ["fs", "mount", "process", "thread"] }
 senax-encoder.workspace = true
 serde.workspace = true

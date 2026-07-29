@@ -32,6 +32,7 @@ members = [
   "crates/rho-webui-messages",
   "crates/rho-web-search",
   "crates/rho-workspaces",
+  "crates/rho-workspaces-types",
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
 ]
@@ -118,6 +119,7 @@ rho-visualizations = { path = "crates/rho-visualizations" }
 rho-webui-messages = { path = "crates/rho-webui-messages" }
 rho-web-search = { path = "crates/rho-web-search" }
 rho-workspaces = { path = "crates/rho-workspaces" }
+rho-workspaces-types = { path = "crates/rho-workspaces-types" }
 rustix-openpty = "0.2"
 rustls = { version = "0.23", default-features = false, features = [
   "aws_lc_rs",

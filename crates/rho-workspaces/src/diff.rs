@@ -11,7 +11,10 @@ use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPath;
-use senax_encoder::{Decode, Encode, Pack, Unpack};
+use rho_workspaces_types::{
+    WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
+    WorkspaceDiffTarget,
+};
 
 /// Resource limits for one diff snapshot. The dedicated UI channel has a
 /// 64-MiB frame bound; leave headroom for paths and encoding overhead.
@@ -23,64 +26,6 @@ const MAX_IO_BYTES: usize = 48 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 40 * 1024 * 1024;
 const ENTRY_OVERHEAD_BUDGET: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct WorkspaceDiffSnapshot {
-    /// Exact jj operation from which the manifest was materialized.
-    pub operation_id: String,
-    /// Immutable working-copy commit the snapshot describes.
-    pub commit_id: String,
-    pub files: Vec<WorkspaceDiffFile>,
-    /// At least one changed path was omitted after [`MAX_FILES`].
-    pub truncated: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct WorkspaceDiffFile {
-    /// Repository-relative path. A rename is represented losslessly as one
-    /// deletion and one addition; copy presentation can be layered on later
-    /// without changing file contents or edit semantics.
-    pub path: Utf8PathBuf,
-    pub status: WorkspaceDiffStatus,
-    pub base: WorkspaceDiffContent,
-    /// Descriptor for the snapshotted current side. Text comes from the live
-    /// Zed Project buffer and is deliberately not duplicated on the wire.
-    pub target: WorkspaceDiffTarget,
-    pub base_executable: Option<bool>,
-    pub target_executable: Option<bool>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum WorkspaceDiffStatus {
-    Added,
-    Modified,
-    Deleted,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum WorkspaceDiffContent {
-    Absent,
-    Text(String),
-    Binary { bytes: u64 },
-    TooLarge { bytes_at_least: u64 },
-    BudgetExhausted,
-    Symlink(String),
-    GitSubmodule(String),
-    AccessDenied(String),
-    OtherConflict(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum WorkspaceDiffTarget {
-    Absent,
-    Text { bytes: u64 },
-    Binary { bytes: u64 },
-    TooLarge { bytes_at_least: u64 },
-    BudgetExhausted,
-    Symlink(String),
-    GitSubmodule(String),
-    Conflict(String),
-}
 
 pub struct CapturedDiff {
     repo: std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
@@ -218,16 +163,16 @@ pub async fn load(
     })
 }
 
-impl WorkspaceDiffTarget {
-    fn variable_len(&self) -> usize {
-        match self {
-            Self::Symlink(value) | Self::GitSubmodule(value) | Self::Conflict(value) => value.len(),
-            Self::Absent
-            | Self::Text { .. }
-            | Self::Binary { .. }
-            | Self::TooLarge { .. }
-            | Self::BudgetExhausted => 0,
-        }
+fn target_variable_len(target: &WorkspaceDiffTarget) -> usize {
+    match target {
+        WorkspaceDiffTarget::Symlink(value)
+        | WorkspaceDiffTarget::GitSubmodule(value)
+        | WorkspaceDiffTarget::Conflict(value) => value.len(),
+        WorkspaceDiffTarget::Absent
+        | WorkspaceDiffTarget::Text { .. }
+        | WorkspaceDiffTarget::Binary { .. }
+        | WorkspaceDiffTarget::TooLarge { .. }
+        | WorkspaceDiffTarget::BudgetExhausted => 0,
     }
 }
 
@@ -258,10 +203,10 @@ async fn materialize_file(
     });
     let target = describe_target(target_tree, repo_path, after, io_budget).await?;
     let available = *payload_budget - fixed_budget;
-    let mut content_budget = base.content.variable_len() + target.variable_len();
+    let mut content_budget = content_variable_len(&base.content) + target_variable_len(&target);
     if content_budget > available {
         base.omit_for_budget();
-        content_budget = base.content.variable_len() + target.variable_len();
+        content_budget = content_variable_len(&base.content) + target_variable_len(&target);
     }
     if content_budget > available {
         return Ok(None);
@@ -346,16 +291,17 @@ impl MaterializedContent {
     }
 }
 
-impl WorkspaceDiffContent {
-    fn variable_len(&self) -> usize {
-        match self {
-            Self::Text(value)
-            | Self::Symlink(value)
-            | Self::GitSubmodule(value)
-            | Self::AccessDenied(value)
-            | Self::OtherConflict(value) => value.len(),
-            Self::Absent | Self::Binary { .. } | Self::TooLarge { .. } | Self::BudgetExhausted => 0,
-        }
+fn content_variable_len(content: &WorkspaceDiffContent) -> usize {
+    match content {
+        WorkspaceDiffContent::Text(value)
+        | WorkspaceDiffContent::Symlink(value)
+        | WorkspaceDiffContent::GitSubmodule(value)
+        | WorkspaceDiffContent::AccessDenied(value)
+        | WorkspaceDiffContent::OtherConflict(value) => value.len(),
+        WorkspaceDiffContent::Absent
+        | WorkspaceDiffContent::Binary { .. }
+        | WorkspaceDiffContent::TooLarge { .. }
+        | WorkspaceDiffContent::BudgetExhausted => 0,
     }
 }
 

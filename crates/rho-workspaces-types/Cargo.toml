@@ -1,13 +1,13 @@
 [package]
+name = "rho-workspaces-types"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-name = "rho-shell-proto"
-readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
 
 [dependencies]
 bytes.workspace = true
+camino.workspace = true
+prefix-id.workspace = true
 senax-encoder.workspace = true
-tokio = { version = "1", features = ["io-util"] }

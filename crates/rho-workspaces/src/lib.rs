@@ -25,9 +25,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
-use prefix_id::{PrefixId, PrefixIdDomain};
 use rustix::fs::FlockOperation;
-use senax_encoder::{Decode, Encode, Pack, Unpack};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
@@ -36,13 +34,11 @@ mod diff;
 mod ns;
 mod sandbox;
 
-pub use diff::{
-    WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
-    WorkspaceDiffTarget,
-};
 pub use ns::init_daemon_namespace;
-
-pub type WorkspaceId = PrefixId<WorkspaceIdDomain>;
+pub use rho_workspaces_types::{
+    WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
+    WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
+};
 
 fn workspace_handle(id: WorkspaceId) -> String {
     format!("ws-{}", id.encoded())
@@ -188,72 +184,6 @@ impl PathOverrides {
             path.push(entry);
         }
         path
-    }
-}
-
-/// Prefix-id family for repository-local jj-managed workspace ids.
-///
-/// jj owns the actual per-repository seed and counter. Rho persists the
-/// resulting encoded id and does not allocate production ids itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WorkspaceIdDomain(pub u64);
-
-impl PrefixIdDomain for WorkspaceIdDomain {
-    const KIND: &'static str = "managed-workspace-id";
-
-    fn machine_seed(&self) -> u64 {
-        self.0
-    }
-}
-
-/// Where an agent works, stored inline on the agent record. Self-contained:
-/// there is no separate workspace table.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
-pub enum WorkspaceInfo {
-    /// The user's own checkout: the agent works directly at the repo path,
-    /// no separate checkout and no namespace.
-    UserCheckout { repo: Utf8PathBuf },
-    /// A stable jj-managed workspace. jj selects and persists its checkout
-    /// path; Rho stores only the repository-local id.
-    Workspace {
-        repo: Utf8PathBuf,
-        #[senax(rename = "name")]
-        id: WorkspaceId,
-    },
-    /// A jj-managed workspace whose original VCS metadata is masked from
-    /// child commands and replaced by a synthetic Git baseline.
-    Sandbox { repo: Utf8PathBuf, id: WorkspaceId },
-}
-
-impl WorkspaceInfo {
-    pub fn repo(&self) -> &Utf8Path {
-        match self {
-            Self::UserCheckout { repo }
-            | Self::Workspace { repo, .. }
-            | Self::Sandbox { repo, .. } => repo,
-        }
-    }
-
-    pub fn is_user_checkout(&self) -> bool {
-        matches!(self, Self::UserCheckout { .. })
-    }
-
-    pub fn workspace_id(&self) -> Option<WorkspaceId> {
-        match self {
-            Self::UserCheckout { .. } => None,
-            Self::Workspace { id, .. } | Self::Sandbox { id, .. } => Some(*id),
-        }
-    }
-
-    pub fn workspace_handle(&self) -> Option<String> {
-        match self {
-            Self::Workspace { id, .. } => Some(workspace_handle(*id)),
-            Self::UserCheckout { .. } | Self::Sandbox { .. } => None,
-        }
-    }
-
-    pub fn is_sandbox(&self) -> bool {
-        matches!(self, Self::Sandbox { .. })
     }
 }
 
