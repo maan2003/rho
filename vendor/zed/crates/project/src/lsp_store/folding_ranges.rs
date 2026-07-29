@@ -1,4 +1,3 @@
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,13 +5,13 @@ use anyhow::Context as _;
 use collections::{HashMap, HashSet};
 use futures::FutureExt as _;
 use futures::future::{Shared, join_all};
-use gpui::{AppContext as _, AsyncApp, Context, Entity, SharedString, Task};
+use gpui::{AppContext as _, AsyncApp, Context, Entity, Task};
 use itertools::Itertools;
 use language::Buffer;
+pub use language::LspFoldingRange;
 use lsp::LanguageServerId;
 use rpc::{TypedEnvelope, proto};
 use settings::Settings as _;
-use text::Anchor;
 use util::ResultExt as _;
 
 use crate::lsp_command::{GetFoldingRanges, LspCommand as _};
@@ -21,12 +20,6 @@ use crate::lsp_store::{
     upstream_lsp_query_server_filter,
 };
 use crate::project_settings::ProjectSettings;
-
-#[derive(Clone, Debug)]
-pub struct LspFoldingRange {
-    pub range: Range<Anchor>,
-    pub collapsed_text: Option<SharedString>,
-}
 
 pub(super) type FoldingRangeTask =
     Shared<Task<std::result::Result<Vec<LspFoldingRange>, Arc<anyhow::Error>>>>;

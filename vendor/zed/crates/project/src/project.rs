@@ -483,29 +483,7 @@ pub enum PrepareRenameResponse {
     InvalidPosition,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum InlayId {
-    EditPrediction(usize),
-    DebuggerValue(usize),
-    // LSP
-    Hint(usize),
-    Color(usize),
-    ReplResult(usize),
-    Custom(usize),
-}
-
-impl InlayId {
-    pub fn id(&self) -> usize {
-        match self {
-            Self::EditPrediction(id) => *id,
-            Self::DebuggerValue(id) => *id,
-            Self::Hint(id) => *id,
-            Self::Color(id) => *id,
-            Self::ReplResult(id) => *id,
-            Self::Custom(id) => *id,
-        }
-    }
-}
+pub use language::InlayId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlayHint {

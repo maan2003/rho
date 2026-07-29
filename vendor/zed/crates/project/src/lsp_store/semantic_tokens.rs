@@ -494,8 +494,7 @@ pub struct BufferSemanticTokens {
     pub tokens: Option<HashMap<LanguageServerId, Arc<[BufferSemanticToken]>>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TokenType(pub u32);
+pub use language::TokenType;
 
 #[derive(Debug, Clone)]
 pub struct BufferSemanticToken {

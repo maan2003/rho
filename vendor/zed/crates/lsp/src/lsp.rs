@@ -148,20 +148,7 @@ pub enum LanguageServerSelector {
     Name(LanguageServerName),
 }
 
-/// Identifies a running language server.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct LanguageServerId(pub usize);
-
-impl LanguageServerId {
-    pub fn from_proto(id: u64) -> Self {
-        Self(id as usize)
-    }
-
-    pub fn to_proto(self) -> u64 {
-        self.0 as u64
-    }
-}
+pub use language_core::LanguageServerId;
 
 /// A name of a language server.
 #[derive(
@@ -1749,12 +1736,6 @@ impl Subscription {
             } => *notification_handlers = None,
             Subscription::Io { io_handlers, .. } => *io_handlers = None,
         }
-    }
-}
-
-impl fmt::Display for LanguageServerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
     }
 }
 

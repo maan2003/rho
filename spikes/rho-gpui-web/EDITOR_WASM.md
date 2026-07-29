@@ -233,6 +233,25 @@ the implementation crate.
   separating native `Editor`/element impl blocks. No browser demo is possible
   until that source split is complete.
 
+### Stage 1 — portable display-map model types
+
+- Moved `InlayId`, `LspFoldingRange`, and `TokenType` into `language`, where
+  both native project integrations and the browser display map can use the
+  same value types. `project::InlayId`,
+  `project::lsp_store::LspFoldingRange`, and
+  `project::lsp_store::TokenType` remain re-exports for native compatibility.
+- Moved `LanguageServerId` into `language_core`; both the native `lsp` crate
+  and the browser data-model-only `lsp-stub` re-export that single identity.
+  This prevents semantic highlight metadata from depending on a language
+  server process crate.
+- Moved the editor's diagnostic display cutoff into `language` as
+  `DiagnosticSeverityFilter`. The old
+  `project::project_settings::DiagnosticSeverity` path remains an alias. The
+  distinct name at the lower layer avoids colliding with the protocol's
+  `language::DiagnosticSeverity` re-export.
+- `DisplayMap` and its fold/inlay layers now consume these portable paths
+  directly. Native editor behavior and public paths are unchanged.
+
 ### Reproduction
 
 ```sh

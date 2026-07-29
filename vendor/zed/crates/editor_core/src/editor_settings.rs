@@ -2,7 +2,7 @@ use core::num;
 
 use gpui::App;
 use language::CursorShape;
-use project::project_settings::DiagnosticSeverity;
+use language::DiagnosticSeverityFilter as DiagnosticSeverity;
 pub use settings::{
     CodeLens, CompletionDetailAlignment, CompletionMenuItemKind, CurrentLineHighlight, DelayMs,
     DiffViewStyle, DisplayIn, DocumentColorsRenderMode, DoubleClickInMultibuffer,

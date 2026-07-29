@@ -9,17 +9,7 @@ use gpui::SharedString;
 use serde::Serialize;
 use std::{collections::HashMap, ffi::OsString, path::PathBuf};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct LanguageServerId(pub usize);
-
-impl LanguageServerId {
-    pub fn from_proto(id: u64) -> Self {
-        Self(id as usize)
-    }
-    pub fn to_proto(self) -> u64 {
-        self.0 as u64
-    }
-}
+pub use language_core::LanguageServerId;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LanguageServerName(pub SharedString);

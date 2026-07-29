@@ -40,7 +40,7 @@ use collections::{HashMap, HashSet};
 use futures::Future;
 use futures::future::LocalBoxFuture;
 use futures::lock::OwnedMutexGuard;
-use gpui::{App, AsyncApp, Entity};
+use gpui::{App, AsyncApp, Entity, SharedString};
 use http_client::HttpClient;
 
 pub use language_core::{
@@ -118,6 +118,73 @@ pub use syntax_map::{
 };
 pub use text::{AnchorRangeExt, LineEnding};
 pub use tree_sitter::{Node, Parser, QueryCapture, Tree, TreeCursor};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InlayId {
+    EditPrediction(usize),
+    DebuggerValue(usize),
+    Hint(usize),
+    Color(usize),
+    ReplResult(usize),
+    Custom(usize),
+}
+
+impl InlayId {
+    pub fn id(&self) -> usize {
+        match self {
+            Self::EditPrediction(id)
+            | Self::DebuggerValue(id)
+            | Self::Hint(id)
+            | Self::Color(id)
+            | Self::ReplResult(id)
+            | Self::Custom(id) => *id,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LspFoldingRange {
+    pub range: Range<Anchor>,
+    pub collapsed_text: Option<SharedString>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TokenType(pub u32);
+
+/// Maximum diagnostic severity rendered by an editor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum DiagnosticSeverityFilter {
+    Off,
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+impl DiagnosticSeverityFilter {
+    pub fn into_lsp(self) -> Option<lsp::DiagnosticSeverity> {
+        match self {
+            Self::Off => None,
+            Self::Error => Some(lsp::DiagnosticSeverity::ERROR),
+            Self::Warning => Some(lsp::DiagnosticSeverity::WARNING),
+            Self::Info => Some(lsp::DiagnosticSeverity::INFORMATION),
+            Self::Hint => Some(lsp::DiagnosticSeverity::HINT),
+        }
+    }
+}
+
+impl From<settings::DiagnosticSeverityContent> for DiagnosticSeverityFilter {
+    fn from(severity: settings::DiagnosticSeverityContent) -> Self {
+        match severity {
+            settings::DiagnosticSeverityContent::Off => Self::Off,
+            settings::DiagnosticSeverityContent::Error => Self::Error,
+            settings::DiagnosticSeverityContent::Warning => Self::Warning,
+            settings::DiagnosticSeverityContent::Info => Self::Info,
+            settings::DiagnosticSeverityContent::Hint
+            | settings::DiagnosticSeverityContent::All => Self::Hint,
+        }
+    }
+}
 
 pub(crate) fn to_settings_soft_wrap(value: language_core::SoftWrap) -> settings::SoftWrap {
     match value {

@@ -6,12 +6,12 @@ use super::{
 };
 use collections::HashMap;
 use gpui::{AnyElement, App, ElementId, HighlightStyle, Pixels, SharedString, Stateful, Window};
+use language::InlayId;
 use language::{Edit, HighlightId, LanguageAwareStyling, Point};
 use multi_buffer::{
     Anchor, AnchorRangeExt, MBTextSummary, MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot,
     RowInfo, ToOffset,
 };
-use project::InlayId;
 use std::{
     any::TypeId,
     cmp::{self, Ordering},

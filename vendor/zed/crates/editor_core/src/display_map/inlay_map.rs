@@ -10,12 +10,12 @@ use crate::{
     inlays::{Inlay, InlayContent},
 };
 use collections::BTreeSet;
+use language::InlayId;
 use language::{Chunk, Edit, LanguageAwareStyling, Point, TextSummary};
 use multi_buffer::{
     MBTextSummary, MultiBufferOffset, MultiBufferRow, MultiBufferRows, MultiBufferSnapshot,
     RowInfo, ToOffset,
 };
-use project::InlayId;
 use smallvec::SmallVec;
 use std::{
     cmp, iter,

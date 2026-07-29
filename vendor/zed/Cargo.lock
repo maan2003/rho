@@ -10553,6 +10553,7 @@ dependencies = [
  "futures-lite 1.13.0",
  "gpui",
  "gpui_util",
+ "language_core",
  "log",
  "lsp-types",
  "parking_lot",
@@ -10571,6 +10572,7 @@ name = "lsp-stub"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "language_core",
  "lsp-types",
  "serde",
 ]

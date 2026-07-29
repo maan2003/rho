@@ -104,12 +104,13 @@ use language::{
     language_settings::{AllLanguageSettings, LanguageSettings},
 };
 
+use language::{
+    DiagnosticSeverityFilter as DiagnosticSeverity, InlayId, LspFoldingRange, TokenType,
+};
 use multi_buffer::{
     Anchor, AnchorRangeExt, MultiBuffer, MultiBufferOffset, MultiBufferOffsetUtf16,
     MultiBufferPoint, MultiBufferRow, MultiBufferSnapshot, RowInfo, ToOffset, ToPoint,
 };
-use project::project_settings::DiagnosticSeverity;
-use project::{InlayId, lsp_store::LspFoldingRange, lsp_store::TokenType};
 use serde::Deserialize;
 use settings::Settings;
 use smallvec::SmallVec;
@@ -364,7 +365,7 @@ pub struct SemanticTokenHighlight {
     pub style: HighlightStyleId,
     pub token_type: TokenType,
     pub token_modifiers: u32,
-    pub server_id: lsp::LanguageServerId,
+    pub server_id: language::LanguageServerId,
 }
 
 impl DisplayMap {

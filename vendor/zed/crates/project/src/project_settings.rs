@@ -347,40 +347,7 @@ impl ContextServerSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum DiagnosticSeverity {
-    // No diagnostics are shown.
-    Off,
-    Error,
-    Warning,
-    Info,
-    Hint,
-}
-
-impl DiagnosticSeverity {
-    pub fn into_lsp(self) -> Option<lsp::DiagnosticSeverity> {
-        match self {
-            DiagnosticSeverity::Off => None,
-            DiagnosticSeverity::Error => Some(lsp::DiagnosticSeverity::ERROR),
-            DiagnosticSeverity::Warning => Some(lsp::DiagnosticSeverity::WARNING),
-            DiagnosticSeverity::Info => Some(lsp::DiagnosticSeverity::INFORMATION),
-            DiagnosticSeverity::Hint => Some(lsp::DiagnosticSeverity::HINT),
-        }
-    }
-}
-
-impl From<settings::DiagnosticSeverityContent> for DiagnosticSeverity {
-    fn from(severity: settings::DiagnosticSeverityContent) -> Self {
-        match severity {
-            settings::DiagnosticSeverityContent::Off => DiagnosticSeverity::Off,
-            settings::DiagnosticSeverityContent::Error => DiagnosticSeverity::Error,
-            settings::DiagnosticSeverityContent::Warning => DiagnosticSeverity::Warning,
-            settings::DiagnosticSeverityContent::Info => DiagnosticSeverity::Info,
-            settings::DiagnosticSeverityContent::Hint => DiagnosticSeverity::Hint,
-            settings::DiagnosticSeverityContent::All => DiagnosticSeverity::Hint,
-        }
-    }
-}
+pub use language::DiagnosticSeverityFilter as DiagnosticSeverity;
 
 /// Determines the severity of the diagnostic that should be moved to.
 #[derive(PartialEq, PartialOrd, Clone, Copy, Debug, Eq, Deserialize, JsonSchema)]

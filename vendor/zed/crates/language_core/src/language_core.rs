@@ -1,6 +1,31 @@
 // language_core: tree-sitter grammar infrastructure, LSP adapter traits,
 // language configuration, and highlight mapping.
 
+/// Identifies a running language server.
+///
+/// This identifier is part of the portable language data model. The native
+/// `lsp` crate owns server processes, but buffers and rendered highlights also
+/// carry server identities in browser builds.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct LanguageServerId(pub usize);
+
+impl LanguageServerId {
+    pub fn from_proto(id: u64) -> Self {
+        Self(id as usize)
+    }
+
+    pub fn to_proto(self) -> u64 {
+        self.0 as u64
+    }
+}
+
+impl std::fmt::Display for LanguageServerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 pub mod grammar;
 pub mod highlight_map;
 pub mod language_config;
