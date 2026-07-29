@@ -81,6 +81,23 @@ impl AgentStore {
     pub fn get(&self, agent_id: &AgentId) -> Option<&UiAgentState> {
         self.states.get(agent_id)
     }
+
+    pub fn mark_unloaded(&mut self, agent_id: AgentId) -> FrameSummary {
+        let state = self.states.entry(agent_id).or_insert_with(empty_state);
+        let was_open = turn_open(state.status);
+        state.status = UiAgentStatus::Unloaded;
+        if was_open && !state.blocks.is_empty() {
+            FrameSummary {
+                first_changed_block: Some(state.blocks.len() - 1),
+                incremental: None,
+            }
+        } else {
+            FrameSummary {
+                first_changed_block: None,
+                incremental: None,
+            }
+        }
+    }
 }
 
 /// Whether the agent is still producing the last turn; while open, the final
@@ -90,7 +107,7 @@ pub fn turn_open(status: UiAgentStatus) -> bool {
         UiAgentStatus::Streaming
         | UiAgentStatus::ToolCalling { .. }
         | UiAgentStatus::UnfinishedTurn { .. } => true,
-        UiAgentStatus::Idle | UiAgentStatus::Error => false,
+        UiAgentStatus::Idle | UiAgentStatus::Error | UiAgentStatus::Unloaded => false,
     }
 }
 
@@ -292,6 +309,30 @@ mod tests {
             },
         );
         assert_eq!(summary.first_changed_block, Some(1));
+    }
+
+    #[test]
+    fn server_unload_retains_transcript_and_closes_turn() {
+        let mut store = AgentStore::default();
+        let agent = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+        store.apply(
+            agent,
+            AgentRemoteFrame::Snapshot(UiAgentState {
+                blocks: vec![UiBlock::AssistantMessage {
+                    text: "partial".to_owned(),
+                    phase: None,
+                }],
+                status: UiAgentStatus::Streaming,
+                context_used: None,
+            }),
+        );
+
+        let summary = store.mark_unloaded(agent);
+
+        let state = store.get(&agent).unwrap();
+        assert_eq!(state.status, UiAgentStatus::Unloaded);
+        assert_eq!(state.blocks.len(), 1);
+        assert_eq!(summary.first_changed_block, Some(0));
     }
 
     #[test]

@@ -308,9 +308,32 @@ impl ClaudeAgent {
         let seq = self.input_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let uuid = Uuid::new_v4().to_string();
         self.input_notify.notify_waiters();
-        let _ = self
-            .control
-            .send(ClaudeControl::UserMessage { content, seq, uuid });
+        let _ = self.control.send(ClaudeControl::UserMessage {
+            content,
+            seq,
+            uuid,
+            accepted: None,
+        });
+    }
+
+    /// Deliver agent mail and wait for acceptance into Rho's volatile Claude
+    /// queue. A process or daemon restart may lose it before Claude records it.
+    pub async fn send_agent_message_accepted(&self, text: String) -> anyhow::Result<()> {
+        let seq = self.input_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let uuid = Uuid::new_v4().to_string();
+        let (accepted, reply) = oneshot::channel();
+        self.input_notify.notify_waiters();
+        self.control
+            .send(ClaudeControl::UserMessage {
+                content: vec![ContentPart::Text { text }],
+                seq,
+                uuid,
+                accepted: Some(accepted),
+            })
+            .map_err(|_| anyhow::anyhow!("Claude agent stopped before accepting mail"))?;
+        reply
+            .await
+            .map_err(|_| anyhow::anyhow!("Claude agent stopped before accepting mail"))?
     }
 
     pub async fn wait_for_input(&self, timeout: std::time::Duration) -> bool {
@@ -401,6 +424,7 @@ enum ClaudeControl {
         content: Vec<ContentPart>,
         seq: u64,
         uuid: String,
+        accepted: Option<oneshot::Sender<anyhow::Result<()>>>,
     },
     SetEffort {
         effort: Effort,
@@ -520,9 +544,17 @@ impl ClaudeLoop {
 
     async fn handle_control(&mut self, control: ClaudeControl) {
         match control {
-            ClaudeControl::UserMessage { content, seq, uuid } => {
+            ClaudeControl::UserMessage {
+                content,
+                seq,
+                uuid,
+                accepted,
+            } => {
                 self.cancelling = false;
                 if let Err(error) = self.ensure_process().await {
+                    if let Some(accepted) = accepted {
+                        let _ = accepted.send(Err(anyhow::anyhow!("{error:#}")));
+                    }
                     self.fail(error);
                     return;
                 }
@@ -567,6 +599,9 @@ impl ClaudeLoop {
                     self.pending_response = PendingInferenceResponse::default();
                     self.stream_items.clear();
                     self.set_streaming_kind();
+                }
+                if let Some(accepted) = accepted {
+                    let _ = accepted.send(Ok(()));
                 }
                 if let Err(error) = self
                     .process

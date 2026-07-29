@@ -77,7 +77,11 @@ pub enum ConnEvent {
         agent_id: AgentId,
         workstream: rho_ui_proto::WorkstreamId,
     },
-    AgentLoaded(AgentId),
+    AgentSubscribed(AgentId),
+    AgentUnloaded {
+        agent_id: AgentId,
+        reason: rho_ui_proto::AgentUnloadReason,
+    },
     Frame {
         agent_id: AgentId,
         frame: AgentRemoteFrame,
@@ -947,7 +951,12 @@ async fn run(
                 agent_id,
                 workstream,
             }),
-            ServerMessage::AgentLoaded { agent_id } => Some(ConnEvent::AgentLoaded(agent_id)),
+            ServerMessage::AgentSubscribed { agent_id } => {
+                Some(ConnEvent::AgentSubscribed(agent_id))
+            }
+            ServerMessage::AgentUnloaded { agent_id, reason } => {
+                Some(ConnEvent::AgentUnloaded { agent_id, reason })
+            }
             ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame {
                 agent_id,
                 frame,
@@ -1419,12 +1428,14 @@ async fn run_agent_streams(
     let allocation_budget = Arc::new(AgentFrameAllocationBudget::new(
         AGENT_FRAME_ALLOCATION_BUDGET,
     ));
+    let generations = Arc::new(tokio::sync::Mutex::new(HashMap::<AgentId, u64>::new()));
     loop {
         tokio::select! {
             accepted = connection.accept_uni() => {
                 let Ok(mut recv) = accepted else { break };
                 let events = events.clone();
                 let allocation_budget = allocation_budget.clone();
+                let generations = generations.clone();
                 streams.spawn(async move {
                     let (header, header_allocation) =
                         read_agent_stream_message(&mut recv, &allocation_budget).await?;
@@ -1433,9 +1444,31 @@ async fn run_agent_streams(
                         anyhow::bail!("invalid agent stream header");
                     };
                     drop(header_allocation);
+                    let generation = {
+                        let mut generations = generations.lock().await;
+                        let generation = generations.entry(agent_id).or_default();
+                        *generation = generation.wrapping_add(1);
+                        *generation
+                    };
                     loop {
-                        let (message, allocation) =
-                            read_agent_stream_message(&mut recv, &allocation_budget).await?;
+                        let (message, allocation) = match read_agent_stream_message(
+                            &mut recv,
+                            &allocation_budget,
+                        )
+                        .await
+                        {
+                            Ok(message) => message,
+                            Err(error)
+                                if error
+                                    .downcast_ref::<std::io::Error>()
+                                    .is_some_and(|error| {
+                                        error.kind() == std::io::ErrorKind::UnexpectedEof
+                                    }) =>
+                            {
+                                return Ok(())
+                            }
+                            Err(error) => return Err(error),
+                        };
                         let ServerMessage::Agent {
                             agent_id: frame_agent_id,
                             frame,
@@ -1444,6 +1477,9 @@ async fn run_agent_streams(
                             anyhow::bail!("invalid message on agent stream");
                         };
                         anyhow::ensure!(frame_agent_id == agent_id, "agent stream id changed");
+                        if generations.lock().await.get(&agent_id) != Some(&generation) {
+                            continue;
+                        }
                         if events
                             .unbounded_send(ConnEvent::Frame {
                                 agent_id,

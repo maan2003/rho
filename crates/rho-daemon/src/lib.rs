@@ -392,11 +392,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         tokio::spawn(run_iroh_listener(agents.clone(), endpoint, iroh_auth));
     }
 
-    // Attention watchers: one per loaded agent, daemon-owned (not tied to
-    // any connection). Preloaded agents are covered here; later creations
-    // ride the pool's `created` broadcast, and late loads the LoadAgent
-    // handler.
+    // Attention watchers are daemon-owned, independent of UI subscriptions.
+    // Subscribe before snapshotting the loaded set so internal activations
+    // (mail and integrations included) cannot slip through the handoff.
+    let mut activated_rx = agents.pool.subscribe_activated();
+    let watched_agents = Arc::new(Mutex::new(HashSet::new()));
     for (agent_id, agent) in agents.loaded().await {
+        watched_agents.lock().await.insert(agent_id);
         spawn_attention_watcher(
             agents.pool.clone(),
             agents.db.clone(),
@@ -406,21 +408,37 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         );
     }
     {
-        let mut created_rx = agents.pool.subscribe_created();
         let pool = agents.pool.clone();
         let db = agents.db.clone();
         let events = agents.events.clone();
+        let watched_agents = watched_agents.clone();
         tokio::spawn(async move {
             loop {
-                match created_rx.recv().await {
-                    Ok(created) => spawn_attention_watcher(
-                        pool.clone(),
-                        db.clone(),
-                        events.clone(),
-                        created.agent_id,
-                        created.agent,
-                    ),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                match activated_rx.recv().await {
+                    Ok(activated) => {
+                        if watched_agents.lock().await.insert(activated.agent_id) {
+                            spawn_attention_watcher(
+                                pool.clone(),
+                                db.clone(),
+                                events.clone(),
+                                activated.agent_id,
+                                activated.agent,
+                            );
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        for (agent_id, agent) in pool.loaded().await {
+                            if watched_agents.lock().await.insert(agent_id) {
+                                spawn_attention_watcher(
+                                    pool.clone(),
+                                    db.clone(),
+                                    events.clone(),
+                                    agent_id,
+                                    agent,
+                                );
+                            }
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -650,22 +668,19 @@ const MAX_IROH_AGENT_STREAMS: usize = 1024;
 #[derive(Clone)]
 struct IrohAgentStreams {
     connection: iroh::endpoint::Connection,
-    opened: Arc<Mutex<HashSet<AgentId>>>,
+    opened: Arc<Mutex<HashMap<AgentId, watch::Sender<bool>>>>,
     control_claimed: Arc<AtomicBool>,
     focus: watch::Sender<Option<AgentId>>,
-    cancel: watch::Sender<bool>,
 }
 
 impl IrohAgentStreams {
     fn new(connection: iroh::endpoint::Connection) -> Self {
         let (focus, _) = watch::channel(None);
-        let (cancel, _) = watch::channel(false);
         Self {
             connection,
-            opened: Arc::new(Mutex::new(HashSet::new())),
+            opened: Arc::new(Mutex::new(HashMap::new())),
             control_claimed: Arc::new(AtomicBool::new(false)),
             focus,
-            cancel,
         }
     }
 
@@ -680,30 +695,36 @@ impl IrohAgentStreams {
     }
 
     fn close(&self) {
-        self.cancel.send_replace(true);
         self.connection
             .close(0u32.into(), b"UI control session closed");
+    }
+
+    async fn remove(&self, agent_id: AgentId) {
+        if let Some(cancel) = self.opened.lock().await.remove(&agent_id) {
+            cancel.send_replace(true);
+        }
     }
 
     async fn ensure(&self, agent_id: AgentId, agent: RunningAgent) -> anyhow::Result<()> {
         {
             let mut opened = self.opened.lock().await;
-            if opened.contains(&agent_id) {
+            if opened.contains_key(&agent_id) {
                 return Ok(());
             }
             if opened.len() >= MAX_IROH_AGENT_STREAMS {
                 self.connection
-                    .close(2u32.into(), b"too many loaded agents");
+                    .close(2u32.into(), b"too many subscribed agents");
                 anyhow::bail!(
                     "iroh agent stream limit ({MAX_IROH_AGENT_STREAMS}) reached; \
                      hide agents before reconnecting"
                 );
             }
-            opened.insert(agent_id);
+            let (cancel, _) = watch::channel(false);
+            opened.insert(agent_id, cancel.clone());
         }
         let connection = self.connection.clone();
         let focus_sender = self.focus.clone();
-        let cancel_sender = self.cancel.clone();
+        let cancel_sender = self.opened.lock().await[&agent_id].clone();
         let opened = self.opened.clone();
         tokio::spawn(async move {
             const RETRIES: usize = 3;
@@ -743,7 +764,14 @@ impl IrohAgentStreams {
                     }
                 }
             }
-            opened.lock().await.remove(&agent_id);
+            let mut opened = opened.lock().await;
+            if opened
+                .get(&agent_id)
+                .is_some_and(|current| current.same_channel(&cancel_sender))
+            {
+                opened.remove(&agent_id);
+            }
+            drop(opened);
             if exhausted {
                 connection.close(1u32.into(), b"agent state stream failed");
             }
@@ -1068,7 +1096,6 @@ impl AgentRegistry {
             iris_agent: Mutex::new(None),
             iris_voice_lease: Arc::new(TokioMutex::new(())),
         };
-        registry.pool.load_non_hidden_agents().await;
         Ok(registry)
     }
 
@@ -1208,17 +1235,6 @@ impl AgentRegistry {
 
     async fn loaded(&self) -> Vec<(AgentId, RunningAgent)> {
         self.pool.loaded().await
-    }
-
-    async fn visible_loaded(&self) -> Vec<(AgentId, RunningAgent)> {
-        self.pool
-            .loaded()
-            .await
-            .into_iter()
-            .filter(|(agent_id, _)| {
-                self.db.read().get_agent(*agent_id).disposition != AgentDisposition::Hidden
-            })
-            .collect()
     }
 
     async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
@@ -1834,46 +1850,24 @@ where
         }
     });
 
-    let _ = outgoing_tx.send(agents.ready_message().await);
-
-    // Subscribe to creations before snapshotting the loaded set so no agent
-    // slips between the two.
+    // Creations update lightweight registry summaries. Agent-state streams
+    // are opened only by this connection's explicit subscriptions. Subscribe
+    // before building Ready so a concurrent creation is either in its
+    // snapshot or arrives on this receiver (occasionally both, harmlessly).
     let mut created_rx = agents.pool.subscribe_created();
-    if let Some(agent_streams) = &agent_streams {
-        for (agent_id, agent) in agents.visible_loaded().await {
-            if let Err(error) = agent_streams.ensure(agent_id, agent).await {
-                let _ = outgoing_tx.send(ServerMessage::Error {
-                    message: error.to_string(),
-                });
-            }
-        }
-    } else {
-        for (agent_id, agent) in agents.loaded().await {
-            subscribe_agent(agent_id, agent, outgoing_tx.clone());
-        }
-    }
+    let mut events_rx = agents.events.subscribe();
+    let _ = outgoing_tx.send(agents.ready_message().await);
+    let mut local_subscriptions = HashMap::new();
 
     // Announce every agent created in the pool — by clients or by other
     // agents spawning children — so it shows up on this connection.
     {
         let agents = Arc::clone(&agents);
         let outgoing_tx = outgoing_tx.clone();
-        let agent_streams = agent_streams.clone();
         tokio::spawn(async move {
             loop {
                 match created_rx.recv().await {
                     Ok(created) => {
-                        if let Some(agent_streams) = &agent_streams {
-                            if let Err(error) =
-                                agent_streams.ensure(created.agent_id, created.agent).await
-                            {
-                                let _ = outgoing_tx.send(ServerMessage::Error {
-                                    message: error.to_string(),
-                                });
-                            }
-                        } else {
-                            subscribe_agent(created.agent_id, created.agent, outgoing_tx.clone());
-                        }
                         if outgoing_tx
                             .send(ServerMessage::AgentCreated {
                                 agent_id: created.agent_id,
@@ -1886,19 +1880,6 @@ where
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Rebuild both the stream set and the refreshed list;
-                        // otherwise a missed creation would never get an
-                        // agent-state stream on this connection.
-                        if let Some(agent_streams) = &agent_streams {
-                            for (agent_id, agent) in agents.visible_loaded().await {
-                                if let Err(error) = agent_streams.ensure(agent_id, agent).await {
-                                    let _ = outgoing_tx.send(ServerMessage::Error {
-                                        message: error.to_string(),
-                                    });
-                                    break;
-                                }
-                            }
-                        }
                         if outgoing_tx.send(agents.ready_message().await).is_err() {
                             break;
                         }
@@ -1912,7 +1893,6 @@ where
     // Daemon-wide events fan out to every client, not just the connection
     // whose action produced them; aborted on disconnect so the writer channel
     // can close.
-    let mut events_rx = agents.events.subscribe();
     let events_tx = outgoing_tx.clone();
     let events_task = tokio::spawn(async move {
         loop {
@@ -1951,6 +1931,7 @@ where
             &mut land_leases,
             land_holder.clone(),
             agent_streams.as_ref(),
+            &mut local_subscriptions,
             message,
         )
         .await
@@ -1970,6 +1951,9 @@ where
         }
     };
     events_task.abort();
+    for (_, subscription) in local_subscriptions {
+        subscription.abort();
+    }
     result
 }
 
@@ -2071,7 +2055,7 @@ fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition)
 
 /// Watches one running agent for the daemon itself (not any particular
 /// connection): records turn ends and broadcasts attention level changes to
-/// every client. Spawned exactly once per loaded agent.
+/// every client. Spawned exactly once per activated agent.
 ///
 /// Sub-agents (a parent spawned them) get Working broadcasts but no turn-end
 /// records: their finished turns are the parent's court, not the user's.
@@ -2402,6 +2386,7 @@ async fn handle_message(
     land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
     land_holder: Option<LandLeaseHolder>,
     agent_streams: Option<&IrohAgentStreams>,
+    local_subscriptions: &mut HashMap<AgentId, tokio::task::JoinHandle<()>>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
     match message {
@@ -2743,28 +2728,44 @@ async fn handle_message(
             }
             Ok(Refresh::None)
         }
-        ClientMessage::LoadAgent { agent_id } => {
-            let (agent_id, agent, loaded_now) = agents.load(agent_id).await?;
-            if loaded_now {
-                spawn_attention_watcher(
-                    agents.pool.clone(),
-                    agents.db.clone(),
-                    agents.events.clone(),
-                    agent_id,
-                    agent.clone(),
-                );
-                if agent_streams.is_none() {
-                    subscribe_agent(agent_id, agent.clone(), outgoing_tx.clone());
+        ClientMessage::SubscribeAgent { agent_id } => {
+            subscribe_connection_agents(
+                agents,
+                outgoing_tx,
+                agent_streams,
+                local_subscriptions,
+                [agent_id],
+            )
+            .await?;
+            Ok(Refresh::None)
+        }
+        ClientMessage::SubscribeAgents { agent_ids } => {
+            anyhow::ensure!(agent_ids.len() <= 1024, "too many agent subscriptions");
+            subscribe_connection_agents(
+                agents,
+                outgoing_tx,
+                agent_streams,
+                local_subscriptions,
+                agent_ids,
+            )
+            .await?;
+            Ok(Refresh::None)
+        }
+        ClientMessage::UnsubscribeAgents { agent_ids } => {
+            anyhow::ensure!(agent_ids.len() <= 1024, "too many agent unsubscriptions");
+            for agent_id in agent_ids {
+                if let Some(streams) = agent_streams {
+                    streams.remove(agent_id).await;
                 }
-            }
-            if let Some(agent_streams) = agent_streams
-                && let Err(error) = agent_streams.ensure(agent_id, agent).await
-            {
-                let _ = outgoing_tx.send(ServerMessage::Error {
-                    message: error.to_string(),
+                if let Some(subscription) = local_subscriptions.remove(&agent_id) {
+                    subscription.abort();
+                    let _ = subscription.await;
+                }
+                let _ = outgoing_tx.send(ServerMessage::AgentUnloaded {
+                    agent_id,
+                    reason: rho_ui_proto::AgentUnloadReason::Unsubscribed,
                 });
             }
-            let _ = outgoing_tx.send(ServerMessage::AgentLoaded { agent_id });
             Ok(Refresh::None)
         }
         ClientMessage::AgentStreamFocus { agent_id } => {
@@ -3586,11 +3587,32 @@ where
         }
     }
 }
+async fn subscribe_connection_agents(
+    agents: &Arc<AgentRegistry>,
+    outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
+    agent_streams: Option<&IrohAgentStreams>,
+    local_subscriptions: &mut HashMap<AgentId, tokio::task::JoinHandle<()>>,
+    agent_ids: impl IntoIterator<Item = AgentId>,
+) -> anyhow::Result<()> {
+    for agent_id in agent_ids {
+        let (agent_id, agent, _loaded_now) = agents.load(agent_id).await?;
+        if let Some(streams) = agent_streams {
+            streams.ensure(agent_id, agent).await?;
+        } else {
+            local_subscriptions
+                .entry(agent_id)
+                .or_insert_with(|| subscribe_agent(agent_id, agent, outgoing_tx.clone()));
+        }
+        let _ = outgoing_tx.send(ServerMessage::AgentSubscribed { agent_id });
+    }
+    Ok(())
+}
+
 fn subscribe_agent(
     agent_id: AgentId,
     agent: RunningAgent,
     state_tx: mpsc::UnboundedSender<ServerMessage>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let changes = agent.subscribe();
         let mut encoder = AgentRemoteEncoder::new();
@@ -3610,7 +3632,7 @@ fn subscribe_agent(
                 break;
             }
         }
-    });
+    })
 }
 
 /// Repo roots must be absolute (the daemon's cwd is meaningless by design)

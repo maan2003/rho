@@ -194,6 +194,12 @@ AI APIs.
   Engineers must validate claims against the repository before changing or
   executing code, and summarize meaningful milestones to their parent rather
   than forwarding raw review text.
+- Inter-agent mail activates parked recipients internally and waits for the
+  recipient loop to accept the input; it never creates a GUI subscription.
+  Native Rho acknowledges only after committing the queued event, so successful
+  delivery survives daemon restart. Claude acknowledges process-local queue
+  acceptance without a separate RhoDB mailbox; a daemon restart before Claude
+  records the input may lose that rare queued message by design.
 
 ## Remote UI transports (iroh and web UI)
 
@@ -226,15 +232,15 @@ AI APIs.
   an intentional trusted-client capability rather than a post-authentication
   denial-of-service boundary. The daemon's iroh secret key lives in the local
   rho database.
-  After authentication, native GUI connections may accept up to 1024
-  daemon-initiated unidirectional agent-state streams. These streams carry only
-  framed UI state for agents already loaded by the daemon; authorization and
-  commands remain on the authenticated control session. Stream weights are
-  sender-local scheduling metadata and are never trusted from the network.
-  If more than 1024 non-hidden agents are loaded, the daemon closes the native
-  connection rather than silently serving incomplete state; the user must hide
-  agents before reconnecting. Hidden agents are omitted from the warm stream
-  set but get a stream if explicitly loaded/opened again.
+  After authentication, each native GUI control connection explicitly
+  subscribes agent state and may accept up to 1024 daemon-initiated
+  unidirectional agent-state streams. Subscriptions are connection-local and
+  may internally activate a parked runtime, but daemon activation alone never
+  exposes a transcript to a GUI. Authorization and commands remain on the
+  authenticated control session. Stream weights are sender-local scheduling
+  metadata and are never trusted from the network. More than 1024 simultaneous
+  subscriptions on one connection closes that connection rather than silently
+  serving incomplete state.
   Agent frames retain the 64 MiB per-frame bound, and the native GUI reserves
   each declared payload against a connection-wide non-FIFO atomic byte budget before
   allocation, bounding concurrent length-prefix-driven frame allocations to

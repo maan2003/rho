@@ -798,6 +798,7 @@ impl Agent {
             content,
             delivery,
             source_id,
+            accepted: None,
         });
     }
 
@@ -828,7 +829,30 @@ impl Agent {
             content: vec![ContentPart::Text { text: text.into() }],
             delivery,
             source_id: None,
+            accepted: None,
         });
+    }
+
+    /// Deliver agent mail and wait until the loop has durably queued it.
+    pub async fn send_agent_message_accepted(
+        &self,
+        sender: AgentId,
+        text: impl Into<String>,
+        delivery: MessageDelivery,
+    ) -> anyhow::Result<()> {
+        let (accepted, reply) = oneshot::channel();
+        self.control
+            .send(AgentControl::UserMessage {
+                sender: MessageSender::Agent { id: sender },
+                content: vec![ContentPart::Text { text: text.into() }],
+                delivery,
+                source_id: None,
+                accepted: Some(accepted),
+            })
+            .map_err(|_| anyhow::anyhow!("agent stopped before accepting mail"))?;
+        reply
+            .await
+            .map_err(|_| anyhow::anyhow!("agent stopped before accepting mail"))
     }
 
     pub fn compact(&self, delivery: MessageDelivery) {
@@ -1024,6 +1048,7 @@ enum AgentControl {
         content: Vec<ContentPart>,
         delivery: MessageDelivery,
         source_id: Option<InputSourceId>,
+        accepted: Option<oneshot::Sender<()>>,
     },
     Compact {
         delivery: MessageDelivery,
@@ -1263,9 +1288,17 @@ impl AgentLoop {
                             content,
                             delivery,
                             source_id,
+                            accepted,
                         } => {
-                            self.enqueue_message(&mut state, sender, content, delivery, source_id)
-                                .await;
+                            self.enqueue_message(
+                                &mut state,
+                                sender,
+                                content,
+                                delivery,
+                                source_id,
+                                accepted,
+                            )
+                            .await;
                         }
                         AgentControl::Compact { delivery } => {
                             let item = QueuedItem {
@@ -1854,6 +1887,7 @@ impl AgentLoop {
         content: Vec<ContentPart>,
         delivery: MessageDelivery,
         source_id: Option<InputSourceId>,
+        accepted: Option<oneshot::Sender<()>>,
     ) {
         let content = Arc::new(content);
         let item = QueuedItem {
@@ -1878,6 +1912,9 @@ impl AgentLoop {
             });
         }
         state.queued_inputs.push(item);
+        if let Some(accepted) = accepted {
+            let _ = accepted.send(());
+        }
         self.wake_for_queued(state).await;
         self.yield_code_mode_wait_for_queued(state);
         // An armed wait counts any deliverable arrival.

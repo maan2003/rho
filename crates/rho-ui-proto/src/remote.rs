@@ -229,6 +229,9 @@ pub enum UiAgentStatus {
     /// The turn failed permanently; the error text is the trailing unsealed
     /// [`UiBlock::Notice`].
     Error,
+    /// The daemon stopped this client's live state stream. Retained transcript
+    /// content may still be displayed, but it is no longer being updated.
+    Unloaded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

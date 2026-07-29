@@ -248,6 +248,7 @@ fn status_label(status: &UiAgentStatus) -> &'static str {
         UiAgentStatus::ToolCalling { .. } => "tool_calling",
         UiAgentStatus::UnfinishedTurn { .. } => "unfinished",
         UiAgentStatus::Error => "error",
+        UiAgentStatus::Unloaded => "unloaded",
     }
 }
 

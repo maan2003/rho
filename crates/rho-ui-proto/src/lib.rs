@@ -95,7 +95,7 @@ pub enum ClientMessage {
         start: StartMode,
         content: Option<Vec<ContentPart>>,
     },
-    LoadAgent {
+    SubscribeAgent {
         agent_id: AgentId,
     },
     SendUserMessage {
@@ -354,6 +354,15 @@ pub enum ClientMessage {
     VisualizationGet {
         id: String,
     },
+    /// Subscribe this UI connection to state snapshots and updates for these
+    /// agents. Loading the backing runtime, when necessary, is daemon policy.
+    SubscribeAgents {
+        agent_ids: Vec<AgentId>,
+    },
+    /// Stop state updates for these agents on this UI connection.
+    UnsubscribeAgents {
+        agent_ids: Vec<AgentId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -548,7 +557,7 @@ pub enum ServerMessage {
     WorkstreamCreated {
         workstream: UiWorkstream,
     },
-    AgentLoaded {
+    AgentSubscribed {
         agent_id: AgentId,
     },
     TurnCancelled {
@@ -707,6 +716,20 @@ pub enum ServerMessage {
     VisualizationRefused {
         reason: String,
     },
+    /// The daemon stopped this connection's live state stream for an agent.
+    /// Clients may retain the last snapshot and subscribe again on demand.
+    AgentUnloaded {
+        agent_id: AgentId,
+        reason: AgentUnloadReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum AgentUnloadReason {
+    /// This connection released its subscription.
+    Unsubscribed,
+    /// The daemon evicted a settled runtime under its idle policy.
+    Idle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -1241,6 +1264,12 @@ mod tests {
                 agent_id: Some(agent_id),
             },
             ClientMessage::AgentStreamFocus { agent_id: None },
+            ClientMessage::SubscribeAgents {
+                agent_ids: vec![agent_id],
+            },
+            ClientMessage::UnsubscribeAgents {
+                agent_ids: vec![agent_id],
+            },
         ] {
             let bytes = senax_encoder::pack(&message).unwrap();
             let mut slice: &[u8] = &bytes;
@@ -1248,11 +1277,18 @@ mod tests {
             assert_eq!(message, decoded);
         }
 
-        let message = ServerMessage::AgentStreamOpened { agent_id };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(message, decoded);
+        for message in [
+            ServerMessage::AgentStreamOpened { agent_id },
+            ServerMessage::AgentUnloaded {
+                agent_id,
+                reason: AgentUnloadReason::Idle,
+            },
+        ] {
+            let bytes = senax_encoder::pack(&message).unwrap();
+            let mut slice: &[u8] = &bytes;
+            let decoded = senax_encoder::unpack(&mut slice).unwrap();
+            assert_eq!(message, decoded);
+        }
     }
 
     #[test]

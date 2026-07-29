@@ -226,6 +226,12 @@ created directly, by a PM, or by an Engineer so prompt ownership context is an
 immutable creation-time fact rather than inferred later. Advisors retain normal
 shell/patch capabilities plus messaging/waiting but cannot spawn or interrupt.
 User-facing handles remain `eng-*`, `pm-*`, and `adv-*` over `AgentId`.
+Mail delivery is an internal daemon operation, not a UI protocol lifecycle.
+It activates a parked recipient when necessary and awaits a per-delivery
+acceptance channel. Native Rho acknowledges after its queued event is committed;
+Claude acknowledges after its process-local input queue accepts the message,
+which intentionally may be lost if the daemon restarts before Claude records
+it.
 The `eng-mini` tier uses the GPT-5.6 Luna Responses model with xhigh reasoning,
 fast mode, and direct tools instead of code mode. Engineers spawned by an
 `eng-mini` parent are also `eng-mini`.
@@ -345,14 +351,28 @@ daemon --iroh`; approval via `rho iroh approve` stays on the Unix socket).
 The protocol crate owns only wire types and state diffs; `rho-daemon` projects
 the richer `rho-agent` runtime state into that wire shape. Consequently UI
 clients do not depend on the agent runtime or inherit its optional features.
-Unix sessions multiplex control and agent state on one byte stream. Native
-iroh sessions keep commands and lifecycle events on a high-priority
+Daemon startup reads lightweight agent summaries but does not restore every
+transcript. Runtime activation is internal daemon policy and serialized per
+pool so concurrent UI subscriptions, mail, and integrations cannot construct
+duplicate loops. Each UI control connection independently subscribes and
+unsubscribes agent state; activation does not imply observation by any GUI.
+`Ready` derives parked-agent attention from persisted disposition alone.
+Error and unfinished-turn states are live runtime detail rather than durable
+parked-agent attention, so an unloaded pending agent remains pending.
+The native GUI initially subscribes its retained selection and up to ten
+top-level representatives from recently active visible workstreams. It then
+keeps a generous 128-entry transcript LRU; opening another agent beyond that
+bound releases the least recently viewed subscription. The daemon confirms a
+released or idle-evicted stream with `AgentUnloaded`, and only that server
+notice changes retained transcript status to `UiAgentStatus::Unloaded`.
+Unix sessions multiplex control and subscribed agent state on one byte stream.
+Native iroh sessions keep commands and lifecycle events on a high-priority
 bidirectional control stream (exactly one per physical connection); the daemon
-opens one unidirectional stream per non-hidden loaded agent, up to 1024, so
-state remains warm in the GUI cache without cross-agent
-head-of-line blocking. The focused stream has weight 200 and background streams
-weight 1 within their lower-priority class. Focus changes travel over the
-control stream and update transport weights without reopening streams.
+opens one unidirectional stream per agent subscribed by that connection, up to
+1024, avoiding cross-agent head-of-line blocking. The focused stream has weight
+200 and background streams weight 1 within their lower-priority class. Focus
+changes travel over the control stream and update transport weights without
+reopening streams.
 Authentication upgrades both peers from the standard QUIC idle timeout to a
 ten-minute same-connection recovery window and raises the daemon's incoming
 bidirectional stream credit from its pre-authentication limit. Iroh already

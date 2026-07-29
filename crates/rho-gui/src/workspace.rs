@@ -5,7 +5,7 @@
 //! merged per agent, and views receive summarized changes rather than the
 //! protocol itself.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,6 +19,7 @@ use gpui::{App, ClipboardEntry, Context, Entity, Focusable as _, Task, Window, d
 use rho_core::ContentPart;
 use rho_ui_proto::{
     AdvisorIntelligence, AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery,
+    UiAgentSummary, UiWorkstream, WorkstreamId,
 };
 use theme::ActiveTheme as _;
 
@@ -40,6 +41,9 @@ use crate::{
     RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
     ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
 };
+
+const MAX_AGENT_SUBSCRIPTIONS: usize = 128;
+const INITIAL_AGENT_SUBSCRIPTIONS: usize = 10;
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
 /// in their context's surface list for the context's lifetime; panes hold
@@ -100,6 +104,75 @@ enum ContextId {
     Task(rho_ui_proto::WorkstreamId),
 }
 
+/// Connection-local live transcript streams. Recently selected agents stay
+/// subscribed until this deliberately generous bound is reached; unloaded
+/// agents reject any transport frames buffered before the server's notice.
+#[derive(Default)]
+struct AgentSubscriptions {
+    lru: VecDeque<AgentId>,
+    unloaded: HashSet<AgentId>,
+}
+
+impl AgentSubscriptions {
+    fn reset(&mut self, agent_ids: &[AgentId]) {
+        self.lru.clear();
+        self.unloaded.clear();
+        for agent_id in agent_ids.iter().rev().copied() {
+            if !self.lru.contains(&agent_id) {
+                self.lru.push_back(agent_id);
+            }
+        }
+    }
+
+    fn contains(&self, agent_id: AgentId) -> bool {
+        self.lru.contains(&agent_id)
+    }
+
+    /// Promotes an existing subscription or adds one. Returns whether a new
+    /// subscribe request is needed and the oldest subscription to release.
+    fn touch(&mut self, agent_id: AgentId) -> (bool, Option<AgentId>) {
+        self.unloaded.remove(&agent_id);
+        let was_subscribed = self
+            .lru
+            .iter()
+            .position(|subscribed| *subscribed == agent_id)
+            .map(|index| self.lru.remove(index))
+            .is_some();
+        self.lru.push_back(agent_id);
+        let evicted = (self.lru.len() > MAX_AGENT_SUBSCRIPTIONS)
+            .then(|| self.lru.pop_front())
+            .flatten();
+        if let Some(evicted) = evicted {
+            self.unloaded.insert(evicted);
+        }
+        (!was_subscribed, evicted)
+    }
+
+    fn mark_unloaded(
+        &mut self,
+        agent_id: AgentId,
+        reason: rho_ui_proto::AgentUnloadReason,
+    ) -> bool {
+        // An unsubscribe acknowledgement can cross a rapid re-subscribe on
+        // QUIC's independent streams. Ignore it once touch() cleared the
+        // pending-unload marker. Daemon idle eviction is always authoritative.
+        if reason == rho_ui_proto::AgentUnloadReason::Unsubscribed
+            && !self.unloaded.contains(&agent_id)
+        {
+            return false;
+        }
+        if let Some(index) = self.lru.iter().position(|id| *id == agent_id) {
+            self.lru.remove(index);
+        }
+        self.unloaded.insert(agent_id);
+        true
+    }
+
+    fn accepts_frames(&self, agent_id: AgentId) -> bool {
+        !self.unloaded.contains(&agent_id)
+    }
+}
+
 /// How to reach the daemon. Deliberately holds no client-local paths: the
 /// socket may be forwarded from another machine, so the GUI's own cwd and
 /// home mean nothing to the daemon and must never leak into agent working
@@ -116,6 +189,7 @@ pub enum AttachTarget {
 
 pub struct Workspace {
     connection: Connection,
+    subscriptions: AgentSubscriptions,
     store: AgentStore,
     registry: AgentRegistry,
     models: HashMap<AgentId, Entity<AgentModel>>,
@@ -331,6 +405,7 @@ impl Workspace {
         );
         let mut this = Self {
             connection,
+            subscriptions: AgentSubscriptions::default(),
             store: AgentStore::default(),
             registry: AgentRegistry::default(),
             models: HashMap::new(),
@@ -460,13 +535,25 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let startup_agent =
-            matches!(self.registry.active_pane(), ActivePane::Startup).then(|| frames[0].0);
+        let startup_agent = matches!(self.registry.active_pane(), ActivePane::Startup)
+            .then(|| {
+                frames
+                    .iter()
+                    .find(|(agent_id, _)| self.subscriptions.accepts_frames(*agent_id))
+                    .map(|(agent_id, _)| *agent_id)
+            })
+            .flatten();
         let mut order = Vec::new();
         let mut changes: HashMap<AgentId, (FrameSummary, Option<u64>)> = HashMap::new();
         let mut live_changed = false;
 
         for (agent_id, frame) in frames {
+            // A transport may still deliver already-buffered frames after
+            // this GUI evicts a subscription. They must not resurrect its
+            // connection-local Live state or mutate the retained snapshot.
+            if !self.subscriptions.accepts_frames(agent_id) {
+                continue;
+            }
             let old_context = self
                 .store
                 .get(&agent_id)
@@ -559,6 +646,15 @@ impl Workspace {
                 agent_counter,
             } => {
                 let first_ready = !self.connected;
+                let retained_selection = self.registry.selected_agent().copied();
+                let initial_subscriptions = first_ready.then(|| {
+                    recent_workstream_roots(
+                        &workstreams,
+                        &agents,
+                        retained_selection,
+                        INITIAL_AGENT_SUBSCRIPTIONS,
+                    )
+                });
                 self.registry.set_machine_seed(machine_seed);
                 self.registry.set_agent_counter(agent_counter);
                 self.registry.set_data(workstreams, agents);
@@ -571,6 +667,14 @@ impl Workspace {
                     // The startup scaffold guessed before daemon data existed;
                     // refresh it now that workdir names and topics are known.
                     self.seed_draft(false, window, cx);
+                }
+                if let Some(agent_ids) = initial_subscriptions
+                    && let Some(selected) = agent_ids.first().copied()
+                {
+                    self.set_initial_subscriptions(agent_ids);
+                    if matches!(self.registry.active_pane(), ActivePane::Startup) {
+                        self.select_agent(Some(selected), window, cx);
+                    }
                 }
                 self.update_statuses(cx);
                 cx.notify();
@@ -588,6 +692,7 @@ impl Workspace {
                 self.registry.mark_known(agent_id);
                 if self.awaiting_draft_agent {
                     self.awaiting_draft_agent = false;
+                    self.subscribe_agent(agent_id);
                     // The draft became this agent: reset the compose surface
                     // and follow the new agent.
                     let label = self
@@ -605,8 +710,37 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            ConnEvent::AgentLoaded(agent_id) => {
+            ConnEvent::AgentSubscribed(agent_id) => {
                 self.registry.mark_known(agent_id);
+                cx.notify();
+            }
+            ConnEvent::AgentUnloaded { agent_id, reason } => {
+                if !self.subscriptions.mark_unloaded(agent_id, reason) {
+                    return;
+                }
+                self.registry.mark_not_live(agent_id);
+                let summary = self.store.mark_unloaded(agent_id);
+                if self.registry.selected_agent() == Some(&agent_id) {
+                    if let Some(view) = self.models.get(&agent_id).cloned()
+                        && let Some(state) = self.store.get(&agent_id)
+                    {
+                        view.update(cx, |view, cx| {
+                            view.sync(
+                                state,
+                                summary,
+                                now_ms(),
+                                &|id| self.registry.agent_display_label(id),
+                                cx,
+                            )
+                        });
+                    }
+                } else if self.models.contains_key(&agent_id) {
+                    self.pending_syncs
+                        .entry(agent_id)
+                        .and_modify(|pending| *pending = pending.merge(summary))
+                        .or_insert(summary);
+                }
+                self.refresh_draft_agent_targets(cx);
                 cx.notify();
             }
             ConnEvent::Frame {
@@ -1684,11 +1818,30 @@ impl Workspace {
         }
     }
 
-    /// Selects an agent, asking the daemon to load it first when this
-    /// connection has never seen frames for it.
+    /// Manage this GUI's bounded transcript subscription set.
+    fn set_initial_subscriptions(&mut self, agent_ids: Vec<AgentId>) {
+        self.subscriptions.reset(&agent_ids);
+        self.connection
+            .send(ClientMessage::SubscribeAgents { agent_ids });
+    }
+
+    fn subscribe_agent(&mut self, agent_id: AgentId) {
+        let (subscribe, evicted) = self.subscriptions.touch(agent_id);
+        if let Some(evicted) = evicted {
+            self.connection.send(ClientMessage::UnsubscribeAgents {
+                agent_ids: vec![evicted],
+            });
+        }
+        if subscribe {
+            self.connection.send(ClientMessage::SubscribeAgents {
+                agent_ids: vec![agent_id],
+            });
+        }
+    }
+
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.connected && !self.registry.is_live(agent_id) {
-            self.connection.send(ClientMessage::LoadAgent { agent_id });
+        if self.connected && !self.subscriptions.contains(agent_id) {
+            self.subscribe_agent(agent_id);
         }
         self.select_agent(Some(agent_id), window, cx);
     }
@@ -1899,9 +2052,9 @@ impl Workspace {
     ) {
         if let Some(agent_id) = agent_id
             && self.connected
-            && !self.registry.is_live(agent_id)
+            && !self.subscriptions.contains(agent_id)
         {
-            self.connection.send(ClientMessage::LoadAgent { agent_id });
+            self.subscribe_agent(agent_id);
         }
         self.select_agent_inner(agent_id, false, window, cx);
     }
@@ -1913,6 +2066,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.connected
+            && let Some(agent_id) = agent_id
+        {
+            // Selection is the strongest subscription signal. Touch it here
+            // so keyboard cycling and every other direct selection path keep
+            // the visible transcript at the protected end of the LRU.
+            self.subscribe_agent(agent_id);
+        }
         if let Some(agent_id) = &agent_id {
             let view = self.materialize_model(agent_id, cx);
             view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
@@ -2508,10 +2669,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_id) = self.registry.next_live_agent(delta) else {
+        let Some(agent_id) = self.registry.next_agent(delta) else {
             self.notice_on(
                 None,
-                "agent-switch: no active agents available yet",
+                "agent-switch: no visible agents available",
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -4034,7 +4195,7 @@ impl Workspace {
 
     pub fn live_agent_targets(&self) -> Vec<crate::commands::Candidate> {
         let mut candidates = Vec::new();
-        for agent_id in self.registry.live_agents() {
+        for agent_id in self.registry.known_agents() {
             let id_label = self.registry.agent_id_label(*agent_id);
             let display_name = self
                 .registry
@@ -4050,7 +4211,7 @@ impl Workspace {
 
     fn agent_target_hints(&self) -> Vec<(String, String)> {
         let mut hints = Vec::new();
-        for agent_id in self.registry.live_agents() {
+        for agent_id in self.registry.known_agents() {
             let id_label = self.registry.agent_id_label(*agent_id);
             if let Some(display_name) = self.registry.agent_display_name(*agent_id) {
                 hints.push((id_label, display_name.to_owned()));
@@ -4433,6 +4594,70 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// One top-level transcript from each of the most recently active visible
+/// workstreams. Descendant activity raises its workstream's recency without
+/// making the whole subtree part of the initial subscription set.
+fn recent_workstream_roots(
+    workstreams: &[UiWorkstream],
+    agents: &[UiAgentSummary],
+    selected: Option<AgentId>,
+    limit: usize,
+) -> Vec<AgentId> {
+    let hidden = workstreams
+        .iter()
+        .filter(|workstream| {
+            workstream
+                .labels
+                .iter()
+                .any(|label| label == crate::registry::HIDE_LABEL)
+        })
+        .map(|workstream| workstream.workstream_id)
+        .collect::<HashSet<_>>();
+    let mut recency = HashMap::<WorkstreamId, rho_core::UnixMs>::new();
+    let mut roots = HashMap::<WorkstreamId, (rho_core::UnixMs, AgentId)>::new();
+    for agent in agents
+        .iter()
+        .filter(|agent| !agent.hidden && !hidden.contains(&agent.workstream))
+    {
+        recency
+            .entry(agent.workstream)
+            .and_modify(|last| *last = (*last).max(agent.last_active))
+            .or_insert(agent.last_active);
+        if agent.parent_agent.is_none() {
+            roots
+                .entry(agent.workstream)
+                .and_modify(|root| {
+                    if agent.last_active > root.0 {
+                        *root = (agent.last_active, agent.agent_id);
+                    }
+                })
+                .or_insert((agent.last_active, agent.agent_id));
+        }
+    }
+    let mut roots = roots
+        .into_iter()
+        .map(|(workstream, (_, agent_id))| (recency[&workstream], workstream, agent_id))
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|(last_active, workstream, agent_id)| {
+        (std::cmp::Reverse(*last_active), *workstream, *agent_id)
+    });
+    let mut selected_roots = roots
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, agent_id)| agent_id)
+        .collect::<Vec<_>>();
+    if let Some(selected) = selected
+        && agents.iter().any(|agent| {
+            agent.agent_id == selected && !agent.hidden && !hidden.contains(&agent.workstream)
+        })
+    {
+        selected_roots.retain(|agent_id| *agent_id != selected);
+        selected_roots.insert(0, selected);
+        selected_roots.truncate(limit);
+    }
+    selected_roots
+}
+
 /// `30m`, `2h`, `1d`; a bare number means minutes.
 fn parse_duration_ms(text: &str) -> Option<u64> {
     let (digits, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
@@ -4460,6 +4685,92 @@ fn resolve_workdir<'a>(argument: &str, workdirs: &'a [(String, String)]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(id: u64, workstream: u64, last_active: u64) -> UiAgentSummary {
+        UiAgentSummary {
+            agent_id: AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap(),
+            parent_agent: None,
+            display_name: None,
+            created_at: rho_core::UnixMs(last_active),
+            updated_at: rho_core::UnixMs(last_active),
+            role: AgentRole::default(),
+            workspace: rho_ui_proto::WorkspaceInfo::UserCheckout {
+                repo: "/tmp".into(),
+            },
+            attention: rho_ui_proto::UiAttention::Quiet,
+            last_active: rho_core::UnixMs(last_active),
+            hidden: false,
+            last_user_message_text: String::new(),
+            workstream: WorkstreamId(workstream),
+            labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn initial_subscriptions_are_bounded_recent_visible_roots_with_selection() {
+        let mut workstreams = (1..=12)
+            .map(|id| UiWorkstream {
+                workstream_id: WorkstreamId(id),
+                name: format!("workstream-{id}"),
+                labels: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        // The newest workstream is explicitly hidden and must not consume a
+        // preload slot.
+        workstreams[11]
+            .labels
+            .push(crate::registry::HIDE_LABEL.to_owned());
+        let agents = (1..=12).map(|id| summary(id, id, id)).collect::<Vec<_>>();
+        let selected = agents[0].agent_id;
+
+        let subscriptions = recent_workstream_roots(&workstreams, &agents, Some(selected), 10);
+
+        assert_eq!(subscriptions.len(), 10);
+        assert_eq!(subscriptions[0], selected);
+        assert!(!subscriptions.contains(&agents[11].agent_id));
+        assert!(subscriptions.contains(&agents[10].agent_id));
+    }
+
+    #[test]
+    fn selecting_oldest_subscription_protects_it_from_next_eviction() {
+        let ids = (1..=MAX_AGENT_SUBSCRIPTIONS as u64 + 1)
+            .map(|id| AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap())
+            .collect::<Vec<_>>();
+        let mut subscriptions = AgentSubscriptions::default();
+        for agent_id in ids[..MAX_AGENT_SUBSCRIPTIONS].iter().copied() {
+            assert_eq!(subscriptions.touch(agent_id), (true, None));
+        }
+
+        assert_eq!(subscriptions.touch(ids[0]), (false, None));
+        assert_eq!(
+            subscriptions.touch(ids[MAX_AGENT_SUBSCRIPTIONS]),
+            (true, Some(ids[1]))
+        );
+        assert!(subscriptions.contains(ids[0]));
+    }
+
+    #[test]
+    fn stale_unsubscribe_ack_does_not_replace_new_subscription() {
+        let id = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+        let mut subscriptions = AgentSubscriptions::default();
+        subscriptions.unloaded.insert(id);
+        assert_eq!(subscriptions.touch(id), (true, None));
+
+        assert!(!subscriptions.mark_unloaded(id, rho_ui_proto::AgentUnloadReason::Unsubscribed,));
+        assert!(subscriptions.contains(id));
+        assert!(subscriptions.accepts_frames(id));
+    }
+
+    #[test]
+    fn daemon_idle_unload_is_authoritative() {
+        let id = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+        let mut subscriptions = AgentSubscriptions::default();
+        assert_eq!(subscriptions.touch(id), (true, None));
+
+        assert!(subscriptions.mark_unloaded(id, rho_ui_proto::AgentUnloadReason::Idle));
+        assert!(!subscriptions.contains(id));
+        assert!(!subscriptions.accepts_frames(id));
+    }
 
     #[test]
     fn parses_agent_role() {

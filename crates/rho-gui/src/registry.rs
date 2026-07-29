@@ -697,8 +697,8 @@ impl AgentRegistry {
         self.agents.insert(agent_id, AgentLife::Live) != Some(AgentLife::Live)
     }
 
-    pub fn is_live(&self, agent_id: AgentId) -> bool {
-        self.agents.get(&agent_id) == Some(&AgentLife::Live)
+    pub fn mark_not_live(&mut self, agent_id: AgentId) {
+        self.agents.insert(agent_id, AgentLife::Known);
     }
 
     pub fn active_pane(&self) -> ActivePane {
@@ -730,6 +730,7 @@ impl AgentRegistry {
     /// Cycles through live, rail-visible agents by `delta`, starting from
     /// the current selection. Cycling follows rail order (workstreams, then
     /// agents within each); agent id order is meaningless.
+    #[cfg(test)]
     pub fn next_live_agent(&self, delta: isize) -> Option<AgentId> {
         let live = self
             .rail_order()
@@ -748,6 +749,26 @@ impl AgentRegistry {
             .map(|index| (index as isize + delta).rem_euclid(len) as usize)
             .unwrap_or_else(|| if delta < 0 { live.len() - 1 } else { 0 });
         live.get(index).copied()
+    }
+
+    /// Cycles through every known rail-visible agent. Selecting a parked
+    /// result lets the workspace establish its connection-local subscription.
+    pub fn next_agent(&self, delta: isize) -> Option<AgentId> {
+        let agents = self
+            .rail_order()
+            .into_iter()
+            .filter(|agent_id| !self.agent_folded(*agent_id))
+            .collect::<Vec<_>>();
+        if agents.is_empty() {
+            return None;
+        }
+        let len = agents.len() as isize;
+        let index = self
+            .selected_agent()
+            .and_then(|selected| agents.iter().position(|agent_id| agent_id == selected))
+            .map(|index| (index as isize + delta).rem_euclid(len) as usize)
+            .unwrap_or_else(|| if delta < 0 { agents.len() - 1 } else { 0 });
+        agents.get(index).copied()
     }
 
     /// All agents in rail display order: pinned workstreams first, and within
@@ -1009,11 +1030,8 @@ impl AgentRegistry {
         })
     }
 
-    pub fn live_agents(&self) -> impl Iterator<Item = &AgentId> {
-        self.agents
-            .iter()
-            .filter(|(_, life)| **life == AgentLife::Live)
-            .map(|(agent_id, _)| agent_id)
+    pub fn known_agents(&self) -> impl Iterator<Item = &AgentId> {
+        self.agents.keys()
     }
 }
 

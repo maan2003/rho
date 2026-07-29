@@ -160,7 +160,11 @@ where
                     FromBrowser::Select { agent_id } => {
                         let Some(&agent_id) = agent_ids.get(&agent_id) else { continue };
                         selected = Some(agent_id);
-                        write_frame(&mut session_write, &ClientMessage::LoadAgent { agent_id }).await?;
+                        write_frame(
+                            &mut session_write,
+                            &ClientMessage::SubscribeAgent { agent_id },
+                        )
+                        .await?;
                         if let Some(state) = states.get(&agent_id) {
                             send_json(&mut writer, &ToBrowser::Agent {
                                 agent_id: agent_id.encoded(),

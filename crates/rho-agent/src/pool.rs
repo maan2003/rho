@@ -37,6 +37,9 @@ pub struct AgentPool {
     path_overrides: PathOverrides,
     user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
+    /// Per-id activation serialization; unrelated cold loads remain
+    /// concurrent, while one persisted agent can never restore two loops.
+    load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
     /// One shared handle per repo root: live-workspace sharing (joined
     /// agents get one checkout but retain separate View namespaces) only
     /// holds within one instance.
@@ -44,6 +47,8 @@ pub struct AgentPool {
     /// Fires for every agent created in this pool — including agents spawned
     /// by other agents — so every UI connection can pick them up.
     created: broadcast::Sender<AgentCreated>,
+    /// Fires when a persisted agent is activated in this pool.
+    activated: broadcast::Sender<AgentActivated>,
     /// Fires when a loaded agent completes a turn with a final answer.
     completed_turns: broadcast::Sender<AgentTurnCompleted>,
     /// Fires once for each fully-finished assistant message item.
@@ -59,6 +64,12 @@ pub struct AgentPool {
 #[derive(Clone)]
 pub struct AgentCreated {
     pub workstream: WorkstreamId,
+    pub agent_id: AgentId,
+    pub agent: RunningAgent,
+}
+
+#[derive(Clone)]
+pub struct AgentActivated {
     pub agent_id: AgentId,
     pub agent: RunningAgent,
 }
@@ -155,8 +166,10 @@ impl AgentPool {
             path_overrides,
             user_environment,
             agents: Mutex::new(HashMap::new()),
+            load_locks: Mutex::new(HashMap::new()),
             repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
+            activated: broadcast::channel(64).0,
             completed_turns: broadcast::channel(64).0,
             completed_assistant_items: broadcast::channel(64).0,
             accepted_inputs: broadcast::channel(64).0,
@@ -198,6 +211,10 @@ impl AgentPool {
 
     pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {
         self.created.subscribe()
+    }
+
+    pub fn subscribe_activated(&self) -> broadcast::Receiver<AgentActivated> {
+        self.activated.subscribe()
     }
 
     pub fn subscribe_completed_turns(&self) -> broadcast::Receiver<AgentTurnCompleted> {
@@ -296,32 +313,6 @@ impl AgentPool {
         agents
     }
 
-    pub async fn load_non_hidden_agents(self: &Arc<Self>) {
-        let agent_ids = self.non_hidden_agent_ids();
-        for agent_id in agent_ids {
-            if let Err(error) = self.load(agent_id).await {
-                eprintln!("rho-agent: failed to load active agent {agent_id:?}: {error:#}");
-            }
-        }
-    }
-
-    fn non_hidden_agent_ids(&self) -> Vec<AgentId> {
-        self.db
-            .read()
-            .list_agents()
-            .into_iter()
-            .filter(|(_, agent)| {
-                agent.role != AgentRole::Iris
-                    && !agent
-                        .labels
-                        .iter()
-                        .any(|label| label == crate::iris_tools::LABEL)
-                    && agent.disposition != AgentDisposition::Hidden
-            })
-            .map(|(agent_id, _)| agent_id)
-            .collect()
-    }
-
     pub async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
         self.agents.lock().await.get(&agent_id).cloned()
     }
@@ -386,6 +377,10 @@ impl AgentPool {
             }
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
+        let _ = self.activated.send(AgentActivated {
+            agent_id,
+            agent: agent.clone(),
+        });
         if config != AgentRole::Iris {
             let _ = self.created.send(AgentCreated {
                 workstream,
@@ -397,8 +392,9 @@ impl AgentPool {
     }
 
     /// Create a child agent for `parent` in the parent's mode, joining the
-    /// parent's workstream, and mail it its task. Returns once the child is
-    /// running. An empty `workdirs` forks the parent's whole working set.
+    /// parent's workstream, and mail it its task. Returns once the child has
+    /// accepted that task. An empty `workdirs` forks the parent's whole
+    /// working set.
     pub async fn spawn_child(
         self: &Arc<Self>,
         parent: AgentId,
@@ -481,7 +477,15 @@ impl AgentPool {
             .create_with_parent(workstream, config, Some(task_name), start, Some(parent))
             .await?;
         let parent_label = self.agent_handle(parent);
-        child.send_agent_message(parent, parent_label, prompt, MessageDelivery::NextRequest);
+        child
+            .send_agent_message_accepted(parent, parent_label, prompt, MessageDelivery::NextRequest)
+            .await
+            .with_context(|| {
+                format!(
+                    "created child {} but it did not accept its initial task",
+                    self.agent_handle(child_id)
+                )
+            })?;
         Ok(child_id)
     }
 
@@ -521,8 +525,8 @@ impl AgentPool {
         Ok(())
     }
 
-    /// Deliver inter-agent mail, loading the recipient first if needed so a
-    /// parked agent still hears follow-ups.
+    /// Deliver inter-agent mail, loading the recipient internally and waiting
+    /// until its loop accepts the input.
     pub async fn deliver_mail(
         self: &Arc<Self>,
         from: AgentId,
@@ -541,8 +545,9 @@ impl AgentPool {
                  to continue."
             ));
         }
-        agent.send_agent_message(from, sender_label, body, delivery);
-        Ok(())
+        agent
+            .send_agent_message_accepted(from, sender_label, body, delivery)
+            .await
     }
 
     /// Resolve an agent id string or prefix against all generated agent ids.
@@ -656,6 +661,18 @@ impl AgentPool {
         self: &Arc<Self>,
         agent_id: AgentId,
     ) -> anyhow::Result<(AgentId, RunningAgent, bool)> {
+        // Lazy loading makes concurrent UI subscriptions, mail, and
+        // integrations commonplace. Serialize this id through construction,
+        // then recheck after waiting so two loops cannot restore at the same
+        // event position. Other agents still load concurrently.
+        let load_lock = self
+            .load_locks
+            .lock()
+            .await
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _loading = load_lock.lock().await;
         if let Some(agent) = self.agents.lock().await.get(&agent_id).cloned() {
             return Ok((agent_id, agent, false));
         }
@@ -677,6 +694,10 @@ impl AgentPool {
             }
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
+        let _ = self.activated.send(AgentActivated {
+            agent_id,
+            agent: agent.clone(),
+        });
         Ok((agent_id, agent, true))
     }
 }
@@ -775,6 +796,29 @@ impl RunningAgent {
             Self::Claude(agent) => agent.send_user_message(format!(
                 "Message Type: MESSAGE\nSender: {sender_label}\nPayload:\n{body}"
             )),
+        }
+    }
+
+    pub async fn send_agent_message_accepted(
+        &self,
+        sender: AgentId,
+        sender_label: String,
+        body: String,
+        delivery: MessageDelivery,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Rho(agent) => {
+                agent
+                    .send_agent_message_accepted(sender, body, delivery)
+                    .await
+            }
+            Self::Claude(agent) => {
+                agent
+                    .send_agent_message_accepted(format!(
+                        "Message Type: MESSAGE\nSender: {sender_label}\nPayload:\n{body}"
+                    ))
+                    .await
+            }
         }
     }
 
