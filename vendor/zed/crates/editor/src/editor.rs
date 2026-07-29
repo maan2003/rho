@@ -205,8 +205,8 @@ use markdown::Markdown;
 use mouse_context_menu::MouseContextMenu;
 use movement::TextLayoutDetails;
 use multi_buffer::{
-    ExcerptBoundaryInfo, ExpandExcerptDirection, MultiBufferDiffHunk, MultiBufferPoint,
-    MultiBufferRow,
+    BufferRangesUpdate, ExcerptBoundaryInfo, ExpandExcerptDirection, MultiBufferDiffHunk,
+    MultiBufferPoint, MultiBufferRow,
 };
 use parking_lot::Mutex;
 use persistence::EditorDb;
@@ -1184,6 +1184,7 @@ pub struct Editor {
         Option<Box<dyn Fn(Point, &mut Window, &mut Context<Self>) + 'static>>,
     suppress_selection_callback: bool,
     applicable_language_settings: HashMap<Option<LanguageName>, LanguageSettings>,
+    bracket_colorization_enabled: bool,
     accent_data: Option<AccentData>,
     bracket_fetched_tree_sitter_chunks: HashMap<Range<text::Anchor>, HashSet<Range<BufferRow>>>,
     semantic_token_state: SemanticTokenState,
@@ -2494,6 +2495,7 @@ impl Editor {
             on_local_selections_changed: None,
             suppress_selection_callback: false,
             applicable_language_settings: HashMap::default(),
+            bracket_colorization_enabled: true,
             semantic_token_state: SemanticTokenState::new(cx, full_mode),
             accent_data: None,
             bracket_fetched_tree_sitter_chunks: HashMap::default(),
@@ -10057,6 +10059,9 @@ impl Editor {
                     path_key: path_key.clone(),
                 });
             }
+            multi_buffer::Event::BufferRangesUpdatedBatch { updates } => {
+                self.on_buffer_ranges_updated_batch(updates, window, cx);
+            }
             multi_buffer::Event::BuffersRemoved { removed_buffer_ids } => {
                 if let Some(inlay_hints) = &mut self.inlay_hints {
                     inlay_hints.remove_inlay_chunk_data(removed_buffer_ids);
@@ -10132,6 +10137,56 @@ impl Editor {
             }
             _ => {}
         };
+    }
+
+    fn on_buffer_ranges_updated_batch(
+        &mut self,
+        updates: &[BufferRangesUpdate],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if updates.is_empty() {
+            return;
+        }
+        self.invalidate_syntax_concealments(None);
+        if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
+            hovered_link_state.symbol_range = None;
+        }
+        self.refresh_document_highlights(cx);
+
+        let mut buffer_ids = HashSet::default();
+        for update in updates {
+            let buffer_id = update.buffer.read(cx).remote_id();
+            buffer_ids.insert(buffer_id);
+            if self.buffer.read(cx).diff_for(buffer_id).is_none()
+                && let Some(project) = &self.project
+            {
+                update_uncommitted_diff_for_buffer(
+                    cx.entity(),
+                    project,
+                    [update.buffer.clone()],
+                    self.buffer.clone(),
+                    cx,
+                )
+                .detach();
+            }
+            self.update_lsp_data(Some(buffer_id), window, cx);
+            self.semantic_token_state.invalidate_buffer(&buffer_id);
+            cx.emit(EditorEvent::BufferRangesUpdated {
+                buffer: update.buffer.clone(),
+                ranges: update.ranges.clone(),
+                path_key: update.path_key.clone(),
+            });
+        }
+
+        self.ensure_visible_buffer_syntax(cx);
+        self.register_visible_buffers(cx);
+        self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+        self.refresh_runnables(None, window, cx);
+        self.bracket_fetched_tree_sitter_chunks
+            .retain(|range, _| !buffer_ids.contains(&range.start.buffer_id));
+        self.colorize_brackets(false, cx);
+        self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
     }
 
     fn on_display_map_changed(

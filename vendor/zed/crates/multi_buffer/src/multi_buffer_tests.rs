@@ -2277,6 +2277,56 @@ fn test_set_excerpts_for_buffer_rename(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_set_excerpts_for_paths_batches_range_events(cx: &mut TestAppContext) {
+    let buffer_a = cx.new(|cx| Buffer::local("alpha\n", cx));
+    let buffer_b = cx.new(|cx| Buffer::local("beta\n", cx));
+    let path_a = PathKey::with_sort_prefix(0, rel_path("a").into_arc());
+    let path_b = PathKey::with_sort_prefix(1, rel_path("b").into_arc());
+    let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
+    let events: Arc<RwLock<Vec<Event>>> = Default::default();
+    multibuffer.update(cx, |_, cx| {
+        let events = events.clone();
+        cx.subscribe(&multibuffer, move |_, _, event, _| {
+            events.write().push(event.clone());
+        })
+        .detach();
+    });
+
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_paths(
+            [
+                (path_a, buffer_a, vec![Point::zero()..Point::new(1, 0)]),
+                (path_b, buffer_b, vec![Point::zero()..Point::new(1, 0)]),
+            ],
+            0,
+            cx,
+        );
+    });
+
+    assert_eq!(
+        multibuffer.read_with(cx, |buffer, cx| buffer.snapshot(cx).text()),
+        "alpha\n\nbeta\n"
+    );
+    let events = events.read();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::Edited { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::BufferRangesUpdated { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::BufferRangesUpdatedBatch { updates } if updates.len() == 2
+    )));
+}
+
+#[gpui::test]
 fn test_set_excerpts_for_path_replaces_previous_buffer(cx: &mut TestAppContext) {
     let buffer_a = cx.new(|cx| {
         Buffer::local(

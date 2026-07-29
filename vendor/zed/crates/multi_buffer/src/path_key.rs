@@ -10,9 +10,9 @@ use util::rel_path::RelPath;
 use ztracing::instrument;
 
 use crate::{
-    Anchor, BufferState, BufferStateSnapshot, DiffChangeKind, Event, Excerpt, ExcerptOffset,
-    ExcerptRange, ExcerptSummary, ExpandExcerptDirection, MultiBuffer, MultiBufferOffset,
-    PathKeyIndex, build_excerpt_ranges, remove_diff_state,
+    Anchor, BufferRangesUpdate, BufferState, BufferStateSnapshot, DiffChangeKind, Event, Excerpt,
+    ExcerptOffset, ExcerptRange, ExcerptSummary, ExpandExcerptDirection, MultiBuffer,
+    MultiBufferOffset, PathKeyIndex, build_excerpt_ranges, remove_diff_state,
 };
 
 #[derive(PartialEq, Eq, Ord, PartialOrd, Clone, Hash, Debug)]
@@ -95,6 +95,42 @@ impl MultiBuffer {
         let merged = Self::merge_excerpt_ranges(&excerpt_ranges);
         let (inserted, _path_key_index) =
             self.set_merged_excerpt_ranges_for_path(path, buffer, &buffer_snapshot, merged, cx);
+        inserted
+    }
+
+    /// Sets excerpts for multiple paths while emitting one aggregate update.
+    #[instrument(skip_all)]
+    pub fn set_excerpts_for_paths(
+        &mut self,
+        entries: impl IntoIterator<Item = (PathKey, Entity<Buffer>, Vec<Range<Point>>)>,
+        context_line_count: u32,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut updates = Vec::new();
+        let mut inserted = false;
+        for (path, buffer, ranges) in entries {
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            let excerpt_ranges = build_excerpt_ranges(ranges, context_line_count, &buffer_snapshot);
+            let merged = Self::merge_excerpt_ranges(&excerpt_ranges);
+            inserted |= self
+                .set_merged_excerpt_ranges_for_path_with_updates(
+                    path,
+                    buffer,
+                    &buffer_snapshot,
+                    merged,
+                    Some(&mut updates),
+                    cx,
+                )
+                .0;
+        }
+        if !updates.is_empty() {
+            cx.emit(Event::Edited {
+                edited_buffer: None,
+                source: BufferEditSource::User,
+            });
+            cx.emit(Event::BufferRangesUpdatedBatch { updates });
+            cx.notify();
+        }
         inserted
     }
 
@@ -329,6 +365,28 @@ impl MultiBuffer {
     where
         T: language::ToOffset,
     {
+        self.set_merged_excerpt_ranges_for_path_with_updates(
+            path,
+            buffer,
+            buffer_snapshot,
+            new,
+            None,
+            cx,
+        )
+    }
+
+    fn set_merged_excerpt_ranges_for_path_with_updates<T>(
+        &mut self,
+        path: PathKey,
+        buffer: Entity<Buffer>,
+        buffer_snapshot: &BufferSnapshot,
+        new: Vec<ExcerptRange<T>>,
+        updates: Option<&mut Vec<BufferRangesUpdate>>,
+        cx: &mut Context<Self>,
+    ) -> (bool, PathKeyIndex)
+    where
+        T: language::ToOffset,
+    {
         let anchor_ranges = new
             .into_iter()
             .map(|r| ExcerptRange {
@@ -338,8 +396,14 @@ impl MultiBuffer {
                     ..buffer_snapshot.anchor_after(r.primary.end),
             })
             .collect::<Vec<_>>();
-        let inserted =
-            self.update_path_excerpts(path.clone(), buffer, buffer_snapshot, &anchor_ranges, cx);
+        let inserted = self.update_path_excerpts_(
+            path.clone(),
+            buffer,
+            buffer_snapshot,
+            &anchor_ranges,
+            updates,
+            cx,
+        );
         let path_key_index = self.get_or_create_path_key_index(&path);
         (inserted, path_key_index)
     }
@@ -364,6 +428,18 @@ impl MultiBuffer {
         buffer: Entity<Buffer>,
         buffer_snapshot: &BufferSnapshot,
         to_insert: &Vec<ExcerptRange<text::Anchor>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.update_path_excerpts_(path_key, buffer, buffer_snapshot, to_insert, None, cx)
+    }
+
+    fn update_path_excerpts_(
+        &mut self,
+        path_key: PathKey,
+        buffer: Entity<Buffer>,
+        buffer_snapshot: &BufferSnapshot,
+        to_insert: &Vec<ExcerptRange<text::Anchor>>,
+        mut updates: Option<&mut Vec<BufferRangesUpdate>>,
         cx: &mut Context<Self>,
     ) -> bool {
         let path_key_index = self.get_or_create_path_key_index(&path_key);
@@ -599,16 +675,24 @@ impl MultiBuffer {
         );
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
-            cx.emit(Event::Edited {
-                edited_buffer: None,
-                source: BufferEditSource::User,
-            });
-            cx.emit(Event::BufferRangesUpdated {
-                buffer,
-                path_key: path_key.clone(),
-                ranges: new_ranges,
-            });
-            cx.notify();
+            if let Some(updates) = updates.as_mut() {
+                updates.push(BufferRangesUpdate {
+                    buffer,
+                    path_key: path_key.clone(),
+                    ranges: new_ranges,
+                });
+            } else {
+                cx.emit(Event::Edited {
+                    edited_buffer: None,
+                    source: BufferEditSource::User,
+                });
+                cx.emit(Event::BufferRangesUpdated {
+                    buffer,
+                    path_key: path_key.clone(),
+                    ranges: new_ranges,
+                });
+                cx.notify();
+            }
         }
 
         added_new_excerpt

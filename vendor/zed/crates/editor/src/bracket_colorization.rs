@@ -16,8 +16,18 @@ use theme::{Appearance, Oklab, Oklch, hsla_to_oklab, hsla_to_oklch, oklch_to_hsl
 use ui::utils::apca_contrast;
 
 impl Editor {
+    pub fn disable_bracket_colorization(&mut self, cx: &mut Context<Editor>) {
+        self.bracket_colorization_enabled = false;
+        self.colorize_brackets_task = gpui::Task::ready(());
+        self.bracket_fetched_tree_sitter_chunks.clear();
+        self.clear_highlights_with(
+            &mut |key| matches!(key, HighlightKey::ColorizeBracket(_)),
+            cx,
+        );
+    }
+
     pub(crate) fn colorize_brackets(&mut self, invalidate: bool, cx: &mut Context<Editor>) {
-        if !self.mode.is_full() {
+        if !self.mode.is_full() || !self.bracket_colorization_enabled {
             return;
         }
 

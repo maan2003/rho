@@ -214,6 +214,7 @@ impl GitBlame {
                     }
                 }
                 multi_buffer::Event::BufferRangesUpdated { .. }
+                | multi_buffer::Event::BufferRangesUpdatedBatch { .. }
                 | multi_buffer::Event::BuffersEdited { .. } => git_blame.regenerate_on_edit(cx),
                 _ => {}
             },

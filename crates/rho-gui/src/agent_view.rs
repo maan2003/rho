@@ -145,6 +145,7 @@ impl AgentModel {
                 cx,
             );
             crate::editor_config::configure(&mut editor, window, cx);
+            editor.disable_bracket_colorization(cx);
             editor.disable_header_for_buffer(system_id, cx);
             editor.set_read_only(true);
             editor.set_autoscroll_pin(multi_buffer::Anchor::Max, AutoscrollStrategy::Bottom, cx);
@@ -183,6 +184,7 @@ impl AgentModel {
                 cx,
             );
             crate::editor_config::configure(&mut editor, window, cx);
+            editor.disable_bracket_colorization(cx);
             editor.disable_header_for_buffer(system_id, cx);
             editor.disable_header_for_buffer(prompt_id, cx);
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(

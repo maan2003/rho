@@ -95,11 +95,21 @@ pub struct MultiBuffer {
 struct PathKeyIndex(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferRangesUpdate {
+    pub buffer: Entity<Buffer>,
+    pub path_key: PathKey,
+    pub ranges: Vec<ExcerptRange<text::Anchor>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     BufferRangesUpdated {
         buffer: Entity<Buffer>,
         path_key: PathKey,
         ranges: Vec<ExcerptRange<text::Anchor>>,
+    },
+    BufferRangesUpdatedBatch {
+        updates: Vec<BufferRangesUpdate>,
     },
     BuffersRemoved {
         removed_buffer_ids: Vec<BufferId>,

@@ -525,43 +525,46 @@ impl TranscriptModel {
 
     fn reset_full_excerpts<V: 'static>(&self, cx: &mut Context<V>) {
         let last = self.buffers.iter().rposition(|turn| turn.composed);
-        self.multi_buffer.update(cx, |multi_buffer, cx| {
-            for (index, turn) in self.buffers.iter().enumerate() {
-                if !turn.composed {
-                    continue;
-                }
+        let entries = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, turn)| turn.composed)
+            .map(|(index, turn)| {
                 let buffer = turn.buffer.read(cx);
                 let end = if Some(index) == last {
                     prompt_gap_excerpt_end(buffer)
                 } else {
                     composed_excerpt_end(buffer)
                 };
-                multi_buffer.set_excerpts_for_path(
+                (
                     transcript_path(turn.start_block),
                     turn.buffer.clone(),
-                    [Point::zero()..end],
-                    0,
-                    cx,
-                );
-            }
+                    vec![Point::zero()..end],
+                )
+            })
+            .collect::<Vec<_>>();
+        self.multi_buffer.update(cx, |multi_buffer, cx| {
+            multi_buffer.set_excerpts_for_paths(entries, 0, cx);
         });
     }
 
     fn reset_document_excerpts<V: 'static>(&self, cx: &mut Context<V>) {
-        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
-            for turn in &self.buffers {
-                if !turn.composed {
-                    continue;
-                }
+        let entries = self
+            .buffers
+            .iter()
+            .filter(|turn| turn.composed)
+            .map(|turn| {
                 let buffer = turn.buffer.read(cx);
-                multi_buffer.set_excerpts_for_path(
+                (
                     transcript_path(turn.start_block),
                     turn.buffer.clone(),
-                    [Point::zero()..composed_excerpt_end(buffer)],
-                    0,
-                    cx,
-                );
-            }
+                    vec![Point::zero()..composed_excerpt_end(buffer)],
+                )
+            })
+            .collect::<Vec<_>>();
+        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
+            multi_buffer.set_excerpts_for_paths(entries, 0, cx);
         });
     }
 
