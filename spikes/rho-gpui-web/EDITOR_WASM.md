@@ -383,6 +383,9 @@ the implementation crate.
 - Scrolling and anchors remain portable. Context-menu/edit-prediction reset
   hooks and workspace persistence identifiers are now native contributions
   around the shared scroll manager, leaving 128 errors.
+- Clipboard string data and selection metadata, including real cut/copy/paste
+  buffer edits, remain portable. Completion/edit-prediction triggers and the
+  project-worktree Markdown image-paste path are native-only, leaving 124.
 
 ### Reproduction
 

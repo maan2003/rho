@@ -94,6 +94,7 @@ impl Editor {
         let clipboard_text = Cow::Borrowed(text.as_str());
 
         self.transact(window, cx, |this, window, cx| {
+            #[cfg(feature = "native")]
             let had_active_edit_prediction = this.has_active_edit_prediction();
             let display_map = this.display_snapshot(cx);
             let old_selections = this.selections.all::<MultiBufferOffset>(&display_map);
@@ -262,9 +263,11 @@ impl Editor {
             // | ..                  |   true        true
             // | had_edit_prediction |   false       true
 
+            #[cfg(feature = "native")]
             let trigger_in_words =
                 this.show_edit_predictions_in_menu() || !had_active_edit_prediction;
 
+            #[cfg(feature = "native")]
             this.trigger_completion_on_input(text, trigger_in_words, window, cx);
         });
     }
@@ -285,11 +288,13 @@ impl Editor {
             return;
         }
 
+        #[cfg(feature = "native")]
         let clipboard_image = item.entries().iter().find_map(|entry| match entry {
             ClipboardEntry::Image(image) if !image.bytes.is_empty() => Some(image),
             _ => None,
         });
 
+        #[cfg(feature = "native")]
         if let Some(image) = clipboard_image {
             let is_markdown = {
                 let display_map = self.display_snapshot(cx);
@@ -357,6 +362,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     fn insert_image_snippet(
         &mut self,
         filename: &str,
