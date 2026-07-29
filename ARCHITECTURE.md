@@ -354,7 +354,10 @@ clients do not depend on the agent runtime or inherit its optional features.
 Daemon startup reads lightweight agent summaries but does not restore every
 transcript. Runtime activation is internal daemon policy and serialized per
 pool so concurrent UI subscriptions, mail, and integrations cannot construct
-duplicate loops. Each UI control connection independently subscribes and
+duplicate loops. Before returning a newly activated runtime, the pool awaits a
+daemon-installed observer that consumes its initial state and arms the
+attention watcher; integrations start only after that observer is installed.
+Each UI control connection independently subscribes and
 unsubscribes agent state; activation does not imply observation by any GUI.
 `Ready` derives parked-agent attention from persisted disposition alone.
 Error and unfinished-turn states are live runtime detail rather than durable

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt as _;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use rho_db::RhoDb;
 use rho_inference::Inference;
@@ -47,8 +48,9 @@ pub struct AgentPool {
     /// Fires for every agent created in this pool — including agents spawned
     /// by other agents — so every UI connection can pick them up.
     created: broadcast::Sender<AgentCreated>,
-    /// Fires when a persisted agent is activated in this pool.
-    activated: broadcast::Sender<AgentActivated>,
+    /// Synchronously pre-arms daemon-owned observation before a newly loaded
+    /// runtime is returned to callers that may immediately start work.
+    activation_observer: std::sync::RwLock<Option<Arc<ActivationObserver>>>,
     /// Fires when a loaded agent completes a turn with a final answer.
     completed_turns: broadcast::Sender<AgentTurnCompleted>,
     /// Fires once for each fully-finished assistant message item.
@@ -68,11 +70,7 @@ pub struct AgentCreated {
     pub agent: RunningAgent,
 }
 
-#[derive(Clone)]
-pub struct AgentActivated {
-    pub agent_id: AgentId,
-    pub agent: RunningAgent,
-}
+pub type ActivationObserver = dyn Fn(AgentId, RunningAgent) -> BoxFuture<'static, ()> + Send + Sync;
 
 /// Broadcast when an agent completes a turn.
 #[derive(Clone, Debug)]
@@ -169,7 +167,7 @@ impl AgentPool {
             load_locks: Mutex::new(HashMap::new()),
             repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
-            activated: broadcast::channel(64).0,
+            activation_observer: std::sync::RwLock::new(None),
             completed_turns: broadcast::channel(64).0,
             completed_assistant_items: broadcast::channel(64).0,
             accepted_inputs: broadcast::channel(64).0,
@@ -213,8 +211,15 @@ impl AgentPool {
         self.created.subscribe()
     }
 
-    pub fn subscribe_activated(&self) -> broadcast::Receiver<AgentActivated> {
-        self.activated.subscribe()
+    pub fn set_activation_observer(&self, observer: Arc<ActivationObserver>) {
+        *self.activation_observer.write().expect("poison") = Some(observer);
+    }
+
+    async fn observe_activation(&self, agent_id: AgentId, agent: RunningAgent) {
+        let observer = self.activation_observer.read().expect("poison").clone();
+        if let Some(observer) = observer {
+            observer(agent_id, agent).await;
+        }
     }
 
     pub fn subscribe_completed_turns(&self) -> broadcast::Receiver<AgentTurnCompleted> {
@@ -377,10 +382,7 @@ impl AgentPool {
             }
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
-        let _ = self.activated.send(AgentActivated {
-            agent_id,
-            agent: agent.clone(),
-        });
+        self.observe_activation(agent_id, agent.clone()).await;
         if config != AgentRole::Iris {
             let _ = self.created.send(AgentCreated {
                 workstream,
@@ -694,10 +696,7 @@ impl AgentPool {
             }
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
-        let _ = self.activated.send(AgentActivated {
-            agent_id,
-            agent: agent.clone(),
-        });
+        self.observe_activation(agent_id, agent.clone()).await;
         Ok((agent_id, agent, true))
     }
 }

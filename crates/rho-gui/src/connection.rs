@@ -1477,9 +1477,12 @@ async fn run_agent_streams(
                             anyhow::bail!("invalid message on agent stream");
                         };
                         anyhow::ensure!(frame_agent_id == agent_id, "agent stream id changed");
-                        if generations.lock().await.get(&agent_id) != Some(&generation) {
+                        let generations = generations.lock().await;
+                        if generations.get(&agent_id) != Some(&generation) {
                             continue;
                         }
+                        // Keep generation validation and enqueue atomic with
+                        // respect to a replacement stream registering itself.
                         if events
                             .unbounded_send(ConnEvent::Frame {
                                 agent_id,
@@ -1490,6 +1493,7 @@ async fn run_agent_streams(
                         {
                             return Ok(());
                         }
+                        drop(generations);
                     }
                     #[allow(unreachable_code)]
                     Ok::<(), anyhow::Error>(())

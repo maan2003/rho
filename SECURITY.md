@@ -197,9 +197,10 @@ AI APIs.
 - Inter-agent mail activates parked recipients internally and waits for the
   recipient loop to accept the input; it never creates a GUI subscription.
   Native Rho acknowledges only after committing the queued event, so successful
-  delivery survives daemon restart. Claude acknowledges process-local queue
-  acceptance without a separate RhoDB mailbox; a daemon restart before Claude
-  records the input may lose that rare queued message by design.
+  delivery survives daemon restart. Claude acknowledges only after writing the
+  input to its live CLI process, but has no separate RhoDB mailbox; a daemon or
+  CLI crash after that write but before Claude records the input may lose that
+  rare message by design.
 
 ## Remote UI transports (iroh and web UI)
 

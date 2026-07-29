@@ -600,9 +600,6 @@ impl ClaudeLoop {
                     self.stream_items.clear();
                     self.set_streaming_kind();
                 }
-                if let Some(accepted) = accepted {
-                    let _ = accepted.send(Ok(()));
-                }
                 if let Err(error) = self
                     .process
                     .as_mut()
@@ -610,7 +607,12 @@ impl ClaudeLoop {
                     .send_user_content_with_uuid((*content).clone(), uuid)
                     .await
                 {
+                    if let Some(accepted) = accepted {
+                        let _ = accepted.send(Err(anyhow::anyhow!("{error:#}")));
+                    }
                     self.fail(error);
+                } else if let Some(accepted) = accepted {
+                    let _ = accepted.send(Ok(()));
                 }
             }
             ClaudeControl::SetEffort { effort, reply } => {

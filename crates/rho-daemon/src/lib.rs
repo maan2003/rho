@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use rho_agent::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentUsageProvider,
     AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider, WorkstreamId,
@@ -349,7 +349,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .await?,
     );
     agents.install_iris_tool_host();
-    agents.resume_platform_integrations();
     spawn_chatgpt_quota_poller(quota_auth_name, agents.db.clone(), agents.events.clone());
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
@@ -392,58 +391,41 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         tokio::spawn(run_iroh_listener(agents.clone(), endpoint, iroh_auth));
     }
 
-    // Attention watchers are daemon-owned, independent of UI subscriptions.
-    // Subscribe before snapshotting the loaded set so internal activations
-    // (mail and integrations included) cannot slip through the handoff.
-    let mut activated_rx = agents.pool.subscribe_activated();
-    let watched_agents = Arc::new(Mutex::new(HashSet::new()));
-    for (agent_id, agent) in agents.loaded().await {
-        watched_agents.lock().await.insert(agent_id);
-        spawn_attention_watcher(
-            agents.pool.clone(),
-            agents.db.clone(),
-            agents.events.clone(),
-            agent_id,
-            agent,
-        );
-    }
-    {
-        let pool = agents.pool.clone();
+    // Attention watchers are daemon-owned and pre-armed synchronously by the
+    // pool before any activation caller can start work on the returned agent.
+    // The weak pool reference avoids a pool -> observer -> pool cycle.
+    let watched_agents = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let activation_observer: Arc<rho_agent::pool::ActivationObserver> = {
+        let pool = Arc::downgrade(&agents.pool);
         let db = agents.db.clone();
         let events = agents.events.clone();
         let watched_agents = watched_agents.clone();
-        tokio::spawn(async move {
-            loop {
-                match activated_rx.recv().await {
-                    Ok(activated) => {
-                        if watched_agents.lock().await.insert(activated.agent_id) {
-                            spawn_attention_watcher(
-                                pool.clone(),
-                                db.clone(),
-                                events.clone(),
-                                activated.agent_id,
-                                activated.agent,
-                            );
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        for (agent_id, agent) in pool.loaded().await {
-                            if watched_agents.lock().await.insert(agent_id) {
-                                spawn_attention_watcher(
-                                    pool.clone(),
-                                    db.clone(),
-                                    events.clone(),
-                                    agent_id,
-                                    agent,
-                                );
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+        Arc::new(move |agent_id, agent| {
+            let pool = pool.clone();
+            let db = db.clone();
+            let events = events.clone();
+            let watched_agents = watched_agents.clone();
+            async move {
+                if !watched_agents.lock().expect("poison").insert(agent_id) {
+                    return;
                 }
+                let Some(pool) = pool.upgrade() else {
+                    return;
+                };
+                spawn_attention_watcher(pool, db, events, agent_id, agent).await;
             }
-        });
+            .boxed()
+        })
+    };
+    agents
+        .pool
+        .set_activation_observer(activation_observer.clone());
+    for (agent_id, agent) in agents.loaded().await {
+        activation_observer(agent_id, agent).await;
     }
+    // Integrations can activate and immediately mail agents, so resume them
+    // only after the activation observer is installed.
+    agents.resume_platform_integrations();
     // Re-arm snooze wake-ups that were pending when the daemon last stopped.
     for (agent_id, agent) in agents.db.read().list_agents() {
         if let AgentDisposition::Snoozed { until } = agent.disposition
@@ -2059,24 +2041,31 @@ fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition)
 ///
 /// Sub-agents (a parent spawned them) get Working broadcasts but no turn-end
 /// records: their finished turns are the parent's court, not the user's.
-fn spawn_attention_watcher(
+async fn spawn_attention_watcher(
     pool: Arc<AgentPool>,
     db: RhoDb,
     events: broadcast::Sender<ServerMessage>,
     agent_id: AgentId,
     agent: RunningAgent,
 ) {
+    let (ready_tx, ready_rx) = oneshot::channel();
     tokio::spawn(async move {
         let runtime_publishes_completion = matches!(&agent, RunningAgent::Rho(_));
         let is_child = db.read().get_agent(agent_id).parent_agent.is_some();
         let changes = agent.subscribe();
         futures::pin_mut!(changes);
-        let initial_state = agent.state();
+        let Some(initial_state) = changes.next().await else {
+            let _ = ready_tx.send(());
+            return;
+        };
         let mut was_working = initial_state.kind.is_working();
         let mut last_reported_response_count = inference_response_count(&initial_state);
         let mut last_sent = None;
         let mut last_quota = None;
-        while let Some(state) = changes.next().await {
+        let states = futures::stream::once(async move { initial_state }).chain(changes);
+        futures::pin_mut!(states);
+        let mut ready_tx = Some(ready_tx);
+        while let Some(state) = states.next().await {
             if state.quota_observation != last_quota {
                 last_quota = state.quota_observation.clone();
                 if let Some(observation) = &state.quota_observation {
@@ -2137,8 +2126,12 @@ fn spawn_attention_watcher(
                 });
                 last_sent = Some(attention);
             }
+            if let Some(ready_tx) = ready_tx.take() {
+                let _ = ready_tx.send(());
+            }
         }
     });
+    let _ = ready_rx.await;
 }
 
 fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
@@ -2867,15 +2860,6 @@ async fn handle_message(
             disposition,
         } => {
             agents.set_disposition(agent_id, disposition).await;
-            if disposition != AgentDisposition::Hidden
-                && let Some(agent_streams) = agent_streams
-                && let Some(agent) = agents.get(agent_id).await
-                && let Err(error) = agent_streams.ensure(agent_id, agent).await
-            {
-                let _ = outgoing_tx.send(ServerMessage::Error {
-                    message: error.to_string(),
-                });
-            }
             // Hidden changes what the rail folds, which clients read off
             // summaries; attention alone travels on its own broadcast.
             if disposition == AgentDisposition::Hidden {
