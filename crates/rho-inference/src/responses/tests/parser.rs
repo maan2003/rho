@@ -278,15 +278,23 @@ fn does_not_classify_user_actionable_stream_errors_for_retry() {
     .unwrap_err();
 
     assert!(!super::is_transient_turn_error(&error));
+
+    assert!(!super::is_transient_turn_error(&anyhow::anyhow!(
+        "temporarily unavailable; try again"
+    )));
 }
 
 #[test]
-fn transient_retry_backoff_matches_codex_jittered_exponential() {
+fn transient_retry_backoff_uses_capped_jittered_fibonacci() {
     let first = super::transient_backoff(1);
     let second = super::transient_backoff(2);
     let third = super::transient_backoff(3);
+    let seventeenth = super::transient_backoff(17);
+    let eighteenth = super::transient_backoff(18);
 
-    assert!((Duration::from_millis(180)..Duration::from_millis(220)).contains(&first));
-    assert!((Duration::from_millis(360)..Duration::from_millis(440)).contains(&second));
-    assert!((Duration::from_millis(720)..Duration::from_millis(880)).contains(&third));
+    assert!((Duration::from_millis(900)..Duration::from_millis(1100)).contains(&first));
+    assert!((Duration::from_millis(900)..Duration::from_millis(1100)).contains(&second));
+    assert!((Duration::from_millis(1800)..Duration::from_millis(2200)).contains(&third));
+    assert!((Duration::from_secs(1437)..Duration::from_secs(1757)).contains(&seventeenth));
+    assert!((Duration::from_secs(1620)..=Duration::from_secs(1800)).contains(&eighteenth));
 }

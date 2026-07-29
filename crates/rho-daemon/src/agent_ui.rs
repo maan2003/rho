@@ -217,12 +217,21 @@ fn ui_status(kind: &AgentStateKind) -> UiAgentStatus {
 fn in_flight_blocks(kind: &AgentStateKind) -> Vec<UiBlock> {
     match kind {
         AgentStateKind::ApiStreaming {
-            pending_response, ..
-        } => pending_response
-            .items
-            .iter()
-            .filter_map(streaming_block)
-            .collect(),
+            pending_response,
+            previous_attempt,
+        } => {
+            let mut blocks = Vec::new();
+            if let Some(failure) = previous_attempt {
+                blocks.push(UiBlock::Notice {
+                    text: format!(
+                        "temporary inference error (attempt {}): {}; retrying",
+                        failure.attempt_count, failure.error
+                    ),
+                });
+            }
+            blocks.extend(pending_response.items.iter().filter_map(streaming_block));
+            blocks
+        }
         AgentStateKind::Error(failure) => {
             let mut blocks = failure
                 .partial_response
@@ -743,12 +752,31 @@ mod tests {
         assert_eq!(
             blocks.updates,
             [UiBlockUpdate {
-                index: 0,
+                index: 1,
                 block: UiBlockDiff::AssistantText(UiTextDiff {
                     keep_bytes: 3,
                     value: "lo".to_owned(),
                 }),
             }]
+        );
+    }
+
+    #[test]
+    fn retry_streaming_displays_temporary_failure() {
+        let state = project_agent_state(&retry_streaming_state("retry response"));
+        assert_eq!(state.status, UiAgentStatus::Streaming);
+        assert_eq!(
+            state.blocks,
+            [
+                UiBlock::Notice {
+                    text: "temporary inference error (attempt 1): temporary failure; retrying"
+                        .to_owned(),
+                },
+                UiBlock::AssistantMessage {
+                    text: "retry response".to_owned(),
+                    phase: None,
+                },
+            ]
         );
     }
 

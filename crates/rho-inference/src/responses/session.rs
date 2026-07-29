@@ -88,6 +88,8 @@ struct Turn {
     raw_events: Vec<serde_json::Value>,
     /// Transient provider/transport retry count for this turn.
     retry_attempts: u32,
+    /// The point after which transient failures become terminal.
+    retry_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -532,6 +534,7 @@ impl SessionTask {
             debug_sequence: None,
             raw_events: Vec::new(),
             retry_attempts: 0,
+            retry_deadline: None,
         });
     }
 
@@ -791,17 +794,24 @@ impl SessionTask {
                 error,
                 retrying_at: Instant::now(),
             }
-        } else if self.turn.is_some()
-            && is_transient_turn_error(&error)
-            && self
+        } else if self.turn.is_some() && is_transient_turn_error(&error) {
+            let now = Instant::now();
+            let deadline = *self
                 .turn
-                .as_ref()
-                .is_some_and(|turn| turn.retry_attempts < MAX_TRANSIENT_RETRIES)
-        {
+                .as_mut()
+                .unwrap()
+                .retry_deadline
+                .get_or_insert(now + TRANSIENT_RETRY_WINDOW);
+            if now >= deadline {
+                self.turn = None;
+                self.connection = None;
+                return ErrorAction::Fail(error);
+            }
+            let remaining = deadline - now;
             let turn = self.turn.as_mut().unwrap();
             turn.retry_attempts += 1;
-            let delay = transient_backoff(turn.retry_attempts);
-            let retrying_at = Instant::now() + delay;
+            let delay = transient_backoff(turn.retry_attempts).min(remaining);
+            let retrying_at = now + delay;
             let replay = match turn.phase {
                 TurnPhase::Queued { replay, .. } | TurnPhase::InFlight { replay, .. } => replay,
             };
@@ -963,9 +973,8 @@ enum ErrorAction {
     Fail(anyhow::Error),
 }
 
-const MAX_TRANSIENT_RETRIES: u32 = 5;
-const TRANSIENT_INITIAL_DELAY_MS: u64 = 200;
-const TRANSIENT_BACKOFF_FACTOR: f64 = 2.0;
+const TRANSIENT_RETRY_WINDOW: Duration = Duration::from_secs(8 * 60 * 60);
+const TRANSIENT_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) fn redact_image_data(value: &mut serde_json::Value) {
     match value {
@@ -983,10 +992,16 @@ pub(crate) fn redact_image_data(value: &mut serde_json::Value) {
 }
 
 pub(crate) fn transient_backoff(attempt: u32) -> Duration {
-    let exp = TRANSIENT_BACKOFF_FACTOR.powi(attempt.saturating_sub(1) as i32);
-    let base = (TRANSIENT_INITIAL_DELAY_MS as f64 * exp) as u64;
+    let mut previous = 1_u64;
+    let mut current = 1_u64;
+    for _ in 2..attempt {
+        let next = previous.saturating_add(current);
+        previous = current;
+        current = next;
+    }
+    let base = Duration::from_secs(current).min(TRANSIENT_MAX_DELAY);
     let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), 0.9..1.1);
-    Duration::from_millis((base as f64 * jitter) as u64)
+    base.mul_f64(jitter).min(TRANSIENT_MAX_DELAY)
 }
 
 pub(crate) fn is_transient_turn_error(error: &anyhow::Error) -> bool {
@@ -999,8 +1014,6 @@ pub(crate) fn is_transient_turn_error(error: &anyhow::Error) -> bool {
         "service_unavailable",
         "server_error",
         "internal_server_error",
-        "temporarily unavailable",
-        "try again",
         "timed out",
         "timeout",
         "websocket ended before response.completed",

@@ -40,9 +40,9 @@ manages file-backed OAuth credentials.
 - Unbounded memory/task growth: inference streams should apply backpressure and
   stop promptly when the returned stream is dropped.
 - Transient provider/transport stream failures (for example overload, rate
-  limit, temporary unavailability, and mid-turn WebSocket loss) are retried in
-  the active turn with bounded exponential backoff before surfacing a terminal
-  failure.
+  limit, and mid-turn WebSocket loss) are retried in the active turn for up to
+  eight hours with jittered Fibonacci backoff capped at 30 minutes before
+  surfacing a terminal failure.
 - Responses protocol drift or malformed events: event parsing should ignore
   unknown/malformed non-terminal events, surface terminal error/incomplete
   events, and preserve provider items needed for replay.
