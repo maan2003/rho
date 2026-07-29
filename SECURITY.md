@@ -271,12 +271,10 @@ AI APIs.
   accepts only a nonempty shell-safe path alphabet; it is not an arbitrary
   remote shell command.
 - The web UI (a static Leptos/wasm page in `webui/`, hostable anywhere) is
-  an iroh client like any other: it connects to the same endpoint on its own
-  ALPN and passes the same per-key enrollment before the daemon serves it.
-  Its session is a reduced JSON command set (list/select agents, send
-  message, new agent in a registered workdir, cancel turn) bridged onto a
-  normal in-process UI protocol session; it grants nothing the full UI
-  protocol does not. The browser uses a user-verifying WebAuthn credential's
+  an iroh client like any other: it connects on the native UI ALPN and passes
+  the same per-key enrollment before the daemon serves it. Its session uses
+  the same framed native UI protocol and therefore has the same privileges as
+  the native GUI. The browser uses a user-verifying WebAuthn credential's
   PRF extension to derive a stable, daemon-specific iroh key on each connect;
   only the non-secret credential id and daemon id are kept in local storage.
   The PRF output and derived iroh key remain in browser memory and are never
@@ -297,10 +295,9 @@ AI APIs.
   the local daemon socket; already-established connections are not forcibly
   closed and must be disconnected (or the daemon restarted) during compromise
   recovery. In-memory trust is always lost when the daemon exits.
-- Inbound data on both ALPNs is remote, semi-trusted input: oversized UI
-  protocol frames are rejected (`MAX_FRAME_LEN`), web UI JSON lines are
-  length-bounded (`MAX_LINE_LEN`), malformed frames end the connection, and
-  malformed browser JSON produces an error message, never a panic.
+- Inbound data on the iroh ALPN is remote, semi-trusted input: oversized UI
+  protocol frames are rejected (`MAX_FRAME_LEN`) and malformed frames end the
+  connection.
 - An authenticated native UI client may request a diff for any workspace it
   can already open through the fully privileged UI protocol. A refresh is a
   persistent jj write: it snapshots that workspace and descendant workspace

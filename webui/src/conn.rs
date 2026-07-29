@@ -1,6 +1,5 @@
-//! Iroh connection to the daemon: newline-delimited JSON on the
-//! [`rho_webui_messages::ALPN`] bi-stream, enrollment code display while the
-//! daemon waits for `rho iroh approve`.
+//! Iroh connection to the daemon's native UI protocol, with enrollment code
+//! display while the daemon waits for `rho iroh approve`.
 
 use std::cell::RefCell;
 use std::str::FromStr as _;
@@ -12,7 +11,7 @@ use iroh::EndpointId;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use rho_webui_messages::{FromBrowser, MAX_LINE_LEN, ToBrowser};
+use rho_ui_proto::{ClientMessage, ServerMessage};
 use sha2::{Digest as _, Sha256};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -31,13 +30,13 @@ const MAX_CREDENTIAL_ID_LEN: usize = 1024;
 
 thread_local! {
     /// Held until a daemon id is known (typed in or from the URL).
-    static PENDING_RECEIVER: RefCell<Option<UnboundedReceiver<FromBrowser>>> =
+    static PENDING_RECEIVER: RefCell<Option<UnboundedReceiver<ClientMessage>>> =
         const { RefCell::new(None) };
 }
 
 /// Start connecting if the page already knows a daemon id, otherwise wait
 /// for [`set_daemon`].
-pub fn init(app: App, receiver: UnboundedReceiver<FromBrowser>) {
+pub fn init(app: App, receiver: UnboundedReceiver<ClientMessage>) {
     PENDING_RECEIVER.with(|cell| *cell.borrow_mut() = Some(receiver));
     if !matches!(app.phase.get_untracked(), Phase::Failed(_))
         && let Some(daemon) = daemon_id_from_page()
@@ -126,7 +125,7 @@ fn start(app: App, daemon: String) {
 async fn run(
     app: App,
     daemon: &str,
-    mut receiver: UnboundedReceiver<FromBrowser>,
+    mut receiver: UnboundedReceiver<ClientMessage>,
 ) -> anyhow::Result<()> {
     let daemon = EndpointId::from_str(daemon.trim())
         .map_err(|error| anyhow::anyhow!("invalid daemon endpoint id: {error}"))?;
@@ -136,7 +135,7 @@ async fn run(
         .await
         .map_err(|error| anyhow::anyhow!("bind iroh endpoint: {error}"))?;
     let connection = endpoint
-        .connect(daemon, rho_webui_messages::ALPN)
+        .connect(daemon, rho_ui_proto::IROH_ALPN)
         .await
         .map_err(|error| anyhow::anyhow!("connect to daemon: {error}"))?;
 
@@ -151,28 +150,24 @@ async fn run(
         }
     }
 
-    let (mut send, recv) = connection
+    let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|error| anyhow::anyhow!("open stream: {error}"))?;
-    send.write_all(b"\n")
-        .await
-        .map_err(|error| anyhow::anyhow!("start stream: {error}"))?;
+    rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
 
     spawn_local(async move {
         while let Some(message) = receiver.next().await {
-            let mut line = match serde_json::to_string(&message) {
-                Ok(line) => line,
-                Err(_) => continue,
-            };
-            line.push('\n');
-            if send.write_all(line.as_bytes()).await.is_err() {
+            if rho_ui_proto::write_frame(&mut send, &message)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     });
 
-    read_loop(app, recv).await
+    read_loop(app, &mut recv).await
 }
 
 async fn authenticate_client_bounded(
@@ -188,53 +183,83 @@ async fn authenticate_client_bounded(
     }
 }
 
-async fn read_loop(app: App, mut recv: iroh::endpoint::RecvStream) -> anyhow::Result<()> {
-    let mut pending: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 16 * 1024];
+async fn read_loop(app: App, recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<()> {
     loop {
-        let read = recv
-            .read(&mut buf)
+        let message: ServerMessage = rho_ui_proto::read_frame(recv)
             .await
             .map_err(|error| anyhow::anyhow!("daemon connection lost: {error}"))?;
-        let Some(read) = read else {
-            anyhow::bail!("daemon closed the connection");
-        };
-        pending.extend_from_slice(&buf[..read]);
-        anyhow::ensure!(pending.len() <= MAX_LINE_LEN, "daemon message too long");
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = pending.drain(..=newline).collect();
-            let line = std::str::from_utf8(&line[..newline])?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let message: ToBrowser = serde_json::from_str(line)
-                .map_err(|error| anyhow::anyhow!("bad daemon message: {error}"))?;
-            handle(app, message);
-        }
+        handle(app, message);
     }
 }
 
-fn handle(app: App, message: ToBrowser) {
+fn handle(app: App, message: ServerMessage) {
     match message {
-        ToBrowser::Hello { topics, projects } => {
-            app.topics.set(topics);
+        ServerMessage::Ready {
+            workstreams,
+            agents,
+            projects,
+            machine_seed,
+            agent_counter,
+            ..
+        } => {
+            app.mutate_registry(|registry| {
+                registry.set_machine_seed(machine_seed);
+                registry.set_agent_counter(agent_counter);
+                registry.set_data(workstreams, agents);
+            });
             app.projects.set(projects);
             if app.phase.get_untracked() != Phase::Online {
                 app.phase.set(Phase::Online);
             }
         }
-        ToBrowser::Agent { agent_id, state } => {
-            if app.selected.get_untracked().as_deref() == Some(agent_id.as_str()) {
-                app.state.set(Some(state));
+        ServerMessage::Agent { agent_id, frame } => {
+            app.states.update_value(|states| {
+                let state =
+                    states
+                        .entry(agent_id)
+                        .or_insert_with(|| rho_ui_proto::remote::UiAgentState {
+                            blocks: Vec::new(),
+                            status: rho_ui_proto::remote::UiAgentStatus::Idle,
+                            context_used: None,
+                        });
+                frame.apply_diff(state);
+            });
+            app.state_epoch.update(|epoch| *epoch += 1);
+        }
+        ServerMessage::AgentCreated {
+            agent_id,
+            workstream,
+        } => {
+            app.mutate_registry(|registry| {
+                registry.note_agent_workstream(agent_id, workstream);
+                registry.mark_known(agent_id);
+            });
+            if app.show_new_agent.get_untracked() {
+                app.show_new_agent.set(false);
+                app.select(agent_id);
             }
         }
-        ToBrowser::AgentCreated { agent_id } => {
-            app.show_new_agent.set(false);
-            app.select(agent_id);
+        ServerMessage::WorkstreamCreated { workstream } => {
+            app.mutate_registry(|registry| registry.add_workstream(workstream));
         }
-        ToBrowser::Error { message } => {
+        ServerMessage::AgentAttention {
+            agent_id,
+            attention,
+        } => {
+            app.mutate_registry(|registry| registry.set_attention(agent_id, attention));
+        }
+        ServerMessage::AgentUnloaded { agent_id, .. } => {
+            app.states.update_value(|states| {
+                if let Some(state) = states.get_mut(&agent_id) {
+                    state.status = rho_ui_proto::remote::UiAgentStatus::Unloaded;
+                }
+            });
+            app.state_epoch.update(|epoch| *epoch += 1);
+        }
+        ServerMessage::Error { message } => {
             app.show_toast(message);
         }
+        _ => {}
     }
 }
 

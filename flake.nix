@@ -157,7 +157,18 @@
             name = projectName;
             path = ./.;
           };
-          paths = buildPaths ++ [ "webui" ];
+          paths = buildPaths ++ [
+            "webui"
+            "crates/json-stream"
+            "crates/prefix-id"
+            "crates/rho-core"
+            "crates/rho-iroh-auth"
+            "crates/rho-registry"
+            "crates/rho-shell-proto"
+            "crates/rho-ui-proto"
+            "crates/rho-workspaces-types"
+            "crates/senax-encoder"
+          ];
         };
 
         # Trunk requires the wasm-bindgen CLI version to exactly match the

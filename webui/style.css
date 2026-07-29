@@ -485,7 +485,7 @@ pre.code,
 }
 
 .stream-title {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
@@ -496,6 +496,10 @@ pre.code,
    needs-input the full accent. */
 .lamp {
   flex: none;
+}
+
+.rail-spacer {
+  flex: 1;
 }
 
 .lamp.working {

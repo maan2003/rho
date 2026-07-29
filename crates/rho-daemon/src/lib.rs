@@ -36,7 +36,6 @@ mod iris;
 mod realtime;
 mod shell;
 mod terminal;
-mod webui;
 mod workspace_channel;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
@@ -380,10 +379,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret)
             .transport_config(transport.build())
-            .alpns(vec![
-                rho_ui_proto::IROH_ALPN.to_vec(),
-                rho_webui_messages::ALPN.to_vec(),
-            ])
+            .alpns(vec![rho_ui_proto::IROH_ALPN.to_vec()])
             .bind()
             .await
             .context("bind iroh endpoint")?;
@@ -521,9 +517,8 @@ async fn load_or_create_iroh_secret(db: &RhoDb) -> anyhow::Result<iroh::SecretKe
 }
 
 /// Authenticates every iroh connection on its first bi-stream, then serves one
-/// full UI control session plus any number of workspace-channel bi-streams on
-/// [`rho_ui_proto::IROH_ALPN`], the web UI JSON protocol on
-/// [`rho_webui_messages::ALPN`]. Unapproved connections never reach either
+/// full UI control session plus any number of dedicated bi-streams on
+/// [`rho_ui_proto::IROH_ALPN`]. Unapproved connections never reach the
 /// application handler.
 async fn run_iroh_listener(
     agents: Arc<AgentRegistry>,
@@ -565,79 +560,74 @@ async fn run_iroh_listener(
                     return;
                 }
             }
-            let webui = connection.alpn() == rho_webui_messages::ALPN;
-            let agent_streams = (!webui).then(|| IrohAgentStreams::new(connection.clone()));
+            let agent_streams = Some(IrohAgentStreams::new(connection.clone()));
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let agents = agents.clone();
                 let agent_streams = agent_streams.clone();
                 tokio::spawn(async move {
-                    let result = if webui {
-                        webui::serve_json_session(agents, recv, send).await
-                    } else {
-                        async {
-                            let counters = rho_ui_proto::IoCounters::default();
-                            let mut recv = recv;
-                            let first =
-                                read_frame_counted::<_, ClientMessage>(&mut recv, Some(&counters))
-                                    .await?;
-                            // Dedicated streams (workspace files, shells,
-                            // terminals, one-shot queries) are not the UI control
-                            // session and must not claim it.
-                            let dedicated = matches!(
-                                &first,
-                                ClientMessage::ChannelOpen { .. }
-                                    | ClientMessage::RealtimeOpen { .. }
-                                    | ClientMessage::DiffSnapshot { .. }
-                                    | ClientMessage::VisualizationGet { .. }
-                                    | ClientMessage::TerminalCreate { .. }
-                                    | ClientMessage::TerminalAttach { .. }
-                                    | ClientMessage::TerminalList { .. }
-                                    | ClientMessage::ShellAttach { .. }
-                                    | ClientMessage::GitTransportRequest { .. }
-                                    | ClientMessage::GitTransportProvide { .. }
-                                    | ClientMessage::GitTransportQuery { .. }
+                    let result = async {
+                        let counters = rho_ui_proto::IoCounters::default();
+                        let mut recv = recv;
+                        let first =
+                            read_frame_counted::<_, ClientMessage>(&mut recv, Some(&counters))
+                                .await?;
+                        // Dedicated streams (workspace files, shells,
+                        // terminals, one-shot queries) are not the UI control
+                        // session and must not claim it.
+                        let dedicated = matches!(
+                            &first,
+                            ClientMessage::ChannelOpen { .. }
+                                | ClientMessage::RealtimeOpen { .. }
+                                | ClientMessage::DiffSnapshot { .. }
+                                | ClientMessage::VisualizationGet { .. }
+                                | ClientMessage::TerminalCreate { .. }
+                                | ClientMessage::TerminalAttach { .. }
+                                | ClientMessage::TerminalList { .. }
+                                | ClientMessage::ShellAttach { .. }
+                                | ClientMessage::GitTransportRequest { .. }
+                                | ClientMessage::GitTransportProvide { .. }
+                                | ClientMessage::GitTransportQuery { .. }
+                        );
+                        let control = if !dedicated {
+                            let streams = agent_streams
+                                .clone()
+                                .context("iroh agent streams missing")?;
+                            anyhow::ensure!(
+                                streams.claim_control(),
+                                "iroh connection already has a UI control session"
                             );
-                            let control = if !dedicated {
-                                let streams = agent_streams
-                                    .clone()
-                                    .context("iroh agent streams missing")?;
-                                anyhow::ensure!(
-                                    streams.claim_control(),
-                                    "iroh connection already has a UI control session"
-                                );
-                                send.set_priority(1)
-                                    .context("set iroh control stream priority")?;
-                                Some(streams)
-                            } else {
-                                None
-                            };
-                            if matches!(
-                                &first,
-                                ClientMessage::TerminalCreate { .. }
-                                    | ClientMessage::TerminalAttach { .. }
-                                    | ClientMessage::ShellAttach { .. }
-                                    | ClientMessage::RealtimeOpen { .. }
-                            ) {
-                                send.set_priority(50)
-                                    .context("set iroh interactive stream priority")?;
-                            }
-                            let result = serve_connection_io(
-                                agents,
-                                recv,
-                                send,
-                                counters,
-                                None,
-                                agent_streams,
-                                Some(first),
-                            )
-                            .await;
-                            if let Some(control) = control {
-                                control.close();
-                            }
-                            result
+                            send.set_priority(1)
+                                .context("set iroh control stream priority")?;
+                            Some(streams)
+                        } else {
+                            None
+                        };
+                        if matches!(
+                            &first,
+                            ClientMessage::TerminalCreate { .. }
+                                | ClientMessage::TerminalAttach { .. }
+                                | ClientMessage::ShellAttach { .. }
+                                | ClientMessage::RealtimeOpen { .. }
+                        ) {
+                            send.set_priority(50)
+                                .context("set iroh interactive stream priority")?;
                         }
-                        .await
-                    };
+                        let result = serve_connection_io(
+                            agents,
+                            recv,
+                            send,
+                            counters,
+                            None,
+                            agent_streams,
+                            Some(first),
+                        )
+                        .await;
+                        if let Some(control) = control {
+                            control.close();
+                        }
+                        result
+                    }
+                    .await;
                     if let Err(error) = result {
                         eprintln!("rho daemon iroh connection error: {error:#}");
                     }

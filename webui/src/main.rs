@@ -1,24 +1,23 @@
-//! Rho web UI: a static Leptos app that connects to the rho daemon over
-//! iroh (`rho_webui_messages::ALPN`) and renders a click-oriented
-//! agent list + chat surface. Built with trunk; the `dist/` output is
-//! hostable on any static host.
+//! Rho web UI: a static Leptos client for the daemon's native `rho/ui/2`
+//! protocol over iroh.
 
 mod conn;
 mod md;
 mod ui;
 
-use leptos::prelude::*;
-use rho_webui_messages::{AgentState, FromBrowser, Topic, Project};
+use std::collections::HashMap;
 
-/// Connection lifecycle as shown to the user.
+use futures::channel::mpsc::UnboundedSender;
+use leptos::prelude::*;
+use rho_registry::AgentRegistry;
+use rho_ui_proto::remote::UiAgentState;
+use rho_ui_proto::{AgentId, ClientMessage, UiProject};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// No daemon endpoint id known yet; ask for one.
     NeedDaemon,
-    /// A daemon id is known, but WebAuthn waits for an explicit user gesture.
     Unlock(String),
     Connecting,
-    /// Connected but not yet enrolled; show `rho iroh approve <code>`.
     Enroll(String),
     Online,
     Failed(String),
@@ -27,27 +26,29 @@ pub enum Phase {
 #[derive(Clone, Copy)]
 pub struct App {
     pub phase: RwSignal<Phase>,
-    pub topics: RwSignal<Vec<Topic>>,
-    pub projects: RwSignal<Vec<Project>>,
-    /// Encoded id of the agent open in the chat pane.
-    pub selected: RwSignal<Option<String>>,
-    /// Transcript of the selected agent, once the daemon has sent it.
-    pub state: RwSignal<Option<AgentState>>,
-    /// Mobile: chat pane covers the agent list.
+    pub registry: StoredValue<AgentRegistry>,
+    /// Invalidates views after an in-place registry mutation.
+    pub registry_epoch: RwSignal<u64>,
+    pub projects: RwSignal<Vec<UiProject>>,
+    pub selected: RwSignal<Option<AgentId>>,
+    pub states: StoredValue<HashMap<AgentId, UiAgentState>>,
+    pub state_epoch: RwSignal<u64>,
     pub chat_open: RwSignal<bool>,
     pub show_new_agent: RwSignal<bool>,
     pub toast: RwSignal<Option<String>>,
-    sender: StoredValue<futures::channel::mpsc::UnboundedSender<FromBrowser>>,
+    sender: StoredValue<UnboundedSender<ClientMessage>>,
 }
 
 impl App {
-    fn new(sender: futures::channel::mpsc::UnboundedSender<FromBrowser>) -> Self {
+    fn new(sender: UnboundedSender<ClientMessage>) -> Self {
         Self {
             phase: RwSignal::new(Phase::NeedDaemon),
-            topics: RwSignal::new(Vec::new()),
+            registry: StoredValue::new(AgentRegistry::default()),
+            registry_epoch: RwSignal::new(0),
             projects: RwSignal::new(Vec::new()),
             selected: RwSignal::new(None),
-            state: RwSignal::new(None),
+            states: StoredValue::new(HashMap::new()),
+            state_epoch: RwSignal::new(0),
             chat_open: RwSignal::new(false),
             show_new_agent: RwSignal::new(false),
             toast: RwSignal::new(None),
@@ -55,17 +56,21 @@ impl App {
         }
     }
 
-    pub fn send(&self, message: FromBrowser) {
+    pub fn send(&self, message: ClientMessage) {
         let _ = self.sender.get_value().unbounded_send(message);
     }
 
-    pub fn select(&self, agent_id: String) {
-        self.send(FromBrowser::Select {
-            agent_id: agent_id.clone(),
-        });
-        self.state.set(None);
+    pub fn mutate_registry(&self, f: impl FnOnce(&mut AgentRegistry)) {
+        self.registry.update_value(f);
+        self.registry_epoch.update(|epoch| *epoch += 1);
+    }
+
+    pub fn select(&self, agent_id: AgentId) {
+        self.send(ClientMessage::SubscribeAgent { agent_id });
+        self.mutate_registry(|registry| registry.select_agent(agent_id));
         self.selected.set(Some(agent_id));
         self.chat_open.set(true);
+        self.show_new_agent.set(false);
     }
 
     pub fn show_toast(&self, message: String) {
@@ -87,7 +92,6 @@ fn main() {
             "Rho cannot run inside another page. Open it in a top-level tab.".to_owned(),
         ));
     }
-    // Mount first: it initializes the wasm executor `conn` spawns onto.
     leptos::mount::mount_to_body(move || ui::Root(app));
     conn::init(app, receiver);
 }

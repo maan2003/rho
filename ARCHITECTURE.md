@@ -390,14 +390,10 @@ ten-minute same-connection recovery window and raises the daemon's incoming
 bidirectional stream credit from its pre-authentication limit. Iroh already
 sends five-second transport heartbeats; after ten seconds without receiving an
 authenticated QUIC datagram, the native GUI presents a temporary bottom
-recovery strip until the same connection responds or finally closes. The
-same iroh endpoint carries a second ALPN for the web UI: newline-delimited JSON
-(`rho-webui-messages`, shared with the browser as a wasm-safe crate) bridged
-through an in-process duplex pipe onto a normal UI protocol session, so the
-daemon's webui module only translates the JSON vocabulary and owns no agent
-policy. Its new-agent command carries the selected topic, registered workdir,
-role, and isolated-versus-user-checkout start choice. The web UI page itself
-is a static Leptos/wasm app (`webui/` at the
+recovery strip until the same connection responds or finally closes. The web
+UI speaks the same native UI protocol over the same iroh ALPN, so both clients
+share one wire vocabulary and agent policy. The web UI page itself is a static
+Leptos/wasm app (`webui/` at the
 repo root, its own cargo workspace, hostable anywhere) that connects as an
 iroh client from the browser.
 

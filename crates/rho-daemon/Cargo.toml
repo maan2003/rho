@@ -36,7 +36,6 @@ rho-profiling.workspace = true
 rho-slack.workspace = true
 rho-ui-proto.workspace = true
 rho-visualizations.workspace = true
-rho-webui-messages.workspace = true
 rho-workspaces.workspace = true
 rustix-openpty.workspace = true
 rustls.workspace = true

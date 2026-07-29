@@ -13623,7 +13623,6 @@ dependencies = [
  "rho-slack",
  "rho-ui-proto",
  "rho-visualizations",
- "rho-webui-messages",
  "rho-workspaces",
  "rustix-openpty",
  "rustls",
@@ -13921,14 +13920,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "rho-webui-messages"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
