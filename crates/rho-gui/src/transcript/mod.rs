@@ -404,16 +404,10 @@ impl TranscriptModel {
             .map(|record| record.range.clone())
             .collect::<Vec<_>>();
         self.buffer.update(cx, |buffer, cx| {
-            // Root scopes grow with streaming inserts at their end, without
-            // changing the record anchors used to delimit adjacent blocks.
-            let scopes = ranges
-                .iter()
-                .map(|range| {
-                    buffer.anchor_before(range.start.to_offset(buffer))
-                        ..buffer.anchor_after(range.end.to_offset(buffer))
-                })
-                .collect();
-            buffer.set_syntax_root_scopes(Some(scopes), cx)
+            // Record ends sit after the trailing newline, while streaming
+            // inserts occur before it. Their left bias therefore grows with
+            // the response without swallowing a subsequently appended block.
+            buffer.set_syntax_root_scopes(Some(ranges), cx)
         });
     }
 
@@ -753,6 +747,12 @@ fn rendered_text_edit(old: &str, new: &str) -> Option<RenderedTextEdit> {
         .zip(new.bytes())
         .take_while(|(old, new)| old == new)
         .count();
+    if old.ends_with('\n') && new.ends_with('\n') {
+        // Keep the transcript's final newline as a suffix sentinel. Inserts
+        // before it move the block's left-biased end anchor; consuming it as
+        // a prefix would append after the anchor when streaming a new line.
+        prefix = prefix.min(old.len() - 1).min(new.len() - 1);
+    }
     while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
         prefix -= 1;
     }
@@ -950,6 +950,13 @@ mod tests {
         let edit = rendered_text_edit("$ …\n", "$ echo …\n").expect("edit");
         assert_eq!(edit.old_range, 2..2);
         assert_eq!(edit.inserted, "echo ");
+    }
+
+    #[test]
+    fn rendered_text_edit_preserves_terminal_newline_sentinel() {
+        let edit = rendered_text_edit("line\n", "line\nnext\n").expect("edit");
+        assert_eq!(edit.old_range, 4..4);
+        assert_eq!(edit.inserted, "\nnext");
     }
 
     #[test]

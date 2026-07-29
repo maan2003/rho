@@ -36,6 +36,7 @@ pub struct SyntaxSnapshot {
     layers: SumTree<SyntaxLayerEntry>,
     root_language: Option<Arc<Language>>,
     root_scopes: Option<Vec<Range<Anchor>>>,
+    root_scopes_dirty: bool,
     parsed_version: clock::Global,
     interpolated_version: clock::Global,
     language_registry_version: usize,
@@ -326,12 +327,9 @@ impl SyntaxMap {
             return false;
         }
 
-        let update_count = self.snapshot.update_count + 1;
-        let root_language = self.snapshot.root_language.take();
-        self.snapshot = SyntaxSnapshot::new(text);
-        self.snapshot.root_language = root_language;
         self.snapshot.root_scopes = root_scopes;
-        self.snapshot.update_count = update_count;
+        self.snapshot.root_scopes_dirty = true;
+        self.snapshot.update_count += 1;
         true
     }
 }
@@ -342,6 +340,7 @@ impl SyntaxSnapshot {
             layers: SumTree::new(text),
             root_language: None,
             root_scopes: None,
+            root_scopes_dirty: false,
             parsed_version: clock::Global::default(),
             interpolated_version: clock::Global::default(),
             language_registry_version: 0,
@@ -515,6 +514,13 @@ impl SyntaxSnapshot {
         mut budget: Option<Duration>,
     ) -> Result<(), ParseTimeout> {
         self.root_language = Some(root_language.clone());
+        if self.root_scopes_dirty {
+            // Keep the old layers in the foreground while replacement roots
+            // parse, but do not try to incrementally reuse trees whose root
+            // partition no longer matches this background snapshot.
+            self.layers = SumTree::new(text);
+            self.root_scopes_dirty = false;
+        }
         let budget = &mut budget;
         let edit_ranges = text
             .edits_since::<usize>(&self.parsed_version)

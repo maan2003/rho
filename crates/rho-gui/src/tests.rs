@@ -2190,6 +2190,73 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
     );
 }
 
+#[gpui::test]
+fn adding_markdown_root_does_not_blank_settled_highlights(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("first")],
+            vec![assistant(
+                "settled **bold text**",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
+    );
+    for _ in 0..64 {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+    }
+    let settled = syntax_highlights_for_text(&workspace, "settled **bold text**", cx);
+    assert!(settled.iter().any(Option::is_some));
+
+    // Force the parse triggered by adding another root into the background so
+    // this observes what the editor paints while that replacement is pending.
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            let buffers = editor.read(cx).buffer().read(cx).all_buffers();
+            buffers
+                .into_iter()
+                .find(|buffer| buffer.read(cx).text().contains("settled **bold text**"))
+                .expect("transcript buffer")
+                .update(cx, |buffer, _| buffer.set_sync_parse_timeout(None));
+        })
+        .expect("disable synchronous transcript parsing");
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![
+                    UiBlockUpdate {
+                        index: 2,
+                        block: UiBlockDiff::Replace(user("second")),
+                    },
+                    UiBlockUpdate {
+                        index: 3,
+                        block: UiBlockDiff::Replace(assistant("new response", None)),
+                    },
+                ],
+            },
+            status: None,
+            context_used: None,
+        },
+    );
+
+    assert_eq!(
+        syntax_highlights_for_text(&workspace, "settled **bold text**", cx),
+        settled,
+        "adding a syntax root blanked existing highlights while parsing",
+    );
+}
+
 /// Every row of a user message scales, not just the one its anchor starts
 /// on, and the mapping survives the folds that conceal markdown markup -
 /// which shift display rows out of step with buffer rows.
