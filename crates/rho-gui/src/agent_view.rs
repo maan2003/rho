@@ -157,6 +157,12 @@ impl AgentModel {
         editor
     }
 
+    /// Releases the dashboard-only editor while retaining the shared
+    /// transcript buffers. A later preview recreates it lazily.
+    pub fn clear_preview_editor(&mut self) {
+        self.preview_editor = None;
+    }
+
     /// Builds a pane's editor over the shared multibuffer — own cursor,
     /// scroll, and folds — fully caught up with the model.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {

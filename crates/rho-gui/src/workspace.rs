@@ -653,7 +653,7 @@ impl Workspace {
                 if let Some(agent_ids) = initial_subscriptions
                     && !agent_ids.is_empty()
                 {
-                    self.set_initial_subscriptions(agent_ids);
+                    self.set_initial_subscriptions(agent_ids, cx);
                 }
                 self.update_statuses(cx);
                 cx.notify();
@@ -671,7 +671,7 @@ impl Workspace {
                 self.registry.mark_known(agent_id);
                 if self.awaiting_draft_agent {
                     self.awaiting_draft_agent = false;
-                    self.subscribe_agent(agent_id);
+                    self.subscribe_agent(agent_id, cx);
                     // The draft became this agent: reset the compose surface
                     // and follow the new agent.
                     let label = self
@@ -719,6 +719,7 @@ impl Workspace {
                         .and_modify(|pending| *pending = pending.merge(summary))
                         .or_insert(summary);
                 }
+                self.release_agent_view_cache(agent_id, cx);
                 self.refresh_draft_agent_targets(cx);
                 cx.notify();
             }
@@ -1798,18 +1799,30 @@ impl Workspace {
     }
 
     /// Manage this GUI's bounded transcript subscription set.
-    fn set_initial_subscriptions(&mut self, agent_ids: Vec<AgentId>) {
+    fn set_initial_subscriptions(&mut self, agent_ids: Vec<AgentId>, cx: &mut Context<Self>) {
+        let retained = agent_ids.iter().copied().collect::<HashSet<_>>();
+        let evicted = self
+            .subscriptions
+            .lru
+            .iter()
+            .copied()
+            .filter(|agent_id| !retained.contains(agent_id))
+            .collect::<Vec<_>>();
         self.subscriptions.reset(&agent_ids);
+        for agent_id in evicted {
+            self.release_agent_view_cache(agent_id, cx);
+        }
         self.connection
             .send(ClientMessage::SubscribeAgents { agent_ids });
     }
 
-    fn subscribe_agent(&mut self, agent_id: AgentId) {
+    fn subscribe_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let (subscribe, evicted) = self.subscriptions.touch(agent_id);
         if let Some(evicted) = evicted {
             self.connection.send(ClientMessage::UnsubscribeAgents {
                 agent_ids: vec![evicted],
             });
+            self.release_agent_view_cache(evicted, cx);
         }
         if subscribe {
             self.connection.send(ClientMessage::SubscribeAgents {
@@ -1818,9 +1831,38 @@ impl Workspace {
         }
     }
 
+    /// Applies the subscription LRU's eviction to client-side editor state.
+    /// Pane-visible transcripts stay pinned; dashboard previews, pane history,
+    /// and hidden transcript surfaces are cache and can be rebuilt lazily.
+    fn release_agent_view_cache(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        if let Some(model) = self.models.get(&agent_id).cloned() {
+            model.update(cx, |model, _| model.clear_preview_editor());
+        }
+
+        for tree in self.contexts.values_mut() {
+            tree.for_each_pane_mut(&mut |pane| {
+                pane.purge_history(|surface| surface.key == SurfaceKey::Transcript(agent_id));
+            });
+        }
+        let shown = self.contexts.values().any(|tree| {
+            tree.panes()
+                .iter()
+                .any(|pane| pane.surface.key == SurfaceKey::Transcript(agent_id))
+        });
+        if shown {
+            return;
+        }
+
+        for surfaces in self.surfaces.values_mut() {
+            surfaces.retain(|surface| surface.key != SurfaceKey::Transcript(agent_id));
+        }
+        self.pending_syncs.remove(&agent_id);
+        self.models.remove(&agent_id);
+    }
+
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
         if self.connected && !self.subscriptions.contains(agent_id) {
-            self.subscribe_agent(agent_id);
+            self.subscribe_agent(agent_id, cx);
         }
         self.select_agent(Some(agent_id), window, cx);
     }
@@ -2033,7 +2075,7 @@ impl Workspace {
             && self.connected
             && !self.subscriptions.contains(agent_id)
         {
-            self.subscribe_agent(agent_id);
+            self.subscribe_agent(agent_id, cx);
         }
         self.select_agent_inner(agent_id, false, window, cx);
     }
@@ -2051,7 +2093,7 @@ impl Workspace {
             // Selection is the strongest subscription signal. Touch it here
             // so keyboard cycling and every other direct selection path keep
             // the visible transcript at the protected end of the LRU.
-            self.subscribe_agent(agent_id);
+            self.subscribe_agent(agent_id, cx);
         }
         if let Some(agent_id) = &agent_id {
             let view = self.materialize_model(agent_id, cx);
@@ -2328,6 +2370,11 @@ impl Workspace {
         }
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
+        if let SurfaceKey::Transcript(agent_id) = key
+            && !self.subscriptions.contains(agent_id)
+        {
+            self.release_agent_view_cache(agent_id, cx);
+        }
         cx.notify();
     }
 
@@ -3003,15 +3050,30 @@ impl Workspace {
     /// Keeps the registry's notion of "current agent" in step with the
     /// focused pane, so `:` commands resolve against what the user sees.
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
-        match self.active_tree().focused().surface.key.clone() {
+        let selected = match self.active_tree().focused().surface.key.clone() {
             SurfaceKey::Transcript(agent_id) | SurfaceKey::Shell(agent_id) => {
-                self.registry.select_agent(agent_id)
+                self.registry.select_agent(agent_id);
+                Some(agent_id)
             }
-            SurfaceKey::Terminal { agent_id, .. } => self.registry.select_agent(agent_id),
-            SurfaceKey::Diff { agent_id } => self.registry.select_agent(agent_id),
-            SurfaceKey::Draft => self.registry.enter_draft(),
+            SurfaceKey::Terminal { agent_id, .. } => {
+                self.registry.select_agent(agent_id);
+                Some(agent_id)
+            }
+            SurfaceKey::Diff { agent_id } => {
+                self.registry.select_agent(agent_id);
+                Some(agent_id)
+            }
+            SurfaceKey::Draft => {
+                self.registry.enter_draft();
+                None
+            }
             // Files keep whatever agent context was current.
-            SurfaceKey::File { .. } => {}
+            SurfaceKey::File { .. } => None,
+        };
+        if self.connected
+            && let Some(agent_id) = selected
+        {
+            self.subscribe_agent(agent_id, cx);
         }
         *self
             .iris_context_agent
@@ -3034,9 +3096,18 @@ impl Workspace {
     }
 
     pub(crate) fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let closed = match self.active_tree().focused().surface.key {
+            SurfaceKey::Transcript(agent_id) => Some(agent_id),
+            _ => None,
+        };
         self.active_tree_mut().close_focused();
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
+        if let Some(agent_id) = closed
+            && !self.subscriptions.contains(agent_id)
+        {
+            self.release_agent_view_cache(agent_id, cx);
+        }
         cx.notify();
     }
 
