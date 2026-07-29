@@ -406,6 +406,7 @@ fn feed_frame(
             );
         })
         .expect("update workspace");
+    cx.run_until_parked();
 }
 
 fn feed_frames(
@@ -434,6 +435,7 @@ fn feed_frames(
             workspace.handle_events(events, window, cx);
         })
         .expect("update workspace");
+    cx.run_until_parked();
 }
 
 fn active_editor(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> Entity<Editor> {
@@ -1607,7 +1609,7 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn hidden_views_defer_rendering_until_selected(cx: &mut TestAppContext) {
+fn subscribed_hidden_views_stay_warm(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -1615,18 +1617,9 @@ fn hidden_views_defer_rendering_until_selected(cx: &mut TestAppContext) {
         agent(1),
         snapshot_frame(state(vec![user("one")], Vec::new())),
     );
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.select_agent(Some(agent(2)), window, cx);
-        })
-        .expect("select agent 2");
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.select_agent(Some(agent(1)), window, cx);
-        })
-        .expect("select agent 1");
 
-    // Agent 2 is materialized but hidden; its frames must not render yet.
+    // Agent 2 has never been focused; its subscription still creates a warm
+    // model so selecting it later does no transcript work.
     feed_frame(
         &workspace,
         cx,
@@ -1652,8 +1645,8 @@ fn hidden_views_defer_rendering_until_selected(cx: &mut TestAppContext) {
         })
         .expect("read hidden view");
     assert!(
-        !hidden_text.contains("done"),
-        "hidden views should not render frames eagerly: {hidden_text:?}"
+        hidden_text.contains("done"),
+        "subscribed hidden views should stay synchronized: {hidden_text:?}"
     );
 
     workspace
@@ -1664,7 +1657,65 @@ fn hidden_views_defer_rendering_until_selected(cx: &mut TestAppContext) {
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("two") && text.contains("done"),
-        "selecting a hidden agent should flush its deferred frames: {text:?}"
+        "selecting a hidden agent should reuse its warm model: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn frames_coalesce_while_subscribed_model_is_loading(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                ConnEvent::Frame {
+                    agent_id: agent(2),
+                    frame: snapshot_frame(state(
+                        vec![user("go"), assistant("hel", None)],
+                        Vec::new(),
+                    )),
+                    allocation: None,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                ConnEvent::Frame {
+                    agent_id: agent(2),
+                    frame: AgentRemoteFrame::Diff {
+                        blocks: UiBlocksDiff {
+                            truncate_to: None,
+                            updates: vec![UiBlockUpdate {
+                                index: 1,
+                                block: UiBlockDiff::AssistantText(UiTextDiff {
+                                    keep_bytes: 3,
+                                    value: "lo".to_owned(),
+                                }),
+                            }],
+                        },
+                        status: None,
+                        context_used: None,
+                        usage: None,
+                    },
+                    allocation: None,
+                },
+                window,
+                cx,
+            );
+        })
+        .expect("queue frames during initial load");
+    cx.run_until_parked();
+
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .agent_model(&agent(2))
+                .expect("subscribed model")
+                .update(cx, |view, cx| view.buffer_text(cx))
+        })
+        .expect("read warmed model");
+    assert!(
+        text.contains("hello"),
+        "queued diff was not applied: {text:?}"
     );
 }
 
@@ -2100,8 +2151,8 @@ fn fenced_code_keeps_its_asterisks(cx: &mut TestAppContext) {
     assert!(display_text(&workspace, cx).contains("**bold**"));
 }
 
-/// A long transcript conceals the visible tail after parsing without eagerly
-/// decorating its off-screen history.
+/// A long transcript conceals the visible tail after its eager background
+/// parse; editor decoration remains viewport-bounded.
 #[gpui::test]
 fn long_transcripts_conceal_their_visible_tail_after_parsing(cx: &mut TestAppContext) {
     let markup = (0..400)
@@ -2135,7 +2186,7 @@ fn long_transcripts_conceal_their_visible_tail_after_parsing(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn transcript_syntax_parses_visible_turns_on_demand(cx: &mut TestAppContext) {
+fn subscribed_transcript_eagerly_parses_history(cx: &mut TestAppContext) {
     let mut history = Vec::new();
     for turn in 0..40 {
         history.push(user(&format!("request {turn}")));
@@ -2176,15 +2227,15 @@ fn transcript_syntax_parses_visible_turns_on_demand(cx: &mut TestAppContext) {
                 .find(|buffer| buffer.read(cx).text().contains("assistant visible tail"))
                 .expect("visible response buffer");
             assert!(
-                !middle.read(cx).has_syntax_tree(),
-                "off-screen history should remain unparsed"
+                middle.read(cx).has_syntax_tree(),
+                "subscribed history should be parsed before Ready"
             );
             assert!(
                 tail.read(cx).has_syntax_tree(),
                 "the visible tail should be parsed"
             );
         })
-        .expect("inspect deferred transcript syntax");
+        .expect("inspect eager transcript syntax");
 }
 
 #[gpui::test]
@@ -2259,7 +2310,11 @@ fn plain_assistant_streaming_keeps_existing_concealment_folds(cx: &mut TestAppCo
     );
     cx.run_until_parked();
 
-    assert_eq!(concealed_fold_ids(&workspace, &editor, cx), before);
+    let after = concealed_fold_ids(&workspace, &editor, cx);
+    assert_eq!(after.len(), before.len());
+    let displayed = display_text(&workspace, cx);
+    assert!(!displayed.contains("**bold**"));
+    assert!(!displayed.contains("`code`"));
 }
 
 /// The block map may not assume display elisions arrive sorted or apart:

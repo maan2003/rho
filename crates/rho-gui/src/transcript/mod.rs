@@ -31,12 +31,15 @@ use std::sync::Arc;
 use editor::Editor;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
 use elisions::{ElisionState, ElisionSync};
-use gpui::{AppContext as _, Context, Entity, IntoElement as _, WeakEntity};
+use futures::FutureExt as _;
+use futures::future::LocalBoxFuture;
+use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, WeakEntity};
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
+use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::UiAgentState;
-use text::{Anchor, ToOffset as _};
+use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
 use crate::connection::VisualizationClient;
 use crate::highlights::{apply_class_highlights, excerpt_range};
@@ -107,6 +110,32 @@ struct TranscriptBuffer {
     buffer: Entity<Buffer>,
 }
 
+pub(crate) struct PreparedInitialTranscript {
+    state: UiAgentState,
+    chunks: Vec<PreparedChunk>,
+}
+
+struct PreparedChunk {
+    start_block: usize,
+    markdown: bool,
+    rendered: Vec<RenderedBlock>,
+    terminal_record: Option<usize>,
+    text: String,
+}
+
+impl PreparedInitialTranscript {
+    pub(crate) fn buffer_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    pub(crate) fn take_texts(&mut self) -> Vec<String> {
+        self.chunks
+            .iter_mut()
+            .map(|chunk| std::mem::take(&mut chunk.text))
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 struct VisualizationAnchor {
     id: String,
@@ -165,6 +194,154 @@ impl TranscriptModel {
             visualization_cache: HashMap::new(),
             attachments: Vec::new(),
         }
+    }
+
+    /// Pure initial projection. This runs on a worker before the subscribed
+    /// agent is considered ready, so first focus never pays transcript
+    /// rendering or text concatenation costs.
+    pub(crate) fn prepare_initial(
+        state: UiAgentState,
+        now_ms: u64,
+        agent_labels: HashMap<AgentId, String>,
+    ) -> PreparedInitialTranscript {
+        let mut previous = None;
+        let rendered_blocks = state
+            .blocks
+            .iter()
+            .map(|block| {
+                let rendered = render_block_with_agent_labels(block, previous, now_ms, &|id| {
+                    agent_labels.get(&id).cloned().unwrap_or_default()
+                });
+                if rendered.visible() {
+                    previous = Some(rendered.kind);
+                }
+                rendered
+            })
+            .collect::<Vec<_>>();
+
+        let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
+        for (block_index, rendered) in rendered_blocks.into_iter().enumerate() {
+            let markdown = matches!(rendered.kind, BlockKind::Response { .. });
+            if chunks
+                .last()
+                .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown)
+            {
+                chunks.push((block_index, markdown, Vec::new()));
+            }
+            chunks.last_mut().unwrap().2.push(rendered);
+        }
+        let chunks = chunks
+            .into_iter()
+            .map(|(start_block, markdown, rendered)| PreparedChunk {
+                start_block,
+                markdown,
+                terminal_record: rendered.iter().rposition(RenderedBlock::visible),
+                text: rendered.iter().map(rendered_text).collect(),
+                rendered,
+            })
+            .collect();
+        PreparedInitialTranscript { state, chunks }
+    }
+
+    /// Installs a worker-prepared initial transcript into its reserved GPUI
+    /// entities. Only registration, language wiring, anchors, and multibuffer
+    /// mutation remain on the foreground thread.
+    pub(crate) fn install_initial<V: 'static>(
+        &mut self,
+        prepared: PreparedInitialTranscript,
+        text_buffers: Vec<(Reservation<Buffer>, TextBuffer)>,
+        now_ms: u64,
+        cx: &mut Context<V>,
+    ) -> Vec<LocalBoxFuture<'static, ()>> {
+        debug_assert!(self.records.is_empty());
+        debug_assert!(self.buffers.is_empty());
+        debug_assert_eq!(prepared.chunks.len(), text_buffers.len());
+
+        self.turn_open = crate::store::turn_open(prepared.state.status);
+        let mut installed = Vec::with_capacity(prepared.chunks.len());
+        // Register newest buffers first; syntax activation below follows the
+        // same order so the visible tail leads the historical parser backlog.
+        for (chunk, (reservation, text_buffer)) in
+            prepared.chunks.into_iter().zip(text_buffers).rev()
+        {
+            let buffer = cx.insert_entity(reservation, |cx| {
+                let mut buffer = Buffer::build(text_buffer, None, language::Capability::Read);
+                if chunk.markdown {
+                    crate::render::markdown::configure_buffer(&mut buffer, cx);
+                }
+                buffer
+            });
+            installed.push((chunk, buffer));
+        }
+
+        let mut gutters_changed = false;
+        for (chunk, buffer) in installed.into_iter().rev() {
+            let mut offset = 0;
+            {
+                let snapshot = buffer.read(cx);
+                for (record_index, rendered) in chunk.rendered.into_iter().enumerate() {
+                    let record = block_record(
+                        &buffer,
+                        snapshot,
+                        offset,
+                        rendered,
+                        chunk.terminal_record == Some(record_index),
+                    );
+                    offset += record.text.len();
+                    gutters_changed |= record.gutter.is_some();
+                    self.records.push(record);
+                }
+            }
+            let composed = !buffer.read(cx).is_empty();
+            if composed {
+                let buffer_id = buffer.read(cx).remote_id();
+                for attachment in &self.attachments {
+                    if let Some(editor) = attachment.editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.disable_header_for_buffer(buffer_id, cx)
+                        });
+                    }
+                }
+            }
+            self.buffers.push(TranscriptBuffer {
+                start_block: chunk.start_block,
+                composed,
+                buffer,
+            });
+        }
+
+        self.turn_boundary = turn_boundary(&self.records);
+        self.reset_full_excerpts(cx);
+        self.document_tail = None;
+        self.reset_document_excerpts(cx);
+        self.refresh_elision_plans(&prepared.state, 0);
+        let history = classes_in(&self.records[..self.turn_boundary]);
+        let live = classes_in(&self.records[self.turn_boundary..]);
+        self.apply_to_attachments(now_ms, &history, &live, gutters_changed, cx);
+        let parsing = Self::warm_syntax(
+            self.buffers.iter().rev().map(|turn| turn.buffer.clone()),
+            cx,
+        );
+        cx.notify();
+        parsing
+    }
+
+    fn warm_syntax<V: 'static>(
+        buffers: impl IntoIterator<Item = Entity<Buffer>>,
+        cx: &mut Context<V>,
+    ) -> Vec<LocalBoxFuture<'static, ()>> {
+        let mut parsing = Vec::new();
+        for buffer in buffers {
+            let has_language = buffer.read(cx).language().is_some();
+            if !has_language {
+                continue;
+            }
+            buffer.update(cx, |buffer, cx| {
+                buffer.ensure_syntax_parsed(cx);
+            });
+            parsing.push(buffer.read(cx).parsing_idle().boxed_local());
+        }
+        parsing
     }
 
     /// Attaches an editor showing this transcript (over whatever
@@ -395,9 +572,15 @@ impl TranscriptModel {
                 buffer,
             });
         }
+        let new_buffers = self.buffers[first_removed..]
+            .iter()
+            .rev()
+            .map(|turn| turn.buffer.clone())
+            .collect::<Vec<_>>();
         self.reset_full_excerpts(cx);
         self.document_tail = None;
         self.reset_document_excerpts(cx);
+        Self::warm_syntax(new_buffers, cx);
     }
 
     fn try_incremental_sync<V: 'static>(

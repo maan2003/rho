@@ -446,7 +446,7 @@ impl Workspace {
                 }
                 event => {
                     if !frames.is_empty() {
-                        self.handle_frame_batch(std::mem::take(&mut frames), cx);
+                        self.handle_frame_batch(std::mem::take(&mut frames), window, cx);
                         allocations.clear();
                     }
                     self.handle_event(event, window, cx);
@@ -454,7 +454,7 @@ impl Workspace {
             }
         }
         if !frames.is_empty() {
-            self.handle_frame_batch(frames, cx);
+            self.handle_frame_batch(frames, window, cx);
         }
         drop(allocations);
     }
@@ -462,6 +462,7 @@ impl Workspace {
     fn handle_frame_batch(
         &mut self,
         frames: Vec<(AgentId, rho_ui_proto::remote::AgentRemoteFrame)>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut order = Vec::new();
@@ -518,30 +519,26 @@ impl Workspace {
             }
         }
 
-        let selected = self.registry.selected_agent().copied();
         for agent_id in order {
             let summary = changes[&agent_id].0;
-            if selected == Some(agent_id) {
-                if let Some(view) = self.models.get(&agent_id).cloned()
-                    && let Some(state) = self.store.get(&agent_id)
-                {
-                    view.update(cx, |view, cx| {
-                        view.sync(
-                            state,
-                            summary,
-                            now_ms(),
-                            &|id| self.registry.agent_display_label(id),
-                            cx,
-                        )
-                    });
-                }
-            } else {
-                if self.models.contains_key(&agent_id) {
+            let (view, started) = self.ensure_agent_model(agent_id, window, cx);
+            if started || !view.read(cx).initial_load_ready() {
+                if !started {
                     self.pending_syncs
                         .entry(agent_id)
                         .and_modify(|pending| *pending = pending.merge(summary))
                         .or_insert(summary);
                 }
+            } else if let Some(state) = self.store.get(&agent_id) {
+                view.update(cx, |view, cx| {
+                    view.sync(
+                        state,
+                        summary,
+                        now_ms(),
+                        &|id| self.registry.agent_display_label(id),
+                        cx,
+                    )
+                });
             }
         }
 
@@ -640,8 +637,8 @@ impl Workspace {
                 }
                 self.registry.mark_not_live(agent_id);
                 let summary = self.store.mark_unloaded(agent_id);
-                if self.registry.selected_agent() == Some(&agent_id) {
-                    if let Some(view) = self.models.get(&agent_id).cloned()
+                if let Some(view) = self.models.get(&agent_id).cloned() {
+                    if view.read(cx).initial_load_ready()
                         && let Some(state) = self.store.get(&agent_id)
                     {
                         view.update(cx, |view, cx| {
@@ -653,12 +650,12 @@ impl Workspace {
                                 cx,
                             )
                         });
+                    } else {
+                        self.pending_syncs
+                            .entry(agent_id)
+                            .and_modify(|pending| *pending = pending.merge(summary))
+                            .or_insert(summary);
                     }
-                } else if self.models.contains_key(&agent_id) {
-                    self.pending_syncs
-                        .entry(agent_id)
-                        .and_modify(|pending| *pending = pending.merge(summary))
-                        .or_insert(summary);
                 }
                 self.release_agent_view_cache(agent_id, cx);
                 self.refresh_draft_agent_targets(cx);
@@ -669,7 +666,7 @@ impl Workspace {
                 frame,
                 allocation,
             } => {
-                self.handle_frame_batch(vec![(agent_id, frame)], cx);
+                self.handle_frame_batch(vec![(agent_id, frame)], window, cx);
                 drop(allocation);
             }
             ConnEvent::AgentAttention {
@@ -2035,7 +2032,7 @@ impl Workspace {
             self.subscribe_agent(agent_id, cx);
         }
         if let Some(agent_id) = &agent_id {
-            let view = self.materialize_model(agent_id, cx);
+            let view = self.materialize_model(agent_id, window, cx);
             view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         }
         let (context, key) = match agent_id {
@@ -2649,45 +2646,92 @@ impl Workspace {
         self.select_agent(Some(agent_id), window, cx);
     }
 
+    fn ensure_agent_model(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<AgentModel>, bool) {
+        let view = if let Some(view) = self.models.get(&agent_id).cloned() {
+            view
+        } else {
+            let workspace = cx.entity().downgrade();
+            let visualization_client = self.connection.visualization_client();
+            let view = cx.new(|cx| AgentModel::new(workspace, visualization_client, cx));
+            self.refresh_view_status(&agent_id, &view, cx);
+            self.models.insert(agent_id, view.clone());
+            view
+        };
+
+        let mut started = false;
+        if !view.read(cx).initial_load_started()
+            && let Some(state) = self.store.get(&agent_id).cloned()
+        {
+            let labels = self
+                .registry
+                .known_agents()
+                .copied()
+                .map(|id| (id, self.registry.agent_display_label(id)))
+                .collect();
+            view.update(cx, |view, cx| {
+                view.start_initial_load(agent_id, state, labels, now_ms(), cx)
+            });
+            started = true;
+        }
+        // The bounded subscription cache owns one warm dashboard editor per
+        // agent. Pane editors remain pane-owned because their cursor, scroll,
+        // and fold state are independent.
+        view.update(cx, |view, cx| {
+            view.preview_editor(window, cx);
+        });
+        (view, started)
+    }
+
     fn materialize_model(
         &mut self,
         agent_id: &AgentId,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<AgentModel> {
-        let deferred = self.pending_syncs.remove(agent_id);
-        if let Some(view) = self.models.get(agent_id).cloned() {
-            if let (Some(summary), Some(state)) = (deferred, self.store.get(agent_id)) {
-                view.update(cx, |view, cx| {
-                    view.sync(
-                        state,
-                        summary,
-                        now_ms(),
-                        &|id| self.registry.agent_display_label(id),
-                        cx,
-                    )
-                });
-            }
-            return view;
-        }
-        // A freshly created view renders the full state below, which
-        // subsumes any deferred summary.
-        let workspace = cx.entity().downgrade();
-        let visualization_client = self.connection.visualization_client();
-        let view = cx.new(|cx| AgentModel::new(workspace, visualization_client, cx));
-        if let Some(state) = self.store.get(agent_id) {
+        let (view, _) = self.ensure_agent_model(*agent_id, window, cx);
+        if view.read(cx).initial_load_ready()
+            && let (Some(summary), Some(state)) = (
+                self.pending_syncs.remove(agent_id),
+                self.store.get(agent_id),
+            )
+        {
             view.update(cx, |view, cx| {
                 view.sync(
                     state,
-                    FrameSummary::everything(),
+                    summary,
                     now_ms(),
                     &|id| self.registry.agent_display_label(id),
                     cx,
                 );
             });
         }
-        self.refresh_view_status(agent_id, &view, cx);
-        self.models.insert(*agent_id, view.clone());
         view
+    }
+
+    pub(crate) fn finish_initial_agent_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let Some(view) = self.models.get(&agent_id).cloned() else {
+            return;
+        };
+        if let Some(summary) = self.pending_syncs.remove(&agent_id)
+            && let Some(state) = self.store.get(&agent_id)
+        {
+            view.update(cx, |view, cx| {
+                view.sync(
+                    state,
+                    summary,
+                    now_ms(),
+                    &|id| self.registry.agent_display_label(id),
+                    cx,
+                )
+            });
+        }
+        self.refresh_view_status(&agent_id, &view, cx);
+        cx.notify();
     }
 
     /// Recomputes the right-prompt status chips for one agent's view.
@@ -2867,7 +2911,7 @@ impl Workspace {
             }
             SurfaceKey::Transcript(agent_id) => {
                 let agent_id = *agent_id;
-                let model = self.materialize_model(&agent_id, cx);
+                let model = self.materialize_model(&agent_id, window, cx);
                 let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
                 SurfaceView::Transcript { model, editor }
             }

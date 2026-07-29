@@ -10,6 +10,7 @@
 //! system-notice region (local messages that must survive transcript
 //! re-renders), and the writable prompt draft.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use collections::HashSet;
@@ -18,13 +19,16 @@ use editor::scroll::AutoscrollStrategy;
 use editor::{
     Editor, EditorMode, EditorRightPrompt, HighlightKey, Inlay, SelectionEffects, SizingBehavior,
 };
+use futures::future::join_all;
 use gpui::prelude::*;
-use gpui::{Context, Entity, Subscription, WeakEntity, Window};
+use gpui::{Context, Entity, Subscription, Task, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
 use rho_core::ContentPart;
+use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::UiAgentState;
+use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
 use crate::commands::WorkspaceCompletionProvider;
 use crate::highlights::apply_class_highlights;
@@ -56,6 +60,9 @@ pub struct AgentModel {
     attachment_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
     status_spans: Vec<(String, gpui::HighlightStyle)>,
     workspace: WeakEntity<Workspace>,
+    initial_load_started: bool,
+    initial_load_ready: bool,
+    initial_load: Option<Task<()>>,
     /// Full-multibuffer editors currently displaying this agent, weakly
     /// held: panes own their editors; the model only reconciles whoever
     /// is still alive. The preview editor lives apart — prompt chrome
@@ -115,9 +122,77 @@ impl AgentModel {
             attachment_blocks: Vec::new(),
             status_spans: Vec::new(),
             workspace,
+            initial_load_started: false,
+            initial_load_ready: false,
+            initial_load: None,
             editors: Vec::new(),
             _subscriptions: subscriptions,
         }
+    }
+
+    pub fn initial_load_started(&self) -> bool {
+        self.initial_load_started
+    }
+
+    pub fn initial_load_ready(&self) -> bool {
+        self.initial_load_ready
+    }
+
+    /// Starts the one asynchronous bulk load for a subscribed agent. Normal
+    /// streamed updates remain synchronous after this reaches Ready.
+    pub fn start_initial_load(
+        &mut self,
+        agent_id: AgentId,
+        state: UiAgentState,
+        agent_labels: HashMap<AgentId, String>,
+        now_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.initial_load_started {
+            return;
+        }
+        self.initial_load_started = true;
+        let workspace = self.workspace.clone();
+        let background = cx.background_executor().clone();
+        self.initial_load = Some(cx.spawn(async move |this, cx| {
+            let mut prepared = background
+                .spawn(async move { TranscriptModel::prepare_initial(state, now_ms, agent_labels) })
+                .await;
+            let reservations = (0..prepared.buffer_count())
+                .map(|_| cx.reserve_entity::<Buffer>())
+                .collect::<Vec<_>>();
+            let buffer_ids = reservations
+                .iter()
+                .map(|reservation| BufferId::from(reservation.entity_id().as_non_zero_u64()))
+                .collect::<Vec<_>>();
+            let texts = prepared.take_texts();
+            let text_buffers = background
+                .spawn(async move {
+                    buffer_ids
+                        .into_iter()
+                        .zip(texts)
+                        .map(|(buffer_id, text)| TextBuffer::new(ReplicaId::LOCAL, buffer_id, text))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let text_buffers = reservations.into_iter().zip(text_buffers).collect();
+            let Ok(parsing) = this.update(cx, |this, cx| {
+                this.transcript
+                    .install_initial(prepared, text_buffers, now_ms, cx)
+            }) else {
+                return;
+            };
+            join_all(parsing).await;
+            if this
+                .update(cx, |this, _| this.initial_load_ready = true)
+                .is_err()
+            {
+                return;
+            }
+            let _ = workspace.update(cx, |workspace, cx| {
+                workspace.finish_initial_agent_load(agent_id, cx)
+            });
+        }));
     }
 
     /// The read-only preview editor over the document multibuffer, built

@@ -52,9 +52,10 @@ pub fn configure_buffer(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
         cx.set_global(MarkdownLanguagesRegistered);
     }
     buffer.set_language_registry(registry);
-    // Editors activate syntax when this turn enters their viewport. The
-    // underlying buffer is shared, so preview and full editors coalesce on
-    // the same parse and unvisited history stays dormant.
+    // Transcript composition activates this after excerpts and editor
+    // attachments are in place. Keeping assignment separate from activation
+    // avoids exposing a half-composed buffer to syntax consumers.
+    buffer.set_sync_parse_timeout(None);
     buffer.set_language_deferred(Some(block.clone()), cx);
 }
 
