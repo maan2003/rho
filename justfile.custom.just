@@ -29,6 +29,11 @@ deploy-webui:
     echo "error: no 'origin' git remote configured" >&2
     exit 1
   fi
+  # The deploy repo pushes over plain SSH, outside rho's octo transport.
+  if [[ "$remote" == octo://* ]]; then
+    remote="${remote#octo://}"
+    remote="git@${remote%%/*}:${remote#*/}"
+  fi
   deploy="${RHO_WEBUI_DEPLOY_DIR:-$HOME/.local/share/rho/webui-deploy}"
   if [ ! -e "$deploy/.jj" ]; then
     mkdir -p "$deploy"
@@ -36,11 +41,13 @@ deploy-webui:
   fi
   cd "$deploy"
   jj git remote set-url origin "$remote"
-  jj new 'root()'
+  # The wasm bundle exceeds jj's default new-file snapshot cap.
+  jj config set --repo snapshot.max-new-file-size 33554432
+  jj new 'root()' -m "deploy $(basename "$bundle")"
   cp -r --no-preserve=mode,ownership "$bundle"/. .
   # Pages runs Jekyll on branch deploys unless told not to.
   touch .nojekyll
   jj bookmark set gh-pages --allow-backwards -r @
-  jj git push --bookmark gh-pages --allow-new
+  jj git push --bookmark gh-pages
   # Only the latest deploy commit is reachable; let jj drop the rest.
   jj util gc --expire now
