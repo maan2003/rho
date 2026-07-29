@@ -635,9 +635,7 @@ type GutterHighlight = (fn(&App) -> Hsla, Vec<Range<Anchor>>);
 
 struct SyntaxConcealment {
     scopes: Vec<Range<Anchor>>,
-    prefix_max_ends: Vec<Anchor>,
     buffer_ids: HashSet<BufferId>,
-    covered: Vec<Range<MultiBufferOffset>>,
     dirty: bool,
 }
 
@@ -9559,6 +9557,10 @@ impl Editor {
     }
 
     /// Conceals syntax-query captures inside the given multibuffer ranges.
+    ///
+    /// Concealment changes display geometry, so its ranges cover the supplied
+    /// scopes independently of the viewport and are published only from a
+    /// completed syntax snapshot.
     pub fn set_syntax_concealment_ranges<T: 'static>(
         &mut self,
         mut scopes: Vec<Range<Anchor>>,
@@ -9578,46 +9580,40 @@ impl Editor {
                 .cmp(&b.start, &snapshot)
                 .then_with(|| a.end.cmp(&b.end, &snapshot))
         });
-        let buffer_ids = scopes
+        let buffer_ids: HashSet<BufferId> = scopes
             .iter()
             .flat_map(|scope| snapshot.buffer_ids_for_range(scope.clone()))
             .collect();
-        let mut prefix_max_ends: Vec<Anchor> = Vec::with_capacity(scopes.len());
-        for scope in &scopes {
-            let max_end = prefix_max_ends
-                .last()
-                .filter(|end| end.cmp(&scope.end, &snapshot).is_gt())
-                .cloned()
-                .unwrap_or(scope.end);
-            prefix_max_ends.push(max_end);
-        }
+        let multi_buffer = self.buffer.read(cx);
+        let parse_pending = buffer_ids.iter().any(|buffer_id| {
+            multi_buffer
+                .buffer(*buffer_id)
+                .is_some_and(|buffer| buffer.read(cx).is_parsing())
+        });
         let state = self
             .syntax_concealments
             .entry(type_id)
             .or_insert_with(|| SyntaxConcealment {
                 scopes: Vec::new(),
-                prefix_max_ends: Vec::new(),
                 buffer_ids: HashSet::default(),
-                covered: Vec::new(),
-                dirty: true,
+                dirty: !parse_pending,
             });
         if state.scopes == scopes {
             return;
         }
 
         state.scopes = scopes;
-        state.prefix_max_ends = prefix_max_ends;
         state.buffer_ids = buffer_ids;
-        state.covered.clear();
-        state.dirty = true;
-        cx.notify();
+        if !parse_pending {
+            state.dirty = true;
+            cx.notify();
+        }
     }
 
     fn invalidate_syntax_concealments(&mut self, buffer_id: Option<BufferId>) -> bool {
         let mut invalidated = false;
         for concealment in self.syntax_concealments.values_mut() {
             if buffer_id.is_none_or(|buffer_id| concealment.buffer_ids.contains(&buffer_id)) {
-                concealment.covered.clear();
                 concealment.dirty = true;
                 invalidated = true;
             }
@@ -9625,66 +9621,25 @@ impl Editor {
         invalidated
     }
 
-    fn refresh_visible_syntax_concealments(&mut self, cx: &mut Context<Self>) {
+    fn refresh_syntax_concealments(&mut self, cx: &mut Context<Self>) {
         if self.syntax_concealments.is_empty() {
             return;
         }
-        let display_snapshot = self.display_snapshot(cx);
-        let snapshot = display_snapshot.buffer_snapshot();
-        let mut visible = self.multi_buffer_visible_range(&display_snapshot, cx);
-        visible.start = Point::new(visible.start.row.saturating_sub(20), 0);
-        visible.end = snapshot.clip_point(
-            Point::new(visible.end.row.saturating_add(100), 0),
-            Bias::Right,
-        );
-        let visible = multi_buffer::ToOffset::to_offset(&visible.start, snapshot)
-            ..multi_buffer::ToOffset::to_offset(&visible.end, snapshot);
-        if visible.is_empty() {
-            return;
-        }
+        let snapshot = self.buffer.read(cx).snapshot(cx);
 
         let mut updates = Vec::new();
         for (type_id, state) in &mut self.syntax_concealments {
-            let first = state
-                .prefix_max_ends
-                .partition_point(|end| end.to_offset(snapshot) <= visible.start);
-            let intersections = state
-                .scopes
-                .iter()
-                .skip(first)
-                .map_while(|scope| {
-                    let scope = scope.start.to_offset(snapshot)..scope.end.to_offset(snapshot);
-                    if scope.start >= visible.end {
-                        return None;
-                    }
-                    let intersection = scope.start.max(visible.start)..scope.end.min(visible.end);
-                    Some((scope, intersection))
-                })
-                .filter(|(_, intersection)| !intersection.is_empty())
-                .collect::<Vec<_>>();
-            if !state.dirty
-                && (intersections.is_empty() && state.covered.is_empty()
-                    || !intersections.is_empty()
-                        && intersections.iter().all(|(_, intersection)| {
-                            state.covered.iter().any(|covered| {
-                                covered.start <= intersection.start
-                                    && covered.end >= intersection.end
-                            })
-                        }))
-            {
+            if !state.dirty {
                 continue;
             }
 
             let mut concealed = Vec::new();
-            for (scope, intersection) in &intersections {
-                concealed.extend(snapshot.concealed_ranges(intersection.clone(), scope.clone()));
+            for scope in &state.scopes {
+                let scope = scope.start.to_offset(&snapshot)..scope.end.to_offset(&snapshot);
+                concealed.extend(snapshot.concealed_ranges(scope.clone(), scope));
             }
             concealed.sort_unstable_by_key(|range| (range.start, range.end));
             concealed.dedup();
-            state.covered = intersections
-                .into_iter()
-                .map(|(_, intersection)| intersection)
-                .collect();
             state.dirty = false;
             updates.push((*type_id, concealed));
         }
@@ -9972,10 +9927,12 @@ impl Editor {
                 edited_buffer,
                 source,
             } => {
-                let edited_buffer_id = edited_buffer
-                    .as_ref()
-                    .map(|buffer| buffer.read(cx).remote_id());
-                self.invalidate_syntax_concealments(edited_buffer_id);
+                // Keep the previous syntax snapshot's concealments until the
+                // parser publishes its replacement. Refreshing here would
+                // expose an intermediate fold set for every streamed edit.
+                if edited_buffer.is_none() {
+                    self.invalidate_syntax_concealments(None);
+                }
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
                 self.refresh_active_diagnostics(cx);
@@ -12376,7 +12333,7 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.refresh_visible_syntax_concealments(cx);
+        self.refresh_syntax_concealments(cx);
         EditorElement::new(&cx.entity(), self.create_style(cx))
     }
 }
