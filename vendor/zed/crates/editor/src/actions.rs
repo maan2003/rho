@@ -1,6 +1,7 @@
 //! This module contains all actions supported by [`Editor`].
 use super::*;
 use gpui::{Action, actions};
+#[cfg(feature = "native")]
 use project::project_settings::GoToDiagnosticSeverityFilter;
 use schemars::JsonSchema;
 use util::serde::default_true;
@@ -291,6 +292,7 @@ pub struct CutToEndOfLine {
 pub struct FoldAtLevel(pub u32);
 
 /// Spawns the nearest available task from the current cursor position.
+#[cfg(feature = "native")]
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
 #[action(namespace = editor)]
 #[serde(deny_unknown_fields)]
@@ -325,6 +327,7 @@ pub struct SplitSelectionIntoLines {
 
 /// Expands the diagnostic under the cursor, if any, in case diagnostics are not
 /// yet active. Otherwise, goes to the next diagnostic in the file.
+#[cfg(feature = "native")]
 #[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
 #[action(namespace = editor)]
 #[serde(deny_unknown_fields)]
@@ -335,6 +338,7 @@ pub struct GoToDiagnostic {
 
 /// Expands the diagnostic under the cursor, if any, in case diagnostics are not
 /// yet active. Otherwise, goes to the previous diagnostic in the file.
+#[cfg(feature = "native")]
 #[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
 #[action(namespace = editor)]
 #[serde(deny_unknown_fields)]

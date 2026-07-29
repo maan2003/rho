@@ -335,6 +335,7 @@ impl Editor {
         cx.notify();
     }
 
+    #[cfg(feature = "native")]
     pub(super) fn toggle_tab_bar(
         &mut self,
         _: &ToggleTabBar,

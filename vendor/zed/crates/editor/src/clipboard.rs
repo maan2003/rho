@@ -16,6 +16,7 @@ pub struct ClipboardSelection {
 }
 
 impl ClipboardSelection {
+    #[cfg(feature = "native")]
     pub fn for_buffer(
         len: usize,
         is_entire_line: bool,
@@ -52,6 +53,25 @@ impl ClipboardSelection {
             first_line_indent,
             file_path,
             line_range,
+        }
+    }
+
+    #[cfg(not(feature = "native"))]
+    pub fn for_buffer(
+        len: usize,
+        is_entire_line: bool,
+        range: Range<Point>,
+        buffer: &MultiBufferSnapshot,
+        _cx: &App,
+    ) -> Self {
+        Self {
+            len,
+            is_entire_line,
+            first_line_indent: buffer
+                .indent_size_for_line(MultiBufferRow(range.start.row))
+                .len,
+            file_path: None,
+            line_range: None,
         }
     }
 }
@@ -395,12 +415,21 @@ impl Editor {
                     len += chunk.len();
                 }
 
+                #[cfg(feature = "native")]
                 clipboard_selections.push(ClipboardSelection::for_buffer(
                     len,
                     is_entire_line,
                     selection.range(),
                     &buffer,
                     self.project.as_ref(),
+                    cx,
+                ));
+                #[cfg(not(feature = "native"))]
+                clipboard_selections.push(ClipboardSelection::for_buffer(
+                    len,
+                    is_entire_line,
+                    selection.range(),
+                    &buffer,
                     cx,
                 ));
             }
@@ -663,12 +692,21 @@ impl Editor {
             }
             prev_selection_was_entire_line = is_entire_line && !is_multiline_trim;
 
+            #[cfg(feature = "native")]
             clipboard_selections.push(ClipboardSelection::for_buffer(
                 selection_len,
                 is_entire_line,
                 start..end,
                 &buffer,
                 self.project.as_ref(),
+                cx,
+            ));
+            #[cfg(not(feature = "native"))]
+            clipboard_selections.push(ClipboardSelection::for_buffer(
+                selection_len,
+                is_entire_line,
+                start..end,
+                &buffer,
                 cx,
             ));
         }

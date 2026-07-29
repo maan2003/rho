@@ -6241,6 +6241,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "native")]
     pub fn toggle_read_only(
         &mut self,
         _: &workspace::ToggleReadOnlyFile,
@@ -6338,6 +6339,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "native")]
     fn add_edit_block(
         &mut self,
         anchor: Anchor,
@@ -8796,7 +8798,7 @@ impl Editor {
     }
 
     pub fn supports_minimap(&self, cx: &App) -> bool {
-        !self.minimap_visibility.disabled() && self.buffer_kind(cx) == ItemBufferKind::Singleton
+        !self.minimap_visibility.disabled() && self.buffer().read(cx).is_singleton()
     }
 
     pub fn toggle_minimap(
@@ -9096,7 +9098,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Self>> {
-        (minimap_settings.minimap_enabled() && self.buffer_kind(cx) == ItemBufferKind::Singleton)
+        (minimap_settings.minimap_enabled() && self.buffer().read(cx).is_singleton())
             .then(|| self.initialize_new_minimap(minimap_settings, window, cx))
     }
 
@@ -10283,6 +10285,8 @@ impl Editor {
                 }
 
                 cx.emit(EditorEvent::BufferEdited);
+                #[cfg(feature = "native")]
+                {
                 cx.emit(SearchEvent::MatchesInvalidated);
 
                 let Some(project) = &self.project else { return };
@@ -10293,6 +10297,7 @@ impl Editor {
                     (telemetry, is_via_ssh)
                 };
                 telemetry.log_edit_event("editor", is_via_ssh);
+                }
             }
             multi_buffer::Event::BufferRangesUpdated {
                 buffer,
@@ -10309,6 +10314,7 @@ impl Editor {
                 if self.buffer.read(cx).diff_for(buffer_id).is_none()
                     && let Some(project) = &self.project
                 {
+                    #[cfg(feature = "native")]
                     update_uncommitted_diff_for_buffer(
                         cx.entity(),
                         project,
@@ -10592,6 +10598,7 @@ impl Editor {
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
 
+        #[cfg(feature = "native")]
         let (restore_unsaved_buffers, show_inline_diagnostics, inline_blame_enabled) = {
             let project_settings = ProjectSettings::get_global(cx);
             (
@@ -10600,16 +10607,20 @@ impl Editor {
                 project_settings.git.inline_blame.enabled,
             )
         };
-        self.buffer_serialization = self
+        #[cfg(feature = "native")]
+        { self.buffer_serialization = self
             .should_serialize_buffer()
             .then(|| BufferSerialization::new(restore_unsaved_buffers));
+        }
 
         if self.mode.is_full() {
+            #[cfg(feature = "native")]
             if self.show_inline_diagnostics != show_inline_diagnostics {
                 self.show_inline_diagnostics = show_inline_diagnostics;
                 self.refresh_inline_diagnostics(false, window, cx);
             }
 
+            #[cfg(feature = "native")]
             if self.git_blame_inline_enabled != inline_blame_enabled {
                 self.toggle_git_blame_inline_internal(false, window, cx);
             }
@@ -10642,6 +10653,7 @@ impl Editor {
                 self.refresh_outline_symbols_at_cursor(cx);
             }
 
+            #[cfg(feature = "native")]
             if let Some(inlay_splice) = self.colors.as_mut().and_then(|colors| {
                 colors.render_mode_updated(EditorSettings::get_global(cx).lsp_document_colors)
             }) {
@@ -10651,14 +10663,19 @@ impl Editor {
                 self.refresh_document_colors(None, window, cx);
             }
 
+            #[cfg(feature = "native")]
             let code_lens_inline =
                 self.enable_code_lens && EditorSettings::get_global(cx).code_lens.inline();
+            #[cfg(feature = "native")]
             let was_inline = self.code_lens.is_some();
+            #[cfg(feature = "native")]
             if code_lens_inline != was_inline {
                 self.toggle_code_lens(code_lens_inline, window, cx);
             }
 
+            #[cfg(feature = "native")]
             let lsp_document_links_enabled = EditorSettings::get_global(cx).lsp_document_links;
+            #[cfg(feature = "native")]
             if lsp_document_links_enabled != self.lsp_document_links.enabled {
                 self.lsp_document_links.enabled = lsp_document_links_enabled;
                 if lsp_document_links_enabled {
@@ -10679,13 +10696,16 @@ impl Editor {
                 cx,
             );
 
+            #[cfg(feature = "native")]
             let new_semantic_token_rules = ProjectSettings::get_global(cx)
                 .global_lsp_settings
                 .semantic_token_rules
                 .clone();
+            #[cfg(feature = "native")]
             let semantic_token_rules_changed = self
                 .semantic_token_state
                 .update_rules(new_semantic_token_rules);
+            #[cfg(feature = "native")]
             if language_settings_changed || semantic_token_rules_changed {
                 self.invalidate_semantic_tokens(None);
                 self.refresh_semantic_tokens(None, false, cx);
@@ -12019,6 +12039,7 @@ pub trait CollaborationHub {
     fn user_names(&self, cx: &App) -> HashMap<u64, SharedString>;
 }
 
+#[cfg(feature = "native")]
 impl CollaborationHub for Entity<Project> {
     #[cfg(feature = "native")]
     fn collaborators<'a>(&self, cx: &'a App) -> &'a HashMap<PeerId, Collaborator> {
@@ -12120,6 +12141,7 @@ pub trait SemanticsProvider {
     ) -> Option<Task<Result<ProjectTransaction>>>;
 }
 
+#[cfg(feature = "native")]
 impl SemanticsProvider for WeakEntity<Project> {
     #[cfg(feature = "native")]
     fn hover(
@@ -12438,12 +12460,15 @@ impl EditorSnapshot {
             && let Some(ch_width) = cx.text_system().ch_width(font_id, font_size).log_err()
             && let Some(ch_advance) = cx.text_system().ch_advance(font_id, font_size).log_err()
         {
+            #[cfg(feature = "native")]
             let show_git_gutter = self.show_git_diff_gutter.unwrap_or_else(|| {
                 matches!(
                     ProjectSettings::get_global(cx).git.git_gutter,
                     GitGutterSetting::TrackedFiles
                 )
             });
+            #[cfg(not(feature = "native"))]
+            let show_git_gutter = false;
             let gutter_settings = EditorSettings::get_global(cx).gutter;
             let show_line_numbers = self
                 .show_line_numbers
@@ -12463,6 +12488,7 @@ impl EditorSnapshot {
             let show_breakpoints = self.show_breakpoints.unwrap_or(gutter_settings.breakpoints);
             let show_bookmarks = self.show_bookmarks.unwrap_or(gutter_settings.bookmarks);
 
+            #[cfg(feature = "native")]
             let git_blame_entries_width =
                 self.git_blame_gutter_max_author_length
                     .map(|max_author_length| {
@@ -12476,6 +12502,8 @@ impl EditorSnapshot {
                         ch_advance * max_char_count
                             + renderer.blame_entry_non_text_width(window, cx)
                     });
+            #[cfg(not(feature = "native"))]
+            let git_blame_entries_width: Option<Pixels> = None;
 
             let is_singleton = self.buffer_snapshot().is_singleton();
 

@@ -315,9 +315,17 @@ the implementation crate.
   range transforms remain available in the browser editor.
 - Kept selected-text/bracket highlights on selection changes while gating the
   native completion, LSP, Git, navigation-history, and hover side effects.
-- The release wasm check is down from 76 to 53 errors. Remaining diagnostics
-  are concentrated in `EditorElement` and mouse native render contributions,
-  followed by narrow native settings/delegate methods in `Editor` and input.
+- A following core-hook pass gated prompt/breakpoint UI, workspace settings,
+  semantic/LSP refreshes, edit-prediction and linked-editing side effects while
+  preserving base insertion/newline edits (wasm uses an empty linked-edit
+  accumulator). Clipboard text and selection metadata remain portable; only
+  native project-path enrichment is omitted.
+- The release wasm check is down from 76 to 25 errors. All remaining initial
+  diagnostics are in `EditorElement` and mouse native render contributions.
+  Resolving them must also restore the portable action seam: movement actions
+  currently live in the native-gated `navigation` module, so simply gating the
+  element's long action-registration method would compile but would not meet
+  the browser keyboard-navigation contract.
 
 ### Reproduction
 

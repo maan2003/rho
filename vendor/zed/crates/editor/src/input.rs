@@ -1,5 +1,15 @@
 use super::*;
 
+#[cfg(not(feature = "native"))]
+struct LinkedEdits;
+
+#[cfg(not(feature = "native"))]
+impl LinkedEdits {
+    fn new() -> Self { Self }
+    fn push(&mut self, _: &Editor, _: Range<Anchor>, _: Arc<str>, _: &App) {}
+    fn apply(self, _: &mut Context<Editor>) {}
+}
+
 const ORDERED_LIST_MAX_MARKER_LEN: usize = 16;
 
 impl Editor {
@@ -522,7 +532,9 @@ impl Editor {
                 }
             }
             this.trigger_completion_on_input(&text, trigger_in_words, window, cx);
+            #[cfg(feature = "native")]
             refresh_linked_ranges(this, window, cx);
+            #[cfg(feature = "native")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -772,6 +784,7 @@ impl Editor {
                 .collect();
 
             this.change_selections(Default::default(), window, cx, |s| s.select(new_selections));
+            #[cfg(feature = "native")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -2041,6 +2054,7 @@ impl Editor {
             });
 
             if apply_linked_edits {
+                #[cfg(feature = "native")]
                 refresh_linked_ranges(this, window, cx);
             }
 
