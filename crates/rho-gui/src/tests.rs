@@ -1989,7 +1989,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
             status: None,
             context_used: None,
             usage: Some(rho_ui_proto::remote::UiAgentUsage {
-                provider: "claude".to_owned(),
+                provider: "fable".to_owned(),
                 total: rho_ui_proto::AgentUsageBucket {
                     input_tokens: 1_000_000,
                     cache_read_tokens: 1_000_000,

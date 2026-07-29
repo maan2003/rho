@@ -223,13 +223,15 @@ impl Transient {
             let series = series.clone();
             let days = self.usage_days;
             let gpt: Hsla = colors.terminal_ansi_cyan.into();
-            let claude: Hsla = rgb(0xd97757).into();
+            let opus: Hsla = colors.terminal_ansi_magenta.into();
+            let fable: Hsla = rgb(0xd97757).into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
             let now = crate::workspace::now_ms();
             let since = now.saturating_sub(days * 24 * 60 * 60 * 1_000);
-            let gpt_cost = provider_cost(&series, "gpt", since);
-            let claude_cost = provider_cost(&series, "claude", since);
-            let total_cost = gpt_cost + claude_cost;
+            let gpt_cost = model_cost(&series, "gpt", since);
+            let opus_cost = model_cost(&series, "opus", since);
+            let fable_cost = model_cost(&series, "fable", since);
+            let total_cost = gpt_cost + opus_cost + fable_cost;
             let requests = series
                 .iter()
                 .flat_map(|series| &series.buckets)
@@ -263,8 +265,13 @@ impl Transient {
                         .px_2()
                         .child(
                             div()
-                                .text_color(claude)
-                                .child(format!("claude ${claude_cost:.2}")),
+                                .text_color(fable)
+                                .child(format!("fable ${fable_cost:.2}")),
+                        )
+                        .child(
+                            div()
+                                .text_color(opus)
+                                .child(format!("opus ${opus_cost:.2}")),
                         )
                         .child(div().text_color(gpt).child(format!("gpt ${gpt_cost:.2}"))),
                 )
@@ -293,7 +300,7 @@ impl Transient {
                                     .flex()
                                     .flex_col()
                                     .child(div().w(px(832.)).h(px(220.)).child(global_usage_chart(
-                                        series, now, days, gpt, claude, grid,
+                                        series, now, days, gpt, opus, fable, grid,
                                     )))
                                     .child(
                                         div()
@@ -678,7 +685,8 @@ fn global_usage_chart(
     now: u64,
     days: u64,
     gpt: Hsla,
-    claude: Hsla,
+    opus: Hsla,
+    fable: Hsla,
     grid: Hsla,
 ) -> impl IntoElement {
     canvas(
@@ -688,25 +696,26 @@ fn global_usage_chart(
             const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
             let window_ms = days * DAY_MS;
             let start = now.saturating_sub(window_ms);
-            let mut costs = HashMap::<u64, (f64, f64)>::new();
-            for provider in &series {
-                for bucket in &provider.buckets {
+            let mut costs = HashMap::<u64, [f64; 3]>::new();
+            for model in &series {
+                for bucket in &model.buckets {
                     if bucket.bucket_start_ms < start {
                         continue;
                     }
                     let entry = costs.entry(bucket.bucket_start_ms).or_default();
-                    let cost = bucket_cost_usd(bucket, &provider.provider);
-                    if provider.provider == "claude" {
-                        entry.1 += cost;
-                    } else {
-                        entry.0 += cost;
-                    }
+                    let cost = bucket_cost_usd(bucket, &model.model);
+                    let index = match model.model.as_str() {
+                        "fable" => 0,
+                        "opus" => 1,
+                        _ => 2,
+                    };
+                    entry[index] += cost;
                 }
             }
 
             let max = costs
                 .values()
-                .map(|(gpt, claude)| gpt + claude)
+                .map(|costs| costs.iter().sum::<f64>())
                 .sum::<f64>()
                 .max(f64::EPSILON);
             let to_point = |at: u64, value: f64| {
@@ -717,50 +726,66 @@ fn global_usage_chart(
                     bounds.origin.y + bounds.size.height * y.clamp(0.0, 1.0) as f32,
                 )
             };
-            let mut claude_total = 0.0;
+            let mut fable_total = 0.0;
+            let mut opus_total = 0.0;
             let mut gpt_total = 0.0;
-            let mut points = vec![(
-                to_point(start, claude_total),
-                to_point(start, claude_total + gpt_total),
-            )];
+            let mut points = vec![[to_point(start, 0.0); 3]];
             let mut bucket_start = start.div_ceil(BUCKET_MS) * BUCKET_MS;
             while bucket_start <= now {
-                points.push((
-                    to_point(bucket_start, claude_total),
-                    to_point(bucket_start, claude_total + gpt_total),
-                ));
-                if let Some((gpt_cost, claude_cost)) = costs.get(&bucket_start) {
+                points.push([
+                    to_point(bucket_start, fable_total),
+                    to_point(bucket_start, fable_total + opus_total),
+                    to_point(bucket_start, fable_total + opus_total + gpt_total),
+                ]);
+                if let Some([fable_cost, opus_cost, gpt_cost]) = costs.get(&bucket_start) {
+                    fable_total += fable_cost;
+                    opus_total += opus_cost;
                     gpt_total += gpt_cost;
-                    claude_total += claude_cost;
                 }
                 let end = bucket_start.saturating_add(BUCKET_MS).min(now);
-                points.push((
-                    to_point(end, claude_total),
-                    to_point(end, claude_total + gpt_total),
-                ));
+                points.push([
+                    to_point(end, fable_total),
+                    to_point(end, fable_total + opus_total),
+                    to_point(end, fable_total + opus_total + gpt_total),
+                ]);
                 bucket_start = bucket_start.saturating_add(BUCKET_MS);
             }
 
-            let mut claude_area = PathBuilder::fill();
-            claude_area.move_to(point(bounds.origin.x, bounds.bottom()));
-            for (point, _) in &points {
-                claude_area.line_to(*point);
+            let mut fable_area = PathBuilder::fill();
+            fable_area.move_to(point(bounds.origin.x, bounds.bottom()));
+            for points in &points {
+                fable_area.line_to(points[0]);
             }
-            claude_area.line_to(point(bounds.right(), bounds.bottom()));
-            claude_area.close();
-            if let Ok(path) = claude_area.build() {
-                window.paint_path(path, claude.opacity(0.72));
+            fable_area.line_to(point(bounds.right(), bounds.bottom()));
+            fable_area.close();
+            if let Ok(path) = fable_area.build() {
+                window.paint_path(path, fable.opacity(0.72));
+            }
+
+            let mut opus_area = PathBuilder::fill();
+            if let Some(first) = points.first() {
+                opus_area.move_to(first[1]);
+            }
+            for points in &points[1..] {
+                opus_area.line_to(points[1]);
+            }
+            for points in points.iter().rev() {
+                opus_area.line_to(points[0]);
+            }
+            opus_area.close();
+            if let Ok(path) = opus_area.build() {
+                window.paint_path(path, opus.opacity(0.72));
             }
 
             let mut gpt_area = PathBuilder::fill();
-            if let Some((_, first)) = points.first() {
-                gpt_area.move_to(*first);
+            if let Some(first) = points.first() {
+                gpt_area.move_to(first[2]);
             }
-            for (_, point) in &points[1..] {
-                gpt_area.line_to(*point);
+            for points in &points[1..] {
+                gpt_area.line_to(points[2]);
             }
-            for (point, _) in points.iter().rev() {
-                gpt_area.line_to(*point);
+            for points in points.iter().rev() {
+                gpt_area.line_to(points[1]);
             }
             gpt_area.close();
             if let Ok(path) = gpt_area.build() {
@@ -805,25 +830,29 @@ fn paint_grid_line(from: Point<Pixels>, to: Point<Pixels>, color: Hsla, window: 
     }
 }
 
-fn provider_cost(series: &[rho_ui_proto::AgentUsageSeries], provider: &str, since: u64) -> f64 {
+fn model_cost(series: &[rho_ui_proto::AgentUsageSeries], model: &str, since: u64) -> f64 {
     series
         .iter()
-        .filter(|series| series.provider == provider)
+        .filter(|series| series.model == model)
         .flat_map(|series| &series.buckets)
         .filter(|bucket| bucket.bucket_start_ms >= since)
-        .map(|bucket| bucket_cost_usd(bucket, provider))
+        .map(|bucket| bucket_cost_usd(bucket, model))
         .sum()
 }
 
-pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, provider: &str) -> f64 {
-    let (input, cache_read, cache_write, output) = if provider.starts_with("claude") {
-        (10.0, 1.0, 12.5, 50.0)
-    } else {
-        (5.0, 0.5, 6.25, 30.0)
+pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &str) -> f64 {
+    let (input, cache_read, cache_write_5m, cache_write_1h, output) = match model {
+        "fable" => (10.0, 1.0, 12.5, 20.0, 50.0),
+        "opus" => (5.0, 0.5, 6.25, 10.0, 25.0),
+        _ => (5.0, 0.5, 6.25, 6.25, 30.0),
     };
+    let cache_write_5m_tokens = bucket
+        .cache_write_tokens
+        .saturating_sub(bucket.cache_write_1h_tokens);
     (bucket.input_tokens as f64 * input
         + bucket.cache_read_tokens as f64 * cache_read
-        + bucket.cache_write_tokens as f64 * cache_write
+        + cache_write_5m_tokens as f64 * cache_write_5m
+        + bucket.cache_write_1h_tokens as f64 * cache_write_1h
         + bucket.output_tokens as f64 * output)
         / 1_000_000.0
 }
@@ -989,10 +1018,12 @@ mod tests {
             input_tokens: 1_000_000,
             cache_read_tokens: 1_000_000,
             cache_write_tokens: 1_000_000,
+            cache_write_1h_tokens: 1_000_000,
             output_tokens: 1_000_000,
             ..Default::default()
         };
-        assert_eq!(bucket_cost_usd(&usage, "claude"), 73.5);
+        assert_eq!(bucket_cost_usd(&usage, "fable"), 81.0);
+        assert_eq!(bucket_cost_usd(&usage, "opus"), 40.5);
         assert_eq!(bucket_cost_usd(&usage, "gpt"), 41.75);
     }
 

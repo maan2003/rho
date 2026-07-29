@@ -9,7 +9,7 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::{FutureExt as _, StreamExt as _};
 use rho_agent::db::{
-    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentUsageProvider,
+    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentUsageModel,
     AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider, WorkstreamId,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
@@ -2074,6 +2074,7 @@ fn ui_agent_usage_bucket(bucket: rho_agent::db::AgentUsageBucket) -> UiAgentUsag
         input_tokens: bucket.input_tokens,
         cache_read_tokens: bucket.cache_read_tokens,
         cache_write_tokens: bucket.cache_write_tokens,
+        cache_write_1h_tokens: bucket.cache_write_1h_tokens,
         output_tokens: bucket.output_tokens,
         requests: bucket.requests,
         approximate: bucket.approximate,
@@ -2304,17 +2305,21 @@ async fn handle_message(
                 .db
                 .read()
                 .global_agent_usage(rho_core::UnixMs(since_ms));
-            let series = [AgentUsageProvider::GPT, AgentUsageProvider::CLAUDE]
-                .into_iter()
-                .map(|provider| AgentUsageSeries {
-                    provider: provider.name().to_owned(),
-                    buckets: usage
-                        .iter()
-                        .filter(|(candidate, _)| *candidate == provider)
-                        .map(|(_, bucket)| ui_agent_usage_bucket(bucket.clone()))
-                        .collect(),
-                })
-                .collect();
+            let series = [
+                AgentUsageModel::GPT,
+                AgentUsageModel::OPUS,
+                AgentUsageModel::FABLE,
+            ]
+            .into_iter()
+            .map(|model| AgentUsageSeries {
+                model: model.name().to_owned(),
+                buckets: usage
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == model)
+                    .map(|(_, bucket)| ui_agent_usage_bucket(bucket.clone()))
+                    .collect(),
+            })
+            .collect();
             let _ = outgoing_tx.send(ServerMessage::GlobalUsage { series });
             Ok(Refresh::None)
         }

@@ -30,9 +30,11 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     );
     let first = AgentUsageBucket {
         bucket_start_ms: AGENT_USAGE_BUCKET_MS,
+        model: AgentUsageModel::GPT,
         input_tokens: 10,
         cache_read_tokens: 20,
         cache_write_tokens: 30,
+        cache_write_1h_tokens: 0,
         output_tokens: 40,
         requests: 1,
         approximate: false,
@@ -54,7 +56,35 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         },
         None,
     );
-    write.add_agent_usage(claude_id, &first);
+    write.add_agent_usage(
+        claude_id,
+        &AgentUsageBucket {
+            model: AgentUsageModel::FABLE,
+            ..first.clone()
+        },
+    );
+    let opus_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        opus_id,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ClaudeOpus {
+            effort: ClaudeEffort::Medium,
+        },
+        AgentRuntime::Claude {
+            session_id: uuid::Uuid::new_v4(),
+        },
+        None,
+    );
+    write.add_agent_usage(
+        opus_id,
+        &AgentUsageBucket {
+            model: AgentUsageModel::OPUS,
+            ..first.clone()
+        },
+    );
     write.commit();
 
     let read = db.read();
@@ -64,11 +94,13 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     assert_eq!(buckets[0].requests, 2);
     assert_eq!(read.agent_usage_total(agent_id).output_tokens, 80);
     let global = read.global_agent_usage(UnixMs(0));
-    assert_eq!(global.len(), 2);
-    assert_eq!(global[0].0, AgentUsageProvider::GPT);
+    assert_eq!(global.len(), 3);
+    assert_eq!(global[0].0, AgentUsageModel::GPT);
     assert_eq!(global[0].1.output_tokens, 80);
-    assert_eq!(global[1].0, AgentUsageProvider::CLAUDE);
+    assert_eq!(global[1].0, AgentUsageModel::FABLE);
     assert_eq!(global[1].1.output_tokens, 40);
+    assert_eq!(global[2].0, AgentUsageModel::OPUS);
+    assert_eq!(global[2].1.output_tokens, 40);
 }
 
 #[tokio::test]
@@ -145,7 +177,7 @@ async fn native_usage_backfill_reads_completed_debug_responses() {
     assert_eq!(bucket.requests, 1);
     let global = read.global_agent_usage(UnixMs(0));
     assert_eq!(global.len(), 1);
-    assert_eq!(global[0].0, AgentUsageProvider::GPT);
+    assert_eq!(global[0].0, AgentUsageModel::GPT);
     assert_eq!(global[0].1.input_tokens, 30);
     let quota = read.quota_observations(QuotaModel::GPT, UnixMs(0));
     assert_eq!(quota.len(), 1);
@@ -165,18 +197,20 @@ async fn claude_usage_backfill_accumulates_usage_samples() {
         .map(
             |(input_tokens, output_tokens)| rho_claude::SessionUsageSample {
                 timestamp: Some("2026-07-02T08:24:50Z".to_owned()),
+                model: Some("claude-fable-5".to_owned()),
                 usage: rho_claude::protocol::TokenUsage {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(output_tokens),
                     cache_creation_input_tokens: Some(30),
                     cache_read_input_tokens: Some(40),
+                    cache_creation: None,
                 },
             },
         )
         .collect();
     let mut buckets = std::collections::HashMap::new();
 
-    add_claude_usage(agent_id, messages, &mut buckets);
+    add_claude_usage(agent_id, AgentUsageModel::FABLE, messages, &mut buckets);
 
     let bucket = buckets.values().next().unwrap();
     assert_eq!(buckets.len(), 1);

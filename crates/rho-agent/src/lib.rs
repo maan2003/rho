@@ -169,7 +169,7 @@ pub struct AgentState {
     pub context_used: Option<u64>,
     /// Cumulative provider-reported usage across this agent's requests.
     pub total_usage: db::AgentUsageBucket,
-    pub usage_provider: db::AgentUsageProvider,
+    pub usage_provider: db::AgentUsageModel,
     /// Latest weekly provider quota observation seen by this runtime.
     pub quota_observation: Option<QuotaObservation>,
 }
@@ -755,7 +755,7 @@ impl Agent {
             kind: restored.kind,
             context_used: restored.context_used,
             total_usage,
-            usage_provider: db::AgentUsageProvider::GPT,
+            usage_provider: db::AgentUsageModel::GPT,
             quota_observation: None,
         }));
         let notify = Arc::new(Notify::new());
@@ -2688,7 +2688,7 @@ mod tests {
             },
             context_used: None,
             total_usage: db::AgentUsageBucket::default(),
-            usage_provider: db::AgentUsageProvider::GPT,
+            usage_provider: db::AgentUsageModel::GPT,
             quota_observation: None,
         }
     }
@@ -2780,7 +2780,7 @@ mod tests {
             kind: AgentStateKind::Idle,
             context_used: Some(232_560),
             total_usage: db::AgentUsageBucket::default(),
-            usage_provider: db::AgentUsageProvider::GPT,
+            usage_provider: db::AgentUsageModel::GPT,
             quota_observation: None,
         };
         assert!(should_auto_compact(&state, Some(232_560)));

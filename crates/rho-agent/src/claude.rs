@@ -99,7 +99,12 @@ impl ClaudeAgent {
             kind: AgentStateKind::Idle,
             context_used: None,
             total_usage: db.read().agent_usage_total(agent_id),
-            usage_provider: crate::db::AgentUsageProvider::CLAUDE,
+            usage_provider: match model {
+                rho_claude::Model::Opus => crate::db::AgentUsageModel::OPUS,
+                rho_claude::Model::Fable | rho_claude::Model::Sonnet => {
+                    crate::db::AgentUsageModel::FABLE
+                }
+            },
             quota_observation: None,
         };
         Ok((
@@ -228,7 +233,12 @@ impl ClaudeAgent {
             kind: AgentStateKind::Idle,
             context_used,
             total_usage: db.read().agent_usage_total(agent_id),
-            usage_provider: crate::db::AgentUsageProvider::CLAUDE,
+            usage_provider: match model {
+                rho_claude::Model::Opus => crate::db::AgentUsageModel::OPUS,
+                rho_claude::Model::Fable | rho_claude::Model::Sonnet => {
+                    crate::db::AgentUsageModel::FABLE
+                }
+            },
             quota_observation: None,
         };
         let pool_events = pool.clone();
@@ -1279,9 +1289,20 @@ impl ClaudeLoop {
                     self.fail(error);
                 } else if message_stopped && let Some(usage) = self.turn_usage.take() {
                     let turn_usage = crate::db::AgentUsageBucket {
+                        model: match self.model {
+                            rho_claude::Model::Opus => crate::db::AgentUsageModel::OPUS,
+                            rho_claude::Model::Fable | rho_claude::Model::Sonnet => {
+                                crate::db::AgentUsageModel::FABLE
+                            }
+                        },
                         input_tokens: usage.input_tokens.unwrap_or(0),
                         cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
                         cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                        cache_write_1h_tokens: usage
+                            .cache_creation
+                            .as_ref()
+                            .and_then(|cache| cache.ephemeral_1h_input_tokens)
+                            .unwrap_or(0),
                         output_tokens: usage.output_tokens.unwrap_or(0),
                         requests: 1,
                         ..crate::db::AgentUsageBucket::default()
@@ -1590,6 +1611,7 @@ fn merge_usage(
     base.cache_read_input_tokens = update
         .cache_read_input_tokens
         .or(base.cache_read_input_tokens);
+    base.cache_creation = update.cache_creation.or(base.cache_creation.take());
 }
 
 fn remove_compact_commands(inputs: &mut InputQueues) {
@@ -1671,7 +1693,7 @@ mod tests {
             kind: AgentStateKind::Idle,
             context_used: None,
             total_usage: crate::db::AgentUsageBucket::default(),
-            usage_provider: crate::db::AgentUsageProvider::CLAUDE,
+            usage_provider: crate::db::AgentUsageModel::FABLE,
             quota_observation: None,
         };
         state.queued_inputs.push(QueuedItem {

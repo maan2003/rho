@@ -727,6 +727,7 @@ pub struct AgentUsageBucket {
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub cache_write_1h_tokens: u64,
     pub output_tokens: u64,
     pub requests: u64,
     pub approximate: bool,
@@ -734,7 +735,7 @@ pub struct AgentUsageBucket {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct AgentUsageSeries {
-    pub provider: String,
+    pub model: String,
     pub buckets: Vec<AgentUsageBucket>,
 }
 
@@ -1096,7 +1097,7 @@ mod tests {
     fn global_usage_response_round_trips() {
         let message = ServerMessage::GlobalUsage {
             series: vec![AgentUsageSeries {
-                provider: "claude".to_owned(),
+                model: "fable".to_owned(),
                 buckets: vec![AgentUsageBucket {
                     bucket_start_ms: 300_000,
                     input_tokens: 10,

@@ -27,6 +27,7 @@ pub struct SessionMessage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionUsageSample {
     pub timestamp: Option<String>,
+    pub model: Option<String>,
     pub usage: crate::protocol::TokenUsage,
 }
 
@@ -211,10 +212,22 @@ fn session_usage(entries: Vec<TranscriptEntry>) -> Vec<SessionUsageSample> {
             .entry(request_id)
             .and_modify(|sample| {
                 sample.timestamp = sample.timestamp.take().max(entry.timestamp.clone());
+                if sample.model.is_none() {
+                    sample.model = entry
+                        .message
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
                 merge_max_usage(&mut sample.usage, &usage);
             })
             .or_insert(SessionUsageSample {
                 timestamp: entry.timestamp,
+                model: entry
+                    .message
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 usage,
             });
     }
@@ -230,6 +243,9 @@ fn merge_max_usage(base: &mut crate::protocol::TokenUsage, update: &crate::proto
     base.cache_read_input_tokens = base
         .cache_read_input_tokens
         .max(update.cache_read_input_tokens);
+    if base.cache_creation.is_none() {
+        base.cache_creation.clone_from(&update.cache_creation);
+    }
 }
 
 pub async fn read_session_context_used_by_id(
@@ -568,7 +584,18 @@ mod tests {
         branch.is_sidechain = Some(true);
         branch.request_id = Some("request-branch".to_owned());
         branch.timestamp = Some("2026-07-02T08:24:49Z".to_owned());
-        branch.message = json!({"usage": {"input_tokens": 10, "output_tokens": 5}});
+        branch.message = json!({
+            "model": "claude-opus-5",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 12,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 12
+                }
+            }
+        });
         let mut latest = entry(TranscriptEntryKind::Assistant, latest, root.uuid);
         latest.request_id = Some("request-latest".to_owned());
         latest.timestamp = Some("2026-07-02T08:24:50Z".to_owned());
@@ -581,6 +608,17 @@ mod tests {
         let usage = session_usage(vec![root, branch, latest, snapshot]);
 
         assert_eq!(usage.len(), 2);
+        let opus = usage
+            .iter()
+            .find(|sample| sample.model.as_deref() == Some("claude-opus-5"))
+            .unwrap();
+        assert_eq!(
+            opus.usage
+                .cache_creation
+                .as_ref()
+                .and_then(|cache| cache.ephemeral_1h_input_tokens),
+            Some(12)
+        );
         assert_eq!(
             usage
                 .iter()

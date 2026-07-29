@@ -54,6 +54,7 @@ pub(crate) fn project_agent_state(state: &AgentState) -> UiAgentState {
                 input_tokens: state.total_usage.input_tokens,
                 cache_read_tokens: state.total_usage.cache_read_tokens,
                 cache_write_tokens: state.total_usage.cache_write_tokens,
+                cache_write_1h_tokens: state.total_usage.cache_write_1h_tokens,
                 output_tokens: state.total_usage.output_tokens,
                 requests: state.total_usage.requests,
                 approximate: state.total_usage.approximate,
@@ -370,7 +371,7 @@ mod tests {
     #[test]
     fn cumulative_usage_is_streamed_as_agent_state() {
         let mut runtime = streaming_state("hello");
-        runtime.usage_provider = rho_agent::db::AgentUsageProvider::CLAUDE;
+        runtime.usage_provider = rho_agent::db::AgentUsageModel::FABLE;
         let mut encoder = AgentRemoteEncoder::new();
         let mut receiver = project_agent_state(&runtime);
         let _ = encoder.encode(receiver.clone());
@@ -380,7 +381,7 @@ mod tests {
         let AgentRemoteFrame::Diff { usage, .. } = &frame else {
             panic!("usage update should be a state diff");
         };
-        assert_eq!(usage.as_ref().unwrap().provider, "claude");
+        assert_eq!(usage.as_ref().unwrap().provider, "fable");
         assert_eq!(usage.as_ref().unwrap().total.output_tokens, 42);
 
         frame.apply_diff(&mut receiver);
@@ -405,7 +406,7 @@ mod tests {
             },
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
-            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
+            usage_provider: rho_agent::db::AgentUsageModel::GPT,
             quota_observation: None,
         }
     }
@@ -445,7 +446,7 @@ mod tests {
             }),
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
-            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
+            usage_provider: rho_agent::db::AgentUsageModel::GPT,
             quota_observation: None,
         }
     }
@@ -466,7 +467,7 @@ mod tests {
             kind: AgentStateKind::Idle,
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
-            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
+            usage_provider: rho_agent::db::AgentUsageModel::GPT,
             quota_observation: None,
         }
     }
@@ -503,7 +504,7 @@ mod tests {
             kind: AgentStateKind::Idle,
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
-            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
+            usage_provider: rho_agent::db::AgentUsageModel::GPT,
             quota_observation: None,
         }
     }
@@ -539,7 +540,7 @@ mod tests {
             },
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
-            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
+            usage_provider: rho_agent::db::AgentUsageModel::GPT,
             quota_observation: None,
         }
     }

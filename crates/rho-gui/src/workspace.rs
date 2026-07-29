@@ -3816,32 +3816,51 @@ impl Workspace {
             .unwrap_or(Duration::ZERO)
             .as_secs() as f64;
         let mut stats = div().flex().items_center().gap(px(6.));
-        for (index, summary) in self.quota_summaries.iter().enumerate() {
-            if index > 0 {
+        let format_reset = |reset_at_unix: Option<i64>| {
+            reset_at_unix
+                .map(|reset| reset as f64 - now)
+                .filter(|seconds| *seconds > 0.0)
+                .map(|seconds| format!(" {:.1}d", seconds / 86_400.0))
+                .unwrap_or_default()
+        };
+        let gpt = self
+            .quota_summaries
+            .iter()
+            .find(|summary| summary.model == "gpt");
+        if let Some(gpt) = gpt {
+            stats = stats.child(div().text_color(colors.terminal_ansi_cyan).child(format!(
+                "{}%{}",
+                gpt.remaining_percent,
+                format_reset(gpt.reset_at_unix)
+            )));
+        }
+        let opus = self
+            .quota_summaries
+            .iter()
+            .find(|summary| summary.model == "opus");
+        let fable = self
+            .quota_summaries
+            .iter()
+            .find(|summary| summary.model == "fable");
+        if opus.is_some() || fable.is_some() {
+            if gpt.is_some() {
                 stats = stats.child(div().text_color(text_style.color.opacity(0.55)).child("·"));
             }
-            let reset_in = summary
-                .reset_at_unix
-                .map(|reset| reset as f64 - now)
-                .filter(|seconds| *seconds > 0.0);
-            let provider_color: gpui::Hsla = match summary.model.as_str() {
-                "opus" => colors.terminal_ansi_magenta.into(),
-                "fable" => gpui::rgb(0xd97757).into(),
-                _ => colors.terminal_ansi_cyan.into(),
-            };
-            stats = stats
-                .child(
-                    div()
-                        .text_color(provider_color)
-                        .child(summary.model.clone()),
-                )
-                .child(match reset_in {
-                    Some(seconds) => {
-                        format!("{}% {:.1}d", summary.remaining_percent, seconds / 86_400.0)
-                    }
-                    None if summary.reset_at_unix.is_some() => "100%".to_owned(),
-                    None => format!("{}%", summary.remaining_percent),
-                });
+            let mut claude = String::new();
+            if let Some(opus) = opus {
+                claude.push_str(&format!("{}%", opus.remaining_percent));
+            }
+            if let Some(fable) = fable {
+                if !claude.is_empty() {
+                    claude.push(' ');
+                }
+                claude.push_str(&format!("{}%", fable.remaining_percent));
+            }
+            let reset = opus
+                .and_then(|summary| summary.reset_at_unix)
+                .or_else(|| fable.and_then(|summary| summary.reset_at_unix));
+            claude.push_str(&format_reset(reset));
+            stats = stats.child(div().text_color(gpui::rgb(0xd97757)).child(claude));
         }
         div()
             .w_full()

@@ -41,7 +41,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
     TableDefinition::new("migration_recovery");
 
-const CURRENT_AGENT_DB_FORMAT: &str = "ae190a64";
+const CURRENT_AGENT_DB_FORMAT: &str = "7c5e2a91";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -78,6 +78,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         from: "f3b7fb40",
         to: "ae190a64",
         migrate: rebuild_usage_and_compact_quota,
+    },
+    AgentDbMigration {
+        from: "ae190a64",
+        to: "7c5e2a91",
+        migrate: rebuild_usage_models,
     },
 ];
 
@@ -140,33 +145,46 @@ struct AgentUsageKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue, Encode, Decode)]
-pub struct AgentUsageProvider(u8);
+pub struct AgentUsageModel(u8);
 
-impl AgentUsageProvider {
+impl AgentUsageModel {
+    pub const UNKNOWN: Self = Self(0);
     pub const GPT: Self = Self(1);
-    pub const CLAUDE: Self = Self(2);
+    pub const FABLE: Self = Self(2);
+    pub const OPUS: Self = Self(3);
 
     pub fn name(self) -> &'static str {
         match self {
             Self::GPT => "gpt",
-            Self::CLAUDE => "claude",
+            Self::FABLE => "fable",
+            Self::OPUS => "opus",
             _ => "unknown",
         }
+    }
+}
+
+impl Default for AgentUsageModel {
+    fn default() -> Self {
+        Self::UNKNOWN
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct GlobalAgentUsageKey {
     bucket_start_ms: u64,
-    provider: AgentUsageProvider,
+    model: AgentUsageModel,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct AgentUsageBucket {
     pub bucket_start_ms: u64,
+    #[senax(default)]
+    pub model: AgentUsageModel,
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    #[senax(default)]
+    pub cache_write_1h_tokens: u64,
     pub output_tokens: u64,
     pub requests: u64,
     #[senax(default)]
@@ -175,6 +193,11 @@ pub struct AgentUsageBucket {
 
 impl AgentUsageBucket {
     pub fn add(&mut self, other: &Self) {
+        if self.requests == 0 {
+            self.model = other.model;
+        } else if other.model != AgentUsageModel::UNKNOWN && self.model != other.model {
+            self.model = AgentUsageModel::UNKNOWN;
+        }
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.cache_read_tokens = self
             .cache_read_tokens
@@ -182,27 +205,31 @@ impl AgentUsageBucket {
         self.cache_write_tokens = self
             .cache_write_tokens
             .saturating_add(other.cache_write_tokens);
+        self.cache_write_1h_tokens = self
+            .cache_write_1h_tokens
+            .saturating_add(other.cache_write_1h_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.requests = self.requests.saturating_add(other.requests);
         self.approximate |= other.approximate;
     }
 }
 
-fn usage_provider(runtime: &AgentRuntime) -> AgentUsageProvider {
-    match runtime {
-        AgentRuntime::Rho { .. } => AgentUsageProvider::GPT,
-        AgentRuntime::Claude { .. } => AgentUsageProvider::CLAUDE,
+fn usage_model(record: &AgentRecord) -> AgentUsageModel {
+    match record.runtime {
+        AgentRuntime::Rho { .. } => AgentUsageModel::GPT,
+        AgentRuntime::Claude { .. } => match record.binding.claude_model() {
+            Some(rho_claude::Model::Opus) => AgentUsageModel::OPUS,
+            Some(rho_claude::Model::Fable | rho_claude::Model::Sonnet) | None => {
+                AgentUsageModel::FABLE
+            }
+        },
     }
 }
 
-fn add_global_agent_usage(
-    write: &mut WriteTxn,
-    provider: AgentUsageProvider,
-    bucket: &AgentUsageBucket,
-) {
+fn add_global_agent_usage(write: &mut WriteTxn, model: AgentUsageModel, bucket: &AgentUsageBucket) {
     let key = GlobalAgentUsageKey {
         bucket_start_ms: bucket.bucket_start_ms,
-        provider,
+        model,
     };
     let mut table = write.open_table(GLOBAL_AGENT_USAGE);
     let mut merged = table
@@ -218,15 +245,10 @@ fn add_global_agent_usage(
 
 fn rebuild_global_agent_usage(write: &mut WriteTxn) {
     write.delete_table("agent_usage_by_time_provider");
-    let providers = write
+    let models = write
         .open_table(AGENTS)
         .iter()
-        .map(|(agent_id, record)| {
-            (
-                agent_id.value(),
-                usage_provider(&record.value().as_ref().runtime),
-            )
-        })
+        .map(|(agent_id, record)| (agent_id.value(), usage_model(record.value().as_ref())))
         .collect::<std::collections::HashMap<_, _>>();
     let buckets = write
         .open_table(AGENT_USAGE_BUCKETS)
@@ -234,10 +256,38 @@ fn rebuild_global_agent_usage(write: &mut WriteTxn) {
         .map(|(key, bucket)| (key.value(), bucket.value().into_owned()))
         .collect::<Vec<_>>();
     for (key, bucket) in buckets {
-        if let Some(provider) = providers.get(&key.agent_id) {
-            add_global_agent_usage(write, *provider, &bucket);
+        let model = if bucket.model == AgentUsageModel::UNKNOWN {
+            models.get(&key.agent_id).copied()
+        } else {
+            Some(bucket.model)
+        };
+        if let Some(model) = model {
+            add_global_agent_usage(write, model, &bucket);
         }
     }
+}
+
+fn rebuild_usage_models(write: &mut WriteTxn) {
+    let models = write
+        .open_table(AGENTS)
+        .iter()
+        .map(|(agent_id, record)| (agent_id.value(), usage_model(record.value().as_ref())))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut buckets = write.open_table(AGENT_USAGE_BUCKETS);
+    let records = buckets
+        .iter()
+        .map(|(key, bucket)| (key.value(), bucket.value().into_owned()))
+        .collect::<Vec<_>>();
+    for (key, mut bucket) in records {
+        if bucket.model == AgentUsageModel::UNKNOWN
+            && let Some(model) = models.get(&key.agent_id)
+        {
+            bucket.model = *model;
+            buckets.insert(&key, SenValue::borrowed(&bucket));
+        }
+    }
+    drop(buckets);
+    rebuild_global_agent_usage(write);
 }
 
 fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservationRecord) -> bool {
@@ -454,6 +504,7 @@ async fn backfill_agent_usage(
                 agent_id,
                 session_id,
                 record.primary_workdir().repo().to_owned(),
+                usage_model(&record),
             )),
         }
     }
@@ -512,9 +563,11 @@ async fn backfill_agent_usage(
                 agent_id,
                 AgentUsageBucket {
                     bucket_start_ms: completed_at / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS,
+                    model: AgentUsageModel::GPT,
                     input_tokens: input.saturating_sub(cache_read).saturating_sub(cache_write),
                     cache_read_tokens: cache_read,
                     cache_write_tokens: cache_write,
+                    cache_write_1h_tokens: 0,
                     output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
                     requests: 1,
                     approximate: false,
@@ -528,11 +581,11 @@ async fn backfill_agent_usage(
     .await;
 
     let claude = futures::stream::iter(claude_sessions.into_iter().map(
-        |(agent_id, session_id, repo)| async move {
+        |(agent_id, session_id, repo, model)| async move {
             let usage = rho_claude::read_session_usage_by_id(session_id, &repo)
                 .await
                 .ok()?;
-            Some((agent_id, usage))
+            Some((agent_id, model, usage))
         },
     ))
     .buffer_unordered(16)
@@ -550,8 +603,8 @@ async fn backfill_agent_usage(
             })
             .add(&bucket);
     }
-    for (agent_id, usage) in claude {
-        add_claude_usage(agent_id, usage, &mut buckets);
+    for (agent_id, model, usage) in claude {
+        add_claude_usage(agent_id, model, usage, &mut buckets);
     }
     buckets
 }
@@ -573,20 +626,21 @@ async fn backfill_claude_agent_usage(
                 agent_id,
                 session_id,
                 record.primary_workdir().repo().to_owned(),
+                usage_model(&record),
             )),
             AgentRuntime::Rho { .. } => None,
         })
         .collect::<Vec<_>>();
     let agents = sessions
         .iter()
-        .map(|(agent_id, _, _)| *agent_id)
+        .map(|(agent_id, _, _, _)| *agent_id)
         .collect::<std::collections::HashSet<_>>();
     let sessions = futures::stream::iter(sessions.into_iter().map(
-        |(agent_id, session_id, repo)| async move {
+        |(agent_id, session_id, repo, model)| async move {
             let usage = rho_claude::read_session_usage_by_id(session_id, &repo)
                 .await
                 .ok()?;
-            Some((agent_id, usage))
+            Some((agent_id, model, usage))
         },
     ))
     .buffer_unordered(16)
@@ -595,14 +649,15 @@ async fn backfill_claude_agent_usage(
     .await;
 
     let mut buckets = std::collections::HashMap::new();
-    for (agent_id, usage) in sessions {
-        add_claude_usage(agent_id, usage, &mut buckets);
+    for (agent_id, model, usage) in sessions {
+        add_claude_usage(agent_id, model, usage, &mut buckets);
     }
     (agents, buckets)
 }
 
 fn add_claude_usage(
     agent_id: AgentId,
+    fallback_model: AgentUsageModel,
     samples: Vec<rho_claude::SessionUsageSample>,
     buckets: &mut std::collections::HashMap<(AgentId, u64), AgentUsageBucket>,
 ) {
@@ -611,11 +666,24 @@ fn add_claude_usage(
             continue;
         };
         let bucket_start_ms = timestamp / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS;
+        let model = match sample.model.as_deref() {
+            Some(model) if model.contains("opus") => AgentUsageModel::OPUS,
+            Some(model) if model.contains("fable") => AgentUsageModel::FABLE,
+            _ => fallback_model,
+        };
+        let cache_write_1h_tokens = sample
+            .usage
+            .cache_creation
+            .as_ref()
+            .and_then(|cache| cache.ephemeral_1h_input_tokens)
+            .unwrap_or(0);
         let bucket = AgentUsageBucket {
             bucket_start_ms,
+            model,
             input_tokens: sample.usage.input_tokens.unwrap_or(0),
             cache_read_tokens: sample.usage.cache_read_input_tokens.unwrap_or(0),
             cache_write_tokens: sample.usage.cache_creation_input_tokens.unwrap_or(0),
+            cache_write_1h_tokens,
             output_tokens: sample.usage.output_tokens.unwrap_or(0),
             requests: 1,
             approximate: true,
@@ -1096,7 +1164,7 @@ pub trait AgentReadTxnExt {
     ) -> Vec<QuotaObservationRecord>;
     fn agent_usage(&self, agent_id: AgentId, since: UnixMillis) -> Vec<AgentUsageBucket>;
     fn agent_usage_total(&self, agent_id: AgentId) -> AgentUsageBucket;
-    fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageProvider, AgentUsageBucket)>;
+    fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageModel, AgentUsageBucket)>;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1425,18 +1493,18 @@ impl AgentReadTxnExt for ReadTxn {
             .unwrap_or_default()
     }
 
-    fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageProvider, AgentUsageBucket)> {
+    fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageModel, AgentUsageBucket)> {
         self.open_table(GLOBAL_AGENT_USAGE)
             .range(
                 GlobalAgentUsageKey {
                     bucket_start_ms: since.0,
-                    provider: AgentUsageProvider::GPT,
+                    model: AgentUsageModel::GPT,
                 }..=GlobalAgentUsageKey {
                     bucket_start_ms: u64::MAX,
-                    provider: AgentUsageProvider::CLAUDE,
+                    model: AgentUsageModel::OPUS,
                 },
             )
-            .map(|(key, value)| (key.value().provider, value.value().into_owned()))
+            .map(|(key, value)| (key.value().model, value.value().into_owned()))
             .collect()
     }
 }
@@ -1714,6 +1782,16 @@ impl AgentWriteTxnExt for WriteTxn {
     }
 
     fn add_agent_usage(&mut self, agent_id: AgentId, bucket: &AgentUsageBucket) {
+        let mut bucket = bucket.clone();
+        let record = self
+            .open_table(AGENTS)
+            .get(&agent_id)
+            .expect("usage agent missing")
+            .value()
+            .into_owned();
+        if bucket.model == AgentUsageModel::UNKNOWN {
+            bucket.model = usage_model(&record);
+        }
         let key = AgentUsageKey {
             agent_id,
             bucket_start_ms: bucket.bucket_start_ms,
@@ -1726,7 +1804,7 @@ impl AgentWriteTxnExt for WriteTxn {
                 bucket_start_ms: bucket.bucket_start_ms,
                 ..AgentUsageBucket::default()
             });
-        merged.add(bucket);
+        merged.add(&bucket);
         buckets.insert(&key, SenValue::borrowed(&merged));
         drop(buckets);
 
@@ -1735,17 +1813,12 @@ impl AgentWriteTxnExt for WriteTxn {
             .get(&agent_id)
             .map(|value| value.value().into_owned())
             .unwrap_or_default();
-        total.add(bucket);
+        total.add(&bucket);
         total.bucket_start_ms = 0;
         totals.insert(&agent_id, SenValue::borrowed(&total));
         drop(totals);
 
-        let provider = self
-            .open_table(AGENTS)
-            .get(&agent_id)
-            .map(|record| usage_provider(&record.value().as_ref().runtime))
-            .expect("usage agent missing");
-        add_global_agent_usage(self, provider, bucket);
+        add_global_agent_usage(self, bucket.model, &bucket);
     }
 
     fn replace_agent_usage(

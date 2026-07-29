@@ -450,6 +450,13 @@ pub struct TokenUsage {
     pub output_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation: Option<CacheCreationUsage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct CacheCreationUsage {
+    pub ephemeral_5m_input_tokens: Option<u64>,
+    pub ephemeral_1h_input_tokens: Option<u64>,
 }
 
 impl TokenUsage {
