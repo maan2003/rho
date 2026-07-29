@@ -63,25 +63,18 @@ impl FeedbackRecord {
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
+#[allow(dead_code)] // Retained to decode feedback records written by the former subscription flow.
 enum ReplyState {
     Reserved { marker: String, started_at_ms: u64 },
     Posted { marker: String, url: String },
 }
 
-pub enum ReserveReply {
-    Reserved { marker: String },
-    InFlight,
-    Posted { url: String },
-}
-
 pub trait PrMonitorReadTxnExt {
     fn list_pr_watches(&self) -> Vec<PrWatch>;
     fn get_pr_watch(&self, key: &str) -> Option<PrWatch>;
-    fn get_feedback_record(&self, event_id: &str) -> Option<FeedbackRecord>;
 }
 
 pub trait PrMonitorWriteTxnExt {
-    fn init_pr_monitor_tables(&mut self);
     fn register_pr_watch(
         &mut self,
         watch: &PrWatch,
@@ -89,15 +82,6 @@ pub trait PrMonitorWriteTxnExt {
     ) -> anyhow::Result<PrWatch>;
     fn update_pr_watch_state(&mut self, watch: &PrWatch) -> bool;
     fn set_feedback_record(&mut self, event_id: &str, record: &FeedbackRecord) -> bool;
-    fn reserve_reply(
-        &mut self,
-        event_id: &str,
-        subscriber: AgentId,
-        generation: u64,
-        marker: String,
-        now_ms: u64,
-    ) -> Option<ReserveReply>;
-    fn complete_reply(&mut self, event_id: &str, subscriber: AgentId, generation: u64, url: String);
     fn remove_pr_watch(&mut self, key: &str, subscriber: AgentId, generation: u64) -> bool;
 }
 
@@ -114,20 +98,9 @@ impl PrMonitorReadTxnExt for ReadTxn {
             .get(&key.to_owned())
             .map(|value| value.value().into_owned())
     }
-
-    fn get_feedback_record(&self, event_id: &str) -> Option<FeedbackRecord> {
-        self.open_table(PR_FEEDBACK)
-            .get(&event_id.to_owned())
-            .map(|value| value.value().into_owned())
-    }
 }
 
 impl PrMonitorWriteTxnExt for WriteTxn {
-    fn init_pr_monitor_tables(&mut self) {
-        self.open_table(PR_WATCHES);
-        self.open_table(PR_FEEDBACK);
-    }
-
     fn register_pr_watch(
         &mut self,
         watch: &PrWatch,
@@ -198,76 +171,6 @@ impl PrMonitorWriteTxnExt for WriteTxn {
         true
     }
 
-    fn reserve_reply(
-        &mut self,
-        event_id: &str,
-        subscriber: AgentId,
-        generation: u64,
-        marker: String,
-        now_ms: u64,
-    ) -> Option<ReserveReply> {
-        let mut feedback = self.open_table(PR_FEEDBACK);
-        let value = feedback.get(&event_id.to_owned())?;
-        let mut record = value.value().into_owned();
-        drop(value);
-        if record.subscriber != subscriber || record.generation != generation {
-            return None;
-        }
-        if let Some(reply) = &mut record.reply {
-            match reply {
-                ReplyState::Posted { url, .. } => {
-                    return Some(ReserveReply::Posted { url: url.clone() });
-                }
-                ReplyState::Reserved { started_at_ms, .. }
-                    if now_ms.saturating_sub(*started_at_ms) < 60_000 =>
-                {
-                    return Some(ReserveReply::InFlight);
-                }
-                ReplyState::Reserved {
-                    marker,
-                    started_at_ms,
-                } => {
-                    *started_at_ms = now_ms;
-                    let marker = marker.clone();
-                    feedback.insert(&event_id.to_owned(), SenValue::borrowed(&record));
-                    return Some(ReserveReply::Reserved { marker });
-                }
-            }
-        }
-        record.reply = Some(ReplyState::Reserved {
-            marker: marker.clone(),
-            started_at_ms: now_ms,
-        });
-        feedback.insert(&event_id.to_owned(), SenValue::borrowed(&record));
-        Some(ReserveReply::Reserved { marker })
-    }
-
-    fn complete_reply(
-        &mut self,
-        event_id: &str,
-        subscriber: AgentId,
-        generation: u64,
-        url: String,
-    ) {
-        let mut feedback = self.open_table(PR_FEEDBACK);
-        let Some(value) = feedback.get(&event_id.to_owned()) else {
-            return;
-        };
-        let mut record = value.value().into_owned();
-        drop(value);
-        if record.subscriber != subscriber || record.generation != generation {
-            return;
-        }
-        let marker = match record.reply {
-            Some(ReplyState::Reserved { marker, .. }) | Some(ReplyState::Posted { marker, .. }) => {
-                marker
-            }
-            None => return,
-        };
-        record.reply = Some(ReplyState::Posted { marker, url });
-        feedback.insert(&event_id.to_owned(), SenValue::borrowed(&record));
-    }
-
     fn remove_pr_watch(&mut self, key: &str, subscriber: AgentId, generation: u64) -> bool {
         let mut watches = self.open_table(PR_WATCHES);
         let Some(value) = watches.get(&key.to_owned()) else {
@@ -321,7 +224,6 @@ mod tests {
             9,
         );
         let mut write = db.write().await;
-        write.init_pr_monitor_tables();
         write.register_pr_watch(&watch, false).unwrap();
         assert!(write.set_feedback_record("inline:9:v1", &record));
         write.commit();
@@ -330,61 +232,6 @@ mod tests {
         assert_eq!(stored.subscriber, subscriber);
         assert_eq!(stored.approved_review_bots, vec!["reviewer[bot]"]);
         assert_eq!(stored.seen_feedback, vec!["issue:1:v1"]);
-        let stored_record = db.read().get_feedback_record("inline:9:v1").unwrap();
-        assert_eq!(stored_record.watch_key, watch.key());
-        assert_eq!(stored_record.generation, watch.generation);
-        assert_eq!(stored_record.comment_id, 9);
-
-        let mut write = db.write().await;
-        assert!(matches!(
-            write.reserve_reply(
-                "inline:9:v1",
-                subscriber,
-                watch.generation,
-                "marker".into(),
-                1
-            ),
-            Some(ReserveReply::Reserved { .. })
-        ));
-        assert!(matches!(
-            write.reserve_reply(
-                "inline:9:v1",
-                subscriber,
-                watch.generation,
-                "other".into(),
-                2
-            ),
-            Some(ReserveReply::InFlight)
-        ));
-        assert!(write.set_feedback_record("inline:9:v1", &record));
-        assert!(matches!(
-            write.reserve_reply(
-                "inline:9:v1",
-                subscriber,
-                watch.generation,
-                "other".into(),
-                60_002
-            ),
-            Some(ReserveReply::Reserved { ref marker }) if marker == "marker"
-        ));
-        write.complete_reply(
-            "inline:9:v1",
-            subscriber,
-            watch.generation,
-            "https://github.com/reply".into(),
-        );
-        assert!(matches!(
-            write.reserve_reply(
-                "inline:9:v1",
-                subscriber,
-                watch.generation,
-                "other".into(),
-                60_003
-            ),
-            Some(ReserveReply::Posted { ref url }) if url == "https://github.com/reply"
-        ));
-        write.commit();
-
         let mut stale_poll = watch.clone();
         stale_poll.approved_review_bots.clear();
         stale_poll.ci_fingerprint = "new-ci".into();
