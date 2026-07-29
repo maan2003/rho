@@ -325,25 +325,17 @@ are rejected. An input `.git` suffix is removed before validation. There is
 no failover after an approved GUI claims an operation; retrying starts a fresh
 provider race.
 
-`rho-pr-monitor` owns long-lived pull-request policy while Octo remains only
-the authenticated GitHub API boundary. Engineers create or adopt PRs through
-`rho pr`, which persists the stable GitHub repository id and PR number,
-registration generation, subscriber Engineer, feedback revisions, CI/check
-state, mergeability, and constrained reply targets in `rho-db`. A daemon task
-polls at most 16 open watches every two minutes, filters pending reviews and
-untrusted human authors, wakes the subscribed Engineer on meaningful CI,
-review, mergeability, or terminal changes, and keeps watching after CI turns
-green until merge/close.
-The Engineer handles repository work and GitHub replies directly, then sends
-concise milestones to its parent so Slack-bound PMs can relay them. The
-standalone `octo` CLI is not installed.
+`rho-pr-monitor` provides stateless pull-request operations while Octo remains
+the authenticated GitHub API boundary. `rho pr status` fetches the current PR,
+CI, review, and feedback snapshot for any canonical GitHub PR URL. Monitoring
+is caller-owned polling: the daemon stores no subscription and never injects
+monitor updates into an agent conversation. The standalone `octo` CLI is not
+installed.
 
 The normal UI protocol carries request-id-scoped `rho pr` commands and their
-text or bounded log-archive results. Agent-side commands identify the
-subscriber from `RHO_AGENT_ID`; the daemon resolves and validates the Engineer
-before calling `rho-pr-monitor`. The CLI process never owns a polling loop:
-subscribe/create return immediately, while the daemon later loads and wakes
-the persisted Engineer through `AgentPool`.
+text or bounded log-archive results. Status needs no agent identity. Mutating
+commands identify the caller from `RHO_AGENT_ID`; the daemon resolves and
+validates the Engineer before calling `rho-pr-monitor`.
 
 The daemon's UI protocol (`rho-ui-proto`) is served over the local Unix socket
 and iroh connections from clients enrolled through `rho-iroh-auth` (`rho

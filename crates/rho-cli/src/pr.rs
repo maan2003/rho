@@ -13,10 +13,10 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     if matches!(&args.command, PrCliCommand::Init) {
         return init(args).await;
     }
-    let agent_id = args
-        .agent
-        .or_else(|| std::env::var("RHO_AGENT_ID").ok())
-        .context("missing --agent or RHO_AGENT_ID")?;
+    let agent_id = args.agent.or_else(|| std::env::var("RHO_AGENT_ID").ok());
+    if agent_id.is_none() && !matches!(&args.command, PrCliCommand::Status { .. }) {
+        anyhow::bail!("missing --agent or RHO_AGENT_ID");
+    }
     let response_run_id = match &args.command {
         PrCliCommand::Logs { run_id, .. } => Some(*run_id),
         _ => None,
@@ -28,7 +28,7 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     daemon
         .send(&ClientMessage::PrCommand {
             request_id,
-            agent_id: Some(agent_id),
+            agent_id,
             command,
         })
         .await?;
@@ -65,7 +65,6 @@ fn command(command: PrCliCommand) -> anyhow::Result<PrCommand> {
             base,
             title,
             body,
-            review_bots,
         } => {
             let (owner, repo) = resolve_repo()?;
             PrCommand::Create {
@@ -78,21 +77,10 @@ fn command(command: PrCliCommand) -> anyhow::Result<PrCommand> {
                 },
                 title,
                 body,
-                review_bots,
+                review_bots: Vec::new(),
             }
         }
-        PrCliCommand::Subscribe {
-            url,
-            replay_existing,
-            review_bots,
-        } => PrCommand::Subscribe {
-            url,
-            replay_existing,
-            review_bots,
-        },
         PrCliCommand::Status { url } => PrCommand::Status { url },
-        PrCliCommand::List => PrCommand::List,
-        PrCliCommand::Stop { url } => PrCommand::Stop { url },
         PrCliCommand::Edit { url, title, body } => {
             anyhow::ensure!(
                 title.is_some() || body.is_some(),

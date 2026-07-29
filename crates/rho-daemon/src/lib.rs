@@ -387,9 +387,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     for (agent_id, agent) in agents.loaded().await {
         activation_observer(agent_id, agent).await;
     }
-    // Pollers, integrations, and listeners can activate and immediately mail
-    // agents, so expose them only after the activation observer is installed.
-    agents.pr_monitor.start_polling();
     agents.resume_platform_integrations();
     // Re-arm snooze wake-ups that were pending when the daemon last stopped.
     for (agent_id, agent) in agents.db.read().list_agents() {
@@ -929,7 +926,7 @@ struct AgentRegistry {
     /// In-process Slack connection and its thread sessions
     /// (see [`rho_slack::SlackManager`]).
     slack: Arc<rho_slack::SlackManager>,
-    /// Durable CI and review-feedback watches owned by PR-friendly PMs.
+    /// Stateless PR, CI, review, and comment operations.
     pr_monitor: Arc<rho_pr_monitor::PrMonitor>,
     /// Shared sealed platform secret store used by Slack and Octo.
     platform_secrets: PlatformSecrets,
@@ -2415,9 +2412,9 @@ async fn handle_message(
             command,
         } => {
             let result = async {
-                let raw_agent_id =
-                    agent_id.ok_or_else(|| anyhow::anyhow!("missing --agent or RHO_AGENT_ID"))?;
-                let agent_id = agents.resolve_display_agent_id(&raw_agent_id)?;
+                let agent_id = agent_id
+                    .map(|raw| agents.resolve_display_agent_id(&raw))
+                    .transpose()?;
                 match command {
                     rho_ui_proto::PrCommand::Create {
                         owner,
@@ -2426,11 +2423,11 @@ async fn handle_message(
                         base,
                         title,
                         body,
-                        review_bots,
+                        review_bots: _,
                     } => agents
                         .pr_monitor
-                        .create_and_subscribe(
-                            agent_id,
+                        .create(
+                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
                             rho_pr_monitor::CreatePullRequest {
                                 owner,
                                 repo,
@@ -2438,52 +2435,61 @@ async fn handle_message(
                                 base,
                                 title,
                                 body,
-                                approved_review_bots: review_bots,
                             },
                         )
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Subscribe {
-                        url,
-                        replay_existing,
-                        review_bots,
-                    } => agents
-                        .pr_monitor
-                        .subscribe(agent_id, &url, replay_existing, review_bots)
-                        .await
-                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Subscribe { .. } => Ok((
+                        "persistent PR subscriptions were removed; poll `rho pr status` instead"
+                            .to_owned(),
+                        Vec::new(),
+                    )),
                     rho_ui_proto::PrCommand::Status { url } => agents
                         .pr_monitor
-                        .status(agent_id, &url)
+                        .status(&url)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::List => agents
-                        .pr_monitor
-                        .list(agent_id)
-                        .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Stop { url } => agents
-                        .pr_monitor
-                        .stop(agent_id, &url)
-                        .await
-                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
+                    rho_ui_proto::PrCommand::Stop { .. } => Ok((
+                        "persistent PR subscriptions were removed".to_owned(),
+                        Vec::new(),
+                    )),
                     rho_ui_proto::PrCommand::Comment { url, reply, body } => agents
                         .pr_monitor
-                        .comment(agent_id, &url, &body, reply.as_deref())
+                        .comment(
+                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
+                            &url,
+                            &body,
+                            reply.as_deref(),
+                        )
                         .await
                         .map(|output| (output, Vec::new())),
                     rho_ui_proto::PrCommand::Edit { url, title, body } => agents
                         .pr_monitor
-                        .edit(agent_id, &url, title, body)
+                        .edit(
+                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
+                            &url,
+                            title,
+                            body,
+                        )
                         .await
                         .map(|output| (output, Vec::new())),
                     rho_ui_proto::PrCommand::Rerun { url, run_id } => agents
                         .pr_monitor
-                        .rerun(agent_id, &url, run_id)
+                        .rerun(
+                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
+                            &url,
+                            run_id,
+                        )
                         .await
                         .map(|output| (output, Vec::new())),
                     rho_ui_proto::PrCommand::Logs { url, run_id } => agents
                         .pr_monitor
-                        .logs(agent_id, &url, run_id)
+                        .logs(
+                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
+                            &url,
+                            run_id,
+                        )
                         .await
                         .map(|data| (format!("downloaded logs for run {run_id}"), data.to_vec())),
                 }

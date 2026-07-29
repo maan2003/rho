@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use client::OctoClient;
-use db::{
-    FeedbackRecord, PrMonitorReadTxnExt as _, PrMonitorWriteTxnExt as _, PrWatch, ReserveReply,
-};
+use db::{FeedbackRecord, PrMonitorReadTxnExt as _, PrMonitorWriteTxnExt as _, PrWatch};
 use futures_util::stream::{self, StreamExt as _};
 use octo_types::{PrFeedback, PrSnapshot};
 use rho_agent::db::{AgentId, AgentReadTxnExt as _};
@@ -36,7 +34,6 @@ pub struct CreatePullRequest {
     pub base: String,
     pub title: String,
     pub body: String,
-    pub approved_review_bots: Vec<String>,
 }
 
 pub struct PrMonitor {
@@ -47,9 +44,6 @@ pub struct PrMonitor {
 
 impl PrMonitor {
     pub async fn new(pool: Arc<AgentPool>, db: RhoDb) -> anyhow::Result<Arc<Self>> {
-        let mut write = db.write().await;
-        write.init_pr_monitor_tables();
-        write.commit();
         let monitor = Arc::new(Self {
             pool,
             db,
@@ -231,7 +225,7 @@ impl PrMonitor {
         Ok(())
     }
 
-    pub async fn create_and_subscribe(
+    pub async fn create(
         &self,
         subscriber: AgentId,
         request: CreatePullRequest,
@@ -250,19 +244,6 @@ impl PrMonitor {
                 },
             )
             .await?;
-        self.subscribe(
-            subscriber,
-            &created.url,
-            false,
-            request.approved_review_bots,
-        )
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "PR created at {}, but subscribing the Engineer failed: {error:#}",
-                created.url
-            )
-        })?;
         Ok(created.url)
     }
 
@@ -384,95 +365,33 @@ impl PrMonitor {
         reply: Option<&str>,
     ) -> anyhow::Result<String> {
         anyhow::ensure!(!text.trim().is_empty(), "comment body cannot be empty");
-        let watch = self.owned_watch(subscriber, url)?;
-        anyhow::ensure!(watch.active, "PR subscription is inactive");
+        self.ensure_engineer(subscriber)?;
+        let (owner, repo, number) = parse_pr_url(url)?;
         let Some(event_id) = reply else {
             let body = format!("{}\n\n{OUTBOUND_MARKER}", text.trim());
-            let response = self
-                .octo
-                .comment(&watch.owner, &watch.repo, watch.number, body)
-                .await?;
+            let response = self.octo.comment(&owner, &repo, number, body).await?;
             return Ok(format!("posted GitHub comment: {}", response.url));
         };
-        let target = self
-            .db
-            .read()
-            .get_feedback_record(event_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown PR feedback event"))?;
-        anyhow::ensure!(
-            target.watch_key == watch.key()
-                && target.subscriber == subscriber
-                && target.generation == watch.generation,
-            "feedback belongs to another PR or previous subscription"
-        );
-        let proposed_marker = format!(
-            "<!-- rho-pr-monitor-operation:{:016x} -->",
-            rand::random::<u64>()
-        );
-        let mut write = self.db.write().await;
-        let reservation = write.reserve_reply(
-            event_id,
-            subscriber,
-            watch.generation,
-            proposed_marker,
-            unix_ms_now(),
-        );
-        write.commit();
-        let operation_marker = match reservation
-            .ok_or_else(|| anyhow::anyhow!("feedback target changed before reply reservation"))?
-        {
-            ReserveReply::Posted { url } => {
-                return Ok(format!("GitHub reply already posted: {url}"));
-            }
-            ReserveReply::InFlight => {
-                return Ok(
-                    "GitHub reply is already in progress; do not retry immediately".to_owned(),
-                );
-            }
-            ReserveReply::Reserved { marker } => marker,
-        };
-        let snapshot = self
-            .octo
-            .snapshot(&watch.owner, &watch.repo, watch.number)
-            .await?;
-        if let Some(feedback) = snapshot.feedback.iter().find(|feedback| {
-            feedback.author_id.is_some()
-                && feedback.author_id == snapshot.authenticated_user_id
-                && feedback.body.contains(&operation_marker)
-        }) {
-            let mut write = self.db.write().await;
-            write.complete_reply(event_id, subscriber, watch.generation, feedback.url.clone());
-            write.commit();
-            return Ok(format!("GitHub reply already posted: {}", feedback.url));
-        }
-        let body = format!("{}\n\n{OUTBOUND_MARKER}\n{operation_marker}", text.trim());
+        let snapshot = self.octo.snapshot(&owner, &repo, number).await?;
+        let target = snapshot
+            .feedback
+            .iter()
+            .find(|feedback| feedback_key(feedback) == event_id)
+            .ok_or_else(|| anyhow::anyhow!("feedback event is not present on this PR"))?;
+        let body = format!("{}\n\n{OUTBOUND_MARKER}", text.trim());
         let response = if target.surface == "inline" {
             self.octo
-                .reply(
-                    &watch.owner,
-                    &watch.repo,
-                    watch.number,
-                    target.comment_id,
-                    body,
-                )
+                .reply(&owner, &repo, number, target.id, body)
                 .await?
         } else {
-            self.octo
-                .comment(&watch.owner, &watch.repo, watch.number, body)
-                .await?
+            self.octo.comment(&owner, &repo, number, body).await?
         };
-        let mut write = self.db.write().await;
-        write.complete_reply(event_id, subscriber, watch.generation, response.url.clone());
-        write.commit();
         Ok(format!("posted GitHub reply: {}", response.url))
     }
 
-    pub async fn status(&self, subscriber: AgentId, url: &str) -> anyhow::Result<String> {
-        let watch = self.owned_watch(subscriber, url)?;
-        let snapshot = self
-            .octo
-            .snapshot(&watch.owner, &watch.repo, watch.number)
-            .await?;
+    pub async fn status(&self, url: &str) -> anyhow::Result<String> {
+        let (owner, repo, number) = parse_pr_url(url)?;
+        let snapshot = self.octo.snapshot(&owner, &repo, number).await?;
         Ok(serde_json::to_string_pretty(&snapshot)?)
     }
 
@@ -502,8 +421,9 @@ impl PrMonitor {
         url: &str,
         run_id: u64,
     ) -> anyhow::Result<String> {
-        let watch = self.owned_watch(subscriber, url)?;
-        self.octo.rerun(&watch.owner, &watch.repo, run_id).await?;
+        self.ensure_engineer(subscriber)?;
+        let (owner, repo, _) = parse_pr_url(url)?;
+        self.octo.rerun(&owner, &repo, run_id).await?;
         Ok(format!("rerun triggered for workflow run {run_id}"))
     }
 
@@ -513,8 +433,9 @@ impl PrMonitor {
         url: &str,
         run_id: u64,
     ) -> anyhow::Result<bytes::Bytes> {
-        let watch = self.owned_watch(subscriber, url)?;
-        self.octo.logs(&watch.owner, &watch.repo, run_id).await
+        self.ensure_engineer(subscriber)?;
+        let (owner, repo, _) = parse_pr_url(url)?;
+        self.octo.logs(&owner, &repo, run_id).await
     }
 
     fn ensure_engineer(&self, subscriber: AgentId) -> anyhow::Result<()> {
@@ -524,23 +445,6 @@ impl PrMonitor {
             "PR subscriptions are owned by Engineers"
         );
         Ok(())
-    }
-
-    fn owned_watch(&self, subscriber: AgentId, url: &str) -> anyhow::Result<PrWatch> {
-        self.ensure_engineer(subscriber)?;
-        let (owner, repo, number) = parse_pr_url(url)?;
-        let watch = self
-            .db
-            .read()
-            .list_pr_watches()
-            .into_iter()
-            .find(|watch| watch.owner == owner && watch.repo == repo && watch.number == number)
-            .ok_or_else(|| anyhow::anyhow!("pull request is not watched"))?;
-        anyhow::ensure!(
-            watch.subscriber == subscriber,
-            "subscription belongs to another Engineer"
-        );
-        Ok(watch)
     }
 
     async fn record_poll_error(

@@ -262,7 +262,7 @@ pub(crate) enum PrCliCommand {
     /// Install the GitHub token used for PR, Actions, and constrained Git
     /// operations.
     Init,
-    /// Create a draft pull request and subscribe the current Engineer.
+    /// Create a draft pull request.
     Create {
         #[arg(short = 'H', long)]
         head: String,
@@ -272,23 +272,9 @@ pub(crate) enum PrCliCommand {
         title: String,
         #[arg(short = 'b', long)]
         body: String,
-        #[arg(long = "review-bot")]
-        review_bots: Vec<String>,
-    },
-    /// Subscribe the current Engineer to an existing pull request.
-    Subscribe {
-        url: String,
-        #[arg(long)]
-        replay_existing: bool,
-        #[arg(long = "review-bot")]
-        review_bots: Vec<String>,
     },
     /// Fetch the current PR, CI, and review snapshot.
     Status { url: String },
-    /// List this Engineer's persisted PR subscriptions.
-    List,
-    /// Stop monitoring an open pull request.
-    Stop { url: String },
     /// Edit a pull request's title or description.
     Edit {
         url: String,
