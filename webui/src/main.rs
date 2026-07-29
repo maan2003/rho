@@ -5,12 +5,11 @@ mod conn;
 mod md;
 mod ui;
 
-use std::collections::HashMap;
-
 use futures::channel::mpsc::UnboundedSender;
 use leptos::prelude::*;
 use rho_registry::AgentRegistry;
-use rho_ui_proto::remote::UiAgentState;
+use rho_registry::session::AgentSubscriptions;
+use rho_registry::store::AgentStore;
 use rho_ui_proto::{AgentId, ClientMessage, UiProject};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,8 +30,9 @@ pub struct App {
     pub registry_epoch: RwSignal<u64>,
     pub projects: RwSignal<Vec<UiProject>>,
     pub selected: RwSignal<Option<AgentId>>,
-    pub states: StoredValue<HashMap<AgentId, UiAgentState>>,
+    pub store: StoredValue<AgentStore>,
     pub state_epoch: RwSignal<u64>,
+    pub subscriptions: StoredValue<AgentSubscriptions>,
     pub chat_open: RwSignal<bool>,
     pub show_new_agent: RwSignal<bool>,
     pub toast: RwSignal<Option<String>>,
@@ -47,8 +47,9 @@ impl App {
             registry_epoch: RwSignal::new(0),
             projects: RwSignal::new(Vec::new()),
             selected: RwSignal::new(None),
-            states: StoredValue::new(HashMap::new()),
+            store: StoredValue::new(AgentStore::default()),
             state_epoch: RwSignal::new(0),
+            subscriptions: StoredValue::new(AgentSubscriptions::default()),
             chat_open: RwSignal::new(false),
             show_new_agent: RwSignal::new(false),
             toast: RwSignal::new(None),
@@ -66,7 +67,7 @@ impl App {
     }
 
     pub fn select(&self, agent_id: AgentId) {
-        self.send(ClientMessage::SubscribeAgent { agent_id });
+        self.subscribe_agent(agent_id);
         // Weight the on-screen agent's state stream above the others.
         self.send(ClientMessage::AgentStreamFocus {
             agent_id: Some(agent_id),
@@ -75,6 +76,25 @@ impl App {
         self.selected.set(Some(agent_id));
         self.chat_open.set(true);
         self.show_new_agent.set(false);
+    }
+
+    /// Manage this client's bounded transcript subscription set with the
+    /// same LRU policy as the native GUI.
+    fn subscribe_agent(&self, agent_id: AgentId) {
+        let mut action = (false, None);
+        self.subscriptions
+            .update_value(|subscriptions| action = subscriptions.touch(agent_id));
+        let (subscribe, evicted) = action;
+        if let Some(evicted) = evicted {
+            self.send(ClientMessage::UnsubscribeAgents {
+                agent_ids: vec![evicted],
+            });
+        }
+        if subscribe {
+            self.send(ClientMessage::SubscribeAgents {
+                agent_ids: vec![agent_id],
+            });
+        }
     }
 
     pub fn show_toast(&self, message: String) {

@@ -488,7 +488,7 @@ fn Transcript(app: App) -> impl IntoView {
         }>
             <div class="column">{move || {
                 app.state_epoch.track();
-                let state = app.selected.get().and_then(|id| app.states.with_value(|states| states.get(&id).cloned()));
+                let state = app.selected.get().and_then(|id| app.store.with_value(|store| store.get(&id).cloned()));
                 match state {
                     None => view! { <p class="muted loading">"Loading transcript…"</p> }.into_any(),
                     Some(state) => {
@@ -692,8 +692,8 @@ fn Composer(app: App) -> impl IntoView {
     let status = Memo::new(move |_| {
         app.state_epoch.track();
         app.selected.get().and_then(|id| {
-            app.states
-                .with_value(|states| states.get(&id).map(|state| state.status))
+            app.store
+                .with_value(|store| store.get(&id).map(|state| state.status))
         })
     });
     let busy = Memo::new(move |_| {
@@ -746,7 +746,7 @@ fn Composer(app: App) -> impl IntoView {
             <div class="composer-bar">
                 <span class="composer-status">{status_label}{move || {
                     app.state_epoch.track();
-                    app.selected.get().and_then(|id| app.states.with_value(|states| states.get(&id).and_then(|state| state.context_used)))
+                    app.selected.get().and_then(|id| app.store.with_value(|store| store.get(&id).and_then(|state| state.context_used)))
                         .map(|used| view! { <span class="chip">{format!("{used}%")}</span> })
                 }}</span>
                 {move || busy.get().then(|| view! {

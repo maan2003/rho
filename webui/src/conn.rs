@@ -2,7 +2,6 @@
 //! display while the daemon waits for `rho iroh approve`.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::str::FromStr as _;
 
@@ -13,7 +12,10 @@ use iroh::EndpointId;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use rho_ui_proto::{AgentId, ClientMessage, ServerMessage};
+use rho_registry::session::{
+    AgentStreamGenerations, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
+};
+use rho_ui_proto::{ClientMessage, ServerMessage};
 use sha2::{Digest as _, Sha256};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -202,7 +204,7 @@ async fn read_loop(app: App, recv: &mut iroh::endpoint::RecvStream) -> anyhow::R
 /// may reopen an agent's stream; a generation counter keeps frames from a
 /// superseded stream out of the state.
 async fn agent_streams(app: App, connection: iroh::endpoint::Connection) {
-    let generations: Rc<RefCell<HashMap<AgentId, u64>>> = Rc::default();
+    let generations: Rc<RefCell<AgentStreamGenerations>> = Rc::default();
     loop {
         let Ok(mut recv) = connection.accept_uni().await else {
             break;
@@ -214,12 +216,7 @@ async fn agent_streams(app: App, connection: iroh::endpoint::Connection) {
             else {
                 return;
             };
-            let generation = {
-                let mut generations = generations.borrow_mut();
-                let generation = generations.entry(agent_id).or_default();
-                *generation = generation.wrapping_add(1);
-                *generation
-            };
+            let generation = generations.borrow_mut().open(agent_id);
             while let Ok(message) = rho_ui_proto::read_frame::<_, ServerMessage>(&mut recv).await {
                 let ServerMessage::Agent {
                     agent_id: frame_id,
@@ -228,8 +225,7 @@ async fn agent_streams(app: App, connection: iroh::endpoint::Connection) {
                 else {
                     return;
                 };
-                if frame_id != agent_id || generations.borrow().get(&agent_id) != Some(&generation)
-                {
+                if frame_id != agent_id || !generations.borrow().is_current(agent_id, generation) {
                     return;
                 }
                 handle(app, ServerMessage::Agent { agent_id, frame });
@@ -248,29 +244,54 @@ fn handle(app: App, message: ServerMessage) {
             agent_counter,
             ..
         } => {
+            let first_ready = app.phase.get_untracked() != Phase::Online;
+            let initial_subscriptions = first_ready.then(|| {
+                recent_workstream_roots(
+                    &workstreams,
+                    &agents,
+                    app.selected.get_untracked(),
+                    INITIAL_AGENT_SUBSCRIPTIONS,
+                )
+            });
             app.mutate_registry(|registry| {
                 registry.set_machine_seed(machine_seed);
                 registry.set_agent_counter(agent_counter);
                 registry.set_data(workstreams, agents);
             });
             app.projects.set(projects);
-            if app.phase.get_untracked() != Phase::Online {
+            if let Some(agent_ids) = initial_subscriptions
+                && !agent_ids.is_empty()
+            {
+                app.subscriptions
+                    .update_value(|subscriptions| subscriptions.reset(&agent_ids));
+                app.send(ClientMessage::SubscribeAgents { agent_ids });
+            }
+            if first_ready {
                 app.phase.set(Phase::Online);
             }
         }
         ServerMessage::Agent { agent_id, frame } => {
-            app.states.update_value(|states| {
-                let state =
-                    states
-                        .entry(agent_id)
-                        .or_insert_with(|| rho_ui_proto::remote::UiAgentState {
-                            blocks: Vec::new(),
-                            status: rho_ui_proto::remote::UiAgentStatus::Idle,
-                            context_used: None,
-                        });
-                frame.apply_diff(state);
+            // A transport may still deliver already-buffered frames after
+            // this client evicts a subscription.
+            if !app
+                .subscriptions
+                .with_value(|subscriptions| subscriptions.accepts_frames(agent_id))
+            {
+                return;
+            }
+            app.store.update_value(|store| {
+                store.apply(agent_id, frame);
             });
+            let mut live_changed = false;
+            app.registry
+                .update_value(|registry| live_changed = registry.mark_live(agent_id));
+            if live_changed {
+                app.registry_epoch.update(|epoch| *epoch += 1);
+            }
             app.state_epoch.update(|epoch| *epoch += 1);
+        }
+        ServerMessage::AgentSubscribed { agent_id } => {
+            app.mutate_registry(|registry| registry.mark_known(agent_id));
         }
         ServerMessage::AgentCreated {
             agent_id,
@@ -294,11 +315,17 @@ fn handle(app: App, message: ServerMessage) {
         } => {
             app.mutate_registry(|registry| registry.set_attention(agent_id, attention));
         }
-        ServerMessage::AgentUnloaded { agent_id, .. } => {
-            app.states.update_value(|states| {
-                if let Some(state) = states.get_mut(&agent_id) {
-                    state.status = rho_ui_proto::remote::UiAgentStatus::Unloaded;
-                }
+        ServerMessage::AgentUnloaded { agent_id, reason } => {
+            let mut authoritative = false;
+            app.subscriptions.update_value(|subscriptions| {
+                authoritative = subscriptions.mark_unloaded(agent_id, reason)
+            });
+            if !authoritative {
+                return;
+            }
+            app.mutate_registry(|registry| registry.mark_not_live(agent_id));
+            app.store.update_value(|store| {
+                store.mark_unloaded(agent_id);
             });
             app.state_epoch.update(|epoch| *epoch += 1);
         }

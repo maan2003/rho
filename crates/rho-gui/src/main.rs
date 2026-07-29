@@ -17,7 +17,6 @@ mod rho_assets;
 #[cfg(test)]
 mod sampler;
 mod shell_view;
-mod store;
 mod style;
 mod terminal_view;
 #[cfg(test)]
@@ -37,9 +36,11 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use gpui::{App, AppContext as _, KeyBinding, WindowOptions, actions};
-// The registry lives in a shared crate so the web UI applies the same rail
-// policy; the alias keeps this crate's `crate::registry::` paths intact.
+// The registry and per-agent frame store live in a shared crate so the web
+// UI applies the same rail policy and state folding; the aliases keep this
+// crate's `crate::registry::` and `crate::store::` paths intact.
 use rho_registry as registry;
+use rho_registry::store;
 use settings::SettingsStore;
 use tracing_subscriber::EnvFilter;
 

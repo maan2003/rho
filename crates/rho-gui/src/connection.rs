@@ -1428,7 +1428,9 @@ async fn run_agent_streams(
     let allocation_budget = Arc::new(AgentFrameAllocationBudget::new(
         AGENT_FRAME_ALLOCATION_BUDGET,
     ));
-    let generations = Arc::new(tokio::sync::Mutex::new(HashMap::<AgentId, u64>::new()));
+    let generations = Arc::new(tokio::sync::Mutex::new(
+        crate::registry::session::AgentStreamGenerations::default(),
+    ));
     loop {
         tokio::select! {
             accepted = connection.accept_uni() => {
@@ -1444,12 +1446,7 @@ async fn run_agent_streams(
                         anyhow::bail!("invalid agent stream header");
                     };
                     drop(header_allocation);
-                    let generation = {
-                        let mut generations = generations.lock().await;
-                        let generation = generations.entry(agent_id).or_default();
-                        *generation = generation.wrapping_add(1);
-                        *generation
-                    };
+                    let generation = generations.lock().await.open(agent_id);
                     loop {
                         let (message, allocation) = match read_agent_stream_message(
                             &mut recv,
@@ -1478,7 +1475,7 @@ async fn run_agent_streams(
                         };
                         anyhow::ensure!(frame_agent_id == agent_id, "agent stream id changed");
                         let generations = generations.lock().await;
-                        if generations.get(&agent_id) != Some(&generation) {
+                        if !generations.is_current(agent_id, generation) {
                             continue;
                         }
                         // Keep generation validation and enqueue atomic with

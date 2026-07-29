@@ -6,6 +6,9 @@
 //! connection has received frames for it). Selection and next/previous
 //! cycling operate over live agents only.
 
+pub mod session;
+pub mod store;
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,10 +18,11 @@ use rho_ui_proto::{AgentId, UiAgentSummary, UiWorkstream, WorkstreamId};
 /// Milliseconds since the unix epoch. `std::time` has no clock on
 /// wasm32-unknown-unknown; web-time is a drop-in that reads the browser's.
 pub fn now_ms() -> u64 {
-    #[cfg(target_family = "wasm")]
-    use web_time::{SystemTime, UNIX_EPOCH};
     #[cfg(not(target_family = "wasm"))]
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(target_family = "wasm")]
+    use web_time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
@@ -1091,11 +1095,7 @@ mod tests {
                 repo: "/tmp".into(),
             },
             attention: rho_ui_proto::UiAttention::Quiet,
-            last_active: rho_core::UnixMs(
-                now_ms()
-                    .saturating_sub(10_000)
-                    .saturating_add(id),
-            ),
+            last_active: rho_core::UnixMs(now_ms().saturating_sub(10_000).saturating_add(id)),
             hidden: false,
             last_user_message_text: String::new(),
             workstream: WorkstreamId(0),
