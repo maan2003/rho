@@ -301,15 +301,22 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let _ = std::env::set_current_dir("/var/empty").or_else(|_| std::env::set_current_dir("/"));
 
     let quota_auth_name = args.auth.clone();
-    let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
+    let default_socket_path = default_socket_path()?;
+    let socket_path = args
+        .socket_path
+        .unwrap_or_else(|| default_socket_path.clone());
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).context("create socket directory")?;
     }
     let _ = std::fs::remove_file(&socket_path);
     let server = Server::bind(&socket_path).context("bind rho daemon socket")?;
     let platform_secrets = PlatformSecrets::from_fd_store();
-    let octo_socket_path = octo_types::socket_path()?;
-    spawn_octo_server(&octo_socket_path, platform_secrets.clone())?;
+    // Octo's fixed socket belongs to the default daemon. Test and other
+    // alternate-socket daemons must not unlink it out from under that daemon.
+    if socket_path == default_socket_path {
+        let octo_socket_path = octo_types::socket_path()?;
+        spawn_octo_server(&octo_socket_path, platform_secrets.clone())?;
+    }
     let mut user_environment = login_environment()?;
     configure_octo_git_transport(&mut user_environment)?;
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
