@@ -1,9 +1,12 @@
+#[cfg(feature = "native")]
 mod header;
 mod mouse;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 pub(crate) use header::StickyHeader;
+#[cfg(feature = "native")]
 pub use header::file_status_label_color;
+#[cfg(feature = "native")]
 pub(crate) use header::{header_jump_data, render_buffer_header};
 
 use crate::{

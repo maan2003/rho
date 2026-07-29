@@ -252,6 +252,29 @@ the implementation crate.
 - `DisplayMap` and its fold/inlay layers now consume these portable paths
   directly. Native editor behavior and public paths are unchanged.
 
+### Stage 2 — native integration module boundary
+
+- Put the cohesive service-backed modules behind `editor/native`: bookmarks,
+  code actions/context menus/lens/completions, diagnostics acquisition,
+  document colors/links/symbols, edit prediction, folding-range acquisition,
+  Git/blame, header UI, hover providers/popovers, LSP inlay-hint acquisition,
+  linked editing, LSP extensions, Markdown actions, mouse context menus,
+  navigation/workspace integration, persistence, runnables/tasks, semantic
+  token acquisition, split workspace items/views, signature help, and the
+  clangd/rust-analyzer extensions.
+- Kept the portable modules compiled: display-map layers, selection and
+  movement, input, scrolling, folding transforms, indentation, clipboard,
+  rewrap, the base inlay value/rendering model, and `EditorElement` itself.
+  `element/mouse.rs` also remains portable as planned; its remaining project
+  checks must be delegated or narrowly gated during the interleaved-impl
+  split rather than dropping mouse selection/scroll behavior.
+- The no-default-features error count fell from about 293 to 178. Remaining
+  errors are concentrated in the deliberately interleaved `Editor` (203
+  diagnostic locations in the first post-gate check) and `EditorElement` (27),
+  plus narrow portable touchpoints in input, display map, inlays, scroll, and
+  mouse handling. Those require field/impl-level separation; further
+  module-level gating would remove required editing or rendering behavior.
+
 ### Reproduction
 
 ```sh

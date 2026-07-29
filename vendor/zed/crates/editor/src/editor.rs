@@ -14,38 +14,59 @@
 pub mod actions;
 pub mod blink_manager;
 mod bracket_colorization;
+#[cfg(feature = "native")]
 mod clangd_ext;
+#[cfg(feature = "native")]
 pub mod code_context_menus;
+#[cfg(feature = "native")]
 mod code_lens;
 pub mod display_map;
+#[cfg(feature = "native")]
 mod document_colors;
+#[cfg(feature = "native")]
 mod document_links;
+#[cfg(feature = "native")]
 mod document_symbols;
 mod editor_settings;
 mod element;
 mod fold;
+#[cfg(feature = "native")]
 mod folding_ranges;
+#[cfg(feature = "native")]
 mod git;
 mod highlight_matching_bracket;
+#[cfg(feature = "native")]
 pub mod hover_links;
+#[cfg(feature = "native")]
 pub mod hover_popover;
 mod indent_guides;
 mod inlays;
+#[cfg(feature = "native")]
 pub mod items;
 mod jsx_tag_auto_close;
+#[cfg(feature = "native")]
 mod linked_editing_ranges;
+#[cfg(feature = "native")]
 mod lsp_ext;
+#[cfg(feature = "native")]
 mod mouse_context_menu;
 pub mod movement;
+#[cfg(feature = "native")]
 mod persistence;
+#[cfg(feature = "native")]
 mod runnables;
+#[cfg(feature = "native")]
 mod rust_analyzer_ext;
 pub mod scroll;
 mod selections_collection;
+#[cfg(feature = "native")]
 pub mod semantic_tokens;
+#[cfg(feature = "native")]
 mod split;
+#[cfg(feature = "native")]
 pub mod split_editor_view;
 
+#[cfg(feature = "native")]
 mod bookmarks;
 #[cfg(test)]
 mod code_completion_tests;
@@ -55,36 +76,49 @@ mod edit_prediction_tests;
 mod editor_block_comment_tests;
 #[cfg(test)]
 mod editor_tests;
+#[cfg(feature = "native")]
 mod signature_help;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 
 mod clipboard;
+#[cfg(feature = "native")]
 mod code_actions;
+#[cfg(feature = "native")]
 mod completions;
 mod config;
+#[cfg(feature = "native")]
 mod diagnostics;
+#[cfg(feature = "native")]
 mod edit_prediction;
 mod input;
+#[cfg(feature = "native")]
 mod markdown_actions;
+#[cfg(feature = "native")]
 mod navigation;
 mod rewrap;
 mod selection;
 
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;
+#[cfg(feature = "native")]
 pub use code_actions::CodeActionProvider;
 use collections::TypeIdHashMap;
+#[cfg(feature = "native")]
 pub use completions::CompletionProvider;
 #[cfg(test)]
 pub(crate) use completions::snippet_candidate_suffixes;
+#[cfg(feature = "native")]
 pub(crate) use completions::split_words;
+#[cfg(feature = "native")]
 use diagnostics::{ActiveDiagnostic, GlobalDiagnosticRenderer, InlineDiagnostic};
+#[cfg(feature = "native")]
 pub use diagnostics::{DiagnosticRenderer, set_diagnostic_renderer};
 pub use display_map::{
     ChunkRenderer, ChunkRendererContext, DisplayElisionId, DisplayElisionProperties, DisplayPoint,
     FoldPlaceholder, HighlightKey, NavigationOverlayKey, SemanticTokenHighlight,
 };
+#[cfg(feature = "native")]
 pub use edit_prediction::make_suggestion_styles;
 
 #[derive(Clone)]
@@ -92,6 +126,7 @@ pub struct EditorRightPrompt {
     pub anchor: Anchor,
     pub spans: Vec<(String, HighlightStyle)>,
 }
+#[cfg(feature = "native")]
 pub(crate) use edit_prediction::{
     EditDisplayMode, EditPrediction, EditPredictionPreview, EditPredictionSettings,
     EditPredictionState, MenuEditPredictionsPolicy, RegisteredEditPredictionDelegate,
@@ -100,8 +135,8 @@ pub(crate) use edit_prediction::{
 pub(crate) use edit_prediction::{
     EditPredictionKeybindAction, EditPredictionKeybindSurface, edit_prediction_edit_text,
 };
-pub use edit_prediction_types::Direction;
-pub use edit_prediction_types::EditPredictionRequestTrigger;
+#[cfg(feature = "native")]
+pub use edit_prediction_types::{Direction, EditPredictionRequestTrigger};
 pub use editor_settings::{
     CompletionDetailAlignment, CompletionMenuItemKind, CurrentLineHighlight, DiffViewStyle,
     DocumentColorsRenderMode, EditorSettings, EditorSettingsScrollbarProxy, OpenResultsIn,
@@ -112,29 +147,41 @@ pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
     file_status_label_color, render_breadcrumb_text,
 };
+#[cfg(feature = "native")]
 pub use git::blame::BlameRenderer;
+#[cfg(feature = "native")]
 pub use git::{
     DiffHunkDelegate, ResolvedDiffHunk, ResolvedDiffHunks, RestoreOnlyDiffHunkDelegate,
     RestoreOnlyUnstagedDiffHunkDelegate, UncommittedDiffHunkDelegate, render_diff_hunk_controls,
     set_blame_renderer,
 };
+#[cfg(feature = "native")]
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
+#[cfg(feature = "native")]
 use git::{
     DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover, update_uncommitted_diff_for_buffer,
 };
+#[cfg(feature = "native")]
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
+#[cfg(feature = "native")]
 pub use hover_popover::hover_markdown_style;
 pub use inlays::Inlay;
+#[cfg(feature = "native")]
 pub use items::MAX_TAB_TITLE_LEN;
+#[cfg(feature = "native")]
 pub use linked_editing_ranges::LinkedEdits;
+#[cfg(feature = "native")]
 pub use lsp::CompletionContext;
+#[cfg(feature = "native")]
 pub use lsp_ext::lsp_tasks;
 pub use multi_buffer::{
     Anchor, AnchorRangeExt, BufferOffset, ExcerptRange, MBTextSummary, MultiBuffer,
     MultiBufferOffset, MultiBufferOffsetUtf16, MultiBufferSnapshot, PathKey, RowInfo, ToOffset,
     ToPoint,
 };
+#[cfg(feature = "native")]
 pub use split::{DiffStyleControls, SplittableEditor, ToggleSplitDiff};
+#[cfg(feature = "native")]
 pub use split_editor_view::SplitEditorView;
 pub use text::Bias;
 

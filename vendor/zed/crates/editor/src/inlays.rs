@@ -15,6 +15,7 @@
 //! [`InlaySplice`] to update this state.
 
 /// Logic, related to managing LSP inlay hint inlays.
+#[cfg(feature = "native")]
 pub mod inlay_hints;
 
 use std::sync::OnceLock;
