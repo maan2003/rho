@@ -357,6 +357,15 @@ pool so concurrent UI subscriptions, mail, and integrations cannot construct
 duplicate loops. Before returning a newly activated runtime, the pool awaits a
 daemon-installed observer that consumes its initial state and arms the
 attention watcher; integrations start only after that observer is installed.
+Native and Claude runtimes publish non-coalescing successful-completion events
+for integrations and separately report settled execution from inside their
+state machines. `AgentPool` flushes usage and persists top-level disposition
+only when no newer queued turn took over, or when a terminal failure prevents
+queued work from proceeding. Attention watchers only project current runtime
+state plus that durable disposition and never infer completion from snapshots.
+User-input disposition changes are likewise committed by the serialized native
+or Claude runtime loop when it accepts the input, not by the calling daemon
+connection, so an older completion cannot overwrite a newer queued input.
 Each UI control connection independently subscribes and
 unsubscribes agent state; activation does not imply observation by any GUI.
 `Ready` derives parked-agent attention from persisted disposition alone.

@@ -55,11 +55,10 @@ impl PrMonitor {
             db,
             octo: OctoClient::new()?,
         });
-        monitor.start_polling();
         Ok(monitor)
     }
 
-    fn start_polling(self: &Arc<Self>) {
+    pub fn start_polling(self: &Arc<Self>) {
         let monitor = Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(POLL_INTERVAL);

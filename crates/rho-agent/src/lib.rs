@@ -314,6 +314,18 @@ pub enum AgentStateKind {
     Idle,
 }
 
+/// A reliable state-machine transition that returns execution to the user's
+/// court. A queued successor remains working and therefore does not settle
+/// between turns; entering Error settles even when initialization failed
+/// before a working snapshot was published.
+pub(crate) fn execution_settled(
+    previous: &AgentStateKind,
+    current: &AgentStateKind,
+    attempt_started: bool,
+) -> bool {
+    (previous.is_working() && !current.is_working()) || (attempt_started && !current.is_working())
+}
+
 impl AgentStateKind {
     /// Whether the agent is actively executing a turn.
     pub fn is_working(&self) -> bool {
@@ -760,6 +772,7 @@ impl Agent {
             iris_tools,
             slack_tools,
             pool_events,
+            execution_generation: 0,
         };
         tokio::spawn(agent_loop.run());
         Self {
@@ -785,6 +798,29 @@ impl Agent {
 
     pub fn send_user_content(&self, content: Vec<ContentPart>, delivery: MessageDelivery) {
         self.send_user_content_with_source(content, delivery, None);
+    }
+
+    /// Send user input and wait until the serialized runtime loop has durably
+    /// queued it and moved persisted attention into the agent's court.
+    pub async fn send_user_content_accepted(
+        &self,
+        content: Vec<ContentPart>,
+        delivery: MessageDelivery,
+        source_id: Option<InputSourceId>,
+    ) -> anyhow::Result<()> {
+        let (accepted, reply) = oneshot::channel();
+        self.control
+            .send(AgentControl::UserMessage {
+                sender: MessageSender::User,
+                content,
+                delivery,
+                source_id,
+                accepted: Some(accepted),
+            })
+            .map_err(|_| anyhow::anyhow!("agent stopped before accepting user input"))?;
+        reply
+            .await
+            .map_err(|_| anyhow::anyhow!("agent stopped before accepting user input"))
     }
 
     pub fn send_user_content_with_source(
@@ -1097,6 +1133,9 @@ struct AgentLoop {
     iris_tools: Option<iris_tools::SharedIrisToolHost>,
     slack_tools: Option<slack_tools::SharedSlackToolHost>,
     pool_events: std::sync::Weak<pool::AgentPool>,
+    /// Incremented inside the serialized loop whenever a provider attempt is
+    /// started, including attempts that fail before publishing Working.
+    execution_generation: u64,
 }
 
 struct ExecutionContext {
@@ -1258,6 +1297,8 @@ impl AgentLoop {
     async fn run(mut self) {
         loop {
             let mut state = self.state.read().expect("poison").clone();
+            let previous_kind = state.kind.clone();
+            let previous_execution_generation = self.execution_generation;
             // Disabled arms still evaluate their expression, so give
             // `sleep_until` a zero deadline when no wait is armed; the guard
             // keeps it from being polled.
@@ -1672,7 +1713,8 @@ impl AgentLoop {
                                         pool.publish_completed_turn(AgentTurnCompleted {
                                             agent_id: self.persistence.agent_id,
                                             final_answer: final_text.clone(),
-                                        });
+                                        })
+                                        .await;
                                     }
                                     self.mail_parent(
                                         if final_text.is_empty() {
@@ -1864,6 +1906,14 @@ impl AgentLoop {
                     .await;
                 }
             }
+            if execution_settled(
+                &previous_kind,
+                &state.kind,
+                self.execution_generation != previous_execution_generation,
+            ) && let Some(pool) = self.pool_events.upgrade()
+            {
+                pool.settle_turn(self.persistence.agent_id).await;
+            }
             *self.state.write().expect("poison") = state.clone();
             self.notify.notify_waiters();
         }
@@ -1899,6 +1949,15 @@ impl AgentLoop {
             delivery,
         };
         let event_pos = self.persist_event(AgentEvent::Queued(item.clone())).await;
+        if sender == MessageSender::User {
+            let mut write = self.persistence.db.write().await;
+            write.record_agent_user_message(
+                UnixMs::now(),
+                self.persistence.agent_id,
+                &rho_core::text_content(&content),
+            );
+            write.commit();
+        }
         if let Some(pool) = self.pool_events.upgrade() {
             pool.publish_accepted_input(AgentInputAccepted {
                 input_id: AgentInputId {
@@ -2106,6 +2165,7 @@ impl AgentLoop {
         state: &mut AgentState,
         previous_attempt: Option<FailedInferenceResponse>,
     ) {
+        self.execution_generation = self.execution_generation.wrapping_add(1);
         let auto_compacting =
             should_auto_compact(state, self.inference_session.auto_compact_token_limit());
         if auto_compacting {
@@ -2349,6 +2409,29 @@ mod tests {
         vec![ContentPart::Text {
             text: text.to_owned(),
         }]
+    }
+
+    #[test]
+    fn settlement_tracks_runtime_ownership_not_snapshot_timing() {
+        let working = AgentStateKind::ApiStreaming {
+            pending_response: PendingInferenceResponse::default(),
+            previous_attempt: None,
+        };
+        let successor_working = AgentStateKind::ApiStreaming {
+            pending_response: PendingInferenceResponse::default(),
+            previous_attempt: None,
+        };
+        let error = AgentStateKind::Error(FailedInferenceResponse {
+            partial_response: PendingInferenceResponse::default(),
+            attempt_count: NonZeroU64::MIN,
+            error: Arc::new("failed".to_owned()),
+        });
+
+        assert!(execution_settled(&working, &AgentStateKind::Idle, false));
+        assert!(!execution_settled(&working, &successor_working, true));
+        assert!(execution_settled(&AgentStateKind::Idle, &error, true));
+        assert!(execution_settled(&error, &error, true));
+        assert!(!execution_settled(&error, &AgentStateKind::Idle, false));
     }
 
     fn queued_event(

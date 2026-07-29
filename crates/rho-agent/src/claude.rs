@@ -89,6 +89,7 @@ impl ClaudeAgent {
         write.set_agent_role(agent_id, role);
         write.commit();
 
+        let pool_events = pool.clone();
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool, agent_id, parent));
@@ -112,6 +113,7 @@ impl ClaudeAgent {
                 ClaudeStartMode::New,
                 false,
                 multi_agent,
+                pool_events,
                 role,
             ),
         ))
@@ -225,6 +227,7 @@ impl ClaudeAgent {
             context_used,
             quota_observation: None,
         };
+        let pool_events = pool.clone();
         Ok(Self::new(
             db,
             agent_id,
@@ -237,6 +240,7 @@ impl ClaudeAgent {
             pending_rewind,
             pool.upgrade()
                 .map(|_| MultiAgentTools::new(pool, agent_id, record.parent_agent)),
+            pool_events,
             record.role,
         ))
     }
@@ -253,6 +257,7 @@ impl ClaudeAgent {
         start_mode: ClaudeStartMode,
         pending_rewind: bool,
         multi_agent: Option<MultiAgentTools>,
+        pool_events: std::sync::Weak<crate::pool::AgentPool>,
         role: crate::db::AgentRole,
     ) -> Self {
         let state = Arc::new(RwLock::new(state));
@@ -277,12 +282,14 @@ impl ClaudeAgent {
             turn_usage: None,
             cancelling: false,
             pending_rewind,
+            execution_generation: 0,
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
             wait_baseline_seq: Arc::clone(&wait_baseline_seq),
             input_notify: Arc::clone(&input_notify),
             control_rx,
             multi_agent,
+            pool_events,
             role,
         };
         tokio::spawn(loop_state.run());
@@ -312,22 +319,40 @@ impl ClaudeAgent {
             content,
             seq,
             uuid,
+            user: true,
             accepted: None,
         });
+    }
+
+    pub async fn send_user_content_accepted(
+        &self,
+        content: Vec<ContentPart>,
+    ) -> anyhow::Result<()> {
+        self.send_content_accepted(content, true).await
     }
 
     /// Deliver agent mail and wait for acceptance into Rho's volatile Claude
     /// queue. A process or daemon restart may lose it before Claude records it.
     pub async fn send_agent_message_accepted(&self, text: String) -> anyhow::Result<()> {
+        self.send_content_accepted(vec![ContentPart::Text { text }], false)
+            .await
+    }
+
+    async fn send_content_accepted(
+        &self,
+        content: Vec<ContentPart>,
+        user: bool,
+    ) -> anyhow::Result<()> {
         let seq = self.input_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let uuid = Uuid::new_v4().to_string();
         let (accepted, reply) = oneshot::channel();
         self.input_notify.notify_waiters();
         self.control
             .send(ClaudeControl::UserMessage {
-                content: vec![ContentPart::Text { text }],
+                content,
                 seq,
                 uuid,
+                user,
                 accepted: Some(accepted),
             })
             .map_err(|_| anyhow::anyhow!("Claude agent stopped before accepting mail"))?;
@@ -424,6 +449,7 @@ enum ClaudeControl {
         content: Vec<ContentPart>,
         seq: u64,
         uuid: String,
+        user: bool,
         accepted: Option<oneshot::Sender<anyhow::Result<()>>>,
     },
     SetEffort {
@@ -461,12 +487,14 @@ struct ClaudeLoop {
     turn_usage: Option<rho_claude::protocol::TokenUsage>,
     cancelling: bool,
     pending_rewind: bool,
+    execution_generation: u64,
     state: Arc<RwLock<AgentState>>,
     notify: Arc<Notify>,
     wait_baseline_seq: Arc<AtomicU64>,
     input_notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
     multi_agent: Option<MultiAgentTools>,
+    pool_events: std::sync::Weak<crate::pool::AgentPool>,
     role: crate::db::AgentRole,
 }
 
@@ -479,6 +507,8 @@ struct ClaudeTurn {
 impl ClaudeLoop {
     async fn run(mut self) {
         loop {
+            let initial_kind = self.state.read().expect("poison").kind.clone();
+            let initial_execution_generation = self.execution_generation;
             if self.process.is_some() {
                 let event = {
                     let process = self.process.as_mut().expect("checked above");
@@ -539,6 +569,18 @@ impl ClaudeLoop {
                 };
                 self.handle_control(control).await;
             }
+            let kind = self.state.read().expect("poison").kind.clone();
+            if crate::execution_settled(
+                &initial_kind,
+                &kind,
+                self.execution_generation != initial_execution_generation,
+            ) && let Some(pool) = self.pool_events.upgrade()
+            {
+                pool.settle_turn(self.agent_id).await;
+                // set_kind notified before the durable disposition changed;
+                // wake projections again so they observe the settled pair.
+                self.notify.notify_waiters();
+            }
         }
     }
 
@@ -548,9 +590,23 @@ impl ClaudeLoop {
                 content,
                 seq,
                 uuid,
+                user,
                 accepted,
             } => {
                 self.cancelling = false;
+                let busy = self.state.read().expect("poison").kind.is_working();
+                if !busy {
+                    self.execution_generation = self.execution_generation.wrapping_add(1);
+                }
+                if user {
+                    let mut write = self.db.write().await;
+                    write.record_agent_user_message(
+                        rho_core::UnixMs::now(),
+                        self.agent_id,
+                        &rho_core::text_content(&content),
+                    );
+                    write.commit();
+                }
                 if let Err(error) = self.ensure_process().await {
                     if let Some(accepted) = accepted {
                         let _ = accepted.send(Err(anyhow::anyhow!("{error:#}")));
@@ -564,10 +620,6 @@ impl ClaudeLoop {
                 // internal queue and show the steering label; turn-opening
                 // sends render as a plain user message right away (the echo
                 // can trail a cold CLI spawn by many seconds).
-                let busy = matches!(
-                    self.state.read().expect("poison").kind,
-                    AgentStateKind::ApiStreaming { .. }
-                );
                 let delivery = if busy {
                     MessageDelivery::NextRequest
                 } else {
@@ -1172,6 +1224,13 @@ impl ClaudeLoop {
                     // A child's finished turn is its report: mail the result
                     // to the parent so it can react.
                     let final_text = message.result.unwrap_or_default();
+                    if let Some(pool) = self.pool_events.upgrade() {
+                        pool.publish_completed_turn(crate::pool::AgentTurnCompleted {
+                            agent_id: self.agent_id,
+                            final_answer: final_text.clone(),
+                        })
+                        .await;
+                    }
                     self.mail_parent(
                         if final_text.is_empty() {
                             "(turn finished with no text response)".to_owned()

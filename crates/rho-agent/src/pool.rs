@@ -251,8 +251,22 @@ impl AgentPool {
         })
     }
 
-    pub fn publish_completed_turn(&self, completed: AgentTurnCompleted) {
+    pub async fn publish_completed_turn(&self, completed: AgentTurnCompleted) {
+        self.flush_agent_usage(Some(completed.agent_id)).await;
         let _ = self.completed_turns.send(completed);
+    }
+
+    /// Persist that execution stopped and the top-level agent is back in the
+    /// user's court. Runtimes call this from their non-coalescing state
+    /// machines only when no newer queued turn took over, or on terminal
+    /// failure where queued work cannot proceed.
+    pub async fn settle_turn(&self, agent_id: AgentId) {
+        self.flush_agent_usage(Some(agent_id)).await;
+        if self.db.read().get_agent(agent_id).parent_agent.is_none() {
+            let mut write = self.db.write().await;
+            write.record_agent_turn_end(agent_id);
+            write.commit();
+        }
     }
 
     pub(crate) fn publish_completed_assistant_item(&self, item: AgentAssistantItemCompleted) {
@@ -763,6 +777,22 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.send_user_content(content, delivery),
             Self::Claude(agent) => agent.send_user_content(content),
+        }
+    }
+
+    pub async fn send_user_content_accepted(
+        &self,
+        content: Vec<rho_core::ContentPart>,
+        delivery: MessageDelivery,
+        source_id: Option<InputSourceId>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Rho(agent) => {
+                agent
+                    .send_user_content_accepted(content, delivery, source_id)
+                    .await
+            }
+            Self::Claude(agent) => agent.send_user_content_accepted(content).await,
         }
     }
 

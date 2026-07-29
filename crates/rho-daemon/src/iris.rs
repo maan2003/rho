@@ -368,10 +368,17 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                     },
                 )
                 .await?;
-            agent.send_user_message(args.prompt.clone(), MessageDelivery::NextRequest);
+            agent
+                .send_user_content_accepted(
+                    vec![rho_core::ContentPart::Text {
+                        text: args.prompt.clone(),
+                    }],
+                    MessageDelivery::NextRequest,
+                    None,
+                )
+                .await?;
             {
                 let mut write = registry.db.write().await;
-                write.record_agent_user_message(rho_core::UnixMs::now(), agent_id, &args.prompt);
                 if let Some(name) = args.task_name {
                     write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, name);
                 }
@@ -398,14 +405,15 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                 Some("next_turn") => MessageDelivery::NextTurn,
                 Some(other) => anyhow::bail!("unknown delivery {other}"),
             };
-            agent.send_user_message_with_source(
-                args.message.clone(),
-                delivery,
-                Some(InputSourceId::fresh_internal()),
-            );
-            let mut write = registry.db.write().await;
-            write.record_agent_user_message(rho_core::UnixMs::now(), agent_id, &args.message);
-            write.commit();
+            agent
+                .send_user_content_accepted(
+                    vec![rho_core::ContentPart::Text {
+                        text: args.message.clone(),
+                    }],
+                    delivery,
+                    Some(InputSourceId::fresh_internal()),
+                )
+                .await?;
             refresh_clients(registry).await;
             Ok(format!("Sent to {}.", registry.display_agent_id(agent_id)))
         }

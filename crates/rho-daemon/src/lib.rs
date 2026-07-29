@@ -12,9 +12,9 @@ use rho_agent::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentUsageProvider,
     AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider, WorkstreamId,
 };
-use rho_agent::pool::{AgentPool, AgentTurnCompleted, RunningAgent};
-use rho_agent::{AgentState, AgentStateKind, MessageDelivery};
-use rho_core::{ContentPart, ContextBlock, text_content};
+use rho_agent::pool::{AgentPool, RunningAgent};
+use rho_agent::{AgentStateKind, MessageDelivery};
+use rho_core::{ContentPart, text_content};
 use rho_db::RhoDb;
 use rho_inference::{Inference, InferenceAuth};
 use rho_ui_proto::remote::AgentRemoteEncoder;
@@ -368,7 +368,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         agents.events.clone(),
     );
 
-    if let Some((secret, iroh_auth)) = iroh {
+    let iroh_listener = if let Some((secret, iroh_auth)) = iroh {
         let mut transport = iroh::endpoint::QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(16u8.into())
             .qlog_from_env("rho-daemon");
@@ -388,8 +388,10 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .await
             .context("bind iroh endpoint")?;
         eprintln!("rho daemon iroh endpoint: {}", endpoint.id());
-        tokio::spawn(run_iroh_listener(agents.clone(), endpoint, iroh_auth));
-    }
+        Some((endpoint, iroh_auth))
+    } else {
+        None
+    };
 
     // Attention watchers are daemon-owned and pre-armed synchronously by the
     // pool before any activation caller can start work on the returned agent.
@@ -423,9 +425,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     for (agent_id, agent) in agents.loaded().await {
         activation_observer(agent_id, agent).await;
     }
-    // Integrations can activate and immediately mail agents, so resume them
-    // only after the activation observer is installed.
+    // Pollers, integrations, and listeners can activate and immediately mail
+    // agents, so expose them only after the activation observer is installed.
+    agents.pr_monitor.start_polling();
     agents.resume_platform_integrations();
+    if let Some((endpoint, iroh_auth)) = iroh_listener {
+        tokio::spawn(run_iroh_listener(agents.clone(), endpoint, iroh_auth));
+    }
     // Re-arm snooze wake-ups that were pending when the daemon last stopped.
     for (agent_id, agent) in agents.db.read().list_agents() {
         if let AgentDisposition::Snoozed { until } = agent.disposition
@@ -2050,21 +2056,21 @@ async fn spawn_attention_watcher(
 ) {
     let (ready_tx, ready_rx) = oneshot::channel();
     tokio::spawn(async move {
-        let runtime_publishes_completion = matches!(&agent, RunningAgent::Rho(_));
-        let is_child = db.read().get_agent(agent_id).parent_agent.is_some();
         let changes = agent.subscribe();
         futures::pin_mut!(changes);
         let Some(initial_state) = changes.next().await else {
             let _ = ready_tx.send(());
             return;
         };
+        // The state subscription is armed. Activation callers may now start
+        // work; durable turn completion is published by each runtime rather
+        // than inferred from this coalescing snapshot stream.
+        let _ = ready_tx.send(());
         let mut was_working = initial_state.kind.is_working();
-        let mut last_reported_response_count = inference_response_count(&initial_state);
         let mut last_sent = None;
         let mut last_quota = None;
         let states = futures::stream::once(async move { initial_state }).chain(changes);
         futures::pin_mut!(states);
-        let mut ready_tx = Some(ready_tx);
         while let Some(state) = states.next().await {
             if state.quota_observation != last_quota {
                 last_quota = state.quota_observation.clone();
@@ -2098,23 +2104,6 @@ async fn spawn_attention_watcher(
             let working = state.kind.is_working();
             if !working && was_working {
                 pool.flush_agent_usage(Some(agent_id)).await;
-                if !is_child {
-                    let mut write = db.write().await;
-                    write.record_agent_turn_end(agent_id);
-                    write.commit();
-                }
-            }
-            if !working
-                && was_working
-                && !runtime_publishes_completion
-                && let Some((response_count, final_answer)) = latest_final_response(&state)
-                && response_count > last_reported_response_count
-            {
-                last_reported_response_count = response_count;
-                pool.publish_completed_turn(AgentTurnCompleted {
-                    agent_id,
-                    final_answer,
-                });
             }
             was_working = working;
             let disposition = db.read().get_agent(agent_id).disposition;
@@ -2125,9 +2114,6 @@ async fn spawn_attention_watcher(
                     attention,
                 });
                 last_sent = Some(attention);
-            }
-            if let Some(ready_tx) = ready_tx.take() {
-                let _ = ready_tx.send(());
             }
         }
     });
@@ -2317,28 +2303,6 @@ fn spawn_claude_quota_recorder(
             }
         }
     });
-}
-
-fn inference_response_count(state: &AgentState) -> usize {
-    state
-        .blocks
-        .iter()
-        .filter(|block| matches!(block.as_ref(), ContextBlock::InferenceResponse { .. }))
-        .count()
-}
-
-fn latest_final_response(state: &AgentState) -> Option<(usize, String)> {
-    let response_count = inference_response_count(state);
-    if response_count == 0 {
-        return None;
-    }
-    state.blocks.iter().rev().find_map(|block| {
-        if let ContextBlock::InferenceResponse { items, .. } = block.as_ref() {
-            Some((response_count, rho_agent::final_answer_text(items)))
-        } else {
-            None
-        }
-    })
 }
 
 /// Wakes a snoozed agent: at `until`, rebroadcasts its (by then pending)
@@ -2656,7 +2620,9 @@ async fn handle_message(
             if let Some(content) = content {
                 let text = text_content(&content);
                 // The agent is fresh, so the lanes are equivalent here.
-                agent.send_user_content(content, MessageDelivery::NextRequest);
+                agent
+                    .send_user_content_accepted(content, MessageDelivery::NextRequest, None)
+                    .await?;
                 agents.maybe_generate_title(agent_id, text, founded).await;
             }
             Ok(Refresh::Ready)
@@ -2778,19 +2744,9 @@ async fn handle_message(
                 .await
                 .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
             let text = text_content(&content);
-            agent.send_user_content(content, delivery);
-            {
-                let mut write = agents.db.write().await;
-                write.record_agent_user_message(rho_core::UnixMs::now(), agent_id, &text);
-                write.commit();
-            }
-            // Replying cleared the disposition; say so even when the turn
-            // doesn't start immediately (queued delivery), or the pending
-            // lamp would linger until the watcher's next state change.
-            let _ = agents.events.send(ServerMessage::AgentAttention {
-                agent_id,
-                attention: attention_level(Some(&agent.state().kind), AgentDisposition::Done),
-            });
+            agent
+                .send_user_content_accepted(content, delivery, None)
+                .await?;
             agents.maybe_generate_title(agent_id, text, None).await;
             Ok(Refresh::None)
         }
@@ -3720,18 +3676,14 @@ mod tests {
     use std::sync::Arc;
 
     use rho_agent::db::{AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider};
-    use rho_agent::{AgentState, AgentStateKind, InputQueues};
-    use rho_core::{
-        ContentPart, ContextBlock, InferenceResponseItem, MessagePhase, UnknownProviderSpecificData,
-    };
+    use rho_core::ContentPart;
     use rho_db::RhoDb;
     use rho_ui_proto::ServerMessage;
 
     use super::{
         GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
-        configure_octo_git_transport, inference_response_count, latest_final_response,
-        load_or_create_iroh_secret, quota_burn, quota_history, quota_summaries,
-        validate_image_content,
+        configure_octo_git_transport, load_or_create_iroh_secret, quota_burn, quota_history,
+        quota_summaries, validate_image_content,
     };
 
     #[test]
@@ -4050,42 +4002,6 @@ mod tests {
                 request_id: done_request
             }) if done_request == request_id
         ));
-    }
-
-    fn state_with_responses(texts: &[&str]) -> AgentState {
-        AgentState {
-            blocks: texts
-                .iter()
-                .map(|text| {
-                    Arc::new(ContextBlock::InferenceResponse {
-                        items: vec![InferenceResponseItem::AssistantMessage {
-                            provider_specific: Box::new(UnknownProviderSpecificData {
-                                tag: "test".to_owned(),
-                            }),
-                            content: vec![ContentPart::Text {
-                                text: (*text).to_owned(),
-                            }],
-                            phase: Some(MessagePhase::FinalAnswer),
-                        }],
-                        provider_response_id: None,
-                    })
-                })
-                .collect(),
-            queued_inputs: InputQueues::default(),
-            kind: AgentStateKind::Idle,
-            context_used: None,
-            quota_observation: None,
-        }
-    }
-
-    #[test]
-    fn latest_final_response_reports_newest_response_and_count() {
-        let state = state_with_responses(&["first", "second"]);
-        assert_eq!(inference_response_count(&state), 2);
-        assert_eq!(
-            latest_final_response(&state),
-            Some((2, "second".to_owned()))
-        );
     }
 
     #[test]
