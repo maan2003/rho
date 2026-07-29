@@ -2408,13 +2408,10 @@ async fn handle_message(
         }
         ClientMessage::PrCommand {
             request_id,
-            agent_id,
+            agent_id: _,
             command,
         } => {
             let result = async {
-                let agent_id = agent_id
-                    .map(|raw| agents.resolve_display_agent_id(&raw))
-                    .transpose()?;
                 match command {
                     rho_ui_proto::PrCommand::Create {
                         owner,
@@ -2426,17 +2423,14 @@ async fn handle_message(
                         review_bots: _,
                     } => agents
                         .pr_monitor
-                        .create(
-                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
-                            rho_pr_monitor::CreatePullRequest {
-                                owner,
-                                repo,
-                                head,
-                                base,
-                                title,
-                                body,
-                            },
-                        )
+                        .create(rho_pr_monitor::CreatePullRequest {
+                            owner,
+                            repo,
+                            head,
+                            base,
+                            title,
+                            body,
+                        })
                         .await
                         .map(|output| (output, Vec::new())),
                     rho_ui_proto::PrCommand::Subscribe { .. } => Ok((
@@ -2456,42 +2450,24 @@ async fn handle_message(
                     )),
                     rho_ui_proto::PrCommand::Comment { url, reply, body } => agents
                         .pr_monitor
-                        .comment(
-                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
-                            &url,
-                            &body,
-                            reply.as_deref(),
-                        )
+                        .comment(&url, &body, reply.as_deref())
                         .await
                         .map(|output| (output, Vec::new())),
                     rho_ui_proto::PrCommand::Edit { url, title, body } => agents
                         .pr_monitor
-                        .edit(
-                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
-                            &url,
-                            title,
-                            body,
-                        )
+                        .edit(&url, title, body)
                         .await
                         .map(|output| (output, Vec::new())),
                     rho_ui_proto::PrCommand::Rerun { url, run_id } => agents
                         .pr_monitor
-                        .rerun(
-                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
-                            &url,
-                            run_id,
-                        )
+                        .rerun(&url, run_id)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Logs { url, run_id } => agents
-                        .pr_monitor
-                        .logs(
-                            agent_id.context("missing --agent or RHO_AGENT_ID")?,
-                            &url,
-                            run_id,
-                        )
-                        .await
-                        .map(|data| (format!("downloaded logs for run {run_id}"), data.to_vec())),
+                    rho_ui_proto::PrCommand::Logs { url, run_id } => {
+                        agents.pr_monitor.logs(&url, run_id).await.map(|data| {
+                            (format!("downloaded logs for run {run_id}"), data.to_vec())
+                        })
+                    }
                 }
             }
             .await;

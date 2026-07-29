@@ -161,11 +161,10 @@ AI APIs.
   callers must inspect the remote ref before retrying.
 - `rho-pr-monitor` uses Octo only for bounded authenticated GitHub API calls
   behind `rho pr` on the normal daemon socket. Status is a stateless read for
-  any canonical HTTPS GitHub PR URL and needs no agent identity. Mutating
-  commands identify the caller with `RHO_AGENT_ID` (or `--agent`) and require
-  an Engineer role. This is request scoping, not a new local authorization
-  boundary: clients able to reach the privileged daemon socket already have
-  equivalent control. The daemon stores no PR subscriptions, runs no polling
+  any canonical HTTPS GitHub PR URL. PR commands need no agent identity;
+  GitHub token permissions authorize mutations. Clients able to reach the
+  privileged daemon socket already have equivalent control. The daemon stores
+  no PR subscriptions, runs no polling
   loop, and never injects GitHub content into an agent conversation.
   Feedback replies re-fetch the named PR snapshot and require the event id to
   be present there. GitHub permissions govern mutations and GitHub retains its

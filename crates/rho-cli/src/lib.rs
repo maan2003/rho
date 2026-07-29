@@ -243,8 +243,6 @@ pub(crate) struct PrArgs {
     auth: String,
     #[arg(long = "socket-path")]
     socket_path: Option<PathBuf>,
-    #[arg(long)]
-    agent: Option<String>,
     #[command(subcommand)]
     command: PrCliCommand,
 }

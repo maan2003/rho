@@ -225,12 +225,7 @@ impl PrMonitor {
         Ok(())
     }
 
-    pub async fn create(
-        &self,
-        subscriber: AgentId,
-        request: CreatePullRequest,
-    ) -> anyhow::Result<String> {
-        self.ensure_engineer(subscriber)?;
+    pub async fn create(&self, request: CreatePullRequest) -> anyhow::Result<String> {
         let created = self
             .octo
             .create(
@@ -334,12 +329,10 @@ impl PrMonitor {
 
     pub async fn edit(
         &self,
-        subscriber: AgentId,
         url: &str,
         title: Option<String>,
         body: Option<String>,
     ) -> anyhow::Result<String> {
-        self.ensure_engineer(subscriber)?;
         anyhow::ensure!(
             title.is_some() || body.is_some(),
             "provide --title or --body"
@@ -359,13 +352,11 @@ impl PrMonitor {
 
     pub async fn comment(
         &self,
-        subscriber: AgentId,
         url: &str,
         text: &str,
         reply: Option<&str>,
     ) -> anyhow::Result<String> {
         anyhow::ensure!(!text.trim().is_empty(), "comment body cannot be empty");
-        self.ensure_engineer(subscriber)?;
         let (owner, repo, number) = parse_pr_url(url)?;
         let Some(event_id) = reply else {
             let body = format!("{}\n\n{OUTBOUND_MARKER}", text.trim());
@@ -415,25 +406,13 @@ impl PrMonitor {
         Ok(serde_json::to_string_pretty(&watches)?)
     }
 
-    pub async fn rerun(
-        &self,
-        subscriber: AgentId,
-        url: &str,
-        run_id: u64,
-    ) -> anyhow::Result<String> {
-        self.ensure_engineer(subscriber)?;
+    pub async fn rerun(&self, url: &str, run_id: u64) -> anyhow::Result<String> {
         let (owner, repo, _) = parse_pr_url(url)?;
         self.octo.rerun(&owner, &repo, run_id).await?;
         Ok(format!("rerun triggered for workflow run {run_id}"))
     }
 
-    pub async fn logs(
-        &self,
-        subscriber: AgentId,
-        url: &str,
-        run_id: u64,
-    ) -> anyhow::Result<bytes::Bytes> {
-        self.ensure_engineer(subscriber)?;
+    pub async fn logs(&self, url: &str, run_id: u64) -> anyhow::Result<bytes::Bytes> {
         let (owner, repo, _) = parse_pr_url(url)?;
         self.octo.logs(&owner, &repo, run_id).await
     }

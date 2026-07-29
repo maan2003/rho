@@ -333,9 +333,8 @@ monitor updates into an agent conversation. The standalone `octo` CLI is not
 installed.
 
 The normal UI protocol carries request-id-scoped `rho pr` commands and their
-text or bounded log-archive results. Status needs no agent identity. Mutating
-commands identify the caller from `RHO_AGENT_ID`; the daemon resolves and
-validates the Engineer before calling `rho-pr-monitor`.
+text or bounded log-archive results. PR operations need no agent identity;
+GitHub token permissions remain the mutation authority.
 
 The daemon's UI protocol (`rho-ui-proto`) is served over the local Unix socket
 and iroh connections from clients enrolled through `rho-iroh-auth` (`rho

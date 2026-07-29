@@ -13,10 +13,6 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     if matches!(&args.command, PrCliCommand::Init) {
         return init(args).await;
     }
-    let agent_id = args.agent.or_else(|| std::env::var("RHO_AGENT_ID").ok());
-    if agent_id.is_none() && !matches!(&args.command, PrCliCommand::Status { .. }) {
-        anyhow::bail!("missing --agent or RHO_AGENT_ID");
-    }
     let response_run_id = match &args.command {
         PrCliCommand::Logs { run_id, .. } => Some(*run_id),
         _ => None,
@@ -28,7 +24,7 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     daemon
         .send(&ClientMessage::PrCommand {
             request_id,
-            agent_id,
+            agent_id: None,
             command,
         })
         .await?;
