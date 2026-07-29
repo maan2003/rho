@@ -11,7 +11,7 @@ use gpui::{
 use language::{Bias, ToOffset};
 use linkify::{LinkFinder, LinkKind};
 use lsp::LanguageServerId;
-use project::{InlayId, LocationLink, Project, ResolvedPath};
+use project::{LocationLink, Project, ResolvedPath};
 use regex::Regex;
 use settings::Settings;
 use std::{ops::Range, str::FromStr as _, sync::LazyLock};
@@ -109,12 +109,7 @@ pub fn document_link_target_to_hover_link(target: &str, server_id: LanguageServe
     HoverLink::Url(target.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InlayHighlight {
-    pub inlay: InlayId,
-    pub inlay_position: Anchor,
-    pub range: Range<usize>,
-}
+pub use crate::inlays::InlayHighlight;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TriggerPoint {

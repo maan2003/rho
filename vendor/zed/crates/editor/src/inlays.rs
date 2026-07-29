@@ -22,10 +22,19 @@ use std::sync::OnceLock;
 
 use gpui::{Context, HighlightStyle, Hsla, Rgba, Task};
 use multi_buffer::Anchor;
-use project::{InlayHint, InlayId};
+use language::InlayId;
+#[cfg(feature = "native")]
+use project::InlayHint;
 use text::Rope;
 
-use crate::{Editor, HighlightKey, hover_links::InlayHighlight};
+use crate::{Editor, HighlightKey};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlayHighlight {
+    pub inlay: InlayId,
+    pub inlay_position: Anchor,
+    pub range: std::ops::Range<usize>,
+}
 
 /// A splice to send into the `inlay_map` for updating the visible inlays on the screen.
 /// "Visible" inlays may not be displayed in the buffer right away, but those are ready to be displayed on further buffer scroll, pane item activations, etc. right away without additional LSP queries or settings changes.
@@ -58,6 +67,7 @@ pub enum InlayContent {
 }
 
 impl Inlay {
+    #[cfg(feature = "native")]
     pub fn hint(id: InlayId, position: Anchor, hint: &InlayHint) -> Self {
         let mut text = hint.text();
         let needs_right_padding = hint.padding_right && !text.ends_with(" ");
@@ -165,6 +175,7 @@ impl Editor {
         to_insert: Vec<Inlay>,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "native")]
         if let Some(inlay_hints) = &mut self.inlay_hints {
             for id_to_remove in to_remove {
                 inlay_hints.added_hints.remove(id_to_remove);

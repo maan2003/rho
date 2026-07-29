@@ -151,6 +151,12 @@ pub struct LspFoldingRange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TokenType(pub u32);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Prev,
+    Next,
+}
+
 /// Maximum diagnostic severity rendered by an editor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum DiagnosticSeverityFilter {

@@ -1646,7 +1646,7 @@ pub struct Chunk<'a> {
     /// the editor.
     pub highlight_style: Option<HighlightStyle>,
     /// The severity of diagnostic associated with this chunk, if any.
-    pub diagnostic_severity: Option<lsp::DiagnosticSeverity>,
+    pub diagnostic_severity: Option<language::DiagnosticSeverity>,
     /// Whether this chunk of text is marked as unnecessary.
     pub is_unnecessary: bool,
     /// Whether this chunk of text should be underlined.

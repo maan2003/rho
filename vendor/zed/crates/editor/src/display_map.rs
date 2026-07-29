@@ -134,7 +134,7 @@ use std::{
 };
 
 use crate::{
-    EditorStyle, RowExt, hover_links::InlayHighlight, inlays::Inlay, movement::TextLayoutDetails,
+    EditorStyle, RowExt, inlays::{Inlay, InlayHighlight}, movement::TextLayoutDetails,
 };
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
 use fold_map::{FoldPointCursor, FoldSnapshot};
@@ -2117,7 +2117,7 @@ impl DisplaySnapshot {
                             underline: (chunk.underline
                                 && editor_style.show_underlines
                                 && !(chunk.is_unnecessary
-                                    && severity > lsp::DiagnosticSeverity::WARNING))
+                                    && severity > language::DiagnosticSeverity::WARNING))
                                 .then(|| {
                                     let diagnostic_color =
                                         diagnostic_style(severity, &editor_style.status);
@@ -2734,12 +2734,12 @@ impl DisplaySnapshot {
     }
 }
 
-fn diagnostic_style(severity: lsp::DiagnosticSeverity, colors: &StatusColors) -> Hsla {
+fn diagnostic_style(severity: language::DiagnosticSeverity, colors: &StatusColors) -> Hsla {
     match severity {
-        lsp::DiagnosticSeverity::ERROR => colors.error.into(),
-        lsp::DiagnosticSeverity::WARNING => colors.warning.into(),
-        lsp::DiagnosticSeverity::INFORMATION => colors.info.into(),
-        lsp::DiagnosticSeverity::HINT => colors.hint.into(),
+        language::DiagnosticSeverity::ERROR => colors.error.into(),
+        language::DiagnosticSeverity::WARNING => colors.warning.into(),
+        language::DiagnosticSeverity::INFORMATION => colors.info.into(),
+        language::DiagnosticSeverity::HINT => colors.hint.into(),
         _ => colors.ignored.into(),
     }
 }
@@ -3729,7 +3729,7 @@ pub mod tests {
                     [DiagnosticEntry {
                         range: PointUtf16::new(0, 0)..PointUtf16::new(2, 1),
                         diagnostic: Diagnostic {
-                            severity: lsp::DiagnosticSeverity::ERROR,
+                            severity: language::DiagnosticSeverity::ERROR,
                             group_id: 1,
                             message: "hi".into(),
                             ..Default::default()
@@ -3790,7 +3790,7 @@ pub mod tests {
         });
 
         let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
-        let mut chunks = Vec::<(String, Option<lsp::DiagnosticSeverity>, Rgba)>::new();
+        let mut chunks = Vec::<(String, Option<language::DiagnosticSeverity>, Rgba)>::new();
         for chunk in snapshot.chunks(
             DisplayRow(0)..DisplayRow(5),
             LanguageAwareStyling {
@@ -3819,11 +3819,11 @@ pub mod tests {
             [
                 (
                     "struct A {\n    b: usize;\n".into(),
-                    Some(lsp::DiagnosticSeverity::ERROR),
+                    Some(language::DiagnosticSeverity::ERROR),
                     black
                 ),
                 ("\n".into(), None, black),
-                ("}".into(), Some(lsp::DiagnosticSeverity::ERROR), black),
+                ("}".into(), Some(language::DiagnosticSeverity::ERROR), black),
                 ("\nconst c: ".into(), None, black),
                 ("usize".into(), None, red),
                 (" = ".into(), None, black),

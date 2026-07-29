@@ -275,6 +275,29 @@ the implementation crate.
   mouse handling. Those require field/impl-level separation; further
   module-level gating would remove required editing or rendering behavior.
 
+### Stage 3 — interleaved implementation split (in progress)
+
+- Feature-gated the native `Editor` fields and their construction/subscription
+  paths while retaining the buffer, display map, selections, scroll manager,
+  focus/input state, editing transactions, highlights, and render state on the
+  portable struct.
+- Kept keyboard deletion and insertion portable: backspace, delete, tab,
+  undo/redo, and focus handling now gate only linked-editing, edit-prediction,
+  hover, blame, diagnostics, and LSP refresh side effects. The actual buffer
+  edits, selection updates, cursor movement, and autoscroll remain compiled.
+- Moved `Direction` into `language` (with the old edit-prediction re-export)
+  and moved `InlayHighlight` into the base inlay model, eliminating two more
+  native type leaks from portable selection/display-map code.
+- Added a wasm construction path to the existing `Editor::new`/
+  `new_internal` implementation by conditionally omitting the project handle;
+  the real `MultiBuffer`, `DisplayMap`, selection collection, blink manager,
+  focus subscriptions, and style machinery are still initialized.
+- The release wasm check is down to 83 errors. Remaining clusters are the
+  native contributions interleaved in `EditorElement`/mouse, persistence hooks
+  in fold/selection/scroll, split companion conversion in `DisplayMap`, and a
+  smaller set of settings/event methods in `Editor` and input. No portable
+  editing or painting module has been gated wholesale.
+
 ### Reproduction
 
 ```sh

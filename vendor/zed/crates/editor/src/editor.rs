@@ -131,12 +131,13 @@ pub(crate) use edit_prediction::{
     EditDisplayMode, EditPrediction, EditPredictionPreview, EditPredictionSettings,
     EditPredictionState, MenuEditPredictionsPolicy, RegisteredEditPredictionDelegate,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 pub(crate) use edit_prediction::{
     EditPredictionKeybindAction, EditPredictionKeybindSurface, edit_prediction_edit_text,
 };
+pub use language::Direction;
 #[cfg(feature = "native")]
-pub use edit_prediction_types::{Direction, EditPredictionRequestTrigger};
+pub use edit_prediction_types::EditPredictionRequestTrigger;
 pub use editor_settings::{
     CompletionDetailAlignment, CompletionMenuItemKind, CurrentLineHighlight, DiffViewStyle,
     DocumentColorsRenderMode, EditorSettings, EditorSettingsScrollbarProxy, OpenResultsIn,
@@ -145,8 +146,10 @@ pub use editor_settings::{
 };
 pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
-    file_status_label_color, render_breadcrumb_text,
+    render_breadcrumb_text,
 };
+#[cfg(feature = "native")]
+pub use element::file_status_label_color;
 #[cfg(feature = "native")]
 pub use git::blame::BlameRenderer;
 #[cfg(feature = "native")]
@@ -185,23 +188,31 @@ pub use split::{DiffStyleControls, SplittableEditor, ToggleSplitDiff};
 pub use split_editor_view::SplitEditorView;
 pub use text::Bias;
 
+#[cfg(feature = "native")]
 use ::git::{Blame, status::FileStatus};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, BuildError};
 use anyhow::{Context as _, Result, anyhow, bail};
 use blink_manager::BlinkManager;
+#[cfg(feature = "native")]
 use client::{Collaborator, ParticipantIndex, parse_zed_link};
 use clock::ReplicaId;
+#[cfg(feature = "native")]
 use code_context_menus::{
     AvailableCodeAction, CodeActionContents, CodeActionsItem, CodeActionsMenu, CodeContextMenu,
     CompletionsMenu, ContextMenuOrigin,
 };
+#[cfg(feature = "native")]
 use code_lens::CodeLensState;
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use convert_case::{Case, Casing};
+#[cfg(feature = "native")]
 use dap::TelemetrySpawnLocation;
 use display_map::*;
+#[cfg(feature = "native")]
 use document_colors::LspColorData;
+#[cfg(feature = "native")]
 use document_links::LspDocumentLinks;
+#[cfg(feature = "native")]
 use edit_prediction_types::{
     EditPredictionDelegate, EditPredictionDelegateHandle, EditPredictionDiscardReason,
     EditPredictionGranularity, SuggestionDisplayType,
@@ -212,7 +223,9 @@ use futures::{
     FutureExt,
     future::{self, Shared},
 };
+#[cfg(feature = "native")]
 use fuzzy::{StringMatch, StringMatchCandidate};
+#[cfg(feature = "native")]
 use git::blame::{GitBlame, GlobalBlameRenderer};
 use gpui::{
     Action, Animation, AnimationExt, AnyElement, App, AppContext, AsyncWindowContext,
@@ -225,16 +238,21 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, WeakFocusHandle, Window, div, point, prelude::*,
     pulsating_between, px, relative, size,
 };
+#[cfg(feature = "native")]
 use hover_links::{HoverLink, HoveredLinkState, find_file};
+#[cfg(feature = "native")]
 use hover_popover::{HoverState, hide_hover};
 use indent_guides::ActiveIndentGuidesState;
-use inlays::{InlaySplice, inlay_hints::InlayHintRefreshReason};
+use inlays::InlaySplice;
+#[cfg(feature = "native")]
+use inlays::inlay_hints::InlayHintRefreshReason;
 use itertools::{Either, Itertools};
 use language::{
     AutoindentMode, BlockCommentConfig, BracketMatch, BracketPair, Buffer, BufferRow,
     BufferSnapshot, Capability, CharClassifier, CharKind, CharScopeContext, CodeLabel, CursorShape,
     DiagnosticEntryRef, DiffOptions, EditPredictionsMode, EditPreview, HighlightedText, IndentKind,
-    IndentSize, Language, LanguageAwareStyling, LanguageName, LanguageRegistry, LanguageScope,
+    DiagnosticSeverityFilter as DiagnosticSeverity, IndentSize, InlayId, Language,
+    LanguageAwareStyling, LanguageName, LanguageRegistry, LanguageScope, LanguageServerId,
     LocalFile, OffsetRangeExt, OutlineItem, Point, Selection, SelectionGoal, TextObject,
     TransactionId, TreeSitterOptions, WordsQuery,
     language_settings::{
@@ -243,12 +261,15 @@ use language::{
     },
     point_from_lsp, point_to_lsp, text_diff_with_options,
 };
+#[cfg(feature = "native")]
 use linked_editing_ranges::refresh_linked_ranges;
+#[cfg(feature = "native")]
 use lsp::{
     CodeActionKind, CompletionItemKind, CompletionTriggerKind, InsertTextFormat, InsertTextMode,
-    LanguageServerId,
 };
+#[cfg(feature = "native")]
 use markdown::Markdown;
+#[cfg(feature = "native")]
 use mouse_context_menu::MouseContextMenu;
 use movement::TextLayoutDetails;
 use multi_buffer::{
@@ -256,10 +277,12 @@ use multi_buffer::{
     MultiBufferPoint, MultiBufferRow,
 };
 use parking_lot::Mutex;
+#[cfg(feature = "native")]
 use persistence::EditorDb;
+#[cfg(feature = "native")]
 use project::{
     BreakpointWithPosition, CodeAction, Completion, CompletionDisplayOptions, CompletionIntent,
-    CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, InlayHint, InlayId,
+    CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, InlayHint,
     InvalidationStrategy, Location, LocationLink, LspAction, PrepareRenameResponse, Project,
     ProjectItem, ProjectPath, ProjectTransaction,
     bookmark_store::BookmarkStore,
@@ -275,10 +298,11 @@ use project::{
         BufferSemanticTokens, CacheInlayHints, CompletionDocumentation, FormatTrigger,
         LspFormatTarget, OpenLspBufferHandle,
     },
-    project_settings::{DiagnosticSeverity, GoToDiagnosticSeverityFilter, ProjectSettings},
+    project_settings::{GoToDiagnosticSeverityFilter, ProjectSettings},
 };
 use rand::seq::SliceRandom;
 use regex::Regex;
+#[cfg(feature = "native")]
 use rpc::{ErrorCode, ErrorExt, proto::PeerId};
 use scroll::{Autoscroll, OngoingScroll, ScrollAnchor, ScrollManager, SharedScrollAnchor};
 use selections_collection::{MutableSelectionsCollection, SelectionsCollection};
@@ -304,6 +328,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+#[cfg(feature = "native")]
 use task::TaskVariables;
 use text::{BufferId, FromAnchor, OffsetUtf16, Rope, ToOffset as _, ToPoint as _};
 use theme::{
@@ -316,6 +341,7 @@ use ui::{
 };
 use ui_input::ErasedEditor;
 use util::{RangeExt, ResultExt, TryFutureExt, maybe, post_inc};
+#[cfg(feature = "native")]
 use workspace::{
     CollaboratorId, Item as WorkspaceItem, ItemId, ItemNavHistory, NavigationEntry, OpenInTerminal,
     OpenTerminal, Pane, RestoreOnStartupBehavior, SERIALIZATION_THROTTLE_TIME, SplitDirection,
@@ -324,20 +350,24 @@ use workspace::{
     notifications::{DetachAndPromptErr, NotificationId, NotifyResultExt, NotifyTaskExt},
     searchable::SearchEvent,
 };
+#[cfg(feature = "native")]
 pub use zed_actions::editor::RevealInFileManager;
 use zed_actions::editor::{MoveDown, MoveUp};
 
 use crate::{
-    code_context_menus::CompletionsMenuSource,
     editor_settings::MultiCursorModifier,
+    scroll::{ScrollOffset, ScrollPixelOffset},
+    selections_collection::resolve_selections_wrapping_blocks,
+};
+#[cfg(feature = "native")]
+use crate::{
+    code_context_menus::CompletionsMenuSource,
     hover_links::{find_url, find_url_from_range},
     inlays::{
         InlineValueCache,
         inlay_hints::{LspInlayHintData, inlay_hint_settings},
     },
     runnables::{ResolvedTasks, RunnableData, RunnableTaskStatus, RunnableTasks},
-    scroll::{ScrollOffset, ScrollPixelOffset},
-    selections_collection::resolve_selections_wrapping_blocks,
     semantic_tokens::SemanticTokenState,
     signature_help::{SignatureHelpHiddenBy, SignatureHelpState},
 };
@@ -403,13 +433,19 @@ impl Navigated {
 }
 
 pub fn init(cx: &mut App) {
+    #[cfg(feature = "native")]
     cx.set_global(GlobalBlameRenderer(Arc::new(())));
+    #[cfg(feature = "native")]
     cx.set_global(breadcrumbs::RenderBreadcrumbText(render_breadcrumb_text));
 
+    #[cfg(feature = "native")]
     workspace::register_project_item::<Editor>(cx);
+    #[cfg(feature = "native")]
     workspace::FollowableViewRegistry::register::<Editor>(cx);
+    #[cfg(feature = "native")]
     workspace::register_serializable_item::<Editor>(cx);
 
+    #[cfg(feature = "native")]
     cx.observe_new(
         |workspace: &mut Workspace, _: Option<&mut Window>, _cx: &mut Context<Workspace>| {
             workspace.register_action(Editor::new_file);
@@ -423,6 +459,7 @@ pub fn init(cx: &mut App) {
     )
     .detach();
 
+    #[cfg(feature = "native")]
     cx.on_action(move |_: &workspace::NewFile, cx| {
         let app_state = workspace::AppState::global(cx);
         workspace::open_new(
@@ -848,6 +885,7 @@ pub trait Addon: 'static {
         menu
     }
 
+    #[cfg(feature = "native")]
     fn override_status_for_buffer_id(&self, _: BufferId, _: &App) -> Option<FileStatus> {
         None
     }
@@ -970,12 +1008,14 @@ struct GutterHoverButton {
     is_active: bool,
 }
 
+#[cfg(feature = "native")]
 enum CodeActionsForSelection {
     None,
     Fetching(Shared<Task<Option<ActionFetchReady>>>),
     Ready(ActionFetchReady),
 }
 
+#[cfg(feature = "native")]
 #[derive(Clone)]
 struct ActionFetchReady {
     location: Location,
@@ -1016,18 +1056,24 @@ pub struct Editor {
     select_syntax_node_history: SelectSyntaxNodeHistory,
     ime_transaction: Option<TransactionId>,
     pub diagnostics_max_severity: DiagnosticSeverity,
+    #[cfg(feature = "native")]
     active_diagnostics: ActiveDiagnostic,
     show_inline_diagnostics: bool,
     inline_diagnostics_update: Task<()>,
     inline_diagnostics_enabled: bool,
     diagnostics_enabled: bool,
     word_completions_enabled: bool,
+    #[cfg(feature = "native")]
     inline_diagnostics: Vec<(Anchor, InlineDiagnostic)>,
     soft_wrap_mode_override: Option<language_settings::SoftWrap>,
     hard_wrap: Option<usize>,
+    #[cfg(feature = "native")]
     project: Option<Entity<Project>>,
+    #[cfg(feature = "native")]
     semantics_provider: Option<Rc<dyn SemanticsProvider>>,
+    #[cfg(feature = "native")]
     completion_provider: Option<Rc<dyn CompletionProvider>>,
+    #[cfg(feature = "native")]
     collaboration_hub: Option<Box<dyn CollaborationHub>>,
     blink_manager: Entity<BlinkManager>,
     show_cursor_names: bool,
@@ -1072,17 +1118,23 @@ pub struct Editor {
     allow_git_diff_scrollbar_markers: bool,
     scrollbar_marker_state: ScrollbarMarkerState,
     active_indent_guides_state: ActiveIndentGuidesState,
+    #[cfg(feature = "native")]
     nav_history: Option<ItemNavHistory>,
+    #[cfg(feature = "native")]
     context_menu: RefCell<Option<CodeContextMenu>>,
     context_menu_options: Option<ContextMenuOptions>,
+    #[cfg(feature = "native")]
     mouse_context_menu: Option<MouseContextMenu>,
     completion_tasks: Vec<(CompletionId, Task<()>)>,
+    #[cfg(feature = "native")]
     inline_blame_popover: Option<InlineBlamePopover>,
     inline_blame_popover_show_task: Option<Task<()>>,
+    #[cfg(feature = "native")]
     signature_help_state: SignatureHelpState,
     auto_signature_help: Option<bool>,
     find_all_references_task_sources: Vec<Anchor>,
     next_completion_id: CompletionId,
+    #[cfg(feature = "native")]
     code_actions_for_selection: CodeActionsForSelection,
     runnables_for_selection_toggle: Task<()>,
     quick_selection_highlight_task: Option<(Range<Anchor>, Task<()>)>,
@@ -1090,8 +1142,11 @@ pub struct Editor {
     debounced_selection_highlight_complete: bool,
     last_selection_from_search: bool,
     document_highlights_task: Option<Task<()>>,
+    #[cfg(feature = "native")]
     linked_editing_range_task: Option<Task<Option<()>>>,
+    #[cfg(feature = "native")]
     linked_edit_ranges: linked_editing_ranges::LinkedEditingRanges,
+    #[cfg(feature = "native")]
     pending_rename: Option<RenameState>,
     searchable: bool,
     cursor_shape: CursorShape,
@@ -1104,28 +1159,40 @@ pub struct Editor {
     /// without selecting the matched text.
     collapse_matches: bool,
     autoindent_mode: Option<AutoindentMode>,
+    #[cfg(feature = "native")]
     workspace: Option<(WeakEntity<Workspace>, Option<WorkspaceId>)>,
     input_enabled: bool,
     expects_character_input: bool,
     use_modal_editing: bool,
     read_only: bool,
+    #[cfg(feature = "native")]
     leader_id: Option<CollaboratorId>,
+    #[cfg(feature = "native")]
     remote_id: Option<ViewId>,
+    #[cfg(feature = "native")]
     pub hover_state: HoverState,
     pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     prev_pressure_stage: Option<PressureStage>,
     gutter_hovered: bool,
+    #[cfg(feature = "native")]
     hovered_link_state: Option<HoveredLinkState>,
+    #[cfg(feature = "native")]
     edit_prediction_provider: Option<RegisteredEditPredictionDelegate>,
+    #[cfg(feature = "native")]
     code_action_providers: Vec<Rc<dyn CodeActionProvider>>,
+    #[cfg(feature = "native")]
     active_edit_prediction: Option<EditPredictionState>,
     /// Used to prevent flickering as the user types while the menu is open
+    #[cfg(feature = "native")]
     stale_edit_prediction_in_menu: Option<EditPredictionState>,
+    #[cfg(feature = "native")]
     edit_prediction_settings: EditPredictionSettings,
     edit_predictions_hidden_for_vim_mode: bool,
     show_edit_predictions_override: Option<bool>,
     show_completions_on_input_override: Option<bool>,
+    #[cfg(feature = "native")]
     menu_edit_predictions_policy: MenuEditPredictionsPolicy,
+    #[cfg(feature = "native")]
     edit_prediction_preview: EditPredictionPreview,
     in_leading_whitespace: bool,
     next_inlay_id: usize,
@@ -1150,6 +1217,7 @@ pub struct Editor {
     git_blame_inline_enabled: bool,
     buffer_serialization: Option<BufferSerialization>,
     show_selection_menu: Option<bool>,
+    #[cfg(feature = "native")]
     blame: Option<Entity<GitBlame>>,
     blame_subscription: Option<Subscription>,
     pending_blame_hover_observation: Option<Subscription>,
@@ -1177,18 +1245,25 @@ pub struct Editor {
     /// paint over the scrollbar.
     last_horizontal_scrollbar_visible: bool,
     expect_bounds_change: Option<Bounds<Pixels>>,
+    #[cfg(feature = "native")]
     runnables: RunnableData,
+    #[cfg(feature = "native")]
     bookmark_store: Option<Entity<BookmarkStore>>,
+    #[cfg(feature = "native")]
     breakpoint_store: Option<Entity<BreakpointStore>>,
     gutter_hover_button: (Option<GutterHoverButton>, Option<Task<()>>),
+    #[cfg(feature = "native")]
     pub(crate) gutter_diff_review_indicator: (Option<PhantomDiffReviewIndicator>, Option<Task<()>>),
+    #[cfg(feature = "native")]
     pub(crate) diff_review_drag_state: Option<DiffReviewDragState>,
     /// Active diff review overlays. Multiple overlays can be open simultaneously
     /// when hunks have comments stored.
+    #[cfg(feature = "native")]
     pub(crate) diff_review_overlays: Vec<DiffReviewOverlay>,
     /// Stored review comments grouped by hunk.
     /// Uses a Vec instead of HashMap because DiffHunkKey contains an Anchor
     /// which doesn't implement Hash/Eq in a way suitable for HashMap keys.
+    #[cfg(feature = "native")]
     stored_review_comments: Vec<(DiffHunkKey, Vec<StoredReviewComment>)>,
     /// Counter for generating unique comment IDs.
     next_review_comment_id: usize,
@@ -1200,8 +1275,10 @@ pub struct Editor {
     focused_block: Option<FocusedBlock>,
     next_scroll_position: NextScrollCursorCenterTopBottom,
     addons: TypeIdHashMap<Box<dyn Addon>>,
+    #[cfg(feature = "native")]
     registered_buffers: HashMap<BufferId, OpenLspBufferHandle>,
     load_diff_task: Option<Shared<Task<()>>>,
+    #[cfg(feature = "native")]
     diff_hunk_delegate: Option<Arc<dyn DiffHunkDelegate>>,
     selection_mark_mode: bool,
     toggle_fold_multiple_buffers: Task<()>,
@@ -1210,17 +1287,21 @@ pub struct Editor {
     serialize_folds: Task<()>,
     minimap: Option<Entity<Self>>,
     pub change_list: ChangeList,
+    #[cfg(feature = "native")]
     inline_value_cache: InlineValueCache,
     number_deleted_lines: bool,
 
     selection_drag_state: SelectionDragState,
+    #[cfg(feature = "native")]
     colors: Option<LspColorData>,
+    #[cfg(feature = "native")]
     code_lens: Option<CodeLensState>,
     post_scroll_update: Task<()>,
     refresh_colors_task: Task<()>,
     refresh_code_lens_task: Task<()>,
     use_document_folding_ranges: bool,
     refresh_folding_ranges_task: Task<()>,
+    #[cfg(feature = "native")]
     inlay_hints: Option<LspInlayHintData>,
     folding_newlines: Task<()>,
     select_next_is_case_sensitive: Option<bool>,
@@ -1232,9 +1313,11 @@ pub struct Editor {
     bracket_colorization_enabled: bool,
     accent_data: Option<AccentData>,
     bracket_fetched_tree_sitter_chunks: HashMap<Range<text::Anchor>, HashSet<Range<BufferRow>>>,
+    #[cfg(feature = "native")]
     semantic_token_state: SemanticTokenState,
     pub(crate) refresh_matching_bracket_highlights_task: Task<()>,
     refresh_document_symbols_task: Shared<Task<()>>,
+    #[cfg(feature = "native")]
     lsp_document_links: LspDocumentLinks,
     lsp_document_symbols: HashMap<BufferId, Vec<OutlineItem<text::Anchor>>>,
     refresh_outline_symbols_at_cursor_at_cursor_task: Task<()>,
@@ -1347,6 +1430,7 @@ struct CharacterDimensions {
     line_height: Pixels,
 }
 
+#[cfg(feature = "native")]
 #[derive(Debug)]
 pub struct RemoteSelection {
     pub replica_id: ReplicaId,
@@ -1802,13 +1886,27 @@ impl Editor {
     pub fn single_line(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        Self::new(EditorMode::SingleLine, buffer, None, window, cx)
+        Self::new(
+            EditorMode::SingleLine,
+            buffer,
+            #[cfg(feature = "native")]
+            None,
+            window,
+            cx,
+        )
     }
 
     pub fn multi_line(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        Self::new(EditorMode::full(), buffer, None, window, cx)
+        Self::new(
+            EditorMode::full(),
+            buffer,
+            #[cfg(feature = "native")]
+            None,
+            window,
+            cx,
+        )
     }
 
     pub fn auto_height(
@@ -1825,6 +1923,7 @@ impl Editor {
                 max_lines: Some(max_lines),
             },
             buffer,
+            #[cfg(feature = "native")]
             None,
             window,
             cx,
@@ -1846,12 +1945,14 @@ impl Editor {
                 max_lines: None,
             },
             buffer,
+            #[cfg(feature = "native")]
             None,
             window,
             cx,
         )
     }
 
+    #[cfg(feature = "native")]
     pub fn for_buffer(
         buffer: Entity<Buffer>,
         project: Option<Entity<Project>>,
@@ -1862,6 +1963,7 @@ impl Editor {
         Self::new(EditorMode::full(), buffer, project, window, cx)
     }
 
+    #[cfg(feature = "native")]
     pub fn for_multibuffer(
         buffer: Entity<MultiBuffer>,
         project: Option<Entity<Project>>,
@@ -1871,6 +1973,7 @@ impl Editor {
         Self::new(EditorMode::full(), buffer, project, window, cx)
     }
 
+    #[cfg(feature = "native")]
     pub fn clone(&self, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut clone = Self::new(
             self.mode.clone(),
@@ -1909,11 +2012,20 @@ impl Editor {
     pub fn new(
         mode: EditorMode,
         buffer: Entity<MultiBuffer>,
+        #[cfg(feature = "native")]
         project: Option<Entity<Project>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Editor::new_internal(mode, buffer, project, None, window, cx)
+        Editor::new_internal(
+            mode,
+            buffer,
+            #[cfg(feature = "native")]
+            project,
+            None,
+            window,
+            cx,
+        )
     }
 
     pub fn refresh_sticky_headers(
@@ -1990,6 +2102,7 @@ impl Editor {
     fn new_internal(
         mode: EditorMode,
         multi_buffer: Entity<MultiBuffer>,
+        #[cfg(feature = "native")]
         project: Option<Entity<Project>>,
         display_map: Option<Entity<DisplayMap>>,
         window: &mut Window,
@@ -2071,7 +2184,9 @@ impl Editor {
         let soft_wrap_mode_override =
             matches!(mode, EditorMode::SingleLine).then(|| language_settings::SoftWrap::None);
 
+        #[cfg(feature = "native")]
         let mut project_subscriptions = Vec::new();
+        #[cfg(feature = "native")]
         if full_mode && let Some(project) = project.as_ref() {
             project_subscriptions.push(cx.subscribe_in(
                 project,
@@ -2263,6 +2378,7 @@ impl Editor {
 
         let buffer_snapshot = multi_buffer.read(cx).snapshot(cx);
 
+        #[cfg(feature = "native")]
         let inlay_hint_settings =
             inlay_hint_settings(selections.newest_anchor().head(), &buffer_snapshot, cx);
         let focus_handle = cx.focus_handle();
@@ -2286,18 +2402,23 @@ impl Editor {
                 None
             };
 
+        #[cfg(feature = "native")]
         let bookmark_store = match (&mode, project.as_ref()) {
             (EditorMode::Full { .. }, Some(project)) => Some(project.read(cx).bookmark_store()),
             _ => None,
         };
 
+        #[cfg(feature = "native")]
         let breakpoint_store = match (&mode, project.as_ref()) {
             (EditorMode::Full { .. }, Some(project)) => Some(project.read(cx).breakpoint_store()),
             _ => None,
         };
 
+        #[cfg(feature = "native")]
         let mut code_action_providers = Vec::new();
+        #[cfg(feature = "native")]
         let mut load_uncommitted_diff = None;
+        #[cfg(feature = "native")]
         if let Some(project) = project.clone() {
             load_uncommitted_diff = Some(
                 update_uncommitted_diff_for_buffer(
@@ -2332,18 +2453,24 @@ impl Editor {
             snippet_stack: InvalidationStack::default(),
             select_syntax_node_history: SelectSyntaxNodeHistory::default(),
             ime_transaction: None,
+            #[cfg(feature = "native")]
             active_diagnostics: ActiveDiagnostic::None,
-            show_inline_diagnostics: ProjectSettings::get_global(cx).diagnostics.inline.enabled,
+            show_inline_diagnostics: cfg!(feature = "native") && full_mode,
             inline_diagnostics_update: Task::ready(()),
+            #[cfg(feature = "native")]
             inline_diagnostics: Vec::new(),
             soft_wrap_mode_override,
             diagnostics_max_severity,
             hard_wrap: None,
+            #[cfg(feature = "native")]
             completion_provider: project.clone().map(|project| Rc::new(project) as _),
+            #[cfg(feature = "native")]
             semantics_provider: project
                 .as_ref()
                 .map(|project| Rc::new(project.downgrade()) as _),
+            #[cfg(feature = "native")]
             collaboration_hub: project.clone().map(|project| Box::new(project) as _),
+            #[cfg(feature = "native")]
             project,
             blink_manager: blink_manager.clone(),
             show_local_selections: true,
@@ -2388,19 +2515,26 @@ impl Editor {
             allow_git_diff_scrollbar_markers: false,
             scrollbar_marker_state: ScrollbarMarkerState::default(),
             active_indent_guides_state: ActiveIndentGuidesState::default(),
+            #[cfg(feature = "native")]
             nav_history: None,
+            #[cfg(feature = "native")]
             context_menu: RefCell::new(None),
             context_menu_options: None,
+            #[cfg(feature = "native")]
             mouse_context_menu: None,
             completion_tasks: Vec::new(),
+            #[cfg(feature = "native")]
             inline_blame_popover: None,
             inline_blame_popover_show_task: None,
+            #[cfg(feature = "native")]
             signature_help_state: SignatureHelpState::default(),
             auto_signature_help: None,
             find_all_references_task_sources: Vec::new(),
             next_completion_id: 0,
             next_inlay_id: 0,
+            #[cfg(feature = "native")]
             code_action_providers,
+            #[cfg(feature = "native")]
             code_actions_for_selection: CodeActionsForSelection::None,
             runnables_for_selection_toggle: Task::ready(()),
             quick_selection_highlight_task: None,
@@ -2408,7 +2542,9 @@ impl Editor {
             debounced_selection_highlight_complete: false,
             last_selection_from_search: false,
             document_highlights_task: None,
+            #[cfg(feature = "native")]
             linked_editing_range_task: None,
+            #[cfg(feature = "native")]
             pending_rename: None,
             searchable: !is_minimap,
             cursor_shape: EditorSettings::get_global(cx)
@@ -2418,6 +2554,7 @@ impl Editor {
             current_line_highlight: None,
             autoindent_mode: Some(AutoindentMode::EachLine),
             collapse_matches: false,
+            #[cfg(feature = "native")]
             workspace: None,
             input_enabled: !is_minimap,
             expects_character_input: !is_minimap,
@@ -2428,21 +2565,30 @@ impl Editor {
             use_selection_highlight: true,
             auto_replace_emoji_shortcode: false,
             jsx_tag_auto_close_enabled_in_any_buffer: false,
+            #[cfg(feature = "native")]
             leader_id: None,
+            #[cfg(feature = "native")]
             remote_id: None,
+            #[cfg(feature = "native")]
             hover_state: HoverState::default(),
             pending_mouse_down: None,
             prev_pressure_stage: None,
+            #[cfg(feature = "native")]
             hovered_link_state: None,
+            #[cfg(feature = "native")]
             edit_prediction_provider: None,
+            #[cfg(feature = "native")]
             active_edit_prediction: None,
+            #[cfg(feature = "native")]
             stale_edit_prediction_in_menu: None,
+            #[cfg(feature = "native")]
             edit_prediction_preview: EditPredictionPreview::Inactive {
                 released_too_fast: false,
             },
             inline_diagnostics_enabled: full_mode,
             diagnostics_enabled: full_mode,
             word_completions_enabled: full_mode,
+            #[cfg(feature = "native")]
             inline_value_cache: InlineValueCache::new(inlay_hint_settings.show_value_hints),
             gutter_hovered: false,
             pixel_position_of_newest_cursor: None,
@@ -2460,7 +2606,9 @@ impl Editor {
             edit_predictions_hidden_for_vim_mode: false,
             show_edit_predictions_override: None,
             show_completions_on_input_override: None,
+            #[cfg(feature = "native")]
             menu_edit_predictions_policy: MenuEditPredictionsPolicy::ByProvider,
+            #[cfg(feature = "native")]
             edit_prediction_settings: EditPredictionSettings::Disabled,
             in_leading_whitespace: false,
             custom_context_menu: None,
@@ -2468,25 +2616,40 @@ impl Editor {
             show_git_blame_inline: false,
             show_selection_menu: None,
             show_git_blame_inline_delay_task: None,
-            git_blame_inline_enabled: full_mode
-                && ProjectSettings::get_global(cx).git.inline_blame.enabled,
-            buffer_serialization: is_minimap.not().then(|| {
-                BufferSerialization::new(
-                    ProjectSettings::get_global(cx)
-                        .session
-                        .restore_unsaved_buffers,
-                )
-            }),
+            git_blame_inline_enabled: cfg!(feature = "native") && full_mode,
+            buffer_serialization: {
+                #[cfg(feature = "native")]
+                {
+                    is_minimap.not().then(|| {
+                        BufferSerialization::new(
+                            ProjectSettings::get_global(cx)
+                                .session
+                                .restore_unsaved_buffers,
+                        )
+                    })
+                }
+                #[cfg(not(feature = "native"))]
+                {
+                    None
+                }
+            },
+            #[cfg(feature = "native")]
             blame: None,
             blame_subscription: None,
             pending_blame_hover_observation: None,
 
+            #[cfg(feature = "native")]
             bookmark_store,
+            #[cfg(feature = "native")]
             breakpoint_store,
             gutter_hover_button: (None, None),
+            #[cfg(feature = "native")]
             gutter_diff_review_indicator: (None, None),
+            #[cfg(feature = "native")]
             diff_review_drag_state: None,
+            #[cfg(feature = "native")]
             diff_review_overlays: Vec::new(),
+            #[cfg(feature = "native")]
             stored_review_comments: Vec::new(),
             next_review_comment_id: 0,
             hovered_diff_hunk_row: None,
@@ -2503,17 +2666,22 @@ impl Editor {
                     ]
                 })
                 .unwrap_or_default(),
+            #[cfg(feature = "native")]
             runnables: RunnableData::new(),
             pull_diagnostics_task: Task::ready(()),
+            #[cfg(feature = "native")]
             colors: None,
+            #[cfg(feature = "native")]
             code_lens: None,
             refresh_colors_task: Task::ready(()),
             refresh_code_lens_task: Task::ready(()),
             use_document_folding_ranges: false,
             refresh_folding_ranges_task: Task::ready(()),
+            #[cfg(feature = "native")]
             inlay_hints: None,
             next_color_inlay_id: 0,
             post_scroll_update: Task::ready(()),
+            #[cfg(feature = "native")]
             linked_edit_ranges: Default::default(),
             in_project_search: false,
             previous_search_ranges: None,
@@ -2521,6 +2689,7 @@ impl Editor {
             focused_block: None,
             next_scroll_position: NextScrollCursorCenterTopBottom::default(),
             addons: Default::default(),
+            #[cfg(feature = "native")]
             registered_buffers: HashMap::default(),
             _scroll_cursor_center_top_bottom_task: Task::ready(()),
             selection_mark_mode: false,
@@ -2528,7 +2697,9 @@ impl Editor {
             serialize_selections: Task::ready(()),
             serialize_folds: Task::ready(()),
             text_style_refinement: None,
+            #[cfg(feature = "native")]
             load_diff_task: load_uncommitted_diff,
+            #[cfg(feature = "native")]
             diff_hunk_delegate: None,
             minimap: None,
             change_list: ChangeList::new(),
@@ -2541,12 +2712,14 @@ impl Editor {
             suppress_selection_callback: false,
             applicable_language_settings: HashMap::default(),
             bracket_colorization_enabled: true,
+            #[cfg(feature = "native")]
             semantic_token_state: SemanticTokenState::new(cx, full_mode),
             accent_data: None,
             bracket_fetched_tree_sitter_chunks: HashMap::default(),
             number_deleted_lines: false,
             refresh_matching_bracket_highlights_task: Task::ready(()),
             refresh_document_symbols_task: Task::ready(()).shared(),
+            #[cfg(feature = "native")]
             lsp_document_links: LspDocumentLinks::new(cx),
             lsp_document_symbols: HashMap::default(),
             refresh_outline_symbols_at_cursor_at_cursor_task: Task::ready(()),
@@ -2563,6 +2736,7 @@ impl Editor {
         editor.applicable_language_settings = editor.fetch_applicable_language_settings(cx);
         editor.accent_data = editor.fetch_accent_data(cx);
 
+        #[cfg(feature = "native")]
         if let Some(breakpoints) = editor.breakpoint_store.as_ref() {
             editor
                 ._subscriptions
@@ -2570,8 +2744,10 @@ impl Editor {
                     cx.notify();
                 }));
         }
+        #[cfg(feature = "native")]
         editor._subscriptions.extend(project_subscriptions);
 
+        #[cfg(feature = "native")]
         editor._subscriptions.push(cx.subscribe_in(
             &cx.entity(),
             window,
@@ -2625,6 +2801,7 @@ impl Editor {
             },
         ));
 
+        #[cfg(feature = "native")]
         if let Some(dap_store) = editor
             .project
             .as_ref()
@@ -2662,6 +2839,7 @@ impl Editor {
         editor.scroll_manager.show_scrollbars(window, cx);
         jsx_tag_auto_close::refresh_enabled_in_any_buffer(&mut editor, &multi_buffer, cx);
 
+        #[cfg(feature = "native")]
         if full_mode {
             let should_auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
             cx.set_global(ScrollbarAutoHide(should_auto_hide_scrollbars));
@@ -2694,6 +2872,7 @@ impl Editor {
         self.display_map.update(cx, |map, cx| map.snapshot(cx))
     }
 
+    #[cfg(feature = "native")]
     pub fn deploy_mouse_context_menu(
         &mut self,
         position: gpui::Point<Pixels>,
@@ -2710,6 +2889,7 @@ impl Editor {
         ));
     }
 
+    #[cfg(feature = "native")]
     pub fn mouse_menu_is_focused(&self, window: &Window, cx: &App) -> bool {
         self.mouse_context_menu
             .as_ref()
@@ -2717,7 +2897,20 @@ impl Editor {
     }
 
     pub fn key_context(&self, window: &mut Window, cx: &mut App) -> KeyContext {
-        self.key_context_internal(self.has_active_edit_prediction(), window, cx)
+        self.key_context_internal(
+            {
+                #[cfg(feature = "native")]
+                {
+                    self.has_active_edit_prediction()
+                }
+                #[cfg(not(feature = "native"))]
+                {
+                    false
+                }
+            },
+            window,
+            cx,
+        )
     }
 
     fn key_context_internal(
@@ -2740,6 +2933,7 @@ impl Editor {
         }
 
         key_context.set("mode", mode);
+        #[cfg(feature = "native")]
         if self.pending_rename.is_some() {
             key_context.add("renaming");
         }
@@ -2756,6 +2950,7 @@ impl Editor {
             }
         }
 
+        #[cfg(feature = "native")]
         match self.context_menu.borrow().as_ref() {
             Some(CodeContextMenu::Completions(menu)) => {
                 if menu.visible() {
@@ -2772,6 +2967,7 @@ impl Editor {
             None => {}
         }
 
+        #[cfg(feature = "native")]
         if self.signature_help_state.has_multiple_signatures() {
             key_context.add("showing_signature_help");
         }
@@ -2902,6 +3098,7 @@ impl Editor {
         cx.notify();
     }
 
+    #[cfg(feature = "native")]
     pub fn new_file(
         workspace: &mut Workspace,
         _: &workspace::NewFile,
@@ -2922,6 +3119,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "native")]
     pub fn new_in_workspace(
         workspace: &mut Workspace,
         window: &mut Window,
@@ -2941,6 +3139,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "native")]
     fn new_file_vertical(
         workspace: &mut Workspace,
         _: &workspace::NewFileSplitVertical,
@@ -2950,6 +3149,7 @@ impl Editor {
         Self::new_file_in_direction(workspace, SplitDirection::vertical(cx), window, cx)
     }
 
+    #[cfg(feature = "native")]
     fn new_file_horizontal(
         workspace: &mut Workspace,
         _: &workspace::NewFileSplitHorizontal,
@@ -2959,6 +3159,7 @@ impl Editor {
         Self::new_file_in_direction(workspace, SplitDirection::horizontal(cx), window, cx)
     }
 
+    #[cfg(feature = "native")]
     fn new_file_split(
         workspace: &mut Workspace,
         action: &workspace::NewFileSplit,
@@ -2968,6 +3169,7 @@ impl Editor {
         Self::new_file_in_direction(workspace, action.0, window, cx)
     }
 
+    #[cfg(feature = "native")]
     fn new_file_in_direction(
         workspace: &mut Workspace,
         direction: SplitDirection,
@@ -3002,6 +3204,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "native")]
     pub fn leader_id(&self) -> Option<CollaboratorId> {
         self.leader_id
     }
@@ -3010,10 +3213,12 @@ impl Editor {
         &self.buffer
     }
 
+    #[cfg(feature = "native")]
     pub fn project(&self) -> Option<&Entity<Project>> {
         self.project.as_ref()
     }
 
+    #[cfg(feature = "native")]
     pub fn workspace(&self) -> Option<Entity<Workspace>> {
         self.workspace.as_ref()?.0.upgrade()
     }
@@ -3037,6 +3242,7 @@ impl Editor {
     }
 
     /// Returns the workspace serialization ID if this editor should be serialized.
+    #[cfg(feature = "native")]
     fn workspace_serialization_id(&self, _cx: &App) -> Option<WorkspaceId> {
         self.workspace
             .as_ref()
@@ -3386,6 +3592,7 @@ impl Editor {
         self.use_selection_highlight = highlight;
     }
 
+    #[cfg(feature = "native")]
     pub fn set_should_serialize(&mut self, should_serialize: bool, cx: &App) {
         self.buffer_serialization = should_serialize.then(|| {
             BufferSerialization::new(
@@ -3500,24 +3707,30 @@ impl Editor {
     ) -> bool {
         let mut dismissed = false;
 
-        dismissed |= self.take_rename(false, window, cx).is_some();
-        dismissed |= self.hide_blame_popover(true, cx);
-        dismissed |= hide_hover(self, cx);
-        dismissed |= self.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
-        dismissed |= self.hide_context_menu(window, cx).is_some();
-        dismissed |= self.mouse_context_menu.take().is_some();
-        dismissed |= is_user_requested
-            && self.discard_edit_prediction(EditPredictionDiscardReason::Rejected, cx);
+        #[cfg(feature = "native")]
+        {
+            dismissed |= self.take_rename(false, window, cx).is_some();
+            dismissed |= self.hide_blame_popover(true, cx);
+            dismissed |= hide_hover(self, cx);
+            dismissed |= self.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
+            dismissed |= self.hide_context_menu(window, cx).is_some();
+            dismissed |= self.mouse_context_menu.take().is_some();
+            dismissed |= is_user_requested
+                && self.discard_edit_prediction(EditPredictionDiscardReason::Rejected, cx);
+        }
         dismissed |= self.snippet_stack.pop().is_some();
+        #[cfg(feature = "native")]
         if self.diff_review_drag_state.is_some() {
             self.cancel_diff_review_drag(cx);
             dismissed = true;
         }
+        #[cfg(feature = "native")]
         if !self.diff_review_overlays.is_empty() {
             self.dismiss_all_diff_review_overlays(cx);
             dismissed = true;
         }
 
+        #[cfg(feature = "native")]
         if self.mode.is_full() && self.has_active_diagnostic_group() {
             self.dismiss_diagnostics(cx);
             dismissed = true;
@@ -3526,6 +3739,7 @@ impl Editor {
         dismissed
     }
 
+    #[cfg(feature = "native")]
     fn open_transaction_for_hidden_buffers(
         workspace: Entity<Workspace>,
         transaction: ProjectTransaction,
@@ -3572,6 +3786,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub async fn open_project_transaction(
         editor: &WeakEntity<Editor>,
         workspace: WeakEntity<Workspace>,
@@ -3669,6 +3884,7 @@ impl Editor {
         self.mouse_context_menu.is_some()
     }
 
+    #[cfg(feature = "native")]
     fn refresh_document_highlights(&mut self, cx: &mut Context<Self>) -> Option<()> {
         if self.pending_rename.is_some() {
             return None;
@@ -3823,6 +4039,7 @@ impl Editor {
     }
 
     #[ztracing::instrument(skip_all)]
+    #[cfg(feature = "native")]
     fn update_selection_occurrence_highlights(
         &mut self,
         multi_buffer_snapshot: MultiBufferSnapshot,
@@ -4064,10 +4281,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "native")]
         self.update_edit_prediction_settings(cx);
 
         // Ensure that the edit prediction preview is updated, even when not
         // enabled, if there's an active edit prediction preview.
+        #[cfg(feature = "native")]
         if self.show_edit_predictions_in_menu()
             || self.edit_prediction_requires_modifier()
             || matches!(
@@ -4088,6 +4307,7 @@ impl Editor {
             return;
         }
 
+        #[cfg(feature = "native")]
         self.update_hovered_link(
             position_map.point_for_position(mouse_position),
             Some(mouse_position),
@@ -4296,6 +4516,7 @@ impl Editor {
     /// This function is used to handle overlaps between breakpoints and Code action/runner symbol.
     /// It's also used to set the color of line numbers with breakpoints to the breakpoint color.
     /// TODO debugger: Use this function to color toggle symbols that house nested breakpoints
+    #[cfg(feature = "native")]
     fn active_breakpoints(
         &self,
         range: Range<DisplayRow>,
@@ -4350,6 +4571,7 @@ impl Editor {
         breakpoint_display_points
     }
 
+    #[cfg(feature = "native")]
     fn gutter_context_menu(
         &self,
         anchor: Anchor,
@@ -4616,6 +4838,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "native")]
     fn render_breakpoint(
         &self,
         position: Anchor,
@@ -4703,6 +4926,7 @@ impl Editor {
             })
     }
 
+    #[cfg(feature = "native")]
     fn render_gutter_hover_button(
         &self,
         position: Anchor,
@@ -4775,6 +4999,7 @@ impl Editor {
             })
     }
 
+    #[cfg(feature = "native")]
     fn build_tasks_context(
         project: &Entity<Project>,
         buffer: &Entity<Buffer>,
@@ -4812,6 +5037,7 @@ impl Editor {
                 .is_some_and(|menu| menu.visible())
     }
 
+    #[cfg(feature = "native")]
     pub fn context_menu_origin(&self) -> Option<ContextMenuOrigin> {
         self.context_menu
             .borrow()
@@ -4862,6 +5088,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "native")]
     fn hide_context_menu(
         &mut self,
         window: &mut Window,
@@ -4880,6 +5107,7 @@ impl Editor {
         context_menu
     }
 
+    #[cfg(feature = "native")]
     fn show_snippet_choices(
         &mut self,
         choices: &Vec<String>,
@@ -5148,6 +5376,7 @@ impl Editor {
         self.transact(window, cx, |this, window, cx| {
             this.select_autoclose_pair(window, cx);
 
+            #[cfg(feature = "native")]
             let linked_edits = this.linked_edits_for_selections(Arc::from(""), cx);
 
             let display_map = this.display_map.update(cx, |map, cx| map.snapshot(cx));
@@ -5190,7 +5419,9 @@ impl Editor {
 
             this.change_selections(Default::default(), window, cx, |s| s.select(selections));
             this.insert("", window, cx);
+            #[cfg(feature = "native")]
             linked_edits.apply_with_left_expansion(cx);
+            #[cfg(feature = "native")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -5198,6 +5429,7 @@ impl Editor {
                 window,
                 cx,
             );
+            #[cfg(feature = "native")]
             refresh_linked_ranges(this, window, cx);
         });
     }
@@ -5224,9 +5456,12 @@ impl Editor {
                     }
                 })
             });
+            #[cfg(feature = "native")]
             let linked_edits = this.linked_edits_for_selections(Arc::from(""), cx);
             this.insert("", window, cx);
+            #[cfg(feature = "native")]
             linked_edits.apply(cx);
+            #[cfg(feature = "native")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -5234,6 +5469,7 @@ impl Editor {
                 window,
                 cx,
             );
+            #[cfg(feature = "native")]
             refresh_linked_ranges(this, window, cx);
         });
     }
@@ -5418,6 +5654,7 @@ impl Editor {
         self.transact(window, cx, |this, window, cx| {
             this.buffer.update(cx, |b, cx| b.edit(edits, None, cx));
             this.change_selections(Default::default(), window, cx, |s| s.select(selections));
+            #[cfg(feature = "native")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -6032,6 +6269,7 @@ impl Editor {
         self.detach_and_notify_err(task, window, cx);
     }
 
+    #[cfg(feature = "native")]
     pub fn open_active_item_in_terminal(
         &mut self,
         _: &OpenInTerminal,
@@ -6061,6 +6299,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     fn set_gutter_context_menu(
         &mut self,
         display_row: DisplayRow,
@@ -6149,6 +6388,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "native")]
     fn add_edit_breakpoint_block(
         &mut self,
         anchor: Anchor,
@@ -6204,6 +6444,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn breakpoint_at_row(
         &self,
         row: u32,
@@ -6216,6 +6457,7 @@ impl Editor {
         self.breakpoint_at_anchor(breakpoint_position, &snapshot, cx)
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn breakpoint_at_anchor(
         &self,
         breakpoint_position: Anchor,
@@ -6323,6 +6565,7 @@ impl Editor {
             })
     }
 
+    #[cfg(feature = "native")]
     pub fn edit_log_breakpoint(
         &mut self,
         _: &EditLogBreakpoint,
@@ -6351,6 +6594,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     fn breakpoints_at_cursors(
         &self,
         window: &mut Window,
@@ -6386,6 +6630,7 @@ impl Editor {
         cursors.into_iter().collect()
     }
 
+    #[cfg(feature = "native")]
     pub fn enable_breakpoint(
         &mut self,
         _: &crate::actions::EnableBreakpoint,
@@ -6503,6 +6748,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn disable_breakpoint(
         &mut self,
         _: &crate::actions::DisableBreakpoint,
@@ -6526,6 +6772,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn toggle_breakpoint(
         &mut self,
         _: &crate::actions::ToggleBreakpoint,
@@ -6555,6 +6802,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn edit_breakpoint_at_anchor(
         &mut self,
         breakpoint_position: Anchor,
@@ -7829,6 +8077,7 @@ impl Editor {
             self.restore_selections(selections, window, cx);
             self.request_autoscroll(Autoscroll::fit(), cx);
             self.unmark_text(window, cx);
+            #[cfg(feature = "native")]
             self.refresh_edit_prediction(
                 true,
                 false,
@@ -7854,6 +8103,7 @@ impl Editor {
             self.restore_selections(selections, window, cx);
             self.request_autoscroll(Autoscroll::fit(), cx);
             self.unmark_text(window, cx);
+            #[cfg(feature = "native")]
             self.refresh_edit_prediction(
                 true,
                 false,
@@ -7951,6 +8201,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn rename(
         &mut self,
         _: &Rename,
@@ -8240,6 +8491,7 @@ impl Editor {
                 s.select_ranges(vec![cursor_in_editor..cursor_in_editor])
             });
         } else {
+            #[cfg(feature = "native")]
             self.refresh_document_highlights(cx);
         }
 
@@ -8271,6 +8523,7 @@ impl Editor {
             .any(|buffer| project.supports_range_formatting(&buffer, cx))
     }
 
+    #[cfg(feature = "native")]
     fn format(
         &mut self,
         _: &Format,
@@ -8295,6 +8548,7 @@ impl Editor {
         ))
     }
 
+    #[cfg(feature = "native")]
     fn format_selections(
         &mut self,
         _: &FormatSelections,
@@ -8326,6 +8580,7 @@ impl Editor {
         ))
     }
 
+    #[cfg(feature = "native")]
     fn perform_format(
         &mut self,
         project: Entity<Project>,
@@ -8416,6 +8671,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "native")]
     fn organize_imports(
         &mut self,
         _: &OrganizeImports,
@@ -8437,6 +8693,7 @@ impl Editor {
         ))
     }
 
+    #[cfg(feature = "native")]
     fn perform_code_action_kind(
         &mut self,
         project: Entity<Project>,
@@ -8510,6 +8767,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     fn cancel_language_server_work(
         workspace: &mut Workspace,
         _: &actions::CancelLanguageServerWork,
@@ -8620,6 +8878,7 @@ impl Editor {
             .is_some()
     }
 
+    #[cfg(feature = "native")]
     pub fn toggle_focus(
         workspace: &mut Workspace,
         _: &actions::ToggleFocus,
@@ -8905,6 +9164,7 @@ impl Editor {
             .and_then(|f| f.as_local())
     }
 
+    #[cfg(feature = "native")]
     fn reveal_in_finder(
         &mut self,
         _: &RevealInFileManager,
@@ -9056,6 +9316,7 @@ impl Editor {
                     (selection.range(), uuid.to_string())
                 });
             this.edit(edits, cx);
+            #[cfg(feature = "native")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -9866,6 +10127,7 @@ impl Editor {
         cx.notify();
     }
 
+    #[cfg(feature = "native")]
     fn on_debug_session_event(
         &mut self,
         _session: Entity<Session>,
@@ -9877,6 +10139,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn refresh_inline_values(&mut self, cx: &mut Context<Self>) {
         let Some(semantics) = self.semantics_provider.clone() else {
             return;
@@ -9982,18 +10245,23 @@ impl Editor {
                 }
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
+                #[cfg(feature = "native")]
                 self.refresh_active_diagnostics(cx);
+                #[cfg(feature = "native")]
                 self.refresh_code_actions_for_selection(window, cx);
                 self.refresh_single_line_folds(window, cx);
                 let snapshot = self.snapshot(window, cx);
                 self.refresh_matching_bracket_highlights(&snapshot, cx);
+                #[cfg(feature = "native")]
                 self.refresh_outline_symbols_at_cursor(cx);
+                #[cfg(feature = "native")]
                 self.refresh_sticky_headers(&snapshot, cx);
                 if source.is_local() && self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
                 }
 
                 // Clean up orphaned review comments after edits
+                #[cfg(feature = "native")]
                 self.cleanup_orphaned_review_comments(cx);
 
                 if let Some(buffer) = edited_buffer {
@@ -10004,7 +10272,9 @@ impl Editor {
                     if self.project.is_some() {
                         let buffer_id = buffer.read(cx).remote_id();
                         self.register_buffer(buffer_id, cx);
+                        #[cfg(feature = "native")]
                         self.update_lsp_data(Some(buffer_id), window, cx);
+                        #[cfg(feature = "native")]
                         self.refresh_inlay_hints(
                             InlayHintRefreshReason::BufferEdited(buffer_id),
                             cx,
@@ -10033,6 +10303,7 @@ impl Editor {
                 if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
                     hovered_link_state.symbol_range = None;
                 }
+                #[cfg(feature = "native")]
                 self.refresh_document_highlights(cx);
                 let buffer_id = buffer.read(cx).remote_id();
                 if self.buffer.read(cx).diff_for(buffer_id).is_none()
@@ -10048,9 +10319,13 @@ impl Editor {
                     .detach();
                 }
                 self.ensure_visible_buffer_syntax(cx);
+                #[cfg(feature = "native")]
                 self.register_visible_buffers(cx);
+                #[cfg(feature = "native")]
                 self.update_lsp_data(Some(buffer_id), window, cx);
+                #[cfg(feature = "native")]
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+                #[cfg(feature = "native")]
                 self.refresh_runnables(None, window, cx);
                 self.bracket_fetched_tree_sitter_chunks
                     .retain(|range, _| range.start.buffer_id != buffer_id);
@@ -10070,6 +10345,7 @@ impl Editor {
                 if let Some(inlay_hints) = &mut self.inlay_hints {
                     inlay_hints.remove_inlay_chunk_data(removed_buffer_ids);
                 }
+                #[cfg(feature = "native")]
                 self.refresh_inlay_hints(
                     InlayHintRefreshReason::BuffersRemoved(removed_buffer_ids.clone()),
                     cx,
@@ -10107,6 +10383,7 @@ impl Editor {
                 if self.invalidate_syntax_concealments(Some(*buffer_id)) {
                     cx.notify();
                 }
+                #[cfg(feature = "native")]
                 self.refresh_runnables(Some(*buffer_id), window, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
@@ -10115,6 +10392,7 @@ impl Editor {
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
             }
             multi_buffer::Event::DiffHunksToggled => {
+                #[cfg(feature = "native")]
                 self.refresh_runnables(None, window, cx);
             }
             multi_buffer::Event::LanguageChanged(buffer_id, is_fresh_language) => {
@@ -10278,8 +10556,10 @@ impl Editor {
                 .unwrap_or(DiagnosticSeverity::Hint);
             self.set_max_diagnostics_severity(new_severity, cx);
         }
+        #[cfg(feature = "native")]
         self.refresh_runnables(None, window, cx);
         self.update_edit_prediction_settings(cx);
+        #[cfg(feature = "native")]
         self.refresh_edit_prediction(
             true,
             false,
@@ -10358,6 +10638,7 @@ impl Editor {
             if language_settings_changed {
                 self.clear_disabled_lsp_folding_ranges(window, cx);
                 self.refresh_document_symbols(None, cx);
+                #[cfg(feature = "native")]
                 self.refresh_outline_symbols_at_cursor(cx);
             }
 
@@ -10388,6 +10669,7 @@ impl Editor {
                 }
             }
 
+            #[cfg(feature = "native")]
             self.refresh_inlay_hints(
                 InlayHintRefreshReason::SettingsChange(inlay_hint_settings(
                     self.selections.newest_anchor().head(),
@@ -10426,6 +10708,7 @@ impl Editor {
 
         self.invalidate_semantic_tokens(None);
         self.refresh_semantic_tokens(None, false, cx);
+        #[cfg(feature = "native")]
         self.refresh_outline_symbols_at_cursor(cx);
     }
 
@@ -10580,6 +10863,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn open_buffers_in_workspace(
         workspace: WeakEntity<Workspace>,
         new_selections_by_buffer: HashMap<
@@ -10721,6 +11005,7 @@ impl Editor {
             .collect()
     }
 
+    #[cfg(feature = "native")]
     fn report_editor_event(
         &self,
         reported_event: ReportEditorEvent,
@@ -10873,6 +11158,7 @@ impl Editor {
         cx.write_to_clipboard(ClipboardItem::new_string(lines));
     }
 
+    #[cfg(feature = "native")]
     pub fn open_context_menu(
         &mut self,
         _: &OpenContextMenu,
@@ -10901,6 +11187,7 @@ impl Editor {
         {
             window.focus(&descendant, cx);
         } else {
+            #[cfg(feature = "native")]
             if let Some(blame) = self.blame.as_ref() {
                 blame.update(cx, GitBlame::focus)
             }
@@ -10909,7 +11196,16 @@ impl Editor {
             self.show_cursor_names(window, cx);
             self.buffer.update(cx, |buffer, cx| {
                 buffer.finalize_last_transaction(cx);
-                if self.leader_id.is_none() {
+                if {
+                    #[cfg(feature = "native")]
+                    {
+                        self.leader_id.is_none()
+                    }
+                    #[cfg(not(feature = "native"))]
+                    {
+                        true
+                    }
+                } {
                     buffer.set_active_selections(
                         &self.selections.disjoint_anchors_arc(),
                         self.selections.line_mode(),
@@ -10952,6 +11248,7 @@ impl Editor {
             self.last_focused_descendant = Some(event.blurred);
         }
         self.selection_drag_state = SelectionDragState::None;
+        #[cfg(feature = "native")]
         self.refresh_inlay_hints(InlayHintRefreshReason::ModifiersChanged(false), cx);
     }
 
@@ -10960,21 +11257,24 @@ impl Editor {
         self.buffer
             .update(cx, |buffer, cx| buffer.remove_active_selections(cx));
 
-        if let Some(blame) = self.blame.as_ref() {
-            blame.update(cx, GitBlame::blur)
-        }
-        if !self.hover_state.focused(window, cx) {
-            hide_hover(self, cx);
-        }
-        if !self
-            .context_menu
-            .borrow()
-            .as_ref()
-            .is_some_and(|context_menu| context_menu.focused(window, cx))
+        #[cfg(feature = "native")]
         {
-            self.hide_context_menu(window, cx);
+            if let Some(blame) = self.blame.as_ref() {
+                blame.update(cx, GitBlame::blur)
+            }
+            if !self.hover_state.focused(window, cx) {
+                hide_hover(self, cx);
+            }
+            if !self
+                .context_menu
+                .borrow()
+                .as_ref()
+                .is_some_and(|context_menu| context_menu.focused(window, cx))
+            {
+                self.hide_context_menu(window, cx);
+            }
+            self.take_active_edit_prediction(true, cx);
         }
-        self.take_active_edit_prediction(true, cx);
         cx.emit(EditorEvent::Blurred);
         cx.notify();
     }
@@ -11135,6 +11435,7 @@ impl Editor {
         self.load_diff_task.clone()
     }
 
+    #[cfg(feature = "native")]
     fn read_metadata_from_db(
         &mut self,
         item_id: u64,
@@ -11408,7 +11709,19 @@ impl Editor {
             syntax: cx.theme().syntax().clone(),
             status: cx.theme().status().clone(),
             inlay_hints_style: make_inlay_hints_style(cx),
-            edit_prediction_styles: make_suggestion_styles(cx),
+            edit_prediction_styles: {
+                #[cfg(feature = "native")]
+                {
+                    make_suggestion_styles(cx)
+                }
+                #[cfg(not(feature = "native"))]
+                {
+                    EditPredictionStyles {
+                        insertion: HighlightStyle::default(),
+                        whitespace: HighlightStyle::default(),
+                    }
+                }
+            },
             unnecessary_code_fade: settings.unnecessary_code_fade,
             show_underlines: self.diagnostics_enabled(),
         }
@@ -11497,14 +11810,20 @@ impl Editor {
 
     fn do_update_data_on_scroll(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.ensure_visible_buffer_syntax(cx);
+        #[cfg(feature = "native")]
         self.register_visible_buffers(cx);
         self.colorize_brackets(false, cx);
+        #[cfg(feature = "native")]
         self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+        #[cfg(feature = "native")]
         self.resolve_visible_code_lenses(cx);
 
+        #[cfg(feature = "native")]
         if !self.buffer().read(cx).is_singleton() || self.needs_initial_data_update {
             self.needs_initial_data_update = false;
+            #[cfg(feature = "native")]
             self.update_lsp_data(None, window, cx);
+            #[cfg(feature = "native")]
             self.refresh_runnables(None, window, cx);
         }
     }
@@ -11543,6 +11862,7 @@ impl Editor {
     }
 }
 
+#[cfg(feature = "native")]
 fn process_completion_for_edit(
     completion: &Completion,
     intent: CompletionIntent,
@@ -11691,20 +12011,26 @@ struct CompletionEdit {
 }
 
 pub trait CollaborationHub {
+    #[cfg(feature = "native")]
     fn collaborators<'a>(&self, cx: &'a App) -> &'a HashMap<PeerId, Collaborator>;
+    #[cfg(feature = "native")]
     fn user_participant_indices<'a>(&self, cx: &'a App) -> &'a HashMap<u64, ParticipantIndex>;
+    #[cfg(feature = "native")]
     fn user_names(&self, cx: &App) -> HashMap<u64, SharedString>;
 }
 
 impl CollaborationHub for Entity<Project> {
+    #[cfg(feature = "native")]
     fn collaborators<'a>(&self, cx: &'a App) -> &'a HashMap<PeerId, Collaborator> {
         self.read(cx).collaborators()
     }
 
+    #[cfg(feature = "native")]
     fn user_participant_indices<'a>(&self, cx: &'a App) -> &'a HashMap<u64, ParticipantIndex> {
         self.read(cx).user_store().read(cx).participant_indices()
     }
 
+    #[cfg(feature = "native")]
     fn user_names(&self, cx: &App) -> HashMap<u64, SharedString> {
         let this = self.read(cx);
         let user_ids = this.collaborators().values().map(|c| c.user_id);
@@ -11713,6 +12039,7 @@ impl CollaborationHub for Entity<Project> {
 }
 
 pub trait SemanticsProvider {
+    #[cfg(feature = "native")]
     fn hover(
         &self,
         buffer: &Entity<Buffer>,
@@ -11720,6 +12047,7 @@ pub trait SemanticsProvider {
         cx: &mut App,
     ) -> Option<Task<Option<Vec<project::Hover>>>>;
 
+    #[cfg(feature = "native")]
     fn inline_values(
         &self,
         buffer_handle: Entity<Buffer>,
@@ -11736,6 +12064,7 @@ pub trait SemanticsProvider {
 
     fn invalidate_inlay_hints(&self, for_buffers: &HashSet<BufferId>, cx: &mut App);
 
+    #[cfg(feature = "native")]
     fn inlay_hints(
         &self,
         invalidate: InvalidationStrategy,
@@ -11745,6 +12074,7 @@ pub trait SemanticsProvider {
         cx: &mut App,
     ) -> Option<HashMap<Range<BufferRow>, Task<Result<CacheInlayHints>>>>;
 
+    #[cfg(feature = "native")]
     fn semantic_tokens(
         &self,
         buffer: Entity<Buffer>,
@@ -11755,6 +12085,7 @@ pub trait SemanticsProvider {
 
     fn supports_semantic_tokens(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool;
 
+    #[cfg(feature = "native")]
     fn document_highlights(
         &self,
         buffer: &Entity<Buffer>,
@@ -11762,6 +12093,7 @@ pub trait SemanticsProvider {
         cx: &mut App,
     ) -> Option<Task<Result<Vec<DocumentHighlight>>>>;
 
+    #[cfg(feature = "native")]
     fn definitions(
         &self,
         buffer: &Entity<Buffer>,
@@ -11770,6 +12102,7 @@ pub trait SemanticsProvider {
         cx: &mut App,
     ) -> Option<Task<Result<Option<Vec<LocationLink>>>>>;
 
+    #[cfg(feature = "native")]
     fn range_for_rename(
         &self,
         buffer: &Entity<Buffer>,
@@ -11777,6 +12110,7 @@ pub trait SemanticsProvider {
         cx: &mut App,
     ) -> Task<Result<Option<Range<text::Anchor>>>>;
 
+    #[cfg(feature = "native")]
     fn perform_rename(
         &self,
         buffer: &Entity<Buffer>,
@@ -11787,6 +12121,7 @@ pub trait SemanticsProvider {
 }
 
 impl SemanticsProvider for WeakEntity<Project> {
+    #[cfg(feature = "native")]
     fn hover(
         &self,
         buffer: &Entity<Buffer>,
@@ -11797,6 +12132,7 @@ impl SemanticsProvider for WeakEntity<Project> {
             .ok()
     }
 
+    #[cfg(feature = "native")]
     fn document_highlights(
         &self,
         buffer: &Entity<Buffer>,
@@ -11809,6 +12145,7 @@ impl SemanticsProvider for WeakEntity<Project> {
         .ok()
     }
 
+    #[cfg(feature = "native")]
     fn definitions(
         &self,
         buffer: &Entity<Buffer>,
@@ -11850,6 +12187,7 @@ impl SemanticsProvider for WeakEntity<Project> {
         .unwrap_or(false)
     }
 
+    #[cfg(feature = "native")]
     fn inline_values(
         &self,
         buffer_handle: Entity<Buffer>,
@@ -11888,6 +12226,7 @@ impl SemanticsProvider for WeakEntity<Project> {
         .ok();
     }
 
+    #[cfg(feature = "native")]
     fn inlay_hints(
         &self,
         invalidate: InvalidationStrategy,
@@ -11904,6 +12243,7 @@ impl SemanticsProvider for WeakEntity<Project> {
         .ok()
     }
 
+    #[cfg(feature = "native")]
     fn semantic_tokens(
         &self,
         buffer: Entity<Buffer>,
@@ -11916,6 +12256,7 @@ impl SemanticsProvider for WeakEntity<Project> {
         .ok()
     }
 
+    #[cfg(feature = "native")]
     fn range_for_rename(
         &self,
         buffer: &Entity<Buffer>,
@@ -11952,6 +12293,7 @@ impl SemanticsProvider for WeakEntity<Project> {
         })
     }
 
+    #[cfg(feature = "native")]
     fn perform_rename(
         &self,
         buffer: &Entity<Buffer>,
@@ -12004,6 +12346,7 @@ fn ending_row(next_selection: &Selection<Point>, display_map: &DisplaySnapshot) 
 }
 
 impl EditorSnapshot {
+    #[cfg(feature = "native")]
     pub fn remote_selections_in_range<'a>(
         &'a self,
         range: &'a Range<Anchor>,
@@ -12775,6 +13118,7 @@ fn collapse_multiline_range(range: Range<Point>) -> Range<Point> {
 
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 
+#[cfg(feature = "native")]
 #[derive(Copy, Clone, Debug)]
 enum BreakpointPromptEditAction {
     Log,
@@ -12782,8 +13126,10 @@ enum BreakpointPromptEditAction {
     HitCondition,
 }
 
+#[cfg(feature = "native")]
 type PromptEditorCallback = Box<dyn FnOnce(String, &mut Editor, &mut Context<Editor>) + 'static>;
 
+#[cfg(feature = "native")]
 struct PromptEditor {
     pub(crate) prompt: Entity<Editor>,
     editor: WeakEntity<Editor>,
@@ -12794,6 +13140,7 @@ struct PromptEditor {
     _subscriptions: Vec<Subscription>,
 }
 
+#[cfg(feature = "native")]
 impl PromptEditor {
     const MAX_LINES: u8 = 4;
 
@@ -12951,6 +13298,7 @@ impl PromptEditor {
     }
 }
 
+#[cfg(feature = "native")]
 impl Render for PromptEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_font_size = ThemeSettings::get_global(cx).ui_font_size(cx);
@@ -12996,6 +13344,7 @@ impl Render for PromptEditor {
     }
 }
 
+#[cfg(feature = "native")]
 impl Focusable for PromptEditor {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.prompt.focus_handle(cx)

@@ -1765,11 +1765,11 @@ impl EditorElement {
             return HashMap::default();
         }
 
-        let severity_to_color = |sev: &lsp::DiagnosticSeverity| match sev {
-            &lsp::DiagnosticSeverity::ERROR => Color::Error,
-            &lsp::DiagnosticSeverity::WARNING => Color::Warning,
-            &lsp::DiagnosticSeverity::INFORMATION => Color::Info,
-            &lsp::DiagnosticSeverity::HINT => Color::Hint,
+        let severity_to_color = |sev: &language::DiagnosticSeverity| match sev {
+            &language::DiagnosticSeverity::ERROR => Color::Error,
+            &language::DiagnosticSeverity::WARNING => Color::Warning,
+            &language::DiagnosticSeverity::INFORMATION => Color::Info,
+            &language::DiagnosticSeverity::HINT => Color::Hint,
             _ => Color::Error,
         };
 
@@ -6258,18 +6258,18 @@ impl EditorElement {
                                             (ScrollbarDiagnostics::All, _) => true,
                                             (
                                                 ScrollbarDiagnostics::Error,
-                                                lsp::DiagnosticSeverity::ERROR,
+                                                language::DiagnosticSeverity::ERROR,
                                             ) => true,
                                             (
                                                 ScrollbarDiagnostics::Warning,
-                                                lsp::DiagnosticSeverity::ERROR
-                                                | lsp::DiagnosticSeverity::WARNING,
+                                                language::DiagnosticSeverity::ERROR
+                                                | language::DiagnosticSeverity::WARNING,
                                             ) => true,
                                             (
                                                 ScrollbarDiagnostics::Information,
-                                                lsp::DiagnosticSeverity::ERROR
-                                                | lsp::DiagnosticSeverity::WARNING
-                                                | lsp::DiagnosticSeverity::INFORMATION,
+                                                language::DiagnosticSeverity::ERROR
+                                                | language::DiagnosticSeverity::WARNING
+                                                | language::DiagnosticSeverity::INFORMATION,
                                             ) => true,
                                             (_, _) => false,
                                         }
@@ -6289,9 +6289,9 @@ impl EditorElement {
                                         .end
                                         .to_display_point(&snapshot.display_snapshot);
                                     let color = match diagnostic.diagnostic.severity {
-                                        lsp::DiagnosticSeverity::ERROR => theme.status().error,
-                                        lsp::DiagnosticSeverity::WARNING => theme.status().warning,
-                                        lsp::DiagnosticSeverity::INFORMATION => theme.status().info,
+                                        language::DiagnosticSeverity::ERROR => theme.status().error,
+                                        language::DiagnosticSeverity::WARNING => theme.status().warning,
+                                        language::DiagnosticSeverity::INFORMATION => theme.status().info,
                                         _ => theme.status().hint,
                                     };
                                     ColoredRange {
