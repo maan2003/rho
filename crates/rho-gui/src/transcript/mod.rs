@@ -48,9 +48,9 @@ use crate::visualization::Visualization;
 
 pub struct TranscriptModel {
     multi_buffer: Entity<MultiBuffer>,
-    /// The document multibuffer: the transcript excerpt, cropped when the
-    /// turn is closed to end where the words end (no trailing turn
-    /// separator). Preview editors read this; the full prompt-bearing
+    /// The document multibuffer: the transcript excerpt omits its rendering
+    /// sentinel, then crops every trailing separator when the turn closes.
+    /// Preview editors read this; the full prompt-bearing
     /// multibuffer is composed by the agent model and reaches this model
     /// only through attachments.
     document_multi_buffer: Entity<MultiBuffer>,
@@ -138,7 +138,8 @@ struct MarkdownConcealment;
 /// turn crops flush at the last content line.
 #[derive(Clone, Copy, PartialEq)]
 enum DocumentTail {
-    /// The excerpt runs to the buffer's end and grows with appends.
+    /// The excerpt omits the terminal rendering sentinel and grows with
+    /// inserts made immediately before it.
     Growing(text::BufferId),
     /// The excerpt is cropped flush at this point.
     Cropped(text::BufferId, Point),
@@ -177,9 +178,12 @@ impl TranscriptModel {
         cx: &mut Context<V>,
     ) {
         editor.update(cx, |editor, cx| {
-            for turn in &self.buffers {
-                editor.disable_header_for_buffer(turn.buffer.read(cx).remote_id(), cx);
-            }
+            let buffer_ids = self
+                .buffers
+                .iter()
+                .map(|turn| turn.buffer.read(cx).remote_id())
+                .collect::<Vec<_>>();
+            editor.disable_headers_for_buffers(buffer_ids, cx);
         });
         self.attachments.push(Attachment {
             editor: editor.downgrade(),
@@ -376,17 +380,6 @@ impl TranscriptModel {
             }
             let composed = !buffer.read(cx).is_empty();
             if composed {
-                let path = transcript_path(start_block);
-                let end = composed_excerpt_end(buffer.read(cx));
-                self.multi_buffer.update(cx, |multi_buffer, cx| {
-                    multi_buffer.set_excerpts_for_path(
-                        path.clone(),
-                        buffer.clone(),
-                        [Point::zero()..end],
-                        0,
-                        cx,
-                    );
-                });
                 let buffer_id = buffer.read(cx).remote_id();
                 for attachment in &self.attachments {
                     if let Some(editor) = attachment.editor.upgrade() {
@@ -402,6 +395,7 @@ impl TranscriptModel {
                 buffer,
             });
         }
+        self.reset_full_excerpts(cx);
         self.document_tail = None;
         self.reset_document_excerpts(cx);
     }
@@ -529,16 +523,16 @@ impl TranscriptModel {
         );
     }
 
-    fn reset_document_excerpts<V: 'static>(&self, cx: &mut Context<V>) {
+    fn reset_full_excerpts<V: 'static>(&self, cx: &mut Context<V>) {
         let last = self.buffers.iter().rposition(|turn| turn.composed);
-        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
+        self.multi_buffer.update(cx, |multi_buffer, cx| {
             for (index, turn) in self.buffers.iter().enumerate() {
                 if !turn.composed {
                     continue;
                 }
                 let buffer = turn.buffer.read(cx);
                 let end = if Some(index) == last {
-                    buffer.max_point()
+                    prompt_gap_excerpt_end(buffer)
                 } else {
                     composed_excerpt_end(buffer)
                 };
@@ -546,6 +540,24 @@ impl TranscriptModel {
                     transcript_path(turn.start_block),
                     turn.buffer.clone(),
                     [Point::zero()..end],
+                    0,
+                    cx,
+                );
+            }
+        });
+    }
+
+    fn reset_document_excerpts<V: 'static>(&self, cx: &mut Context<V>) {
+        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
+            for turn in &self.buffers {
+                if !turn.composed {
+                    continue;
+                }
+                let buffer = turn.buffer.read(cx);
+                multi_buffer.set_excerpts_for_path(
+                    transcript_path(turn.start_block),
+                    turn.buffer.clone(),
+                    [Point::zero()..composed_excerpt_end(buffer)],
                     0,
                     cx,
                 );
@@ -578,7 +590,7 @@ impl TranscriptModel {
         }
         self.document_tail = Some(desired);
         let end = match desired {
-            DocumentTail::Growing(_) => buffer.max_point(),
+            DocumentTail::Growing(_) => composed_excerpt_end(buffer),
             DocumentTail::Cropped(_, end) => end,
         };
         let buffer = last.buffer.clone();
@@ -831,6 +843,17 @@ fn transcript_path(start_block: usize) -> PathKey {
 fn composed_excerpt_end(buffer: &Buffer) -> Point {
     debug_assert!(buffer.as_rope().reversed_chars_at(buffer.len()).next() == Some('\n'));
     buffer.offset_to_point(buffer.len() - 1)
+}
+
+fn prompt_gap_excerpt_end(buffer: &Buffer) -> Point {
+    let len = buffer.len();
+    let trailing = buffer
+        .as_rope()
+        .reversed_chars_at(len)
+        .take_while(|character| *character == '\n')
+        .count();
+    debug_assert!(trailing > 0);
+    buffer.offset_to_point(len - trailing.saturating_sub(1))
 }
 
 fn block_record(

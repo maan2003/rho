@@ -755,8 +755,16 @@ impl Editor {
     }
 
     pub fn disable_header_for_buffer(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
+        self.disable_headers_for_buffers([buffer_id], cx);
+    }
+
+    pub fn disable_headers_for_buffers(
+        &mut self,
+        buffer_ids: impl IntoIterator<Item = BufferId>,
+        cx: &mut Context<Self>,
+    ) {
         self.display_map.update(cx, |display_map, cx| {
-            display_map.disable_header_for_buffer(buffer_id, cx);
+            display_map.disable_headers_for_buffers(buffer_ids, cx);
         });
         cx.notify();
     }

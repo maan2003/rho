@@ -2333,10 +2333,29 @@ impl BlockMapWriter<'_> {
         self.remove(blocks_to_remove);
     }
 
-    pub fn disable_header_for_buffer(&mut self, buffer_id: BufferId) {
-        self.block_map
-            .buffers_with_disabled_headers
-            .insert(buffer_id);
+    pub fn disable_headers_for_buffers(&mut self, buffer_ids: impl IntoIterator<Item = BufferId>) {
+        let newly_disabled = buffer_ids
+            .into_iter()
+            .filter(|buffer_id| {
+                self.block_map
+                    .buffers_with_disabled_headers
+                    .insert(*buffer_id)
+            })
+            .collect::<Vec<_>>();
+        let has_materialized_header = {
+            let wrap_snapshot = self.block_map.wrap_snapshot.borrow();
+            let buffer = wrap_snapshot.buffer_snapshot();
+            newly_disabled
+                .iter()
+                .any(|buffer_id| buffer.excerpts_for_buffer(*buffer_id).next().is_some())
+        };
+        if has_materialized_header {
+            let max_row = self.block_map.wrap_snapshot.borrow().max_point().row();
+            self.block_map.deferred_edits.set(Patch::new(vec![Edit {
+                old: WrapRow(0)..max_row + WrapRow(1),
+                new: WrapRow(0)..max_row + WrapRow(1),
+            }]));
+        }
     }
 
     #[ztracing::instrument(skip_all)]

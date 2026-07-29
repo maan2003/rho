@@ -739,9 +739,14 @@ impl DisplayMap {
                 .collect(),
             cx,
         );
-        for buffer_id in &other.block_snapshot.buffers_with_disabled_headers {
-            self.disable_header_for_buffer(*buffer_id, cx);
-        }
+        self.disable_headers_for_buffers(
+            other
+                .block_snapshot
+                .buffers_with_disabled_headers
+                .iter()
+                .copied(),
+            cx,
+        );
     }
 
     /// Creates folds for the given creases.
@@ -930,10 +935,23 @@ impl DisplayMap {
 
     #[instrument(skip_all)]
     pub fn disable_header_for_buffer(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
+        self.disable_headers_for_buffers([buffer_id], cx);
+    }
+
+    #[instrument(skip_all)]
+    pub fn disable_headers_for_buffers(
+        &mut self,
+        buffer_ids: impl IntoIterator<Item = BufferId>,
+        cx: &mut Context<Self>,
+    ) {
         let (self_wrap_snapshot, self_wrap_edits) = self.sync_through_wrap(cx);
         self.block_map
             .write(self_wrap_snapshot, self_wrap_edits, None)
-            .disable_header_for_buffer(buffer_id);
+            .disable_headers_for_buffers(buffer_ids);
+        // If a boundary was already materialized, consume the invalidation
+        // now. Leaving it deferred makes the stale header disappear only
+        // after unrelated cursor movement or another display-map update.
+        self.sync_through_wrap(cx);
     }
 
     #[instrument(skip_all)]

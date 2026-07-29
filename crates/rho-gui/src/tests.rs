@@ -514,6 +514,34 @@ fn has_custom_block(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext
         .expect("inspect custom blocks")
 }
 
+fn excerpt_boundary_count(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> usize {
+    let editor = active_editor(workspace, cx);
+    editor_excerpt_boundary_count(workspace, &editor, cx)
+}
+
+fn editor_excerpt_boundary_count(
+    workspace: &WindowHandle<Workspace>,
+    editor: &Entity<Editor>,
+    cx: &mut TestAppContext,
+) -> usize {
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                snapshot
+                    .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
+                    .filter(|(_, block)| {
+                        matches!(
+                            block,
+                            Block::ExcerptBoundary { .. } | Block::BufferHeader { .. }
+                        )
+                    })
+                    .count()
+            })
+        })
+        .expect("inspect excerpt boundaries")
+}
+
 fn user(text: &str) -> UiBlock {
     UiBlock::UserMessage {
         text: text.to_owned(),
@@ -605,7 +633,45 @@ fn user_messages_render_with_turn_gaps_and_gutters(cx: &mut TestAppContext) {
         .expect("read gutters");
     assert!(
         gutter_highlights.len() >= 2,
-        "user messages should render gutter highlights: {gutter_highlights:?}"
+        "user messages should retain their vertical gutter lines: {gutter_highlights:?}"
+    );
+    assert_eq!(
+        excerpt_boundary_count(&workspace, cx),
+        0,
+        "turn buffers should not render horizontal excerpt boundaries"
+    );
+}
+
+#[gpui::test]
+fn last_response_has_a_blank_line_before_the_prompt(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("question")],
+            vec![assistant("answer", None)],
+        )),
+    );
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("answer\n\nWrite a message…"),
+        "the prompt should have a blank row after the last response: {text:?}"
+    );
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("last user")], Vec::new())),
+    );
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("last user\n\nWrite a message…")
+            && !text.contains("last user\n\n\nWrite a message…"),
+        "a user message should keep exactly one blank row before the prompt: {text:?}"
     );
 }
 
@@ -1223,6 +1289,32 @@ fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
     assert!(
         text.contains("draft!"),
         "prompt cursor should remain in the prompt after streaming update: {text:?}"
+    );
+
+    // A streamed tool/status frame can rebuild the active turn instead of
+    // taking the text-only fast path. The prompt excerpt and its cursor must
+    // remain stable across that replacement too.
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("go")],
+            vec![
+                assistant("hello", Some(UiMessagePhase::FinalAnswer)),
+                UiBlock::Tool(tool("t1", UiToolStatus::Running, None, None)),
+            ],
+        )),
+    );
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("?", window, cx));
+        })
+        .expect("continue typing after turn rebuild");
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("draft!?"),
+        "prompt cursor moved during active-turn replacement: {text:?}"
     );
 }
 
@@ -2493,7 +2585,7 @@ fn terminal_user_message_keeps_its_style_at_the_excerpt_boundary(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn growing_document_preview_preserves_the_terminal_newline(cx: &mut TestAppContext) {
+fn growing_document_preview_omits_the_terminal_blank_row(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -2514,7 +2606,12 @@ fn growing_document_preview_preserves_the_terminal_newline(cx: &mut TestAppConte
         })
         .expect("read preview text");
 
-    assert_eq!(text, "first\n\nsecond\n");
+    assert_eq!(text, "first\n\nsecond");
+    assert_eq!(
+        editor_excerpt_boundary_count(&workspace, &preview, cx),
+        0,
+        "attaching a preview should remove already-materialized excerpt boundaries"
+    );
 }
 
 #[gpui::test]
