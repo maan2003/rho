@@ -3,9 +3,11 @@
 // Component functions follow leptos' PascalCase convention.
 #![allow(non_snake_case)]
 
+use std::collections::{HashMap, HashSet};
+
 use leptos::html;
 use leptos::prelude::*;
-use rho_webui_messages::{AgentSummary, Block, FromBrowser};
+use rho_webui_messages::{AgentSummary, Block, FromBrowser, Topic};
 use wasm_bindgen::JsCast as _;
 
 use crate::{App, Phase, conn, md};
@@ -137,14 +139,181 @@ fn StatusScreen(title: &'static str, detail: Option<String>) -> impl IntoView {
     }
 }
 
-/// Sort rank: agents that need the user come first everywhere.
-fn attention_rank(attention: &str) -> u8 {
+/// Quiet rows riding along with the active cohort before the tail folds,
+/// mirroring the GUI registry's rail policy.
+const EXTRA_ROWS: usize = 5;
+
+/// Attention as an ordered level; higher needs the user more.
+fn attention_level(attention: &str) -> u8 {
     match attention {
-        "needs_input" => 0,
-        "pending" => 1,
-        "working" => 2,
-        _ => 3,
+        "needs_input" => 3,
+        "pending" => 2,
+        "working" => 1,
+        _ => 0,
     }
+}
+
+/// The GUI registry's active bucket: every colored row, plus enough of the
+/// most recently active quiet rows to fill five slots.
+fn active_bucket(mut candidates: Vec<(String, u8, u64)>) -> HashSet<String> {
+    let colored = candidates
+        .iter()
+        .filter(|(_, level, _)| *level > 0)
+        .count();
+    let quiet_slots = 5usize.saturating_sub(colored);
+    let mut top: HashSet<String> = candidates
+        .iter()
+        .filter(|(_, level, _)| *level > 0)
+        .map(|(key, _, _)| key.clone())
+        .collect();
+    candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    top.extend(
+        candidates
+            .into_iter()
+            .filter(|(_, level, _)| *level == 0)
+            .take(quiet_slots)
+            .map(|(key, _, _)| key),
+    );
+    top
+}
+
+/// Retained rail order, mirroring the GUI registry: first-seen agents enter
+/// above the existing order seeded by recency; already-placed agents keep
+/// their relative position across refreshes.
+fn update_retained(order: &mut Vec<String>, topics: &[Topic]) -> HashMap<String, usize> {
+    let mut unseen: Vec<(u64, String)> = topics
+        .iter()
+        .flat_map(|topic| &topic.agents)
+        .filter(|agent| !order.iter().any(|id| id == &agent.id))
+        .map(|agent| (agent.updated_at, agent.id.clone()))
+        .collect();
+    unseen.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    order.splice(0..0, unseen.into_iter().map(|(_, id)| id));
+    order
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(rank, id)| (id, rank))
+        .collect()
+}
+
+/// One rail row: a workstream with its visible agents in rail order.
+/// Activating the row opens the root (best-ordered) agent.
+#[derive(Clone, PartialEq)]
+struct StreamRowData {
+    topic_id: String,
+    name: String,
+    pinned: bool,
+    has_pinned_agent: bool,
+    /// Highest attention level over visible agents; the row's lamp.
+    lamp: u8,
+    agents: Vec<AgentSummary>,
+}
+
+/// The native dashboard's rail: workstream rows in retained order behind
+/// pinned rows and the active cohort, with the quiet tail folded.
+fn rail_rows(
+    topics: &[Topic],
+    selected: Option<&str>,
+    ranks: &HashMap<String, usize>,
+) -> (Vec<StreamRowData>, Vec<StreamRowData>) {
+    let mut rows = Vec::new();
+    let mut best_ranks = HashMap::new();
+    let mut max_updated = HashMap::new();
+    for topic in topics {
+        let visible: Vec<&AgentSummary> = topic
+            .agents
+            .iter()
+            .filter(|agent| !agent.hidden)
+            .collect();
+        if visible.is_empty() {
+            continue;
+        }
+        let topic_bucket = active_bucket(
+            visible
+                .iter()
+                .filter(|agent| !agent.pinned)
+                .map(|agent| {
+                    (
+                        agent.id.clone(),
+                        attention_level(&agent.attention),
+                        agent.updated_at,
+                    )
+                })
+                .collect(),
+        );
+        let mut agents: Vec<AgentSummary> = visible.into_iter().cloned().collect();
+        agents.sort_by_key(|agent| {
+            (
+                !agent.pinned,
+                !topic_bucket.contains(&agent.id),
+                ranks.get(&agent.id).copied().unwrap_or(usize::MAX),
+            )
+        });
+        best_ranks.insert(
+            topic.id.clone(),
+            agents
+                .first()
+                .and_then(|agent| ranks.get(&agent.id))
+                .copied()
+                .unwrap_or(usize::MAX),
+        );
+        max_updated.insert(
+            topic.id.clone(),
+            agents.iter().map(|agent| agent.updated_at).max().unwrap_or(0),
+        );
+        rows.push(StreamRowData {
+            topic_id: topic.id.clone(),
+            name: topic.name.clone(),
+            pinned: topic.pinned,
+            has_pinned_agent: agents.iter().any(|agent| agent.pinned),
+            lamp: agents
+                .iter()
+                .map(|agent| attention_level(&agent.attention))
+                .max()
+                .unwrap_or(0),
+            agents,
+        });
+    }
+    let bucket = active_bucket(
+        rows.iter()
+            .filter(|row| !row.pinned && !row.has_pinned_agent)
+            .map(|row| {
+                (
+                    row.topic_id.clone(),
+                    row.lamp,
+                    max_updated.get(&row.topic_id).copied().unwrap_or(0),
+                )
+            })
+            .collect(),
+    );
+    rows.sort_by_key(|row| {
+        (
+            !row.pinned,
+            !row.has_pinned_agent,
+            !bucket.contains(&row.topic_id),
+            best_ranks.get(&row.topic_id).copied().unwrap_or(usize::MAX),
+        )
+    });
+    let mut listed = Vec::new();
+    let mut folded = Vec::new();
+    let mut extra = 0;
+    for row in rows {
+        let keep = row.pinned
+            || row.has_pinned_agent
+            || bucket.contains(&row.topic_id)
+            || selected
+                .is_some_and(|selected| row.agents.iter().any(|agent| agent.id == selected));
+        if keep {
+            listed.push(row);
+        } else if extra < EXTRA_ROWS {
+            extra += 1;
+            listed.push(row);
+        } else {
+            folded.push(row);
+        }
+    }
+    (listed, folded)
 }
 
 fn Main(app: App) -> impl IntoView {
@@ -166,25 +335,17 @@ fn Main(app: App) -> impl IntoView {
             document.set_title(&title);
         }
     });
-    let needs_attention = move || {
-        let mut agents = app.topics.with(|topics| {
-            topics
-                .iter()
-                .flat_map(|topic| &topic.agents)
-                .filter(|agent| {
-                    !agent.hidden
-                        && matches!(agent.attention.as_str(), "needs_input" | "pending")
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        });
-        agents.sort_by_key(|agent| {
-            (
-                attention_rank(&agent.attention),
-                std::cmp::Reverse(agent.updated_at),
-            )
-        });
-        agents
+    // Session-retained rail order and per-row disclosure, surviving refreshes.
+    let retained: StoredValue<Vec<String>> = StoredValue::new(Vec::new());
+    let open_streams: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
+    let folded_open = RwSignal::new(false);
+    let rows = move || {
+        let topics = app.topics.get();
+        let selected = app.selected.get();
+        let ranks = retained
+            .try_update_value(|order| update_retained(order, &topics))
+            .unwrap_or_default();
+        rail_rows(&topics, selected.as_deref(), &ranks)
     };
     view! {
         <div class="rail">
@@ -206,18 +367,21 @@ fn Main(app: App) -> impl IntoView {
             </div>
             <div class="topics">
                 {move || {
-                    let agents = needs_attention();
-                    (!agents.is_empty()).then(|| view! {
-                        <div class="topic needs">
-                            <div class="topic-name"><span>"needs attention"</span></div>
-                            {agents.into_iter().map(|agent| AgentRow(app, agent)).collect_view()}
-                        </div>
-                    })
-                }}
-                {move || {
-                    let mut topics = app.topics.get();
-                    topics.sort_by_key(|topic| !topic.pinned);
-                    topics.into_iter().map(|topic| TopicSection(app, topic)).collect_view()
+                    let (listed, folded) = rows();
+                    let folded_count = folded.len();
+                    view! {
+                        {listed.into_iter().map(|row| StreamRow(app, row, open_streams)).collect_view()}
+                        {(folded_count > 0).then(|| view! {
+                            {move || folded_open.get().then({
+                                let folded = folded.clone();
+                                move || folded.into_iter().map(|row| StreamRow(app, row, open_streams)).collect_view()
+                            })}
+                            <button class="fold-row" on:click=move |_| folded_open.update(|value| *value = !*value)>
+                                <span>{move || if folded_open.get() { "⌃" } else { "⌄" }}</span>
+                                <span>{move || if folded_open.get() { "Show less".to_owned() } else { format!("{folded_count} more") }}</span>
+                            </button>
+                        })}
+                    }
                 }}
             </div>
             <div class="rail-foot" title="connected">
@@ -243,43 +407,100 @@ fn Main(app: App) -> impl IntoView {
     }
 }
 
-fn TopicSection(app: App, topic: rho_webui_messages::Topic) -> impl IntoView {
-    let expanded = RwSignal::new(false);
-    let mut agents = topic.agents;
-    agents.sort_by_key(|agent| {
-        (
-            attention_rank(&agent.attention),
-            !agent.pinned,
-            std::cmp::Reverse(agent.updated_at),
-        )
-    });
-    let mut active = Vec::new();
-    let mut folded = Vec::new();
-    for agent in agents {
-        if agent.hidden || active.len() >= 10 {
-            folded.push(agent);
-        } else {
-            active.push(agent);
-        }
-    }
-    let folded_count = folded.len();
+/// The attention lamp hanging off a row's right end, GUI glyphs and all.
+fn lamp_view(level: u8) -> Option<AnyView> {
+    let (glyph, class) = match level {
+        3 => ("◆", "needs_input"),
+        2 => ("●", "pending"),
+        1 => ("…", "working"),
+        _ => return None,
+    };
+    Some(view! { <span class=format!("lamp {class}")>{glyph}</span> }.into_any())
+}
+
+/// One workstream row: activation opens the root agent; a disclosure
+/// chevron reveals the member agents of multi-agent workstreams.
+fn StreamRow(app: App, row: StreamRowData, open_streams: RwSignal<HashSet<String>>) -> impl IntoView {
+    let root = row.agents.first().map(|agent| agent.id.clone());
+    let agent_ids: Vec<String> = row.agents.iter().map(|agent| agent.id.clone()).collect();
+    let active_ids = agent_ids.clone();
+    let multi = row.agents.len() > 1;
+    let topic_id = row.topic_id.clone();
+    let toggle_id = row.topic_id.clone();
+    let title = if row.name.trim().is_empty() {
+        "Untitled workstream".to_owned()
+    } else {
+        row.name.clone()
+    };
+    let agents = row.agents.clone();
     view! {
-        <div class="topic">
-            <div class="topic-name">
-                <span>{topic.name}</span>
-                {topic.pinned.then(|| view! { <span class="pin" title="Pinned">"◆"</span> })}
+        <div class="stream">
+            <div
+                class="stream-row"
+                role="button"
+                class:active=move || {
+                    app.selected.get().is_some_and(|selected| active_ids.contains(&selected))
+                }
+                on:click=move |_| {
+                    if let Some(root) = root.clone() {
+                        app.select(root);
+                    }
+                }
+            >
+                {row.pinned.then(|| view! { <span class="pin-mark">"◆"</span> })}
+                <span class="stream-title">{title}</span>
+                {lamp_view(row.lamp)}
+                {multi.then(|| view! {
+                    <button
+                        class="disclose"
+                        on:click=move |event| {
+                            event.stop_propagation();
+                            open_streams.update(|open| {
+                                if !open.remove(&toggle_id) {
+                                    open.insert(toggle_id.clone());
+                                }
+                            });
+                        }
+                    >
+                        {
+                            let chevron_id = topic_id.clone();
+                            move || if open_streams.with(|open| open.contains(&chevron_id)) { "⌄" } else { "›" }
+                        }
+                    </button>
+                })}
             </div>
-            {active.into_iter().map(|agent| AgentRow(app, agent)).collect_view()}
-            {move || expanded.get().then(|| {
-                folded.clone().into_iter().map(|agent| AgentRow(app, agent)).collect_view()
-            })}
-            {(folded_count > 0).then(|| view! {
-                <button class="fold-row" on:click=move |_| expanded.update(|value| *value = !*value)>
-                    <span>{move || if expanded.get() { "⌃" } else { "⌄" }}</span>
-                    <span>{move || if expanded.get() { "Show less".to_owned() } else { format!("{folded_count} more") }}</span>
-                </button>
-            })}
+            {
+                let members_id = row.topic_id.clone();
+                move || {
+                    (multi && open_streams.with(|open| open.contains(&members_id))).then(|| {
+                        agents
+                            .clone()
+                            .into_iter()
+                            .map(|agent| AgentLine(app, agent))
+                            .collect_view()
+                    })
+                }
+            }
         </div>
+    }
+}
+
+/// A member agent line under a disclosed workstream row.
+fn AgentLine(app: App, agent: AgentSummary) -> impl IntoView {
+    let id = agent.id.clone();
+    let selected_id = agent.id.clone();
+    let level = attention_level(&agent.attention);
+    view! {
+        <button
+            class="agent-line"
+            class:active=move || app.selected.get().as_deref() == Some(selected_id.as_str())
+            on:click=move |_| app.select(id.clone())
+        >
+            {agent.pinned.then(|| view! { <span class="pin-mark">"◆"</span> })}
+            <span class="agent-line-name">{agent.name}</span>
+            <span class="agent-line-role">{agent.role}</span>
+            {lamp_view(level)}
+        </button>
     }
 }
 
@@ -292,28 +513,6 @@ fn daemon_short() -> String {
     }
 }
 
-fn AgentRow(app: App, agent: AgentSummary) -> impl IntoView {
-    let id = agent.id.clone();
-    let selected_id = agent.id.clone();
-    let attention = agent.attention.clone();
-    view! {
-        <button
-            class="agent-row"
-            class:active=move || app.selected.get().as_deref() == Some(selected_id.as_str())
-            class:needs=agent.attention == "needs_input"
-            on:click=move |_| app.select(id.clone())
-        >
-            <svg class="row-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
-                <path d="M2.5 3.5h11v8h-6l-3 2.5v-2.5h-2v-8z"/>
-            </svg>
-            <span class="agent-meta">
-                <span class="agent-name">{agent.name}</span>
-                <span class="agent-mode">{agent.role}</span>
-            </span>
-            <span class=format!("attn {attention}")></span>
-        </button>
-    }
-}
 
 fn ChatPane(app: App, agent_id: String) -> impl IntoView {
     let summary = Memo::new({
@@ -328,52 +527,14 @@ fn ChatPane(app: App, agent_id: String) -> impl IntoView {
             })
         }
     });
-    let status = Memo::new(move |_| {
-        app.state
-            .with(|state| state.as_ref().map(|state| state.status.clone()))
-    });
-    let busy =
-        Memo::new(move |_| matches!(status.get().as_deref(), Some("streaming" | "tool_calling")));
-    let cancel_id = agent_id.clone();
-    let header_status = move || {
-        status.get().map(|status| {
-            let label = match status.as_str() {
-                "idle" => "idle",
-                "streaming" => "thinking",
-                "tool_calling" => "running tools",
-                "unfinished" => "stopped mid-turn",
-                "error" => "error",
-                _ => "…",
-            };
-            view! { <span class=format!("chip status-{status}")>{label}</span> }
-        })
-    };
     view! {
         <div class="chat-head">
             <button class="back" on:click=move |_| app.chat_open.set(false)>"‹"</button>
-            <div class="chat-title">
-                <span class="chat-name">
-                    {move || summary.get().map(|agent| agent.name).unwrap_or_else(|| agent_id.clone())}
-                </span>
-                <span class="chat-chips">
-                    {header_status}
-                    {move || app.state.with(|state| {
-                        state.as_ref().and_then(|state| state.context_used).map(|used| {
-                            view! { <span class="chip">{format!("{used}% context")}</span> }
-                        })
-                    })}
-                </span>
-            </div>
+            <span class="chat-name">
+                {move || summary.get().map(|agent| agent.name).unwrap_or_else(|| agent_id.clone())}
+            </span>
             {move || summary.get().map(|agent| view! {
                 <span class="chip mode">{agent.role}</span>
-            })}
-            {move || busy.get().then(|| {
-                let cancel_id = cancel_id.clone();
-                view! {
-                    <button class="stop" on:click=move |_| {
-                        app.send(FromBrowser::Cancel { agent_id: cancel_id.clone() });
-                    }>"Stop"</button>
-                }
             })}
         </div>
         <Transcript app=app />
@@ -593,6 +754,24 @@ fn ToolLine(
 #[component]
 fn Composer(app: App) -> impl IntoView {
     let area: NodeRef<html::Textarea> = NodeRef::new();
+    let status = Memo::new(move |_| {
+        app.state
+            .with(|state| state.as_ref().map(|state| state.status.clone()))
+    });
+    let busy =
+        Memo::new(move |_| matches!(status.get().as_deref(), Some("streaming" | "tool_calling")));
+    let status_label = move || {
+        status.get().and_then(|status| {
+            let label = match status.as_str() {
+                "streaming" => "thinking…",
+                "tool_calling" => "running tools…",
+                "unfinished" => "stopped mid-turn",
+                "error" => "error",
+                _ => return None,
+            };
+            Some(view! { <span class=format!("chip status-{status}")>{label}</span> })
+        })
+    };
     let send = move || {
         let Some(element) = area.get_untracked() else {
             return;
@@ -638,6 +817,23 @@ fn Composer(app: App) -> impl IntoView {
                     }
                 ></textarea>
                 <div class="composer-bar">
+                    <span class="composer-status">
+                        {status_label}
+                        {move || app.state.with(|state| {
+                            state.as_ref().and_then(|state| state.context_used).map(|used| {
+                                view! { <span class="chip">{format!("{used}%")}</span> }
+                            })
+                        })}
+                    </span>
+                    {move || busy.get().then(|| {
+                        view! {
+                            <button class="stop" title="Stop" on:click=move |_| {
+                                if let Some(agent_id) = app.selected.get_untracked() {
+                                    app.send(FromBrowser::Cancel { agent_id });
+                                }
+                            }>"■"</button>
+                        }
+                    })}
                     <button class="send" on:click=move |_| send() title="Send">"↑"</button>
                 </div>
             </div>

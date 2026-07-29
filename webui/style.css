@@ -1,6 +1,25 @@
-/* Rho web UI — dark, monospace, terminal-editorial (Amp-style). */
+/* Rho web UI — the native GUI's Rho OKSolar P3 theme and Rho Font. */
 
-/* Bundled so the UI is monospace even without local mono fonts. */
+/* The GUI's buffer font (iA Writer Duo V, renamed under the OFL; see
+   fonts/rho-font/LICENSE.md). Variable weight 400-700, like the native
+   bundle. */
+@font-face {
+  font-family: "Rho Font";
+  src: url("fonts/rho-font/RhoFont-Regular.ttf") format("truetype");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Rho Font";
+  src: url("fonts/rho-font/RhoFont-Italic.ttf") format("truetype");
+  font-weight: 400 700;
+  font-style: italic;
+  font-display: swap;
+}
+
+/* Fallback when Rho Font has not loaded yet. */
 @font-face {
   font-family: "JetBrains Mono";
   src: url("fonts/JetBrainsMono.woff2") format("woff2");
@@ -8,25 +27,28 @@
   font-display: swap;
 }
 
+/* Values transcribed from the GUI's rho-oksolar-p3.json. */
 :root {
   color-scheme: dark;
-  --background: #0b0d0b;
-  --foreground: #f6fff5;
-  --border: #878b8626;
-  --muted: #878b861a;
-  --muted-foreground: #9ca49c;
-  --faint-foreground: #6d746d;
-  --input-border: #f6fff526;
-  --accent: #f6fff512;
-  --card: #f6fff508;
-  --bubble: #f6fff514;
-  --code-bg: #f6fff50a;
-  --success: #54b879;
-  --destructive: #d67670;
-  --warning: #d6a038;
-  --link: #6ca0e0;
+  --background: oklch(23% 0.018 150);
+  --foreground: oklch(78% 0.012 95);
+  --border: oklch(30.5% 0.02 150);
+  --muted: oklch(30.5% 0.02 150);
+  --muted-foreground: oklch(56% 0.012 100);
+  --faint-foreground: oklch(48% 0.012 100);
+  --input-border: oklch(35.5% 0.022 150);
+  --accent: oklch(30.5% 0.02 150);
+  --accent-strong: oklch(35.5% 0.022 150);
+  --card: oklch(24.5% 0.018 150);
+  --bubble: oklch(30.5% 0.02 150);
+  --code-bg: oklch(26% 0.018 150);
+  --success: oklch(63.1% 0.168 118.8);
+  --destructive: oklch(63.1% 0.16 21.6);
+  --warning: oklch(63.1% 0.145 86.4);
+  --link: oklch(63.1% 0.195 244.8);
+  --accent-text: oklch(72% 0.11 105);
   --radius: 6px;
-  --mono: "Berkeley Mono", "JetBrains Mono", ui-monospace, "SF Mono", Menlo,
+  --mono: "Rho Font", "JetBrains Mono", ui-monospace, "SF Mono", Menlo,
     Consolas, monospace;
 }
 
@@ -41,8 +63,9 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--mono);
-  font-size: 13px;
-  line-height: 20px;
+  /* The GUI's buffer font size. */
+  font-size: 16px;
+  line-height: 24px;
 }
 
 ::-webkit-scrollbar {
@@ -214,7 +237,7 @@ pre.code,
 /* ---- rail ---- */
 
 .rail {
-  width: 15rem;
+  width: 22rem;
   flex: none;
   display: flex;
   flex-direction: column;
@@ -246,12 +269,6 @@ pre.code,
   border-top: 1px solid var(--border);
   font-size: 11px;
   color: var(--faint-foreground);
-}
-
-.pin {
-  margin-left: auto;
-  color: var(--warning);
-  font-size: 8px;
 }
 
 .fold-row {
@@ -444,52 +461,30 @@ pre.code,
   padding: 0 6px 10px;
 }
 
-.topic-name {
-  display: flex;
-  align-items: center;
-  font-size: 10.5px;
-  color: var(--faint-foreground);
-  padding: 8px 8px 3px;
-}
+/* ---- workstream rows, native-dashboard style ---- */
 
-.agent-row {
+.stream-row {
   display: flex;
   align-items: center;
   gap: 7px;
   width: 100%;
-  height: 26px;
-  padding: 0 8px;
-  text-align: left;
-  font-size: 12px;
-  color: var(--muted-foreground);
-}
-
-.agent-row:hover {
-  background: var(--accent);
+  min-height: 34px;
+  padding: 4px 10px;
+  border-radius: var(--radius);
   color: var(--foreground);
+  cursor: pointer;
 }
 
-.agent-row.active {
+.stream-row:hover,
+.stream-row.active {
   background: var(--accent);
-  color: var(--foreground);
 }
 
-.row-icon {
+.pin-mark {
   flex: none;
-  width: 13px;
-  height: 13px;
-  opacity: 0.65;
 }
 
-.agent-meta {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.agent-name {
+.stream-title {
   flex: 1;
   min-width: 0;
   white-space: nowrap;
@@ -497,50 +492,66 @@ pre.code,
   text-overflow: ellipsis;
 }
 
-.agent-mode {
-  font-size: 10.5px;
+/* The GUI lamp colors: working stays muted, pending is the accent at 65%,
+   needs-input the full accent. */
+.lamp {
+  flex: none;
+}
+
+.lamp.working {
+  color: var(--muted-foreground);
+}
+
+.lamp.pending {
+  color: oklch(72% 0.11 105 / 0.65);
+}
+
+.lamp.needs_input {
+  color: var(--accent-text);
+}
+
+.disclose {
+  flex: none;
+  min-width: 26px;
+  color: var(--faint-foreground);
+  padding: 0 4px;
+}
+
+.disclose:hover {
+  color: var(--foreground);
+}
+
+.agent-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 2px 10px 2px 26px;
+  text-align: left;
+  border-radius: var(--radius);
+  color: var(--muted-foreground);
+}
+
+.agent-line:hover,
+.agent-line.active {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+.agent-line-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-line-role {
+  font-size: 12px;
   color: var(--faint-foreground);
 }
 
-.attn {
-  width: 5px;
-  height: 5px;
-  flex: none;
-  border-radius: 50%;
-  background: transparent;
-}
-
-.agent-row.needs {
-  color: var(--foreground);
-  background: #d6767014;
-}
-
-.topic.needs .topic-name {
-  color: var(--destructive);
-}
-
-.attn.working {
-  background: var(--link);
-  animation: pulse 1.4s ease-in-out infinite;
-}
-
-.attn.pending {
-  background: var(--warning);
-}
-
-.attn.needs_input {
-  background: var(--destructive);
-}
-
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.3;
-  }
-}
 
 /* ---- chat ---- */
 
@@ -576,27 +587,13 @@ pre.code,
   color: var(--muted-foreground);
 }
 
-.chat-title {
+.chat-name {
   flex: 1;
   min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.chat-name {
   font-weight: 700;
-  font-size: 12.5px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.chat-chips {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 10px;
 }
 
 .chip {
@@ -626,14 +623,18 @@ pre.code,
 }
 
 .stop {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
   color: var(--destructive);
-  font-size: 11.5px;
-  padding: 3px 10px;
-  border: 1px solid #d6767040;
+  border: 1px solid oklch(63.1% 0.16 21.6 / 0.4);
+  font-size: 11px;
+  line-height: 1;
 }
 
 .stop:hover {
-  background: #d6767018;
+  background: oklch(63.1% 0.16 21.6 / 0.12);
 }
 
 .transcript {
@@ -884,8 +885,18 @@ pre.code,
 .composer-bar {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  padding: 5px 7px;
+  gap: 8px;
+  padding: 5px 7px 5px 12px;
+}
+
+.composer-status {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .send {
@@ -1002,12 +1013,6 @@ pre.code,
 /* ---- mobile ---- */
 
 @media (max-width: 700px) {
-  html,
-  body {
-    font-size: 15px;
-    line-height: 22px;
-  }
-
   /* Any focused input under 16px makes iOS zoom the page. */
   input,
   select,
@@ -1038,30 +1043,18 @@ pre.code,
     min-height: 44px;
   }
 
-  .topic-name {
-    font-size: 12px;
-    padding: 12px 10px 4px;
-  }
-
-  .agent-row {
-    height: 44px;
-    font-size: 15px;
-    gap: 10px;
+  .stream-row {
+    min-height: 48px;
     border-radius: 8px;
   }
 
-  .agent-mode {
-    font-size: 12px;
+  .agent-line {
+    min-height: 44px;
   }
 
-  .attn {
-    width: 8px;
-    height: 8px;
-  }
-
-  .row-icon {
-    width: 16px;
-    height: 16px;
+  .disclose {
+    min-width: 44px;
+    min-height: 44px;
   }
 
   .rail-head {
@@ -1078,12 +1071,14 @@ pre.code,
     padding-top: calc(6px + env(safe-area-inset-top));
   }
 
-  .chat-head .stop {
-    min-height: 38px;
-  }
-
   .chip {
     font-size: 12px;
+  }
+
+  .stop,
+  .composer .send {
+    width: 38px;
+    height: 38px;
   }
 
   .tool-line {
