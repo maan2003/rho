@@ -23,6 +23,8 @@ use crate::{App, Phase};
 const CREDENTIAL_KEY: &str = "rho-webui-passkey-credential";
 const LEGACY_SECRET_KEY: &str = "rho-webui-secret";
 const DAEMON_KEY: &str = "rho-webui-daemon";
+/// `"cross-platform"` to create the credential on a roaming security key.
+const AUTHENTICATOR_KEY: &str = "rho-webui-authenticator";
 const PRF_LABEL: &[u8] = b"rho webui iroh prf v1";
 const HKDF_INFO: &[u8] = b"rho webui iroh ed25519 seed v1";
 const MAX_CREDENTIAL_ID_LEN: usize = 1024;
@@ -95,6 +97,17 @@ pub fn reset_passkey() {
     if let Some(storage) = local_storage() {
         let _ = storage.remove_item(CREDENTIAL_KEY);
         let _ = storage.remove_item(LEGACY_SECRET_KEY);
+        let _ = storage.remove_item(AUTHENTICATOR_KEY);
+    }
+}
+
+/// Forget passkey metadata and create the next credential on a roaming
+/// security key: device-bound, outside synced passkey providers (Apple's
+/// platform authenticator only offers iCloud Keychain passkeys).
+pub fn reset_to_security_key() {
+    reset_passkey();
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(AUTHENTICATOR_KEY, "cross-platform");
     }
 }
 
@@ -299,6 +312,13 @@ async fn create_passkey() -> anyhow::Result<Vec<u8>> {
         &JsValue::from_str("required"),
     )?;
     set(&selection, "residentKey", &JsValue::from_str("preferred"))?;
+    if let Some(attachment) = local_storage().and_then(|s| s.get_item(AUTHENTICATOR_KEY).ok()?) {
+        set(
+            &selection,
+            "authenticatorAttachment",
+            &JsValue::from_str(&attachment),
+        )?;
+    }
     set(&public_key, "authenticatorSelection", &selection)?;
     let extensions = Object::new();
     set(&extensions, "prf", &Object::new())?;

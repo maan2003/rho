@@ -32,6 +32,7 @@ pub fn Root(app: App) -> impl IntoView {
 fn UnlockScreen(app: App, daemon: String) -> impl IntoView {
     let connect_daemon = daemon.clone();
     let reset_daemon = daemon.clone();
+    let security_key_daemon = daemon.clone();
     let short = if daemon.len() > 20 {
         format!("{}…", &daemon[..20])
     } else {
@@ -50,6 +51,10 @@ fn UnlockScreen(app: App, daemon: String) -> impl IntoView {
                     conn::reset_passkey();
                     conn::unlock(app, reset_daemon.clone());
                 }>"Use a new passkey"</button>
+                <button on:click=move |_| {
+                    conn::reset_to_security_key();
+                    conn::unlock(app, security_key_daemon.clone());
+                }>"Use a security key"</button>
             </div>
         </div>
     }
