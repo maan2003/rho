@@ -19,14 +19,6 @@
   font-display: swap;
 }
 
-/* Fallback when Rho Font has not loaded yet. */
-@font-face {
-  font-family: "JetBrains Mono";
-  src: url("fonts/JetBrainsMono.woff2") format("woff2");
-  font-weight: 100 800;
-  font-display: swap;
-}
-
 /* Values transcribed from the GUI's rho-oksolar-p3.json. */
 :root {
   color-scheme: dark;
@@ -48,8 +40,7 @@
   --link: oklch(63.1% 0.195 244.8);
   --accent-text: oklch(72% 0.11 105);
   --radius: 6px;
-  --mono: "Rho Font", "JetBrains Mono", ui-monospace, "SF Mono", Menlo,
-    Consolas, monospace;
+  --mono: "Rho Font", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
 * {

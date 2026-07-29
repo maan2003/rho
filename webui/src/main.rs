@@ -67,6 +67,10 @@ impl App {
 
     pub fn select(&self, agent_id: AgentId) {
         self.send(ClientMessage::SubscribeAgent { agent_id });
+        // Weight the on-screen agent's state stream above the others.
+        self.send(ClientMessage::AgentStreamFocus {
+            agent_id: Some(agent_id),
+        });
         self.mutate_registry(|registry| registry.select_agent(agent_id));
         self.selected.set(Some(agent_id));
         self.chat_open.set(true);

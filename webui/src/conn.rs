@@ -2,6 +2,8 @@
 //! display while the daemon waits for `rho iroh approve`.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::str::FromStr as _;
 
 use futures::channel::mpsc::UnboundedReceiver;
@@ -11,7 +13,7 @@ use iroh::EndpointId;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use rho_ui_proto::{ClientMessage, ServerMessage};
+use rho_ui_proto::{AgentId, ClientMessage, ServerMessage};
 use sha2::{Digest as _, Sha256};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -155,6 +157,7 @@ async fn run(
         .await
         .map_err(|error| anyhow::anyhow!("open stream: {error}"))?;
     rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
+    spawn_local(agent_streams(app, connection.clone()));
 
     spawn_local(async move {
         while let Some(message) = receiver.next().await {
@@ -189,6 +192,49 @@ async fn read_loop(app: App, recv: &mut iroh::endpoint::RecvStream) -> anyhow::R
             .await
             .map_err(|error| anyhow::anyhow!("daemon connection lost: {error}"))?;
         handle(app, message);
+    }
+}
+
+/// Agent state arrives on daemon-opened unidirectional streams, one per
+/// agent, so QUIC can schedule agents independently while the bidirectional
+/// session stays a low-volume control channel. Each stream carries an
+/// `AgentStreamOpened` header and then `Agent` frames until EOF. The daemon
+/// may reopen an agent's stream; a generation counter keeps frames from a
+/// superseded stream out of the state.
+async fn agent_streams(app: App, connection: iroh::endpoint::Connection) {
+    let generations: Rc<RefCell<HashMap<AgentId, u64>>> = Rc::default();
+    loop {
+        let Ok(mut recv) = connection.accept_uni().await else {
+            break;
+        };
+        let generations = generations.clone();
+        spawn_local(async move {
+            let Ok(ServerMessage::AgentStreamOpened { agent_id }) =
+                rho_ui_proto::read_frame(&mut recv).await
+            else {
+                return;
+            };
+            let generation = {
+                let mut generations = generations.borrow_mut();
+                let generation = generations.entry(agent_id).or_default();
+                *generation = generation.wrapping_add(1);
+                *generation
+            };
+            while let Ok(message) = rho_ui_proto::read_frame::<_, ServerMessage>(&mut recv).await {
+                let ServerMessage::Agent {
+                    agent_id: frame_id,
+                    frame,
+                } = message
+                else {
+                    return;
+                };
+                if frame_id != agent_id || generations.borrow().get(&agent_id) != Some(&generation)
+                {
+                    return;
+                }
+                handle(app, ServerMessage::Agent { agent_id, frame });
+            }
+        });
     }
 }
 
