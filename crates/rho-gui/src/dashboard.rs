@@ -549,12 +549,14 @@ impl Dashboard {
             self.order.iter().position(|entry| entry == key)
                 != order.iter().position(|entry| entry == key)
         };
+        let first_population = self.order.is_empty() && !order.is_empty();
         let restore = match &self.pending_cursor {
             Some(key) if order.contains(key) => Some(key.clone()),
             _ => match &cursor_key {
                 Some(key) if order.contains(key) && (moved(key) || edited.contains(key)) => {
                     Some(key.clone())
                 }
+                _ if first_population => order.first().cloned(),
                 _ => None,
             },
         };

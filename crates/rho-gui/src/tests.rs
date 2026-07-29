@@ -207,6 +207,51 @@ fn dashboard_elides_subagents_behind_inline_fold(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn startup_stays_on_the_first_dashboard_row(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                ConnEvent::Ready {
+                    workstreams: vec![UiWorkstream {
+                        workstream_id: WorkstreamId(1),
+                        name: "Existing work".to_owned(),
+                        labels: Vec::new(),
+                    }],
+                    agents: vec![agent_summary(1, None)],
+                    projects: Vec::new(),
+                    machine_seed: 0,
+                    agent_counter: 1,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            assert!(workspace.is_dashboard_mode(window, cx));
+            assert_eq!(
+                workspace.dashboard_cursor_target(cx),
+                Some(crate::dashboard::RowTarget::Iris)
+            );
+
+            workspace.handle_event(
+                ConnEvent::Frame {
+                    agent_id: agent(1),
+                    frame: snapshot_frame(state(vec![user("old transcript")], Vec::new())),
+                    allocation: None,
+                },
+                window,
+                cx,
+            );
+            assert!(workspace.is_dashboard_mode(window, cx));
+            assert_eq!(
+                workspace.dashboard_cursor_target(cx),
+                Some(crate::dashboard::RowTarget::Iris)
+            );
+        })
+        .expect("start on dashboard");
+}
+
+#[gpui::test]
 fn dashboard_quiet_tail_is_one_native_display_elision(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let workstreams = (1..=13)
@@ -345,6 +390,11 @@ fn feed_frame(
 ) {
     workspace
         .update(cx, |workspace, window, cx| {
+            // Transcript rendering tests use a selected agent explicitly;
+            // production startup no longer derives selection from a frame.
+            if workspace.is_startup_pane() {
+                workspace.select_agent(Some(agent_id), window, cx);
+            }
             workspace.handle_event(
                 ConnEvent::Frame {
                     agent_id,
@@ -363,7 +413,7 @@ fn feed_frames(
     cx: &mut TestAppContext,
     frames: impl IntoIterator<Item = (AgentId, AgentRemoteFrame)>,
 ) {
-    let events = frames
+    let events: Vec<_> = frames
         .into_iter()
         .map(|(agent_id, frame)| ConnEvent::Frame {
             agent_id,
@@ -373,6 +423,14 @@ fn feed_frames(
         .collect();
     workspace
         .update(cx, |workspace, window, cx| {
+            if workspace.is_startup_pane()
+                && let Some(agent_id) = events.iter().find_map(|event| match event {
+                    ConnEvent::Frame { agent_id, .. } => Some(*agent_id),
+                    _ => None,
+                })
+            {
+                workspace.select_agent(Some(agent_id), window, cx);
+            }
             workspace.handle_events(events, window, cx);
         })
         .expect("update workspace");

@@ -516,7 +516,7 @@ impl Workspace {
                 }
                 event => {
                     if !frames.is_empty() {
-                        self.handle_frame_batch(std::mem::take(&mut frames), window, cx);
+                        self.handle_frame_batch(std::mem::take(&mut frames), cx);
                         allocations.clear();
                     }
                     self.handle_event(event, window, cx);
@@ -524,7 +524,7 @@ impl Workspace {
             }
         }
         if !frames.is_empty() {
-            self.handle_frame_batch(frames, window, cx);
+            self.handle_frame_batch(frames, cx);
         }
         drop(allocations);
     }
@@ -532,17 +532,8 @@ impl Workspace {
     fn handle_frame_batch(
         &mut self,
         frames: Vec<(AgentId, rho_ui_proto::remote::AgentRemoteFrame)>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let startup_agent = matches!(self.registry.active_pane(), ActivePane::Startup)
-            .then(|| {
-                frames
-                    .iter()
-                    .find(|(agent_id, _)| self.subscriptions.accepts_frames(*agent_id))
-                    .map(|(agent_id, _)| *agent_id)
-            })
-            .flatten();
         let mut order = Vec::new();
         let mut changes: HashMap<AgentId, (FrameSummary, Option<u64>)> = HashMap::new();
         let mut live_changed = false;
@@ -586,18 +577,9 @@ impl Workspace {
             }
         }
 
-        if let Some(agent_id) = startup_agent {
-            // Materializing after applying the whole batch renders the final
-            // state directly, avoiding one editor sync per queued frame.
-            self.select_agent(Some(agent_id), window, cx);
-        }
-
         let selected = self.registry.selected_agent().copied();
         for agent_id in order {
             let summary = changes[&agent_id].0;
-            if Some(agent_id) == startup_agent {
-                continue;
-            }
             if selected == Some(agent_id) {
                 if let Some(view) = self.models.get(&agent_id).cloned()
                     && let Some(state) = self.store.get(&agent_id)
@@ -626,7 +608,7 @@ impl Workspace {
         // Selected views notify themselves when their editor changes. Only a
         // newly-live agent changes workspace chrome; background transcript
         // frames should not dirty the window.
-        if live_changed && startup_agent.is_none() {
+        if live_changed {
             cx.notify();
         }
     }
@@ -669,12 +651,9 @@ impl Workspace {
                     self.seed_draft(false, window, cx);
                 }
                 if let Some(agent_ids) = initial_subscriptions
-                    && let Some(selected) = agent_ids.first().copied()
+                    && !agent_ids.is_empty()
                 {
                     self.set_initial_subscriptions(agent_ids);
-                    if matches!(self.registry.active_pane(), ActivePane::Startup) {
-                        self.select_agent(Some(selected), window, cx);
-                    }
                 }
                 self.update_statuses(cx);
                 cx.notify();
@@ -748,7 +727,7 @@ impl Workspace {
                 frame,
                 allocation,
             } => {
-                self.handle_frame_batch(vec![(agent_id, frame)], window, cx);
+                self.handle_frame_batch(vec![(agent_id, frame)], cx);
                 drop(allocation);
             }
             ConnEvent::AgentAttention {
@@ -2798,6 +2777,11 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn is_dashboard_mode(&self, window: &Window, cx: &App) -> bool {
         self.dashboard_mode(window, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_startup_pane(&self) -> bool {
+        matches!(self.registry.active_pane(), ActivePane::Startup)
     }
 
     pub(crate) fn active_agent_model(&self) -> Option<Entity<AgentModel>> {
