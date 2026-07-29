@@ -210,6 +210,29 @@ the implementation crate.
   rail remains the last successful browser scene.
 - **Milestone 5 — highlighting:** deferred.
 
+### Split progress (2026-04-02)
+
+- The complete implementation was mechanically moved to `editor_core` and
+  `editor` is now a compatibility facade that re-exports it. Both crates enable
+  `editor_core/native` by default, so existing native crate paths, GPUI entity
+  types, inherent methods, and behavior are unchanged.
+- The native dependency families are optional dependencies of `editor_core`
+  activated by `native`: breadcrumbs, client, DAP, DB, edit prediction,
+  feature flags, file icons, filesystem use, fuzzy matching, Git, LSP,
+  Markdown, menus, project, RPC, tasks, telemetry, and workspace. This removes
+  them from the no-default-features direct dependency set while preserving the
+  default native graph.
+- `cargo check -p editor` in the Zed workspace and `cargo check -p rho-gui` at
+  the repository root pass after both changes.
+- The release wasm check now reaches `editor_core` Rust compilation with the
+  established nightly/unwrapped-clang setup. It currently reports about 300
+  unresolved native references because source modules and the interleaved
+  `Editor`/`EditorElement` implementation have not yet been feature-gated.
+  The highest-leverage next step is module-level gating of the native feature
+  list above, followed by relocating the four DisplayMap data types and then
+  separating native `Editor`/element impl blocks. No browser demo is possible
+  until that source split is complete.
+
 ### Reproduction
 
 ```sh
