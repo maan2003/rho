@@ -300,11 +300,9 @@ async fn run(
                     });
                     continue;
                 }
-                // Runs the cell's synchronous prefix inline; a busy loop
-                // blocks here until terminated via the isolate handle.
-                // A final primitive keeps V8's awaited REPL result alive;
-                // evaluations settling to `undefined` can otherwise race GC
-                // and report "Promise was collected" despite having run.
+                // REPL evaluation runs inline, so busy loops remain terminable.
+                // V8 weakly holds the result promise under Deno's explicit
+                // microtask policy, so drain its settlement before other V8 work.
                 let expression = format!("{source}\n;0");
                 session.post_message(
                     eval_id,
@@ -315,7 +313,6 @@ async fn run(
                         "awaitPromise": true,
                     })),
                 );
-                // Drain the REPL promise callback before V8 can collect it.
                 runtime.v8_isolate().perform_microtask_checkpoint();
                 let _ = runtime.execute_script("rho:end-cell", "__rhoBeginCell(0);");
             }
