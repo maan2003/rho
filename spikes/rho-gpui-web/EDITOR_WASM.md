@@ -392,6 +392,11 @@ the implementation crate.
   signature-help, on-type formatting, edit-prediction, and named project snippets
   are native hooks. Resolving the full input frontier leaves 108 errors, beginning
   with selection side effects and then the remaining interleaved `Editor` hooks.
+- Local selection mutation, active-selection publication, highlights, callbacks,
+  cursor blinking, and selection events remain portable. Context menus,
+  collaboration leadership, navigation history, workspace restoration/persistence,
+  and signature-help automation are native contributions. The selection frontier is
+  clear and 102 errors remain in the interleaved `Editor` hooks.
 
 ### Reproduction
 

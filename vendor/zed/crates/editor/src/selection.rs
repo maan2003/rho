@@ -1174,6 +1174,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "native")]
         self.hide_context_menu(window, cx);
 
         match phase {
@@ -1591,7 +1592,18 @@ impl Editor {
 
         let selection_anchors = self.selections.disjoint_anchors_arc();
 
-        if self.focus_handle.is_focused(window) && self.leader_id.is_none() {
+        let should_publish_active_selections = self.focus_handle.is_focused(window)
+            && {
+                #[cfg(feature = "native")]
+                {
+                    self.leader_id.is_none()
+                }
+                #[cfg(not(feature = "native"))]
+                {
+                    true
+                }
+            };
+        if should_publish_active_selections {
             self.buffer.update(cx, |buffer, cx| {
                 buffer.set_active_selections(
                     &selection_anchors,
@@ -1619,6 +1631,7 @@ impl Editor {
         let new_cursor_position = newest_selection.head();
         let selection_start = newest_selection.start;
 
+        #[cfg(feature = "native")]
         if effects.nav_history.is_none() || effects.nav_history == Some(true) {
             self.push_to_nav_history(
                 *old_cursor_position,
@@ -1714,6 +1727,7 @@ impl Editor {
         cx.emit(EditorEvent::SelectionsChanged { local });
 
         let selections = &self.selections.disjoint_anchors_arc();
+        #[cfg(feature = "native")]
         if local && let Some(buffer_snapshot) = buffer.as_singleton() {
             let inmemory_selections = selections
                 .iter()
@@ -1727,7 +1741,6 @@ impl Editor {
                 data.selections = inmemory_selections;
             });
 
-            #[cfg(feature = "native")]
             if WorkspaceSettings::get(None, cx).restore_on_startup
                 != RestoreOnStartupBehavior::EmptyTab
                 && let Some(workspace_id) = self.workspace_serialization_id(cx)
@@ -1782,6 +1795,7 @@ impl Editor {
 
             self.selections_did_change(true, old_cursor_position, state.effects, window, cx);
 
+            #[cfg(feature = "native")]
             if self.should_open_signature_help_automatically(old_cursor_position, cx) {
                 self.show_signature_help_auto(window, cx);
             }
