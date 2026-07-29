@@ -23,6 +23,10 @@ pub use path::PathStyle;
 pub fn home_dir() -> &'static PathBuf {
     static HOME_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     HOME_DIR.get_or_init(|| {
+        #[cfg(target_family = "wasm")]
+        return PathBuf::from("/");
+
+        #[cfg(not(target_family = "wasm"))]
         if cfg!(any(test, feature = "test-support")) {
             if cfg!(target_os = "macos") {
                 PathBuf::from("/Users/zed")

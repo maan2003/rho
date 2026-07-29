@@ -1,25 +1,34 @@
+#[cfg(not(target_family = "wasm"))]
 pub mod archive;
+#[cfg(not(target_family = "wasm"))]
 pub mod command;
 pub mod disambiguate;
+#[cfg(not(target_family = "wasm"))]
 pub mod fs;
 pub mod markdown;
 pub mod path_list;
 pub mod paths;
+#[cfg(not(target_family = "wasm"))]
 pub mod process;
 pub mod redact;
 pub mod schemars;
 pub mod serde;
+#[cfg(not(target_family = "wasm"))]
 pub mod shell;
+#[cfg(not(target_family = "wasm"))]
 pub mod shell_builder;
+#[cfg(not(target_family = "wasm"))]
 pub mod shell_env;
 pub mod size;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 pub mod time;
 
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Result;
 use itertools::Either;
 use regex::Regex;
+#[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::{
@@ -38,6 +47,7 @@ pub use take_until::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use util_macros::{line_endings, path, uri};
 
+#[cfg(not(target_family = "wasm"))]
 pub use self::shell::{
     get_default_system_shell, get_default_system_shell_preferring_bash, get_system_shell,
 };
@@ -310,6 +320,7 @@ fn load_shell_from_passwd() -> Result<()> {
 }
 
 /// Returns a shell escaped path for the current zed executable
+#[cfg(not(target_family = "wasm"))]
 pub fn get_shell_safe_zed_path(shell_kind: shell::ShellKind) -> anyhow::Result<String> {
     use anyhow::Context as _;
     use paths::PathExt;
@@ -334,6 +345,7 @@ pub fn get_shell_safe_zed_path(shell_kind: shell::ShellKind) -> anyhow::Result<S
 
 /// Returns a path for the zed cli executable, this function
 /// should be called from the zed executable, not zed-cli.
+#[cfg(not(target_family = "wasm"))]
 pub fn get_zed_cli_path() -> Result<PathBuf> {
     use anyhow::Context as _;
     let zed_path =
