@@ -175,6 +175,29 @@
           };
         };
 
+        # Adds CSP hash sources for the inline scripts trunk injects into
+        # index.html; the meta-tag policy would otherwise block the wasm
+        # bootstrap on static hosts, where per-response nonces are impossible.
+        webuiCspHash = pkgs.writeText "webui-csp-hash.py" ''
+          import base64
+          import hashlib
+          import re
+          import sys
+
+          path = sys.argv[1]
+          with open(path) as f:
+              html = f.read()
+          hashes = []
+          for m in re.finditer(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.DOTALL):
+              digest = base64.b64encode(hashlib.sha256(m.group(1).encode()).digest()).decode()
+              hashes.append("'sha256-" + digest + "'")
+          assert hashes, "no inline scripts found in index.html"
+          new, count = re.subn(r"script-src 'self'", "script-src 'self' " + " ".join(hashes), html)
+          assert count == 1, "expected one script-src directive, found %d" % count
+          with open(path, "w") as f:
+              f.write(new)
+        '';
+
         webui = pkgs.rustPlatform.buildRustPackage {
           pname = "rho-webui";
           version = "0.1.0";
@@ -186,6 +209,7 @@
             wasmBindgenCli
             pkgs.binaryen
             pkgs.lld
+            pkgs.python3
           ];
           # `ring` compiles C for wasm32; the wrapped clang injects host
           # flags that produce unlinkable objects.
@@ -198,6 +222,9 @@
             # Relative public URL: GitHub Pages serves project sites under a
             # /<repo>/ subpath.
             trunk build --release --dist dist --public-url ./
+            # Allow the trunk-injected inline bootstrap script through the
+            # CSP by hash; static hosts cannot use nonces.
+            python3 ${webuiCspHash} dist/index.html
             runHook postBuild
           '';
           installPhase = ''
