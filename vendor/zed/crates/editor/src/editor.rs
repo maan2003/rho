@@ -94,7 +94,6 @@ mod edit_prediction;
 mod input;
 #[cfg(feature = "native")]
 mod markdown_actions;
-#[cfg(feature = "native")]
 mod navigation;
 mod rewrap;
 mod selection;

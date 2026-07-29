@@ -9,17 +9,6 @@ impl Editor {
         self.show_completions_on_input_override = show_completions_on_input;
     }
 
-    pub fn text_layout_details(&self, window: &mut Window, cx: &mut App) -> TextLayoutDetails {
-        TextLayoutDetails {
-            text_system: window.text_system().clone(),
-            editor_style: self.style.clone().unwrap_or_else(|| self.create_style(cx)),
-            rem_size: window.rem_size(),
-            scroll_anchor: self.scroll_manager.shared_scroll_anchor(cx),
-            visible_rows: self.visible_line_count(),
-            vertical_scroll_margin: self.scroll_manager.vertical_scroll_margin,
-        }
-    }
-
     pub fn show_word_completions(
         &mut self,
         _: &ShowWordCompletions,

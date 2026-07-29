@@ -327,6 +327,24 @@ the implementation crate.
   element's long action-registration method would compile but would not meet
   the browser keyboard-navigation contract.
 
+### Stage 5 — portable navigation seam
+
+- The movement/navigation implementation now compiles in no-default-features
+  builds. Native navigation-history, project/workspace jumps, references, and
+  hover-link integration remain feature-gated, while cursor and selection
+  movement (including arrows, line home/end, words, paragraphs, excerpts, and
+  pages) remains portable.
+- `text_layout_details`, required for vertical movement through shaped and
+  wrapped text, moved out of the native completion module and into portable
+  navigation.
+- The release wasm check still reports exactly 25 initial diagnostics, all in
+  `element.rs` (21) and `element/mouse.rs` (4). That count masks substantial
+  follow-on work: experimentally resolving those imports exposed about 200
+  additional native references across element producers/consumers and nearby
+  portable modules. The element split must therefore gate coherent native
+  islands (fields, producers, and consumers together), rather than treating
+  the initial diagnostic count as the true remaining workload.
+
 ### Reproduction
 
 ```sh

@@ -1,6 +1,22 @@
 use super::*;
 
+#[cfg(not(feature = "native"))]
+use language::Direction as NavigationDirection;
+#[cfg(feature = "native")]
+use workspace::searchable::Direction as NavigationDirection;
+
 impl Editor {
+    pub fn text_layout_details(&self, window: &mut Window, cx: &mut App) -> TextLayoutDetails {
+        TextLayoutDetails {
+            text_system: window.text_system().clone(),
+            editor_style: self.style.clone().unwrap_or_else(|| self.create_style(cx)),
+            rem_size: window.rem_size(),
+            scroll_anchor: self.scroll_manager.shared_scroll_anchor(cx),
+            visible_rows: self.visible_line_count(),
+            vertical_scroll_margin: self.scroll_manager.vertical_scroll_margin,
+        }
+    }
+
     pub fn move_left(&mut self, _: &MoveLeft, window: &mut Window, cx: &mut Context<Self>) {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
@@ -42,9 +58,8 @@ impl Editor {
     }
 
     pub fn move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        #[cfg(feature = "native")]
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         if self.mode.is_single_line() {
             cx.propagate();
@@ -83,9 +98,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        #[cfg(feature = "native")]
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         if self.mode.is_single_line() {
             cx.propagate();
@@ -118,9 +132,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        #[cfg(feature = "native")]
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         if self.mode.is_single_line() {
             cx.propagate();
@@ -200,10 +213,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        #[cfg(feature = "native")]
+        if self.take_rename(true, window, cx).is_some() { return; }
 
+        #[cfg(feature = "native")]
         if self
             .context_menu
             .borrow_mut()
@@ -259,9 +272,8 @@ impl Editor {
     }
 
     pub fn move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        #[cfg(feature = "native")]
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         if self.mode.is_single_line() {
             cx.propagate();
@@ -319,10 +331,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        #[cfg(feature = "native")]
+        if self.take_rename(true, window, cx).is_some() { return; }
 
+        #[cfg(feature = "native")]
         if self
             .context_menu
             .borrow_mut()
@@ -630,7 +642,7 @@ impl Editor {
                         movement::comment_paragraph(
                             map,
                             selection.head(),
-                            workspace::searchable::Direction::Next,
+                            NavigationDirection::Next,
                         ),
                         SelectionGoal::None,
                     )
@@ -661,7 +673,7 @@ impl Editor {
                         movement::comment_paragraph(
                             map,
                             selection.head(),
-                            workspace::searchable::Direction::Prev,
+                            NavigationDirection::Prev,
                         ),
                         SelectionGoal::None,
                     )
@@ -726,7 +738,7 @@ impl Editor {
                     movement::start_of_excerpt(
                         map,
                         selection.head(),
-                        workspace::searchable::Direction::Prev,
+                        NavigationDirection::Prev,
                     ),
                     SelectionGoal::None,
                 )
@@ -751,7 +763,7 @@ impl Editor {
                     movement::start_of_excerpt(
                         map,
                         selection.head(),
-                        workspace::searchable::Direction::Next,
+                        NavigationDirection::Next,
                     ),
                     SelectionGoal::None,
                 )
@@ -775,7 +787,7 @@ impl Editor {
                     movement::end_of_excerpt(
                         map,
                         selection.head(),
-                        workspace::searchable::Direction::Next,
+                        NavigationDirection::Next,
                     ),
                     SelectionGoal::None,
                 )
@@ -799,7 +811,7 @@ impl Editor {
                     movement::end_of_excerpt(
                         map,
                         selection.head(),
-                        workspace::searchable::Direction::Prev,
+                        NavigationDirection::Prev,
                     ),
                     SelectionGoal::None,
                 )
@@ -820,7 +832,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, _| {
                 (
-                    movement::start_of_excerpt(map, head, workspace::searchable::Direction::Prev),
+                    movement::start_of_excerpt(map, head, NavigationDirection::Prev),
                     SelectionGoal::None,
                 )
             });
@@ -840,7 +852,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, _| {
                 (
-                    movement::start_of_excerpt(map, head, workspace::searchable::Direction::Next),
+                    movement::start_of_excerpt(map, head, NavigationDirection::Next),
                     SelectionGoal::None,
                 )
             });
@@ -860,7 +872,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, _| {
                 (
-                    movement::end_of_excerpt(map, head, workspace::searchable::Direction::Next),
+                    movement::end_of_excerpt(map, head, NavigationDirection::Next),
                     SelectionGoal::None,
                 )
             });
@@ -880,7 +892,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, _| {
                 (
-                    movement::end_of_excerpt(map, head, workspace::searchable::Direction::Prev),
+                    movement::end_of_excerpt(map, head, NavigationDirection::Prev),
                     SelectionGoal::None,
                 )
             });
@@ -926,6 +938,10 @@ impl Editor {
         });
     }
 
+}
+
+#[cfg(feature = "native")]
+impl Editor {
     pub fn set_nav_history(&mut self, nav_history: Option<ItemNavHistory>) {
         self.nav_history = nav_history;
     }
