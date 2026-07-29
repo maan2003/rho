@@ -71,6 +71,85 @@ and repository behavior and must be absent on wasm.
 
 ## Severance plan
 
+### Concrete editor symbol inventory (2026-04-02)
+
+The crate boundary has to account for Rust method ownership, not just Cargo
+edges. `Editor` is defined in a 12.9k-line `editor.rs`, `EditorElement` in a
+12.7k-line `element.rs`, and `DisplayMap` in a 4.6k-line module backed by about
+15k lines of map layers. Portable editing and native integration methods are
+currently interleaved in inherent `impl Editor` blocks. A second crate cannot
+add inherent native methods to a core-owned `Editor`, so simply moving the
+struct and leaving its project methods behind is not a viable incremental
+split.
+
+The concrete production-module dependencies are:
+
+- **Portable leaf modules now:** `display_map/{block_map,crease_map,
+  custom_highlights,dimensions,invisibles,row_scale_map,tab_map,wrap_map}` are
+  already expressed in terms of GPUI, language, `multi_buffer`, text, and
+  theme types. `selection`, `selections_collection`, and most of `movement`
+  are similarly model-only. `blink_manager`, indentation rendering, and the
+  scroll amount/autoscroll value types are also portable.
+- **Display-map leaks to relocate:** `InlayId` is owned by `project`; folding
+  ranges and semantic token types come from `project::lsp_store`; diagnostic
+  severity comes from both project settings and `lsp`; and the inlay map uses
+  `editor::inlays::{Inlay, InlayContent}` plus hover-highlight types. These are
+  data-model types, not project services, and must move to the core boundary
+  (or a lower language model crate). Display-map companion conversion also
+  calls the project-oriented split module and should be injected or kept as an
+  optional native extension. `block_map` calls one static spacer renderer on
+  `EditorElement`; that renderer must become a block-map callback/helper.
+- **Incidental native names in portable behavior:** `movement` imports only
+  `workspace::searchable::Direction` (a two-way navigation enum) and project
+  diagnostic settings in tests; `scroll` imports persistence plus
+  `WorkspaceId`/`ItemId` even though its coordinate and autoscroll machinery
+  is portable; `editor_settings` imports project diagnostic severity. These
+  value types/settings hooks should be core-owned, with persistence remaining
+  native.
+- **Native feature modules:** bookmarks, code actions/context menus/lens,
+  completions, diagnostics acquisition, document colors/links/symbols,
+  folding-range acquisition, hover providers, inlay-hint acquisition,
+  runnables/tasks, semantic-token acquisition, Git/blame, persistence, split
+  workspace items, and the clangd/rust-analyzer extensions directly call
+  project/workspace/LSP/RPC/DB/Git services and stay native. `items.rs` is the
+  workspace/collaboration serialization layer and stays native.
+- **Main `Editor` native state:** the struct directly stores `Project`,
+  `Workspace`/`WorkspaceId`, collaboration view and collaborator IDs, project
+  completion/semantics/edit-prediction delegates, code actions, debugger and
+  runnable state, LSP hover/rename/signature/document-highlight state,
+  Git-blame state, workspace navigation history, and serialization state.
+  Project event subscriptions and workspace item registration are also in the
+  main module. These fields and methods need a native extension state/delegate;
+  the core struct retains the `MultiBuffer`, `DisplayMap`, selections, scroll
+  manager, focus/input state, editing transactions, style/highlights, and
+  rendering configuration.
+- **`EditorElement` split:** basic text, cursor, selection, gutter, scrollbar,
+  block, inlay, and input rendering is portable. Header/path controls,
+  Git-blame/diff UI, debugger breakpoints, runnable/code-action gutters,
+  project settings, workspace tab-bar behavior, hover/context menus, and
+  Markdown LSP popovers are native render contributions. `element/header.rs`
+  stays native; `element/mouse.rs` is portable after delegating its project
+  file/AI-setting checks. The element needs a core-defined render delegate for
+  optional gutter/header/popover contributions rather than project handles.
+
+The lowest-risk crate cut is therefore an `editor_core` implementation crate
+with an explicit native integration feature, while `editor` initially becomes
+a compatibility/re-export facade enabling that feature. This preserves the
+existing `editor::Editor` identity and all native consumers while portable
+leaves and core `Editor`/`EditorElement` behavior are separated behind cfgs.
+Once the browser build is clean, native-only state can be moved from the
+feature implementation into delegate objects without a flag day across the
+many crates that store `Entity<Editor>`. A wrapper `editor::Editor(EditorCore)`
+was rejected because it changes GPUI entity types and cannot preserve inherent
+method calls through all consumers.
+
+The extraction order is: relocate the four display-map model leaks and spacer
+callback; move/check the complete display-map stack; move selection/movement
+and portable scrolling; split `EditorElement` render contributions; finally
+separate the core `Editor` fields/input methods from native feature state. Each
+step must keep the facade's native check green and add a release wasm check of
+the implementation crate.
+
 1. **Finish the portable text/model seam.**
    - Keep the wasm-only `util` module gates.
    - Keep the real tree-sitter runtime, query/syntax-map facilities, and one
