@@ -2191,7 +2191,52 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn adding_markdown_root_does_not_blank_settled_highlights(cx: &mut TestAppContext) {
+fn assistant_and_tool_segments_share_one_turn_buffer(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![
+                user("first request"),
+                assistant("first assistant segment", Some(UiMessagePhase::Commentary)),
+                UiBlock::Tool(tool("tool-1", UiToolStatus::Success, Some(10), Some(20))),
+                assistant(
+                    "second assistant segment",
+                    Some(UiMessagePhase::FinalAnswer),
+                ),
+                user("second request"),
+            ],
+            vec![assistant("next turn response", None)],
+        )),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            let buffers = editor.read(cx).buffer().read(cx).all_buffers();
+            let first_turn = buffers
+                .iter()
+                .find(|buffer| buffer.read(cx).text().contains("first assistant segment"))
+                .expect("first response turn buffer");
+            assert!(
+                first_turn
+                    .read(cx)
+                    .text()
+                    .contains("second assistant segment"),
+                "assistant segments separated by a tool must share their turn buffer"
+            );
+            assert!(
+                !first_turn.read(cx).text().contains("next turn response"),
+                "the next user turn must start a new response buffer"
+            );
+        })
+        .expect("inspect transcript turn buffers");
+}
+
+#[gpui::test]
+fn adding_markdown_turn_does_not_blank_settled_highlights(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -2213,8 +2258,8 @@ fn adding_markdown_root_does_not_blank_settled_highlights(cx: &mut TestAppContex
     let settled = syntax_highlights_for_text(&workspace, "settled **bold text**", cx);
     assert!(settled.iter().any(Option::is_some));
 
-    // Force the parse triggered by adding another root into the background so
-    // this observes what the editor paints while that replacement is pending.
+    // Force the settled turn's parser into background-only mode. Adding a new
+    // turn must not disturb that independent buffer's published highlights.
     let editor = active_editor(&workspace, cx);
     workspace
         .update(cx, |_, _, cx| {
@@ -2253,7 +2298,7 @@ fn adding_markdown_root_does_not_blank_settled_highlights(cx: &mut TestAppContex
     assert_eq!(
         syntax_highlights_for_text(&workspace, "settled **bold text**", cx),
         settled,
-        "adding a syntax root blanked existing highlights while parsing",
+        "adding a turn blanked existing highlights while parsing",
     );
 }
 
@@ -2364,5 +2409,189 @@ fn streamed_markup_conceals_once_its_delimiters_close(cx: &mut TestAppContext) {
     assert!(
         !text.contains("**"),
         "streamed markup should conceal like markup that arrived whole: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn terminal_invisible_assistant_segment_rebuilds_its_turn_when_it_appears(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![
+                user("go"),
+                assistant("first", Some(UiMessagePhase::Commentary)),
+            ],
+            vec![assistant("", None)],
+        )),
+    );
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 2,
+                    block: UiBlockDiff::AssistantText(UiTextDiff {
+                        keep_bytes: 0,
+                        value: "second".to_owned(),
+                    }),
+                }],
+            },
+            status: None,
+            context_used: None,
+        },
+    );
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("first\nsecond"),
+        "newly visible segment lost its turn separator: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn invisible_response_chunk_adds_no_excerpt_boundary(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![
+                user("first"),
+                assistant("", Some(UiMessagePhase::FinalAnswer)),
+                user("second"),
+            ],
+            Vec::new(),
+        )),
+    );
+
+    assert_eq!(buffer_text(&workspace, cx), "first\n\nsecond\n\n");
+}
+
+#[gpui::test]
+fn terminal_user_message_keeps_its_style_at_the_excerpt_boundary(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("last user")], Vec::new())),
+    );
+
+    let runs = styled_runs(&workspace, cx);
+    assert!(
+        runs.iter()
+            .any(|(text, color)| text.contains("last user") && color.is_some()),
+        "terminal user text lost its semantic style: {runs:?}"
+    );
+}
+
+#[gpui::test]
+fn growing_document_preview_preserves_the_terminal_newline(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("first")], vec![assistant("second", None)])),
+    );
+
+    let preview = workspace
+        .update(cx, |workspace, window, cx| {
+            let model = workspace.active_agent_model().expect("agent view");
+            model.update(cx, |model, cx| model.preview_editor(window, cx))
+        })
+        .expect("open preview");
+    let text = workspace
+        .update(cx, |_, _, cx| {
+            preview.update(cx, |preview, cx| preview.text(cx))
+        })
+        .expect("read preview text");
+
+    assert_eq!(text, "first\n\nsecond\n");
+}
+
+#[gpui::test]
+fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let mut history = Vec::new();
+    for index in 0..250 {
+        history.push(user(&format!("question {index}")));
+        history.push(assistant(
+            &format!("settled **answer {index}**"),
+            Some(UiMessagePhase::FinalAnswer),
+        ));
+    }
+    history.push(user("latest question"));
+    let active_index = history.len();
+    let initial = "## Initial heading\n\n**initial bold**";
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(history, vec![assistant(initial, None)])),
+    );
+    let first_parse = syntax_highlights_for_text(&workspace, initial, cx);
+    assert!(
+        first_parse.iter().any(Option::is_some),
+        "a new turn had no syntax tree for its first paint: {first_parse:?}"
+    );
+    for _ in 0..64 {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+    }
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .all_buffers()
+                .into_iter()
+                .find(|buffer| buffer.read(cx).text().contains(initial))
+                .expect("transcript buffer")
+                .update(cx, |buffer, _| {
+                    buffer.set_sync_parse_timeout(Some(std::time::Duration::from_millis(1)))
+                });
+        })
+        .expect("set transcript parse budget");
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: active_index,
+                    block: UiBlockDiff::AssistantText(UiTextDiff {
+                        keep_bytes: initial.len(),
+                        value: "\n\n## New heading\n\n**new bold**".to_owned(),
+                    }),
+                }],
+            },
+            status: None,
+            context_used: None,
+        },
+    );
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        !text.contains("## New heading"),
+        "heading flashed raw: {text:?}"
+    );
+    assert!(
+        !text.contains("**new bold**"),
+        "emphasis flashed raw: {text:?}"
     );
 }

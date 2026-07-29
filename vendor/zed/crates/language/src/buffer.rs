@@ -1344,11 +1344,6 @@ impl Buffer {
             if let Some(language_registry) = self.language_registry() {
                 branch.set_language_registry(language_registry);
             }
-            let root_scopes = self.syntax_map.lock().root_scopes().map(ToOwned::to_owned);
-            branch
-                .syntax_map
-                .lock()
-                .set_root_scopes(root_scopes, &branch.text);
 
             // Reparse the branch buffer so that we get syntax highlighting immediately.
             branch.reparse(cx, true);
@@ -1560,26 +1555,6 @@ impl Buffer {
         self.syntax_map
             .lock()
             .set_language_registry(language_registry);
-    }
-
-    /// Restricts the buffer's root syntax language to independent ranges.
-    ///
-    /// `None` parses one root over the whole buffer. `Some([])` keeps the
-    /// assigned root language but creates no syntax trees.
-    pub fn set_syntax_root_scopes(
-        &mut self,
-        root_scopes: Option<Vec<Range<Anchor>>>,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .syntax_map
-            .lock()
-            .set_root_scopes(root_scopes, &self.text)
-        {
-            self.non_text_state_update_count += 1;
-            self.was_changed();
-            self.reparse(cx, true);
-        }
     }
 
     pub fn language_registry(&self) -> Option<Arc<LanguageRegistry>> {
@@ -1934,7 +1909,6 @@ impl Buffer {
         syntax_map.interpolate(&text);
         let language_registry = syntax_map.language_registry();
         let mut syntax_snapshot = syntax_map.snapshot();
-        let root_scopes = syntax_snapshot.root_scopes().map(ToOwned::to_owned);
         drop(syntax_map);
 
         self.parse_status.0.send(ParseStatus::Parsing).unwrap();
@@ -1963,8 +1937,6 @@ impl Buffer {
         self.reparse = Some(cx.spawn(async move |this, cx| {
             let new_syntax_map = parse_task.await;
             this.update(cx, move |this, cx| {
-                let root_scopes_changed =
-                    this.syntax_map.lock().root_scopes() != root_scopes.as_deref();
                 let grammar_changed = || {
                     this.language
                         .as_ref()
@@ -1978,17 +1950,11 @@ impl Buffer {
                 };
                 let parse_again = this.version.changed_since(&parsed_version)
                     || language_registry_changed()
-                    || grammar_changed()
-                    || root_scopes_changed;
-                if !root_scopes_changed {
-                    this.did_finish_parsing(new_syntax_map, None, cx);
-                }
+                    || grammar_changed();
+                this.did_finish_parsing(new_syntax_map, None, cx);
                 this.reparse = None;
                 if parse_again {
                     this.reparse(cx, false);
-                    if this.reparse.is_none() {
-                        this.parse_status.0.send(ParseStatus::Idle).unwrap();
-                    }
                 }
             })
             .ok();

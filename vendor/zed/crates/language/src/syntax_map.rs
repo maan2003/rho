@@ -34,9 +34,6 @@ pub struct SyntaxMap {
 #[derive(Clone)]
 pub struct SyntaxSnapshot {
     layers: SumTree<SyntaxLayerEntry>,
-    root_language: Option<Arc<Language>>,
-    root_scopes: Option<Vec<Range<Anchor>>>,
-    root_scopes_dirty: bool,
     parsed_version: clock::Global,
     interpolated_version: clock::Global,
     language_registry_version: usize,
@@ -297,40 +294,8 @@ impl SyntaxMap {
 
     pub fn clear(&mut self, text: &BufferSnapshot) {
         let update_count = self.snapshot.update_count + 1;
-        let root_scopes = self.snapshot.root_scopes.take();
         self.snapshot = SyntaxSnapshot::new(text);
-        self.snapshot.root_scopes = root_scopes;
         self.snapshot.update_count = update_count;
-    }
-
-    pub fn set_root_scopes(
-        &mut self,
-        mut root_scopes: Option<Vec<Range<Anchor>>>,
-        text: &BufferSnapshot,
-    ) -> bool {
-        if let Some(scopes) = &mut root_scopes {
-            scopes.sort_by(|a, b| {
-                a.start
-                    .cmp(&b.start, text)
-                    .then_with(|| a.end.cmp(&b.end, text))
-            });
-        }
-        let same_scopes = match (&self.snapshot.root_scopes, &root_scopes) {
-            (None, None) => true,
-            (Some(old), Some(new)) if old.len() == new.len() => old
-                .iter()
-                .zip(new)
-                .all(|(old, new)| old.to_offset(text) == new.to_offset(text)),
-            _ => false,
-        };
-        if same_scopes {
-            return false;
-        }
-
-        self.snapshot.root_scopes = root_scopes;
-        self.snapshot.root_scopes_dirty = true;
-        self.snapshot.update_count += 1;
-        true
     }
 }
 
@@ -338,9 +303,6 @@ impl SyntaxSnapshot {
     fn new(text: &BufferSnapshot) -> Self {
         Self {
             layers: SumTree::new(text),
-            root_language: None,
-            root_scopes: None,
-            root_scopes_dirty: false,
             parsed_version: clock::Global::default(),
             interpolated_version: clock::Global::default(),
             language_registry_version: 0,
@@ -353,11 +315,10 @@ impl SyntaxSnapshot {
     }
 
     pub fn root_language(&self) -> Option<Arc<Language>> {
-        self.root_language.clone()
-    }
-
-    pub fn root_scopes(&self) -> Option<&[Range<Anchor>]> {
-        self.root_scopes.as_deref()
+        match &self.layers.first()?.content {
+            SyntaxLayerContent::Parsed { language, .. } => Some(language.clone()),
+            SyntaxLayerContent::Pending { .. } => None,
+        }
     }
 
     pub fn update_count(&self) -> usize {
@@ -513,14 +474,6 @@ impl SyntaxSnapshot {
         root_language: Arc<Language>,
         mut budget: Option<Duration>,
     ) -> Result<(), ParseTimeout> {
-        self.root_language = Some(root_language.clone());
-        if self.root_scopes_dirty {
-            // Keep the old layers in the foreground while replacement roots
-            // parse, but do not try to incrementally reuse trees whose root
-            // partition no longer matches this background snapshot.
-            self.layers = SumTree::new(text);
-            self.root_scopes_dirty = false;
-        }
         let budget = &mut budget;
         let edit_ranges = text
             .edits_since::<usize>(&self.parsed_version)
@@ -599,41 +552,20 @@ impl SyntaxSnapshot {
         let mut changed_regions = ChangeRegionSet::default();
         let mut queue = BinaryHeap::new();
         let mut combined_injection_ranges = HashMap::default();
-        match &self.root_scopes {
-            None => queue.push(ParseStep {
-                depth: 0,
-                language: ParseStepLanguage::Loaded {
-                    language: root_language,
-                },
-                included_ranges: vec![tree_sitter::Range {
-                    start_byte: 0,
-                    end_byte: text.len(),
-                    start_point: Point::zero().to_ts_point(),
-                    end_point: text.max_point().to_ts_point(),
-                }],
-                range: Anchor::min_max_range_for_buffer(text.remote_id()),
-                mode: ParseMode::Single,
-            }),
-            Some(scopes) => {
-                for scope in scopes {
-                    let range = scope.to_offset(text);
-                    queue.push(ParseStep {
-                        depth: 0,
-                        language: ParseStepLanguage::Loaded {
-                            language: root_language.clone(),
-                        },
-                        included_ranges: vec![tree_sitter::Range {
-                            start_byte: range.start,
-                            end_byte: range.end,
-                            start_point: range.start.to_point(text).to_ts_point(),
-                            end_point: range.end.to_point(text).to_ts_point(),
-                        }],
-                        range: scope.clone(),
-                        mode: ParseMode::Single,
-                    });
-                }
-            }
-        }
+        queue.push(ParseStep {
+            depth: 0,
+            language: ParseStepLanguage::Loaded {
+                language: root_language,
+            },
+            included_ranges: vec![tree_sitter::Range {
+                start_byte: 0,
+                end_byte: text.len(),
+                start_point: Point::zero().to_ts_point(),
+                end_point: text.max_point().to_ts_point(),
+            }],
+            range: Anchor::min_max_range_for_buffer(text.remote_id()),
+            mode: ParseMode::Single,
+        });
 
         loop {
             let step = queue.pop();

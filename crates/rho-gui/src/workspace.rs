@@ -3673,11 +3673,9 @@ impl Workspace {
                         .child(summary.model.clone()),
                 )
                 .child(match reset_in {
-                    Some(seconds) => format!(
-                        "{}% {:.1}d",
-                        summary.remaining_percent,
-                        seconds / 86_400.0
-                    ),
+                    Some(seconds) => {
+                        format!("{}% {:.1}d", summary.remaining_percent, seconds / 86_400.0)
+                    }
                     None if summary.reset_at_unix.is_some() => "100%".to_owned(),
                     None => format!("{}%", summary.remaining_percent),
                 });

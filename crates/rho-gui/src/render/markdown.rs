@@ -52,10 +52,10 @@ pub fn configure_buffer(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
         cx.set_global(MarkdownLanguagesRegistered);
     }
     buffer.set_language_registry(registry);
-    // Keep Buffer's bounded synchronous parse budget. Small streaming edits
-    // should not paint an interpolated capture from the previous text; large
-    // initial parses still time out and continue in the background.
-    buffer.set_language_async(Some(block.clone()), cx);
+    // Response buffers are created already populated. Spend Buffer's bounded
+    // synchronous parse budget before their excerpt becomes visible; larger
+    // turns still time out and continue in the background.
+    buffer.set_language(Some(block.clone()), cx);
 }
 
 fn markdown_language(cx: &App) -> Option<&'static Arc<Language>> {

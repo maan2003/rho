@@ -14,59 +14,6 @@ use unindent::Unindent as _;
 use util::test::marked_text_ranges;
 
 #[test]
-fn test_independent_root_scopes() {
-    let text = "```text\nunclosed\n\n**bold**";
-    let buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), text.to_owned());
-    let second_start = text.find("**bold**").unwrap();
-    let mut syntax_map = SyntaxMap::new(&buffer);
-    syntax_map.set_root_scopes(
-        Some(vec![
-            buffer.anchor_before(0)..buffer.anchor_after(second_start - 1),
-            buffer.anchor_before(second_start)..buffer.anchor_after(text.len()),
-        ]),
-        &buffer,
-    );
-
-    let markdown = markdown_lang();
-    syntax_map.reparse(markdown.clone(), &buffer);
-    let root_layers = syntax_map
-        .layers(&buffer)
-        .into_iter()
-        .filter(|layer| layer.depth == 0)
-        .collect::<Vec<_>>();
-    assert_eq!(root_layers.len(), 2);
-    assert!(
-        root_layers[0]
-            .node()
-            .to_sexp()
-            .contains("fenced_code_block")
-    );
-    assert!(
-        !root_layers[1]
-            .node()
-            .to_sexp()
-            .contains("fenced_code_block")
-    );
-    assert_eq!(root_layers[1].node().byte_range(), second_start..text.len());
-
-    syntax_map.set_root_scopes(Some(Vec::new()), &buffer);
-    syntax_map.reparse(markdown.clone(), &buffer);
-    assert!(syntax_map.is_empty());
-    assert_eq!(syntax_map.root_language(), Some(markdown));
-
-    syntax_map.set_root_scopes(None, &buffer);
-    syntax_map.reparse(markdown_lang(), &buffer);
-    assert_eq!(
-        syntax_map
-            .layers(&buffer)
-            .into_iter()
-            .filter(|layer| layer.depth == 0)
-            .count(),
-        1
-    );
-}
-
-#[test]
 fn test_splice_included_ranges() {
     let ranges = vec![ts_range(20..30), ts_range(50..60), ts_range(80..90)];
 

@@ -1,7 +1,8 @@
-//! Incremental transcript projection into a read-only buffer.
+//! Incremental transcript projection into per-turn read-only buffers.
 //!
-//! The transcript buffer always equals `render(blocks)`, one record per
-//! protocol block. A [`FrameSummary`] bounds every update: blocks before
+//! Response runs (assistant/tool/assistant until the next user message) each
+//! own one Markdown buffer; user-originated records own plain buffers. A
+//! [`FrameSummary`] bounds every update: blocks before
 //! `first_changed_block` are never touched (their anchors, highlights,
 //! gutters and folds survive untouched); everything after is re-rendered.
 //!
@@ -46,7 +47,7 @@ use crate::style::{Region, StyleClass};
 use crate::visualization::Visualization;
 
 pub struct TranscriptModel {
-    buffer: Entity<Buffer>,
+    multi_buffer: Entity<MultiBuffer>,
     /// The document multibuffer: the transcript excerpt, cropped when the
     /// turn is closed to end where the words end (no trailing turn
     /// separator). Preview editors read this; the full prompt-bearing
@@ -62,6 +63,7 @@ pub struct TranscriptModel {
     /// carry their highlights in the history region, records from it onward
     /// in the live-turn region.
     turn_boundary: usize,
+    buffers: Vec<TranscriptBuffer>,
     elisions: ElisionSync,
     // Custom inlay ids share each editor's id space with the prompt
     // placeholder (id 0), so they start at 1. One counter serves every
@@ -86,6 +88,7 @@ struct Attachment {
 }
 
 struct BlockRecord {
+    buffer: Entity<Buffer>,
     range: Range<Anchor>,
     kind: BlockKind,
     visible: bool,
@@ -94,7 +97,14 @@ struct BlockRecord {
     inlay: Option<InlayRecord>,
     styles: Vec<(StyleClass, Range<Anchor>)>,
     markdown: bool,
+    terminal_newline_supplied_by_excerpt: bool,
     visualizations: Vec<VisualizationAnchor>,
+}
+
+struct TranscriptBuffer {
+    start_block: usize,
+    composed: bool,
+    buffer: Entity<Buffer>,
 }
 
 #[derive(Clone)]
@@ -129,34 +139,31 @@ struct MarkdownConcealment;
 #[derive(Clone, Copy, PartialEq)]
 enum DocumentTail {
     /// The excerpt runs to the buffer's end and grows with appends.
-    Growing,
+    Growing(text::BufferId),
     /// The excerpt is cropped flush at this point.
-    Cropped(Point),
+    Cropped(text::BufferId, Point),
 }
 
 impl TranscriptModel {
     pub fn new(
-        buffer: Entity<Buffer>,
+        multi_buffer: Entity<MultiBuffer>,
         document_multi_buffer: Entity<MultiBuffer>,
         visualization_client: VisualizationClient,
     ) -> Self {
         Self {
-            buffer,
+            multi_buffer,
             document_multi_buffer,
             document_tail: None,
             turn_open: false,
             records: Vec::new(),
             turn_boundary: 0,
+            buffers: Vec::new(),
             elisions: ElisionSync::default(),
             next_inlay_id: 1,
             visualization_client,
             visualization_cache: HashMap::new(),
             attachments: Vec::new(),
         }
-    }
-
-    pub fn buffer(&self) -> &Entity<Buffer> {
-        &self.buffer
     }
 
     /// Attaches an editor showing this transcript (over whatever
@@ -169,6 +176,11 @@ impl TranscriptModel {
         now_ms: u64,
         cx: &mut Context<V>,
     ) {
+        editor.update(cx, |editor, cx| {
+            for turn in &self.buffers {
+                editor.disable_header_for_buffer(turn.buffer.read(cx).remote_id(), cx);
+            }
+        });
         self.attachments.push(Attachment {
             editor: editor.downgrade(),
             multi_buffer: editor.read(cx).buffer().clone(),
@@ -205,7 +217,8 @@ impl TranscriptModel {
             return;
         }
 
-        let start = first_changed.min(self.records.len());
+        let requested_start = first_changed.min(self.records.len());
+        let start = self.rebuild_start(requested_start, state);
 
         let changed_blocks = state.blocks.get(start..).unwrap_or(&[]);
         let mut prev_kind = last_visible_kind(&self.records[..start]);
@@ -224,41 +237,19 @@ impl TranscriptModel {
         let mut changed_history = HashSet::new();
         let mut changed_live = HashSet::new();
         let mut gutters_changed = false;
-        self.buffer.clone().update(cx, |buffer, cx| {
-            let removed = self.records.split_off(start);
-            for (offset, record) in removed.iter().enumerate() {
-                let changed = if start + offset < old_boundary {
-                    &mut changed_history
-                } else {
-                    &mut changed_live
-                };
-                for (class, _) in &record.styles {
-                    changed.insert(*class);
-                }
-                gutters_changed |= record.gutter.is_some();
+        let removed = self.records.split_off(start);
+        for (offset, record) in removed.iter().enumerate() {
+            let changed = if start + offset < old_boundary {
+                &mut changed_history
+            } else {
+                &mut changed_live
+            };
+            for (class, _) in &record.styles {
+                changed.insert(*class);
             }
-            let start_offset = removed
-                .first()
-                .map(|record| record.range.start.to_offset(buffer))
-                .unwrap_or_else(|| buffer.len());
-            // One edit keeps attached editors from synchronizing their display maps once
-            // per transcript block while a large agent is materialized.
-            let replacement = rendered_blocks
-                .iter()
-                .map(rendered_text)
-                .collect::<String>();
-            if start_offset < buffer.len() || !replacement.is_empty() {
-                buffer.edit([(start_offset..buffer.len(), replacement)], None, cx);
-            }
-
-            let mut offset = start_offset;
-            for rendered in rendered_blocks {
-                let record = block_record(buffer, offset, rendered);
-                offset += record.text.len();
-                gutters_changed |= record.gutter.is_some();
-                self.records.push(record);
-            }
-        });
+            gutters_changed |= record.gutter.is_some();
+        }
+        self.replace_buffers_from(start, rendered_blocks, &mut gutters_changed, cx);
 
         let new_boundary = turn_boundary(&self.records);
         for (index, record) in self.records.iter().enumerate().skip(start) {
@@ -284,11 +275,135 @@ impl TranscriptModel {
         }
         self.turn_boundary = new_boundary;
 
-        self.refresh_markdown_root_scopes(cx);
-
         self.refresh_elision_plans(state, start);
         self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
         cx.notify();
+    }
+
+    fn rebuild_start(&self, requested: usize, state: &UiAgentState) -> usize {
+        if let Some(record) = self.records.get(requested) {
+            return self
+                .buffers
+                .iter()
+                .find(|turn| turn.buffer == record.buffer)
+                .map_or(requested, |turn| turn.start_block);
+        }
+        let next_is_response = state.blocks.get(requested).is_some_and(|block| {
+            matches!(crate::render::block_kind(block), BlockKind::Response { .. })
+        });
+        if next_is_response
+            && self
+                .records
+                .last()
+                .is_some_and(|record| matches!(record.kind, BlockKind::Response { .. }))
+            && let Some(turn) = self.buffers.last()
+        {
+            return turn.start_block;
+        }
+        requested
+    }
+
+    fn replace_buffers_from<V: 'static>(
+        &mut self,
+        start: usize,
+        rendered_blocks: Vec<RenderedBlock>,
+        gutters_changed: &mut bool,
+        cx: &mut Context<V>,
+    ) {
+        let first_removed = self
+            .buffers
+            .iter()
+            .position(|turn| turn.start_block >= start)
+            .unwrap_or(self.buffers.len());
+        let removed = self.buffers.split_off(first_removed);
+        for turn in removed {
+            let path = transcript_path(turn.start_block);
+            self.multi_buffer.update(cx, |multi_buffer, cx| {
+                multi_buffer.remove_excerpts(path.clone(), cx)
+            });
+            self.document_multi_buffer.update(cx, |multi_buffer, cx| {
+                multi_buffer.remove_excerpts(path, cx)
+            });
+        }
+
+        let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
+        for (offset, rendered) in rendered_blocks.into_iter().enumerate() {
+            let block_index = start + offset;
+            let markdown = matches!(rendered.kind, BlockKind::Response { .. });
+            let starts_chunk = chunks
+                .last()
+                .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown);
+            if starts_chunk {
+                chunks.push((block_index, markdown, Vec::new()));
+            }
+            chunks.last_mut().unwrap().2.push(rendered);
+        }
+
+        let mut prepared = Vec::with_capacity(chunks.len());
+        // Materializing a long restored transcript can fill the parser pool.
+        // Create newest turns first so the visible live turn receives its
+        // bounded foreground parse before historical work is queued.
+        for (start_block, markdown, rendered) in chunks.into_iter().rev() {
+            let terminal_record = rendered.iter().rposition(RenderedBlock::visible);
+            let text = rendered.iter().map(rendered_text).collect::<String>();
+            let buffer = cx.new(|cx| {
+                let mut buffer = Buffer::local(&text, cx);
+                if markdown {
+                    crate::render::markdown::configure_buffer(&mut buffer, cx);
+                }
+                buffer.set_capability(language::Capability::Read, cx);
+                buffer
+            });
+            prepared.push((start_block, rendered, terminal_record, buffer));
+        }
+
+        for (start_block, rendered, terminal_record, buffer) in prepared.into_iter().rev() {
+            let mut offset = 0;
+            {
+                let snapshot = buffer.read(cx);
+                for (record_index, rendered) in rendered.into_iter().enumerate() {
+                    let record = block_record(
+                        &buffer,
+                        snapshot,
+                        offset,
+                        rendered,
+                        terminal_record == Some(record_index),
+                    );
+                    offset += record.text.len();
+                    *gutters_changed |= record.gutter.is_some();
+                    self.records.push(record);
+                }
+            }
+            let composed = !buffer.read(cx).is_empty();
+            if composed {
+                let path = transcript_path(start_block);
+                let end = composed_excerpt_end(buffer.read(cx));
+                self.multi_buffer.update(cx, |multi_buffer, cx| {
+                    multi_buffer.set_excerpts_for_path(
+                        path.clone(),
+                        buffer.clone(),
+                        [Point::zero()..end],
+                        0,
+                        cx,
+                    );
+                });
+                let buffer_id = buffer.read(cx).remote_id();
+                for attachment in &self.attachments {
+                    if let Some(editor) = attachment.editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.disable_header_for_buffer(buffer_id, cx)
+                        });
+                    }
+                }
+            }
+            self.buffers.push(TranscriptBuffer {
+                start_block,
+                composed,
+                buffer,
+            });
+        }
+        self.document_tail = None;
+        self.reset_document_excerpts(cx);
     }
 
     fn try_incremental_sync<V: 'static>(
@@ -315,11 +430,10 @@ impl TranscriptModel {
         };
         let rendered = render_block_with_agent_labels(block, prev_kind, now_ms, agent_label);
         let old_record = &self.records[index];
-        if index + 1 < self.records.len()
-            && (old_record.kind != rendered.kind || old_record.visible != rendered.visible())
-        {
+        if old_record.kind != rendered.kind || old_record.visible != rendered.visible() {
             return false;
         }
+        let terminal_newline_supplied_by_excerpt = old_record.terminal_newline_supplied_by_excerpt;
 
         let new_text = rendered_text(&rendered);
         let Some(edit) = rendered_text_edit(&old_record.text, &new_text) else {
@@ -329,7 +443,8 @@ impl TranscriptModel {
         let live_region = index >= self.turn_boundary;
         let mut changed = HashSet::new();
         let mut gutters_changed = false;
-        self.buffer.clone().update(cx, |buffer, cx| {
+        let record_buffer = self.records[index].buffer.clone();
+        record_buffer.update(cx, |buffer, cx| {
             let block_start = self.records[index].range.start.to_offset(buffer);
             let old_relative_styles =
                 relative_style_ranges(buffer, block_start, &self.records[index].styles);
@@ -339,22 +454,22 @@ impl TranscriptModel {
 
             let (span_ranges, inlay, gutter, visualizations) =
                 spans_for_rendered(buffer, block_start, &rendered);
-            let styles = rendered
-                .spans
-                .iter()
-                .zip(&span_ranges)
-                .filter(|(span, _)| span.class != StyleClass::Default && !span.text.is_empty())
-                .map(|(span, range)| (span.class, range.clone()))
-                .collect::<Vec<_>>();
+            let style_end = new_text
+                .len()
+                .checked_sub(usize::from(terminal_newline_supplied_by_excerpt))
+                .map(|len| block_start + len);
+            let styles = styles_for_rendered(buffer, &rendered, &span_ranges, style_end);
             let new_relative_styles = relative_style_ranges(buffer, block_start, &styles);
             changed.extend(changed_style_classes(
                 &old_relative_styles,
                 &new_relative_styles,
             ));
 
-            let new_end = block_start + new_text.len();
+            let new_end =
+                block_start + new_text.len() - usize::from(terminal_newline_supplied_by_excerpt);
             gutters_changed = self.records[index].gutter.is_some() || gutter.is_some();
             self.records[index] = BlockRecord {
+                buffer: record_buffer.clone(),
                 range: buffer.anchor_before(block_start)..buffer.anchor_before(new_end),
                 kind: rendered.kind,
                 visible: rendered.visible(),
@@ -363,6 +478,7 @@ impl TranscriptModel {
                 inlay,
                 styles,
                 markdown: rendered.markdown,
+                terminal_newline_supplied_by_excerpt,
                 visualizations,
             };
         });
@@ -373,7 +489,6 @@ impl TranscriptModel {
         } else {
             (&changed, &empty)
         };
-        self.refresh_markdown_root_scopes(cx);
         self.refresh_elision_plans(state, index);
         self.apply_to_attachments(now_ms, changed_history, changed_live, gutters_changed, cx);
         cx.notify();
@@ -396,21 +511,6 @@ impl TranscriptModel {
             .any(|record| record.inlay.as_ref().is_some_and(InlayRecord::ticks))
     }
 
-    fn refresh_markdown_root_scopes<V: 'static>(&self, cx: &mut Context<V>) {
-        let ranges = self
-            .records
-            .iter()
-            .filter(|record| record.markdown)
-            .map(|record| record.range.clone())
-            .collect::<Vec<_>>();
-        self.buffer.update(cx, |buffer, cx| {
-            // Record ends sit after the trailing newline, while streaming
-            // inserts occur before it. Their left bias therefore grows with
-            // the response without swallowing a subsequently appended block.
-            buffer.set_syntax_root_scopes(Some(ranges), cx)
-        });
-    }
-
     fn refresh_elision_plans(&mut self, state: &UiAgentState, first_changed_block: usize) {
         let visible = self
             .records
@@ -429,13 +529,41 @@ impl TranscriptModel {
         );
     }
 
+    fn reset_document_excerpts<V: 'static>(&self, cx: &mut Context<V>) {
+        let last = self.buffers.iter().rposition(|turn| turn.composed);
+        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
+            for (index, turn) in self.buffers.iter().enumerate() {
+                if !turn.composed {
+                    continue;
+                }
+                let buffer = turn.buffer.read(cx);
+                let end = if Some(index) == last {
+                    buffer.max_point()
+                } else {
+                    composed_excerpt_end(buffer)
+                };
+                multi_buffer.set_excerpts_for_path(
+                    transcript_path(turn.start_block),
+                    turn.buffer.clone(),
+                    [Point::zero()..end],
+                    0,
+                    cx,
+                );
+            }
+        });
+    }
+
     /// Aligns the document excerpt with the tail policy. Returns whether
     /// the excerpt was replaced (its id changed): every anchor a document
     /// attachment holds is stale then, and it needs a full re-apply.
     fn update_document_excerpt<V: 'static>(&mut self, cx: &mut Context<V>) -> bool {
-        let buffer = self.buffer.read(cx);
+        let Some(last) = self.buffers.iter().rev().find(|turn| turn.composed) else {
+            return self.document_tail.take().is_some();
+        };
+        let buffer = last.buffer.read(cx);
+        let buffer_id = buffer.remote_id();
         let desired = if self.turn_open {
-            DocumentTail::Growing
+            DocumentTail::Growing(buffer_id)
         } else {
             let len = buffer.len();
             let trailing = buffer
@@ -443,25 +571,20 @@ impl TranscriptModel {
                 .reversed_chars_at(len)
                 .take_while(|c| *c == '\n')
                 .count();
-            DocumentTail::Cropped(buffer.offset_to_point(len - trailing))
+            DocumentTail::Cropped(buffer_id, buffer.offset_to_point(len - trailing))
         };
         if self.document_tail == Some(desired) {
             return false;
         }
         self.document_tail = Some(desired);
         let end = match desired {
-            DocumentTail::Growing => buffer.max_point(),
-            DocumentTail::Cropped(end) => end,
+            DocumentTail::Growing(_) => buffer.max_point(),
+            DocumentTail::Cropped(_, end) => end,
         };
-        let buffer = self.buffer.clone();
+        let buffer = last.buffer.clone();
+        let path = transcript_path(last.start_block);
         self.document_multi_buffer.update(cx, |multi_buffer, cx| {
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(0),
-                buffer,
-                [Point::zero()..end],
-                0,
-                cx,
-            );
+            multi_buffer.set_excerpts_for_path(path, buffer, [Point::zero()..end], 0, cx);
         });
         true
     }
@@ -701,18 +824,35 @@ fn plan_anchor_range(records: &[BlockRecord], plan: &ElisionPlan) -> Option<Rang
     Some(start..end)
 }
 
-fn block_record(buffer: &Buffer, start: usize, rendered: RenderedBlock) -> BlockRecord {
+fn transcript_path(start_block: usize) -> PathKey {
+    PathKey::sorted(start_block as u64)
+}
+
+fn composed_excerpt_end(buffer: &Buffer) -> Point {
+    debug_assert!(buffer.as_rope().reversed_chars_at(buffer.len()).next() == Some('\n'));
+    buffer.offset_to_point(buffer.len() - 1)
+}
+
+fn block_record(
+    buffer_entity: &Entity<Buffer>,
+    buffer: &Buffer,
+    start: usize,
+    rendered: RenderedBlock,
+    terminal_newline_supplied_by_excerpt: bool,
+) -> BlockRecord {
     let (span_ranges, inlay, gutter, visualizations) = spans_for_rendered(buffer, start, &rendered);
     let text = rendered_text(&rendered);
-    let styles = rendered
-        .spans
-        .iter()
-        .zip(&span_ranges)
-        .filter(|(span, _)| span.class != StyleClass::Default && !span.text.is_empty())
-        .map(|(span, range)| (span.class, range.clone()))
-        .collect();
+    let style_end = text
+        .len()
+        .checked_sub(usize::from(terminal_newline_supplied_by_excerpt))
+        .map(|len| start + len);
+    let styles = styles_for_rendered(buffer, &rendered, &span_ranges, style_end);
     BlockRecord {
-        range: buffer.anchor_before(start)..buffer.anchor_before(start + text.len()),
+        buffer: buffer_entity.clone(),
+        range: buffer.anchor_before(start)
+            ..buffer.anchor_before(
+                start + text.len() - usize::from(terminal_newline_supplied_by_excerpt),
+            ),
         kind: rendered.kind,
         visible: rendered.visible(),
         text,
@@ -720,6 +860,7 @@ fn block_record(buffer: &Buffer, start: usize, rendered: RenderedBlock) -> Block
         inlay,
         styles,
         markdown: rendered.markdown,
+        terminal_newline_supplied_by_excerpt,
         visualizations,
     }
 }
@@ -834,6 +975,28 @@ fn spans_for_rendered(buffer: &Buffer, start: usize, rendered: &RenderedBlock) -
         })
         .collect();
     (ranges, inlay, gutter, visualizations)
+}
+
+fn styles_for_rendered(
+    buffer: &Buffer,
+    rendered: &RenderedBlock,
+    ranges: &[Range<Anchor>],
+    source_end: Option<usize>,
+) -> Vec<(StyleClass, Range<Anchor>)> {
+    rendered
+        .spans
+        .iter()
+        .zip(ranges)
+        .filter(|(span, _)| span.class != StyleClass::Default && !span.text.is_empty())
+        .filter_map(|(span, range)| {
+            let start = range.start.to_offset(buffer);
+            let end = source_end.map_or_else(
+                || range.end.to_offset(buffer),
+                |source_end| range.end.to_offset(buffer).min(source_end),
+            );
+            (start < end).then(|| (span.class, range.start..buffer.anchor_before(end)))
+        })
+        .collect()
 }
 
 fn reconcile_visualizations<V: 'static>(

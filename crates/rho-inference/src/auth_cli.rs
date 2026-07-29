@@ -313,8 +313,7 @@ pub fn chatgpt_weekly_usage(name: impl AsRef<str>) -> Result<Option<ChatGptUsage
     let resolved = auth.resolve().context("resolving OAuth credentials")?;
     let status = fetch_rate_limit_status(&resolved.bearer_token, resolved.account_id.as_deref())
         .context("fetching ChatGPT rate limits")?;
-    let Some(window) = status.rate_limit.as_ref().and_then(weekly_window)
-    else {
+    let Some(window) = status.rate_limit.as_ref().and_then(weekly_window) else {
         return Ok(None);
     };
     if !window.used_percent.is_finite() {

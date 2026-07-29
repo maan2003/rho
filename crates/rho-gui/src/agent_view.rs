@@ -6,9 +6,9 @@
 //! content or chrome changes, so the model persists for the session while
 //! editors come and go with panes.
 //!
-//! The multibuffer composes three buffers: the read-only transcript, a lazy
-//! read-only system-notice region (local messages that must survive
-//! transcript re-renders), and the writable prompt draft.
+//! The multibuffer composes the transcript's per-turn buffers, a lazy read-only
+//! system-notice region (local messages that must survive transcript
+//! re-renders), and the writable prompt draft.
 
 use std::ops::Range;
 
@@ -70,12 +70,6 @@ impl AgentModel {
         visualization_client: crate::connection::VisualizationClient,
         cx: &mut Context<Self>,
     ) -> Self {
-        let transcript_buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local("", cx);
-            crate::render::markdown::configure_buffer(&mut buffer, cx);
-            buffer.set_capability(Capability::Read, cx);
-            buffer
-        });
         let system_buffer = cx.new(|cx| {
             let mut buffer = Buffer::local("", cx);
             buffer.set_capability(Capability::Read, cx);
@@ -86,14 +80,7 @@ impl AgentModel {
         let multi_buffer = cx.new(|cx| {
             let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
             multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(0),
-                transcript_buffer.clone(),
-                [Point::zero()..transcript_buffer.read(cx).max_point()],
-                0,
-                cx,
-            );
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(2),
+                PathKey::sorted(u64::MAX),
                 prompt_buffer.clone(),
                 [Point::zero()..prompt_buffer.read(cx).max_point()],
                 0,
@@ -110,7 +97,7 @@ impl AgentModel {
 
         let document_multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadWrite));
         let transcript = TranscriptModel::new(
-            transcript_buffer,
+            multi_buffer.clone(),
             document_multi_buffer.clone(),
             visualization_client,
         );
@@ -144,7 +131,6 @@ impl AgentModel {
             return editor.clone();
         }
         let multi_buffer = self.document_multi_buffer.clone();
-        let transcript_id = self.transcript.buffer().read(cx).remote_id();
         let system_id = self.system_buffer.read(cx).remote_id();
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
@@ -159,7 +145,6 @@ impl AgentModel {
                 cx,
             );
             crate::editor_config::configure(&mut editor, window, cx);
-            editor.disable_header_for_buffer(transcript_id, cx);
             editor.disable_header_for_buffer(system_id, cx);
             editor.set_read_only(true);
             editor.set_autoscroll_pin(multi_buffer::Anchor::Max, AutoscrollStrategy::Bottom, cx);
@@ -175,7 +160,6 @@ impl AgentModel {
     /// Builds a pane's editor over the shared multibuffer — own cursor,
     /// scroll, and folds — fully caught up with the model.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
-        let transcript_id = self.transcript.buffer().read(cx).remote_id();
         let workspace = self.workspace.clone();
         let multi_buffer = self.multi_buffer.clone();
         let system_id = self.system_buffer.read(cx).remote_id();
@@ -193,7 +177,6 @@ impl AgentModel {
                 cx,
             );
             crate::editor_config::configure(&mut editor, window, cx);
-            editor.disable_header_for_buffer(transcript_id, cx);
             editor.disable_header_for_buffer(system_id, cx);
             editor.disable_header_for_buffer(prompt_id, cx);
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
@@ -312,7 +295,7 @@ impl AgentModel {
             self.system_excerpt_added = true;
             self.multi_buffer.update(cx, |multi_buffer, cx| {
                 multi_buffer.set_excerpts_for_path(
-                    PathKey::sorted(1),
+                    PathKey::sorted(u64::MAX - 1),
                     system_buffer.clone(),
                     [Point::zero()..system_buffer.read(cx).max_point()],
                     0,
@@ -328,7 +311,7 @@ impl AgentModel {
         };
         self.document_multi_buffer.update(cx, |multi_buffer, cx| {
             multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(1),
+                PathKey::sorted(u64::MAX - 1),
                 system_buffer.clone(),
                 [Point::zero()..end],
                 0,

@@ -9,9 +9,10 @@
 use std::io::{Read as _, Write as _};
 
 use anyhow::{Context as _, bail};
+use rho_ui_proto::client::Client;
 use rho_ui_proto::{
     AgentId, AgentIdDomain, ClientMessage, ServerMessage, UiAgentSummary, UiAttention,
-    UiWorkstream, WorkstreamId, WorkstreamTarget, client::Client,
+    UiWorkstream, WorkstreamId, WorkstreamTarget,
 };
 
 use crate::{WorkstreamArgs, WorkstreamCommand, default_socket_path};
@@ -211,7 +212,11 @@ impl Snapshot {
 
     fn agent_line(&self, agent: &UiAgentSummary) -> String {
         let mut line = self.agent_label(agent);
-        if let Some(name) = agent.display_name.as_deref().filter(|name| !name.is_empty()) {
+        if let Some(name) = agent
+            .display_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
             line.push_str("  ");
             line.push_str(name);
         }
