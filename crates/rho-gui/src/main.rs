@@ -12,7 +12,6 @@ mod highlights;
 mod minibuffer;
 mod native_realtime;
 mod pane;
-mod registry;
 mod render;
 mod rho_assets;
 #[cfg(test)]
@@ -38,6 +37,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use gpui::{App, AppContext as _, KeyBinding, WindowOptions, actions};
+// The registry lives in a shared crate so the web UI applies the same rail
+// policy; the alias keeps this crate's `crate::registry::` paths intact.
+use rho_registry as registry;
 use settings::SettingsStore;
 use tracing_subscriber::EnvFilter;
 

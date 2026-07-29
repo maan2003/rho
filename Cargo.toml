@@ -24,6 +24,7 @@ members = [
   "crates/rho-pr-monitor",
   "crates/rho-profiling",
   "crates/rho-realtime",
+  "crates/rho-registry",
   "crates/rho-slack",
   "crates/rho-tool-shell",
   "crates/rho-ui-proto",
@@ -105,6 +106,7 @@ rho-db = { path = "crates/rho-db" }
 rho-shell-proto = { path = "crates/rho-shell-proto" }
 rho-inference = { path = "crates/rho-inference" }
 rho-realtime = { path = "crates/rho-realtime" }
+rho-registry = { path = "crates/rho-registry" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }

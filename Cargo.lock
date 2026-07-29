@@ -13685,6 +13685,7 @@ dependencies = [
  "rho-iroh-auth",
  "rho-profiling",
  "rho-realtime",
+ "rho-registry",
  "rho-ui-proto",
  "rodio",
  "rust-embed",
@@ -13799,6 +13800,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rho-registry"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "prefix-id",
+ "rho-core",
+ "rho-ui-proto",
+ "web-time",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
-//! Agent lifecycle and selection.
+//! Agent lifecycle, selection, and the rail policy — shared by every Rho
+//! client surface so ordering, folding, and naming behave identically.
 //!
 //! One explicit state machine instead of parallel sets: an agent is *known*
 //! (appears in summaries or was announced), and optionally *live* (this
@@ -10,6 +11,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
 use rho_ui_proto::{AgentId, UiAgentSummary, UiWorkstream, WorkstreamId};
+
+/// Milliseconds since the unix epoch. `std::time` has no clock on
+/// wasm32-unknown-unknown; web-time is a drop-in that reads the browser's.
+pub fn now_ms() -> u64 {
+    #[cfg(target_family = "wasm")]
+    use web_time::{SystemTime, UNIX_EPOCH};
+    #[cfg(not(target_family = "wasm"))]
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
 
 /// A workstream with its member agents resolved: the unit the rail rows
 /// and per-task pane contexts are built around.
@@ -193,7 +207,8 @@ struct TopicRailLayout {
     /// directly; the listed/folded split below remains navigation policy.
     roots: Vec<(AgentId, usize)>,
     listed: Vec<(AgentId, usize)>,
-    #[cfg(test)]
+    /// Test support (for this crate and client crates' suites): the folded
+    /// complement of `listed`, newest first.
     folded: Vec<(AgentId, usize)>,
 }
 
@@ -398,7 +413,7 @@ impl AgentRegistry {
     /// The user engaged this agent right now (sent it a message).
     pub fn touch_agent(&mut self, agent_id: AgentId) {
         self.last_active
-            .insert(agent_id, rho_core::UnixMs(crate::workspace::now_ms()));
+            .insert(agent_id, rho_core::UnixMs(now_ms()));
         self.rebuild_topic_rail_layouts();
     }
 
@@ -874,12 +889,8 @@ impl AgentRegistry {
                     .filter(|agent| !state.auto_collapsed(agent.agent_id))
                     .partition(|agent| !state.folded(agent.agent_id));
                 let listed = self.order_topic_agents_with_state(&state, listed);
-                #[cfg(test)]
                 let mut folded = folded;
-                #[cfg(test)]
                 folded.sort_by_key(|agent| Reverse(agent.updated_at));
-                #[cfg(not(test))]
-                let _ = folded;
                 let indexes = topic
                     .agents
                     .iter()
@@ -897,7 +908,6 @@ impl AgentRegistry {
                     TopicRailLayout {
                         roots: cache(roots),
                         listed: cache(listed),
-                        #[cfg(test)]
                         folded: cache(folded),
                     },
                 )
@@ -930,7 +940,7 @@ impl AgentRegistry {
     /// Every visible root in the retained, coarse-bucket order used by the
     /// old agent rail. Unlike navigation folding, this does not drop quiet
     /// roots from a multi-root dashboard section.
-    pub(crate) fn ordered_workstream_roots<'a>(
+    pub fn ordered_workstream_roots<'a>(
         &self,
         workstream: &'a Workstream,
     ) -> Vec<&'a UiAgentSummary> {
@@ -942,7 +952,7 @@ impl AgentRegistry {
 
     /// Every visible agent in one workstream, ordered as a parent-before-child
     /// tree. The depth is relative to the root agent; roots have depth zero.
-    pub(crate) fn ordered_workstream_tree<'a>(
+    pub fn ordered_workstream_tree<'a>(
         &self,
         workstream: &'a Workstream,
     ) -> Vec<(&'a UiAgentSummary, usize)> {
@@ -1004,8 +1014,9 @@ impl AgentRegistry {
     /// Attention displayed for one dashboard root, including its visible
     /// descendants. This is also the signal used to place the root and its
     /// containing workstream in their coarse active cohorts.
-    #[cfg(test)]
-    pub(crate) fn split_workstream_agents<'a>(
+    ///
+    /// Test support for client crates' suites.
+    pub fn split_workstream_agents<'a>(
         &self,
         topic: &'a Workstream,
     ) -> (Vec<&'a UiAgentSummary>, Vec<&'a UiAgentSummary>) {
@@ -1081,7 +1092,7 @@ mod tests {
             },
             attention: rho_ui_proto::UiAttention::Quiet,
             last_active: rho_core::UnixMs(
-                crate::workspace::now_ms()
+                now_ms()
                     .saturating_sub(10_000)
                     .saturating_add(id),
             ),
@@ -1164,7 +1175,7 @@ mod tests {
     fn cycling_follows_active_rail_order() {
         let mut registry = AgentRegistry::default();
         let mut recent = agent(3, Status::Normal);
-        recent.last_active = rho_core::UnixMs(crate::workspace::now_ms() + 100);
+        recent.last_active = rho_core::UnixMs(now_ms() + 100);
         set_topics(
             &mut registry,
             vec![topic(
@@ -1196,7 +1207,7 @@ mod tests {
         // agent 1 engaged most recently (fixture recency grows with id,
         // bumped explicitly here).
         let mut fresh = agent(1, Status::Normal);
-        fresh.last_active = rho_core::UnixMs(crate::workspace::now_ms() + 100);
+        fresh.last_active = rho_core::UnixMs(now_ms() + 100);
         set_topics(
             &mut registry,
             vec![
