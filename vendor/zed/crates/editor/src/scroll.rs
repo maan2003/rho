@@ -890,6 +890,7 @@ impl Editor {
         #[cfg(not(feature = "native"))]
         let workspace_id = None;
 
+        #[cfg(feature = "native")]
         self.edit_prediction_preview
             .set_previous_scroll_position(None);
 
@@ -925,7 +926,10 @@ impl Editor {
     ) {
         #[cfg(feature = "native")]
         hide_hover(self, cx);
+        #[cfg(feature = "native")]
         let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
+        #[cfg(not(feature = "native"))]
+        let workspace_id = None;
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let top_row = scroll_anchor
             .anchor
@@ -951,7 +955,10 @@ impl Editor {
     ) {
         #[cfg(feature = "native")]
         hide_hover(self, cx);
+        #[cfg(feature = "native")]
         let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
+        #[cfg(not(feature = "native"))]
+        let workspace_id = None;
         let buffer_snapshot = self.buffer().read(cx).snapshot(cx);
         if !scroll_anchor.anchor.is_valid(&buffer_snapshot) {
             log::warn!("Invalid scroll anchor: {:?}", scroll_anchor);

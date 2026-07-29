@@ -12,6 +12,7 @@ impl Editor {
             return;
         }
 
+        #[cfg(feature = "native")]
         if self.mouse_context_menu.is_some() {
             return;
         }

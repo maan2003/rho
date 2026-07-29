@@ -380,6 +380,9 @@ the implementation crate.
 - Fold transforms remain portable; only the native workspace restoration-data
   mirror is omitted. Debugger inline-value state is likewise native-only while
   base inlay splicing/highlighting remains portable. This leaves 132 errors.
+- Scrolling and anchors remain portable. Context-menu/edit-prediction reset
+  hooks and workspace persistence identifiers are now native contributions
+  around the shared scroll manager, leaving 128 errors.
 
 ### Reproduction
 
