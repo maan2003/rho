@@ -201,9 +201,13 @@ the implementation crate.
 - **Milestone 3 — reduced editor:** complete. The single `editor` crate has a
   default-on `native` feature; `--no-default-features` retains the complete
   portable editing/rendering path and passes the release wasm check.
-- **Milestone 4 — browser editor demo:** not started. The existing plain GPUI
-  rail remains the last successful browser scene.
-- **Milestone 5 — highlighting:** deferred.
+- **Milestone 4 — browser editor demo:** complete. The browser mounts a real
+  in-memory `Editor::multi_line` beside the existing rail, focuses it, and
+  wires text input, Backspace, Enter, arrows, Home/End, undo/redo, mouse
+  selection, and wheel scrolling through the portable editor action/input path.
+- **Milestone 5 — highlighting:** deferred. The demo deliberately stops at the
+  stable editing/rendering seam rather than adding a grammar after the runtime
+  portability fixes needed for interactive verification.
 
 ### Split progress (2026-04-02)
 
@@ -402,6 +406,46 @@ the implementation crate.
   bookmarks/breakpoints/debugger state, diff loading, edit predictions, and language
   server control are gated as complete native islands. The release
   `editor --no-default-features` wasm check now passes with zero errors.
+
+### Browser demo and runtime verification (2026-04-02)
+
+The standalone spike now depends on `editor` with default features disabled
+and constructs its singleton buffer entirely in memory. It initializes Zed's
+embedded fonts, base theme/settings, and editor actions, then mounts the editor
+as an ordinary GPUI entity beside the canned Rho agent rail. No project,
+workspace, filesystem, persistence, LSP, Git, DAP, Node, or daemon service is
+constructed.
+
+Browser exercise found four runtime-only portability seams beyond a successful
+wasm compile:
+
+- syntax snapshots drop their tree-sitter layers synchronously on wasm instead
+  of spawning the native drop thread;
+- transaction and editor timing uses `web_time::Instant`, which is
+  `std::time::Instant`-compatible natively and calls the browser clock on wasm;
+- wrap-map, autoindent, and indent-guide work is awaited asynchronously on wasm
+  instead of using GPUI's deliberately unsupported blocking executor methods;
+- animation frames are deferred while another GPUI app update owns the app
+  borrow, avoiding harmless-but-noisy re-entrant frame errors during key actions.
+
+A headed Chromium 150 run in the isolated Wayland compositor, served with
+COOP/COEP, reported `crossOriginIsolated`, initialized `BrowserWebGpu`,
+created a 2560x1378 canvas and hidden input, and continued submitting frames
+without console, wasm panic, or wgpu validation errors while typing, deleting,
+inserting newlines, moving with arrows/Home/End, undoing, and wheel scrolling.
+The software-renderer capture is not used as a pixel-success criterion, per the
+renderer findings.
+
+The final clean release artifact is **23,517,126 bytes (22.43 MiB)** before
+compression and with wasm-opt disabled. The larger size relative to the plain
+rail is expected: it now contains the editor/display-map/text/language stack and
+embedded Zed assets.
+
+The standalone build needs two C-toolchain details in addition to the existing
+threaded Rust flags: C/C++ objects use `-matomics -mbulk-memory`, and the clang
+shim injects tree-sitter's minimal wasm libc headers only for tree-sitter builds
+so they do not shadow zstd's own wasm shim. A direct getrandom 0.2 dependency
+enables its `js` feature for the standalone resolver.
 
 ### Reproduction
 

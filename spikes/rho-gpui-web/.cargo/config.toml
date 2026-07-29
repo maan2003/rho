@@ -16,3 +16,4 @@ build-std = ["std", "panic_abort"]
 
 [env]
 CC_wasm32_unknown_unknown = { value = "toolchain/clang", relative = true, force = true }
+CFLAGS_wasm32_unknown_unknown = "-matomics -mbulk-memory"

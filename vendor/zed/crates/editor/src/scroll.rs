@@ -21,8 +21,9 @@ pub use scroll_amount::ScrollAmount;
 use settings::Settings;
 use std::{
     cmp::Ordering,
-    time::{Duration, Instant},
+    time::Duration,
 };
+use web_time::Instant;
 use ui::scrollbars::ScrollbarAutoHide;
 use util::ResultExt;
 #[cfg(feature = "native")]

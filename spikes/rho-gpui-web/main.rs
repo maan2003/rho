@@ -1,5 +1,12 @@
+use editor::{
+    Backspace, Editor, MoveLeft, MoveRight, MoveToBeginningOfLine, MoveToEndOfLine, Newline, Redo,
+    Undo,
+};
 use gpui::prelude::*;
-use gpui::{App, Bounds, Context, Window, WindowBounds, WindowOptions, div, px, rgb, size};
+use gpui::{
+    App, AssetSource, Bounds, Context, Focusable, KeyBinding, Window, WindowBounds, WindowOptions,
+    div, px, rgb, size,
+};
 use rho_core::UnixMs;
 use rho_registry::AgentRegistry;
 use rho_ui_proto::{
@@ -18,10 +25,11 @@ const NEEDS_INPUT: u32 = 0xff7b72;
 
 struct Rail {
     registry: AgentRegistry,
+    editor: gpui::Entity<Editor>,
 }
 
 impl Rail {
-    fn canned() -> Self {
+    fn canned(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut registry = AgentRegistry::default();
         registry.set_machine_seed(7);
         registry.set_agent_counter(4);
@@ -73,7 +81,23 @@ impl Rail {
                 ),
             ],
         );
-        Self { registry }
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_text(
+                "// The real Zed editor, running in WebAssembly\n\
+                 fn browser_editor() {\n\
+                 \tlet editing = \"typing, selection, movement\";\n\
+                 \tprintln!(\"{editing}\");\n\
+                 }\n\n\
+                 Try typing here. Backspace, Enter, arrows, Home/End,\n\
+                 scrolling, Ctrl-Z and Ctrl-Shift-Z are wired to Editor.",
+                window,
+                cx,
+            );
+            editor
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        Self { registry, editor }
     }
 }
 
@@ -180,14 +204,14 @@ impl Render for Rail {
             .flex()
             .size_full()
             .bg(rgb(BACKGROUND))
-            .justify_center()
-            .items_center()
+            .gap_4()
+            .p_5()
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_4()
-                    .w(px(480.))
+                    .w(px(420.))
                     .p_5()
                     .rounded_lg()
                     .bg(rgb(RAIL))
@@ -200,19 +224,55 @@ impl Render for Rail {
                     )
                     .child(workstream_rows),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .h_full()
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(ROW))
+                    .child(self.editor.clone()),
+            )
     }
 }
 
 fn main() {
     gpui_platform::web_init();
     let app = gpui_platform::application().run_embedded(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(720.), px(640.)), cx);
+        let assets = assets::Assets;
+        let fonts = assets
+            .list("fonts")
+            .expect("list embedded fonts")
+            .into_iter()
+            .filter(|path| path.ends_with(".ttf"))
+            .map(|path| assets.load(&path).expect("load embedded font").unwrap())
+            .collect();
+        cx.text_system().add_fonts(fonts).expect("add editor fonts");
+        settings::init(cx);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+        cx.bind_keys([
+            KeyBinding::new("left", MoveLeft, Some("Editor")),
+            KeyBinding::new("right", MoveRight, Some("Editor")),
+            KeyBinding::new("up", zed_actions::editor::MoveUp, Some("Editor")),
+            KeyBinding::new("down", zed_actions::editor::MoveDown, Some("Editor")),
+            KeyBinding::new("home", MoveToBeginningOfLine::default(), Some("Editor")),
+            KeyBinding::new("end", MoveToEndOfLine::default(), Some("Editor")),
+            KeyBinding::new("backspace", Backspace, Some("Editor")),
+            KeyBinding::new("enter", Newline, Some("Editor")),
+            KeyBinding::new("ctrl-z", Undo, Some("Editor")),
+            KeyBinding::new("ctrl-shift-z", Redo, Some("Editor")),
+        ]);
+
+        let bounds = Bounds::centered(None, size(px(1180.), px(720.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Rail::canned()),
+            |window, cx| cx.new(|cx| Rail::canned(window, cx)),
         )
         .expect("open spike window");
         cx.activate(true);

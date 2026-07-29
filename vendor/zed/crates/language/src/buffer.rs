@@ -52,7 +52,7 @@ use std::{
     path::PathBuf,
     rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
     vec,
 };
 use sum_tree::TreeMap;
@@ -68,6 +68,7 @@ use theme::{ActiveTheme as _, SyntaxTheme};
 #[cfg(any(test, feature = "test-support"))]
 use util::RandomCharIter;
 use util::{RangeExt, debug_panic, maybe, paths::PathStyle, rel_path::RelPath};
+use web_time::Instant;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use {tree_sitter_python, tree_sitter_rust, tree_sitter_typescript};
@@ -2087,7 +2088,7 @@ impl Buffer {
     fn request_autoindent(&mut self, cx: &mut Context<Self>, block_budget: Option<Duration>) {
         if let Some(indent_sizes) = self.compute_autoindents() {
             let indent_sizes = cx.background_spawn(indent_sizes);
-            let Some(block_budget) = block_budget else {
+            if block_budget.is_none() || cfg!(target_family = "wasm") {
                 self.pending_autoindent = Some(cx.spawn(async move |this, cx| {
                     let indent_sizes = indent_sizes.await;
                     this.update(cx, |this, cx| {
@@ -2096,7 +2097,8 @@ impl Buffer {
                     .ok();
                 }));
                 return;
-            };
+            }
+            let block_budget = block_budget.unwrap();
             match cx
                 .foreground_executor()
                 .block_with_timeout(block_budget, indent_sizes)

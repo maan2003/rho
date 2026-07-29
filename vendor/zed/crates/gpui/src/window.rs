@@ -1577,6 +1577,11 @@ impl Window {
                     deferred_force_render |= request_frame_options.force_render;
                     return;
                 }
+                if !cx.can_update() {
+                    log::debug!("deferring window draw request during app update");
+                    deferred_force_render |= request_frame_options.force_render;
+                    return;
+                }
                 // Take the deferred flag first: `||` short-circuits, and leaving
                 // the flag set when this request already forces a render would
                 // force a second, redundant render on the next frame.

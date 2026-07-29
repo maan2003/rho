@@ -98,7 +98,7 @@ mod navigation;
 mod rewrap;
 mod selection;
 
-pub(crate) use actions::*;
+pub use actions::*;
 pub use clipboard::ClipboardSelection;
 #[cfg(feature = "native")]
 pub use code_actions::CodeActionProvider;
@@ -326,8 +326,9 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+use web_time::Instant;
 #[cfg(feature = "native")]
 use task::TaskVariables;
 use text::{BufferId, FromAnchor, OffsetUtf16, Rope, ToOffset as _, ToPoint as _};

@@ -5820,6 +5820,7 @@ dependencies = [
  "util",
  "uuid",
  "vim_mode_setting",
+ "web-time",
  "workspace",
  "zed_actions",
  "zlog",
@@ -9729,6 +9730,7 @@ dependencies = [
  "unindent",
  "util",
  "watch",
+ "web-time",
  "zlog",
  "ztracing",
 ]
@@ -11342,6 +11344,7 @@ dependencies = [
  "tree-sitter-wasm-feature",
  "unicode-segmentation",
  "util",
+ "web-time",
  "zlog",
  "ztracing",
 ]
@@ -18662,6 +18665,7 @@ dependencies = [
  "smallvec",
  "sum_tree",
  "util",
+ "web-time",
  "zlog",
 ]
 

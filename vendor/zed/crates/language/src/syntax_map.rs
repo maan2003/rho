@@ -13,8 +13,8 @@ use std::{
     collections::BinaryHeap,
     fmt, iter,
     ops::{ControlFlow, Deref, DerefMut, Range},
-    sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 use streaming_iterator::StreamingIterator;
 use sum_tree::{Bias, Dimensions, SeekTarget, SumTree};
@@ -23,6 +23,7 @@ use tree_sitter::{
     Node, Query, QueryCapture, QueryCaptures, QueryCursor, QueryMatch, QueryMatches,
     QueryPredicateArg,
 };
+use web_time::Instant;
 
 pub const MAX_BYTES_TO_QUERY: usize = 16 * 1024;
 
@@ -42,10 +43,11 @@ pub struct SyntaxSnapshot {
 
 // Dropping deep treesitter Trees can be quite slow due to deallocating lots of memory.
 // To avoid blocking the main thread, we offload the drop operation to a background thread.
+#[cfg(not(target_family = "wasm"))]
 impl Drop for SyntaxSnapshot {
     fn drop(&mut self) {
-        static DROP_TX: LazyLock<std::sync::mpsc::Sender<SumTree<SyntaxLayerEntry>>> =
-            LazyLock::new(|| {
+        static DROP_TX: std::sync::LazyLock<std::sync::mpsc::Sender<SumTree<SyntaxLayerEntry>>> =
+            std::sync::LazyLock::new(|| {
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::Builder::new()
                     .name("SyntaxSnapshot::drop".into())

@@ -65,6 +65,7 @@ text.workspace = true
 theme.workspace = true
 toml.workspace = true
 tracing.workspace = true
+web-time.workspace = true
 grammars = { workspace = true, optional = true }
 tree-sitter-json = { workspace = true, optional = true }
 tree-sitter-md = { workspace = true, optional = true }

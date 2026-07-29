@@ -234,7 +234,7 @@ impl WrapMap {
                 new: range,
             }];
 
-            if total_rows < WRAP_YIELD_ROW_INTERVAL {
+            if cfg!(not(target_family = "wasm")) && total_rows < WRAP_YIELD_ROW_INTERVAL {
                 let edits = gpui::block_on(new_snapshot.update(
                     tab_snapshot,
                     &tab_edits,
@@ -258,6 +258,7 @@ impl WrapMap {
                     (new_snapshot, edits)
                 });
 
+                #[cfg(not(target_family = "wasm"))]
                 match cx
                     .foreground_executor()
                     .block_with_timeout(Duration::from_millis(5), task)
@@ -267,22 +268,12 @@ impl WrapMap {
                         self.edits_since_sync = self.edits_since_sync.compose(&edits);
                     }
                     Err(wrap_task) => {
-                        self.background_task = Some(cx.spawn(async move |this, cx| {
-                            let (snapshot, edits) = wrap_task.await;
-                            this.update(cx, |this, cx| {
-                                this.snapshot = snapshot;
-                                this.edits_since_sync = this
-                                    .edits_since_sync
-                                    .compose(mem::take(&mut this.interpolated_edits).invert())
-                                    .compose(&edits);
-                                this.background_task = None;
-                                this.flush_edits(cx);
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
+                        let wrap_task = cx.background_spawn(wrap_task);
+                        self.finish_update_in_background(wrap_task, cx);
                     }
                 }
+                #[cfg(target_family = "wasm")]
+                self.finish_update_in_background(task, cx);
             }
         } else {
             let old_rows = self.snapshot.transforms.summary().output.lines.row + 1;
@@ -300,6 +291,27 @@ impl WrapMap {
                 new: WrapRow(0)..WrapRow(new_rows),
             }]));
         }
+    }
+
+    fn finish_update_in_background(
+        &mut self,
+        task: Task<(WrapSnapshot, WrapPatch)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_task = Some(cx.spawn(async move |this, cx| {
+            let (snapshot, edits) = task.await;
+            this.update(cx, |this, cx| {
+                this.snapshot = snapshot;
+                this.edits_since_sync = this
+                    .edits_since_sync
+                    .compose(mem::take(&mut this.interpolated_edits).invert())
+                    .compose(&edits);
+                this.background_task = None;
+                this.flush_edits(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     #[ztracing::instrument(skip_all)]
@@ -328,7 +340,8 @@ impl WrapMap {
             let text_system = cx.text_system().clone();
             let (font, font_size) = self.font_with_size.clone();
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
-            if pending_edits.len() == 1
+            if cfg!(not(target_family = "wasm"))
+                && pending_edits.len() == 1
                 && let Some((_, _, tab_edits)) = pending_edits.back()
                 && let [edit] = &**tab_edits
                 && ((edit.new.end.row().saturating_sub(edit.new.start.row()) + 1) as usize)
@@ -362,6 +375,7 @@ impl WrapMap {
                     (snapshot, edits)
                 });
 
+                #[cfg(not(target_family = "wasm"))]
                 match cx
                     .foreground_executor()
                     .block_with_timeout(Duration::from_millis(1), update_task)
@@ -371,22 +385,12 @@ impl WrapMap {
                         self.edits_since_sync = self.edits_since_sync.compose(&output_edits);
                     }
                     Err(update_task) => {
-                        self.background_task = Some(cx.spawn(async move |this, cx| {
-                            let (snapshot, edits) = update_task.await;
-                            this.update(cx, |this, cx| {
-                                this.snapshot = snapshot;
-                                this.edits_since_sync = this
-                                    .edits_since_sync
-                                    .compose(mem::take(&mut this.interpolated_edits).invert())
-                                    .compose(&edits);
-                                this.background_task = None;
-                                this.flush_edits(cx);
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
+                        let update_task = cx.background_spawn(update_task);
+                        self.finish_update_in_background(update_task, cx);
                     }
                 }
+                #[cfg(target_family = "wasm")]
+                self.finish_update_in_background(update_task, cx);
             }
         }
 

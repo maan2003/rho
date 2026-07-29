@@ -31,6 +31,13 @@ impl AsyncApp {
             .upgrade()
             .expect("app was released before async operation completed")
     }
+
+    pub(crate) fn can_update(&self) -> bool {
+        let Some(app) = self.app.upgrade() else {
+            return false;
+        };
+        app.try_borrow_mut().is_ok()
+    }
 }
 
 impl AppContext for AsyncApp {
