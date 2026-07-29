@@ -2,36 +2,32 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::net::UnixStream;
-
 use crate::{
-    ClientMessage, IoCounters, ProtocolLogDirection, ServerMessage, append_protocol_log_record,
-    protocol_frame_bytes, read_frame_counted, write_frame_counted,
+    ClientMessage, ProtocolLogDirection, ServerMessage, append_protocol_log_record,
+    protocol_frame_bytes, read_frame, write_frame,
 };
 
 /// Raw async client for the rho UI Unix-socket protocol.
 pub struct Client {
-    stream: UnixStream,
-    counters: IoCounters,
+    stream: rho_rpc::Stream,
     logger: Option<ProtocolLogger>,
 }
 
 impl Client {
     pub async fn connect(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let stream = UnixStream::connect(path).await?;
+        let stream = rho_rpc::connect_unix(path).await?;
         Ok(Self::from_stream(stream))
     }
 
-    pub fn from_stream(stream: UnixStream) -> Self {
+    pub fn from_stream(stream: rho_rpc::Stream) -> Self {
         Self {
             stream,
-            counters: IoCounters::default(),
             logger: ProtocolLogger::from_env(),
         }
     }
 
     pub async fn send(&mut self, message: &ClientMessage) -> anyhow::Result<()> {
-        write_frame_counted(&mut self.stream, message, Some(&self.counters)).await?;
+        write_frame(&mut self.stream, message).await?;
         if let Some(logger) = &self.logger {
             logger.log(ProtocolLogDirection::ClientToServer, message);
         }
@@ -39,18 +35,14 @@ impl Client {
     }
 
     pub async fn recv(&mut self) -> anyhow::Result<ServerMessage> {
-        let message = read_frame_counted(&mut self.stream, Some(&self.counters)).await?;
+        let message = read_frame(&mut self.stream).await?;
         if let Some(logger) = &self.logger {
             logger.log(ProtocolLogDirection::ServerToClient, &message);
         }
         Ok(message)
     }
 
-    pub fn io_counters(&self) -> IoCounters {
-        self.counters.clone()
-    }
-
-    pub fn into_stream(self) -> UnixStream {
+    pub fn into_stream(self) -> rho_rpc::Stream {
         self.stream
     }
 }

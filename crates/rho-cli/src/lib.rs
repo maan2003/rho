@@ -31,7 +31,6 @@ pub fn main() -> Result<()> {
     // CLI behavior; Rust's default ignore turns it into a print panic.
     // SAFETY: top of main, single-threaded, resetting to default handling.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
-    rho_daemon::install_crypto_provider()?;
     let args = Args::parse_or_exit(std::env::args().skip(1));
     if let Command::Daemon(mut daemon_args) = args.command {
         // SAFETY: top of main, before the runtime — no threads exist yet and
@@ -134,7 +133,6 @@ pub(crate) async fn connect_or_start_daemon(
         .arg(auth)
         .arg("--socket-path")
         .arg(socket_path)
-        .arg("--die-on-detached")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

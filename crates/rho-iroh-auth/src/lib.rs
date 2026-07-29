@@ -9,7 +9,7 @@ mod server;
 mod shared;
 
 #[cfg(feature = "server")]
-pub use server::{ApproveError, IrohAuth, ServerAuthDecision};
+pub use server::{ApproveError, IrohAuth, PreapprovedEndpoint, ServerAuthDecision};
 pub use shared::{EnrollmentCode, ParseEnrollmentCodeError};
 
 const AUTH_REQUEST: &[u8] = b"rho-auth-v1\n";
@@ -62,6 +62,7 @@ pub async fn authenticate_client(
 pub async fn authenticate_server_connection(
     auth: &IrohAuth,
     connection: &iroh::endpoint::Connection,
+    preapproved: Option<PreapprovedEndpoint>,
 ) -> anyhow::Result<ServerAuthDecision> {
     use std::time::Duration;
 
@@ -70,7 +71,20 @@ pub async fn authenticate_server_connection(
         let mut request = [0; AUTH_REQUEST.len()];
         recv.read_exact(&mut request).await?;
         anyhow::ensure!(request == AUTH_REQUEST, "invalid iroh auth request");
-        let decision = auth.authenticate_connection(connection).await;
+        // Pin trust established at admission for this connection. Revocation
+        // affects later connections, not one whose authenticated handshake
+        // already passed admission. Unknown peers may still become approved
+        // while waiting for enrollment capacity.
+        let decision = match preapproved {
+            Some(preapproved) => {
+                anyhow::ensure!(
+                    preapproved.matches(connection.remote_id()),
+                    "preapproved endpoint does not match connection"
+                );
+                ServerAuthDecision::Approved
+            }
+            None => auth.authenticate_connection(connection).await,
+        };
         let response = match &decision {
             ServerAuthDecision::Approved => "approved\n".to_owned(),
             ServerAuthDecision::EnrollmentRequired(_) => "enrollment-required\n".to_owned(),

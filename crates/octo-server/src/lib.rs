@@ -20,6 +20,7 @@ use state::AppState;
 pub use state::TokenProvider;
 
 pub fn router(token_provider: TokenProvider, github_api_url: Url) -> Router {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let state = Arc::new(AppState {
         client: Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -36,12 +37,8 @@ pub fn router(token_provider: TokenProvider, github_api_url: Url) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(
-    listener: UnixListener,
-    token_provider: TokenProvider,
-    github_api_url: Url,
-) -> Result<()> {
-    axum::serve(listener, router(token_provider, github_api_url)).await?;
+pub async fn serve(listener: UnixListener, router: Router) -> Result<()> {
+    axum::serve(listener, router).await?;
     Ok(())
 }
 

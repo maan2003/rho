@@ -14,6 +14,7 @@ pub(crate) struct OctoClient {
 
 impl OctoClient {
     pub(crate) fn new() -> Result<Self> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         Ok(Self {
             client: reqwest::Client::builder()
                 .unix_socket(octo_types::socket_path()?)

@@ -31,15 +31,13 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
     tokio::spawn(rho_daemon::run(rho_daemon::DaemonArgs {
         auth: "default".to_owned(),
         socket_path: Some(socket_path.clone()),
-        die_on_detached: false,
         iroh: false,
-        iroh_bbr3: false,
         cpu_profile: None,
         extra_before_path: None,
         extra_after_path: None,
     }));
     let mut control = loop {
-        match tokio::net::UnixStream::connect(&socket_path).await {
+        match rho_rpc::connect_unix(&socket_path).await {
             Ok(stream) => break stream,
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
@@ -88,7 +86,7 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
     wait_for_line(&mut stream, "e2e-done").await?;
 
     // The listing sees the running terminal.
-    let mut list = tokio::net::UnixStream::connect(&socket_path).await?;
+    let mut list = rho_rpc::connect_unix(&socket_path).await?;
     write_frame(
         &mut list,
         &ClientMessage::TerminalList {
@@ -121,8 +119,8 @@ async fn open_terminal(
     socket_path: &std::path::Path,
     agent_id: AgentId,
     create: bool,
-) -> anyhow::Result<tokio::net::UnixStream> {
-    let mut stream = tokio::net::UnixStream::connect(socket_path).await?;
+) -> anyhow::Result<rho_rpc::Stream> {
+    let mut stream = rho_rpc::connect_unix(socket_path).await?;
     let open = if create {
         ClientMessage::TerminalCreate {
             agent: agent_id.encoded(),
@@ -173,7 +171,7 @@ fn frame_kind(frame: &TermServerFrame) -> String {
     }
 }
 
-async fn wait_for_line(stream: &mut tokio::net::UnixStream, needle: &str) -> anyhow::Result<()> {
+async fn wait_for_line(stream: &mut rho_rpc::Stream, needle: &str) -> anyhow::Result<()> {
     let mut screen = WireScreen::new(usize::MAX);
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {

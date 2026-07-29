@@ -348,8 +348,21 @@ the persisted Engineer through `AgentPool`.
 The daemon's UI protocol (`rho-ui-proto`) is served over the local Unix socket
 and iroh connections from clients enrolled through `rho-iroh-auth` (`rho
 daemon --iroh`; approval via `rho iroh approve` stays on the Unix socket).
-The protocol crate owns only wire types and state diffs; `rho-daemon` projects
-the richer `rho-agent` runtime state into that wire shape. Consequently UI
+`rho-rpc` owns the transport below that vocabulary: the raw bounded iroh
+authentication exchange, the versioned Unix preface, whole-stream zstd,
+bounded Senax framing, Unix/iroh dialing, supervised bounded typed channels,
+and flush-aware raw relays. Its authenticated listener classifies completed
+iroh handshakes, bounds unknown-client enrollment, and exposes only approved
+connections to `rho-daemon`. It also owns the persisted endpoint identity,
+endpoint construction, qlog setup, congestion controller, and QUIC credit
+transitions. `rho-iroh-auth` owns the trusted-client table, temporary trust,
+and pending enrollments in `rho-db`; the daemon supplies only the application
+ALPN and retains approve/revoke command routing. Each post-authentication application direction is
+one streaming zstd frame with a 128 KiB maximum history window; Senax length
+limits apply to decompressed payloads. The iroh ALPN is `rho/ui/3` and Unix
+peers exchange the fixed `RHO-STREAM-3` preface before compression.
+The protocol crate owns only wire types, limits, and state diffs; `rho-daemon`
+projects the richer `rho-agent` runtime state into that wire shape. Consequently UI
 clients do not depend on the agent runtime or inherit its optional features.
 Daemon startup reads lightweight agent summaries but does not restore every
 transcript. Runtime activation is internal daemon policy and serialized per
@@ -392,7 +405,10 @@ sends five-second transport heartbeats; after ten seconds without receiving an
 authenticated QUIC datagram, the native GUI presents a temporary bottom
 recovery strip until the same connection responds or finally closes. The web
 UI speaks the same native UI protocol over the same iroh ALPN, so both clients
-share one wire vocabulary and agent policy. The web UI page itself is a static
+share one wire vocabulary and agent policy. It retains only its selected-agent
+subscription, accepts 16 concurrent daemon-initiated streams, and reserves
+decompressed frames against a 64 MiB aggregate allocation budget. The web UI
+page itself is a static
 Leptos/wasm app (`webui/` at the
 repo root, its own cargo workspace, hostable anywhere) that connects as an
 iroh client from the browser.
@@ -448,9 +464,9 @@ connection bandwidth allocation, while application-level stream selection and
 coalescing remain UI protocol policy. Native GUI and daemon endpoints enable
 noq's qlog instrumentation when `QLOGDIR` is set, writing `rho-gui-*` and
 `rho-daemon-*` traces respectively for transport-level diagnosis. Iroh uses
-CUBIC congestion control by default; `rho daemon --iroh-bbr3` (or
-`RHO_IROH_BBR3=true`) selects BBR3 for daemon-to-client traffic without
-requiring the client to use the same controller.
+CUBIC congestion control by default; `rho-rpc` selects BBR3 for
+daemon-to-client traffic when `RHO_IROH_BBR3=true`, without requiring the
+client to use the same controller.
 
 
 Dependencies should flow from higher-level assembly/policy crates toward lower

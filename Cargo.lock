@@ -576,6 +576,7 @@ dependencies = [
  "compression-core",
  "futures-io",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -2365,6 +2366,8 @@ dependencies = [
  "deflate64",
  "flate2",
  "memchr",
+ "zstd 0.13.3",
+ "zstd-safe 7.2.4",
 ]
 
 [[package]]
@@ -9962,6 +9965,7 @@ dependencies = [
  "n0-qlog",
  "rand 0.10.2",
  "rand_pcg",
+ "ring",
  "rustc-hash 2.1.3",
  "rustls",
  "rustls-pki-types",
@@ -13602,12 +13606,10 @@ dependencies = [
  "iroh",
  "json-stream",
  "libc",
- "noq-proto",
  "notify",
  "octo-server",
  "octo-types",
  "prefix-id",
- "redb",
  "reqwest 0.12.28",
  "rho-agent",
  "rho-claude",
@@ -13618,6 +13620,7 @@ dependencies = [
  "rho-iroh-auth",
  "rho-pr-monitor",
  "rho-profiling",
+ "rho-rpc",
  "rho-shell",
  "rho-shell-proto",
  "rho-slack",
@@ -13625,7 +13628,6 @@ dependencies = [
  "rho-visualizations",
  "rho-workspaces",
  "rustix-openpty",
- "rustls",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -13685,6 +13687,7 @@ dependencies = [
  "rho-profiling",
  "rho-realtime",
  "rho-registry",
+ "rho-rpc",
  "rho-ui-proto",
  "rodio",
  "rust-embed",
@@ -13813,6 +13816,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-rpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "futures 0.3.33",
+ "iroh",
+ "noq-proto",
+ "redb",
+ "rho-db",
+ "rho-iroh-auth",
+ "rustls",
+ "senax-encoder",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rho-shell"
 version = "0.1.0"
 dependencies = [
@@ -13887,6 +13908,7 @@ dependencies = [
  "dirs",
  "futures 0.3.33",
  "rho-core",
+ "rho-rpc",
  "rho-shell-proto",
  "rho-workspaces-types",
  "senax-encoder",
@@ -14102,7 +14124,7 @@ dependencies = [
  "strum 0.27.2",
  "tracing",
  "util",
- "zstd",
+ "zstd 0.11.2+zstd.1.5.2",
 ]
 
 [[package]]
@@ -16711,6 +16733,7 @@ dependencies = [
  "http",
  "httparse",
  "rand 0.10.2",
+ "ring",
  "rustls-pki-types",
  "sha1_smol",
  "simdutf8",
@@ -20266,7 +20289,7 @@ dependencies = [
  "pbkdf2 0.11.0",
  "sha1",
  "time",
- "zstd",
+ "zstd 0.11.2+zstd.1.5.2",
 ]
 
 [[package]]
@@ -20340,7 +20363,16 @@ version = "0.11.2+zstd.1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20cc960326ece64f010d2d2107537f26dc589a6573a316bd5b1dba685fa5fde4"
 dependencies = [
- "zstd-safe",
+ "zstd-safe 5.0.2+zstd.1.5.2",
+]
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe 7.2.4",
 ]
 
 [[package]]
@@ -20350,6 +20382,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d2a5585e04f9eea4b2a3d1eca508c4dee9592a89ef6f450c11719da0726f4db"
 dependencies = [
  "libc",
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+dependencies = [
  "zstd-sys",
 ]
 

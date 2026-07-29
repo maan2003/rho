@@ -2,10 +2,14 @@
 //! display while the daemon waits for `rho iroh approve`.
 
 use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::str::FromStr as _;
+use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedReceiver;
+use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _};
 use hkdf::Hkdf;
 use iroh::EndpointId;
@@ -15,7 +19,7 @@ use leptos::task::spawn_local;
 use rho_registry::session::{
     AgentStreamGenerations, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
 };
-use rho_ui_proto::{ClientMessage, ServerMessage};
+use rho_ui_proto::{AgentId, ClientMessage, ServerMessage};
 use sha2::{Digest as _, Sha256};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -133,17 +137,13 @@ async fn run(
 ) -> anyhow::Result<()> {
     let daemon = EndpointId::from_str(daemon.trim())
         .map_err(|error| anyhow::anyhow!("invalid daemon endpoint id: {error}"))?;
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(passkey_secret(daemon).await?)
-        .bind()
-        .await
-        .map_err(|error| anyhow::anyhow!("bind iroh endpoint: {error}"))?;
+    let endpoint = rho_rpc::bind_browser_iroh_client(passkey_secret(daemon).await?).await?;
     let connection = endpoint
         .connect(daemon, rho_ui_proto::IROH_ALPN)
         .await
         .map_err(|error| anyhow::anyhow!("connect to daemon: {error}"))?;
 
-    match authenticate_client_bounded(&connection, endpoint.id()).await? {
+    match rho_rpc::authenticate_iroh_client(&connection, endpoint.id()).await? {
         rho_iroh_auth::ClientAuthResult::Approved => {}
         rho_iroh_auth::ClientAuthResult::EnrollmentRequired(code) => {
             app.phase.set(Phase::Enroll(code.to_string()));
@@ -154,13 +154,15 @@ async fn run(
         }
     }
 
-    let (mut send, mut recv) = connection
+    let (send, recv) = connection
         .open_bi()
         .await
         .map_err(|error| anyhow::anyhow!("open stream: {error}"))?;
+    send.set_priority(1)
+        .map_err(|error| anyhow::anyhow!("set control stream priority: {error}"))?;
+    let mut send = rho_rpc::Writer::new(send);
+    let mut recv = rho_rpc::Reader::new(recv);
     rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
-    spawn_local(agent_streams(app, connection.clone()));
-
     spawn_local(async move {
         while let Some(message) = receiver.next().await {
             if rho_ui_proto::write_frame(&mut send, &message)
@@ -172,23 +174,14 @@ async fn run(
         }
     });
 
-    read_loop(app, &mut recv).await
+    futures::try_join!(
+        read_loop(app.clone(), &mut recv),
+        read_agent_streams(app, connection.clone()),
+    )?;
+    Ok(())
 }
 
-async fn authenticate_client_bounded(
-    connection: &iroh::endpoint::Connection,
-    client_endpoint_id: iroh::EndpointId,
-) -> anyhow::Result<rho_iroh_auth::ClientAuthResult> {
-    let auth = rho_iroh_auth::authenticate_client(connection, client_endpoint_id).fuse();
-    let timeout = gloo_timers::future::TimeoutFuture::new(10_000).fuse();
-    futures::pin_mut!(auth, timeout);
-    futures::select! {
-        result = auth => result,
-        () = timeout => anyhow::bail!("iroh authentication timed out"),
-    }
-}
-
-async fn read_loop(app: App, recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<()> {
+async fn read_loop(app: App, recv: &mut rho_rpc::Reader) -> anyhow::Result<()> {
     loop {
         let message: ServerMessage = rho_ui_proto::read_frame(recv)
             .await
@@ -198,40 +191,96 @@ async fn read_loop(app: App, recv: &mut iroh::endpoint::RecvStream) -> anyhow::R
 }
 
 /// Agent state arrives on daemon-opened unidirectional streams, one per
-/// agent, so QUIC can schedule agents independently while the bidirectional
-/// session stays a low-volume control channel. Each stream carries an
-/// `AgentStreamOpened` header and then `Agent` frames until EOF. The daemon
-/// may reopen an agent's stream; a generation counter keeps frames from a
-/// superseded stream out of the state.
-async fn agent_streams(app: App, connection: iroh::endpoint::Connection) {
-    let generations: Rc<RefCell<AgentStreamGenerations>> = Rc::default();
+/// agent, while aggregate decompressed frame allocation remains bounded.
+async fn read_agent_streams(
+    app: App,
+    connection: iroh::endpoint::Connection,
+) -> anyhow::Result<()> {
+    const FRAME_BUDGET: usize = 64 * 1024 * 1024;
+    type AgentTask = Pin<Box<dyn Future<Output = anyhow::Result<()>>>>;
+    let budget = Arc::new(tokio::sync::Semaphore::new(FRAME_BUDGET));
+    let generations = Rc::new(RefCell::new(AgentStreamGenerations::default()));
+    let mut streams = FuturesUnordered::<AgentTask>::new();
     loop {
-        let Ok(mut recv) = connection.accept_uni().await else {
-            break;
-        };
-        let generations = generations.clone();
-        spawn_local(async move {
-            let Ok(ServerMessage::AgentStreamOpened { agent_id }) =
-                rho_ui_proto::read_frame(&mut recv).await
-            else {
-                return;
-            };
-            let generation = generations.borrow_mut().open(agent_id);
-            while let Ok(message) = rho_ui_proto::read_frame::<_, ServerMessage>(&mut recv).await {
-                let ServerMessage::Agent {
-                    agent_id: frame_id,
-                    frame,
-                } = message
-                else {
-                    return;
-                };
-                if frame_id != agent_id || !generations.borrow().is_current(agent_id, generation) {
-                    return;
-                }
-                handle(app, ServerMessage::Agent { agent_id, frame });
+        if streams.is_empty() {
+            let recv = connection
+                .accept_uni()
+                .await
+                .map_err(|error| anyhow::anyhow!("accept agent stream: {error}"))?;
+            streams.push(Box::pin(read_agent_stream(
+                app.clone(),
+                recv,
+                Arc::clone(&budget),
+                Rc::clone(&generations),
+            )));
+            continue;
+        }
+        let accepted = connection.accept_uni().fuse();
+        let completed = streams.next().fuse();
+        futures::pin_mut!(accepted, completed);
+        futures::select! {
+            accepted = accepted => {
+                let recv = accepted.map_err(|error| anyhow::anyhow!("accept agent stream: {error}"))?;
+                streams.push(Box::pin(read_agent_stream(
+                    app.clone(),
+                    recv,
+                    Arc::clone(&budget),
+                    Rc::clone(&generations),
+                )));
             }
-        });
+            completed = completed => {
+                if let Err(error) = completed.expect("agent stream set is nonempty") {
+                    // A malformed or superseded agent stream is isolated from
+                    // the authenticated control session and other agents.
+                    app.show_toast(format!("Agent stream closed: {error:#}"));
+                }
+            }
+        }
     }
+}
+
+async fn read_agent_stream(
+    app: App,
+    recv: iroh::endpoint::RecvStream,
+    budget: Arc<tokio::sync::Semaphore>,
+    generations: Rc<RefCell<AgentStreamGenerations>>,
+) -> anyhow::Result<()> {
+    let mut recv = rho_rpc::Reader::new(recv);
+    let header = read_budgeted(&mut recv, &budget)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("agent stream closed before its header"))?;
+    let ServerMessage::AgentStreamOpened { agent_id } = header else {
+        anyhow::bail!("invalid agent stream header");
+    };
+    let generation = generations.borrow_mut().open(agent_id);
+    loop {
+        let Some(message) = read_budgeted(&mut recv, &budget).await? else {
+            return Ok(());
+        };
+        let ServerMessage::Agent {
+            agent_id: frame_agent_id,
+            ..
+        } = &message
+        else {
+            anyhow::bail!("invalid message on agent stream");
+        };
+        anyhow::ensure!(*frame_agent_id == agent_id, "agent stream id changed");
+        if generations.borrow().is_current(agent_id, generation) {
+            handle(app.clone(), message);
+        }
+    }
+}
+
+async fn read_budgeted(
+    recv: &mut rho_rpc::Reader,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> anyhow::Result<Option<ServerMessage>> {
+    let message =
+        rho_rpc::read_frame_allocated_optional(recv, rho_ui_proto::MAX_FRAME_LEN, |len| {
+            Arc::clone(budget).acquire_many_owned(len as u32)
+        })
+        .await?;
+    Ok(message.map(|(message, _allocation, _)| message))
 }
 
 fn handle(app: App, message: ServerMessage) {

@@ -24,7 +24,7 @@ dirs.workspace = true
 editor = { path = "../../vendor/zed/crates/editor" }
 fs = { path = "../../vendor/zed/crates/fs" }
 futures.workspace = true
-iroh = { workspace = true, features = ["qlog", "tls-aws-lc-rs"] }
+iroh.workspace = true
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "wayland",
 ] }
@@ -47,6 +47,7 @@ rho-iroh-auth.workspace = true
 rho-profiling.workspace = true
 rho-realtime.workspace = true
 rho-registry.workspace = true
+rho-rpc = { workspace = true, features = ["native-client"] }
 rho-ui-proto.workspace = true
 rust-embed = { version = "8.11", features = ["include-exclude"] }
 rustls.workspace = true

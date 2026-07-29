@@ -14,6 +14,7 @@ bytes.workspace = true
 camino.workspace = true
 futures.workspace = true
 rho-core.workspace = true
+rho-rpc.workspace = true
 rho-shell-proto.workspace = true
 rho-workspaces-types.workspace = true
 senax-encoder.workspace = true

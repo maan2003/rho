@@ -39,6 +39,16 @@ pub enum ServerAuthDecision {
     Unavailable,
 }
 
+/// Proof that this authenticator admitted an endpoint identity immediately
+/// after its authenticated QUIC handshake.
+pub struct PreapprovedEndpoint(EndpointId);
+
+impl PreapprovedEndpoint {
+    pub(crate) fn matches(&self, endpoint_id: EndpointId) -> bool {
+        self.0 == endpoint_id
+    }
+}
+
 /// Library-level authenticator combining persistent trust and pending
 /// approvals.
 #[derive(Clone, Debug)]
@@ -300,6 +310,10 @@ impl IrohAuth {
         Self::with_pending(db, server_endpoint_id, PendingEnrollments::default())
     }
 
+    pub fn server_endpoint_id(&self) -> EndpointId {
+        self.inner.server_endpoint_id
+    }
+
     fn with_pending(
         db: RhoDb,
         server_endpoint_id: EndpointId,
@@ -321,7 +335,7 @@ impl IrohAuth {
         client_endpoint_id: EndpointId,
         code: EnrollmentCode,
     ) -> Result<bool, BeginEnrollmentError> {
-        if self.is_trusted(client_endpoint_id).await {
+        if self.is_trusted_endpoint(client_endpoint_id).await {
             return Ok(true);
         }
 
@@ -337,7 +351,7 @@ impl IrohAuth {
     /// independently verifiable by that client.
     pub async fn authenticate_connection(&self, conn: &Connection) -> ServerAuthDecision {
         let client_endpoint_id = conn.remote_id();
-        if self.is_trusted(client_endpoint_id).await {
+        if self.is_trusted_endpoint(client_endpoint_id).await {
             return ServerAuthDecision::Approved;
         }
         let code = enrollment_code(conn, self.inner.server_endpoint_id, client_endpoint_id);
@@ -353,7 +367,19 @@ impl IrohAuth {
         }
     }
 
-    async fn is_trusted(&self, client_endpoint_id: EndpointId) -> bool {
+    /// Pins a trusted identity at connection admission. Revocation applies to
+    /// subsequent connections, while the returned token keeps this connection
+    /// approved through its explicit first-stream confirmation.
+    pub async fn preapprove_endpoint(
+        &self,
+        client_endpoint_id: EndpointId,
+    ) -> Option<PreapprovedEndpoint> {
+        self.is_trusted_endpoint(client_endpoint_id)
+            .await
+            .then_some(PreapprovedEndpoint(client_endpoint_id))
+    }
+
+    async fn is_trusted_endpoint(&self, client_endpoint_id: EndpointId) -> bool {
         if self
             .inner
             .memory_trusted
@@ -442,6 +468,7 @@ mod tests {
         assert!(!auth.begin_enrollment(client, code).await.unwrap());
         let approved = auth.approve_code(&code).await.unwrap();
         assert_eq!(approved, client);
+        assert!(auth.is_trusted_endpoint(client).await);
 
         assert!(
             auth.begin_enrollment(client, EnrollmentCode::from_str("ABCD-EFGH-JM").unwrap())
@@ -471,7 +498,7 @@ mod tests {
                 .unwrap()
         );
         assert!(auth.revoke(client).await);
-        assert!(!auth.is_trusted(client).await);
+        assert!(!auth.is_trusted_endpoint(client).await);
     }
 
     #[test]

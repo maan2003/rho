@@ -4,10 +4,7 @@
 //! outbound commands are fire-and-forget.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
@@ -24,42 +21,6 @@ use rho_ui_proto::{
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::workspace::AttachTarget;
-
-trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncStream for T {}
-
-struct IrohStream {
-    inner: tokio::io::Join<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>,
-    _endpoint: iroh::Endpoint,
-}
-
-impl tokio::io::AsyncRead for IrohStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for IrohStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
 
 pub enum ConnEvent {
     Ready {
@@ -121,41 +82,24 @@ pub enum GitApprovalDecision {
     Done,
 }
 
-/// One workspace file channel. Dropping `outgoing` half-closes the stream and
+/// One workspace file channel. Dropping the owner cancels the transport and
 /// tears down its daemon-side watcher.
 pub struct WorkspaceChannel {
     pub outgoing: futures_mpsc::Sender<rho_ui_proto::WorkspaceClientFrame>,
-    pub incoming: futures_mpsc::Receiver<rho_ui_proto::WorkspaceServerFrame>,
+    pub incoming: futures_mpsc::Receiver<anyhow::Result<rho_ui_proto::WorkspaceServerFrame>>,
+    pub transport: rho_rpc::ChannelTask,
 }
 
 /// How to dial an extra workspace-file stream to the daemon: locally a
 /// second Unix connection, remotely another bi-stream on the already
 /// authenticated iroh connection. Set by the IO task once connected.
-#[derive(Clone)]
-pub(crate) enum ChannelDialer {
-    Unix(PathBuf),
-    Iroh(iroh::endpoint::Connection),
-}
+pub(crate) type ChannelDialer = rho_rpc::Dialer;
 
 async fn dial_channel(
     dialer: ChannelDialer,
     workspace: WorkspaceInfo,
 ) -> anyhow::Result<WorkspaceChannel> {
-    let mut stream = match dialer {
-        ChannelDialer::Unix(socket_path) => {
-            let client = Client::connect(&socket_path)
-                .await
-                .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-            Box::new(client.into_stream()) as Box<dyn AsyncStream>
-        }
-        ChannelDialer::Iroh(connection) => {
-            let (send, recv) = connection
-                .open_bi()
-                .await
-                .context("open iroh workspace-file stream")?;
-            Box::new(tokio::io::join(recv, send)) as Box<dyn AsyncStream>
-        }
-    };
+    let mut stream = dialer.open(None).await?;
     write_frame(&mut stream, &ClientMessage::ChannelOpen { workspace }).await?;
     let reply: ServerMessage = read_frame(&mut stream).await?;
     match reply {
@@ -166,51 +110,28 @@ async fn dial_channel(
         _ => anyhow::bail!("unexpected reply to ChannelOpen"),
     }
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (mut incoming_tx, incoming_rx) = futures_mpsc::channel(32);
-    let (outgoing_tx, mut outgoing_rx) =
-        futures_mpsc::channel::<rho_ui_proto::WorkspaceClientFrame>(16);
-    tokio::spawn(async move {
-        while let Ok(frame) = rho_ui_proto::read_frame_limited(
-            &mut reader,
-            rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
-        )
-        .await
-        {
-            if incoming_tx.send(frame).await.is_err() {
-                break;
-            }
-        }
+    let channel = stream.into_channel(rho_rpc::ChannelConfig {
+        tx_limit: rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+        rx_limit: rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+        tx_capacity: 16,
+        rx_capacity: 32,
     });
-    tokio::spawn(async move {
-        while let Some(frame) = outgoing_rx.next().await {
-            if rho_ui_proto::write_frame_limited(
-                &mut writer,
-                &frame,
-                rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
-            )
-            .await
-            .is_err()
-            {
-                break;
-            }
-        }
-        // Half-close so the daemon sees EOF and tears the session down.
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
-    });
+    let (outgoing, incoming, transport) = channel.into_parts();
     Ok(WorkspaceChannel {
-        outgoing: outgoing_tx,
-        incoming: incoming_rx,
+        outgoing,
+        incoming,
+        transport,
     })
 }
 
 /// One attached terminal: a dedicated stream carrying [`rho_ui_proto::term`]
-/// frames after the handshake. Dropping `input` half-closes the stream,
-/// which only detaches — the terminal keeps running in the daemon.
+/// frames after the handshake. Dropping the owner cancels the attachment; the
+/// terminal keeps running in the daemon.
 pub struct TerminalChannel {
     pub terminal_id: u64,
-    pub frames: futures_mpsc::UnboundedReceiver<rho_ui_proto::term::TermServerFrame>,
-    pub input: futures_mpsc::UnboundedSender<rho_ui_proto::term::TermClientFrame>,
+    pub frames: futures_mpsc::Receiver<anyhow::Result<rho_ui_proto::term::TermServerFrame>>,
+    pub input: futures_mpsc::Sender<rho_ui_proto::term::TermClientFrame>,
+    pub transport: rho_rpc::ChannelTask,
 }
 
 /// One attachment to an agent's daemon-owned Comint-style shell. Dropping
@@ -228,8 +149,10 @@ pub struct ShellSubmission {
 
 pub struct RealtimeChannel {
     pub answer_sdp: String,
-    pub requests: futures_mpsc::UnboundedSender<rho_ui_proto::realtime::RealtimeClientFrame>,
-    pub replies: futures_mpsc::UnboundedReceiver<rho_ui_proto::realtime::RealtimeServerFrame>,
+    pub requests: futures_mpsc::Sender<rho_ui_proto::realtime::RealtimeClientFrame>,
+    pub replies:
+        futures_mpsc::Receiver<anyhow::Result<rho_ui_proto::realtime::RealtimeServerFrame>>,
+    _transport: rho_rpc::ChannelTask,
 }
 
 pub(crate) async fn dial_realtime(
@@ -243,28 +166,18 @@ pub(crate) async fn dial_realtime(
         ServerMessage::RealtimeRefused { reason } => anyhow::bail!("{reason}"),
         _ => anyhow::bail!("unexpected reply to RealtimeOpen"),
     };
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (request_tx, mut request_rx) = futures_mpsc::unbounded();
-    let (reply_tx, reply_rx) = futures_mpsc::unbounded();
-    tokio::spawn(async move {
-        while let Some(frame) = request_rx.next().await {
-            if write_frame(&mut writer, &frame).await.is_err() {
-                break;
-            }
-        }
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    let channel = stream.into_channel(rho_rpc::ChannelConfig {
+        tx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        rx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        tx_capacity: 32,
+        rx_capacity: 32,
     });
-    tokio::spawn(async move {
-        while let Ok(frame) = read_frame(&mut reader).await {
-            if reply_tx.unbounded_send(frame).is_err() {
-                break;
-            }
-        }
-    });
+    let (requests, replies, transport) = channel.into_parts();
     Ok(RealtimeChannel {
         answer_sdp,
-        requests: request_tx,
-        replies: reply_rx,
+        requests,
+        replies,
+        _transport: transport,
     })
 }
 
@@ -314,25 +227,9 @@ async fn shell_control_request(
         .context("shell lifecycle request was dropped")
 }
 
-async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<Box<dyn AsyncStream>> {
-    Ok(match dialer {
-        ChannelDialer::Unix(socket_path) => {
-            let client = Client::connect(&socket_path)
-                .await
-                .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-            Box::new(client.into_stream()) as Box<dyn AsyncStream>
-        }
-        ChannelDialer::Iroh(connection) => {
-            let (send, recv) = connection
-                .open_bi()
-                .await
-                .context("open iroh terminal stream")?;
-            // Interactive terminals outrank the control session (priority 1).
-            send.set_priority(50)
-                .context("set iroh terminal stream priority")?;
-            Box::new(tokio::io::join(recv, send)) as Box<dyn AsyncStream>
-        }
-    })
+async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
+    // Interactive streams outrank the control session (priority 1).
+    dialer.open(Some(50)).await
 }
 
 async fn dial_diff_snapshot(
@@ -382,22 +279,8 @@ async fn dial_visualization(
 
 /// Opens a low-priority one-shot/bulk stream. Unlike terminal streams this
 /// deliberately keeps iroh's default priority below interactive traffic.
-async fn dial_bulk_stream(dialer: ChannelDialer) -> anyhow::Result<Box<dyn AsyncStream>> {
-    Ok(match dialer {
-        ChannelDialer::Unix(socket_path) => {
-            let client = Client::connect(&socket_path)
-                .await
-                .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
-            Box::new(client.into_stream()) as Box<dyn AsyncStream>
-        }
-        ChannelDialer::Iroh(connection) => {
-            let (send, recv) = connection
-                .open_bi()
-                .await
-                .context("open iroh bulk stream")?;
-            Box::new(tokio::io::join(recv, send)) as Box<dyn AsyncStream>
-        }
-    })
+async fn dial_bulk_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
+    dialer.open(None).await
 }
 
 /// One-shot `TerminalList` request for one agent's running terminals.
@@ -465,31 +348,18 @@ async fn dial_terminal(
         _ => anyhow::bail!("unexpected reply on terminal stream"),
     }
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (frames_tx, frames_rx) = futures_mpsc::unbounded();
-    let (input_tx, mut input_rx) = futures_mpsc::unbounded::<rho_ui_proto::term::TermClientFrame>();
-    tokio::spawn(async move {
-        while let Ok(frame) =
-            read_frame::<_, rho_ui_proto::term::TermServerFrame>(&mut reader).await
-        {
-            if frames_tx.unbounded_send(frame).is_err() {
-                break;
-            }
-        }
+    let channel = stream.into_channel(rho_rpc::ChannelConfig {
+        tx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        rx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        tx_capacity: 64,
+        rx_capacity: 256,
     });
-    tokio::spawn(async move {
-        while let Some(frame) = input_rx.next().await {
-            if write_frame(&mut writer, &frame).await.is_err() {
-                break;
-            }
-        }
-        // Half-close so the daemon sees EOF and detaches this client.
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
-    });
+    let (input, frames, transport) = channel.into_parts();
     Ok(TerminalChannel {
         terminal_id,
-        frames: frames_rx,
-        input: input_tx,
+        frames,
+        input,
+        transport,
     })
 }
 
@@ -804,23 +674,23 @@ async fn run(
     dialer: &Mutex<Option<ChannelDialer>>,
     shell_requests: &Mutex<ShellControlRequests>,
 ) -> anyhow::Result<()> {
-    let (mut stream, agent_connection) = match target {
+    let (mut stream, agent_connection, _endpoint) = match target {
         AttachTarget::Unix(socket_path) => {
             let client = Client::connect(&socket_path)
                 .await
                 .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
             *dialer.lock().unwrap() = Some(ChannelDialer::Unix(socket_path));
-            (Box::new(client.into_stream()) as Box<dyn AsyncStream>, None)
+            (client.into_stream(), None, None)
         }
         AttachTarget::Iroh {
             endpoint_id,
             ssh_destination,
             remote_rho,
         } => {
-            let (stream, connection) =
+            let (stream, connection, endpoint) =
                 connect_iroh(endpoint_id, &ssh_destination, &remote_rho).await?;
             *dialer.lock().unwrap() = Some(ChannelDialer::Iroh(connection.clone()));
-            (stream, Some(connection))
+            (stream, Some(connection), Some(endpoint))
         }
     };
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
@@ -1201,14 +1071,12 @@ async fn run_git_transport_provider(
             )
             .await?;
         } else {
-            tokio::io::copy(&mut transport_read, &mut ssh_stdin).await?;
-            ssh_stdin.shutdown().await?;
+            rho_rpc::copy_flush(&mut transport_read, &mut ssh_stdin).await?;
         }
         Ok::<(), anyhow::Error>(())
     };
     let output = async {
-        tokio::io::copy(&mut ssh_stdout, &mut transport_write).await?;
-        transport_write.shutdown().await?;
+        rho_rpc::copy_flush(&mut ssh_stdout, &mut transport_write).await?;
         Ok::<(), anyhow::Error>(())
     };
     let stderr = async {
@@ -1249,8 +1117,7 @@ where
         "Git receive-pack destination refs differ from the approved plan"
     );
     writer.write_all(&prefix).await?;
-    tokio::io::copy(reader, writer).await?;
-    writer.shutdown().await?;
+    rho_rpc::copy_flush(reader, writer).await?;
     Ok(())
 }
 
@@ -1322,7 +1189,7 @@ async fn open_git_transport_provider(
     dialer: ChannelDialer,
     request_id: u64,
     provider_id: u64,
-) -> anyhow::Result<Option<Box<dyn AsyncStream>>> {
+) -> anyhow::Result<Option<rho_rpc::Stream>> {
     let mut stream = dial_stream(dialer).await?;
     write_frame(
         &mut stream,
@@ -1434,7 +1301,8 @@ async fn run_agent_streams(
     loop {
         tokio::select! {
             accepted = connection.accept_uni() => {
-                let Ok(mut recv) = accepted else { break };
+                let Ok(recv) = accepted else { break };
+                let mut recv = rho_rpc::Reader::new(recv);
                 let events = events.clone();
                 let allocation_budget = allocation_budget.clone();
                 let generations = generations.clone();
@@ -1516,25 +1384,14 @@ async fn run_agent_streams(
 }
 
 async fn read_agent_stream_message(
-    recv: &mut iroh::endpoint::RecvStream,
+    recv: &mut rho_rpc::Reader,
     allocation_budget: &Arc<AgentFrameAllocationBudget>,
 ) -> anyhow::Result<(ServerMessage, AgentFrameAllocation)> {
-    let len = recv
-        .read_u32_le()
-        .await
-        .context("read agent stream frame length")? as usize;
-    anyhow::ensure!(
-        len <= rho_ui_proto::MAX_FRAME_LEN,
-        "agent stream frame length {len} exceeds {}",
-        rho_ui_proto::MAX_FRAME_LEN,
-    );
-    let allocation = allocation_budget.reserve(len).await;
-    let mut payload = vec![0; len];
-    recv.read_exact(&mut payload)
-        .await
-        .context("read agent stream frame payload")?;
-    let mut payload = payload.as_slice();
-    let message = senax_encoder::unpack(&mut payload).context("unpack agent stream frame")?;
+    let (message, allocation, _) =
+        rho_rpc::read_frame_allocated(recv, rho_ui_proto::MAX_FRAME_LEN, |len| {
+            allocation_budget.reserve(len)
+        })
+        .await?;
     Ok((message, allocation))
 }
 
@@ -1596,21 +1453,10 @@ async fn connect_iroh(
     daemon_id: iroh::EndpointId,
     ssh_destination: &str,
     remote_rho: &str,
-) -> anyhow::Result<(Box<dyn AsyncStream>, iroh::endpoint::Connection)> {
+) -> anyhow::Result<(rho_rpc::Stream, iroh::endpoint::Connection, iroh::Endpoint)> {
     // The native client's identity intentionally lives only as long as this
     // process. The daemon can trust it in memory via an existing SSH login.
-    let secret = iroh::SecretKey::generate();
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret)
-        .transport_config(
-            iroh::endpoint::QuicTransportConfig::builder()
-                .max_concurrent_uni_streams(1024u32.into())
-                .qlog_from_env("rho-gui")
-                .build(),
-        )
-        .bind()
-        .await
-        .context("bind iroh client endpoint")?;
+    let endpoint = rho_rpc::bind_ephemeral_iroh_client().await?;
     tracing::info!(
         destination = ssh_destination,
         "trusting ephemeral iroh client over SSH"
@@ -1625,23 +1471,15 @@ async fn connect_iroh(
         .await
         .context("connect to daemon over iroh")?;
     anyhow::ensure!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            rho_iroh_auth::authenticate_client(&connection, endpoint.id()),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("iroh authentication timed out"))??
+        rho_rpc::authenticate_iroh_client(&connection, endpoint.id()).await?
             == rho_iroh_auth::ClientAuthResult::Approved,
         "daemon did not approve SSH-trusted iroh client"
     );
     let (send, recv) = connection.open_bi().await.context("open iroh UI stream")?;
     send.set_priority(1)
         .context("set iroh UI control stream priority")?;
-    let stream = Box::new(IrohStream {
-        inner: tokio::io::join(recv, send),
-        _endpoint: endpoint,
-    });
-    Ok((stream, connection))
+    let stream = rho_rpc::Stream::new(recv, send);
+    Ok((stream, connection, endpoint))
 }
 
 async fn trust_in_memory_over_ssh(

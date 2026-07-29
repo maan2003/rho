@@ -1,11 +1,8 @@
-//! Senax-framed Unix-socket protocol shared by rho UI processes.
+//! UI wire vocabulary shared by Rho clients and the daemon.
 //!
-//! This crate intentionally owns only the wire vocabulary and framing. The CLI
-//! and daemon can map these messages onto concrete `rho-agent` handles without
-//! teaching lower crates about sockets or UI policy.
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+//! Transport, authentication, compression, and generic Senax framing live in
+//! `rho-rpc`; this crate owns UI message types, UI-specific limits, logical
+//! traffic accounting, and protocol logs.
 
 use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
@@ -35,8 +32,7 @@ pub use workspace::{FileReadResult, FileSaveResult, WorkspaceClientFrame, Worksp
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/2";
-const FRAME_LEN_BYTES: u64 = size_of::<u32>() as u64;
+pub const IROH_ALPN: &[u8] = b"rho/ui/3";
 #[cfg(not(target_family = "wasm"))]
 const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP2";
 
@@ -47,41 +43,6 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
         .or_else(dirs::state_dir)
         .ok_or_else(|| anyhow::anyhow!("runtime directory not available"))?;
     Ok(base.join("rho").join("rho.sock"))
-}
-
-/// Shared byte counters for one UI protocol connection.
-///
-/// Counts successful length-prefixed frames on the wire, including the 4-byte
-/// little-endian frame length.
-#[derive(Clone, Debug, Default)]
-pub struct IoCounters {
-    sent: Arc<AtomicU64>,
-    received: Arc<AtomicU64>,
-}
-
-impl IoCounters {
-    pub fn snapshot(&self) -> IoStats {
-        IoStats {
-            sent: self.sent.load(Ordering::Relaxed),
-            received: self.received.load(Ordering::Relaxed),
-        }
-    }
-
-    fn record_sent(&self, payload_len: usize) {
-        self.sent
-            .fetch_add(frame_wire_len(payload_len), Ordering::Relaxed);
-    }
-
-    fn record_received(&self, payload_len: usize) {
-        self.received
-            .fetch_add(frame_wire_len(payload_len), Ordering::Relaxed);
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct IoStats {
-    pub sent: u64,
-    pub received: u64,
 }
 
 /// Message sent from a UI client to the rho daemon.
@@ -858,44 +819,9 @@ where
     W: AsyncWrite + Unpin,
     T: Packer,
 {
-    write_frame_counted(writer, value, None).await
-}
-
-/// Encode and write one length-prefixed senax frame, recording bytes on
-/// successful completion when counters are supplied.
-pub async fn write_frame_counted<W, T>(
-    writer: &mut W,
-    value: &T,
-    counters: Option<&IoCounters>,
-) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-    T: Packer,
-{
-    let payload = senax_encoder::pack(value).context("pack protocol frame")?;
-    if payload.len() > MAX_FRAME_LEN {
-        bail!(
-            "protocol frame length {} exceeds {MAX_FRAME_LEN}",
-            payload.len()
-        );
-    }
-    let len: u32 = payload
-        .len()
-        .try_into()
-        .context("protocol frame too large")?;
-    writer
-        .write_u32_le(len)
+    rho_rpc::write_frame(writer, value, MAX_FRAME_LEN)
         .await
-        .context("write frame length")?;
-    writer
-        .write_all(&payload)
-        .await
-        .context("write frame payload")?;
-    writer.flush().await.context("flush frame")?;
-    if let Some(counters) = counters {
-        counters.record_sent(payload.len());
-    }
-    Ok(())
+        .map(|_| ())
 }
 
 /// Read and decode one length-prefixed senax frame.
@@ -904,7 +830,9 @@ where
     R: AsyncRead + Unpin,
     T: Unpacker,
 {
-    read_frame_counted(reader, None).await
+    rho_rpc::read_frame(reader, MAX_FRAME_LEN)
+        .await
+        .map(|(value, _)| value)
 }
 
 /// Read and decode one frame with a protocol-specific bound smaller than the
@@ -914,17 +842,9 @@ where
     R: AsyncRead + Unpin,
     T: Unpacker,
 {
-    let len = reader.read_u32_le().await.context("read frame length")? as usize;
-    if len > max_len {
-        bail!("protocol frame length {len} exceeds {max_len}");
-    }
-    let mut payload = vec![0; len];
-    reader
-        .read_exact(&mut payload)
+    rho_rpc::read_frame(reader, max_len)
         .await
-        .context("read frame payload")?;
-    let mut payload = payload.as_slice();
-    senax_encoder::unpack(&mut payload).context("unpack protocol frame")
+        .map(|(value, _)| value)
 }
 
 /// Encode and write one frame with a protocol-specific bound smaller than the
@@ -938,55 +858,9 @@ where
     W: AsyncWrite + Unpin,
     T: Packer,
 {
-    let payload = senax_encoder::pack(value).context("pack protocol frame")?;
-    if payload.len() > max_len {
-        bail!("protocol frame length {} exceeds {max_len}", payload.len());
-    }
-    let len: u32 = payload
-        .len()
-        .try_into()
-        .context("protocol frame too large")?;
-    writer
-        .write_u32_le(len)
+    rho_rpc::write_frame(writer, value, max_len)
         .await
-        .context("write frame length")?;
-    writer
-        .write_all(&payload)
-        .await
-        .context("write frame payload")?;
-    writer.flush().await.context("flush frame")
-}
-
-/// Read and decode one length-prefixed senax frame, recording bytes on
-/// successful completion when counters are supplied.
-pub async fn read_frame_counted<R, T>(
-    reader: &mut R,
-    counters: Option<&IoCounters>,
-) -> anyhow::Result<T>
-where
-    R: AsyncRead + Unpin,
-    T: Unpacker,
-{
-    let len = reader.read_u32_le().await.context("read frame length")? as usize;
-    if len > MAX_FRAME_LEN {
-        bail!("protocol frame length {len} exceeds {MAX_FRAME_LEN}");
-    }
-
-    let mut payload = vec![0; len];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .context("read frame payload")?;
-    let mut payload = payload.as_slice();
-    let message = senax_encoder::unpack(&mut payload).context("unpack protocol frame")?;
-    if let Some(counters) = counters {
-        counters.record_received(len);
-    }
-    Ok(message)
-}
-
-fn frame_wire_len(payload_len: usize) -> u64 {
-    FRAME_LEN_BYTES + payload_len as u64
+        .map(|_| ())
 }
 
 /// Write one length-prefixed raw frame (no senax encoding).
@@ -1181,12 +1055,6 @@ fn read_protocol_log_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn frame_wire_len_includes_length_prefix() {
-        assert_eq!(frame_wire_len(0), 4);
-        assert_eq!(frame_wire_len(12), 16);
-    }
 
     #[test]
     fn protocol_log_records_full_length_prefixed_frame() {

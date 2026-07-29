@@ -225,14 +225,26 @@ AI APIs.
   registration succeeded, preventing cross-daemon code substitution.
   Active pending enrollments are capped at 10 and the five-minute
   recently-used collision cache at 4096 entries, including under repeated
-  reconnects from one endpoint. At most 64 pre-auth exchanges run concurrently,
-  each connection permits at most 16 queued bidirectional streams before
-  approval, and both client and server bound the auth exchange to ten seconds.
+  reconnects from one endpoint. Once the QUIC handshake authenticates its
+  endpoint key, a persistently or temporarily trusted client bypasses the
+  64-permit enrollment semaphore but still completes the explicit first-stream
+  confirmation and acknowledgement. At most 64 unknown-client enrollment
+  exchanges run concurrently, and waiting for enrollment capacity is also
+  bounded to ten seconds. Each connection permits at most 16 queued
+  bidirectional streams before approval, and both client and server bound the
+  auth exchange itself to ten seconds.
   Approved iroh clients receive 1024 bidirectional-stream credits and both
   peers extend the connection and path recovery window to ten minutes. This is
   an intentional trusted-client capability rather than a post-authentication
   denial-of-service boundary. The daemon's iroh secret key lives in the local
   rho database.
+  The auth stream remains raw so unauthenticated input cannot invoke a
+  decompressor. All later application directions use ALPN `rho/ui/3` and one
+  streaming zstd frame with a 128 KiB maximum decoder window. Local Unix peers
+  must first exchange the fixed, ten-second-bounded `RHO-STREAM-3` preface.
+  Senax frame limits are enforced on declared decompressed lengths before
+  allocating payloads; compression is not an authorization or integrity
+  boundary.
   After authentication, each native GUI control connection explicitly
   subscribes agent state and may accept up to 1024 daemon-initiated
   unidirectional agent-state streams. Subscriptions are connection-local and
@@ -248,6 +260,10 @@ AI APIs.
   128 MiB while allowing small frames to bypass a waiting large allocation.
   The reservation remains attached to the decoded GUI event until consumption,
   so slow UI handling cannot refill an unbounded queue of large agent frames.
+  The web UI retains only one selected-agent subscription, advertises 16
+  unidirectional stream credits for replacement overlap, and applies a 64 MiB
+  aggregate decompressed-frame allocation budget. A malformed individual
+  agent stream is discarded without tearing down unrelated control traffic.
   Setting `QLOGDIR` opts the process into writing a qlog file for every iroh
   connection. Qlog records transport metadata such as endpoint addresses,
   connection IDs, packet timing and sizes, stream IDs and offsets, loss, and
@@ -298,6 +314,13 @@ AI APIs.
 - Inbound data on the iroh ALPN is remote, semi-trusted input: oversized UI
   protocol frames are rejected (`MAX_FRAME_LEN`) and malformed frames end the
   connection.
+  Raw Git tunnels have no total-byte bound because repository transfer sizes
+  are intentionally data-dependent; their relay uses a fixed 16 KiB buffer,
+  flushes the zstd writer after every chunk, and propagates half-close so small
+  request/response exchanges cannot deadlock behind compressor buffering.
+  Dropping a supervised typed channel cancels/resets its transport task;
+  sender-driven graceful completion instead finishes the zstd frame and
+  half-closes before the task joins.
 - An authenticated native UI client may request a diff for any workspace it
   can already open through the fully privileged UI protocol. A refresh is a
   persistent jj write: it snapshots that workspace and descendant workspace

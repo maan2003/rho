@@ -23,6 +23,7 @@ members = [
   "crates/rho-iroh-auth",
   "crates/rho-pr-monitor",
   "crates/rho-profiling",
+  "crates/rho-rpc",
   "crates/rho-realtime",
   "crates/rho-registry",
   "crates/rho-slack",
@@ -54,6 +55,7 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 brush-builtins = { path = "vendor/brush/brush-builtins" }
 brush-core = { path = "vendor/brush/brush-core" }
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
@@ -107,9 +109,10 @@ rho-shell-proto = { path = "crates/rho-shell-proto" }
 rho-inference = { path = "crates/rho-inference" }
 rho-realtime = { path = "crates/rho-realtime" }
 rho-registry = { path = "crates/rho-registry" }
-rho-iroh-auth = { path = "crates/rho-iroh-auth" }
+rho-iroh-auth = { path = "crates/rho-iroh-auth", default-features = false }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
+rho-rpc = { path = "crates/rho-rpc", default-features = false }
 rho-shell = { path = "crates/rho-shell" }
 rho-slack = { path = "crates/rho-slack" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }

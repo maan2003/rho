@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::bail;
-use futures::StreamExt as _;
+use futures::{SinkExt as _, StreamExt as _};
 use rho_realtime::{
     DelegateResponseChannel, RealtimeEvent, RealtimeSession, SdpAnswer, TranscriptRole,
 };
@@ -52,12 +52,12 @@ pub(crate) async fn run(
                 let transcript_delta = request.transcript_delta;
                 channel
                     .requests
-                    .unbounded_send(RealtimeClientFrame::Delegate {
+                    .send(RealtimeClientFrame::Delegate {
                         request_id,
                         context_agent,
                         text: request.text,
                         transcript_delta,
-                    })?;
+                    }).await?;
                 requests.push((request_id, request.id));
             }
             Some(RealtimeEvent::TranscriptDelta { role, delta }) => {
@@ -72,7 +72,7 @@ pub(crate) async fn run(
                 break;
             }
         },
-            reply = channel.replies.next() => match reply {
+            reply = channel.replies.next() => match reply.transpose()? {
                 Some(RealtimeServerFrame::DelegatedItem { request_id, phase, text }) => {
                     let provider_id = requests
                         .iter()
@@ -120,12 +120,13 @@ pub(crate) async fn run(
         let context_agent = *context_agent.lock().expect("Iris context mutex poisoned");
         let _ = channel
             .requests
-            .unbounded_send(RealtimeClientFrame::TranscriptTail {
+            .send(RealtimeClientFrame::TranscriptTail {
                 context_agent,
                 text,
-            });
+            })
+            .await;
     }
-    let _ = channel.requests.unbounded_send(RealtimeClientFrame::Close);
+    let _ = channel.requests.send(RealtimeClientFrame::Close).await;
     result?;
     tracing::info!("native realtime client session ended");
     Ok(())

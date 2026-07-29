@@ -48,7 +48,7 @@ const SCROLLBACK_LIMIT: usize = 8192;
 /// Panes hold views over it; the model outlives any of them.
 pub struct TerminalModel {
     screen: WireScreen,
-    input: futures_mpsc::UnboundedSender<TermClientFrame>,
+    input: futures_mpsc::Sender<TermClientFrame>,
     /// Monotonic count of lines appended to scrollback, so views can keep
     /// their place while history arrives (the ring length saturates).
     history_appended: u64,
@@ -58,6 +58,7 @@ pub struct TerminalModel {
     /// The stream ended without an `Exited` status (daemon or dial gone).
     disconnected: bool,
     _read_task: gpui::Task<()>,
+    _transport: rho_rpc::ChannelTask,
 }
 
 impl TerminalModel {
@@ -66,9 +67,10 @@ impl TerminalModel {
             terminal_id: _,
             mut frames,
             input,
+            transport,
         } = channel;
         let read_task = cx.spawn(async move |this, cx| {
-            while let Some(frame) = frames.next().await {
+            while let Some(Ok(frame)) = frames.next().await {
                 let exited = matches!(frame, TermServerFrame::Exited { .. });
                 if this
                     .update(cx, |model: &mut TerminalModel, cx| model.apply(frame, cx))
@@ -90,6 +92,7 @@ impl TerminalModel {
             sent_size: Rc::new(Cell::new((0, 0))),
             disconnected: false,
             _read_task: read_task,
+            _transport: transport,
         }
     }
 
@@ -103,7 +106,7 @@ impl TerminalModel {
     }
 
     fn send(&self, frame: TermClientFrame) {
-        let _ = self.input.unbounded_send(frame);
+        let _ = self.input.clone().try_send(frame);
     }
 }
 
@@ -363,7 +366,7 @@ impl Render for TerminalView {
                 let size = (cols.max(2.0) as u16, rows.max(2.0) as u16);
                 if sent_size.get() != size {
                     sent_size.set(size);
-                    let _ = input.unbounded_send(TermClientFrame::Resize {
+                    let _ = input.clone().try_send(TermClientFrame::Resize {
                         cols: size.0,
                         rows: size.1,
                     });

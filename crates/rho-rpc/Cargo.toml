@@ -1,0 +1,42 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "rho-rpc"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = []
+browser-client = ["iroh/tls-ring"]
+native-client = ["iroh/qlog", "iroh/tls-aws-lc-rs", "dep:rustls"]
+server = [
+  "rho-iroh-auth/server",
+  "iroh/qlog",
+  "iroh/tls-aws-lc-rs",
+  "dep:noq-proto",
+  "dep:redb",
+  "dep:rho-db",
+  "dep:rustls",
+]
+
+[dependencies]
+anyhow.workspace = true
+async-compression.workspace = true
+iroh.workspace = true
+futures.workspace = true
+noq-proto = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }
+rho-db = { workspace = true, optional = true }
+rho-iroh-auth = { workspace = true, default-features = false }
+rustls = { workspace = true, optional = true }
+senax-encoder.workspace = true
+tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+tokio = { version = "1", features = ["net"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

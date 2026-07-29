@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -23,12 +23,9 @@ use rho_ui_proto::{
     AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, ClientMessage, JoinTarget,
     LandLeaseHolder, LandStatus, McpAgentToolRequest, McpAgentToolResponse, QuotaPoint,
     QuotaSeries, QuotaSummary, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
-    UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, read_frame_counted, write_frame,
-    write_frame_counted,
+    UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, write_frame,
 };
-use tokio::sync::{
-    Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot, watch,
-};
+use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot, watch};
 
 mod agent_ui;
 pub mod debug;
@@ -40,9 +37,6 @@ mod workspace_channel;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
-const IROH_SECRET: redb::TableDefinition<(), &[u8; 32]> =
-    redb::TableDefinition::new("rho_daemon_iroh_secret_v1");
-
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
     rho_ui_proto::socket_path()
 }
@@ -218,8 +212,9 @@ fn spawn_octo_server(
     let github_api_url = url::Url::parse("https://api.github.com")?;
     let token_provider: octo_server::TokenProvider =
         Arc::new(move || secrets.get("GITHUB_TOKEN").context("reading GITHUB_TOKEN"));
+    let router = octo_server::router(token_provider, github_api_url);
     tokio::spawn(async move {
-        if let Err(error) = octo_server::serve(listener, token_provider, github_api_url).await {
+        if let Err(error) = octo_server::serve(listener, router).await {
             tracing::error!(%error, "octo server stopped");
         }
     });
@@ -237,17 +232,11 @@ pub struct DaemonArgs {
     pub auth: String,
     #[arg(long = "socket-path")]
     pub socket_path: Option<PathBuf>,
-    /// Exit once the last UI client disconnects.
-    #[arg(long = "die-on-detached")]
-    pub die_on_detached: bool,
     /// Also listen for UI clients (including the web UI) over iroh
     /// (relay-backed). Remote clients must be enrolled once via
     /// `rho iroh approve <code>` on this machine.
     #[arg(long = "iroh")]
     pub iroh: bool,
-    /// Use BBR3 instead of CUBIC for daemon-to-client iroh traffic.
-    #[arg(long = "iroh-bbr3", env = "RHO_IROH_BBR3")]
-    pub iroh_bbr3: bool,
     #[arg(long = "extra-before-path", env = "RHO_EXTRA_BEFORE_PATH")]
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
@@ -255,15 +244,6 @@ pub struct DaemonArgs {
     /// Write a Dial9 CPU trace on shutdown (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     pub cpu_profile: Option<PathBuf>,
-}
-
-pub fn install_crypto_provider() -> anyhow::Result<()> {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .map_err(|_| anyhow::anyhow!("failed to install the AWS-LC rustls crypto provider"))?;
-    }
-    Ok(())
 }
 
 pub struct DaemonProfiler(Option<rho_profiling::CpuProfiler>);
@@ -294,7 +274,6 @@ impl DaemonProfiler {
 }
 
 pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
-    install_crypto_provider()?;
     // The daemon's own cwd must never matter: agents each carry their own
     // working directory. Park the process somewhere empty and read-only so
     // any code still depending on process cwd fails loudly.
@@ -335,9 +314,10 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
     let quota_path_overrides = path_overrides.clone();
     let iroh = if args.iroh {
-        let secret = load_or_create_iroh_secret(&db).await?;
-        let iroh_auth = rho_iroh_auth::IrohAuth::new(db.clone(), secret.public());
-        Some((secret, iroh_auth))
+        let (listener, auth) =
+            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_ui_proto::IROH_ALPN).await?;
+        eprintln!("rho daemon iroh endpoint: {}", listener.endpoint_id());
+        Some((listener, auth))
     } else {
         None
     };
@@ -350,7 +330,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             path_overrides,
             user_environment,
             platform_secrets,
-            iroh_auth,
         )
         .await?,
     );
@@ -374,27 +353,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         agents.events.clone(),
     );
 
-    let iroh_listener = if let Some((secret, iroh_auth)) = iroh {
-        let mut transport = iroh::endpoint::QuicTransportConfig::builder()
-            .max_concurrent_bidi_streams(16u8.into())
-            .qlog_from_env("rho-daemon");
-        if args.iroh_bbr3 {
-            transport = transport.congestion_controller_factory(Arc::new(
-                noq_proto::congestion::Bbr3Config::default(),
-            ));
-        }
-        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(secret)
-            .transport_config(transport.build())
-            .alpns(vec![rho_ui_proto::IROH_ALPN.to_vec()])
-            .bind()
-            .await
-            .context("bind iroh endpoint")?;
-        eprintln!("rho daemon iroh endpoint: {}", endpoint.id());
-        Some((endpoint, iroh_auth))
-    } else {
-        None
-    };
+    let iroh_listener = iroh.map(|(listener, _)| listener);
 
     // Attention watchers are daemon-owned and pre-armed synchronously by the
     // pool before any activation caller can start work on the returned agent.
@@ -432,9 +391,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // agents, so expose them only after the activation observer is installed.
     agents.pr_monitor.start_polling();
     agents.resume_platform_integrations();
-    if let Some((endpoint, iroh_auth)) = iroh_listener {
-        tokio::spawn(run_iroh_listener(agents.clone(), endpoint, iroh_auth));
-    }
     // Re-arm snooze wake-ups that were pending when the daemon last stopped.
     for (agent_id, agent) in agents.db.read().list_agents() {
         if let AgentDisposition::Snoozed { until } = agent.disposition
@@ -450,21 +406,17 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         }
     }
 
-    let active_connections = Arc::new(AtomicUsize::new(0));
-    let connection_closed = Arc::new(Notify::new());
-    let mut accepted_connection = false;
+    if let Some(listener) = iroh_listener {
+        tokio::spawn(run_iroh_listener(
+            agents.clone(),
+            listener,
+            iroh_auth.clone(),
+        ));
+    }
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
-        if args.die_on_detached
-            && accepted_connection
-            && active_connections.load(Ordering::Relaxed) == 0
-        {
-            agents.pool.flush_agent_usage(None).await;
-            return Ok(());
-        }
-
         tokio::select! {
             result = &mut shutdown => {
                 result?;
@@ -473,20 +425,14 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             }
             connection = server.accept() => {
                 let connection = connection?;
-                accepted_connection = true;
-                active_connections.fetch_add(1, Ordering::Relaxed);
                 let agents = agents.clone();
-                let active_connections = active_connections.clone();
-                let connection_closed = connection_closed.clone();
+                let iroh_auth = iroh_auth.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = serve_connection(agents, connection).await {
+                    if let Err(error) = serve_connection(agents, iroh_auth, connection).await {
                         eprintln!("rho daemon connection error: {error:#}");
                     }
-                    active_connections.fetch_sub(1, Ordering::Relaxed);
-                    connection_closed.notify_one();
                 });
             }
-            () = connection_closed.notified(), if active_connections.load(Ordering::Relaxed) > 0 => {}
         }
     }
 }
@@ -508,76 +454,38 @@ async fn shutdown_signal() -> anyhow::Result<()> {
     }
 }
 
-/// Loads the daemon's iroh identity from the local database.
-async fn load_or_create_iroh_secret(db: &RhoDb) -> anyhow::Result<iroh::SecretKey> {
-    let mut write = db.write().await;
-    let mut table = write.open_table(IROH_SECRET);
-    if let Some(secret) = table.get(&()) {
-        return Ok(iroh::SecretKey::from_bytes(secret.value()));
-    }
-
-    let secret = iroh::SecretKey::generate().to_bytes();
-    table.insert(&(), &secret);
-    drop(table);
-    write.commit();
-    Ok(iroh::SecretKey::from_bytes(&secret))
-}
-
-/// Authenticates every iroh connection on its first bi-stream, then serves one
-/// full UI control session plus any number of dedicated bi-streams on
-/// [`rho_ui_proto::IROH_ALPN`]. Unapproved connections never reach the
-/// application handler.
+/// Serves application streams from connections already approved by
+/// [`rho_rpc::AuthenticatedIrohListener`].
 async fn run_iroh_listener(
     agents: Arc<AgentRegistry>,
-    endpoint: iroh::Endpoint,
-    auth: rho_iroh_auth::IrohAuth,
+    mut listener: rho_rpc::AuthenticatedIrohListener,
+    iroh_auth: Option<rho_iroh_auth::IrohAuth>,
 ) {
-    const MAX_CONCURRENT_PREAUTH: usize = 64;
-    let preauth = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PREAUTH));
-    while let Some(incoming) = endpoint.accept().await {
-        let permit = match preauth.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => return,
+    while let Some(approved) = listener.accept().await {
+        let connection = match approved {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("rho daemon iroh authentication error: {error:#}");
+                continue;
+            }
         };
         let agents = agents.clone();
-        let auth = auth.clone();
+        let iroh_auth = iroh_auth.clone();
         tokio::spawn(async move {
-            let connection = match incoming.await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    eprintln!("rho daemon iroh accept error: {error:#}");
-                    return;
-                }
-            };
-            match rho_iroh_auth::authenticate_server_connection(&auth, &connection).await {
-                Ok(rho_iroh_auth::ServerAuthDecision::Approved) => {
-                    connection.set_max_concurrent_bi_streams(1024u32.into());
-                    drop(permit);
-                }
-                Ok(
-                    rho_iroh_auth::ServerAuthDecision::EnrollmentRequired(_)
-                    | rho_iroh_auth::ServerAuthDecision::Unavailable,
-                ) => {
-                    connection.close(0u32.into(), b"iroh authentication required");
-                    return;
-                }
-                Err(error) => {
-                    eprintln!("rho daemon iroh authentication error: {error:#}");
-                    connection.close(0u32.into(), b"iroh authentication failed");
-                    return;
-                }
-            }
             let agent_streams = Some(IrohAgentStreams::new(connection.clone()));
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let agents = agents.clone();
                 let agent_streams = agent_streams.clone();
+                let iroh_auth = iroh_auth.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let counters = rho_ui_proto::IoCounters::default();
-                        let mut recv = recv;
-                        let first =
-                            read_frame_counted::<_, ClientMessage>(&mut recv, Some(&counters))
-                                .await?;
+                        let mut recv = rho_rpc::Reader::new(recv);
+                        let first = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            read_frame::<_, ClientMessage>(&mut recv),
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!("iroh stream first frame timed out"))??;
                         // Dedicated streams (workspace files, shells,
                         // terminals, one-shot queries) are not the UI control
                         // session and must not claim it.
@@ -619,11 +527,12 @@ async fn run_iroh_listener(
                             send.set_priority(50)
                                 .context("set iroh interactive stream priority")?;
                         }
+                        let send = rho_rpc::Writer::new(send);
                         let result = serve_connection_io(
                             agents,
+                            iroh_auth,
                             recv,
                             send,
-                            counters,
                             None,
                             agent_streams,
                             Some(first),
@@ -642,6 +551,7 @@ async fn run_iroh_listener(
             }
         });
     }
+    listener.close().await;
 }
 
 const FOCUSED_AGENT_STREAM_WEIGHT: NonZeroU16 = NonZeroU16::new(200).unwrap();
@@ -768,7 +678,7 @@ impl IrohAgentStreams {
 async fn serve_iroh_agent_stream(
     agent_id: AgentId,
     agent: RunningAgent,
-    mut send: iroh::endpoint::SendStream,
+    send: iroh::endpoint::SendStream,
     mut focus: watch::Receiver<Option<AgentId>>,
     mut cancel: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -801,7 +711,8 @@ async fn serve_iroh_agent_stream(
         }
     });
 
-    let result = async {
+    let mut send = rho_rpc::Writer::new(send);
+    let result: anyhow::Result<()> = async {
         write_frame(&mut send, &ServerMessage::AgentStreamOpened { agent_id }).await?;
         let changes = agent.subscribe();
         let mut encoder = AgentRemoteEncoder::new();
@@ -833,7 +744,10 @@ async fn serve_iroh_agent_stream(
     }
     .await;
     focus_task.abort();
-    result
+    result?;
+    tokio::io::AsyncWriteExt::shutdown(&mut send)
+        .await
+        .context("finish compressed iroh agent stream")
 }
 
 trait GitStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -1023,8 +937,6 @@ struct AgentRegistry {
     /// which connection caused them (attention changes); each connection
     /// forwards this onto its own outgoing channel.
     events: broadcast::Sender<ServerMessage>,
-    /// Enrollment/trust for iroh clients; `None` unless `--iroh` is set.
-    iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     /// Daemon-owned Comint-style shell sessions, one per agent.
     shells: Arc<shell::ShellRegistry>,
     /// Daemon-owned terminal sessions, keyed per agent.
@@ -1046,7 +958,6 @@ impl AgentRegistry {
         path_overrides: PathOverrides,
         user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
-        iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     ) -> anyhow::Result<Self> {
         let pool = AgentPool::new(
             db.clone(),
@@ -1073,7 +984,6 @@ impl AgentRegistry {
             pr_monitor,
             platform_secrets,
             events: broadcast::channel(1024).0,
-            iroh_auth,
             shells: Arc::new(shell::ShellRegistry::default()),
             terminals: Arc::new(terminal::TerminalRegistry::default()),
             user_environment,
@@ -1696,9 +1606,9 @@ impl AgentRegistry {
 
 async fn serve_connection(
     agents: Arc<AgentRegistry>,
+    iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     connection: ServerConnection,
 ) -> anyhow::Result<()> {
-    let counters = connection.io_counters();
     let land_holder = connection.peer_cred().ok().map(|cred| LandLeaseHolder {
         pid: cred.pid().and_then(|pid| u32::try_from(pid).ok()),
         uid: cred.uid(),
@@ -1706,16 +1616,16 @@ async fn serve_connection(
     });
     let stream = connection.into_stream();
     let (reader, writer) = stream.into_split();
-    serve_connection_io(agents, reader, writer, counters, land_holder, None, None).await
+    serve_connection_io(agents, iroh_auth, reader, writer, land_holder, None, None).await
 }
 
 /// One UI protocol session over any framed byte stream (Unix socket or an
 /// iroh bi-stream from an enrolled remote client).
 async fn serve_connection_io<R, W>(
     agents: Arc<AgentRegistry>,
+    iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     reader: R,
     writer: W,
-    counters: rho_ui_proto::IoCounters,
     land_holder: Option<LandLeaseHolder>,
     agent_streams: Option<IrohAgentStreams>,
     first: Option<ClientMessage>,
@@ -1731,7 +1641,12 @@ where
     let mut reader = reader;
     let first = match first {
         Some(first) => first,
-        None => read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await?,
+        None => tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_frame::<_, ClientMessage>(&mut reader),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Unix stream first frame timed out"))??,
     };
     if let ClientMessage::ChannelOpen { workspace } = first {
         return serve_workspace_channel(agents, reader, writer, workspace).await;
@@ -1822,14 +1737,10 @@ where
     }
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let writer_counters = counters.clone();
     tokio::spawn(async move {
         let mut writer = writer;
         while let Some(message) = outgoing_rx.recv().await {
-            if write_frame_counted(&mut writer, &message, Some(&writer_counters))
-                .await
-                .is_err()
-            {
+            if write_frame(&mut writer, &message).await.is_err() {
                 break;
             }
         }
@@ -1898,20 +1809,19 @@ where
     let result = loop {
         let message = match first.take() {
             Some(message) => message,
-            None => {
-                match read_frame_counted::<_, ClientMessage>(&mut reader, Some(&counters)).await {
-                    Ok(message) => message,
-                    Err(error) => {
-                        for (repo, _) in &land_leases {
-                            agents.clear_land_holder(repo).await;
-                        }
-                        break Err(error);
+            None => match read_frame::<_, ClientMessage>(&mut reader).await {
+                Ok(message) => message,
+                Err(error) => {
+                    for (repo, _) in &land_leases {
+                        agents.clear_land_holder(repo).await;
                     }
+                    break Err(error);
                 }
-            }
+            },
         };
         match handle_message(
             &agents,
+            iroh_auth.as_ref(),
             &outgoing_tx,
             &mut land_leases,
             land_holder.clone(),
@@ -1952,7 +1862,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let mut provider = match agents.git_transport.request(request).await {
+    let provider = match agents.git_transport.request(request).await {
         Ok(provider) => provider,
         Err(error) => {
             write_frame(
@@ -1966,8 +1876,8 @@ where
         }
     };
     write_frame(&mut writer, &ServerMessage::GitTransportReady).await?;
-    let mut requester = tokio::io::join(reader, writer);
-    tokio::io::copy_bidirectional(&mut requester, &mut provider).await?;
+    let requester = tokio::io::join(reader, writer);
+    rho_rpc::relay_bidirectional(requester, provider).await?;
     Ok(())
 }
 
@@ -2334,8 +2244,10 @@ enum Refresh {
 
 /// One client request. `Err` becomes a [`ServerMessage::Error`]; extra replies
 /// (creation events, pongs) are sent inline before the caller's `Ready`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     agents: &Arc<AgentRegistry>,
+    iroh_auth: Option<&rho_iroh_auth::IrohAuth>,
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
     land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
     land_holder: Option<LandLeaseHolder>,
@@ -2864,10 +2776,8 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::IrohApprove { code } => {
-            let auth = agents
-                .iroh_auth
-                .as_ref()
-                .context("daemon is not listening over iroh (start it with --iroh)")?;
+            let auth =
+                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
             let code = code
                 .parse::<rho_iroh_auth::EnrollmentCode>()
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -2881,10 +2791,8 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::IrohTrustInMemory { endpoint_id } => {
-            let auth = agents
-                .iroh_auth
-                .as_ref()
-                .context("daemon is not listening over iroh (start it with --iroh)")?;
+            let auth =
+                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
             let endpoint_id = endpoint_id
                 .parse::<iroh::EndpointId>()
                 .context("invalid iroh client endpoint id")?;
@@ -2895,10 +2803,8 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::IrohRevoke { endpoint_id } => {
-            let auth = agents
-                .iroh_auth
-                .as_ref()
-                .context("daemon is not listening over iroh (start it with --iroh)")?;
+            let auth =
+                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
             let endpoint_id = endpoint_id
                 .parse::<iroh::EndpointId>()
                 .context("invalid iroh client endpoint id")?;
@@ -3679,8 +3585,8 @@ mod tests {
 
     use super::{
         GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
-        configure_octo_git_transport, load_or_create_iroh_secret, quota_burn, quota_history,
-        quota_summaries, validate_image_content,
+        configure_octo_git_transport, quota_burn, quota_history, quota_summaries,
+        validate_image_content,
     };
 
     #[test]
@@ -3865,17 +3771,6 @@ mod tests {
             environment_value(&environment, "GIT_CONFIG_VALUE_4"),
             Some(OsStr::new("ssh://git@git.sr.ht/"))
         );
-    }
-
-    #[tokio::test]
-    async fn iroh_secret_is_persisted_in_database() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(temp.path().join("rho.redb"));
-
-        let first = load_or_create_iroh_secret(&db).await.unwrap();
-        let second = load_or_create_iroh_secret(&db).await.unwrap();
-
-        assert_eq!(first.public(), second.public());
     }
 
     #[tokio::test]

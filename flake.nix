@@ -164,6 +164,7 @@
             "crates/rho-core"
             "crates/rho-iroh-auth"
             "crates/rho-registry"
+            "crates/rho-rpc"
             "crates/rho-shell-proto"
             "crates/rho-ui-proto"
             "crates/rho-workspaces-types"

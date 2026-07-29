@@ -1,4 +1,4 @@
-//! Rho web UI: a static Leptos client for the daemon's native `rho/ui/2`
+//! Rho web UI: a static Leptos client for the daemon's native `rho/ui/3`
 //! protocol over iroh.
 
 mod conn;

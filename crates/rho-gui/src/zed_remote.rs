@@ -38,6 +38,7 @@ pub struct RemoteProjectState {
     buffers: HashMap<Utf8PathBuf, OpenBuffer>,
     languages: Arc<language::LanguageRegistry>,
     _incoming: Task<()>,
+    _transport: rho_rpc::ChannelTask,
 }
 
 struct OpenBuffer {
@@ -260,6 +261,7 @@ pub fn open_remote_project(
         let WorkspaceChannel {
             outgoing,
             mut incoming,
+            transport,
         } = channel_task
             .await
             .context("workspace channel dial task failed")??;
@@ -273,11 +275,13 @@ pub fn open_remote_project(
                 buffers: HashMap::new(),
                 languages,
                 _incoming: Task::ready(()),
+                _transport: transport,
             })
         });
         let weak = state.downgrade();
         let task = cx.spawn(async move |cx| {
             while let Some(frame) = incoming.next().await {
+                let Ok(frame) = frame else { break };
                 if weak
                     .update(cx, |state, cx| state.handle_frame(frame, cx))
                     .is_err()
