@@ -1,6 +1,12 @@
+#[cfg(not(target_family = "wasm"))]
 pub mod fs_watcher;
 
+#[cfg(not(target_family = "wasm"))]
 pub use fs_watcher::requires_poll_watcher;
+#[cfg(target_family = "wasm")]
+pub fn requires_poll_watcher() -> bool {
+    false
+}
 
 use parking_lot::Mutex;
 use slotmap::{KeyData, SlotMap};
@@ -18,6 +24,7 @@ use gpui::ReadGlobal as _;
 use gpui::SharedString;
 #[cfg(unix)]
 use std::ffi::CString;
+#[cfg(not(target_family = "wasm"))]
 use util::command::new_command;
 
 #[cfg(unix)]
@@ -31,12 +38,15 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::mem::MaybeUninit;
 
+#[cfg(not(target_family = "wasm"))]
 use async_tar::Archive;
 use futures::{AsyncRead, Stream, StreamExt, future::BoxFuture};
+#[cfg(not(target_family = "wasm"))]
 use git::repository::{GitRepository, RealGitRepository};
 use is_executable::IsExecutable;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_family = "wasm"))]
 use smol::io::AsyncWriteExt;
 #[cfg(feature = "test-support")]
 use std::path::Component;
@@ -104,6 +114,7 @@ pub trait Fs: Send + Sync {
         path: &Path,
         content: Pin<&mut (dyn AsyncRead + Send)>,
     ) -> Result<()>;
+    #[cfg(not(target_family = "wasm"))]
     async fn extract_tar_file(
         &self,
         path: &Path,
@@ -155,14 +166,18 @@ pub trait Fs: Send + Sync {
         Arc<dyn Watcher>,
     );
 
+    #[cfg(not(target_family = "wasm"))]
     fn open_repo(
         &self,
         abs_dot_git: &Path,
         system_git_binary_path: Option<&Path>,
     ) -> Result<Arc<dyn GitRepository>>;
+    #[cfg(not(target_family = "wasm"))]
     async fn git_init(&self, abs_work_directory: &Path, fallback_branch_name: String)
     -> Result<()>;
+    #[cfg(not(target_family = "wasm"))]
     async fn git_clone(&self, abs_work_directory: &Path, repo_url: &str) -> Result<()>;
+    #[cfg(not(target_family = "wasm"))]
     async fn git_config(&self, abs_work_directory: &Path, args: Vec<String>) -> Result<String>;
     fn is_fake(&self) -> bool;
     async fn is_case_sensitive(&self) -> bool;
@@ -197,6 +212,7 @@ struct TrashedEntry {
     pub original_parent: PathBuf,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<trash::TrashItem> for TrashedEntry {
     fn from(item: trash::TrashItem) -> Self {
         Self {
@@ -207,6 +223,7 @@ impl From<trash::TrashItem> for TrashedEntry {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl TrashedEntry {
     fn into_trash_item(self) -> trash::TrashItem {
         trash::TrashItem {
@@ -235,6 +252,7 @@ pub enum TrashRestoreError {
     Unknown { description: String },
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl From<trash::Error> for TrashRestoreError {
     fn from(err: trash::Error) -> Self {
         match err {
@@ -411,6 +429,7 @@ impl TrashId {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct RealFs {
     bundled_git_binary_path: Option<PathBuf>,
     executor: BackgroundExecutor,
@@ -424,6 +443,7 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn current_path(&self, fs: &Arc<dyn Fs>) -> Result<PathBuf>;
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl FileHandle for std::fs::File {
     #[cfg(target_os = "macos")]
     fn current_path(&self, _: &Arc<dyn Fs>) -> Result<PathBuf> {
@@ -516,8 +536,10 @@ impl FileHandle for std::fs::File {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub struct RealWatcher {}
 
+#[cfg(not(target_family = "wasm"))]
 impl RealFs {
     pub fn new(git_binary_path: Option<PathBuf>, executor: BackgroundExecutor) -> Self {
         Self {
@@ -683,6 +705,7 @@ fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<
 }
 
 #[async_trait::async_trait]
+#[cfg(not(target_family = "wasm"))]
 impl Fs for RealFs {
     async fn create_dir(&self, path: &Path) -> Result<()> {
         Ok(smol::fs::create_dir_all(path).await?)
@@ -1370,7 +1393,10 @@ impl Fs for RealFs {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(any(target_os = "linux", target_os = "freebsd"))
+))]
 impl Watcher for RealWatcher {
     fn add(&self, _: &Path) -> Result<()> {
         Ok(())

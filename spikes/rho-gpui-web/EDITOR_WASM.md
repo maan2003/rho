@@ -23,8 +23,9 @@ Direct checks from `vendor/zed` establish the current boundary:
 | `sum_tree`, `clock`, `collections` | **clean** | No changes required. |
 | `util` | **clean after gating** | Its process, command, shell, archive, and filesystem modules were compiled on wasm even though their `smol`, `async-fs`, `dirs`, `which`, and `libc` dependencies are native-only. Compile those modules only off wasm; use `/` as the inert wasm home path. |
 | `rope`, `text` | **clean after the util gate** | Their production use of `util` is target-neutral (`debug_panic`, UTF-8 helpers, range helpers). |
-| `language_core` | **blocked** | `language_core -> tree-sitter 0.26.9`. The tree-sitter C-runtime build script aborts on `wasm32-unknown-unknown`: `DEP_TREE_SITTER_LANGUAGE_WASM_HEADERS` and `DEP_TREE_SITTER_LANGUAGE_WASM_SRC` are not supplied. |
-| `language` | **blocked behind language_core** | Also unconditionally links `fs`, `http_client`, `lsp`, `rpc`, `task`, settings, and tree-sitter syntax/query machinery. |
+| `language_core` | **clean with inert parser API** | Wasm selects `tree-sitter-stub`; native continues selecting tree-sitter 0.26.9. |
+| `fs` | **interface/model layer clean** | Wasm retains `Fs`, metadata, events, and `MTime`, but excludes `RealFs`, Git, process execution, native watching, archive extraction, and trash integration. |
+| `language` | **blocked** | Two remaining transitive chains fail before language code is checked: `language -> settings -> settings_json/migrator -> tree-sitter 0.26.9`, and `language -> lsp -> lsp-types`, whose URI code calls unavailable `Url::from_file_path` on wasm. |
 | `buffer_diff`, `multi_buffer` | **blocked behind language** | The text/sum-tree portions are portable, but buffer types are owned by `language`; `multi_buffer` also directly enables tree-sitter's `wasm` feature. |
 | `editor` | **not wasm-shaped** | All native integrations are unconditional dependencies and imports. The first compile failure is currently tree-sitter, before the later native failures become visible. |
 
@@ -112,9 +113,10 @@ and repository behavior and must be absent on wasm.
 
 - **Milestone 1 — dependency map and plan:** complete.
 - **Milestone 2 — core text stack:** partial. `sum_tree`, `clock`,
-  `collections`, `util`, `rope`, and `text` check successfully.
-  `language_core` fails in the tree-sitter build script, so `language` and
-  `multi_buffer` are not yet complete.
+  `collections`, `util`, `rope`, `text`, `language_core`, and the `fs`
+  interface/model layer check successfully. `language` is blocked by the
+  settings parser and native LSP URI chains above, so `multi_buffer` is not yet
+  complete.
 - **Milestone 3 — reduced editor:** not started; it depends on the syntax-free
   language/multibuffer seam.
 - **Milestone 4 — browser editor demo:** not started. The existing plain GPUI
