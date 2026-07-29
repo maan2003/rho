@@ -324,13 +324,6 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "source: {}", snapshot.source.display())?;
     writeln!(output, "snapshot: {}", snapshot.path.display())?;
     writeln!(output, "migration on copied database: ok")?;
-    if let Some(point) = rho_agent::db::migration_recovery_point(&db) {
-        writeln!(
-            output,
-            "recovery savepoint: {} ({} -> {}, created {})",
-            point.savepoint_id, point.from_format, point.to_format, point.created_at.0
-        )?;
-    }
     writeln!(output, "agents decoded: {}", agents.len())?;
     writeln!(output, "events decoded: {events}")?;
     io::stdout().lock().write_all(output.as_bytes())?;
@@ -338,12 +331,9 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
-    rho_agent::db::prepare_agent_db_migration(db).await;
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
-    rho_agent::db::prune_migration_savepoints(db).await;
-    rho_agent::db::finalize_agent_db_migration(db).await;
     Ok(())
 }
 

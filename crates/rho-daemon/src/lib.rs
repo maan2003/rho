@@ -410,11 +410,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             iroh_auth.clone(),
         ));
     }
-    let migration_db = agents.db.clone();
-    tokio::spawn(async move {
-        rho_agent::db::prune_migration_savepoints(&migration_db).await;
-        rho_agent::db::finalize_agent_db_migration(&migration_db).await;
-    });
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 

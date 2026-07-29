@@ -154,7 +154,6 @@ impl AgentPool {
         path_overrides: PathOverrides,
         user_environment: UserEnvironment,
     ) -> Arc<Self> {
-        crate::db::prepare_agent_db_migration(&db).await;
         let mut write = db.write().await;
         write.init_agent_tables();
         write.commit();

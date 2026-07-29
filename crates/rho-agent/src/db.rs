@@ -38,12 +38,8 @@ const AGENT_USAGE_TOTALS: TableDefinition<AgentId, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_totals");
 const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_by_time_provider");
-const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
-    TableDefinition::new("migration_recovery");
-
 const CURRENT_AGENT_DB_FORMAT: &str = "7c5e2a91";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
-const RETAINED_MIGRATION_SAVEPOINTS: usize = 10;
 
 struct AgentDbMigration {
     from: &'static str,
@@ -51,41 +47,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct MigrationRecoveryPoint {
-    pub savepoint_id: u64,
-    pub from_format: String,
-    pub to_format: String,
-    pub created_at: UnixMillis,
-}
-
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: "f12a7c9d",
-        to: "a61e39c4",
-        migrate: |_| {},
-    },
-    AgentDbMigration {
-        from: "a61e39c4",
-        to: "d93b71e4",
-        migrate: rebuild_global_agent_usage,
-    },
-    AgentDbMigration {
-        from: "d93b71e4",
-        to: "f3b7fb40",
-        migrate: compact_quota_observations,
-    },
-    AgentDbMigration {
-        from: "f3b7fb40",
-        to: "ae190a64",
-        migrate: rebuild_usage_and_compact_quota,
-    },
-    AgentDbMigration {
-        from: "ae190a64",
-        to: "7c5e2a91",
-        migrate: |_| {},
-    },
-];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -244,70 +206,6 @@ fn add_global_agent_usage(write: &mut WriteTxn, model: AgentUsageModel, bucket: 
     table.insert(&key, SenValue::borrowed(&merged));
 }
 
-fn rebuild_global_agent_usage(write: &mut WriteTxn) {
-    let models = write
-        .open_table(AGENTS)
-        .iter()
-        .map(|(agent_id, record)| (agent_id.value(), usage_model(record.value().as_ref())))
-        .collect::<std::collections::HashMap<_, _>>();
-    let buckets = write
-        .open_table(AGENT_USAGE_BUCKETS)
-        .iter()
-        .map(|(key, bucket)| (key.value(), bucket.value().into_owned()))
-        .collect::<Vec<_>>();
-    let mut rebuilt = std::collections::BTreeMap::<GlobalAgentUsageKey, AgentUsageBucket>::new();
-    for (key, bucket) in buckets {
-        let model = if bucket.model == AgentUsageModel::UNKNOWN {
-            models.get(&key.agent_id).copied()
-        } else {
-            Some(bucket.model)
-        };
-        if let Some(model) = model {
-            rebuilt
-                .entry(GlobalAgentUsageKey {
-                    bucket_start_ms: bucket.bucket_start_ms,
-                    model,
-                })
-                .or_insert_with(|| AgentUsageBucket {
-                    bucket_start_ms: bucket.bucket_start_ms,
-                    ..AgentUsageBucket::default()
-                })
-                .add(&bucket);
-        }
-    }
-    write.delete_table("agent_usage_by_time_provider");
-    let mut global = write.open_table(GLOBAL_AGENT_USAGE);
-    for (key, bucket) in rebuilt {
-        global.insert(&key, SenValue::owned(bucket));
-    }
-}
-
-fn rebuild_usage_models(write: &mut WriteTxn) {
-    let models = write
-        .open_table(AGENTS)
-        .iter()
-        .map(|(agent_id, record)| (agent_id.value(), usage_model(record.value().as_ref())))
-        .collect::<std::collections::HashMap<_, _>>();
-    let buckets = write.open_table(AGENT_USAGE_BUCKETS);
-    let records = buckets
-        .iter()
-        .map(|(key, bucket)| (key.value(), bucket.value().into_owned()))
-        .collect::<Vec<_>>();
-    drop(buckets);
-    write.delete_table("agent_usage_by_agent_time");
-    let mut buckets = write.open_table(AGENT_USAGE_BUCKETS);
-    for (key, mut bucket) in records {
-        if bucket.model == AgentUsageModel::UNKNOWN
-            && let Some(model) = models.get(&key.agent_id)
-        {
-            bucket.model = *model;
-        }
-        buckets.insert(&key, SenValue::owned(bucket));
-    }
-    drop(buckets);
-    rebuild_global_agent_usage(write);
-}
-
 fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservationRecord) -> bool {
     old.provider == new.provider
         && old.model == new.model
@@ -317,43 +215,6 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
             (None, None) => true,
             _ => false,
         }
-}
-
-fn compact_quota_observations(write: &mut WriteTxn) {
-    let mut previous = None;
-    let observations = write.open_table(QUOTA_OBSERVATIONS);
-    let mut retained = Vec::new();
-    for (_, value) in observations.iter() {
-        let observation = value.value().into_owned();
-        if !previous
-            .as_ref()
-            .is_some_and(|old| quota_observation_unchanged(old, &observation))
-        {
-            previous = Some(observation.clone());
-            retained.push(observation);
-        }
-    }
-    drop(observations);
-
-    // Rebuilding is linear and releases the old B-tree in one operation.
-    // Removing a long provider-debug history row by row made recovery from
-    // the original import take minutes while holding the daemon startup.
-    write.delete_table("quota_observations_by_model_time");
-    let mut observations = write.open_table(QUOTA_OBSERVATIONS);
-    for observation in retained {
-        observations.insert(
-            &QuotaObservationKey {
-                model: observation.model,
-                observed_at: observation.observed_at.0,
-            },
-            SenValue::owned(observation),
-        );
-    }
-}
-
-fn rebuild_usage_and_compact_quota(write: &mut WriteTxn) {
-    rebuild_global_agent_usage(write);
-    compact_quota_observations(write);
 }
 
 pub use rho_core::{
@@ -413,442 +274,6 @@ impl AgentEventPos {
 }
 
 pub type UnixMillis = UnixMs;
-
-pub fn migration_recovery_point(db: &rho_db::RhoDb) -> Option<MigrationRecoveryPoint> {
-    let read = db.read();
-    if !read.has_table("migration_recovery") {
-        return None;
-    }
-    let table = read.open_table(MIGRATION_RECOVERY);
-    table.get(&()).map(|point| point.value().into_owned())
-}
-
-pub async fn prune_migration_savepoints(db: &rho_db::RhoDb) {
-    let mut savepoint_ids = {
-        let write = db.write().await;
-        write.persistent_savepoints()
-    };
-    savepoint_ids.sort_unstable();
-    let delete_count = savepoint_ids
-        .len()
-        .saturating_sub(RETAINED_MIGRATION_SAVEPOINTS);
-    for savepoint_id in savepoint_ids.into_iter().take(delete_count) {
-        let mut write = db.write().await;
-        write.delete_persistent_savepoint(savepoint_id);
-        write.commit();
-        tokio::task::yield_now().await;
-    }
-}
-
-pub async fn finalize_agent_db_migration(db: &rho_db::RhoDb) {
-    let Some(recovery) = migration_recovery_point(db) else {
-        return;
-    };
-    if recovery.to_format != CURRENT_AGENT_DB_FORMAT {
-        return;
-    }
-    let mut write = db.write().await;
-    rebuild_usage_models(&mut write);
-    write.open_table(MIGRATION_RECOVERY).remove(&());
-    write.commit();
-}
-
-pub async fn prepare_agent_db_migration(db: &rho_db::RhoDb) {
-    let debug_dir = dirs::state_dir().map(|dir| dir.join("rho/debug/provider-requests"));
-    prepare_agent_db_migration_with_debug_dir(db, debug_dir).await;
-}
-
-async fn prepare_agent_db_migration_with_debug_dir(
-    db: &rho_db::RhoDb,
-    debug_dir: Option<std::path::PathBuf>,
-) {
-    let from_format = {
-        let read = db.read();
-        read.has_table("format")
-            .then(|| {
-                read.open_table(FORMAT)
-                    .get(&())
-                    .map(|format| format.value())
-            })
-            .flatten()
-            .filter(|format| format != CURRENT_AGENT_DB_FORMAT)
-    };
-    let Some(from_format) = from_format else {
-        return;
-    };
-    let recovery_ready = migration_recovery_point(db).is_some_and(|point| {
-        point.from_format == from_format && point.to_format == CURRENT_AGENT_DB_FORMAT
-    });
-    if !recovery_ready {
-        db.persistent_savepoint(|write, savepoint_id| {
-            let point = MigrationRecoveryPoint {
-                savepoint_id,
-                from_format: from_format.clone(),
-                to_format: CURRENT_AGENT_DB_FORMAT.to_owned(),
-                created_at: UnixMillis::now(),
-            };
-            write
-                .open_table(MIGRATION_RECOVERY)
-                .insert(&(), SenValue::borrowed(&point));
-        })
-        .await;
-    }
-    if from_format == "f12a7c9d" {
-        eprintln!("rho-agent: backfilling per-agent token usage");
-        let buckets = backfill_agent_usage(db, debug_dir.clone()).await;
-        eprintln!(
-            "rho-agent: writing {} five-minute token-usage buckets",
-            buckets.len()
-        );
-        let mut write = db.write().await;
-        write.replace_agent_usage(&buckets);
-        write.commit();
-    } else {
-        eprintln!("rho-agent: rebuilding Claude token usage");
-        let (agents, buckets) = backfill_claude_agent_usage(db).await;
-        let previous_requests = {
-            let read = db.read();
-            agents
-                .iter()
-                .map(|agent_id| read.agent_usage_total(*agent_id).requests)
-                .sum::<u64>()
-        };
-        let rebuilt_requests = buckets.values().map(|bucket| bucket.requests).sum::<u64>();
-        eprintln!(
-            "rho-agent: replacing Claude usage with {} five-minute buckets \
-             ({previous_requests} stored requests, {rebuilt_requests} transcript records)",
-            buckets.len(),
-        );
-        let mut write = db.write().await;
-        replace_agent_usage_for_agents(&mut write, &agents, &buckets);
-        write.commit();
-    }
-
-    // Quota history was already rebuilt and compacted by the preceding
-    // format. The ae190a64 -> 7c5e2a91 hop only needs richer Claude usage,
-    // so rereading every provider debug response here is both redundant and
-    // prohibitively expensive for long-lived developer databases.
-    if from_format != "ae190a64" {
-        eprintln!("rho-agent: backfilling ChatGPT quota history");
-        let observations = backfill_quota_observations(debug_dir).await;
-        eprintln!(
-            "rho-agent: found {} historical quota observations",
-            observations.len()
-        );
-        let mut write = db.write().await;
-        let mut table = write.open_table(QUOTA_OBSERVATIONS);
-        for observation in observations {
-            table.insert(
-                &QuotaObservationKey {
-                    model: observation.model,
-                    observed_at: observation.observed_at.0,
-                },
-                SenValue::owned(observation),
-            );
-        }
-        drop(table);
-        write.commit();
-    }
-}
-
-async fn backfill_agent_usage(
-    db: &rho_db::RhoDb,
-    debug_dir: Option<std::path::PathBuf>,
-) -> std::collections::HashMap<(AgentId, u64), AgentUsageBucket> {
-    use futures::StreamExt as _;
-
-    let agents = db.read().list_agents();
-    let mut prompt_keys = std::collections::HashMap::<String, Vec<AgentId>>::new();
-    let mut claude_sessions = Vec::new();
-    for (agent_id, record) in agents {
-        match record.runtime {
-            AgentRuntime::Rho { prompt_cache_key } => prompt_keys
-                .entry(prompt_cache_key.debug_file_stem())
-                .or_default()
-                .push(agent_id),
-            AgentRuntime::Claude { session_id } => claude_sessions.push((
-                agent_id,
-                session_id,
-                record.primary_workdir().repo().to_owned(),
-                usage_model(&record),
-            )),
-        }
-    }
-    let prompt_keys = prompt_keys
-        .into_iter()
-        .filter_map(|(key, agents)| (agents.len() == 1).then_some((key, agents[0])))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut paths = Vec::new();
-    if let Some(dir) = debug_dir
-        && let Ok(mut entries) = tokio::fs::read_dir(dir).await
-    {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with("-response.json")
-                && name
-                    .get(..16)
-                    .is_some_and(|prefix| prompt_keys.contains_key(prefix))
-            {
-                paths.push(entry.path());
-            }
-        }
-    }
-
-    let native = futures::stream::iter(paths.into_iter().map(|path| {
-        let prompt_keys = &prompt_keys;
-        async move {
-            let name = path.file_name()?.to_string_lossy();
-            let agent_id = *prompt_keys.get(name.get(..16)?)?;
-            let bytes = tokio::fs::read(&path).await.ok()?;
-            let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            let response = value["raw_events"]
-                .as_array()?
-                .iter()
-                .rev()
-                .find(|event| event["type"] == "response.completed")?
-                .get("response")?;
-            let usage = response.get("usage")?;
-            let input = usage["input_tokens"].as_u64()?;
-            let cache_read = usage["input_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or(0);
-            let cache_write = usage["input_tokens_details"]["cache_write_tokens"]
-                .as_u64()
-                .unwrap_or(0);
-            let completed_at: u64 = tokio::fs::metadata(&path)
-                .await
-                .ok()?
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_millis()
-                .try_into()
-                .ok()?;
-            Some((
-                agent_id,
-                AgentUsageBucket {
-                    bucket_start_ms: completed_at / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS,
-                    model: AgentUsageModel::GPT,
-                    input_tokens: input.saturating_sub(cache_read).saturating_sub(cache_write),
-                    cache_read_tokens: cache_read,
-                    cache_write_tokens: cache_write,
-                    cache_write_1h_tokens: 0,
-                    output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                    requests: 1,
-                    approximate: false,
-                },
-            ))
-        }
-    }))
-    .buffer_unordered(32)
-    .filter_map(async move |value| value)
-    .collect::<Vec<_>>()
-    .await;
-
-    let claude = futures::stream::iter(claude_sessions.into_iter().map(
-        |(agent_id, session_id, repo, model)| async move {
-            let usage = rho_claude::read_session_usage_by_id(session_id, &repo)
-                .await
-                .ok()?;
-            Some((agent_id, model, usage))
-        },
-    ))
-    .buffer_unordered(16)
-    .filter_map(async move |value| value)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut buckets = std::collections::HashMap::<(AgentId, u64), AgentUsageBucket>::new();
-    for (agent_id, bucket) in native {
-        buckets
-            .entry((agent_id, bucket.bucket_start_ms))
-            .or_insert_with(|| AgentUsageBucket {
-                bucket_start_ms: bucket.bucket_start_ms,
-                ..AgentUsageBucket::default()
-            })
-            .add(&bucket);
-    }
-    for (agent_id, model, usage) in claude {
-        add_claude_usage(agent_id, model, usage, &mut buckets);
-    }
-    buckets
-}
-
-async fn backfill_claude_agent_usage(
-    db: &rho_db::RhoDb,
-) -> (
-    std::collections::HashSet<AgentId>,
-    std::collections::HashMap<(AgentId, u64), AgentUsageBucket>,
-) {
-    use futures::StreamExt as _;
-
-    let sessions = db
-        .read()
-        .list_agents()
-        .into_iter()
-        .filter_map(|(agent_id, record)| match record.runtime {
-            AgentRuntime::Claude { session_id } => Some((
-                agent_id,
-                session_id,
-                record.primary_workdir().repo().to_owned(),
-                usage_model(&record),
-            )),
-            AgentRuntime::Rho { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    let agents = sessions
-        .iter()
-        .map(|(agent_id, _, _, _)| *agent_id)
-        .collect::<std::collections::HashSet<_>>();
-    let sessions = futures::stream::iter(sessions.into_iter().map(
-        |(agent_id, session_id, repo, model)| async move {
-            let usage = rho_claude::read_session_usage_by_id(session_id, &repo)
-                .await
-                .ok()?;
-            Some((agent_id, model, usage))
-        },
-    ))
-    .buffer_unordered(16)
-    .filter_map(async move |value| value)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut buckets = std::collections::HashMap::new();
-    for (agent_id, model, usage) in sessions {
-        add_claude_usage(agent_id, model, usage, &mut buckets);
-    }
-    (agents, buckets)
-}
-
-fn add_claude_usage(
-    agent_id: AgentId,
-    fallback_model: AgentUsageModel,
-    samples: Vec<rho_claude::SessionUsageSample>,
-    buckets: &mut std::collections::HashMap<(AgentId, u64), AgentUsageBucket>,
-) {
-    for sample in samples {
-        let Some(timestamp) = sample.timestamp.as_deref().and_then(parse_rfc3339_millis) else {
-            continue;
-        };
-        let bucket_start_ms = timestamp / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS;
-        let model = match sample.model.as_deref() {
-            Some(model) if model.contains("opus") => AgentUsageModel::OPUS,
-            Some(model) if model.contains("fable") => AgentUsageModel::FABLE,
-            _ => fallback_model,
-        };
-        let cache_write_1h_tokens = sample
-            .usage
-            .cache_creation
-            .as_ref()
-            .and_then(|cache| cache.ephemeral_1h_input_tokens)
-            .unwrap_or(0);
-        let bucket = AgentUsageBucket {
-            bucket_start_ms,
-            model,
-            input_tokens: sample.usage.input_tokens.unwrap_or(0),
-            cache_read_tokens: sample.usage.cache_read_input_tokens.unwrap_or(0),
-            cache_write_tokens: sample.usage.cache_creation_input_tokens.unwrap_or(0),
-            cache_write_1h_tokens,
-            output_tokens: sample.usage.output_tokens.unwrap_or(0),
-            requests: 1,
-            approximate: true,
-        };
-        buckets
-            .entry((agent_id, bucket_start_ms))
-            .or_insert_with(|| AgentUsageBucket {
-                bucket_start_ms,
-                ..AgentUsageBucket::default()
-            })
-            .add(&bucket);
-    }
-}
-
-async fn backfill_quota_observations(
-    debug_dir: Option<std::path::PathBuf>,
-) -> Vec<QuotaObservationRecord> {
-    use futures::StreamExt as _;
-
-    let mut paths = Vec::new();
-    if let Some(dir) = debug_dir
-        && let Ok(mut entries) = tokio::fs::read_dir(dir).await
-    {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with("-response.json")
-            {
-                paths.push(entry.path());
-            }
-        }
-    }
-
-    let mut observations = futures::stream::iter(paths.into_iter().map(|path| async move {
-        let bytes = tokio::fs::read(&path).await.ok()?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let (used_percent, reset_at_unix) = value["raw_events"]
-            .as_array()?
-            .iter()
-            .rev()
-            .find_map(quota_from_debug_event)?;
-        let observed_at: u64 = tokio::fs::metadata(path)
-            .await
-            .ok()?
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_millis()
-            .try_into()
-            .ok()?;
-        Some(QuotaObservationRecord {
-            provider: QuotaProvider::ChatGpt,
-            model: QuotaModel::GPT,
-            observed_at: UnixMs(observed_at),
-            used_percent,
-            reset_at_unix,
-        })
-    }))
-    .buffer_unordered(32)
-    .filter_map(async move |value| value)
-    .collect::<Vec<_>>()
-    .await;
-    observations.sort_unstable_by_key(|observation| observation.observed_at);
-    observations
-}
-
-fn quota_from_debug_event(event: &serde_json::Value) -> Option<(u8, Option<i64>)> {
-    if event.get("type")?.as_str()? != "codex.rate_limits" {
-        return None;
-    }
-    let window = event
-        .get("rate_limits")
-        .into_iter()
-        .flat_map(|limits| [limits.get("primary"), limits.get("secondary")])
-        .flatten()
-        .find(|window| {
-            window
-                .get("window_minutes")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|minutes| minutes.abs_diff(7 * 24 * 60) <= 7 * 24 * 3)
-        })?;
-    let used_percent = window.get("used_percent")?.as_f64()?;
-    used_percent.is_finite().then(|| {
-        (
-            used_percent.clamp(0.0, 100.0).round() as u8,
-            window.get("reset_at").and_then(serde_json::Value::as_i64),
-        )
-    })
-}
-
-fn parse_rfc3339_millis(timestamp: &str) -> Option<u64> {
-    chrono::DateTime::parse_from_rfc3339(timestamp)
-        .ok()?
-        .timestamp_millis()
-        .try_into()
-        .ok()
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {
@@ -956,13 +381,6 @@ pub(crate) enum SessionBinding {
     },
     /// Sol-backed advisory agent.
     AdvisorSol(InferenceProfile),
-}
-
-// Temporary migration-only representation of the previous latency field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-enum Latency {
-    Standard,
-    Fast,
 }
 
 pub(crate) trait AgentRoleSessionProfile {
@@ -1074,62 +492,36 @@ impl SessionBinding {
                 intelligence: AdvisorIntelligence::Medium,
             };
         }
-        let (intelligence, _latency) = match self {
-            Self::ResponsesLuna(config) => (
-                EngineerIntelligence::Mini,
-                if config.fast_mode {
-                    Latency::Fast
-                } else {
-                    Latency::Standard
-                },
-            ),
+        let intelligence = match self {
+            Self::ResponsesLuna(_) => EngineerIntelligence::Mini,
             Self::ClaudeFable {
                 effort: ClaudeEffort::High,
             }
             | Self::ClaudeAdvisor {
                 effort: ClaudeEffort::High,
-            } => (EngineerIntelligence::Ultra, Latency::Standard),
+            } => EngineerIntelligence::Ultra,
             Self::ClaudeOpus {
                 effort: ClaudeEffort::High,
-            } => (EngineerIntelligence::Alt, Latency::Standard),
-            Self::ResponsesSol(config) if config.effort == ReasoningEffort::Xhigh => (
-                EngineerIntelligence::High,
-                if config.fast_mode {
-                    Latency::Fast
-                } else {
-                    Latency::Standard
-                },
-            ),
-            Self::ResponsesTerra(config) if config.effort == ReasoningEffort::Low => (
-                EngineerIntelligence::Low,
-                if config.fast_mode {
-                    Latency::Fast
-                } else {
-                    Latency::Standard
-                },
-            ),
+            } => EngineerIntelligence::Alt,
+            Self::ResponsesSol(config) if config.effort == ReasoningEffort::Xhigh => {
+                EngineerIntelligence::High
+            }
+            Self::ResponsesTerra(config) if config.effort == ReasoningEffort::Low => {
+                EngineerIntelligence::Low
+            }
             Self::ResponsesGpt55(config)
             | Self::ResponsesSol(config)
             | Self::ResponsesTerra(config)
             | Self::CoordinatorTerra(config)
             | Self::CoordinatorSol(config)
-            | Self::AdvisorSol(config) => (
-                match config.effort {
-                    ReasoningEffort::Low => EngineerIntelligence::Low,
-                    ReasoningEffort::Medium => EngineerIntelligence::Medium,
-                    ReasoningEffort::High => EngineerIntelligence::High,
-                    ReasoningEffort::Xhigh => EngineerIntelligence::High,
-                },
-                if config.fast_mode {
-                    Latency::Fast
-                } else {
-                    Latency::Standard
-                },
-            ),
-            Self::ClaudeFable { .. } | Self::ClaudeAdvisor { .. } => {
-                (EngineerIntelligence::Ultra, Latency::Standard)
-            }
-            Self::ClaudeOpus { .. } => (EngineerIntelligence::Alt, Latency::Standard),
+            | Self::AdvisorSol(config) => match config.effort {
+                ReasoningEffort::Low => EngineerIntelligence::Low,
+                ReasoningEffort::Medium => EngineerIntelligence::Medium,
+                ReasoningEffort::High => EngineerIntelligence::High,
+                ReasoningEffort::Xhigh => EngineerIntelligence::High,
+            },
+            Self::ClaudeFable { .. } | Self::ClaudeAdvisor { .. } => EngineerIntelligence::Ultra,
+            Self::ClaudeOpus { .. } => EngineerIntelligence::Alt,
         };
         AgentRole::Engineer { intelligence }
     }
@@ -1926,45 +1318,6 @@ impl AgentWriteTxnExt for WriteTxn {
             total.bucket_start_ms = 0;
             totals.insert(&agent_id, SenValue::borrowed(&total));
         }
-    }
-}
-
-fn replace_agent_usage_for_agents(
-    write: &mut WriteTxn,
-    agents: &std::collections::HashSet<AgentId>,
-    replacement: &std::collections::HashMap<(AgentId, u64), AgentUsageBucket>,
-) {
-    let mut buckets = write.open_table(AGENT_USAGE_BUCKETS);
-    let old_keys = buckets
-        .iter()
-        .map(|(key, _)| key.value())
-        .filter(|key| agents.contains(&key.agent_id))
-        .collect::<Vec<_>>();
-    for key in old_keys {
-        buckets.remove(&key);
-    }
-    for ((agent_id, bucket_start_ms), bucket) in replacement {
-        buckets.insert(
-            &AgentUsageKey {
-                agent_id: *agent_id,
-                bucket_start_ms: *bucket_start_ms,
-            },
-            SenValue::borrowed(bucket),
-        );
-    }
-    drop(buckets);
-
-    let mut totals = write.open_table(AGENT_USAGE_TOTALS);
-    for agent_id in agents {
-        totals.remove(agent_id);
-    }
-    let mut by_agent = std::collections::HashMap::<AgentId, AgentUsageBucket>::new();
-    for ((agent_id, _), bucket) in replacement {
-        by_agent.entry(*agent_id).or_default().add(bucket);
-    }
-    for (agent_id, mut total) in by_agent {
-        total.bucket_start_ms = 0;
-        totals.insert(&agent_id, SenValue::borrowed(&total));
     }
 }
 
