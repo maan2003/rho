@@ -27,7 +27,7 @@ Direct checks from `vendor/zed` establish the current boundary:
 | `fs` | **interface/model layer clean** | Wasm retains `Fs`, metadata, events, and `MTime`, but excludes `RealFs`, Git, process execution, native watching, archive extraction, and trash integration. |
 | `language` | **clean** | Browser builds use the real parser/query stack, omit dynamic Wasmtime grammar loading, and substitute an LSP data-model-only crate for the native language-server process runtime. |
 | `buffer_diff`, `multi_buffer` | **clean** | Both compile with the browser language stack and real tree-sitter node/tree types. |
-| `editor` | **blocked at crate ownership split** | The parser/model stack is clean, but editor still unconditionally reaches `db -> sqlez -> smol -> polling`, `client/rpc -> tokio -> mio`, and `project -> terminal/node_runtime/git/workspace`. Native project/client types also appear directly throughout the main `Editor` implementation and element modules. |
+| `editor` | **clean without default features** | The portable editor, display map, element, input, selection, scrolling, clipboard, folds, blocks, and rendering pipeline compile for wasm. The default-on `native` feature retains project/workspace, persistence, LSP, Git, DAP, completion, and prediction integrations. |
 
 The tree-sitter `wasm` Cargo feature is not the browser runtime feature. In
 this revision it enables a Wasmtime-backed host for dynamically loaded grammar
@@ -198,12 +198,9 @@ the implementation crate.
   `buffer_diff`, and `multi_buffer` check successfully. Real tree-sitter types
   and parsing remain present; local filesystem implementations and LSP process
   execution are absent.
-- **Milestone 3 — reduced editor:** blocked after dependency trial. The main
-  editor crate must be split into a target-neutral editor/element core plus
-  native integration modules (or receive a large API-compatible project/client
-  model layer). Merely target-gating Cargo dependencies is insufficient because
-  project, workspace, client, DAP, database, Git, and LSP integration types are
-  embedded throughout `editor.rs`, display-map extensions, and element code.
+- **Milestone 3 — reduced editor:** complete. The single `editor` crate has a
+  default-on `native` feature; `--no-default-features` retains the complete
+  portable editing/rendering path and passes the release wasm check.
 - **Milestone 4 — browser editor demo:** not started. The existing plain GPUI
   rail remains the last successful browser scene.
 - **Milestone 5 — highlighting:** deferred.
@@ -397,6 +394,14 @@ the implementation crate.
   collaboration leadership, navigation history, workspace restoration/persistence,
   and signature-help automation are native contributions. The selection frontier is
   clear and 102 errors remain in the interleaved `Editor` hooks.
+- The final `Editor` split retains snapshots, key context, buffer events, minimap,
+  local file-path fallback, theme/settings updates, excerpt delegation, and local
+  selected-text highlights on wasm. The latter uses a portable literal matcher;
+  native keeps its project search query implementation. Project/workspace actions,
+  collaboration, semantic/LSP data, diagnostics, completion/signature menus,
+  bookmarks/breakpoints/debugger state, diff loading, edit predictions, and language
+  server control are gated as complete native islands. The release
+  `editor --no-default-features` wasm check now passes with zero errors.
 
 ### Reproduction
 
@@ -411,6 +416,9 @@ CC_wasm32_unknown_unknown=/path/to/unwrapped/clang \
 CFLAGS_wasm32_unknown_unknown=-I/path/to/tree_sitter_wasm/include \
 CC_wasm32_unknown_unknown=/path/to/unwrapped/clang \
   cargo check -p tree-sitter-json --target wasm32-unknown-unknown --release
+CFLAGS_wasm32_unknown_unknown=-I/path/to/tree_sitter_wasm/include \
+CC_wasm32_unknown_unknown=/path/to/unwrapped/clang \
+  cargo check -p editor --no-default-features --target wasm32-unknown-unknown --release
 ```
 
 The standalone Zed lockfile was stale relative to the already-vendored wgpu 30

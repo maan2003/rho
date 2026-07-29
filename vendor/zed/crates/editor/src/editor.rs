@@ -1277,6 +1277,7 @@ pub struct Editor {
     addons: TypeIdHashMap<Box<dyn Addon>>,
     #[cfg(feature = "native")]
     registered_buffers: HashMap<BufferId, OpenLspBufferHandle>,
+    #[cfg(feature = "native")]
     load_diff_task: Option<Shared<Task<()>>>,
     #[cfg(feature = "native")]
     diff_hunk_delegate: Option<Arc<dyn DiffHunkDelegate>>,
@@ -2974,7 +2975,17 @@ impl Editor {
 
         // Disable vim contexts when a sub-editor (e.g. rename/inline assistant) is focused.
         if !self.focus_handle(cx).contains_focused(window, cx)
-            || (self.is_focused(window) || self.mouse_menu_is_focused(window, cx))
+            || (self.is_focused(window)
+                || {
+                    #[cfg(feature = "native")]
+                    {
+                        self.mouse_menu_is_focused(window, cx)
+                    }
+                    #[cfg(not(feature = "native"))]
+                    {
+                        false
+                    }
+                })
         {
             for addon in self.addons.values() {
                 addon.extend_key_context(&mut key_context, cx)
@@ -3004,6 +3015,7 @@ impl Editor {
         if self.in_leading_whitespace {
             key_context.add("in_leading_whitespace");
         }
+        #[cfg(feature = "native")]
         if self.edit_prediction_requires_modifier() {
             key_context.set("edit_prediction_mode", "subtle")
         } else {
@@ -3034,6 +3046,7 @@ impl Editor {
             }
         }
 
+        #[cfg(feature = "native")]
         if self.has_any_expanded_diff_hunks(cx) {
             key_context.add("diffs_expanded");
         }
@@ -3068,14 +3081,14 @@ impl Editor {
     pub fn target_file_abs_path(&self, cx: &mut Context<Self>) -> Option<PathBuf> {
         self.active_buffer(cx).and_then(|buffer| {
             let buffer = buffer.read(cx);
+            #[cfg(feature = "native")]
             if let Some(project_path) = buffer.project_path(cx) {
                 let project = self.project()?.read(cx);
-                project.absolute_path(&project_path, cx)
-            } else {
-                buffer
-                    .file()
-                    .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
+                return project.absolute_path(&project_path, cx);
             }
+            buffer
+                .file()
+                .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
         })
     }
 
@@ -3234,11 +3247,12 @@ impl Editor {
         E: std::fmt::Debug + std::fmt::Display + 'static,
         R: 'static,
     {
+        #[cfg(feature = "native")]
         if let Some(workspace) = self.workspace() {
             task.detach_and_notify_err(workspace.downgrade(), window, cx);
-        } else {
-            task.detach_and_log_err(cx);
+            return;
         }
+        task.detach_and_log_err(cx);
     }
 
     /// Returns the workspace serialization ID if this editor should be serialized.
@@ -3255,6 +3269,7 @@ impl Editor {
     }
 
     pub fn snapshot(&self, window: &Window, cx: &mut App) -> EditorSnapshot {
+        #[cfg(feature = "native")]
         let git_blame_gutter_max_author_length = self
             .render_git_blame_gutter(cx)
             .then(|| {
@@ -3267,6 +3282,8 @@ impl Editor {
                 }
             })
             .flatten();
+        #[cfg(not(feature = "native"))]
+        let git_blame_gutter_max_author_length = None;
 
         let display_snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
 
@@ -3278,7 +3295,16 @@ impl Editor {
             show_line_numbers: self.show_line_numbers,
             number_deleted_lines: self.number_deleted_lines,
             show_git_diff_gutter: self.show_git_diff_gutter,
-            semantic_tokens_enabled: self.semantic_token_state.enabled(),
+            semantic_tokens_enabled: {
+                #[cfg(feature = "native")]
+                {
+                    self.semantic_token_state.enabled()
+                }
+                #[cfg(not(feature = "native"))]
+                {
+                    false
+                }
+            },
             show_code_actions: self.show_code_actions,
             show_runnables: self.show_runnables,
             show_bookmarks: self.show_bookmarks,
@@ -3323,10 +3349,12 @@ impl Editor {
         self.mode = mode;
     }
 
+    #[cfg(feature = "native")]
     pub fn collaboration_hub(&self) -> Option<&dyn CollaborationHub> {
         self.collaboration_hub.as_deref()
     }
 
+    #[cfg(feature = "native")]
     pub fn set_collaboration_hub(&mut self, hub: Box<dyn CollaborationHub>) {
         self.collaboration_hub = Some(hub);
     }
@@ -3348,10 +3376,12 @@ impl Editor {
         self.custom_context_menu = Some(Box::new(f))
     }
 
+    #[cfg(feature = "native")]
     pub fn semantics_provider(&self) -> Option<Rc<dyn SemanticsProvider>> {
         self.semantics_provider.clone()
     }
 
+    #[cfg(feature = "native")]
     pub fn set_semantics_provider(&mut self, provider: Option<Rc<dyn SemanticsProvider>>) {
         self.semantics_provider = provider;
     }
@@ -3679,6 +3709,7 @@ impl Editor {
             cx.notify();
             return;
         }
+        #[cfg(feature = "native")]
         if self.clear_expanded_diff_hunks(cx) {
             cx.notify();
             return;
@@ -3881,7 +3912,14 @@ impl Editor {
     }
 
     pub fn has_mouse_context_menu(&self) -> bool {
-        self.mouse_context_menu.is_some()
+        #[cfg(feature = "native")]
+        {
+            self.mouse_context_menu.is_some()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
     }
 
     #[cfg(feature = "native")]
@@ -4039,7 +4077,6 @@ impl Editor {
     }
 
     #[ztracing::instrument(skip_all)]
-    #[cfg(feature = "native")]
     fn update_selection_occurrence_highlights(
         &mut self,
         multi_buffer_snapshot: MultiBufferSnapshot,
@@ -4064,6 +4101,7 @@ impl Editor {
                     .into_iter()
                     .filter(|(_, excerpt_visible_range, _)| !excerpt_visible_range.is_empty());
                 let mut match_ranges = Vec::new();
+                #[cfg(feature = "native")]
                 let Ok(regex) = project::search::SearchQuery::text(
                     query_text,
                     false,
@@ -4078,6 +4116,7 @@ impl Editor {
                 };
                 let query_range = query_range.to_anchors(&multi_buffer_snapshot);
                 for (buffer_snapshot, search_range, _) in buffer_ranges {
+                    #[cfg(feature = "native")]
                     match_ranges.extend(
                         regex
                             .search(
@@ -4101,6 +4140,23 @@ impl Editor {
                                 }
                             }),
                     );
+                    #[cfg(not(feature = "native"))]
+                    {
+                        let search_text = buffer_snapshot
+                            .text_for_range(search_range.clone())
+                            .collect::<String>();
+                        match_ranges.extend(search_text.match_indices(&query_text).filter_map(
+                            |(start, matched)| {
+                                let match_start = buffer_snapshot
+                                    .anchor_after(search_range.start + start);
+                                let match_end = buffer_snapshot
+                                    .anchor_before(search_range.start + start + matched.len());
+                                let range = multi_buffer_snapshot.anchor_in_buffer(match_start)?
+                                    ..multi_buffer_snapshot.anchor_in_buffer(match_end)?;
+                                (range != query_range).then_some(range)
+                            },
+                        ));
+                    }
                 }
                 match_ranges
             });
@@ -4131,6 +4187,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "native")]
     #[ztracing::instrument(skip_all)]
     fn refresh_outline_symbols_at_cursor(&mut self, cx: &mut Context<Editor>) {
         if !self.lsp_data_enabled() {
@@ -4379,6 +4436,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "native")]
     fn active_run_indicators(
         &mut self,
         range: Range<DisplayRow>,
@@ -4430,6 +4488,7 @@ impl Editor {
             .collect()
     }
 
+    #[cfg(feature = "native")]
     fn active_bookmarks(
         &self,
         range: Range<DisplayRow>,
@@ -4487,6 +4546,7 @@ impl Editor {
         bookmark_display_points
     }
 
+    #[cfg(feature = "native")]
     fn render_bookmark(&self, row: DisplayRow, cx: &mut Context<Self>) -> IconButton {
         let focus_handle = self.focus_handle.clone();
         IconButton::new(("bookmark indicator", row.0 as usize), IconName::Bookmark)
@@ -5029,12 +5089,19 @@ impl Editor {
     }
 
     pub fn context_menu_visible(&self) -> bool {
-        !self.edit_prediction_preview_is_active()
+        #[cfg(feature = "native")]
+        {
+            !self.edit_prediction_preview_is_active()
             && self
                 .context_menu
                 .borrow()
                 .as_ref()
                 .is_some_and(|menu| menu.visible())
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
     }
 
     #[cfg(feature = "native")]
@@ -5063,6 +5130,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Option<AnyElement> {
+        #[cfg(feature = "native")]
+        {
         let menu = self.context_menu.borrow();
         let menu = menu.as_ref()?;
         if !menu.visible() {
@@ -5071,6 +5140,11 @@ impl Editor {
         self.style
             .as_ref()
             .map(|style| menu.render(style, max_height_in_lines, window, cx))
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            None
+        }
     }
 
     fn render_context_menu_aside(
@@ -5079,6 +5153,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Option<AnyElement> {
+        #[cfg(feature = "native")]
+        {
         self.context_menu.borrow_mut().as_mut().and_then(|menu| {
             if menu.visible() {
                 menu.render_aside(max_size, window, cx)
@@ -5086,6 +5162,11 @@ impl Editor {
                 None
             }
         })
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            None
+        }
     }
 
     #[cfg(feature = "native")]
@@ -5212,6 +5293,7 @@ impl Editor {
             if let Some(choices) = &tabstop.choices
                 && let Some(selection) = tabstop.ranges.first()
             {
+                #[cfg(feature = "native")]
                 self.show_snippet_choices(choices, selection.clone(), cx)
             }
 
@@ -5348,6 +5430,7 @@ impl Editor {
                 if let Some(choices) = &snippet.choices[snippet.active_index]
                     && let Some(selection) = current_ranges.first()
                 {
+                    #[cfg(feature = "native")]
                     self.show_snippet_choices(choices, selection.clone(), cx);
                 }
 
@@ -6262,6 +6345,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn reload_file(&mut self, _: &ReloadFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.project.clone() else {
             return;
@@ -6508,6 +6592,7 @@ impl Editor {
             })
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn bookmark_at_row(
         &self,
         row: u32,
@@ -6520,6 +6605,7 @@ impl Editor {
         self.bookmark_at_anchor(bookmark_position, &snapshot, cx)
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn bookmark_at_anchor(
         &self,
         bookmark_position: Anchor,
@@ -6844,6 +6930,7 @@ impl Editor {
         self.breakpoint_store.clone()
     }
 
+    #[cfg(feature = "native")]
     fn go_to_active_debug_line(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         maybe!({
             let breakpoint_store = self.breakpoint_store.as_ref()?;
@@ -8127,6 +8214,7 @@ impl Editor {
             .update(cx, |buffer, cx| buffer.group_until_transaction(tx_id, cx));
     }
 
+    #[cfg(feature = "native")]
     pub fn context_menu_first(
         &mut self,
         _: &ContextMenuFirst,
@@ -8138,6 +8226,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn context_menu_prev(
         &mut self,
         _: &ContextMenuPrevious,
@@ -8149,6 +8238,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn context_menu_next(
         &mut self,
         _: &ContextMenuNext,
@@ -8160,6 +8250,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn context_menu_last(
         &mut self,
         _: &ContextMenuLast,
@@ -8171,6 +8262,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn signature_help_prev(
         &mut self,
         _: &SignatureHelpPrevious,
@@ -8187,6 +8279,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn signature_help_next(
         &mut self,
         _: &SignatureHelpNext,
@@ -8402,6 +8495,7 @@ impl Editor {
         }))
     }
 
+    #[cfg(feature = "native")]
     pub fn confirm_rename(
         &mut self,
         _: &ConfirmRename,
@@ -8459,6 +8553,13 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<RenameState> {
+        #[cfg(not(feature = "native"))]
+        {
+            let _ = (moving_cursor, window, cx);
+            return None;
+        }
+        #[cfg(feature = "native")]
+        {
         let rename = self.pending_rename.take()?;
         if rename.editor.focus_handle(cx).is_focused(window) {
             window.focus(&self.focus_handle, cx);
@@ -8498,12 +8599,15 @@ impl Editor {
         }
 
         Some(rename)
+        }
     }
 
+    #[cfg(feature = "native")]
     pub fn pending_rename(&self) -> Option<&RenameState> {
         self.pending_rename.as_ref()
     }
 
+    #[cfg(feature = "native")]
     fn can_format_selections(&self, cx: &App) -> bool {
         if !self.mode.is_full() {
             return false;
@@ -8730,6 +8834,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "native")]
     fn restart_language_server(
         &mut self,
         _: &RestartLanguageServer,
@@ -8750,6 +8855,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     fn stop_language_server(
         &mut self,
         _: &StopLanguageServer,
@@ -9116,6 +9222,7 @@ impl Editor {
                 parent: cx.weak_entity(),
             },
             self.buffer.clone(),
+            #[cfg(feature = "native")]
             None,
             Some(self.display_map.clone()),
             window,
@@ -9197,6 +9304,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     fn copy_relative_path(
         &mut self,
         _: &zed_actions::workspace::CopyRelativePath,
@@ -9238,6 +9346,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn copy_file_location(
         &mut self,
         _: &CopyFileLocation,
@@ -9329,6 +9438,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "native")]
     pub fn open_selections_in_multibuffer(
         &mut self,
         _: &OpenSelectionsInMultibuffer,
@@ -10258,6 +10368,7 @@ impl Editor {
                 self.refresh_outline_symbols_at_cursor(cx);
                 #[cfg(feature = "native")]
                 self.refresh_sticky_headers(&snapshot, cx);
+                #[cfg(feature = "native")]
                 if source.is_local() && self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
                 }
@@ -10271,6 +10382,7 @@ impl Editor {
                         cx.emit(EditorEvent::TitleChanged);
                     }
 
+                    #[cfg(feature = "native")]
                     if self.project.is_some() {
                         let buffer_id = buffer.read(cx).remote_id();
                         self.register_buffer(buffer_id, cx);
@@ -10305,16 +10417,17 @@ impl Editor {
                 path_key,
             } => {
                 self.invalidate_syntax_concealments(None);
+                #[cfg(feature = "native")]
                 if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
                     hovered_link_state.symbol_range = None;
                 }
                 #[cfg(feature = "native")]
                 self.refresh_document_highlights(cx);
                 let buffer_id = buffer.read(cx).remote_id();
+                #[cfg(feature = "native")]
                 if self.buffer.read(cx).diff_for(buffer_id).is_none()
                     && let Some(project) = &self.project
                 {
-                    #[cfg(feature = "native")]
                     update_uncommitted_diff_for_buffer(
                         cx.entity(),
                         project,
@@ -10337,6 +10450,7 @@ impl Editor {
                     .retain(|range, _| range.start.buffer_id != buffer_id);
                 self.colorize_brackets(false, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
+                #[cfg(feature = "native")]
                 self.semantic_token_state.invalidate_buffer(&buffer_id);
                 cx.emit(EditorEvent::BufferRangesUpdated {
                     buffer: buffer.clone(),
@@ -10348,6 +10462,7 @@ impl Editor {
                 self.on_buffer_ranges_updated_batch(updates, window, cx);
             }
             multi_buffer::Event::BuffersRemoved { removed_buffer_ids } => {
+                #[cfg(feature = "native")]
                 if let Some(inlay_hints) = &mut self.inlay_hints {
                     inlay_hints.remove_inlay_chunk_data(removed_buffer_ids);
                 }
@@ -10357,11 +10472,14 @@ impl Editor {
                     cx,
                 );
                 for buffer_id in removed_buffer_ids {
+                    #[cfg(feature = "native")]
+                    {
                     self.registered_buffers.remove(buffer_id);
                     self.clear_runnables(Some(*buffer_id));
                     self.semantic_token_state.invalidate_buffer(buffer_id);
                     self.lsp_document_symbols.remove(buffer_id);
                     self.lsp_document_links.per_buffer.remove(buffer_id);
+                    }
                     self.display_map.update(cx, |display_map, cx| {
                         display_map.invalidate_semantic_highlights(*buffer_id);
                         display_map.clear_lsp_folding_ranges(*buffer_id, cx);
@@ -10403,11 +10521,13 @@ impl Editor {
             }
             multi_buffer::Event::LanguageChanged(buffer_id, is_fresh_language) => {
                 self.invalidate_syntax_concealments(Some(*buffer_id));
+                #[cfg(feature = "native")]
                 if !is_fresh_language {
                     self.registered_buffers.remove(&buffer_id);
                 }
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
+                #[cfg(feature = "native")]
                 self.update_edit_prediction_settings(cx);
                 cx.notify();
             }
@@ -10421,6 +10541,7 @@ impl Editor {
                 cx.emit(EditorEvent::TitleChanged)
             }
             multi_buffer::Event::DiagnosticsUpdated => {
+                #[cfg(feature = "native")]
                 self.update_diagnostics_state(window, cx);
             }
             _ => {}
@@ -10556,6 +10677,7 @@ impl Editor {
         let accents_changed = new_accents != self.accent_data;
         self.accent_data = new_accents;
 
+        #[cfg(feature = "native")]
         if self.diagnostics_enabled() {
             let new_severity = EditorSettings::get_global(cx)
                 .diagnostics_max_severity
@@ -10564,6 +10686,7 @@ impl Editor {
         }
         #[cfg(feature = "native")]
         self.refresh_runnables(None, window, cx);
+        #[cfg(feature = "native")]
         self.update_edit_prediction_settings(cx);
         #[cfg(feature = "native")]
         self.refresh_edit_prediction(
@@ -10573,6 +10696,7 @@ impl Editor {
             window,
             cx,
         );
+        #[cfg(feature = "native")]
         self.refresh_inline_values(cx);
 
         let old_cursor_shape = self.cursor_shape;
@@ -10647,7 +10771,9 @@ impl Editor {
             }
 
             if language_settings_changed {
+                #[cfg(feature = "native")]
                 self.clear_disabled_lsp_folding_ranges(window, cx);
+                #[cfg(feature = "native")]
                 self.refresh_document_symbols(None, cx);
                 #[cfg(feature = "native")]
                 self.refresh_outline_symbols_at_cursor(cx);
@@ -10726,8 +10852,11 @@ impl Editor {
             self.colorize_brackets(true, cx);
         }
 
-        self.invalidate_semantic_tokens(None);
-        self.refresh_semantic_tokens(None, false, cx);
+        #[cfg(feature = "native")]
+        {
+            self.invalidate_semantic_tokens(None);
+            self.refresh_semantic_tokens(None, false, cx);
+        }
         #[cfg(feature = "native")]
         self.refresh_outline_symbols_at_cursor(cx);
     }
@@ -10862,25 +10991,30 @@ impl Editor {
             return;
         }
 
-        let Some(workspace) = self.workspace() else {
-            cx.propagate();
-            return;
-        };
+        #[cfg(feature = "native")]
+        {
+            let Some(workspace) = self.workspace() else {
+                cx.propagate();
+                return;
+            };
 
-        new_selections_by_buffer
-            .retain(|buffer, _| buffer.read(cx).file().is_none_or(|file| file.can_open()));
+            new_selections_by_buffer
+                .retain(|buffer, _| buffer.read(cx).file().is_none_or(|file| file.can_open()));
 
-        if new_selections_by_buffer.is_empty() {
-            return;
+            if new_selections_by_buffer.is_empty() {
+                return;
+            }
+
+            Self::open_buffers_in_workspace(
+                workspace.downgrade(),
+                new_selections_by_buffer,
+                split,
+                window,
+                cx,
+            );
         }
-
-        Self::open_buffers_in_workspace(
-            workspace.downgrade(),
-            new_selections_by_buffer,
-            split,
-            window,
-            cx,
-        );
+        #[cfg(not(feature = "native"))]
+        cx.propagate();
     }
 
     #[cfg(feature = "native")]
@@ -11451,6 +11585,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     pub fn wait_for_diff_to_load(&self) -> Option<Shared<Task<()>>> {
         self.load_diff_task.clone()
     }
@@ -11628,6 +11763,7 @@ impl Editor {
         self.enable_lsp_data && self.mode().is_full()
     }
 
+    #[cfg(feature = "native")]
     fn update_lsp_data(
         &mut self,
         for_buffer: Option<BufferId>,
@@ -11649,6 +11785,7 @@ impl Editor {
         self.refresh_document_symbols(for_buffer, cx);
     }
 
+    #[cfg(feature = "native")]
     fn register_visible_buffers(&mut self, cx: &mut Context<Self>) {
         if !self.lsp_data_enabled() {
             return;
@@ -11663,6 +11800,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "native")]
     fn register_buffer(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
         if !self.lsp_data_enabled() {
             return;
@@ -11743,7 +11881,16 @@ impl Editor {
                 }
             },
             unnecessary_code_fade: settings.unnecessary_code_fade,
-            show_underlines: self.diagnostics_enabled(),
+            show_underlines: {
+                #[cfg(feature = "native")]
+                {
+                    self.diagnostics_enabled()
+                }
+                #[cfg(not(feature = "native"))]
+                {
+                    self.diagnostics_enabled
+                }
+            },
         }
     }
 
@@ -11755,13 +11902,19 @@ impl Editor {
                 buffer
                     .read(cx)
                     .snapshot()
-                    .resolve_file_path(
-                        self.project
-                            .as_ref()
-                            .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
-                            .unwrap_or_default(),
-                        cx,
-                    )
+                    .resolve_file_path({
+                        #[cfg(feature = "native")]
+                        {
+                            self.project
+                                .as_ref()
+                                .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
+                                .unwrap_or_default()
+                        }
+                        #[cfg(not(feature = "native"))]
+                        {
+                            false
+                        }
+                    }, cx)
                     .unwrap_or_else(|| multi_buffer.title(cx).to_string())
             });
             vec![HighlightedText {
@@ -11798,6 +11951,7 @@ impl Editor {
 
     pub fn disable_code_lens(&mut self, cx: &mut Context<Self>) {
         self.enable_code_lens = false;
+        #[cfg(feature = "native")]
         self.clear_code_lenses(cx);
     }
 

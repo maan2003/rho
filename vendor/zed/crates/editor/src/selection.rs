@@ -1644,6 +1644,7 @@ impl Editor {
 
         if local {
             if let Some((anchor, _)) = buffer.anchor_to_buffer_anchor(new_cursor_position) {
+                #[cfg(feature = "native")]
                 self.register_buffer(anchor.buffer_id, cx);
             }
 
