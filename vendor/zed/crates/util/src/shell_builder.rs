@@ -176,6 +176,7 @@ impl ShellBuilder {
     ///
     /// Prefer this over manually constructing a command with the output of `Self::build`,
     /// as this method handles `cmd` weirdness on windows correctly.
+    #[cfg(not(target_family = "wasm"))]
     pub fn build_smol_command(
         self,
         task_command: Option<String>,
@@ -188,6 +189,7 @@ impl ShellBuilder {
     ///
     /// Prefer this over manually constructing a command with the output of `Self::build`,
     /// as this method handles `cmd` weirdness on windows correctly.
+    #[cfg(not(target_family = "wasm"))]
     pub fn build_std_command(
         self,
         mut task_command: Option<String>,

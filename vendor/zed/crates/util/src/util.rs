@@ -13,9 +13,7 @@ pub mod process;
 pub mod redact;
 pub mod schemars;
 pub mod serde;
-#[cfg(not(target_family = "wasm"))]
 pub mod shell;
-#[cfg(not(target_family = "wasm"))]
 pub mod shell_builder;
 #[cfg(not(target_family = "wasm"))]
 pub mod shell_env;
@@ -47,7 +45,6 @@ pub use take_until::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use util_macros::{line_endings, path, uri};
 
-#[cfg(not(target_family = "wasm"))]
 pub use self::shell::{
     get_default_system_shell, get_default_system_shell_preferring_bash, get_system_shell,
 };

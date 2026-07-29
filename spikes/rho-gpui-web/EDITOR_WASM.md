@@ -25,8 +25,8 @@ Direct checks from `vendor/zed` establish the current boundary:
 | `rope`, `text` | **clean after the util gate** | Their production use of `util` is target-neutral (`debug_panic`, UTF-8 helpers, range helpers). |
 | `language_core` | **clean with real tree-sitter** | tree-sitter 0.26.9 C runtime cross-compiles with unwrapped clang and tree-sitter-language 0.1.7's wasm libc provider. The Wasmtime grammar-loader feature is disabled on the browser target. |
 | `fs` | **interface/model layer clean** | Wasm retains `Fs`, metadata, events, and `MTime`, but excludes `RealFs`, Git, process execution, native watching, archive extraction, and trash integration. |
-| `language` | **blocked after parser runtime** | `language -> settings -> settings_json/migrator` still enables tree-sitter's native Wasmtime feature, and `language -> lsp -> lsp-types` calls unavailable `Url::from_file_path` on wasm. These consumers need the same target feature split or must be compiled out. |
-| `buffer_diff`, `multi_buffer` | **blocked behind language** | The text/sum-tree portions are portable, but buffer types are owned by `language`; `multi_buffer` also directly enables tree-sitter's `wasm` feature. |
+| `language` | **clean** | Browser builds use the real parser/query stack, omit dynamic Wasmtime grammar loading, and substitute an LSP data-model-only crate for the native language-server process runtime. |
+| `buffer_diff`, `multi_buffer` | **clean** | Both compile with the browser language stack and real tree-sitter node/tree types. |
 | `editor` | **not wasm-shaped** | All native integrations are unconditional dependencies and imports. The first compile failure is currently tree-sitter, before the later native failures become visible. |
 
 The tree-sitter `wasm` Cargo feature is not the browser runtime feature. In
@@ -116,11 +116,11 @@ and repository behavior and must be absent on wasm.
 ## Milestone status
 
 - **Milestone 1 — dependency map and plan:** complete.
-- **Milestone 2 — core text stack:** partial. `sum_tree`, `clock`,
-  `collections`, `util`, `rope`, `text`, `language_core`, and the `fs`
-  interface/model layer check successfully. `language` is blocked by the
-  settings parser and native LSP URI chains above, so `multi_buffer` is not yet
-  complete.
+- **Milestone 2 — core text stack:** complete. `sum_tree`, `clock`,
+  `collections`, `util`, `rope`, `text`, `language_core`, `language`,
+  `buffer_diff`, and `multi_buffer` check successfully. Real tree-sitter types
+  and parsing remain present; local filesystem implementations and LSP process
+  execution are absent.
 - **Milestone 3 — reduced editor:** not started; it depends on the remaining
   language/multibuffer dependency severance.
 - **Milestone 4 — browser editor demo:** not started. The existing plain GPUI

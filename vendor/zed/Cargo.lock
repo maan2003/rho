@@ -9690,6 +9690,7 @@ dependencies = [
  "language_core",
  "log",
  "lsp",
+ "lsp-stub",
  "parking_lot",
  "postage",
  "pretty_assertions",
@@ -10559,9 +10560,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lsp-stub"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "lsp-types",
+ "serde",
+]
+
+[[package]]
 name = "lsp-types"
 version = "0.95.1"
-source = "git+https://github.com/zed-industries/lsp-types?rev=f4dfa89a21ca35cd929b70354b1583fabae325f8#f4dfa89a21ca35cd929b70354b1583fabae325f8"
 dependencies = [
  "bitflags 1.3.2",
  "serde",
@@ -11096,6 +11105,7 @@ dependencies = [
  "streaming-iterator",
  "tree-sitter",
  "tree-sitter-json",
+ "tree-sitter-wasm-feature",
  "unindent",
 ]
 
@@ -16839,6 +16849,7 @@ dependencies = [
  "serde_path_to_error",
  "tree-sitter",
  "tree-sitter-json",
+ "tree-sitter-wasm-feature",
  "unindent",
  "util",
 ]

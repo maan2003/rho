@@ -19,11 +19,17 @@ convert_case.workspace = true
 log.workspace = true
 streaming-iterator.workspace = true
 tree-sitter-json.workspace = true
-tree-sitter = { workspace = true, features = ["wasm"] }
+tree-sitter.workspace = true
 serde_json_lenient.workspace = true
 serde_json.workspace = true
 settings_content.workspace = true
 settings_json.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tree-sitter-wasm-feature.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["tree-sitter-wasm-feature"]
 
 [dev-dependencies]
 pretty_assertions.workspace = true

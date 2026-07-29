@@ -92,32 +92,38 @@ pub fn get_default_system_shell_preferring_bash() -> String {
 }
 
 pub fn get_windows_bash() -> Option<String> {
-    use std::path::PathBuf;
+    #[cfg(target_family = "wasm")]
+    return None;
 
-    fn find_bash_in_scoop() -> Option<PathBuf> {
-        let bash_exe =
-            PathBuf::from(std::env::var_os("USERPROFILE")?).join("scoop\\shims\\bash.exe");
-        bash_exe.exists().then_some(bash_exe)
-    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        use std::path::PathBuf;
 
-    fn find_bash_in_git() -> Option<PathBuf> {
-        // /path/to/git/cmd/git.exe/../../bin/bash.exe
-        let git = which::which("git").ok()?;
-        let git_bash = git.parent()?.parent()?.join("bin").join("bash.exe");
-        git_bash.exists().then_some(git_bash)
-    }
-
-    static BASH: LazyLock<Option<String>> = LazyLock::new(|| {
-        let bash = find_bash_in_scoop()
-            .or_else(|| find_bash_in_git())
-            .map(|p| p.to_string_lossy().into_owned());
-        if let Some(ref path) = bash {
-            log::info!("Found bash at {}", path);
+        fn find_bash_in_scoop() -> Option<PathBuf> {
+            let bash_exe =
+                PathBuf::from(std::env::var_os("USERPROFILE")?).join("scoop\\shims\\bash.exe");
+            bash_exe.exists().then_some(bash_exe)
         }
-        bash
-    });
 
-    (*BASH).clone()
+        fn find_bash_in_git() -> Option<PathBuf> {
+            // /path/to/git/cmd/git.exe/../../bin/bash.exe
+            let git = which::which("git").ok()?;
+            let git_bash = git.parent()?.parent()?.join("bin").join("bash.exe");
+            git_bash.exists().then_some(git_bash)
+        }
+
+        static BASH: LazyLock<Option<String>> = LazyLock::new(|| {
+            let bash = find_bash_in_scoop()
+                .or_else(|| find_bash_in_git())
+                .map(|p| p.to_string_lossy().into_owned());
+            if let Some(ref path) = bash {
+                log::info!("Found bash at {}", path);
+            }
+            bash
+        });
+
+        (*BASH).clone()
+    }
 }
 
 pub fn get_windows_system_shell() -> String {

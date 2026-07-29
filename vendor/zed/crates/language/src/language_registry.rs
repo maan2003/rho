@@ -730,6 +730,14 @@ impl LanguageRegistry {
                 AvailableGrammar::Loading(_, txs) => {
                     txs.push(tx);
                 }
+                #[cfg(target_family = "wasm")]
+                AvailableGrammar::Unloaded(_) => {
+                    tx.send(Err(Arc::new(anyhow!(
+                        "dynamic grammar loading is unavailable in the browser"
+                    ))))
+                    .ok();
+                }
+                #[cfg(not(target_family = "wasm"))]
                 AvailableGrammar::Unloaded(wasm_path) => {
                     log::trace!("start loading grammar {name:?}");
                     let this = self.clone();

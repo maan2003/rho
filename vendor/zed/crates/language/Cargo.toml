@@ -46,7 +46,6 @@ imara-diff.workspace = true
 language_core.workspace = true
 itertools.workspace = true
 log.workspace = true
-lsp.workspace = true
 parking_lot.workspace = true
 postage.workspace = true
 rand = { workspace = true, optional = true }
@@ -81,7 +80,11 @@ diffy = "0.4.2"
 tree-sitter.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+lsp.workspace = true
 tree-sitter-wasm-feature.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+lsp-stub.workspace = true
 
 [dev-dependencies]
 collections = { workspace = true, features = ["test-support"] }
