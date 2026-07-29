@@ -28,8 +28,10 @@ zeroize = "1"
 web-sys = { version = "0.3", features = [
   "CssStyleDeclaration",
   "Crypto",
+  "Document",
   "HtmlTextAreaElement",
   "Location",
+  "MediaQueryList",
   "Navigator",
   "Storage",
   "Window",

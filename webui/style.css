@@ -510,6 +510,15 @@ pre.code,
   background: transparent;
 }
 
+.agent-row.needs {
+  color: var(--foreground);
+  background: #d6767014;
+}
+
+.topic.needs .topic-name {
+  color: var(--destructive);
+}
+
 .attn.working {
   background: var(--link);
   animation: pulse 1.4s ease-in-out infinite;
@@ -969,9 +978,43 @@ pre.code,
   z-index: 30;
 }
 
+/* ---- floating "back to newest" pill over the transcript ---- */
+
+.jump-latest {
+  position: sticky;
+  bottom: 10px;
+  left: 100%;
+  transform: translateX(calc(-100% - 14px));
+  background: #161916;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  box-shadow: 0 2px 10px #00000066;
+}
+
+.jump-latest:hover {
+  color: var(--foreground);
+  background: var(--accent);
+}
+
 /* ---- mobile ---- */
 
 @media (max-width: 700px) {
+  html,
+  body {
+    font-size: 15px;
+    line-height: 22px;
+  }
+
+  /* Any focused input under 16px makes iOS zoom the page. */
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+
   .rail {
     width: 100%;
     border-right: none;
@@ -991,6 +1034,60 @@ pre.code,
 
   .back {
     display: block;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .topic-name {
+    font-size: 12px;
+    padding: 12px 10px 4px;
+  }
+
+  .agent-row {
+    height: 44px;
+    font-size: 15px;
+    gap: 10px;
+    border-radius: 8px;
+  }
+
+  .agent-mode {
+    font-size: 12px;
+  }
+
+  .attn {
+    width: 8px;
+    height: 8px;
+  }
+
+  .row-icon {
+    width: 16px;
+    height: 16px;
+  }
+
+  .rail-head {
+    padding-top: calc(8px + env(safe-area-inset-top));
+  }
+
+  .new-agent {
+    height: 34px;
+    font-size: 14px;
+    padding: 0 12px;
+  }
+
+  .chat-head {
+    padding-top: calc(6px + env(safe-area-inset-top));
+  }
+
+  .chat-head .stop {
+    min-height: 38px;
+  }
+
+  .chip {
+    font-size: 12px;
+  }
+
+  .tool-line {
+    min-height: 34px;
   }
 
   .column {
@@ -1003,5 +1100,14 @@ pre.code,
 
   .composer {
     padding: 0 10px calc(10px + env(safe-area-inset-bottom));
+  }
+
+  .composer textarea {
+    font-size: 16px;
+  }
+
+  .composer .send {
+    width: 38px;
+    height: 38px;
   }
 }

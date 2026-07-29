@@ -137,7 +137,55 @@ fn StatusScreen(title: &'static str, detail: Option<String>) -> impl IntoView {
     }
 }
 
+/// Sort rank: agents that need the user come first everywhere.
+fn attention_rank(attention: &str) -> u8 {
+    match attention {
+        "needs_input" => 0,
+        "pending" => 1,
+        "working" => 2,
+        _ => 3,
+    }
+}
+
 fn Main(app: App) -> impl IntoView {
+    // Surface the attention count where a phone glance lands: the tab title.
+    Effect::new(move |_| {
+        let count = app.topics.with(|topics| {
+            topics
+                .iter()
+                .flat_map(|topic| &topic.agents)
+                .filter(|agent| !agent.hidden && agent.attention == "needs_input")
+                .count()
+        });
+        if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+            let title = if count > 0 {
+                format!("({count}) Rho")
+            } else {
+                "Rho".to_owned()
+            };
+            document.set_title(&title);
+        }
+    });
+    let needs_attention = move || {
+        let mut agents = app.topics.with(|topics| {
+            topics
+                .iter()
+                .flat_map(|topic| &topic.agents)
+                .filter(|agent| {
+                    !agent.hidden
+                        && matches!(agent.attention.as_str(), "needs_input" | "pending")
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        agents.sort_by_key(|agent| {
+            (
+                attention_rank(&agent.attention),
+                std::cmp::Reverse(agent.updated_at),
+            )
+        });
+        agents
+    };
     view! {
         <div class="rail">
             <div class="rail-head">
@@ -157,6 +205,15 @@ fn Main(app: App) -> impl IntoView {
                 </button>
             </div>
             <div class="topics">
+                {move || {
+                    let agents = needs_attention();
+                    (!agents.is_empty()).then(|| view! {
+                        <div class="topic needs">
+                            <div class="topic-name"><span>"needs attention"</span></div>
+                            {agents.into_iter().map(|agent| AgentRow(app, agent)).collect_view()}
+                        </div>
+                    })
+                }}
                 {move || {
                     let mut topics = app.topics.get();
                     topics.sort_by_key(|topic| !topic.pinned);
@@ -189,7 +246,13 @@ fn Main(app: App) -> impl IntoView {
 fn TopicSection(app: App, topic: rho_webui_messages::Topic) -> impl IntoView {
     let expanded = RwSignal::new(false);
     let mut agents = topic.agents;
-    agents.sort_by_key(|agent| (!agent.pinned, std::cmp::Reverse(agent.updated_at)));
+    agents.sort_by_key(|agent| {
+        (
+            attention_rank(&agent.attention),
+            !agent.pinned,
+            std::cmp::Reverse(agent.updated_at),
+        )
+    });
     let mut active = Vec::new();
     let mut folded = Vec::new();
     for agent in agents {
@@ -237,6 +300,7 @@ fn AgentRow(app: App, agent: AgentSummary) -> impl IntoView {
         <button
             class="agent-row"
             class:active=move || app.selected.get().as_deref() == Some(selected_id.as_str())
+            class:needs=agent.attention == "needs_input"
             on:click=move |_| app.select(id.clone())
         >
             <svg class="row-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
@@ -320,17 +384,39 @@ fn ChatPane(app: App, agent_id: String) -> impl IntoView {
 #[component]
 fn Transcript(app: App) -> impl IntoView {
     let scroller: NodeRef<html::Div> = NodeRef::new();
-    // Follow the newest message whenever the transcript grows.
+    // Follow the newest message only while the reader is at the bottom;
+    // scrolling up to reread must never be yanked back down by streaming.
+    let pinned = RwSignal::new(true);
     Effect::new(move |_| {
         app.state.track();
+        if !pinned.get_untracked() {
+            return;
+        }
         if let Some(element) = scroller.get_untracked() {
             request_animation_frame(move || {
                 element.set_scroll_top(element.scroll_height());
             });
         }
     });
+    let jump_to_latest = move |_| {
+        if let Some(element) = scroller.get_untracked() {
+            element.set_scroll_top(element.scroll_height());
+        }
+        pinned.set(true);
+    };
     view! {
-        <div class="transcript" node_ref=scroller>
+        <div
+            class="transcript"
+            node_ref=scroller
+            on:scroll=move |_| {
+                if let Some(element) = scroller.get_untracked() {
+                    let bottom_gap = element.scroll_height()
+                        - element.scroll_top()
+                        - element.client_height();
+                    pinned.set(bottom_gap < 60);
+                }
+            }
+        >
             <div class="column">
                 {move || match app.state.get() {
                     None => view! { <p class="muted loading">"Loading transcript…"</p> }.into_any(),
@@ -340,6 +426,9 @@ fn Transcript(app: App) -> impl IntoView {
                     }
                 }}
             </div>
+            {move || (!pinned.get()).then(|| view! {
+                <button class="jump-latest" on:click=jump_to_latest>"↓ latest"</button>
+            })}
         </div>
     }
 }
@@ -539,7 +628,10 @@ fn Composer(app: App) -> impl IntoView {
                         }
                     }
                     on:keydown=move |event| {
-                        if event.key() == "Enter" && !event.shift_key() {
+                        // Touch keyboards have no shift-enter; there the
+                        // enter key inserts a newline and the send button
+                        // sends.
+                        if event.key() == "Enter" && !event.shift_key() && !coarse_pointer() {
                             event.prevent_default();
                             send();
                         }
@@ -551,6 +643,13 @@ fn Composer(app: App) -> impl IntoView {
             </div>
         </div>
     }
+}
+
+/// Primary input is a touch screen (phone or tablet).
+fn coarse_pointer() -> bool {
+    web_sys::window()
+        .and_then(|window| window.match_media("(pointer: coarse)").ok().flatten())
+        .is_some_and(|query| query.matches())
 }
 
 fn autosize(element: &web_sys::HtmlTextAreaElement) {
