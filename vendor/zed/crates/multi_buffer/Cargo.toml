@@ -45,12 +45,10 @@ ztracing.workspace = true
 tracing.workspace = true
 util.workspace = true
 unicode-segmentation.workspace = true
+tree-sitter.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-tree-sitter = { workspace = true, features = ["wasm"] }
-
-[target.'cfg(target_family = "wasm")'.dependencies]
-tree-sitter-stub = { path = "../tree_sitter_stub" }
+tree-sitter-wasm-feature.workspace = true
 
 [dev-dependencies]
 buffer_diff = { workspace = true, features = ["test-support"] }
@@ -65,4 +63,4 @@ util = { workspace = true, features = ["test-support"] }
 zlog.workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["tracing"]
+ignored = ["tracing", "tree-sitter-wasm-feature"]

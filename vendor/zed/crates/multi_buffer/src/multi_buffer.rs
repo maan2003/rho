@@ -1,6 +1,4 @@
 mod anchor;
-#[cfg(target_family = "wasm")]
-extern crate tree_sitter_stub as tree_sitter;
 #[cfg(test)]
 mod multi_buffer_tests;
 mod path_key;

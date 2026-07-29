@@ -23,19 +23,24 @@ Direct checks from `vendor/zed` establish the current boundary:
 | `sum_tree`, `clock`, `collections` | **clean** | No changes required. |
 | `util` | **clean after gating** | Its process, command, shell, archive, and filesystem modules were compiled on wasm even though their `smol`, `async-fs`, `dirs`, `which`, and `libc` dependencies are native-only. Compile those modules only off wasm; use `/` as the inert wasm home path. |
 | `rope`, `text` | **clean after the util gate** | Their production use of `util` is target-neutral (`debug_panic`, UTF-8 helpers, range helpers). |
-| `language_core` | **clean with inert parser API** | Wasm selects `tree-sitter-stub`; native continues selecting tree-sitter 0.26.9. |
+| `language_core` | **clean with real tree-sitter** | tree-sitter 0.26.9 C runtime cross-compiles with unwrapped clang and tree-sitter-language 0.1.7's wasm libc provider. The Wasmtime grammar-loader feature is disabled on the browser target. |
 | `fs` | **interface/model layer clean** | Wasm retains `Fs`, metadata, events, and `MTime`, but excludes `RealFs`, Git, process execution, native watching, archive extraction, and trash integration. |
-| `language` | **blocked** | Two remaining transitive chains fail before language code is checked: `language -> settings -> settings_json/migrator -> tree-sitter 0.26.9`, and `language -> lsp -> lsp-types`, whose URI code calls unavailable `Url::from_file_path` on wasm. |
+| `language` | **blocked after parser runtime** | `language -> settings -> settings_json/migrator` still enables tree-sitter's native Wasmtime feature, and `language -> lsp -> lsp-types` calls unavailable `Url::from_file_path` on wasm. These consumers need the same target feature split or must be compiled out. |
 | `buffer_diff`, `multi_buffer` | **blocked behind language** | The text/sum-tree portions are portable, but buffer types are owned by `language`; `multi_buffer` also directly enables tree-sitter's `wasm` feature. |
 | `editor` | **not wasm-shaped** | All native integrations are unconditional dependencies and imports. The first compile failure is currently tree-sitter, before the later native failures become visible. |
 
-The tree-sitter `wasm` Cargo feature is not the browser solution. In this
-revision it enables tree-sitter's Wasmtime-backed grammar loader, which itself
-pulls a large Wasmtime/Cranelift graph. The browser editor will permanently run
-without tree-sitter: parsing and syntax classification belong to the daemon,
-which will ship styled spans in the same general shape as LSP semantic tokens.
-The wasm build therefore links an inert API-compatible tree-sitter stub solely
-to preserve model API types; it never parses or loads grammars.
+The tree-sitter `wasm` Cargo feature is not the browser runtime feature. In
+this revision it enables a Wasmtime-backed host for dynamically loaded grammar
+modules and pulls Wasmtime/Cranelift. Browser builds instead compile the real
+C runtime directly into the client wasm. Updating `tree-sitter-language` from
+0.1.5 to 0.1.7 supplies the minimal wasm libc sources/headers that tree-sitter
+0.26.9's build script expects. An unwrapped clang is required: Nix's clang
+wrapper injects `-fzero-call-used-regs=used-gpr`, which wasm rejects.
+
+Static grammar linking is the proven shortest path: `tree-sitter-json`'s
+`parser.c` cross-compiles when given the same minimal headers. Dynamic grammar
+loading remains possible later, but is unnecessary for the demo and its
+Wasmtime-based native implementation must stay out of the browser bundle.
 
 ### Native editor dependency families to sever
 
@@ -56,9 +61,9 @@ still reachable:
 - **Network/runtime:** the client/project side reaches `tokio`, `smol`,
   async sockets, TLS, and `aws-lc-sys`. Browser remote-buffer transport
   belongs to Rho's web protocol layer, not inside the editor crate.
-- **Parsing:** `language_core/language/multi_buffer -> tree-sitter` and, with
-  the current feature selection, Wasmtime. A plain-text mode must compile
-  without parser/query/grammar types.
+- **Parsing:** browser builds retain the real tree-sitter runtime and statically
+  linked grammar objects, but exclude the Wasmtime grammar loader. Native keeps
+  Zed's dynamic extension-grammar support unchanged.
 
 Git itself is Zed's abstraction crate in this graph rather than a direct
 `libgit2-sys` edge, but it still owns native askpass, filesystem, process,
@@ -68,10 +73,9 @@ and repository behavior and must be absent on wasm.
 
 1. **Finish the portable text/model seam.**
    - Keep the wasm-only `util` module gates.
-   - Add a syntax-free build mode at the language ownership boundary. Do not
-     stub tree-sitter's C API. Instead make grammar/query/syntax-map facilities
-     optional and preserve buffer edits, anchors, snapshots, selections, and
-     operations without syntax layers.
+   - Keep the real tree-sitter runtime, query/syntax-map facilities, and one
+     statically linked proof grammar. Disable only Wasmtime-based dynamic
+     grammar loading on the browser target.
    - Move `fs`, `http_client`, `lsp`, `rpc`, and toolchain/registry
      loading behind the native/default feature or target cfg.
    - Build `language`, `buffer_diff`, and `multi_buffer` for wasm before
@@ -104,10 +108,10 @@ and repository behavior and must be absent on wasm.
      conflict policy are still unspecified and are required for a usable
      remote editor.
 
-5. **Remote highlighting.**
-   - Extend the remote-buffer protocol with revision-bound styled spans.
-   - Apply daemon-computed spans to buffer chunks without introducing a parser
-     or grammar runtime in the browser module.
+5. **Highlighting.**
+   - Register statically linked browser grammars at startup and use Zed's
+     existing query/syntax-map path. Start with JSON; bundle size is currently
+     secondary to proving editor behavior.
 
 ## Milestone status
 
@@ -117,8 +121,8 @@ and repository behavior and must be absent on wasm.
   interface/model layer check successfully. `language` is blocked by the
   settings parser and native LSP URI chains above, so `multi_buffer` is not yet
   complete.
-- **Milestone 3 — reduced editor:** not started; it depends on the syntax-free
-  language/multibuffer seam.
+- **Milestone 3 — reduced editor:** not started; it depends on the remaining
+  language/multibuffer dependency severance.
 - **Milestone 4 — browser editor demo:** not started. The existing plain GPUI
   rail remains the last successful browser scene.
 - **Milestone 5 — highlighting:** deferred.
@@ -131,9 +135,11 @@ export PATH="$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:$PATH
 cargo check -p sum_tree --target wasm32-unknown-unknown --release
 cargo check -p rope --target wasm32-unknown-unknown --release
 cargo check -p text --target wasm32-unknown-unknown --release
-cargo check -p language_core --target wasm32-unknown-unknown --release
-# tree-sitter build.rs panics:
-# Environment variable DEP_TREE_SITTER_LANGUAGE_WASM_HEADERS must be set
+CC_wasm32_unknown_unknown=/path/to/unwrapped/clang \
+  cargo check -p language_core --target wasm32-unknown-unknown --release
+CFLAGS_wasm32_unknown_unknown=-I/path/to/tree_sitter_wasm/include \
+CC_wasm32_unknown_unknown=/path/to/unwrapped/clang \
+  cargo check -p tree-sitter-json --target wasm32-unknown-unknown --release
 ```
 
 The standalone Zed lockfile was stale relative to the already-vendored wgpu 30

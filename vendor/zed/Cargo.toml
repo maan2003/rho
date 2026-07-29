@@ -207,7 +207,7 @@ members = [
     "crates/terminal",
     "crates/terminal_view",
     "crates/text",
-    "crates/tree_sitter_stub",
+    "crates/tree_sitter_wasm_feature",
     "crates/theme",
     "crates/theme_extension",
     "crates/theme_settings",
@@ -835,6 +835,7 @@ toml_edit = { version = "0.22", default-features = false, features = [
 ] }
 tower-http = "0.4.4"
 tree-sitter = "0.26.9"
+tree-sitter-wasm-feature = { path = "crates/tree_sitter_wasm_feature" }
 tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24.1"
 tree-sitter-cpp = { git = "https://github.com/tree-sitter/tree-sitter-cpp", rev = "5cb9b693cfd7bfacab1d9ff4acac1a4150700609" }

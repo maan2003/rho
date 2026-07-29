@@ -1,9 +1,6 @@
 // language_core: tree-sitter grammar infrastructure, LSP adapter traits,
 // language configuration, and highlight mapping.
 
-#[cfg(target_family = "wasm")]
-extern crate tree_sitter_stub as tree_sitter;
-
 pub mod grammar;
 pub mod highlight_map;
 pub mod language_config;

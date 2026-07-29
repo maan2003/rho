@@ -78,12 +78,10 @@ watch.workspace = true
 zlog.workspace = true
 ztracing.workspace = true
 diffy = "0.4.2"
+tree-sitter.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-tree-sitter = { workspace = true, features = ["wasm"] }
-
-[target.'cfg(target_family = "wasm")'.dependencies]
-tree-sitter-stub = { path = "../tree_sitter_stub" }
+tree-sitter-wasm-feature.workspace = true
 
 [dev-dependencies]
 collections = { workspace = true, features = ["test-support"] }
@@ -120,4 +118,4 @@ name = "highlight_map"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["tracing"]
+ignored = ["tracing", "tree-sitter-wasm-feature"]

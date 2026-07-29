@@ -13,3 +13,6 @@ rustflags = [
 
 [unstable]
 build-std = ["std", "panic_abort"]
+
+[env]
+CC_wasm32_unknown_unknown = { value = "toolchain/clang", relative = true, force = true }

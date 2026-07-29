@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
+exec clang -I"$root/vendor/zed/tooling/tree_sitter_wasm/include" "$@"

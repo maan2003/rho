@@ -1,5 +1,5 @@
 [package]
-name = "tree-sitter-stub"
+name = "tree-sitter-wasm-feature"
 version = "0.1.0"
 edition.workspace = true
 publish = false
@@ -7,3 +7,6 @@ license = "GPL-3.0-or-later"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+tree-sitter = { workspace = true, features = ["wasm"] }
