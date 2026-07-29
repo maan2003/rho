@@ -98,6 +98,8 @@ impl ClaudeAgent {
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
+            total_usage: db.read().agent_usage_total(agent_id),
+            usage_provider: crate::db::AgentUsageProvider::CLAUDE,
             quota_observation: None,
         };
         Ok((
@@ -225,6 +227,8 @@ impl ClaudeAgent {
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used,
+            total_usage: db.read().agent_usage_total(agent_id),
+            usage_provider: crate::db::AgentUsageProvider::CLAUDE,
             quota_observation: None,
         };
         let pool_events = pool.clone();
@@ -1273,20 +1277,24 @@ impl ClaudeLoop {
                 );
                 if let Err(error) = self.handle_stream_event(event.event) {
                     self.fail(error);
-                } else if message_stopped
-                    && let Some(usage) = self.turn_usage.take()
-                    && let Some(multi_agent) = &self.multi_agent
-                {
-                    multi_agent
-                        .record_usage(crate::db::AgentUsageBucket {
-                            input_tokens: usage.input_tokens.unwrap_or(0),
-                            cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-                            cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-                            output_tokens: usage.output_tokens.unwrap_or(0),
-                            requests: 1,
-                            ..crate::db::AgentUsageBucket::default()
-                        })
-                        .await;
+                } else if message_stopped && let Some(usage) = self.turn_usage.take() {
+                    let turn_usage = crate::db::AgentUsageBucket {
+                        input_tokens: usage.input_tokens.unwrap_or(0),
+                        cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                        cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                        output_tokens: usage.output_tokens.unwrap_or(0),
+                        requests: 1,
+                        ..crate::db::AgentUsageBucket::default()
+                    };
+                    self.state
+                        .write()
+                        .expect("poison")
+                        .total_usage
+                        .add(&turn_usage);
+                    if let Some(pool) = self.pool_events.upgrade() {
+                        pool.record_agent_usage(self.agent_id, turn_usage).await;
+                    }
+                    self.notify.notify_waiters();
                 }
             }
             rho_claude::ClaudeEvent::RateLimitEvent(_) => {}
@@ -1662,6 +1670,8 @@ mod tests {
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
+            total_usage: crate::db::AgentUsageBucket::default(),
+            usage_provider: crate::db::AgentUsageProvider::CLAUDE,
             quota_observation: None,
         };
         state.queued_inputs.push(QueuedItem {

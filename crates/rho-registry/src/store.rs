@@ -116,6 +116,7 @@ fn empty_state() -> UiAgentState {
         blocks: Vec::new(),
         status: UiAgentStatus::Idle,
         context_used: None,
+        usage: Default::default(),
     }
 }
 
@@ -172,6 +173,7 @@ mod tests {
             blocks,
             status: None,
             context_used: None,
+            usage: None,
         }
     }
 
@@ -295,6 +297,7 @@ mod tests {
                 ],
                 status: UiAgentStatus::Streaming,
                 context_used: None,
+                usage: Default::default(),
             }),
         );
         let summary = store.apply(
@@ -306,6 +309,7 @@ mod tests {
                 },
                 status: Some(UiAgentStatus::Idle),
                 context_used: None,
+                usage: None,
             },
         );
         assert_eq!(summary.first_changed_block, Some(1));
@@ -324,6 +328,7 @@ mod tests {
                 }],
                 status: UiAgentStatus::Streaming,
                 context_used: None,
+                usage: Default::default(),
             }),
         );
 

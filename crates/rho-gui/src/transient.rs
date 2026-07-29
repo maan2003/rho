@@ -815,10 +815,11 @@ fn provider_cost(series: &[rho_ui_proto::AgentUsageSeries], provider: &str, sinc
         .sum()
 }
 
-fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, provider: &str) -> f64 {
-    let (input, cache_read, cache_write, output) = match provider {
-        "claude" => (10.0, 1.0, 12.5, 50.0),
-        _ => (5.0, 0.5, 6.25, 30.0),
+pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, provider: &str) -> f64 {
+    let (input, cache_read, cache_write, output) = if provider.starts_with("claude") {
+        (10.0, 1.0, 12.5, 50.0)
+    } else {
+        (5.0, 0.5, 6.25, 30.0)
     };
     (bucket.input_tokens as f64 * input
         + bucket.cache_read_tokens as f64 * cache_read

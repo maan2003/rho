@@ -8,8 +8,8 @@ use rho_core::{
     StreamingContextItemState, ToolFileStatus, ToolResultMetadata, text_content,
 };
 use rho_ui_proto::remote::{
-    UiAgentState, UiAgentStatus, UiApplyPatchMetadata, UiBlock, UiTool, UiToolFileChange,
-    UiToolFileStatus, UiToolMetadata, UiToolStatus,
+    UiAgentState, UiAgentStatus, UiAgentUsage, UiApplyPatchMetadata, UiBlock, UiTool,
+    UiToolFileChange, UiToolFileStatus, UiToolMetadata, UiToolStatus,
 };
 
 pub(crate) fn project_agent_state(state: &AgentState) -> UiAgentState {
@@ -47,6 +47,18 @@ pub(crate) fn project_agent_state(state: &AgentState) -> UiAgentState {
         blocks,
         status: ui_status(&state.kind),
         context_used: state.context_used,
+        usage: UiAgentUsage {
+            provider: state.usage_provider.name().to_owned(),
+            total: rho_ui_proto::AgentUsageBucket {
+                bucket_start_ms: state.total_usage.bucket_start_ms,
+                input_tokens: state.total_usage.input_tokens,
+                cache_read_tokens: state.total_usage.cache_read_tokens,
+                cache_write_tokens: state.total_usage.cache_write_tokens,
+                output_tokens: state.total_usage.output_tokens,
+                requests: state.total_usage.requests,
+                approximate: state.total_usage.approximate,
+            },
+        },
     }
 }
 
@@ -355,6 +367,26 @@ mod tests {
         })
     }
 
+    #[test]
+    fn cumulative_usage_is_streamed_as_agent_state() {
+        let mut runtime = streaming_state("hello");
+        runtime.usage_provider = rho_agent::db::AgentUsageProvider::CLAUDE;
+        let mut encoder = AgentRemoteEncoder::new();
+        let mut receiver = project_agent_state(&runtime);
+        let _ = encoder.encode(receiver.clone());
+
+        runtime.total_usage.output_tokens = 42;
+        let frame = encoder.encode(project_agent_state(&runtime));
+        let AgentRemoteFrame::Diff { usage, .. } = &frame else {
+            panic!("usage update should be a state diff");
+        };
+        assert_eq!(usage.as_ref().unwrap().provider, "claude");
+        assert_eq!(usage.as_ref().unwrap().total.output_tokens, 42);
+
+        frame.apply_diff(&mut receiver);
+        assert_eq!(receiver.usage.total.output_tokens, 42);
+    }
+
     fn streaming_state(text: &str) -> AgentState {
         AgentState {
             blocks: Vec::new(),
@@ -372,6 +404,8 @@ mod tests {
                 previous_attempt: None,
             },
             context_used: None,
+            total_usage: rho_agent::db::AgentUsageBucket::default(),
+            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
             quota_observation: None,
         }
     }
@@ -410,6 +444,8 @@ mod tests {
                 error: Arc::new(message.to_owned()),
             }),
             context_used: None,
+            total_usage: rho_agent::db::AgentUsageBucket::default(),
+            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
             quota_observation: None,
         }
     }
@@ -429,6 +465,8 @@ mod tests {
             queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
+            total_usage: rho_agent::db::AgentUsageBucket::default(),
+            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
             quota_observation: None,
         }
     }
@@ -464,6 +502,8 @@ mod tests {
             queued_inputs: rho_agent::InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: None,
+            total_usage: rho_agent::db::AgentUsageBucket::default(),
+            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
             quota_observation: None,
         }
     }
@@ -498,6 +538,8 @@ mod tests {
                 waiting: None,
             },
             context_used: None,
+            total_usage: rho_agent::db::AgentUsageBucket::default(),
+            usage_provider: rho_agent::db::AgentUsageProvider::GPT,
             quota_observation: None,
         }
     }

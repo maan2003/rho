@@ -25,6 +25,7 @@ impl AgentRemoteEncoder {
                 status: (previous.status != current.status).then_some(current.status),
                 context_used: (previous.context_used != current.context_used)
                     .then_some(current.context_used),
+                usage: (previous.usage != current.usage).then_some(current.usage.clone()),
             },
             None => AgentRemoteFrame::Snapshot(current.clone()),
         };
@@ -47,6 +48,7 @@ pub enum AgentRemoteFrame {
         status: Option<UiAgentStatus>,
         /// `None` means unchanged; `Some(value)` overwrites.
         context_used: Option<Option<u64>>,
+        usage: Option<UiAgentUsage>,
     },
 }
 
@@ -58,6 +60,7 @@ impl AgentRemoteFrame {
                 blocks,
                 status,
                 context_used,
+                usage,
             } => {
                 blocks.apply_diff(&mut state.blocks);
                 if let Some(status) = status {
@@ -65,6 +68,9 @@ impl AgentRemoteFrame {
                 }
                 if let Some(context_used) = context_used {
                     state.context_used = context_used;
+                }
+                if let Some(usage) = usage {
+                    state.usage = usage;
                 }
             }
         }
@@ -87,6 +93,15 @@ pub struct UiAgentState {
     /// Tokens occupying the model's context window after the latest
     /// response; `None` until the agent's first response.
     pub context_used: Option<u64>,
+    /// Cumulative billable usage for this agent across all of its turns.
+    #[senax(default)]
+    pub usage: UiAgentUsage,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiAgentUsage {
+    pub provider: String,
+    pub total: crate::AgentUsageBucket,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

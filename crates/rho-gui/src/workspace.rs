@@ -465,7 +465,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let mut order = Vec::new();
-        let mut changes: HashMap<AgentId, (FrameSummary, Option<u64>)> = HashMap::new();
+        let mut changes: HashMap<AgentId, (FrameSummary, Option<u64>, bool)> = HashMap::new();
         let mut live_changed = false;
 
         for (agent_id, frame) in frames {
@@ -479,14 +479,20 @@ impl Workspace {
                 .store
                 .get(&agent_id)
                 .and_then(|state| state.context_used);
+            let old_usage = self.store.get(&agent_id).map(|state| state.usage.clone());
             let summary = self.store.apply(agent_id, frame);
+            let usage_changed =
+                old_usage.as_ref() != self.store.get(&agent_id).map(|state| &state.usage);
             live_changed |= self.registry.mark_live(agent_id);
             changes
                 .entry(agent_id)
-                .and_modify(|(pending, _)| *pending = pending.merge(summary))
+                .and_modify(|(pending, _, refresh_usage)| {
+                    *pending = pending.merge(summary);
+                    *refresh_usage |= usage_changed;
+                })
                 .or_insert_with(|| {
                     order.push(agent_id);
-                    (summary, old_context)
+                    (summary, old_context, usage_changed)
                 });
         }
 
@@ -501,6 +507,11 @@ impl Workspace {
                 .get(agent_id)
                 .and_then(|state| state.context_used);
             if old_context != new_context
+                && let Some(view) = self.models.get(agent_id).cloned()
+            {
+                self.refresh_view_status(agent_id, &view, cx);
+            }
+            if changes[agent_id].2
                 && let Some(view) = self.models.get(agent_id).cloned()
             {
                 self.refresh_view_status(agent_id, &view, cx);
@@ -2688,6 +2699,19 @@ impl Workspace {
     ) {
         let directory_label = self.working_directory_label(agent_id);
         let workspace_label = self.registry.workspace_id_label(*agent_id);
+        let usage_label = self.store.get(agent_id).map(|state| {
+            let usage = &state.usage.total;
+            let tokens = usage
+                .input_tokens
+                .saturating_add(usage.cache_read_tokens)
+                .saturating_add(usage.cache_write_tokens)
+                .saturating_add(usage.output_tokens);
+            format!(
+                "{} tok · ${:.2}",
+                crate::agent_view::format_token_count(tokens),
+                crate::transient::bucket_cost_usd(usage, &state.usage.provider)
+            )
+        });
         let role_label = self.role_label(agent_id);
         let context_used = self
             .store
@@ -2697,6 +2721,7 @@ impl Workspace {
             view.set_status(
                 &directory_label,
                 workspace_label.as_deref(),
+                usage_label.as_deref(),
                 role_label
                     .as_ref()
                     .map(|label| (label.text.as_str(), label.family)),

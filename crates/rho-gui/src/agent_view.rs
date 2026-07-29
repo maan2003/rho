@@ -359,6 +359,7 @@ impl AgentModel {
         &mut self,
         project_label: &str,
         workspace_label: Option<&str>,
+        usage_label: Option<&str>,
         role_label: Option<(&str, style::RoleFamily)>,
         context_used: Option<u64>,
         cx: &mut Context<Self>,
@@ -374,6 +375,14 @@ impl AgentModel {
                 spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
             }
             spans.push((workspace_label.to_owned(), style::workspace_chip_style(cx)));
+        }
+        if let Some(usage_label) = usage_label
+            && !usage_label.is_empty()
+        {
+            if !spans.is_empty() {
+                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
+            }
+            spans.push((usage_label.to_owned(), style::context_chip_style(cx)));
         }
         if let Some((role_label, mode_family)) = role_label
             && !role_label.is_empty()
@@ -527,7 +536,7 @@ impl AgentModel {
 /// Renders a token count compactly for the status chip: bare below a
 /// thousand, then `k`/`M` with one decimal while a single digit (`9.5k`,
 /// `1.2M`) and whole numbers after (`62k`, `12M`).
-fn format_token_count(tokens: u64) -> String {
+pub(crate) fn format_token_count(tokens: u64) -> String {
     fn scaled(value: f64, suffix: &str) -> String {
         if value < 9.95 {
             format!("{value:.1}{suffix}")

@@ -647,6 +647,7 @@ fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
         blocks,
         status: UiAgentStatus::Streaming,
         context_used: None,
+        usage: Default::default(),
     }
 }
 
@@ -791,6 +792,7 @@ fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
     let text = display_text(&workspace, cx);
@@ -867,6 +869,7 @@ fn bench_markdown_transcript(cx: &mut TestAppContext) {
                 },
                 status: None,
                 context_used: None,
+                usage: None,
             },
         );
         worst = worst.max(delta.elapsed());
@@ -1016,6 +1019,7 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                 },
                 status: None,
                 context_used: None,
+                usage: None,
             },
         );
     }
@@ -1187,6 +1191,7 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
     cx.run_until_parked();
@@ -1248,6 +1253,7 @@ fn visualization_refs_become_inline_editor_blocks(cx: &mut TestAppContext) {
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
     assert!(!has_custom_block(&workspace, cx));
@@ -1279,6 +1285,7 @@ fn queued_streaming_updates_to_one_block_render_once_to_final_state(cx: &mut Tes
         },
         status: None,
         context_used: None,
+        usage: None,
     };
     feed_frames(
         &workspace,
@@ -1330,6 +1337,7 @@ fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
 
@@ -1428,6 +1436,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
 
@@ -1936,6 +1945,7 @@ fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
             ],
             status: UiAgentStatus::Idle,
             context_used: Some(194_816),
+            usage: Default::default(),
         }),
     );
     let spans = workspace
@@ -1950,6 +1960,59 @@ fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
     assert!(
         spans.contains("195k"),
         "restored context chip missing from status spans: {spans:?}"
+    );
+}
+
+#[gpui::test]
+fn total_usage_and_cost_show_in_status_chips(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Snapshot(UiAgentState {
+            blocks: vec![user("go")],
+            status: UiAgentStatus::Idle,
+            context_used: None,
+            usage: Default::default(),
+        }),
+    );
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: Vec::new(),
+            },
+            status: None,
+            context_used: None,
+            usage: Some(rho_ui_proto::remote::UiAgentUsage {
+                provider: "claude".to_owned(),
+                total: rho_ui_proto::AgentUsageBucket {
+                    input_tokens: 1_000_000,
+                    cache_read_tokens: 1_000_000,
+                    cache_write_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    ..Default::default()
+                },
+            }),
+        },
+    );
+
+    let spans = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .active_agent_model()
+                .expect("agent view")
+                .read(cx)
+                .status_span_text()
+        })
+        .expect("read spans");
+    assert!(
+        spans.contains("4.0M tok · $73.50"),
+        "total usage chip missing from status spans: {spans:?}"
     );
 }
 
@@ -1985,6 +2048,7 @@ fn context_chip_appears_when_frame_arrives_after_selection(cx: &mut TestAppConte
             blocks: vec![user("go")],
             status: UiAgentStatus::Idle,
             context_used: Some(62_300),
+            usage: Default::default(),
         }),
     );
     let spans = workspace
@@ -2133,6 +2197,7 @@ fn plain_assistant_streaming_keeps_existing_concealment_folds(cx: &mut TestAppCo
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
     cx.run_until_parked();
@@ -2286,6 +2351,7 @@ fn streaming_replacement_does_not_inherit_previous_markdown_syntax(cx: &mut Test
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
     let highlights = syntax_highlights_for_text(&replaced, "plain text", cx);
@@ -2442,6 +2508,7 @@ fn adding_markdown_turn_does_not_blank_settled_highlights(cx: &mut TestAppContex
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
 
@@ -2544,6 +2611,7 @@ fn streamed_markup_conceals_once_its_delimiters_close(cx: &mut TestAppContext) {
                 },
                 status: None,
                 context_used: None,
+                usage: None,
             },
         );
         sent = next;
@@ -2594,6 +2662,7 @@ fn terminal_invisible_assistant_segment_rebuilds_its_turn_when_it_appears(cx: &m
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
 
@@ -2737,6 +2806,7 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
             },
             status: None,
             context_used: None,
+            usage: None,
         },
     );
 

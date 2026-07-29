@@ -167,6 +167,9 @@ pub struct AgentState {
     /// transcript (Claude runtime); `None` until the agent's first response
     /// reports usage.
     pub context_used: Option<u64>,
+    /// Cumulative provider-reported usage across this agent's requests.
+    pub total_usage: db::AgentUsageBucket,
+    pub usage_provider: db::AgentUsageProvider,
     /// Latest weekly provider quota observation seen by this runtime.
     pub quota_observation: Option<QuotaObservation>,
 }
@@ -745,11 +748,14 @@ impl Agent {
                 }
             }
         }));
+        let total_usage = db.read().agent_usage_total(agent_id);
         let state = Arc::new(RwLock::new(AgentState {
             blocks: restored.blocks,
             queued_inputs: restored.queued_inputs,
             kind: restored.kind,
             context_used: restored.context_used,
+            total_usage,
+            usage_provider: db::AgentUsageProvider::GPT,
             quota_observation: None,
         }));
         let notify = Arc::new(Notify::new());
@@ -1672,12 +1678,8 @@ impl AgentLoop {
                                     context_used,
                                 })
                                 .await;
-                                if let Some(usage) = &usage
-                                    && let Some(pool) = self.pool_events.upgrade()
-                                {
-                                    pool.record_agent_usage(
-                                        self.persistence.agent_id,
-                                        db::AgentUsageBucket {
+                                if let Some(usage) = &usage {
+                                    let turn_usage = db::AgentUsageBucket {
                                             input_tokens: usage
                                                 .input_tokens
                                                 .saturating_sub(usage.cached_input_tokens)
@@ -1687,9 +1689,15 @@ impl AgentLoop {
                                             output_tokens: usage.output_tokens,
                                             requests: 1,
                                             ..db::AgentUsageBucket::default()
-                                        },
-                                    )
-                                    .await;
+                                        };
+                                    state.total_usage.add(&turn_usage);
+                                    if let Some(pool) = self.pool_events.upgrade() {
+                                        pool.record_agent_usage(
+                                            self.persistence.agent_id,
+                                            turn_usage,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
                                     items,
@@ -2679,6 +2687,8 @@ mod tests {
                 waiting: None,
             },
             context_used: None,
+            total_usage: db::AgentUsageBucket::default(),
+            usage_provider: db::AgentUsageProvider::GPT,
             quota_observation: None,
         }
     }
@@ -2769,6 +2779,8 @@ mod tests {
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
             context_used: Some(232_560),
+            total_usage: db::AgentUsageBucket::default(),
+            usage_provider: db::AgentUsageProvider::GPT,
             quota_observation: None,
         };
         assert!(should_auto_compact(&state, Some(232_560)));
