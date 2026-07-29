@@ -378,14 +378,6 @@ impl AgentModel {
             }
             spans.push((workspace_label.to_owned(), style::workspace_chip_style(cx)));
         }
-        if let Some(usage_label) = usage_label
-            && !usage_label.is_empty()
-        {
-            if !spans.is_empty() {
-                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
-            }
-            spans.push((usage_label.to_owned(), style::context_chip_style(cx)));
-        }
         if let Some((role_label, mode_family)) = role_label
             && !role_label.is_empty()
         {
@@ -405,6 +397,14 @@ impl AgentModel {
                 format_token_count(context_used),
                 style::context_chip_style(cx),
             ));
+        }
+        if let Some(usage_label) = usage_label
+            && !usage_label.is_empty()
+        {
+            if !spans.is_empty() {
+                spans.push((" ".to_owned(), style::cwd_chip_style(cx)));
+            }
+            spans.push((usage_label.to_owned(), style::context_chip_style(cx)));
         }
         self.status_spans = spans;
         for editor in self.live_editors() {

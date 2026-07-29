@@ -1973,7 +1973,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
         AgentRemoteFrame::Snapshot(UiAgentState {
             blocks: vec![user("go")],
             status: UiAgentStatus::Idle,
-            context_used: None,
+            context_used: Some(62_300),
             usage: Default::default(),
         }),
     );
@@ -2013,6 +2013,10 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
     assert!(
         spans.contains("$73.50") && !spans.contains("tok"),
         "cost-only chip missing from status spans: {spans:?}"
+    );
+    assert!(
+        spans.find("62k") < spans.find("$73.50"),
+        "cost chip should follow context size: {spans:?}"
     );
 }
 
