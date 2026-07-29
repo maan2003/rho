@@ -242,6 +242,21 @@ impl ReadTxn {
 }
 
 impl WriteTxn {
+    /// Deletes a persistent recovery savepoint, returning whether it existed.
+    pub fn delete_persistent_savepoint(&mut self, id: u64) -> bool {
+        self.inner
+            .delete_persistent_savepoint(id)
+            .expect("delete rho-db persistent savepoint")
+    }
+
+    /// Lists persistent recovery savepoints.
+    pub fn persistent_savepoints(&self) -> Vec<u64> {
+        self.inner
+            .list_persistent_savepoints()
+            .expect("list rho-db persistent savepoints")
+            .collect()
+    }
+
     pub fn open_table<K, V>(&mut self, definition: TableDefinition<K, V>) -> WriteTable<'_, K, V>
     where
         K: redb::Key + 'static,

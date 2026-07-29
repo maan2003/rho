@@ -43,6 +43,7 @@ const MIGRATION_RECOVERY: TableDefinition<(), Sen<MigrationRecoveryPoint>> =
 
 const CURRENT_AGENT_DB_FORMAT: &str = "7c5e2a91";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
+const RETAINED_MIGRATION_SAVEPOINTS: usize = 10;
 
 struct AgentDbMigration {
     from: &'static str,
@@ -82,7 +83,7 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
     AgentDbMigration {
         from: "ae190a64",
         to: "7c5e2a91",
-        migrate: rebuild_usage_models,
+        migrate: |_| {},
     },
 ];
 
@@ -244,7 +245,6 @@ fn add_global_agent_usage(write: &mut WriteTxn, model: AgentUsageModel, bucket: 
 }
 
 fn rebuild_global_agent_usage(write: &mut WriteTxn) {
-    write.delete_table("agent_usage_by_time_provider");
     let models = write
         .open_table(AGENTS)
         .iter()
@@ -255,6 +255,7 @@ fn rebuild_global_agent_usage(write: &mut WriteTxn) {
         .iter()
         .map(|(key, bucket)| (key.value(), bucket.value().into_owned()))
         .collect::<Vec<_>>();
+    let mut rebuilt = std::collections::BTreeMap::<GlobalAgentUsageKey, AgentUsageBucket>::new();
     for (key, bucket) in buckets {
         let model = if bucket.model == AgentUsageModel::UNKNOWN {
             models.get(&key.agent_id).copied()
@@ -262,8 +263,22 @@ fn rebuild_global_agent_usage(write: &mut WriteTxn) {
             Some(bucket.model)
         };
         if let Some(model) = model {
-            add_global_agent_usage(write, model, &bucket);
+            rebuilt
+                .entry(GlobalAgentUsageKey {
+                    bucket_start_ms: bucket.bucket_start_ms,
+                    model,
+                })
+                .or_insert_with(|| AgentUsageBucket {
+                    bucket_start_ms: bucket.bucket_start_ms,
+                    ..AgentUsageBucket::default()
+                })
+                .add(&bucket);
         }
+    }
+    write.delete_table("agent_usage_by_time_provider");
+    let mut global = write.open_table(GLOBAL_AGENT_USAGE);
+    for (key, bucket) in rebuilt {
+        global.insert(&key, SenValue::owned(bucket));
     }
 }
 
@@ -273,18 +288,21 @@ fn rebuild_usage_models(write: &mut WriteTxn) {
         .iter()
         .map(|(agent_id, record)| (agent_id.value(), usage_model(record.value().as_ref())))
         .collect::<std::collections::HashMap<_, _>>();
-    let mut buckets = write.open_table(AGENT_USAGE_BUCKETS);
+    let buckets = write.open_table(AGENT_USAGE_BUCKETS);
     let records = buckets
         .iter()
         .map(|(key, bucket)| (key.value(), bucket.value().into_owned()))
         .collect::<Vec<_>>();
+    drop(buckets);
+    write.delete_table("agent_usage_by_agent_time");
+    let mut buckets = write.open_table(AGENT_USAGE_BUCKETS);
     for (key, mut bucket) in records {
         if bucket.model == AgentUsageModel::UNKNOWN
             && let Some(model) = models.get(&key.agent_id)
         {
             bucket.model = *model;
-            buckets.insert(&key, SenValue::borrowed(&bucket));
         }
+        buckets.insert(&key, SenValue::owned(bucket));
     }
     drop(buckets);
     rebuild_global_agent_usage(write);
@@ -303,21 +321,33 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
 
 fn compact_quota_observations(write: &mut WriteTxn) {
     let mut previous = None;
-    let mut redundant = Vec::new();
-    let mut observations = write.open_table(QUOTA_OBSERVATIONS);
-    for (key, value) in observations.iter() {
+    let observations = write.open_table(QUOTA_OBSERVATIONS);
+    let mut retained = Vec::new();
+    for (_, value) in observations.iter() {
         let observation = value.value().into_owned();
-        if previous
+        if !previous
             .as_ref()
             .is_some_and(|old| quota_observation_unchanged(old, &observation))
         {
-            redundant.push(key.value());
-        } else {
-            previous = Some(observation);
+            previous = Some(observation.clone());
+            retained.push(observation);
         }
     }
-    for key in redundant {
-        observations.remove(&key);
+    drop(observations);
+
+    // Rebuilding is linear and releases the old B-tree in one operation.
+    // Removing a long provider-debug history row by row made recovery from
+    // the original import take minutes while holding the daemon startup.
+    write.delete_table("quota_observations_by_model_time");
+    let mut observations = write.open_table(QUOTA_OBSERVATIONS);
+    for observation in retained {
+        observations.insert(
+            &QuotaObservationKey {
+                model: observation.model,
+                observed_at: observation.observed_at.0,
+            },
+            SenValue::owned(observation),
+        );
     }
 }
 
@@ -393,6 +423,36 @@ pub fn migration_recovery_point(db: &rho_db::RhoDb) -> Option<MigrationRecoveryP
     table.get(&()).map(|point| point.value().into_owned())
 }
 
+pub async fn prune_migration_savepoints(db: &rho_db::RhoDb) {
+    let mut savepoint_ids = {
+        let write = db.write().await;
+        write.persistent_savepoints()
+    };
+    savepoint_ids.sort_unstable();
+    let delete_count = savepoint_ids
+        .len()
+        .saturating_sub(RETAINED_MIGRATION_SAVEPOINTS);
+    for savepoint_id in savepoint_ids.into_iter().take(delete_count) {
+        let mut write = db.write().await;
+        write.delete_persistent_savepoint(savepoint_id);
+        write.commit();
+        tokio::task::yield_now().await;
+    }
+}
+
+pub async fn finalize_agent_db_migration(db: &rho_db::RhoDb) {
+    let Some(recovery) = migration_recovery_point(db) else {
+        return;
+    };
+    if recovery.to_format != CURRENT_AGENT_DB_FORMAT {
+        return;
+    }
+    let mut write = db.write().await;
+    rebuild_usage_models(&mut write);
+    write.open_table(MIGRATION_RECOVERY).remove(&());
+    write.commit();
+}
+
 pub async fn prepare_agent_db_migration(db: &rho_db::RhoDb) {
     let debug_dir = dirs::state_dir().map(|dir| dir.join("rho/debug/provider-requests"));
     prepare_agent_db_migration_with_debug_dir(db, debug_dir).await;
@@ -464,25 +524,31 @@ async fn prepare_agent_db_migration_with_debug_dir(
         write.commit();
     }
 
-    eprintln!("rho-agent: backfilling ChatGPT quota history");
-    let observations = backfill_quota_observations(debug_dir).await;
-    eprintln!(
-        "rho-agent: found {} historical quota observations",
-        observations.len()
-    );
-    let mut write = db.write().await;
-    let mut table = write.open_table(QUOTA_OBSERVATIONS);
-    for observation in observations {
-        table.insert(
-            &QuotaObservationKey {
-                model: observation.model,
-                observed_at: observation.observed_at.0,
-            },
-            SenValue::owned(observation),
+    // Quota history was already rebuilt and compacted by the preceding
+    // format. The ae190a64 -> 7c5e2a91 hop only needs richer Claude usage,
+    // so rereading every provider debug response here is both redundant and
+    // prohibitively expensive for long-lived developer databases.
+    if from_format != "ae190a64" {
+        eprintln!("rho-agent: backfilling ChatGPT quota history");
+        let observations = backfill_quota_observations(debug_dir).await;
+        eprintln!(
+            "rho-agent: found {} historical quota observations",
+            observations.len()
         );
+        let mut write = db.write().await;
+        let mut table = write.open_table(QUOTA_OBSERVATIONS);
+        for observation in observations {
+            table.insert(
+                &QuotaObservationKey {
+                    model: observation.model,
+                    observed_at: observation.observed_at.0,
+                },
+                SenValue::owned(observation),
+            );
+        }
+        drop(table);
+        write.commit();
     }
-    drop(table);
-    write.commit();
 }
 
 async fn backfill_agent_usage(

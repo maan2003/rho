@@ -342,6 +342,8 @@ async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();
+    rho_agent::db::prune_migration_savepoints(db).await;
+    rho_agent::db::finalize_agent_db_migration(db).await;
     Ok(())
 }
 

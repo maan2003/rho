@@ -186,6 +186,80 @@ async fn native_usage_backfill_reads_completed_debug_responses() {
 }
 
 #[tokio::test]
+async fn model_usage_migration_skips_quota_backfill_and_prunes_savepoints() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let sample = QuotaObservationRecord {
+        provider: QuotaProvider::ChatGpt,
+        model: QuotaModel::GPT,
+        observed_at: UnixMs(1),
+        used_percent: 20,
+        reset_at_unix: Some(100),
+    };
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let mut quota = write.open_table(QUOTA_OBSERVATIONS);
+    for observed_at in [1, 2] {
+        quota.insert(
+            &QuotaObservationKey {
+                model: QuotaModel::GPT,
+                observed_at,
+            },
+            SenValue::owned(QuotaObservationRecord {
+                observed_at: UnixMs(observed_at),
+                ..sample.clone()
+            }),
+        );
+    }
+    drop(quota);
+    write.open_table(FORMAT).insert(&(), &"ae190a64".to_owned());
+    write.commit();
+
+    let debug_dir = temp.path().join("debug");
+    std::fs::create_dir(&debug_dir).unwrap();
+    std::fs::write(
+        debug_dir.join("unused-response.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "raw_events": [{
+                "type": "codex.rate_limits",
+                "rate_limits": {"primary": {
+                    "used_percent": 99,
+                    "window_minutes": 10080,
+                    "reset_at": 200
+                }}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    for _ in 0..12 {
+        db.persistent_savepoint(|_, _| {}).await;
+    }
+    prepare_agent_db_migration_with_debug_dir(&db, Some(debug_dir)).await;
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(
+        read.open_table(FORMAT).get(&()).unwrap().value(),
+        CURRENT_AGENT_DB_FORMAT
+    );
+    let quota = read.quota_observations(QuotaModel::GPT, UnixMs(0));
+    assert_eq!(quota.len(), 2);
+    assert!(quota.iter().all(|sample| sample.used_percent == 20));
+    drop(read);
+    assert!(migration_recovery_point(&db).is_some());
+    prune_migration_savepoints(&db).await;
+    finalize_agent_db_migration(&db).await;
+    assert!(migration_recovery_point(&db).is_none());
+    let savepoints = db.write().await.persistent_savepoints();
+    assert_eq!(savepoints.len(), RETAINED_MIGRATION_SAVEPOINTS);
+    assert_eq!(savepoints, (4..=13).collect::<Vec<_>>());
+}
+
+#[tokio::test]
 async fn claude_usage_backfill_accumulates_usage_samples() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
