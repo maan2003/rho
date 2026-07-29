@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "rho-gpui-web-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "rho-gpui-web-spike"
+path = "main.rs"
+
+[dependencies]
+gpui = { path = "../../vendor/zed/crates/gpui" }
+gpui_platform = { path = "../../vendor/zed/crates/gpui_platform" }
+rho-core = { path = "../../crates/rho-core" }
+rho-registry = { path = "../../crates/rho-registry" }
+rho-ui-proto = { path = "../../crates/rho-ui-proto" }
+
+[profile.release]
+opt-level = "s"
+lto = true
