@@ -27,7 +27,7 @@ Direct checks from `vendor/zed` establish the current boundary:
 | `fs` | **interface/model layer clean** | Wasm retains `Fs`, metadata, events, and `MTime`, but excludes `RealFs`, Git, process execution, native watching, archive extraction, and trash integration. |
 | `language` | **clean** | Browser builds use the real parser/query stack, omit dynamic Wasmtime grammar loading, and substitute an LSP data-model-only crate for the native language-server process runtime. |
 | `buffer_diff`, `multi_buffer` | **clean** | Both compile with the browser language stack and real tree-sitter node/tree types. |
-| `editor` | **not wasm-shaped** | All native integrations are unconditional dependencies and imports. The first compile failure is currently tree-sitter, before the later native failures become visible. |
+| `editor` | **blocked at crate ownership split** | The parser/model stack is clean, but editor still unconditionally reaches `db -> sqlez -> smol -> polling`, `client/rpc -> tokio -> mio`, and `project -> terminal/node_runtime/git/workspace`. Native project/client types also appear directly throughout the main `Editor` implementation and element modules. |
 
 The tree-sitter `wasm` Cargo feature is not the browser runtime feature. In
 this revision it enables a Wasmtime-backed host for dynamically loaded grammar
@@ -121,8 +121,12 @@ and repository behavior and must be absent on wasm.
   `buffer_diff`, and `multi_buffer` check successfully. Real tree-sitter types
   and parsing remain present; local filesystem implementations and LSP process
   execution are absent.
-- **Milestone 3 — reduced editor:** not started; it depends on the remaining
-  language/multibuffer dependency severance.
+- **Milestone 3 — reduced editor:** blocked after dependency trial. The main
+  editor crate must be split into a target-neutral editor/element core plus
+  native integration modules (or receive a large API-compatible project/client
+  model layer). Merely target-gating Cargo dependencies is insufficient because
+  project, workspace, client, DAP, database, Git, and LSP integration types are
+  embedded throughout `editor.rs`, display-map extensions, and element code.
 - **Milestone 4 — browser editor demo:** not started. The existing plain GPUI
   rail remains the last successful browser scene.
 - **Milestone 5 — highlighting:** deferred.
