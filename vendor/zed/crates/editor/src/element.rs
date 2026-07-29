@@ -12,14 +12,11 @@ pub(crate) use header::{header_jump_data, render_buffer_header};
 use crate::{
     BUFFER_HEADER_PADDING, BlockId, ChunkRendererContext, ChunkReplacement, CodeActionSource,
     ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker,
-    ContextMenuPlacement, CursorShape, CustomBlockId, DisplayDiffHunk, DisplayPoint, DisplayRow,
-    EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings, EditorSnapshot,
-    EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
-    HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp,
-    MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection,
-    SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
-    code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
-    column_pixels,
+    ContextMenuPlacement, CursorShape, CustomBlockId, DisplayPoint, DisplayRow, Editor, EditorMode,
+    EditorSettings, EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock,
+    GutterDimensions, HalfPageDown, HalfPageUp, HandleInput, HoveredCursor, LineDown,
+    LineHighlight, LineUp, MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt,
+    RowRangeExt, Selection, SelectionDragState, SizingBehavior, SoftWrap, ToPoint, column_pixels,
     display_map::{
         Block, BlockContext, BlockStyle, ChunkRendererId, DisplaySnapshot, EditorMargins,
         HighlightKey, HighlightedChunk, ToDisplayPoint,
@@ -28,20 +25,27 @@ use crate::{
         CurrentLineHighlight, DocumentColorsRenderMode, Minimap, MinimapThumb, MinimapThumbBorder,
         ScrollBeyondLastLine, ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
     },
+    scroll::{
+        ActiveScrollbarState, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
+        scroll_amount::ScrollAmount,
+    },
+};
+#[cfg(feature = "native")]
+use crate::{
+    DisplayDiffHunk, EditDisplayMode, EditPrediction, InlayHintRefreshReason,
+    code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     git::blame::{BlameRenderer, GitBlame, GlobalBlameRenderer},
     hover_popover::{
         self, HOVER_POPOVER_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT,
         POPOVER_RIGHT_OFFSET,
     },
     inlay_hint_settings,
-    scroll::{
-        ActiveScrollbarState, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
-        scroll_amount::ScrollAmount,
-    },
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, HashMap, HashSet};
+#[cfg(feature = "native")]
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
+#[cfg(feature = "native")]
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
@@ -59,12 +63,14 @@ use language::{
     HighlightedText, IndentGuideSettings, LanguageAwareStyling,
     language_settings::ShowWhitespaceSetting,
 };
+#[cfg(feature = "native")]
 use markdown::Markdown;
 use multi_buffer::{
     Anchor, ExpandExcerptDirection, ExpandInfo, MultiBufferOffset, MultiBufferPoint,
     MultiBufferRow, RowInfo, ToOffset,
 };
 
+#[cfg(feature = "native")]
 use project::{
     debugger::breakpoint_store::{Breakpoint, BreakpointSessionState},
     project_settings::{InlineBlameLocation, ProjectSettings},
@@ -94,6 +100,7 @@ use ui::utils::ensure_minimum_contrast;
 use ui::{ButtonLike, POPOVER_Y_PADDING, Tooltip, prelude::*, scrollbars::ShowScrollbar};
 use unicode_segmentation::UnicodeSegmentation;
 use util::{ResultExt, debug_panic};
+#[cfg(feature = "native")]
 use workspace::{
     CollaboratorId, ItemHandle, Workspace,
     item::{Item, ItemBufferKind},
@@ -152,6 +159,7 @@ struct SelectionLayout {
     user_name: Option<SharedString>,
 }
 
+#[cfg(feature = "native")]
 struct InlineBlameLayout {
     element: AnyElement,
     bounds: Bounds<Pixels>,
@@ -275,6 +283,8 @@ impl EditorElement {
     pub fn set_split_side(&mut self, side: SplitSide) {
         self.split_side = Some(side);
     }
+
+    #[cfg(feature = "native")]
 
     fn register_actions(&self, window: &mut Window, cx: &mut App) {
         let editor = &self.editor;
@@ -734,6 +744,46 @@ impl EditorElement {
         }
     }
 
+    #[cfg(not(feature = "native"))]
+    fn register_actions(&self, window: &mut Window, _: &mut App) {
+        let editor = &self.editor;
+        register_action(editor, window, Editor::move_left);
+        register_action(editor, window, Editor::move_right);
+        register_action(editor, window, Editor::move_up);
+        register_action(editor, window, Editor::move_down);
+        register_action(editor, window, Editor::move_to_beginning_of_line);
+        register_action(editor, window, Editor::move_to_end_of_line);
+        register_action(editor, window, Editor::select_left);
+        register_action(editor, window, Editor::select_right);
+        register_action(editor, window, Editor::select_up);
+        register_action(editor, window, Editor::select_down);
+        register_action(editor, window, Editor::select_to_beginning_of_line);
+        register_action(editor, window, Editor::select_to_end_of_line);
+        register_action(editor, window, Editor::select_all);
+        register_action(editor, window, Editor::copy);
+        register_action(editor, window, Editor::cut);
+        register_action(editor, window, Editor::paste);
+        register_action(editor, window, Editor::newline);
+        register_action(editor, window, Editor::backspace);
+        register_action(editor, window, Editor::delete);
+        register_action(editor, window, Editor::tab);
+        register_action(editor, window, Editor::backtab);
+        register_action(editor, window, Editor::undo);
+        register_action(editor, window, Editor::redo);
+        register_action(editor, window, Editor::toggle_fold);
+        register_action(editor, window, Editor::unfold_lines);
+        register_action(
+            editor,
+            window,
+            |editor, HandleInput(text): &HandleInput, window, cx| {
+                if !text.is_empty() {
+                    editor.handle_input(text, window, cx);
+                }
+            },
+        );
+    }
+
+    #[cfg(feature = "native")]
     fn register_key_listeners(&self, window: &mut Window, _: &mut App, layout: &EditorLayout) {
         let position_map = layout.position_map.clone();
         window.on_key_event({
@@ -771,6 +821,9 @@ impl EditorElement {
             }
         });
     }
+
+    #[cfg(not(feature = "native"))]
+    fn register_key_listeners(&self, _: &mut Window, _: &mut App, _: &EditorLayout) {}
 
     fn layout_selections(
         &self,
@@ -810,7 +863,16 @@ impl EditorElement {
                         editor.cursor_shape,
                         &snapshot.display_snapshot,
                         is_newest,
-                        editor.leader_id.is_none(),
+                        {
+                            #[cfg(feature = "native")]
+                            {
+                                editor.leader_id.is_none()
+                            }
+                            #[cfg(not(feature = "native"))]
+                            {
+                                true
+                            }
+                        },
                         None,
                     );
                     if is_newest {
@@ -865,6 +927,7 @@ impl EditorElement {
                 }
             }
 
+            #[cfg(feature = "native")]
             if let Some(collaboration_hub) = &editor.collaboration_hub {
                 // When following someone, render the local selections in their color.
                 if let Some(leader_id) = editor.leader_id {
@@ -974,6 +1037,7 @@ impl EditorElement {
             cursors.push((anchor.to_display_point(&snapshot.display_snapshot), color));
         };
         // Remote cursors
+        #[cfg(feature = "native")]
         if let Some(collaboration_hub) = &editor.collaboration_hub {
             for remote_selection in snapshot.remote_selections_in_range(
                 &(Anchor::Min..Anchor::Max),
@@ -1328,7 +1392,7 @@ impl EditorElement {
         let show_scrollbars = match scrollbar_settings.show {
             ShowScrollbar::Auto => {
                 let editor = self.editor.read(cx);
-                let is_singleton = editor.buffer_kind(cx) == ItemBufferKind::Singleton;
+                let is_singleton = editor.buffer.read(cx).is_singleton();
                 let supports_git_diff_markers =
                     is_singleton || editor.allow_git_diff_scrollbar_markers;
                 // Git
@@ -1401,6 +1465,7 @@ impl EditorElement {
 
         let minimap_settings = EditorSettings::get_global(cx).minimap;
 
+        #[cfg(feature = "native")]
         if minimap_settings.on_active_editor() {
             let active_editor = self.editor.read(cx).workspace().and_then(|ws| {
                 ws.read(cx)
@@ -1665,6 +1730,7 @@ impl EditorElement {
 
     // Folds contained in a hunk are ignored apart from shrinking visual size
     // If a fold contains any hunks then that fold line is marked as modified
+    #[cfg(feature = "native")]
     fn layout_gutter_diff_hunks(
         &self,
         line_height: Pixels,
@@ -1698,6 +1764,8 @@ impl EditorElement {
 
         display_hunks
     }
+
+    #[cfg(feature = "native")]
 
     fn layout_inline_diagnostics(
         &self,
@@ -1861,6 +1929,8 @@ impl EditorElement {
         elements
     }
 
+    #[cfg(feature = "native")]
+
     fn layout_inline_code_actions(
         &self,
         display_point: DisplayPoint,
@@ -2020,6 +2090,8 @@ impl EditorElement {
         );
         Some(button)
     }
+
+    #[cfg(feature = "native")]
 
     fn layout_inline_blame(
         &self,
@@ -2182,6 +2254,8 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "native")]
+
     fn layout_blame_popover(
         &self,
         editor_snapshot: &EditorSnapshot,
@@ -2280,6 +2354,8 @@ impl EditorElement {
             window.defer_draw(element, origin, 2, None);
         }
     }
+
+    #[cfg(feature = "native")]
 
     fn layout_blame_entries(
         &self,
@@ -2536,6 +2612,8 @@ impl EditorElement {
         (offset_y, length, row_range)
     }
 
+    #[cfg(feature = "native")]
+
     fn layout_bookmarks(
         &self,
         gutter: &Gutter<'_>,
@@ -2562,6 +2640,8 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "native")]
+
     fn layout_gutter_hover_button(
         &self,
         gutter: &Gutter,
@@ -2587,6 +2667,8 @@ impl EditorElement {
             )
         })
     }
+
+    #[cfg(feature = "native")]
 
     fn layout_breakpoints(
         &self,
@@ -2617,6 +2699,8 @@ impl EditorElement {
                 .collect_vec()
         })
     }
+
+    #[cfg(feature = "native")]
 
     fn should_render_diff_review_button(
         &self,
@@ -2660,6 +2744,8 @@ impl EditorElement {
         let buffer_row = row_info.and_then(|info| info.buffer_row);
         Some((display_row, buffer_row))
     }
+
+    #[cfg(feature = "native")]
 
     fn layout_run_indicators(
         &self,
@@ -2946,7 +3032,7 @@ impl EditorElement {
         let include_fold_statuses = EditorSettings::get_global(cx).gutter.folds
             && snapshot.mode.is_full()
             && snapshot.display_snapshot.companion_snapshot().is_none()
-            && self.editor.read(cx).buffer_kind(cx) == ItemBufferKind::Singleton;
+            && self.editor.read(cx).buffer.read(cx).is_singleton();
         if include_fold_statuses {
             row_infos
                 .iter()
@@ -3386,6 +3472,7 @@ impl EditorElement {
             } => {
                 let mut result = v_flex().id(block_id).w_full().pr(editor_margins.right);
 
+                #[cfg(feature = "native")]
                 if self.should_show_buffer_headers() {
                     let selected = selected_buffer_ids.contains(&first_excerpt.buffer_id());
                     let jump_data = header::header_jump_data(
@@ -3406,6 +3493,11 @@ impl EditorElement {
                         cx,
                     ));
                 } else {
+                    result =
+                        result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                }
+                #[cfg(not(feature = "native"))]
+                {
                     result =
                         result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
                 }
@@ -3434,6 +3526,7 @@ impl EditorElement {
             Block::BufferHeader { excerpt, height } => {
                 let mut result = v_flex().id(block_id).w_full();
 
+                #[cfg(feature = "native")]
                 if self.should_show_buffer_headers() {
                     let jump_data = header::header_jump_data(
                         snapshot,
@@ -3463,6 +3556,11 @@ impl EditorElement {
                             result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
                     }
                 } else {
+                    result =
+                        result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                }
+                #[cfg(not(feature = "native"))]
+                {
                     result =
                         result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
                 }
@@ -3896,6 +3994,8 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "native")]
+
     fn layout_cursor_popovers(
         &self,
         line_height: Pixels,
@@ -4113,6 +4213,8 @@ impl EditorElement {
         None
     }
 
+    #[cfg(feature = "native")]
+
     fn layout_gutter_menu(
         &self,
         line_height: Pixels,
@@ -4180,6 +4282,8 @@ impl EditorElement {
             },
         );
     }
+
+    #[cfg(feature = "native")]
 
     fn layout_popovers_above_or_below_line(
         &self,
@@ -4307,6 +4411,8 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "native")]
+
     fn layout_context_menu_aside(
         &self,
         y_flipped: bool,
@@ -4427,6 +4533,8 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "native")]
+
     fn layout_hover_popovers(
         &self,
         snapshot: &EditorSnapshot,
@@ -4516,6 +4624,8 @@ impl EditorElement {
             })
             .collect::<Vec<_>>();
 
+        #[cfg(feature = "native")]
+
         fn draw_occluder(
             width: Pixels,
             origin: gpui::Point<Pixels>,
@@ -4530,6 +4640,8 @@ impl EditorElement {
             occlusion.layout_as_root(size(width, HOVER_POPOVER_GAP).into(), window, cx);
             window.defer_draw(occlusion, origin, 2, None);
         }
+
+        #[cfg(feature = "native")]
 
         fn place_popovers_above(
             hovered_point: gpui::Point<Pixels>,
@@ -4554,6 +4666,8 @@ impl EditorElement {
                 current_y = popover_origin.y - HOVER_POPOVER_GAP;
             }
         }
+
+        #[cfg(feature = "native")]
 
         fn place_popovers_below(
             hovered_point: gpui::Point<Pixels>,
@@ -4689,6 +4803,8 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "native")]
+
     fn layout_word_diff_highlights(
         display_hunks: &[(DisplayDiffHunk, Option<Hitbox>)],
         row_infos: &[RowInfo],
@@ -4750,6 +4866,8 @@ impl EditorElement {
             }
         }
     }
+
+    #[cfg(feature = "native")]
 
     fn layout_diff_hunk_controls(
         &self,
@@ -4871,6 +4989,8 @@ impl EditorElement {
 
         (controls, control_bounds)
     }
+
+    #[cfg(feature = "native")]
 
     fn layout_signature_help(
         &self,
@@ -5269,7 +5389,7 @@ impl EditorElement {
     }
 
     fn paint_line_numbers(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
-        let is_singleton = self.editor.read(cx).buffer_kind(cx) == ItemBufferKind::Singleton;
+        let is_singleton = self.editor.read(cx).buffer.read(cx).is_singleton();
 
         let line_height = layout.position_map.line_height;
         window.set_cursor_style(CursorStyle::Arrow, &layout.gutter_hitbox);
@@ -5323,6 +5443,8 @@ impl EditorElement {
             }
         }
     }
+
+    #[cfg(feature = "native")]
 
     fn paint_gutter_diff_hunks(
         &self,
@@ -5435,6 +5557,8 @@ impl EditorElement {
         (0.275 * line_height).floor()
     }
 
+    #[cfg(feature = "native")]
+
     fn diff_hunk_bounds(
         scroll_position: gpui::Point<ScrollOffset>,
         line_height: Pixels,
@@ -5531,18 +5655,22 @@ impl EditorElement {
                 }
             });
 
+            #[cfg(feature = "native")]
             for bookmark in layout.bookmarks.iter_mut() {
                 bookmark.paint(window, cx);
             }
 
+            #[cfg(feature = "native")]
             for breakpoint in layout.breakpoints.iter_mut() {
                 breakpoint.paint(window, cx);
             }
 
+            #[cfg(feature = "native")]
             for test_indicator in layout.test_indicators.iter_mut() {
                 test_indicator.paint(window, cx);
             }
 
+            #[cfg(feature = "native")]
             if let Some(diff_review_button) = layout.diff_review_button.as_mut() {
                 diff_review_button.paint(window, cx);
             }
@@ -5555,6 +5683,7 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        #[cfg(feature = "native")]
         for (_, hunk_hitbox) in &layout.display_hunks {
             if let Some(hunk_hitbox) = hunk_hitbox
                 && !self
@@ -5568,6 +5697,7 @@ impl EditorElement {
             }
         }
 
+        #[cfg(feature = "native")]
         let show_git_gutter = layout
             .position_map
             .snapshot
@@ -5578,6 +5708,7 @@ impl EditorElement {
                     GitGutterSetting::TrackedFiles
                 )
             });
+        #[cfg(feature = "native")]
         if show_git_gutter {
             self.paint_gutter_diff_hunks(layout, self.split_side, window, cx)
         }
@@ -5623,6 +5754,8 @@ impl EditorElement {
             }
         });
     }
+
+    #[cfg(feature = "native")]
 
     fn paint_blamed_display_rows(
         &self,
@@ -5670,11 +5803,19 @@ impl EditorElement {
                 ) {
                     window
                         .set_cursor_style(CursorStyle::DragCopy, &layout.position_map.text_hitbox);
-                } else if editor
-                    .hovered_link_state
-                    .as_ref()
-                    .is_some_and(|hovered_link_state| !hovered_link_state.links.is_empty())
-                {
+                } else if {
+                    #[cfg(feature = "native")]
+                    {
+                        editor
+                            .hovered_link_state
+                            .as_ref()
+                            .is_some_and(|state| !state.links.is_empty())
+                    }
+                    #[cfg(not(feature = "native"))]
+                    {
+                        false
+                    }
+                } {
                     window.set_cursor_style(
                         CursorStyle::PointingHand,
                         &layout.position_map.text_hitbox,
@@ -5685,15 +5826,21 @@ impl EditorElement {
 
                 self.paint_lines_background(layout, window, cx);
                 let invisible_display_ranges = self.paint_highlights(layout, window, cx);
+                #[cfg(feature = "native")]
                 self.paint_document_colors(layout, window);
                 self.paint_lines(&invisible_display_ranges, layout, window, cx);
                 self.paint_redactions(layout, window);
                 self.paint_navigation_overlays(layout, window, cx);
                 self.paint_cursors(layout, window, cx);
+                #[cfg(feature = "native")]
                 self.paint_inline_diagnostics(layout, window, cx);
+                #[cfg(feature = "native")]
                 self.paint_inline_blame(layout, window, cx);
+                #[cfg(feature = "native")]
                 self.paint_inline_code_actions(layout, window, cx);
+                #[cfg(feature = "native")]
                 self.paint_right_prompt(layout, window, cx);
+                #[cfg(feature = "native")]
                 self.paint_diff_hunk_controls(layout, window, cx);
                 window.with_element_namespace("crease_trailers", |window| {
                     for trailer in layout.crease_trailers.iter_mut().flatten() {
@@ -5835,6 +5982,8 @@ impl EditorElement {
             }
         });
     }
+
+    #[cfg(feature = "native")]
 
     fn paint_document_colors(&self, layout: &mut EditorLayout, window: &mut Window) {
         let Some((colors_render_mode, image_colors)) = &layout.document_colors else {
@@ -6137,7 +6286,7 @@ impl EditorElement {
         cx: &mut App,
     ) {
         self.editor.update(cx, |editor, cx| {
-            let is_singleton = editor.buffer_kind(cx) == ItemBufferKind::Singleton;
+            let is_singleton = editor.buffer.read(cx).is_singleton();
             let scrollbar_settings = EditorSettings::get_global(cx).scrollbar;
             let show_git_diff_markers = scrollbar_settings.git_diff
                 && (is_singleton || editor.allow_git_diff_scrollbar_markers);
@@ -6290,8 +6439,12 @@ impl EditorElement {
                                         .to_display_point(&snapshot.display_snapshot);
                                     let color = match diagnostic.diagnostic.severity {
                                         language::DiagnosticSeverity::ERROR => theme.status().error,
-                                        language::DiagnosticSeverity::WARNING => theme.status().warning,
-                                        language::DiagnosticSeverity::INFORMATION => theme.status().info,
+                                        language::DiagnosticSeverity::WARNING => {
+                                            theme.status().warning
+                                        }
+                                        language::DiagnosticSeverity::INFORMATION => {
+                                            theme.status().info
+                                        }
                                         _ => theme.status().hint,
                                     };
                                     ColoredRange {
@@ -6398,6 +6551,8 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "native")]
+
     fn paint_inline_diagnostics(
         &mut self,
         layout: &mut EditorLayout,
@@ -6409,6 +6564,8 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "native")]
+
     fn paint_inline_blame(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         if let Some(mut blame_layout) = layout.inline_blame_layout.take() {
             window.paint_layer(layout.position_map.text_hitbox.bounds, |window| {
@@ -6416,6 +6573,8 @@ impl EditorElement {
             })
         }
     }
+
+    #[cfg(feature = "native")]
 
     fn paint_right_prompt(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         if let Some(right_prompt) = layout.right_prompt_layout.take() {
@@ -6435,6 +6594,8 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "native")]
+
     fn paint_inline_code_actions(
         &mut self,
         layout: &mut EditorLayout,
@@ -6447,6 +6608,8 @@ impl EditorElement {
             })
         }
     }
+
+    #[cfg(feature = "native")]
 
     fn paint_diff_hunk_controls(
         &mut self,
@@ -6685,6 +6848,8 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "native")]
+
     fn paint_edit_prediction_popover(
         &mut self,
         layout: &mut EditorLayout,
@@ -6695,6 +6860,8 @@ impl EditorElement {
             edit_prediction_popover.paint(window, cx);
         }
     }
+
+    #[cfg(feature = "native")]
 
     fn paint_mouse_context_menu(
         &mut self,
@@ -6726,6 +6893,8 @@ impl EditorElement {
             None,
         )
     }
+
+    #[cfg(feature = "native")]
 
     fn diff_hunk_hollow(&self, status: DiffHunkStatus, cx: &mut App) -> bool {
         let unstaged = !self
@@ -6883,6 +7052,7 @@ impl Gutter<'_> {
     }
 }
 
+#[cfg(feature = "native")]
 pub fn render_breadcrumb_text(
     mut segments: Vec<HighlightedText>,
     breadcrumb_font: Option<Font>,
@@ -7083,6 +7253,8 @@ fn apply_dirty_filename_style(
     )
 }
 
+#[cfg(feature = "native")]
+
 fn render_inline_blame_entry(
     blame_entry: BlameEntry,
     style: &EditorStyle,
@@ -7091,6 +7263,8 @@ fn render_inline_blame_entry(
     let renderer = cx.global::<GlobalBlameRenderer>().0.clone();
     renderer.render_inline_blame_entry(&style.text, blame_entry, cx)
 }
+
+#[cfg(feature = "native")]
 
 fn render_blame_entry_popover(
     blame_entry: BlameEntry,
@@ -7123,6 +7297,8 @@ fn render_blame_entry_popover(
         cx,
     )
 }
+
+#[cfg(feature = "native")]
 
 fn render_blame_entry(
     ix: usize,
@@ -8170,7 +8346,7 @@ impl Element for EditorElement {
         };
 
         let is_minimap = self.editor.read(cx).mode.is_minimap();
-        let is_singleton = self.editor.read(cx).buffer_kind(cx) == ItemBufferKind::Singleton;
+        let is_singleton = self.editor.read(cx).buffer.read(cx).is_singleton();
 
         if !is_minimap {
             let focus_handle = self.editor.focus_handle(cx);
@@ -8426,83 +8602,91 @@ impl Element for EditorElement {
                         })
                         .unwrap_or_default();
 
-                    struct DiffHunkHighlightColors {
-                        filled_background: Hsla,
-                        hollow_background: Hsla,
-                        hollow_border: Hsla,
-                    }
+                    #[cfg(feature = "native")]
+                    {
+                        struct DiffHunkHighlightColors {
+                            filled_background: Hsla,
+                            hollow_background: Hsla,
+                            hollow_border: Hsla,
+                        }
 
-                    let colors = cx.theme().colors();
-                    let added_diff_hunk_colors = DiffHunkHighlightColors {
-                        filled_background: colors.editor_diff_hunk_added_background.into(),
-                        hollow_background: colors.editor_diff_hunk_added_hollow_background.into(),
-                        hollow_border: colors.editor_diff_hunk_added_hollow_border.into(),
-                    };
-                    let deleted_diff_hunk_colors = DiffHunkHighlightColors {
-                        filled_background: colors.editor_diff_hunk_deleted_background.into(),
-                        hollow_background: colors.editor_diff_hunk_deleted_hollow_background.into(),
-                        hollow_border: colors.editor_diff_hunk_deleted_hollow_border.into(),
-                    };
-                    let drag_highlight_color: Hsla = colors.editor_active_line_background.into();
-                    let drag_border_color: Hsla = colors.border_focused.into();
-
-                    for (ix, row_info) in row_infos.iter().enumerate() {
-                        let Some(diff_status) = row_info.diff_status else {
-                            continue;
+                        let colors = cx.theme().colors();
+                        let added_diff_hunk_colors = DiffHunkHighlightColors {
+                            filled_background: colors.editor_diff_hunk_added_background.into(),
+                            hollow_background: colors
+                                .editor_diff_hunk_added_hollow_background
+                                .into(),
+                            hollow_border: colors.editor_diff_hunk_added_hollow_border.into(),
                         };
+                        let deleted_diff_hunk_colors = DiffHunkHighlightColors {
+                            filled_background: colors.editor_diff_hunk_deleted_background.into(),
+                            hollow_background: colors
+                                .editor_diff_hunk_deleted_hollow_background
+                                .into(),
+                            hollow_border: colors.editor_diff_hunk_deleted_hollow_border.into(),
+                        };
+                        let drag_highlight_color: Hsla =
+                            colors.editor_active_line_background.into();
+                        let drag_border_color: Hsla = colors.border_focused.into();
 
-                        let diff_hunk_colors = match diff_status.kind {
-                            DiffHunkStatusKind::Added => &added_diff_hunk_colors,
-                            DiffHunkStatusKind::Deleted => &deleted_diff_hunk_colors,
-                            DiffHunkStatusKind::Modified => {
-                                debug_panic!("modified diff status for row info");
+                        for (ix, row_info) in row_infos.iter().enumerate() {
+                            let Some(diff_status) = row_info.diff_status else {
                                 continue;
-                            }
-                        };
+                            };
 
-                        let hollow_highlight = LineHighlight {
-                            background: diff_hunk_colors.hollow_background.into(),
-                            border: Some(diff_hunk_colors.hollow_border),
-                            include_gutter: true,
-                            type_id: None,
-                        };
+                            let diff_hunk_colors = match diff_status.kind {
+                                DiffHunkStatusKind::Added => &added_diff_hunk_colors,
+                                DiffHunkStatusKind::Deleted => &deleted_diff_hunk_colors,
+                                DiffHunkStatusKind::Modified => {
+                                    debug_panic!("modified diff status for row info");
+                                    continue;
+                                }
+                            };
 
-                        let filled_highlight = LineHighlight {
-                            background: solid_background(diff_hunk_colors.filled_background),
-                            border: None,
-                            include_gutter: true,
-                            type_id: None,
-                        };
+                            let hollow_highlight = LineHighlight {
+                                background: diff_hunk_colors.hollow_background.into(),
+                                border: Some(diff_hunk_colors.hollow_border),
+                                include_gutter: true,
+                                type_id: None,
+                            };
 
-                        let background = if self.diff_hunk_hollow(diff_status, cx) {
-                            hollow_highlight
-                        } else {
-                            filled_highlight
-                        };
+                            let filled_highlight = LineHighlight {
+                                background: solid_background(diff_hunk_colors.filled_background),
+                                border: None,
+                                include_gutter: true,
+                                type_id: None,
+                            };
 
-                        let base_display_point =
-                            DisplayPoint::new(start_row + DisplayRow(ix as u32), 0);
+                            let background = if self.diff_hunk_hollow(diff_status, cx) {
+                                hollow_highlight
+                            } else {
+                                filled_highlight
+                            };
 
-                        highlighted_rows
-                            .entry(base_display_point.row())
-                            .or_insert(background);
-                    }
+                            let base_display_point =
+                                DisplayPoint::new(start_row + DisplayRow(ix as u32), 0);
 
-                    // Add diff review drag selection highlight to text area
-                    if let Some(drag_state) = &self.editor.read(cx).diff_review_drag_state {
-                        let range = drag_state.row_range(&snapshot.display_snapshot);
-                        let start_row = range.start().0;
-                        let end_row = range.end().0;
-                        let drag_highlight = LineHighlight {
-                            background: solid_background(drag_highlight_color),
-                            border: Some(drag_border_color),
-                            include_gutter: true,
-                            type_id: None,
-                        };
-                        for row_num in start_row..=end_row {
                             highlighted_rows
-                                .entry(DisplayRow(row_num))
-                                .or_insert(drag_highlight);
+                                .entry(base_display_point.row())
+                                .or_insert(background);
+                        }
+
+                        // Add diff review drag selection highlight to text area
+                        if let Some(drag_state) = &self.editor.read(cx).diff_review_drag_state {
+                            let range = drag_state.row_range(&snapshot.display_snapshot);
+                            let start_row = range.start().0;
+                            let end_row = range.end().0;
+                            let drag_highlight = LineHighlight {
+                                background: solid_background(drag_highlight_color),
+                                border: Some(drag_border_color),
+                                include_gutter: true,
+                                type_id: None,
+                            };
+                            for row_num in start_row..=end_row {
+                                highlighted_rows
+                                    .entry(DisplayRow(row_num))
+                                    .or_insert(drag_highlight);
+                            }
                         }
                     }
 
@@ -8513,6 +8697,7 @@ impl Element for EditorElement {
                             cx,
                         );
 
+                    #[cfg(feature = "native")]
                     let document_colors = self
                         .editor
                         .read(cx)
@@ -8533,8 +8718,7 @@ impl Element for EditorElement {
                         .editor_with_selections(cx)
                         .map(|editor| {
                             editor.update(cx, |editor, cx| {
-                                let is_singleton =
-                                    editor.buffer_kind(cx) == ItemBufferKind::Singleton;
+                                let is_singleton = editor.buffer.read(cx).is_singleton();
 
                                 // Singleton buffers only need the newest selection anchor here.
                                 let selected_buffer_ids = if is_singleton {
@@ -8645,14 +8829,17 @@ impl Element for EditorElement {
                         })
                     });
 
+                    #[cfg(feature = "native")]
                     let run_indicator_rows = self.editor.update(cx, |editor, cx| {
                         editor.active_run_indicators(start_row..end_row, window, cx)
                     });
 
+                    #[cfg(feature = "native")]
                     let mut breakpoint_rows = self.editor.update(cx, |editor, cx| {
                         editor.active_breakpoints(start_row..end_row, window, cx)
                     });
 
+                    #[cfg(feature = "native")]
                     for (display_row, (_, bp, state)) in &breakpoint_rows {
                         if bp.is_enabled() && state.is_none_or(|s| s.verified) {
                             active_rows.entry(*display_row).or_default().breakpoint = true;
@@ -8713,6 +8900,7 @@ impl Element for EditorElement {
                             )
                         });
 
+                    #[cfg(feature = "native")]
                     let display_hunks = self.layout_gutter_diff_hunks(
                         line_height,
                         &gutter_hitbox,
@@ -8723,6 +8911,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    #[cfg(feature = "native")]
                     Self::layout_word_diff_highlights(
                         &display_hunks,
                         &row_infos,
@@ -8736,9 +8925,12 @@ impl Element for EditorElement {
                         start_row..end_row,
                         &selections,
                         highlighted_ranges.iter().cloned().chain(
+                            #[cfg(feature = "native")]
                             document_colors
                                 .iter()
                                 .flat_map(|(_, colors)| colors.iter().cloned()),
+                            #[cfg(not(feature = "native"))]
+                            std::iter::empty(),
                         ),
                         self.style.background,
                     );
@@ -8782,6 +8974,7 @@ impl Element for EditorElement {
                         );
                     }
 
+                    #[cfg(feature = "native")]
                     let longest_line_blame_width = self
                         .editor
                         .update(cx, |editor, cx| {
@@ -8816,6 +9009,8 @@ impl Element for EditorElement {
                             )
                         })
                         .unwrap_or(Pixels::ZERO);
+                    #[cfg(not(feature = "native"))]
+                    let longest_line_blame_width = Pixels::ZERO;
 
                     let longest_line_width = layout_line(
                         snapshot.longest_row(),
@@ -8929,6 +9124,7 @@ impl Element for EditorElement {
                         }
                     }
 
+                    #[cfg(feature = "native")]
                     let sticky_buffer_header = if self.should_show_buffer_headers() {
                         sticky_header_excerpt.map(|sticky_header_excerpt| {
                             window.with_element_namespace("blocks", |window| {
@@ -8989,6 +9185,7 @@ impl Element for EditorElement {
                         scroll_position.x * f64::from(em_layout_width),
                         scroll_position.y * f64::from(line_height),
                     );
+                    #[cfg(feature = "native")]
                     let sticky_headers = if !is_minimap
                         && is_singleton
                         && EditorSettings::get_global(cx).sticky_scroll.enabled
@@ -9044,6 +9241,7 @@ impl Element for EditorElement {
                             )
                         });
 
+                    #[cfg(feature = "native")]
                     let (edit_prediction_popover, edit_prediction_popover_origin) = self
                         .editor
                         .update(cx, |editor, cx| {
@@ -9068,6 +9266,7 @@ impl Element for EditorElement {
                         })
                         .unzip();
 
+                    #[cfg(feature = "native")]
                     let mut inline_diagnostics = self.layout_inline_diagnostics(
                         &line_layouts,
                         &crease_trailers,
@@ -9085,6 +9284,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    #[cfg(feature = "native")]
                     let right_prompt_layout = self.layout_right_prompt(
                         &snapshot,
                         &line_layouts,
@@ -9100,8 +9300,11 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    #[cfg(feature = "native")]
                     let mut inline_blame_layout = None;
+                    #[cfg(feature = "native")]
                     let mut inline_code_actions = None;
+                    #[cfg(feature = "native")]
                     if let Some(newest_selection_head) = newest_selection_head {
                         let display_row = newest_selection_head.row();
                         if (start_row..end_row).contains(&display_row)
@@ -9156,6 +9359,7 @@ impl Element for EditorElement {
                         }
                     }
 
+                    #[cfg(feature = "native")]
                     let blamed_display_rows = self.layout_blame_entries(
                         &row_infos,
                         em_width,
@@ -9255,6 +9459,7 @@ impl Element for EditorElement {
 
                     let gutter_settings = EditorSettings::get_global(cx).gutter;
 
+                    #[cfg(feature = "native")]
                     let context_menu_layout =
                         if let Some(newest_selection_head) = newest_selection_head {
                             let newest_selection_point =
@@ -9281,6 +9486,7 @@ impl Element for EditorElement {
                             None
                         };
 
+                    #[cfg(feature = "native")]
                     self.layout_gutter_menu(
                         line_height,
                         &text_hitbox,
@@ -9292,6 +9498,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    #[cfg(feature = "native")]
                     let test_indicators = if gutter_settings.runnables {
                         self.layout_run_indicators(
                             &gutter,
@@ -9304,9 +9511,11 @@ impl Element for EditorElement {
                         Vec::new()
                     };
 
+                    #[cfg(feature = "native")]
                     let show_bookmarks =
                         snapshot.show_bookmarks.unwrap_or(gutter_settings.bookmarks);
 
+                    #[cfg(feature = "native")]
                     let bookmark_rows = self.editor.update(cx, |editor, cx| {
                         let mut rows = editor.active_bookmarks(start_row..end_row, window, cx);
                         rows.retain(|k| !run_indicator_rows.contains(k));
@@ -9314,23 +9523,28 @@ impl Element for EditorElement {
                         rows
                     });
 
+                    #[cfg(feature = "native")]
                     let bookmarks = if show_bookmarks {
                         self.layout_bookmarks(&gutter, &bookmark_rows, window, cx)
                     } else {
                         Vec::new()
                     };
 
+                    #[cfg(feature = "native")]
                     let show_breakpoints = snapshot
                         .show_breakpoints
                         .unwrap_or(gutter_settings.breakpoints);
 
+                    #[cfg(feature = "native")]
                     breakpoint_rows.retain(|k, _| !run_indicator_rows.contains(k));
+                    #[cfg(feature = "native")]
                     let mut breakpoints = if show_breakpoints {
                         self.layout_breakpoints(&gutter, &breakpoint_rows, window, cx)
                     } else {
                         Vec::new()
                     };
 
+                    #[cfg(feature = "native")]
                     let gutter_hover_button = self
                         .editor
                         .read(cx)
@@ -9339,6 +9553,7 @@ impl Element for EditorElement {
                         .filter(|phantom| phantom.is_active)
                         .map(|phantom| phantom.display_row);
 
+                    #[cfg(feature = "native")]
                     if let Some(row) = gutter_hover_button
                         && !breakpoint_rows.contains_key(&row)
                         && !run_indicator_rows.contains(&row)
@@ -9352,12 +9567,15 @@ impl Element for EditorElement {
                         );
                     }
 
+                    #[cfg(feature = "native")]
                     let git_gutter_width = Self::gutter_strip_width(line_height)
                         + gutter_dimensions
                             .git_blame_entries_width
                             .unwrap_or_default();
+                    #[cfg(feature = "native")]
                     let available_width = gutter_dimensions.left_padding - git_gutter_width;
 
+                    #[cfg(feature = "native")]
                     let max_line_number_length = self
                         .editor
                         .read(cx)
@@ -9368,6 +9586,7 @@ impl Element for EditorElement {
                         .ilog10()
                         + 1;
 
+                    #[cfg(feature = "native")]
                     let diff_review_button = self
                         .should_render_diff_review_button(
                             start_row..end_row,
@@ -9398,6 +9617,7 @@ impl Element for EditorElement {
                             gutter.prepaint_button(button, display_row, window, cx)
                         });
 
+                    #[cfg(feature = "native")]
                     self.layout_signature_help(
                         &hitbox,
                         content_origin,
@@ -9412,6 +9632,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    #[cfg(feature = "native")]
                     if !cx.has_active_drag() {
                         self.layout_hover_popovers(
                             &snapshot,
@@ -9430,6 +9651,7 @@ impl Element for EditorElement {
                         self.layout_blame_popover(&snapshot, &hitbox, line_height, window, cx);
                     }
 
+                    #[cfg(feature = "native")]
                     let mouse_context_menu = self.layout_mouse_context_menu(
                         &snapshot,
                         start_row..end_row,
@@ -9518,13 +9740,16 @@ impl Element for EditorElement {
 
                     let mode = snapshot.mode.clone();
 
+                    #[cfg(feature = "native")]
                     let sticky_scroll_header_height = sticky_headers
                         .as_ref()
                         .and_then(|headers| headers.lines.last())
                         .map_or(Pixels::ZERO, |last| last.offset + line_height);
 
+                    #[cfg(feature = "native")]
                     let has_sticky_buffer_header =
                         sticky_buffer_header.is_some() || sticky_header_excerpt_id.is_some();
+                    #[cfg(feature = "native")]
                     let sticky_header_height = if has_sticky_buffer_header {
                         let full_height = FILE_HEADER_HEIGHT as f32 * line_height;
                         let display_row = blocks
@@ -9551,6 +9776,7 @@ impl Element for EditorElement {
                         sticky_scroll_header_height
                     };
 
+                    #[cfg(feature = "native")]
                     let (diff_hunk_controls, diff_hunk_control_bounds) =
                         if is_read_only && self.editor.read(cx).diff_hunk_delegate.is_none() {
                             (vec![], vec![])
@@ -9587,10 +9813,13 @@ impl Element for EditorElement {
                         content_width: text_hitbox.size.width,
                         gutter_hitbox: gutter_hitbox.clone(),
                         text_hitbox: text_hitbox.clone(),
+                        #[cfg(feature = "native")]
                         inline_blame_bounds: inline_blame_layout
                             .as_ref()
                             .map(|layout| (layout.bounds, layout.buffer_id, layout.entry.clone())),
+                        #[cfg(feature = "native")]
                         display_hunks: display_hunks.clone(),
+                        #[cfg(feature = "native")]
                         diff_hunk_control_bounds,
                     });
 
@@ -9613,6 +9842,7 @@ impl Element for EditorElement {
                         indent_guides,
                         hitbox,
                         gutter_hitbox,
+                        #[cfg(feature = "native")]
                         display_hunks,
                         content_origin,
                         scrollbars_layout,
@@ -9622,13 +9852,19 @@ impl Element for EditorElement {
                         highlighted_ranges,
                         highlighted_gutter_ranges,
                         redacted_ranges,
+                        #[cfg(feature = "native")]
                         document_colors,
                         line_elements,
                         line_numbers,
+                        #[cfg(feature = "native")]
                         blamed_display_rows,
+                        #[cfg(feature = "native")]
                         inline_diagnostics,
+                        #[cfg(feature = "native")]
                         inline_blame_layout,
+                        #[cfg(feature = "native")]
                         inline_code_actions,
+                        #[cfg(feature = "native")]
                         right_prompt_layout,
                         blocks,
                         spacer_blocks,
@@ -9636,18 +9872,27 @@ impl Element for EditorElement {
                         visible_cursors,
                         navigation_overlay_paint_commands,
                         selections,
+                        #[cfg(feature = "native")]
                         edit_prediction_popover,
+                        #[cfg(feature = "native")]
                         diff_hunk_controls,
+                        #[cfg(feature = "native")]
                         mouse_context_menu,
+                        #[cfg(feature = "native")]
                         test_indicators,
+                        #[cfg(feature = "native")]
                         bookmarks,
+                        #[cfg(feature = "native")]
                         breakpoints,
+                        #[cfg(feature = "native")]
                         diff_review_button,
                         crease_toggles,
                         crease_trailers,
                         tab_invisible,
                         space_invisible,
+                        #[cfg(feature = "native")]
                         sticky_buffer_header,
+                        #[cfg(feature = "native")]
                         sticky_headers,
                         expand_toggles,
                         text_align: self.style.text.text_align,
@@ -9697,6 +9942,7 @@ impl Element for EditorElement {
 
                     // Mask the editor behind sticky scroll headers. Important
                     // for transparent backgrounds.
+                    #[cfg(feature = "native")]
                     let below_sticky_headers_mask = layout
                         .sticky_headers
                         .as_ref()
@@ -9716,6 +9962,8 @@ impl Element for EditorElement {
                                 ),
                             },
                         });
+                    #[cfg(not(feature = "native"))]
+                    let below_sticky_headers_mask = None;
 
                     window.with_content_mask(below_sticky_headers_mask, |window| {
                         self.paint_background(layout, window, cx);
@@ -9723,6 +9971,7 @@ impl Element for EditorElement {
                         self.paint_indent_guides(layout, window, cx);
 
                         if layout.gutter_hitbox.size.width > Pixels::ZERO {
+                            #[cfg(feature = "native")]
                             self.paint_blamed_display_rows(layout, window, cx);
                             self.paint_line_numbers(layout, window, cx);
                         }
@@ -9747,16 +9996,20 @@ impl Element for EditorElement {
                         }
                     });
 
+                    #[cfg(feature = "native")]
                     window.with_element_namespace("blocks", |window| {
                         if let Some(mut sticky_header) = layout.sticky_buffer_header.take() {
                             sticky_header.paint(window, cx)
                         }
                     });
 
+                    #[cfg(feature = "native")]
                     self.paint_sticky_headers(layout, window, cx);
                     self.paint_minimap(layout, window, cx);
                     self.paint_scrollbars(layout, window, cx);
+                    #[cfg(feature = "native")]
                     self.paint_edit_prediction_popover(layout, window, cx);
+                    #[cfg(feature = "native")]
                     self.paint_mouse_context_menu(layout, window, cx);
                 });
             })
@@ -9840,11 +10093,17 @@ pub struct EditorLayout {
     highlighted_rows: BTreeMap<DisplayRow, LineHighlight>,
     line_elements: SmallVec<[AnyElement; 1]>,
     line_numbers: Arc<HashMap<MultiBufferRow, LineNumberLayout>>,
+    #[cfg(feature = "native")]
     display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
+    #[cfg(feature = "native")]
     blamed_display_rows: Option<Vec<AnyElement>>,
+    #[cfg(feature = "native")]
     inline_diagnostics: HashMap<DisplayRow, AnyElement>,
+    #[cfg(feature = "native")]
     inline_blame_layout: Option<InlineBlameLayout>,
+    #[cfg(feature = "native")]
     inline_code_actions: Option<AnyElement>,
+    #[cfg(feature = "native")]
     right_prompt_layout: Option<RightPromptLayout>,
     blocks: Vec<BlockLayout>,
     spacer_blocks: Vec<BlockLayout>,
@@ -9855,20 +10114,30 @@ pub struct EditorLayout {
     visible_cursors: Vec<CursorLayout>,
     navigation_overlay_paint_commands: Vec<NavigationOverlayPaintCommand>,
     selections: Vec<(PlayerColor, Vec<SelectionLayout>)>,
+    #[cfg(feature = "native")]
     test_indicators: Vec<AnyElement>,
+    #[cfg(feature = "native")]
     bookmarks: Vec<AnyElement>,
+    #[cfg(feature = "native")]
     breakpoints: Vec<AnyElement>,
+    #[cfg(feature = "native")]
     diff_review_button: Option<AnyElement>,
     crease_toggles: Vec<Option<AnyElement>>,
     expand_toggles: Vec<Option<(AnyElement, gpui::Point<Pixels>)>>,
+    #[cfg(feature = "native")]
     diff_hunk_controls: Vec<AnyElement>,
     crease_trailers: Vec<Option<CreaseTrailerLayout>>,
+    #[cfg(feature = "native")]
     edit_prediction_popover: Option<AnyElement>,
+    #[cfg(feature = "native")]
     mouse_context_menu: Option<AnyElement>,
     tab_invisible: ShapedLine,
     space_invisible: ShapedLine,
+    #[cfg(feature = "native")]
     sticky_buffer_header: Option<AnyElement>,
+    #[cfg(feature = "native")]
     sticky_headers: Option<header::StickyHeaders>,
+    #[cfg(feature = "native")]
     document_colors: Option<(DocumentColorsRenderMode, Vec<(Range<DisplayPoint>, Hsla)>)>,
     text_align: TextAlign,
     content_width: Pixels,
@@ -10318,8 +10587,11 @@ pub(crate) struct PositionMap {
     pub content_width: Pixels,
     pub text_hitbox: Hitbox,
     pub gutter_hitbox: Hitbox,
+    #[cfg(feature = "native")]
     pub inline_blame_bounds: Option<(Bounds<Pixels>, BufferId, BlameEntry)>,
+    #[cfg(feature = "native")]
     pub display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
+    #[cfg(feature = "native")]
     pub diff_hunk_control_bounds: Vec<(DisplayRow, Bounds<Pixels>)>,
 }
 

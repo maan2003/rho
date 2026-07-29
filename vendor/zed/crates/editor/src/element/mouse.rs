@@ -2,6 +2,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use collections::HashMap;
+#[cfg(feature = "native")]
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use gpui::{
     AnyElement, App, AvailableSpace, ClickEvent, Context, DefiniteLength, DispatchPhase, Element,
@@ -10,6 +11,7 @@ use gpui::{
     Window, anchored, deferred, point, px,
 };
 use multi_buffer::MultiBufferRow;
+#[cfg(feature = "native")]
 use project::DisableAiSettings;
 use settings::Settings;
 use sum_tree::Bias;
@@ -19,14 +21,18 @@ use util::{RangeExt, debug_panic, post_inc};
 
 use super::{EditorElement, EditorLayout, LineNumberLayout, PositionMap, SplitSide};
 use crate::{
-    CURSORS_VISIBLE_FOR, ColumnarMode, DisplayDiffHunk, DisplayPoint, DisplayRow, Editor,
-    EditorSettings, EditorSnapshot, GutterHoverButton, HoveredCursor, JumpData,
-    PhantomDiffReviewIndicator, SelectPhase, Selection, SelectionDragState,
-    display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer,
-    hover_popover::hover_at, mouse_context_menu, scroll::ScrollPixelOffset,
+    CURSORS_VISIBLE_FOR, ColumnarMode, DisplayPoint, DisplayRow, Editor, EditorSettings,
+    EditorSnapshot, GutterHoverButton, HoveredCursor, JumpData, SelectPhase, Selection,
+    SelectionDragState, display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer,
+    scroll::ScrollPixelOffset,
+};
+#[cfg(feature = "native")]
+use crate::{
+    DisplayDiffHunk, PhantomDiffReviewIndicator, hover_popover::hover_at, mouse_context_menu,
 };
 
 impl EditorElement {
+    #[cfg(feature = "native")]
     pub(crate) fn mouse_moved(
         editor: &mut Editor,
         event: &MouseMoveEvent,
@@ -274,6 +280,29 @@ impl EditorElement {
         }
     }
 
+    #[cfg(not(feature = "native"))]
+    pub(crate) fn mouse_moved(
+        editor: &mut Editor,
+        event: &MouseMoveEvent,
+        position_map: &PositionMap,
+        _: Option<SplitSide>,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) {
+        if position_map.text_hitbox.is_hovered(window) {
+            Self::update_visible_cursor(
+                editor,
+                position_map
+                    .point_for_position(event.position)
+                    .nearest_valid,
+                position_map,
+                window,
+                cx,
+            );
+        }
+    }
+
+    #[cfg(feature = "native")]
     pub(super) fn layout_mouse_context_menu(
         &self,
         editor_snapshot: &EditorSnapshot,
@@ -468,6 +497,7 @@ impl EditorElement {
             move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble {
                     editor.update(cx, |editor, cx| {
+                        #[cfg(feature = "native")]
                         if editor.hover_state.focused(window, cx) {
                             return;
                         }
@@ -615,6 +645,7 @@ impl EditorElement {
         let mut click_count = event.click_count;
         let mut modifiers = event.modifiers;
 
+        #[cfg(feature = "native")]
         if let Some(hovered_hunk) =
             position_map
                 .display_hunks
@@ -632,7 +663,8 @@ impl EditorElement {
             editor.toggle_single_diff_hunk(hovered_hunk, cx);
             cx.notify();
             return;
-        } else if gutter_hitbox.is_hovered(window) {
+        }
+        if gutter_hitbox.is_hovered(window) {
             click_count = 3; // Simulate triple-click when clicking the gutter to select lines
         } else if !text_hitbox.is_hovered(window) {
             return;
@@ -660,6 +692,7 @@ impl EditorElement {
 
         let is_singleton = editor.buffer().read(cx).is_singleton();
 
+        #[cfg(feature = "native")]
         if click_count == 2 && !is_singleton {
             match EditorSettings::get_global(cx).double_click_in_multibuffer {
                 DoubleClickInMultibuffer::Select => {
@@ -701,6 +734,7 @@ impl EditorElement {
             }
         }
 
+        #[cfg(feature = "native")]
         if !is_singleton {
             let display_row = (ScrollPixelOffset::from(
                 (event.position - gutter_hitbox.bounds.origin).y / position_map.line_height,
@@ -775,6 +809,7 @@ impl EditorElement {
         cx.stop_propagation();
     }
 
+    #[cfg(feature = "native")]
     fn mouse_right_down(
         editor: &mut Editor,
         event: &MouseDownEvent,
@@ -815,6 +850,16 @@ impl EditorElement {
             cx,
         );
         cx.stop_propagation();
+    }
+
+    #[cfg(not(feature = "native"))]
+    fn mouse_right_down(
+        _: &mut Editor,
+        _: &MouseDownEvent,
+        _: &PositionMap,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) {
     }
 
     fn mouse_middle_down(
@@ -858,6 +903,7 @@ impl EditorElement {
         }
 
         // Handle diff review drag completion
+        #[cfg(feature = "native")]
         if editor.diff_review_drag_state.is_some() {
             editor.end_diff_review_drag(window, cx);
             cx.stop_propagation();
@@ -956,6 +1002,8 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "native")]
+
     fn click(
         editor: &mut Editor,
         event: &ClickEvent,
@@ -994,6 +1042,8 @@ impl EditorElement {
             cx.stop_propagation();
         }
     }
+
+    #[cfg(feature = "native")]
 
     fn pressure_click(
         editor: &mut Editor,
@@ -1179,6 +1229,8 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "native")]
+
     fn update_visible_cursor(
         editor: &mut Editor,
         point: DisplayPoint,
@@ -1229,6 +1281,35 @@ impl EditorElement {
             }),
         );
         cx.notify()
+    }
+    #[cfg(not(feature = "native"))]
+    fn click(
+        _: &mut Editor,
+        _: &ClickEvent,
+        _: &PositionMap,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) {
+    }
+
+    #[cfg(not(feature = "native"))]
+    fn pressure_click(
+        _: &mut Editor,
+        _: &MousePressureEvent,
+        _: &PositionMap,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) {
+    }
+
+    #[cfg(not(feature = "native"))]
+    fn update_visible_cursor(
+        _: &mut Editor,
+        _: DisplayPoint,
+        _: &PositionMap,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) {
     }
 }
 

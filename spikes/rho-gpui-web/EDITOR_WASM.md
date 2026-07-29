@@ -345,6 +345,35 @@ the implementation crate.
   islands (fields, producers, and consumers together), rather than treating
   the initial diagnostic count as the true remaining workload.
 
+### Stage 6 — element payload split plan (in progress)
+
+- `EditorLayout` keeps the portable render pipeline payloads: position map,
+  hitboxes/content origin, scrollbars/minimap, mode and wrap/indent guides,
+  visible rows and local row highlights, line elements/numbers, blocks and
+  spacer blocks, text/gutter highlight ranges, redactions, cursors and local
+  selections, navigation overlays, fold crease/expand toggles, invisible
+  glyphs, alignment, and content width.
+- Native-only `EditorLayout` payloads are gated together with their producers
+  and paint consumers: diff hunks/controls/review UI, blame, diagnostics,
+  inline code actions, prompts, runnables/bookmarks/breakpoints, edit prediction
+  and context/hover menus, sticky project buffer headers, and document colors.
+- `PositionMap` keeps geometry, shaped lines, the portable editor snapshot,
+  alignment/content width, and text/gutter hitboxes. Inline-blame bounds, diff
+  hunks, and diff-control bounds are native-only. Mouse text selection and
+  wheel scrolling continue to consume the portable portion.
+- The planned split is now implemented. The portable element registers typing,
+  deletion, newline, undo/redo, clipboard, fold, arrow, home/end, and selection
+  actions on wasm; native-only action families remain on the native path.
+  Text layout, line painting, blocks, local selections/cursors, scrolling,
+  minimap geometry, crease/expand controls, and mouse text selection stay in
+  the portable producer/consumer pipeline. Portable excerpt expansion now
+  updates the real `MultiBuffer` rather than dropping the block control.
+- The wasm diagnostic frontier moved from 25 import errors to 140 actionable
+  errors, with no remaining errors in `element.rs` or `element/mouse.rs`.
+  Next families are bracket colorization (1), display-map companion calls (4),
+  fold/inlays, scroll/clipboard/input/selection, then the remaining interleaved
+  `Editor` hooks. Native `editor` and root `rho-gui` checks remain green.
+
 ### Reproduction
 
 ```sh

@@ -938,6 +938,31 @@ impl Editor {
         });
     }
 
+    #[cfg(not(feature = "native"))]
+    pub(super) fn expand_excerpt(
+        &mut self,
+        excerpt_anchor: Anchor,
+        direction: ExpandExcerptDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lines = EditorSettings::get_global(cx).expand_excerpt_lines;
+        let current_scroll_position = self.scroll_position(cx);
+        let keep_scroll = direction == ExpandExcerptDirection::Up
+            && self
+                .buffer
+                .read(cx)
+                .snapshot(cx)
+                .excerpt_before(excerpt_anchor)
+                .is_none();
+        self.buffer.update(cx, |buffer, cx| {
+            buffer.expand_excerpts([excerpt_anchor], lines, direction, cx)
+        });
+        if keep_scroll {
+            self.set_scroll_position(current_scroll_position, window, cx);
+        }
+    }
+
 }
 
 #[cfg(feature = "native")]

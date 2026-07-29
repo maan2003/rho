@@ -145,8 +145,9 @@ pub use editor_settings::{
 };
 pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
-    render_breadcrumb_text,
 };
+#[cfg(feature = "native")]
+pub use element::render_breadcrumb_text;
 #[cfg(feature = "native")]
 pub use element::file_status_label_color;
 #[cfg(feature = "native")]
