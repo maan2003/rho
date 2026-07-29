@@ -199,6 +199,7 @@ impl Editor {
         cx.notify();
     }
 
+    #[cfg(feature = "native")]
     pub fn inline_values_enabled(&self) -> bool {
         self.inline_value_cache.enabled
     }

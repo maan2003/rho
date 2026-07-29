@@ -896,6 +896,8 @@ impl Editor {
             return;
         }
 
+        #[cfg(feature = "native")]
+        {
         let display_snapshot = self
             .display_map
             .update(cx, |display_map, cx| display_map.snapshot(cx));
@@ -913,9 +915,6 @@ impl Editor {
         self.update_restoration_data(cx, |data| {
             data.folds = inmemory_folds;
         });
-
-        #[cfg(feature = "native")]
-        {
         let Some(workspace_id) = self.workspace_serialization_id(cx) else {
             return;
         };

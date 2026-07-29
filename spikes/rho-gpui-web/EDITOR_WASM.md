@@ -377,6 +377,9 @@ the implementation crate.
   living in completions. Split-companion construction and all balancing/spacer
   consumers are gated as one native island; the ordinary display-map stack is
   unchanged. This removes those five diagnostics and leaves 134.
+- Fold transforms remain portable; only the native workspace restoration-data
+  mirror is omitted. Debugger inline-value state is likewise native-only while
+  base inlay splicing/highlighting remains portable. This leaves 132 errors.
 
 ### Reproduction
 
