@@ -423,6 +423,7 @@ impl DisplayMap {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn set_companion(
         &mut self,
         companion: Option<(Entity<DisplayMap>, Entity<Companion>)>,

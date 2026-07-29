@@ -26,6 +26,27 @@ impl Editor {
         );
     }
 
+    pub(super) fn visible_buffer_ranges(
+        &self,
+        cx: &mut Context<Editor>,
+    ) -> Vec<(
+        BufferSnapshot,
+        Range<BufferOffset>,
+        ExcerptRange<text::Anchor>,
+    )> {
+        let display_snapshot = self.display_snapshot(cx);
+        let visible_range = self.multi_buffer_visible_range(&display_snapshot, cx);
+        display_snapshot
+            .buffer_snapshot()
+            .range_to_buffer_ranges(visible_range)
+            .into_iter()
+            .filter(|(_, excerpt_visible_range, _)| !excerpt_visible_range.is_empty())
+            .map(|(buffer_snapshot, buffer_offset_range, excerpt_range)| {
+                (buffer_snapshot.clone(), buffer_offset_range, excerpt_range)
+            })
+            .collect()
+    }
+
     pub(crate) fn colorize_brackets(&mut self, invalidate: bool, cx: &mut Context<Editor>) {
         if !self.mode.is_full() || !self.bracket_colorization_enabled {
             return;

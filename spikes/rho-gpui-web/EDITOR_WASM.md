@@ -373,6 +373,10 @@ the implementation crate.
   Next families are bracket colorization (1), display-map companion calls (4),
   fold/inlays, scroll/clipboard/input/selection, then the remaining interleaved
   `Editor` hooks. Native `editor` and root `rho-gui` checks remain green.
+- Bracket-colorization's visible-range calculation is now portable rather than
+  living in completions. Split-companion construction and all balancing/spacer
+  consumers are gated as one native island; the ordinary display-map stack is
+  unchanged. This removes those five diagnostics and leaves 134.
 
 ### Reproduction
 

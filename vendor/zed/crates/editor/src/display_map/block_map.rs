@@ -943,6 +943,7 @@ impl BlockMap {
         }
 
         // Pull in companion edits to ensure we recompute spacers in ranges that have changed in the companion.
+        #[cfg(feature = "native")]
         if let Some(CompanionView {
             companion_wrap_snapshot: companion_new_snapshot,
             companion_wrap_edits: companion_edits,
@@ -1262,6 +1263,7 @@ impl BlockMap {
                 },
             ));
 
+            #[cfg(feature = "native")]
             if let Some(CompanionView {
                 companion_wrap_snapshot: companion_snapshot,
                 companion,
@@ -1449,6 +1451,7 @@ impl BlockMap {
         })
     }
 
+    #[cfg(feature = "native")]
     fn spacer_blocks(
         &self,
         bounds: (Bound<MultiBufferPoint>, Bound<MultiBufferPoint>),
@@ -1915,6 +1918,7 @@ impl BlockMapReader<'_> {
     }
 }
 
+#[cfg(feature = "native")]
 pub(crate) fn balancing_block(
     my_block: &BlockProperties<Anchor>,
     my_snapshot: &MultiBufferSnapshot,
@@ -2115,6 +2119,7 @@ impl BlockMapWriter<'_> {
             };
 
             // Insert a matching custom block in the companion (if any)
+            #[cfg(feature = "native")]
             if let Some(companion) = &mut self.companion
                 && companion.inverse.is_some()
             {
