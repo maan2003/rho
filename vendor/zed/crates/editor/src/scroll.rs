@@ -787,9 +787,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let opened_first_time = self.scroll_manager.visible_line_count.is_none();
+        let viewport_height_changed = self.scroll_manager.visible_line_count != Some(lines);
         self.scroll_manager.visible_line_count = Some(lines);
-        if opened_first_time {
+        if viewport_height_changed {
             self.update_data_on_scroll(false, window, cx);
         }
     }

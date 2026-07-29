@@ -2131,6 +2131,59 @@ fn long_transcripts_conceal_their_visible_tail_after_parsing(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn transcript_syntax_parses_visible_turns_on_demand(cx: &mut TestAppContext) {
+    let mut history = Vec::new();
+    for turn in 0..40 {
+        history.push(user(&format!("request {turn}")));
+        history.push(assistant(
+            &format!("assistant turn {turn}\n{}", "historical line\n".repeat(12)),
+            Some(UiMessagePhase::FinalAnswer),
+        ));
+    }
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            history,
+            vec![assistant(
+                "assistant visible tail **bold**",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
+    );
+    for _ in 0..64 {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(20));
+    }
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            let buffers = editor.read(cx).buffer().read(cx).all_buffers();
+            let middle = buffers
+                .iter()
+                .find(|buffer| buffer.read(cx).text().contains("assistant turn 20"))
+                .expect("middle response buffer");
+            let tail = buffers
+                .iter()
+                .find(|buffer| buffer.read(cx).text().contains("assistant visible tail"))
+                .expect("visible response buffer");
+            assert!(
+                !middle.read(cx).has_syntax_tree(),
+                "off-screen history should remain unparsed"
+            );
+            assert!(
+                tail.read(cx).has_syntax_tree(),
+                "the visible tail should be parsed"
+            );
+        })
+        .expect("inspect deferred transcript syntax");
+}
+
+#[gpui::test]
 fn prompt_typing_keeps_transcript_concealment_folds(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
@@ -2761,16 +2814,16 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
         agent(1),
         snapshot_frame(state(history, vec![assistant(initial, None)])),
     );
-    let first_parse = syntax_highlights_for_text(&workspace, initial, cx);
-    assert!(
-        first_parse.iter().any(Option::is_some),
-        "a new turn had no syntax tree for its first paint: {first_parse:?}"
-    );
     for _ in 0..64 {
         cx.run_until_parked();
         cx.executor()
             .advance_clock(std::time::Duration::from_millis(20));
     }
+    let first_parse = syntax_highlights_for_text(&workspace, initial, cx);
+    assert!(
+        first_parse.iter().any(Option::is_some),
+        "the visible turn did not activate syntax: {first_parse:?}"
+    );
 
     let editor = active_editor(&workspace, cx);
     workspace

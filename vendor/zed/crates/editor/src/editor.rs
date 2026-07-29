@@ -635,6 +635,7 @@ type GutterHighlight = (fn(&App) -> Hsla, Vec<Range<Anchor>>);
 
 struct SyntaxConcealment {
     scopes: Vec<Range<Anchor>>,
+    prefix_max_ends: Vec<Anchor>,
     buffer_ids: HashSet<BufferId>,
     covered: Vec<Range<MultiBufferOffset>>,
     dirty: bool,
@@ -2542,9 +2543,8 @@ impl Editor {
                                 new_anchor.offset,
                             );
                         });
-
-                        editor.update_data_on_scroll(true, window, cx);
                     }
+                    editor.update_data_on_scroll(*local, window, cx);
                     editor.refresh_sticky_headers(&editor.snapshot(window, cx), cx);
                 }
                 EditorEvent::Edited { .. } => {
@@ -9559,35 +9559,52 @@ impl Editor {
     /// Conceals syntax-query captures inside the given multibuffer ranges.
     pub fn set_syntax_concealment_ranges<T: 'static>(
         &mut self,
-        scopes: Vec<Range<Anchor>>,
+        mut scopes: Vec<Range<Anchor>>,
         cx: &mut Context<Self>,
     ) {
         let type_id = TypeId::of::<T>();
+        if self
+            .syntax_concealments
+            .get(&type_id)
+            .is_some_and(|state| state.scopes == scopes)
+        {
+            return;
+        }
         let snapshot = self.buffer.read(cx).snapshot(cx);
+        scopes.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start, &snapshot)
+                .then_with(|| a.end.cmp(&b.end, &snapshot))
+        });
         let buffer_ids = scopes
             .iter()
             .flat_map(|scope| snapshot.buffer_ids_for_range(scope.clone()))
             .collect();
+        let mut prefix_max_ends: Vec<Anchor> = Vec::with_capacity(scopes.len());
+        for scope in &scopes {
+            let max_end = prefix_max_ends
+                .last()
+                .filter(|end| end.cmp(&scope.end, &snapshot).is_gt())
+                .cloned()
+                .unwrap_or(scope.end);
+            prefix_max_ends.push(max_end);
+        }
         let state = self
             .syntax_concealments
             .entry(type_id)
             .or_insert_with(|| SyntaxConcealment {
                 scopes: Vec::new(),
+                prefix_max_ends: Vec::new(),
                 buffer_ids: HashSet::default(),
                 covered: Vec::new(),
                 dirty: true,
             });
-        let divergence = state
-            .scopes
-            .iter()
-            .zip(&scopes)
-            .position(|(old, new)| old != new)
-            .unwrap_or(state.scopes.len().min(scopes.len()));
-        if divergence == state.scopes.len() && divergence == scopes.len() {
+        if state.scopes == scopes {
             return;
         }
 
         state.scopes = scopes;
+        state.prefix_max_ends = prefix_max_ends;
         state.buffer_ids = buffer_ids;
         state.covered.clear();
         state.dirty = true;
@@ -9626,14 +9643,22 @@ impl Editor {
 
         let mut updates = Vec::new();
         for (type_id, state) in &mut self.syntax_concealments {
+            let first = state
+                .prefix_max_ends
+                .partition_point(|end| end.to_offset(snapshot) <= visible.start);
             let intersections = state
                 .scopes
                 .iter()
-                .filter_map(|scope| {
+                .skip(first)
+                .map_while(|scope| {
                     let scope = scope.start.to_offset(snapshot)..scope.end.to_offset(snapshot);
+                    if scope.start >= visible.end {
+                        return None;
+                    }
                     let intersection = scope.start.max(visible.start)..scope.end.min(visible.end);
-                    (!intersection.is_empty()).then_some((scope, intersection))
+                    Some((scope, intersection))
                 })
+                .filter(|(_, intersection)| !intersection.is_empty())
                 .collect::<Vec<_>>();
             if !state.dirty
                 && (intersections.is_empty() && state.covered.is_empty()
@@ -10016,6 +10041,7 @@ impl Editor {
                     )
                     .detach();
                 }
+                self.ensure_visible_buffer_syntax(cx);
                 self.register_visible_buffers(cx);
                 self.update_lsp_data(Some(buffer_id), window, cx);
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
@@ -10114,6 +10140,7 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ensure_visible_buffer_syntax(cx);
         cx.notify();
     }
 
@@ -11410,6 +11437,7 @@ impl Editor {
     }
 
     fn do_update_data_on_scroll(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.ensure_visible_buffer_syntax(cx);
         self.register_visible_buffers(cx);
         self.colorize_brackets(false, cx);
         self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
@@ -11419,6 +11447,18 @@ impl Editor {
             self.needs_initial_data_update = false;
             self.update_lsp_data(None, window, cx);
             self.refresh_runnables(None, window, cx);
+        }
+    }
+
+    fn ensure_visible_buffer_syntax(&mut self, cx: &mut Context<Self>) {
+        let mut seen = HashSet::default();
+        for buffer in self.visible_buffers(cx) {
+            let buffer_id = buffer.read(cx).remote_id();
+            if seen.insert(buffer_id) {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.ensure_syntax_parsed(cx);
+                });
+            }
         }
     }
 

@@ -29,8 +29,8 @@ use fs::MTime;
 use futures::channel::oneshot;
 use futures_lite::future::yield_now;
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, HighlightStyle, SharedString, StyledText,
-    Task, TextStyle,
+    App, AppContext as _, Context, Entity, EventEmitter, HighlightStyle, Priority, SharedString,
+    StyledText, Task, TextStyle,
 };
 
 use lsp::LanguageServerId;
@@ -118,6 +118,7 @@ pub struct Buffer {
     sync_parse_timeout: Option<Duration>,
     syntax_map: Mutex<SyntaxMap>,
     reparse: Option<Task<()>>,
+    syntax_parsing_enabled: bool,
     parse_status: (watch::Sender<ParseStatus>, watch::Receiver<ParseStatus>),
     non_text_state_update_count: usize,
     diagnostics: TreeMap<LanguageServerId, DiagnosticSet>,
@@ -1176,6 +1177,7 @@ impl Buffer {
             capability,
             syntax_map,
             reparse: None,
+            syntax_parsing_enabled: true,
             non_text_state_update_count: 0,
             sync_parse_timeout: if cfg!(any(test, feature = "test-support")) {
                 Some(Duration::from_millis(10))
@@ -1521,12 +1523,27 @@ impl Buffer {
 
     /// Assign a language to the buffer.
     pub fn set_language_async(&mut self, language: Option<Arc<Language>>, cx: &mut Context<Self>) {
-        self.set_language_(language, cfg!(any(test, feature = "test-support")), cx);
+        self.set_language_(
+            language,
+            cfg!(any(test, feature = "test-support")),
+            true,
+            cx,
+        );
     }
 
     /// Assign a language to the buffer, blocking for up to 1ms to reparse the buffer.
     pub fn set_language(&mut self, language: Option<Arc<Language>>, cx: &mut Context<Self>) {
-        self.set_language_(language, true, cx);
+        self.set_language_(language, true, true, cx);
+    }
+
+    /// Assign a language without parsing until an editor or another syntax
+    /// consumer explicitly requests it.
+    pub fn set_language_deferred(
+        &mut self,
+        language: Option<Arc<Language>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_language_(language, false, false, cx);
     }
 
     #[ztracing::instrument(skip_all)]
@@ -1534,16 +1551,27 @@ impl Buffer {
         &mut self,
         language: Option<Arc<Language>>,
         may_block: bool,
+        syntax_parsing_enabled: bool,
         cx: &mut Context<Self>,
     ) {
         if language == self.language {
+            if syntax_parsing_enabled {
+                self.ensure_syntax_parsed(cx);
+            }
             return;
         }
+        if !syntax_parsing_enabled {
+            self.reparse = None;
+            self.parse_status.0.send(ParseStatus::Idle).unwrap();
+        }
+        self.syntax_parsing_enabled = syntax_parsing_enabled;
         self.non_text_state_update_count += 1;
         self.syntax_map.lock().clear(&self.text);
         let old_language = std::mem::replace(&mut self.language, language);
         self.was_changed();
-        self.reparse(cx, may_block);
+        if syntax_parsing_enabled {
+            self.reparse(cx, may_block);
+        }
         let has_fresh_language =
             self.language.is_some() && old_language.is_none_or(|old| old == *PLAIN_TEXT);
         cx.emit(BufferEvent::LanguageChanged(has_fresh_language));
@@ -1839,6 +1867,22 @@ impl Buffer {
         self.reparse.is_some()
     }
 
+    /// Whether this buffer already has a syntax tree available to consumers.
+    pub fn has_syntax_tree(&self) -> bool {
+        !self.syntax_map.lock().snapshot().is_empty()
+    }
+
+    /// Starts parsing a deferred buffer. Concurrent requests coalesce in the
+    /// buffer's existing parse task.
+    pub fn ensure_syntax_parsed(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.syntax_parsing_enabled || self.language.is_none() {
+            return false;
+        }
+        self.syntax_parsing_enabled = true;
+        self.reparse_with_priority(cx, false, Priority::High);
+        true
+    }
+
     /// Indicates whether the buffer contains any regions that may be
     /// written in a language that hasn't been loaded yet.
     pub fn contains_unknown_injections(&self) -> bool {
@@ -1890,8 +1934,20 @@ impl Buffer {
     /// parsing in the background.
     #[ztracing::instrument(skip_all)]
     pub fn reparse(&mut self, cx: &mut Context<Self>, may_block: bool) {
+        self.reparse_with_priority(cx, may_block, Priority::Medium);
+    }
+
+    fn reparse_with_priority(
+        &mut self,
+        cx: &mut Context<Self>,
+        may_block: bool,
+        priority: Priority,
+    ) {
         if self.text.version() != *self.tree_sitter_data.version() {
             Self::invalidate_tree_sitter_data(&mut self.tree_sitter_data, self.text.snapshot());
+        }
+        if !self.syntax_parsing_enabled {
+            return;
         }
         if self.reparse.is_some() {
             return;
@@ -1925,7 +1981,7 @@ impl Buffer {
             }
         }
 
-        let parse_task = cx.background_spawn({
+        let parse_task = cx.background_executor().spawn_with_priority(priority, {
             let language = language.clone();
             let language_registry = language_registry.clone();
             async move {

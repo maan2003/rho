@@ -764,6 +764,42 @@ async fn test_reparse(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_deferred_syntax_parsing(cx: &mut gpui::TestAppContext) {
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::local("fn a() {}", cx);
+        buffer.set_sync_parse_timeout(None);
+        buffer.set_language_deferred(Some(rust_lang()), cx);
+        buffer
+    });
+
+    assert!(buffer.read_with(cx, |buffer, _| buffer.language().is_some()));
+    assert!(!buffer.read_with(cx, |buffer, _| buffer.is_parsing()));
+    assert!(!buffer.read_with(cx, |buffer, _| buffer.has_syntax_tree()));
+
+    buffer.update(cx, |buffer, cx| {
+        let offset = buffer.text().find('}').unwrap();
+        buffer.edit([(offset..offset, " let b = 1; ")], None, cx);
+        assert!(!buffer.is_parsing());
+        assert!(!buffer.has_syntax_tree());
+        assert!(buffer.ensure_syntax_parsed(cx));
+        assert!(!buffer.ensure_syntax_parsed(cx));
+        assert!(buffer.is_parsing());
+    });
+    cx.executor().run_until_parked();
+
+    assert!(buffer.read_with(cx, |buffer, _| buffer.has_syntax_tree()));
+    assert!(get_tree_sexp(&buffer, cx).contains("let_declaration"));
+
+    buffer.update(cx, |buffer, cx| {
+        let offset = buffer.text().find('1').unwrap();
+        buffer.edit([(offset..offset + 1, "2")], None, cx);
+        assert!(buffer.is_parsing());
+    });
+    cx.executor().run_until_parked();
+    assert!(get_tree_sexp(&buffer, cx).contains("integer_literal"));
+}
+
+#[gpui::test]
 async fn test_resetting_language(cx: &mut gpui::TestAppContext) {
     let buffer = cx.new(|cx| {
         let mut buffer = Buffer::local("{}", cx).with_language(rust_lang(), cx);
