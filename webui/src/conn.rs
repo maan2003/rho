@@ -44,19 +44,29 @@ pub fn init(app: App, receiver: UnboundedReceiver<FromBrowser>) {
     }
 }
 
-/// Daemon endpoint id from `?daemon=` (also remembered) or local storage.
+/// Daemon endpoint id from `#daemon=` (also remembered) or local storage.
+/// The fragment never leaves the browser; `?daemon=` is accepted as a
+/// legacy fallback but ends up in host logs and referrers.
 fn daemon_id_from_page() -> Option<String> {
     let window = web_sys::window()?;
     let storage = window.local_storage().ok()??;
-    if let Ok(query) = window.location().search()
-        && let Some(daemon) = query
-            .trim_start_matches('?')
+    let location = window.location();
+    let daemon = [
+        location.hash().ok().map(|s| (s, '#')),
+        location.search().ok().map(|s| (s, '?')),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|(part, prefix)| {
+        part.trim_start_matches(prefix)
             .split('&')
             .find_map(|pair| pair.strip_prefix("daemon="))
-        && !daemon.is_empty()
-    {
-        let _ = storage.set_item(DAEMON_KEY, daemon);
-        return Some(daemon.to_owned());
+            .filter(|daemon| !daemon.is_empty())
+            .map(str::to_owned)
+    });
+    if let Some(daemon) = daemon {
+        let _ = storage.set_item(DAEMON_KEY, &daemon);
+        return Some(daemon);
     }
     storage.get_item(DAEMON_KEY).ok()?
 }

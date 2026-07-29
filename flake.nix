@@ -145,6 +145,69 @@
           paths = buildPaths;
         };
 
+        # The web UI is its own cargo workspace targeting wasm32, built with
+        # trunk into a static bundle. Reproducible `nix build .#webui` output
+        # is the deployable artifact: anyone can rebuild and byte-compare
+        # against the hosted bundle. The source still needs the root
+        # workspace manifest and `crates`/`vendor` trees because the webui
+        # depends on `rho-iroh-auth` (workspace-inherited fields) and patches
+        # in the vendored `iroh`/`noq` forks.
+        webuiSrc = flakeboxLib.filterSubPaths {
+          root = builtins.path {
+            name = projectName;
+            path = ./.;
+          };
+          paths = buildPaths ++ [ "webui" ];
+        };
+
+        # Trunk requires the wasm-bindgen CLI version to exactly match the
+        # `wasm-bindgen` crate in webui/Cargo.lock.
+        wasmBindgenCli = pkgs.buildWasmBindgenCli rec {
+          src = pkgs.fetchCrate {
+            pname = "wasm-bindgen-cli";
+            version = "0.2.126";
+            hash = "sha256-H6Is3fiZVxZCfOMWK5dWMSrtn50VGv0sfdnsT+cTtyk=";
+          };
+          cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+            inherit src;
+            inherit (src) pname version;
+            hash = "sha256-VucqkXbCi4qtQzY/HrXiDnbSURsagPsdNVMn1Tw3UiY=";
+          };
+        };
+
+        webui = pkgs.rustPlatform.buildRustPackage {
+          pname = "rho-webui";
+          version = "0.1.0";
+          src = webuiSrc;
+          sourceRoot = "source/webui";
+          cargoLock.lockFile = ./webui/Cargo.lock;
+          nativeBuildInputs = [
+            pkgs.trunk
+            wasmBindgenCli
+            pkgs.binaryen
+            pkgs.lld
+          ];
+          # `ring` compiles C for wasm32; the wrapped clang injects host
+          # flags that produce unlinkable objects.
+          env.CC_wasm32_unknown_unknown = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+          buildPhase = ''
+            runHook preBuild
+            export TRUNK_OFFLINE=true
+            export TRUNK_SKIP_VERSION_CHECK=true
+            export XDG_CACHE_HOME=$TMPDIR/cache
+            # Relative public URL: GitHub Pages serves project sites under a
+            # /<repo>/ subpath.
+            trunk build --release --dist dist --public-url ./
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            cp -r dist $out
+            runHook postInstall
+          '';
+          doCheck = false;
+        };
+
         guiNativeBuildInputs = [
           pkgs.clang
           pkgs.cmake
@@ -340,6 +403,7 @@
           default = multiBuild.package;
           rho = multiBuild.package;
           workspace = multiBuild.workspace;
+          inherit webui;
         };
 
         ci = {

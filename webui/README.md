@@ -7,9 +7,24 @@ through an iroh relay.
 
 ## Build
 
-This directory is its own cargo workspace (the root workspace's
-`.cargo/config.toml` uses nightly-only options, so build the web UI in
-release mode with a stable toolchain):
+The reproducible build is a flake package; the output is the deployable
+bundle:
+
+```sh
+nix build .#webui
+```
+
+Reproducibility is the tamper check for third-party hosting: rebuild
+locally and byte-compare against what the host serves.
+
+`just deploy-webui` builds the bundle and pushes it as a fresh root commit
+to the `gh-pages` bookmark of this repo's `origin`, using a separate local
+jj repo (`~/.local/share/rho/webui-deploy` by default) so deploy commits
+never accumulate in this checkout's repository.
+
+For iterating, this directory is its own cargo workspace (the root
+workspace's `.cargo/config.toml` uses nightly-only options, so build the
+web UI in release mode with a stable toolchain):
 
 ```sh
 env CC_wasm32_unknown_unknown=clang \
@@ -25,7 +40,7 @@ shell's `gcc`) leaks in.
 ## Use
 
 1. Run the daemon with `rho daemon --iroh`; it prints its endpoint id.
-2. Open the hosted page as `https://…/?daemon=<endpoint-id>` (remembered in
+2. Open the hosted page as `https://…/#daemon=<endpoint-id>` (remembered in
    local storage afterwards).
 3. First visit shows an enrollment code; run `rho iroh approve <code>` on
    the daemon machine within a minute.

@@ -35,6 +35,13 @@ web-sys = { version = "0.3", features = [
   "Window",
 ] }
 
+# Same forks the root workspace patches in: `rho-iroh-auth` uses vendored
+# iroh/noq API surface, so this workspace must resolve the same sources.
+[patch.crates-io]
+noq = { path = "../vendor/noq/noq" }
+noq-proto = { path = "../vendor/noq/noq-proto" }
+iroh = { path = "../vendor/iroh/iroh" }
+
 [profile.release]
 opt-level = "s"
 lto = true
