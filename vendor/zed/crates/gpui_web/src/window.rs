@@ -120,6 +120,10 @@ impl WebWindow {
             .map_err(|e| anyhow::anyhow!("Failed to create input element: {e:?}"))?
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
+        // The element only relays hardware key and IME events, and pointerdown
+        // refocuses it constantly; without this, touch browsers flicker their
+        // virtual keyboard open on every tap.
+        input_element.set_attribute("inputmode", "none").ok();
         let input_style = input_element.style();
         input_style.set_property("position", "fixed").ok();
         input_style.set_property("top", "0").ok();

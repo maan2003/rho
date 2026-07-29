@@ -1,6 +1,24 @@
 # GPUI-web feasibility spike
 
-## Verdict
+## Update: renders on real hardware
+
+After deployment to GitHub Pages (with a coi-serviceworker shim supplying the
+COOP/COEP isolation Pages cannot send as headers), the rail rendered correctly
+on a real device with hardware WebGPU. The all-black captures below were an
+artifact of headless *software* WebGPU paths (SwiftShader and Vulkan/ANGLE),
+not a renderer defect. The milestone 2 verdict flips to **feasible**: GPUI-web
+visibly presents plain-element Rho scenes in a real browser.
+
+Real-device testing surfaced one mobile issue, fixed in the vendored platform:
+every pointerdown refocuses the hidden IME input, which made touch browsers
+flicker the virtual keyboard open on each tap. The input now carries
+`inputmode="none"`, which suppresses the virtual keyboard while keeping
+hardware key and composition events. A production client would need to swap
+the attribute back on whenever an actual text field takes focus.
+
+The original findings follow, unamended.
+
+## Verdict (original, superseded on the rendering question)
 
 **Milestone 2 is not feasible with the currently vendored Zed revision as a browser UI replacement.** The Rho protocol/registry side is ready: an isolated wasm crate can link `rho-ui-proto` and `rho-registry`, construct the same `Ready` snapshot data used by the Leptos client, run the registry's workstream/tree ordering, and produce a non-empty GPUI scene using only `div` and text elements. The current GPUI-web renderer does not, however, produce visible pixels in the tested Chromium WebGPU implementations. Both `hello_web` and this Rho rail mount a correctly sized canvas, initialize BrowserWebGPU, render non-empty scenes, submit frames successfully, and remain visually black in browser and CDP captures.
 
