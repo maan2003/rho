@@ -5741,31 +5741,6 @@ dependencies = [
 name = "editor"
 version = "0.1.0"
 dependencies = [
- "editor_core",
-]
-
-[[package]]
-name = "editor_benchmarks"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "editor",
- "gpui",
- "gpui_platform",
- "language",
- "multi_buffer",
- "project",
- "release_channel",
- "semver",
- "settings",
- "theme",
- "workspace",
-]
-
-[[package]]
-name = "editor_core"
-version = "0.1.0"
-dependencies = [
  "aho-corasick",
  "anyhow",
  "assets",
@@ -5849,6 +5824,24 @@ dependencies = [
  "zed_actions",
  "zlog",
  "ztracing",
+]
+
+[[package]]
+name = "editor_benchmarks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "gpui_platform",
+ "language",
+ "multi_buffer",
+ "project",
+ "release_channel",
+ "semver",
+ "settings",
+ "theme",
+ "workspace",
 ]
 
 [[package]]

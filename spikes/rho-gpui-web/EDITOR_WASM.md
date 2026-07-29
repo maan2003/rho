@@ -132,16 +132,14 @@ The concrete production-module dependencies are:
   file/AI-setting checks. The element needs a core-defined render delegate for
   optional gutter/header/popover contributions rather than project handles.
 
-The lowest-risk crate cut is therefore an `editor_core` implementation crate
-with an explicit native integration feature, while `editor` initially becomes
-a compatibility/re-export facade enabling that feature. This preserves the
-existing `editor::Editor` identity and all native consumers while portable
-leaves and core `Editor`/`EditorElement` behavior are separated behind cfgs.
-Once the browser build is clean, native-only state can be moved from the
-feature implementation into delegate objects without a flag day across the
-many crates that store `Entity<Editor>`. A wrapper `editor::Editor(EditorCore)`
-was rejected because it changes GPUI entity types and cannot preserve inherent
-method calls through all consumers.
+The implementation remains in the single `editor` crate, with an explicit
+default-on `native` integration feature. This preserves the existing
+`editor::Editor` identity and all native consumers while portable leaves and
+core `Editor`/`EditorElement` behavior are separated behind cfgs. A separate
+implementation crate or `editor::Editor(EditorCore)` wrapper would add
+indirection (and, for the wrapper, change GPUI entity types) without helping
+the inherent-impl split. The browser workspace can depend on `editor` with
+default features disabled without native feature unification leaking in.
 
 The extraction order is: relocate the four display-map model leaks and spacer
 callback; move/check the complete display-map stack; move selection/movement
@@ -212,11 +210,13 @@ the implementation crate.
 
 ### Split progress (2026-04-02)
 
-- The complete implementation was mechanically moved to `editor_core` and
-  `editor` is now a compatibility facade that re-exports it. Both crates enable
-  `editor_core/native` by default, so existing native crate paths, GPUI entity
-  types, inherent methods, and behavior are unchanged.
-- The native dependency families are optional dependencies of `editor_core`
+- The complete implementation was initially moved to an `editor_core`
+  implementation crate behind an `editor` compatibility facade. That
+  intermediate split was subsequently collapsed back into the single `editor`
+  crate because the facade provided no feature-isolation benefit. `editor`
+  itself now owns the default-on `native` feature, so existing native crate
+  paths, GPUI entity types, inherent methods, and behavior remain unchanged.
+- The native dependency families are optional dependencies of `editor`
   activated by `native`: breadcrumbs, client, DAP, DB, edit prediction,
   feature flags, file icons, filesystem use, fuzzy matching, Git, LSP,
   Markdown, menus, project, RPC, tasks, telemetry, and workspace. This removes
@@ -224,7 +224,7 @@ the implementation crate.
   default native graph.
 - `cargo check -p editor` in the Zed workspace and `cargo check -p rho-gui` at
   the repository root pass after both changes.
-- The release wasm check now reaches `editor_core` Rust compilation with the
+- The release wasm check now reaches `editor` Rust compilation with the
   established nightly/unwrapped-clang setup. It currently reports about 300
   unresolved native references because source modules and the interleaved
   `Editor`/`EditorElement` implementation have not yet been feature-gated.

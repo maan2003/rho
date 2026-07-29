@@ -4112,13 +4112,6 @@ dependencies = [
 name = "editor"
 version = "0.1.0"
 dependencies = [
- "editor_core",
-]
-
-[[package]]
-name = "editor_core"
-version = "0.1.0"
-dependencies = [
  "aho-corasick",
  "anyhow",
  "assets",
