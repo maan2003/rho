@@ -41,11 +41,16 @@ smallvec.workspace = true
 sum_tree.workspace = true
 text.workspace = true
 theme.workspace = true
-tree-sitter = { workspace = true, features = ["wasm"] }
 ztracing.workspace = true
 tracing.workspace = true
 util.workspace = true
 unicode-segmentation.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tree-sitter = { workspace = true, features = ["wasm"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tree-sitter-stub = { path = "../tree_sitter_stub" }
 
 [dev-dependencies]
 buffer_diff = { workspace = true, features = ["test-support"] }

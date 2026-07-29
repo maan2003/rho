@@ -8328,6 +8328,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tree-sitter",
+ "tree-sitter-stub",
  "unicase",
  "util",
  "watch",
@@ -8352,6 +8353,7 @@ dependencies = [
  "serde_json",
  "toml 0.8.23",
  "tree-sitter",
+ "tree-sitter-stub",
 ]
 
 [[package]]
@@ -9511,6 +9513,7 @@ dependencies = [
  "theme",
  "tracing",
  "tree-sitter",
+ "tree-sitter-stub",
  "unicode-segmentation",
  "util",
  "ztracing",
@@ -17185,6 +17188,10 @@ dependencies = [
  "cc",
  "tree-sitter-language",
 ]
+
+[[package]]
+name = "tree-sitter-stub"
+version = "0.1.0"
 
 [[package]]
 name = "tree-sitter-typescript"

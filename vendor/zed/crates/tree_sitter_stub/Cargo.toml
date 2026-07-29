@@ -1,0 +1,9 @@
+[package]
+name = "tree-sitter-stub"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"

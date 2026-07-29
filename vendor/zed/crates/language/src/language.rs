@@ -6,6 +6,9 @@
 //! - Exposes [`LanguageConfig`] that describes how constructs (like brackets or line comments) should be handled by the editor for a source file of a particular language.
 //!
 //! Notably we do *not* assign a single language to a single file; in real world a single file can consist of multiple programming languages - HTML is a good example of that - and `language` crate tends to reflect that status quo in its API.
+#[cfg(target_family = "wasm")]
+extern crate tree_sitter_stub as tree_sitter;
+
 mod available_languages;
 mod buffer;
 mod diagnostic;

@@ -30,11 +30,11 @@ Direct checks from `vendor/zed` establish the current boundary:
 
 The tree-sitter `wasm` Cargo feature is not the browser solution. In this
 revision it enables tree-sitter's Wasmtime-backed grammar loader, which itself
-pulls a large Wasmtime/Cranelift graph. Compiling tree-sitter's C runtime *to*
-wasm is a separate path and currently expects a C-support provider that is not
-in the resolved graph. Zed's extension grammar wasm store remains the likely
-future highlighting path, but it should be integrated only after a
-syntax-free editor works.
+pulls a large Wasmtime/Cranelift graph. The browser editor will permanently run
+without tree-sitter: parsing and syntax classification belong to the daemon,
+which will ship styled spans in the same general shape as LSP semantic tokens.
+The wasm build therefore links an inert API-compatible tree-sitter stub solely
+to preserve model API types; it never parses or loads grammars.
 
 ### Native editor dependency families to sever
 
@@ -103,10 +103,10 @@ and repository behavior and must be absent on wasm.
      conflict policy are still unspecified and are required for a usable
      remote editor.
 
-5. **Stretch: highlighting.**
-   - After plain text is stable, load one extension grammar through a
-     browser-appropriate tree-sitter wasm runtime/store. Do not ship native
-     Wasmtime/Cranelift in the browser module.
+5. **Remote highlighting.**
+   - Extend the remote-buffer protocol with revision-bound styled spans.
+   - Apply daemon-computed spans to buffer chunks without introducing a parser
+     or grammar runtime in the browser module.
 
 ## Milestone status
 

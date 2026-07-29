@@ -20,7 +20,11 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 tree-sitter.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tree-sitter-stub = { path = "../tree_sitter_stub" }
 
 [features]
 test-support = []

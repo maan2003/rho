@@ -207,6 +207,7 @@ members = [
     "crates/terminal",
     "crates/terminal_view",
     "crates/text",
+    "crates/tree_sitter_stub",
     "crates/theme",
     "crates/theme_extension",
     "crates/theme_settings",
