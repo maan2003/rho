@@ -6,14 +6,14 @@ use std::rc::Rc;
 
 use futures::StreamExt as _;
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Render, Subscription, Task, Window, div, px};
+use gpui::{App, Context, Entity, Focusable as _, Render, Subscription, Task, Window, div, px};
 use rho_registry::session::{
     AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
 };
 use rho_touch_keyboard::{
     ContextChip, KeyboardPlugin, KeyboardStyle, TouchKeyboard, dump_telemetry,
 };
-use rho_ui_proto::{AgentId, ClientMessage, ServerMessage};
+use rho_ui_proto::{AgentId, ClientMessage, MessageDelivery, ServerMessage};
 use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
@@ -63,9 +63,12 @@ pub struct Workspace {
     models: HashMap<AgentId, Entity<AgentModel>>,
     pending_syncs: HashMap<AgentId, FrameSummary>,
     preview: Option<Entity<editor::Editor>>,
+    /// The full transcript editor (prompt included) for the phone layout,
+    /// kept per selected agent so reopening does not rebuild it.
+    transcript: Option<(AgentId, Entity<editor::Editor>)>,
     /// On narrow (phone) viewports only one pane fits; this switches between
-    /// the dashboard and the transcript preview.
-    narrow_preview: bool,
+    /// the dashboard and the full agent transcript.
+    agent_screen: bool,
     touch_keyboard: Entity<TouchKeyboard>,
     _event_task: Task<()>,
     _dashboard_subscription: Subscription,
@@ -111,7 +114,8 @@ impl Workspace {
             models: HashMap::new(),
             pending_syncs: HashMap::new(),
             preview: None,
-            narrow_preview: false,
+            transcript: None,
+            agent_screen: false,
             touch_keyboard: cx.new(|_| TouchKeyboard::new(RhoKeyboardPlugin)),
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
@@ -285,8 +289,47 @@ impl Workspace {
             agent_id: Some(agent_id),
         });
         let (model, _) = self.ensure_agent_model(agent_id, window, cx);
-        self.preview = Some(model.update(cx, |model, cx| model.preview_editor(window, cx)));
-        self.narrow_preview = true;
+        if window.viewport_size().width < px(700.) {
+            let editor = match &self.transcript {
+                Some((id, editor)) if *id == agent_id => editor.clone(),
+                _ => {
+                    let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
+                    self.transcript = Some((agent_id, editor.clone()));
+                    editor
+                }
+            };
+            window.focus(&editor.read(cx).focus_handle(cx), cx);
+        } else {
+            self.preview = Some(model.update(cx, |model, cx| model.preview_editor(window, cx)));
+        }
+        self.agent_screen = true;
+        cx.notify();
+    }
+
+    fn submit_prompt(
+        &mut self,
+        _: &crate::SubmitPrompt,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.phase != Phase::Online {
+            return;
+        }
+        let Some(agent_id) = self.registry.selected_agent().copied() else {
+            return;
+        };
+        let Some(model) = self.models.get(&agent_id).cloned() else {
+            return;
+        };
+        let Some(content) = model.update(cx, |model, cx| model.take_prompt(cx)) else {
+            return;
+        };
+        self.connection.send(ClientMessage::SendUserMessage {
+            agent_id,
+            content,
+            delivery: MessageDelivery::NextRequest,
+        });
+        self.registry.touch_agent(agent_id);
         cx.notify();
     }
 
@@ -366,15 +409,17 @@ impl Render for Workspace {
             show_keyboard.then(|| TouchKeyboard::region(window.viewport_size())),
         );
         let body = if narrow {
-            if self.narrow_preview && self.preview.is_some() {
+            if self.agent_screen && let Some((agent_id, transcript)) = self.transcript.clone() {
                 div()
                     .flex()
                     .flex_col()
                     .size_full()
+                    .key_context("RhoTranscript")
                     .child(
                         div()
                             .flex()
                             .items_center()
+                            .gap_2()
                             .px_1()
                             .py_1()
                             .border_b_1()
@@ -388,18 +433,23 @@ impl Render for Workspace {
                                     .rounded_sm()
                                     .text_color(text_muted)
                                     .child("‹ agents")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.narrow_preview = false;
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.agent_screen = false;
+                                        window.focus(
+                                            &this.dashboard.editor().read(cx).focus_handle(cx),
+                                            cx,
+                                        );
                                         cx.notify();
                                     })),
+                            )
+                            .child(
+                                div()
+                                    .text_color(text_muted)
+                                    .overflow_hidden()
+                                    .child(self.registry.agent_display_label(agent_id)),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .children(self.preview.clone()),
-                    )
+                    .child(div().flex_1().overflow_hidden().child(transcript))
             } else {
                 div()
                     .size_full()
@@ -495,6 +545,7 @@ impl Render for Workspace {
             .p(px(2.))
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
+            .on_action(cx.listener(Self::submit_prompt))
             .child(div().flex_1().overflow_hidden().child(body))
             .children(show_keyboard.then(|| self.touch_keyboard.clone().into_any_element()))
             .children(overlay)

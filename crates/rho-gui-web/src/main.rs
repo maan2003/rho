@@ -1,5 +1,6 @@
 use editor::{Backspace, MoveLeft, MoveRight, MoveToBeginningOfLine, MoveToEndOfLine, Newline, Redo, Undo};
 use gpui::{App, AppContext as _, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
+use rho_gui::SubmitPrompt;
 use rho_gui::rho_assets::RhoAssets;
 use rho_gui::workspace::Workspace;
 
@@ -37,6 +38,10 @@ fn main() {
             KeyBinding::new("enter", Newline, Some("Editor")),
             KeyBinding::new("ctrl-z", Undo, Some("Editor")),
             KeyBinding::new("ctrl-shift-z", Redo, Some("Editor")),
+            // The transcript's prompt is chat-style: Enter sends, and the
+            // deeper context outranks the plain `Editor` Newline binding.
+            KeyBinding::new("enter", SubmitPrompt, Some("RhoTranscript > Editor")),
+            KeyBinding::new("shift-enter", Newline, Some("RhoTranscript > Editor")),
         ]);
         let bounds = Bounds::centered(None, size(px(1180.), px(720.)), cx);
         cx.open_window(
