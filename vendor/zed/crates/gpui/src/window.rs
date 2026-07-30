@@ -2073,6 +2073,20 @@ impl Window {
         self.refresh();
     }
 
+    /// Bypass touch gesture recognition inside `bounds`, delivering presses on
+    /// pointer down. The region is platform-specific and lasts until replaced.
+    pub fn set_direct_touch_region(&mut self, bounds: Option<Bounds<Pixels>>) {
+        self.platform_window.set_direct_touch_region(bounds);
+    }
+
+    /// Returns whether the focused element is accepting text input.
+    pub fn has_input_handler(&self) -> bool {
+        self.rendered_frame
+            .input_handlers
+            .iter()
+            .any(Option::is_some)
+    }
+
     /// Blur the window and don't allow anything in it to be focused again.
     pub fn disable_focus(&mut self) {
         self.blur();

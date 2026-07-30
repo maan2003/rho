@@ -802,6 +802,11 @@ pub enum TextInputStateChange {
 
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    /// Routes touch contacts inside `bounds` as immediate mouse presses instead of
+    /// platform gestures. Intended for latency-sensitive, canvas-rendered controls
+    /// such as an on-screen keyboard. Platforms without touch may ignore this.
+    fn set_direct_touch_region(&mut self, _bounds: Option<Bounds<Pixels>>) {}
+
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
     fn window_bounds(&self) -> WindowBounds;

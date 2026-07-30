@@ -164,6 +164,7 @@ impl WebWindowInner {
         let mut handles = vec![
             self.register_pointer_down(),
             self.register_pointer_up(),
+            self.register_pointer_cancel(),
             self.register_pointer_move(),
             self.register_pointer_leave(),
             self.register_wheel(),
@@ -263,6 +264,24 @@ impl WebWindowInner {
             // like catching a scrolling list with a finger.
             this.fling.borrow_mut().take();
 
+            if is_touch(&event)
+                && this
+                    .direct_touch_region
+                    .get()
+                    .is_some_and(|bounds| bounds.contains(&position))
+            {
+                this.direct_touches.borrow_mut().insert(event.pointer_id());
+                let click_count = this.click_state.borrow_mut().register_click(position, time);
+                this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers,
+                    click_count,
+                    first_mouse: false,
+                }));
+                return;
+            }
+
             // A touch gesture is undecided at this point: it may become a
             // scroll or a tap. Dispatching MouseDown now would start a text
             // selection drag, so the decision is deferred to pointermove
@@ -308,6 +327,16 @@ impl WebWindowInner {
             }
 
             if is_touch(&event) {
+                if this.direct_touches.borrow_mut().remove(&event.pointer_id()) {
+                    let click_count = this.click_state.borrow().current_count;
+                    this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count,
+                    }));
+                    return;
+                }
                 let Some(drag) = this.touch_drag.borrow_mut().take() else {
                     return;
                 };
@@ -348,12 +377,6 @@ impl WebWindowInner {
                     modifiers,
                     click_count,
                 }));
-                // The click above installs an input handler only during the
-                // next draw, so the gesture-time raise below sees stale
-                // state on a first tap. The RAF tick re-checks once after
-                // that draw; browsers keep the user activation alive long
-                // enough for focus() to still raise the keyboard there.
-                this.raise_keyboard_after_draw.set(true);
             } else {
                 this.pressed_button.set(None);
                 let click_count = this.click_state.borrow().current_count;
@@ -365,16 +388,22 @@ impl WebWindowInner {
                     click_count,
                 }));
             }
+        })
+    }
 
-            // Raise the touch keyboard here, not when the input handler is
-            // installed: iOS only honors a keyboard-raising focus() inside a
-            // trusted user gesture, and handler installation happens during
-            // the RAF draw. By pointerup the draw triggered by pointerdown's
-            // focus change has settled whether a text view holds the
-            // handler, and pointerup is still a gesture. Dismissal happens
-            // on the RAF tick, which needs no gesture.
-            if this.state.borrow().input_handler.is_some() && !this.keyboard_input_focused() {
-                this.keyboard_input_element.focus().ok();
+    fn register_pointer_cancel(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen("pointercancel", move |event: JsValue| {
+            let event: web_sys::PointerEvent = event.unchecked_into();
+            if this.direct_touches.borrow_mut().remove(&event.pointer_id()) {
+                let position = pointer_position_in_element(&event);
+                let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+                this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers,
+                    click_count: this.click_state.borrow().current_count,
+                }));
             }
         })
     }
@@ -399,6 +428,9 @@ impl WebWindowInner {
             // is suppressed entirely: a finger has no hover state, and
             // synthetic hover would flash hover styles mid-scroll.
             if is_touch(&event) {
+                if this.direct_touches.borrow().contains(&event.pointer_id()) {
+                    return;
+                }
                 let scroll = {
                     let mut drag_slot = this.touch_drag.borrow_mut();
                     let Some(drag) = drag_slot.as_mut() else {
@@ -407,10 +439,7 @@ impl WebWindowInner {
                     let time = js_sys::Date::now();
                     let delta = point(position.x - drag.last.x, position.y - drag.last.y);
                     let elapsed = (time - drag.last_time).max(1.0) as f32;
-                    let instant = (
-                        f32::from(delta.x) / elapsed,
-                        f32::from(delta.y) / elapsed,
-                    );
+                    let instant = (f32::from(delta.x) / elapsed, f32::from(delta.y) / elapsed);
                     // Weighted toward the newest sample so the fling picks up
                     // the release-time velocity, not the whole gesture's mean.
                     drag.velocity = (
