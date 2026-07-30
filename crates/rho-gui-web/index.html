@@ -21,9 +21,15 @@
       canvas { display: block; width: 100%; height: 100%; outline: none; }
     </style>
     <script>
-      // Keyboard haptics: Android exposes navigator.vibrate; iOS has no web
-      // vibration API, but toggling a switch-style checkbox produces the
-      // system haptic (WebKit's intended behavior for switches, iOS 17.4+).
+      // Keyboard haptics. Android exposes navigator.vibrate. iOS has no web
+      // vibration API; toggling a switch-style checkbox produces the system
+      // haptic, but iOS 26.5 patched *programmatic* clicks, so __rhoHaptic
+      // (called on key commit) only helps iOS 17.4-26.4. For later iOS the
+      // keyboard region gets an invisible real switch overlay: the finger's
+      // genuine tap toggles it (still haptic), and the overlay forwards
+      // cloned pointer events to the canvas so typing works unchanged. The
+      // clones shift pointerId so GPUI's pointer capture cannot steal the
+      // real pointer stream from the switch mid-tap.
       (function () {
         let toggle = null;
         function ensureToggle() {
@@ -45,6 +51,55 @@
             return;
           }
           try { ensureToggle().click(); } catch (_) {}
+        };
+
+        let overlay = null;
+        let lastTop = null;
+        function ensureOverlay() {
+          if (overlay) return overlay;
+          overlay = document.createElement("div");
+          overlay.style.cssText =
+            "position:fixed;left:0;right:0;bottom:0;display:none;z-index:10;" +
+            "touch-action:none;-webkit-tap-highlight-color:transparent;";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.setAttribute("switch", "");
+          input.setAttribute("aria-hidden", "true");
+          input.tabIndex = -1;
+          input.style.cssText =
+            "position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;";
+          overlay.appendChild(input);
+          const forward = (e) => {
+            const canvas = document.querySelector("canvas");
+            if (!canvas) return;
+            canvas.dispatchEvent(new PointerEvent(e.type, {
+              pointerId: e.pointerId + 10000,
+              pointerType: e.pointerType,
+              isPrimary: e.isPrimary,
+              clientX: e.clientX, clientY: e.clientY,
+              screenX: e.screenX, screenY: e.screenY,
+              button: e.button, buttons: e.buttons,
+              bubbles: false, cancelable: true,
+            }));
+          };
+          for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) {
+            overlay.addEventListener(type, forward);
+          }
+          document.body.appendChild(overlay);
+          return overlay;
+        }
+        window.__rhoHapticRegion = function (top) {
+          if (top === lastTop) return;
+          lastTop = top;
+          const el = ensureOverlay();
+          if (top == null || top < 0) {
+            el.style.display = "none";
+            return;
+          }
+          const canvas = document.querySelector("canvas");
+          const base = canvas ? canvas.getBoundingClientRect().top : 0;
+          el.style.top = base + top + "px";
+          el.style.display = "block";
         };
       })();
     </script>

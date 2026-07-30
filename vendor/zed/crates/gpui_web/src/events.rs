@@ -977,6 +977,20 @@ fn pointer_position_in_element(event: &web_sys::PointerEvent) -> Point<Pixels> {
 }
 
 fn mouse_position_in_element(event: &web_sys::MouseEvent) -> Point<Pixels> {
-    // offset_x/offset_y give position relative to the target element's padding edge
-    point(px(event.offset_x() as f32), px(event.offset_y() as f32))
+    // Derive the position from client coordinates and the target's rect instead
+    // of offset_x/offset_y: Chromium erroneously divides offset coordinates of
+    // untrusted (script-dispatched) events by the page zoom factor, which
+    // breaks pointer events forwarded by the haptic switch overlay.
+    if let Some(target) = event
+        .target()
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+    {
+        let rect = target.get_bounding_client_rect();
+        point(
+            px(event.client_x() as f32 - rect.left() as f32),
+            px(event.client_y() as f32 - rect.top() as f32),
+        )
+    } else {
+        point(px(event.offset_x() as f32), px(event.offset_y() as f32))
+    }
 }

@@ -2,7 +2,6 @@
 //! used by the native GPUI client. Transport remains direct iroh.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use futures::StreamExt as _;
 use gpui::prelude::*;
@@ -10,9 +9,7 @@ use gpui::{App, Context, Entity, Focusable as _, Render, Subscription, Task, Win
 use rho_registry::session::{
     AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
 };
-use rho_touch_keyboard::{
-    ContextChip, KeyboardPlugin, KeyboardStyle, TouchKeyboard, dump_telemetry,
-};
+use rho_touch_keyboard::{ContextChip, KeyboardPlugin, KeyboardStyle, TouchKeyboard};
 use rho_ui_proto::{AgentId, ClientMessage, MessageDelivery, ServerMessage};
 use theme::ActiveTheme as _;
 
@@ -26,10 +23,7 @@ struct RhoKeyboardPlugin;
 
 impl KeyboardPlugin for RhoKeyboardPlugin {
     fn context_chips(&self) -> Vec<ContextChip> {
-        vec![ContextChip {
-            label: "dump typing data".into(),
-            on_select: Rc::new(|_, _| dump_telemetry()),
-        }]
+        Vec::new()
     }
 
     fn style(&self, cx: &App) -> KeyboardStyle {
@@ -452,6 +446,11 @@ impl Render for Workspace {
         window.set_direct_touch_region(
             show_keyboard.then(|| TouchKeyboard::region(window.viewport_size(), bar_height)),
         );
+        set_haptic_region(if show_keyboard {
+            f32::from(window.viewport_size().height - bar_height - TouchKeyboard::height())
+        } else {
+            -1.
+        });
         // Percent heights do not survive the flex_1 wrapper here (the agent
         // screen collapsed to its header), so the phone transcript gets
         // explicit pixel heights derived from the viewport.
@@ -681,6 +680,23 @@ impl Render for Workspace {
 
 pub fn now_ms() -> u64 {
     js_sys::Date::now() as u64
+}
+
+/// Moves the index.html haptic switch overlay over the keyboard (negative
+/// hides it). iOS 26.5 blocks scripted switch clicks, so key haptics come
+/// from the finger's genuine tap toggling an invisible switch there; the
+/// overlay forwards cloned pointer events to the canvas.
+fn set_haptic_region(top: f32) {
+    use wasm_bindgen::JsCast as _;
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let window: &wasm_bindgen::JsValue = window.as_ref();
+    if let Ok(hook) = js_sys::Reflect::get(window, &"__rhoHapticRegion".into())
+        && let Some(hook) = hook.dyn_ref::<js_sys::Function>()
+    {
+        let _ = hook.call1(&wasm_bindgen::JsValue::NULL, &top.into());
+    }
 }
 
 /// Endpoint ids are 64 hex chars; unbroken they defeat text wrapping, so the

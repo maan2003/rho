@@ -150,7 +150,7 @@ fn layout_rows(width: f32) -> [Vec<(Key, f32, f32)>; 5] {
     shift_row.push((Key::Backspace, width - H_GAP - edge_width, edge_width));
 
     let side_width = 1.35 * unit;
-    let return_width = 2.8 * unit;
+    let return_width = 2.4 * unit;
     let space_width = width - 5. * H_GAP - 2. * side_width - return_width;
     let mut x = H_GAP;
     let mut bottom_row = Vec::new();
