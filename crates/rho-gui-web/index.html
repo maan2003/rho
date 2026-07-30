@@ -2,14 +2,52 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#111318" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Rho</title>
     <link data-trunk rel="rust" data-bin="rho-gui-web" data-bindgen-target="web" data-wasm-opt="0" />
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
       html, body { height: 100%; background: #111318; }
+      /* In PWA mode the page extends under the status bar, rounded corners,
+         and home indicator; padding the body by the safe-area insets keeps
+         the canvas clear of them while the body background fills the rest. */
+      body {
+        padding: env(safe-area-inset-top) env(safe-area-inset-right)
+                 env(safe-area-inset-bottom) env(safe-area-inset-left);
+      }
       canvas { display: block; width: 100%; height: 100%; outline: none; }
     </style>
+    <script>
+      // Keyboard haptics: Android exposes navigator.vibrate; iOS has no web
+      // vibration API, but toggling a switch-style checkbox produces the
+      // system haptic (WebKit's intended behavior for switches, iOS 17.4+).
+      (function () {
+        let toggle = null;
+        function ensureToggle() {
+          if (toggle) return toggle;
+          const label = document.createElement("label");
+          label.style.cssText =
+            "position:fixed;top:0;left:0;width:0;height:0;overflow:hidden;opacity:0;pointer-events:none";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.setAttribute("switch", "");
+          label.appendChild(input);
+          document.body.appendChild(label);
+          toggle = label;
+          return toggle;
+        }
+        window.__rhoHaptic = function () {
+          if (navigator.vibrate) {
+            navigator.vibrate(8);
+            return;
+          }
+          try { ensureToggle().click(); } catch (_) {}
+        };
+      })();
+    </script>
   </head>
   <body></body>
 </html>

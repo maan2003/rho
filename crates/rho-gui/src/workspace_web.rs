@@ -11,7 +11,7 @@ use rho_registry::session::{
     AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
 };
 use rho_touch_keyboard::{
-    ContextChip, KeyboardEvent, KeyboardPlugin, KeyboardStyle, TouchKeyboard, dump_telemetry,
+    ContextChip, KeyboardPlugin, KeyboardStyle, TouchKeyboard, dump_telemetry,
 };
 use rho_ui_proto::{AgentId, ClientMessage, MessageDelivery, ServerMessage};
 use theme::ActiveTheme as _;
@@ -71,13 +71,12 @@ pub struct Workspace {
     agent_screen: bool,
     touch_keyboard: Entity<TouchKeyboard>,
     /// The keyboard appears only on explicit intent to type: a tap that
-    /// lands in the transcript's editable prompt. It hides on a tap in the
-    /// read-only transcript, on the keyboard's own hide key, and after
-    /// sending a message.
+    /// lands in the transcript's editable prompt, or the action bar's
+    /// keyboard toggle. It hides on a tap in the read-only transcript, the
+    /// toggle again, and after sending a message.
     keyboard_visible: bool,
     _event_task: Task<()>,
     _dashboard_subscription: Subscription,
-    _keyboard_subscription: Subscription,
     _transcript_subscription: Option<Subscription>,
 }
 
@@ -112,15 +111,6 @@ impl Workspace {
             },
         );
         let touch_keyboard = cx.new(|_| TouchKeyboard::new(RhoKeyboardPlugin));
-        let keyboard_subscription =
-            cx.subscribe(&touch_keyboard, |this, _, event: &KeyboardEvent, cx| {
-                match event {
-                    KeyboardEvent::Dismissed => {
-                        this.keyboard_visible = false;
-                        cx.notify();
-                    }
-                }
-            });
         Self {
             connection,
             phase,
@@ -137,7 +127,6 @@ impl Workspace {
             keyboard_visible: false,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
-            _keyboard_subscription: keyboard_subscription,
             _transcript_subscription: None,
         }
     }
@@ -454,9 +443,14 @@ impl Render for Workspace {
             colors.text_muted,
         );
         let narrow = window.viewport_size().width < px(700.);
-        let show_keyboard = coarse_pointer() && narrow && self.agent_screen && self.keyboard_visible;
+        // The phone gets a persistent action bar along the very bottom: it
+        // hosts quick actions and doubles as clearance for the iPhone's
+        // rounded corners and home indicator in PWA mode.
+        let phone = coarse_pointer() && narrow;
+        let bar_height = px(40.);
+        let show_keyboard = phone && self.agent_screen && self.keyboard_visible;
         window.set_direct_touch_region(
-            show_keyboard.then(|| TouchKeyboard::region(window.viewport_size())),
+            show_keyboard.then(|| TouchKeyboard::region(window.viewport_size(), bar_height)),
         );
         // Percent heights do not survive the flex_1 wrapper here (the agent
         // screen collapsed to its header), so the phone transcript gets
@@ -464,6 +458,7 @@ impl Render for Workspace {
         let header_height = px(34.);
         let content_height = window.viewport_size().height
             - px(4.)
+            - if phone { bar_height } else { px(0.) }
             - if show_keyboard {
                 TouchKeyboard::height()
             } else {
@@ -621,6 +616,56 @@ impl Render for Workspace {
                 div().flex_1().overflow_hidden().child(body),
             )
             .children(show_keyboard.then(|| self.touch_keyboard.clone().into_any_element()))
+            .children(phone.then(|| {
+                let mut bar = div()
+                    .flex_none()
+                    .h(bar_height)
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_1()
+                    .border_t_1()
+                    .border_color(card_border);
+                if self.agent_screen {
+                    bar = bar
+                        .child(
+                            div()
+                                .id("kbd-toggle")
+                                .cursor_pointer()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .px_4()
+                                .text_color(text_muted)
+                                .child(if self.keyboard_visible { "⌄" } else { "⌨" })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.keyboard_visible = !this.keyboard_visible;
+                                    if this.keyboard_visible
+                                        && let Some((_, editor)) = this.transcript.clone()
+                                    {
+                                        window.focus(&editor.read(cx).focus_handle(cx), cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("send-prompt")
+                                .cursor_pointer()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .px_4()
+                                .text_color(text_muted)
+                                .child("send")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_prompt(&crate::SubmitPrompt, window, cx);
+                                })),
+                        );
+                }
+                bar
+            }))
             .children(overlay)
     }
 }
