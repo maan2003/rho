@@ -5093,7 +5093,15 @@ impl Window {
             }
         }
 
-        self.rendered_frame.mouse_listeners = mouse_listeners;
+        // A listener may trigger a synchronous draw (for example dispatching a
+        // keystroke, which draws when the window is dirty), replacing
+        // `rendered_frame` and installing that frame's own listeners. The
+        // listeners taken above then belong to the replaced frame and capture
+        // its stale hitbox ids; restoring them would clobber the fresh ones
+        // and swallow mouse events until the next redraw.
+        if self.rendered_frame.mouse_listeners.is_empty() {
+            self.rendered_frame.mouse_listeners = mouse_listeners;
+        }
 
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {

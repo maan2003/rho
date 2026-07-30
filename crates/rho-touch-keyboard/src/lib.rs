@@ -107,6 +107,10 @@ impl TouchKeyboard {
         )
     }
 
+    /// Updates keyboard state for a key press and returns the keystroke to
+    /// dispatch. Callers must dispatch it after this entity update ends:
+    /// `dispatch_keystroke` runs arbitrary app code (input handlers,
+    /// subscriptions, draws) that may re-enter this entity.
     fn commit(
         &mut self,
         key: Key,
@@ -114,7 +118,7 @@ impl TouchKeyboard {
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<TouchKeyboard>,
-    ) {
+    ) -> Option<Keystroke> {
         let now = js_sys::Date::now();
         match key {
             Key::Shift => {
@@ -136,7 +140,7 @@ impl TouchKeyboard {
                 );
                 self.last_key = Some("shift".into());
                 cx.notify();
-                return;
+                return None;
             }
             Key::Dismiss => {
                 self.record(
@@ -149,7 +153,7 @@ impl TouchKeyboard {
                 self.last_key = Some("dismiss".into());
                 window.blur();
                 cx.notify();
-                return;
+                return None;
             }
             Key::Reserved => {
                 self.record(
@@ -160,7 +164,7 @@ impl TouchKeyboard {
                     false,
                 );
                 self.last_key = Some("reserved".into());
-                return;
+                return None;
             }
             _ => {}
         }
@@ -179,9 +183,6 @@ impl TouchKeyboard {
             Key::Space => ("space".into(), "space".into()),
             _ => unreachable!(),
         };
-        if let Ok(keystroke) = Keystroke::parse(&stroke) {
-            window.dispatch_keystroke(keystroke, cx);
-        }
         self.record(
             telemetry_key.clone(),
             f32::from(event.position.x - center.x),
@@ -194,6 +195,7 @@ impl TouchKeyboard {
             self.shift = Shift::Off;
             cx.notify();
         }
+        Keystroke::parse(&stroke).ok()
     }
 
     fn record(&mut self, key: String, dx: f32, dy: f32, now: f64, backspace_after_key: bool) {
@@ -240,17 +242,20 @@ impl TouchKeyboard {
         self._repeat = Some(cx.spawn_in(window, async move |_, cx| {
             executor.timer(Duration::from_millis(420)).await;
             loop {
-                let keep_going = owner
+                let step = owner
                     .update_in(cx, |keyboard, window, cx| {
                         if keyboard.repeat_generation != generation {
-                            return false;
+                            return None;
                         }
-                        keyboard.commit(Key::Backspace, center, &event, window, cx);
-                        true
+                        Some(keyboard.commit(Key::Backspace, center, &event, window, cx))
                     })
-                    .unwrap_or(false);
-                if !keep_going {
-                    break;
+                    .ok()
+                    .flatten();
+                let Some(keystroke) = step else { break };
+                if let Some(keystroke) = keystroke {
+                    let _ = cx.update(|window, cx| {
+                        window.dispatch_keystroke(keystroke, cx);
+                    });
                 }
                 executor.timer(Duration::from_millis(65)).await;
             }
@@ -340,7 +345,7 @@ impl TouchKeyboard {
             let unit = available / total_weight;
             let mut x = 3.;
             let mut row_div = div().h(px(ROW_HEIGHT)).w_full().flex().gap(px(GAP));
-            for (key, weight) in row {
+            for (key_index, (key, weight)) in row.into_iter().enumerate() {
                 let key_width = unit * weight;
                 let center = point(
                     px(x + key_width / 2.),
@@ -353,6 +358,7 @@ impl TouchKeyboard {
                 x += key_width + GAP;
                 row_div = row_div.child(self.render_key(
                     key,
+                    row_index * 16 + key_index,
                     key_width,
                     center,
                     cx.entity().downgrade(),
@@ -367,6 +373,7 @@ impl TouchKeyboard {
     fn render_key(
         &self,
         key: Key,
+        key_ordinal: usize,
         width: f32,
         center: Point<Pixels>,
         owner: WeakEntity<TouchKeyboard>,
@@ -387,7 +394,7 @@ impl TouchKeyboard {
         let repeat_owner_on_down = repeat_owner.clone();
         let repeat_owner_out = repeat_owner.clone();
         div()
-            .id(("touch-key", f32::from(center.x).to_bits() as usize))
+            .id(("touch-key", key_ordinal))
             .w(px(width))
             .h(px(ROW_HEIGHT))
             .flex()
@@ -406,18 +413,25 @@ impl TouchKeyboard {
             .child(label)
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                 cx.stop_propagation();
-                let _ = owner.update(cx, |keyboard, cx| {
-                    keyboard.commit(key, center, event, window, cx);
-                    if matches!(key, Key::Backspace) {
-                        keyboard.start_repeat(
-                            repeat_owner_on_down.clone(),
-                            center,
-                            event.clone(),
-                            window,
-                            cx,
-                        );
-                    }
-                });
+                let keystroke = owner
+                    .update(cx, |keyboard, cx| {
+                        let keystroke = keyboard.commit(key, center, event, window, cx);
+                        if matches!(key, Key::Backspace) {
+                            keyboard.start_repeat(
+                                repeat_owner_on_down.clone(),
+                                center,
+                                event.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                        keystroke
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(keystroke) = keystroke {
+                    window.dispatch_keystroke(keystroke, cx);
+                }
             })
             .on_mouse_up(MouseButton::Left, move |_, _, cx| {
                 let _ = repeat_owner.update(cx, |keyboard, _| keyboard.stop_repeat());
