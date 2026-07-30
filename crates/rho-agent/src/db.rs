@@ -115,12 +115,16 @@ impl AgentUsageModel {
     pub const GPT: Self = Self(1);
     pub const FABLE: Self = Self(2);
     pub const OPUS: Self = Self(3);
+    pub const TERRA: Self = Self(4);
+    pub const LUNA: Self = Self(5);
 
     pub fn name(self) -> &'static str {
         match self {
             Self::GPT => "gpt",
             Self::FABLE => "fable",
             Self::OPUS => "opus",
+            Self::TERRA => "terra",
+            Self::LUNA => "luna",
             _ => "unknown",
         }
     }
@@ -179,7 +183,11 @@ impl AgentUsageBucket {
 
 fn usage_model(record: &AgentRecord) -> AgentUsageModel {
     match record.runtime {
-        AgentRuntime::Rho { .. } => AgentUsageModel::GPT,
+        AgentRuntime::Rho { .. } => match record.binding.deep_model() {
+            Some(InferenceModel::Gpt56Terra) => AgentUsageModel::TERRA,
+            Some(InferenceModel::Gpt56Luna) => AgentUsageModel::LUNA,
+            _ => AgentUsageModel::GPT,
+        },
         AgentRuntime::Claude { .. } => match record.binding.claude_model() {
             Some(rho_claude::Model::Opus) => AgentUsageModel::OPUS,
             Some(rho_claude::Model::Fable | rho_claude::Model::Sonnet) | None => {
@@ -425,6 +433,13 @@ impl AgentRoleSessionProfile for AgentRole {
                 ..
             } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low)),
             AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Cheap,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Cheap,
+                ..
+            } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::High)),
+            AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Medium,
             } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
             AgentRole::WorkflowEngineer {
@@ -508,6 +523,9 @@ impl SessionBinding {
             }
             Self::ResponsesTerra(config) if config.effort == ReasoningEffort::Low => {
                 EngineerIntelligence::Low
+            }
+            Self::ResponsesTerra(config) if config.effort == ReasoningEffort::High => {
+                EngineerIntelligence::Cheap
             }
             Self::ResponsesGpt55(config)
             | Self::ResponsesSol(config)
@@ -959,7 +977,7 @@ impl AgentReadTxnExt for ReadTxn {
                     model: AgentUsageModel::GPT,
                 }..=GlobalAgentUsageKey {
                     bucket_start_ms: u64::MAX,
-                    model: AgentUsageModel::OPUS,
+                    model: AgentUsageModel::LUNA,
                 },
             )
             .map(|(key, value)| (key.value().model, value.value().into_owned()))

@@ -34,8 +34,8 @@ enum DebugCommand {
     Context,
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
-        /// Role text: eng, eng-mini, eng-low, eng-high, eng-ultra, eng-alt, pm,
-        /// advisor, or advisor-high.
+        /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra,
+        /// eng-alt, pm, advisor, or advisor-high.
         role: String,
     },
 }
@@ -103,6 +103,9 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
         "eng-low" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
         },
+        "eng-cheap" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
+        },
         "eng-high" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
         },
@@ -120,7 +123,7 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
             intelligence: AdvisorIntelligence::High,
         },
         _ => anyhow::bail!(
-            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-high, eng-ultra, eng-alt, pm, advisor, or advisor-high"
+            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, pm, advisor, or advisor-high"
         ),
     })
 }
@@ -363,6 +366,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
             let intelligence = match intelligence {
                 EngineerIntelligence::Mini => "mini",
                 EngineerIntelligence::Low => "low",
+                EngineerIntelligence::Cheap => "cheap",
                 EngineerIntelligence::Medium => "medium",
                 EngineerIntelligence::High => "high",
                 EngineerIntelligence::Ultra => "ultra",

@@ -1342,16 +1342,18 @@ impl Workspace {
             AgentRole::Engineer {
                 intelligence:
                     EngineerIntelligence::Low
+                    | EngineerIntelligence::Cheap
                     | EngineerIntelligence::Medium
                     | EngineerIntelligence::High,
             }
             | AgentRole::WorkflowEngineer {
                 intelligence:
                     EngineerIntelligence::Low
+                    | EngineerIntelligence::Cheap
                     | EngineerIntelligence::Medium
                     | EngineerIntelligence::High,
                 ..
-            } => &["eng-low", "eng", "eng-high"],
+            } => &["eng-low", "eng-cheap", "eng", "eng-high"],
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
             }
@@ -1387,6 +1389,7 @@ impl Workspace {
              cx: &mut Context<Workspace>| {
                 let intelligence = match input.trim().to_ascii_lowercase().as_str() {
                     "eng-low" => Some(EngineerIntelligence::Low),
+                    "eng-cheap" => Some(EngineerIntelligence::Cheap),
                     "eng" => Some(EngineerIntelligence::Medium),
                     "eng-high" => Some(EngineerIntelligence::High),
                     "eng-ultra" => Some(EngineerIntelligence::Ultra),
@@ -4366,6 +4369,9 @@ fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
         "eng-low" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
         }),
+        "eng-cheap" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
+        }),
         "eng-high" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
         }),
@@ -4377,7 +4383,7 @@ fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
         }),
         "pm" => Ok(AgentRole::pm()),
         other => Err(format!(
-            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-high, eng-ultra, eng-alt, or pm"
+            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, or pm"
         )),
     }
 }
@@ -4398,6 +4404,14 @@ fn cycle_agent_role_text(current: &str) -> &'static str {
         }
         | AgentRole::WorkflowEngineer {
             intelligence: EngineerIntelligence::Low,
+            ..
+        } => "eng-cheap",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
+            ..
+        }
+        | AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Cheap,
             ..
         } => "eng",
         AgentRole::Engineer {
@@ -4470,6 +4484,7 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
                 text: match intelligence {
                     EngineerIntelligence::Mini => "eng-mini",
                     EngineerIntelligence::Low => "eng-low",
+                    EngineerIntelligence::Cheap => "eng-cheap",
                     EngineerIntelligence::Medium => "eng",
                     EngineerIntelligence::High => "eng-high",
                     EngineerIntelligence::Ultra => "eng-ultra",

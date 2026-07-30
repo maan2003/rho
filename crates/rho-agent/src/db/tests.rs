@@ -84,6 +84,46 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
             ..first.clone()
         },
     );
+    let terra_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        terra_id,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesTerra(InferenceProfile::default()),
+        AgentRuntime::Rho {
+            prompt_cache_key: PromptCacheKey::generate(),
+        },
+        None,
+    );
+    write.add_agent_usage(
+        terra_id,
+        &AgentUsageBucket {
+            model: AgentUsageModel::UNKNOWN,
+            ..first.clone()
+        },
+    );
+    let luna_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        luna_id,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesLuna(InferenceProfile::default()),
+        AgentRuntime::Rho {
+            prompt_cache_key: PromptCacheKey::generate(),
+        },
+        None,
+    );
+    write.add_agent_usage(
+        luna_id,
+        &AgentUsageBucket {
+            model: AgentUsageModel::UNKNOWN,
+            ..first.clone()
+        },
+    );
     write.commit();
 
     let read = db.read();
@@ -93,13 +133,15 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     assert_eq!(buckets[0].requests, 2);
     assert_eq!(read.agent_usage_total(agent_id).output_tokens, 80);
     let global = read.global_agent_usage(UnixMs(0));
-    assert_eq!(global.len(), 3);
+    assert_eq!(global.len(), 5);
     assert_eq!(global[0].0, AgentUsageModel::GPT);
     assert_eq!(global[0].1.output_tokens, 80);
     assert_eq!(global[1].0, AgentUsageModel::FABLE);
     assert_eq!(global[1].1.output_tokens, 40);
     assert_eq!(global[2].0, AgentUsageModel::OPUS);
     assert_eq!(global[2].1.output_tokens, 40);
+    assert_eq!(global[3].0, AgentUsageModel::TERRA);
+    assert_eq!(global[4].0, AgentUsageModel::LUNA);
 }
 
 #[tokio::test]
@@ -202,6 +244,14 @@ fn agent_role_resolves_opinionated_bindings() {
         })
     ));
     assert!(matches!(
+        profile(EngineerIntelligence::Cheap),
+        SessionBinding::ResponsesTerra(InferenceProfile {
+            effort: ReasoningEffort::High,
+            code_mode: true,
+            ..
+        })
+    ));
+    assert!(matches!(
         profile(EngineerIntelligence::Medium),
         SessionBinding::ResponsesSol(InferenceProfile {
             effort: ReasoningEffort::Medium,
@@ -229,6 +279,7 @@ fn agent_role_resolves_opinionated_bindings() {
     ));
     for intelligence in [
         EngineerIntelligence::Low,
+        EngineerIntelligence::Cheap,
         EngineerIntelligence::Medium,
         EngineerIntelligence::High,
     ] {

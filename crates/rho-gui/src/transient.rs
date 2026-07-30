@@ -225,13 +225,16 @@ impl Transient {
             let gpt: Hsla = colors.terminal_ansi_cyan.into();
             let opus: Hsla = colors.terminal_ansi_magenta.into();
             let fable: Hsla = rgb(0xd97757).into();
+            let terra: Hsla = colors.terminal_ansi_yellow.into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
             let now = crate::workspace::now_ms();
             let since = now.saturating_sub(days * 24 * 60 * 60 * 1_000);
             let gpt_cost = model_cost(&series, "gpt", since);
+            let luna_cost = model_cost(&series, "luna", since);
             let opus_cost = model_cost(&series, "opus", since);
             let fable_cost = model_cost(&series, "fable", since);
-            let total_cost = gpt_cost + opus_cost + fable_cost;
+            let terra_cost = model_cost(&series, "terra", since);
+            let total_cost = gpt_cost + luna_cost + opus_cost + fable_cost + terra_cost;
             let requests = series
                 .iter()
                 .flat_map(|series| &series.buckets)
@@ -273,7 +276,13 @@ impl Transient {
                                 .text_color(opus)
                                 .child(format!("opus ${opus_cost:.2}")),
                         )
-                        .child(div().text_color(gpt).child(format!("gpt ${gpt_cost:.2}"))),
+                        .child(div().text_color(gpt).child(format!("gpt ${gpt_cost:.2}")))
+                        .child(div().text_color(gpt).child(format!("luna ${luna_cost:.2}")))
+                        .child(
+                            div()
+                                .text_color(terra)
+                                .child(format!("terra ${terra_cost:.2}")),
+                        ),
                 )
                 .child(
                     div().px_2().pb_1().child(
@@ -300,7 +309,7 @@ impl Transient {
                                     .flex()
                                     .flex_col()
                                     .child(div().w(px(832.)).h(px(220.)).child(global_usage_chart(
-                                        series, now, days, gpt, opus, fable, grid,
+                                        series, now, days, gpt, opus, fable, terra, grid,
                                     )))
                                     .child(
                                         div()
@@ -680,6 +689,7 @@ fn pchip_endpoint(width: f64, adjacent_width: f64, secant: f64, adjacent: f64) -
     slope
 }
 
+#[expect(clippy::too_many_arguments)]
 fn global_usage_chart(
     series: Vec<rho_ui_proto::AgentUsageSeries>,
     now: u64,
@@ -687,6 +697,7 @@ fn global_usage_chart(
     gpt: Hsla,
     opus: Hsla,
     fable: Hsla,
+    terra: Hsla,
     grid: Hsla,
 ) -> impl IntoElement {
     canvas(
@@ -696,7 +707,7 @@ fn global_usage_chart(
             const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
             let window_ms = days * DAY_MS;
             let start = now.saturating_sub(window_ms);
-            let mut costs = HashMap::<u64, [f64; 3]>::new();
+            let mut costs = HashMap::<u64, [f64; 4]>::new();
             for model in &series {
                 for bucket in &model.buckets {
                     if bucket.bucket_start_ms < start {
@@ -706,8 +717,10 @@ fn global_usage_chart(
                     let cost = bucket_cost_usd(bucket, &model.model);
                     let index = match model.model.as_str() {
                         "fable" => 0,
-                        "opus" => 1,
-                        _ => 2,
+                        "gpt" | "luna" => 1,
+                        "opus" => 2,
+                        "terra" => 3,
+                        _ => continue,
                     };
                     entry[index] += cost;
                 }
@@ -727,26 +740,35 @@ fn global_usage_chart(
                 )
             };
             let mut fable_total = 0.0;
-            let mut opus_total = 0.0;
             let mut gpt_total = 0.0;
-            let mut points = vec![[to_point(start, 0.0); 3]];
+            let mut opus_total = 0.0;
+            let mut terra_total = 0.0;
+            let mut points = vec![[to_point(start, 0.0); 4]];
             let mut bucket_start = start.div_ceil(BUCKET_MS) * BUCKET_MS;
             while bucket_start <= now {
                 points.push([
                     to_point(bucket_start, fable_total),
-                    to_point(bucket_start, fable_total + opus_total),
-                    to_point(bucket_start, fable_total + opus_total + gpt_total),
+                    to_point(bucket_start, fable_total + gpt_total),
+                    to_point(bucket_start, fable_total + gpt_total + opus_total),
+                    to_point(
+                        bucket_start,
+                        fable_total + gpt_total + opus_total + terra_total,
+                    ),
                 ]);
-                if let Some([fable_cost, opus_cost, gpt_cost]) = costs.get(&bucket_start) {
+                if let Some([fable_cost, gpt_cost, opus_cost, terra_cost]) =
+                    costs.get(&bucket_start)
+                {
                     fable_total += fable_cost;
-                    opus_total += opus_cost;
                     gpt_total += gpt_cost;
+                    opus_total += opus_cost;
+                    terra_total += terra_cost;
                 }
                 let end = bucket_start.saturating_add(BUCKET_MS).min(now);
                 points.push([
                     to_point(end, fable_total),
-                    to_point(end, fable_total + opus_total),
-                    to_point(end, fable_total + opus_total + gpt_total),
+                    to_point(end, fable_total + gpt_total),
+                    to_point(end, fable_total + gpt_total + opus_total),
+                    to_point(end, fable_total + gpt_total + opus_total + terra_total),
                 ]);
                 bucket_start = bucket_start.saturating_add(BUCKET_MS);
             }
@@ -762,34 +784,49 @@ fn global_usage_chart(
                 window.paint_path(path, fable.opacity(0.72));
             }
 
-            let mut opus_area = PathBuilder::fill();
+            let mut gpt_area = PathBuilder::fill();
             if let Some(first) = points.first() {
-                opus_area.move_to(first[1]);
+                gpt_area.move_to(first[1]);
             }
             for points in &points[1..] {
-                opus_area.line_to(points[1]);
+                gpt_area.line_to(points[1]);
             }
             for points in points.iter().rev() {
-                opus_area.line_to(points[0]);
+                gpt_area.line_to(points[0]);
+            }
+            gpt_area.close();
+            if let Ok(path) = gpt_area.build() {
+                window.paint_path(path, gpt.opacity(0.72));
+            }
+
+            let mut opus_area = PathBuilder::fill();
+            if let Some(first) = points.first() {
+                opus_area.move_to(first[2]);
+            }
+            for points in &points[1..] {
+                opus_area.line_to(points[2]);
+            }
+            for points in points.iter().rev() {
+                opus_area.line_to(points[1]);
             }
             opus_area.close();
             if let Ok(path) = opus_area.build() {
                 window.paint_path(path, opus.opacity(0.72));
             }
 
-            let mut gpt_area = PathBuilder::fill();
+            let mut terra_area = PathBuilder::fill();
             if let Some(first) = points.first() {
-                gpt_area.move_to(first[2]);
+                terra_area.move_to(first[3]);
             }
             for points in &points[1..] {
-                gpt_area.line_to(points[2]);
+                terra_area.line_to(points[3]);
             }
             for points in points.iter().rev() {
-                gpt_area.line_to(points[1]);
+                terra_area.line_to(points[2]);
             }
-            gpt_area.close();
-            if let Ok(path) = gpt_area.build() {
-                window.paint_path(path, gpt.opacity(0.72));
+            terra_area.close();
+            if let Ok(path) = terra_area.build() {
+                window.paint_path(path, terra.opacity(0.72));
             }
 
             for step in 0..=4 {
@@ -844,6 +881,8 @@ pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &s
     let (input, cache_read, cache_write_5m, cache_write_1h, output) = match model {
         "fable" => (10.0, 1.0, 12.5, 20.0, 50.0),
         "opus" => (5.0, 0.5, 6.25, 10.0, 25.0),
+        "terra" => (2.5, 0.25, 3.125, 3.125, 15.0),
+        "luna" => (1.0, 0.1, 1.25, 1.25, 6.0),
         _ => (5.0, 0.5, 6.25, 6.25, 30.0),
     };
     let cache_write_5m_tokens = bucket
@@ -1025,6 +1064,8 @@ mod tests {
         assert_eq!(bucket_cost_usd(&usage, "fable"), 81.0);
         assert_eq!(bucket_cost_usd(&usage, "opus"), 40.5);
         assert_eq!(bucket_cost_usd(&usage, "gpt"), 41.75);
+        assert_eq!(bucket_cost_usd(&usage, "terra"), 20.875);
+        assert_eq!(bucket_cost_usd(&usage, "luna"), 8.35);
     }
 
     #[test]

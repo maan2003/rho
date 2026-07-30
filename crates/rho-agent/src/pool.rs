@@ -718,6 +718,18 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
     match (parent, child) {
         (
             AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Alt,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Alt,
+                ..
+            },
+            AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. },
+        ) => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
+        },
+        (
+            AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
             }
             | AgentRole::WorkflowEngineer {
@@ -998,6 +1010,33 @@ mod tests {
             AgentRole::Advisor {
                 intelligence: crate::db::AdvisorIntelligence::Medium,
             }
+        );
+    }
+
+    #[test]
+    fn alt_engineers_spawn_cheap_engineers() {
+        let cheap = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
+        };
+
+        assert_eq!(
+            child_role(
+                AgentRole::Engineer {
+                    intelligence: EngineerIntelligence::Alt,
+                },
+                AgentRole::default(),
+            ),
+            cheap
+        );
+        assert_eq!(
+            child_role(
+                AgentRole::WorkflowEngineer {
+                    intelligence: EngineerIntelligence::Alt,
+                    workflow: AgentWorkflow::PrFriendly,
+                },
+                AgentRole::default(),
+            ),
+            cheap
         );
     }
 }

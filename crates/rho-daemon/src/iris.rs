@@ -546,6 +546,9 @@ fn parse_role(role: &str) -> anyhow::Result<AgentRole> {
         "eng-low" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
         },
+        "eng-cheap" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
+        },
         "eng" => AgentRole::default(),
         "eng-high" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,

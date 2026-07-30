@@ -782,6 +782,7 @@ fn role_label(role: AgentRole) -> &'static str {
         | AgentRole::WorkflowEngineer { intelligence, .. } => match intelligence {
             EngineerIntelligence::Mini => "eng-mini",
             EngineerIntelligence::Low => "eng-low",
+            EngineerIntelligence::Cheap => "eng-cheap",
             EngineerIntelligence::Medium => "eng",
             EngineerIntelligence::High => "eng-high",
             EngineerIntelligence::Ultra => "eng-ultra",
@@ -797,6 +798,9 @@ fn parse_role(role: &str) -> AgentRole {
         },
         "eng-low" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Low,
+        },
+        "eng-cheap" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
         },
         "eng-high" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
@@ -892,7 +896,7 @@ fn NewAgentPage(app: App) -> impl IntoView {
                     </section>
                     <section><h2>"Role"</h2><label>"Responsibility and intelligence"</label>
                         <select on:change=move |event| role.set(event_target_value(&event))>
-                            <option value="eng-mini">"Engineer · Mini"</option><option value="eng-low">"Engineer · Low"</option>
+                            <option value="eng-mini">"Engineer · Mini"</option><option value="eng-low">"Engineer · Low"</option><option value="eng-cheap">"Engineer · Cheap"</option>
                             <option value="eng" selected>"Engineer · Standard"</option><option value="eng-high">"Engineer · High"</option>
                             <option value="eng-ultra">"Engineer · Ultra"</option><option value="pm">"Project manager"</option>
                         </select>

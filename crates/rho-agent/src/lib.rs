@@ -755,7 +755,11 @@ impl Agent {
             kind: restored.kind,
             context_used: restored.context_used,
             total_usage,
-            usage_provider: db::AgentUsageModel::GPT,
+            usage_provider: match model {
+                db::InferenceModel::Gpt56Terra => db::AgentUsageModel::TERRA,
+                db::InferenceModel::Gpt56Luna => db::AgentUsageModel::LUNA,
+                _ => db::AgentUsageModel::GPT,
+            },
             quota_observation: None,
         }));
         let notify = Arc::new(Notify::new());
@@ -1234,10 +1238,11 @@ impl AgentLoop {
             matches!(
                 requested,
                 db::EngineerIntelligence::Low
+                    | db::EngineerIntelligence::Cheap
                     | db::EngineerIntelligence::Medium
                     | db::EngineerIntelligence::High
             ),
-            "this agent can switch only between eng-low, eng, and eng-high"
+            "this agent can switch only between eng-low, eng-cheap, eng, and eng-high"
         );
 
         let current = self
@@ -1250,6 +1255,7 @@ impl AgentLoop {
             db::AgentRole::Engineer {
                 intelligence:
                     db::EngineerIntelligence::Low
+                    | db::EngineerIntelligence::Cheap
                     | db::EngineerIntelligence::Medium
                     | db::EngineerIntelligence::High,
             } => db::AgentRole::Engineer {
@@ -1265,7 +1271,9 @@ impl AgentLoop {
                 intelligence: requested,
                 workflow,
             },
-            _ => anyhow::bail!("this agent can switch only between eng-low, eng, and eng-high"),
+            _ => anyhow::bail!(
+                "this agent can switch only between eng-low, eng-cheap, eng, and eng-high"
+            ),
         };
         if role == current {
             return Ok(());
