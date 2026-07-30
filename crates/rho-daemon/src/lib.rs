@@ -226,6 +226,18 @@ fn spawn_octo_server(
 /// [`rho_workspaces::init_daemon_namespace`]).
 pub use rho_workspaces::{PathOverrides, init_daemon_namespace};
 
+const EMBEDDED_DIRENV_PATH_BEFORE: Option<&str> = option_env!("RHO_DIRENV_PATH_BEFORE");
+
+/// Nix packages can embed a directory for direnv's post-`use_flake` PATH hook.
+/// This must run before the Tokio runtime starts, because mutating the process
+/// environment is not thread-safe.
+pub fn configure_embedded_environment() {
+    if let Some(path) = EMBEDDED_DIRENV_PATH_BEFORE {
+        // SAFETY: called by rho-daemon's main before it creates the Tokio runtime.
+        unsafe { std::env::set_var("RHO_DIRENV_PATH_BEFORE", path) };
+    }
+}
+
 #[derive(Clone, Debug, clap::Args)]
 pub struct DaemonArgs {
     #[arg(long = "auth", default_value = "default")]
@@ -297,6 +309,9 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         spawn_octo_server(&octo_socket_path, platform_secrets.clone())?;
     }
     let mut user_environment = login_environment()?;
+    if let Some(path) = EMBEDDED_DIRENV_PATH_BEFORE {
+        user_environment.push(("RHO_DIRENV_PATH_BEFORE".into(), path.into()));
+    }
     configure_octo_git_transport(&mut user_environment)?;
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 

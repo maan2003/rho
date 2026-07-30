@@ -48,6 +48,18 @@
             ./nix/patches/git-http-unix-socket.patch
           ];
         });
+        findutils = pkgs.rustPlatform.buildRustPackage {
+          pname = "findutils";
+          version = "0.9.2";
+          src = pkgs.fetchFromGitHub {
+            owner = "maan2003";
+            repo = "findutils";
+            rev = "57c86421be36752883eca182ac20ae6307e928ad";
+            hash = "sha256-knklzS+tjXlqMBDAtRIL7sC4BE6W6pdZukHmeumuga8=";
+          };
+          cargoHash = "sha256-40S4WBglCcoo+zS7qf/QzNkpTGRZo3W8hublOnKVxPc=";
+          doCheck = false;
+        };
         rustyV8Archives = {
           x86_64-linux = pkgs.fetchurl {
             url = "https://github.com/denoland/rusty_v8/releases/download/v149.4.0/librusty_v8_simdutf_release_x86_64-unknown-linux-gnu.a.gz";
@@ -369,6 +381,7 @@
               cargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo -p jj-cli";
               doCheck = false;
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
+              env.RHO_DIRENV_PATH_BEFORE = "${findutils}/bin";
               postInstall = ''
                 install -Dm755 target/release/jj $out/bin/jj
                 mkdir -p $out/share/rho/skills
@@ -442,7 +455,7 @@
           default = multiBuild.package;
           rho = multiBuild.package;
           workspace = multiBuild.workspace;
-          inherit webui;
+          inherit findutils webui;
         };
 
         ci = {
