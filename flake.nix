@@ -366,9 +366,11 @@
               # dependencies. The patched noq crates are dependencies of iroh,
               # so they must retain their implementations in the dummy source.
               extraDummyScript = ''
-                rm -rf $out/vendor/brush $out/vendor/noq
+                rm -rf $out/vendor/brush $out/vendor/noq $out/vendor/tree-sitter-language
                 cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/brush $out/vendor/brush
                 cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/noq $out/vendor/noq
+                cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/tree-sitter-language \
+                  $out/vendor/tree-sitter-language
               '';
             };
 
