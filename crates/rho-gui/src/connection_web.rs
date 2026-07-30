@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
-use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt as _;
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use hkdf::Hkdf;
 use iroh::EndpointId;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
@@ -50,7 +50,14 @@ impl Connection {
     pub fn new() -> (Self, UnboundedReceiver<Event>) {
         let (commands, receiver) = mpsc::unbounded();
         let (events, event_rx) = mpsc::unbounded();
-        (Self { commands, receiver: Rc::new(RefCell::new(Some(receiver))), events }, event_rx)
+        (
+            Self {
+                commands,
+                receiver: Rc::new(RefCell::new(Some(receiver))),
+                events,
+            },
+            event_rx,
+        )
     }
 
     pub fn send(&self, message: ClientMessage) {
@@ -58,7 +65,9 @@ impl Connection {
     }
 
     pub fn connect(&self, daemon: String) {
-        let Some(receiver) = self.receiver.borrow_mut().take() else { return };
+        let Some(receiver) = self.receiver.borrow_mut().take() else {
+            return;
+        };
         remember_daemon(&daemon);
         let events = self.events.clone();
         let _ = events.unbounded_send(Event::Phase(Phase::Connecting));
@@ -74,12 +83,19 @@ pub fn daemon_id_from_page() -> Option<String> {
     let window = web_sys::window()?;
     let storage = window.local_storage().ok()??;
     let location = window.location();
-    let daemon = [location.hash().ok().map(|s| (s, '#')), location.search().ok().map(|s| (s, '?'))]
-        .into_iter().flatten().find_map(|(part, prefix)| {
-            part.trim_start_matches(prefix).split('&')
-                .find_map(|pair| pair.strip_prefix("daemon="))
-                .filter(|daemon| !daemon.is_empty()).map(str::to_owned)
-        });
+    let daemon = [
+        location.hash().ok().map(|s| (s, '#')),
+        location.search().ok().map(|s| (s, '?')),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|(part, prefix)| {
+        part.trim_start_matches(prefix)
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("daemon="))
+            .filter(|daemon| !daemon.is_empty())
+            .map(str::to_owned)
+    });
     if let Some(daemon) = daemon {
         let _ = storage.set_item(DAEMON_KEY, &daemon);
         Some(daemon)
@@ -89,7 +105,9 @@ pub fn daemon_id_from_page() -> Option<String> {
 }
 
 fn remember_daemon(daemon: &str) {
-    if let Some(storage) = local_storage() { let _ = storage.set_item(DAEMON_KEY, daemon); }
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(DAEMON_KEY, daemon);
+    }
 }
 
 /// Progress breadcrumbs for the connect path; "Connecting…" is otherwise a
@@ -98,15 +116,24 @@ fn conn_log(message: &str) {
     web_sys::console::log_1(&JsValue::from_str(&format!("[rho-conn] {message}")));
 }
 
-async fn run(daemon: &str, mut receiver: UnboundedReceiver<ClientMessage>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
+async fn run(
+    daemon: &str,
+    mut receiver: UnboundedReceiver<ClientMessage>,
+    events: UnboundedSender<Event>,
+) -> anyhow::Result<()> {
     let daemon = EndpointId::from_str(daemon.trim())
         .map_err(|error| anyhow::anyhow!("invalid daemon endpoint id: {error}"))?;
     conn_log("unlocking passkey identity");
     let secret = passkey_secret(daemon).await?;
     conn_log("passkey identity ready; binding browser iroh endpoint");
     let endpoint = rho_rpc::bind_browser_iroh_client(secret).await?;
-    conn_log(&format!("endpoint bound as {}; dialing daemon", endpoint.id()));
-    let connection = endpoint.connect(daemon, rho_ui_proto::IROH_ALPN).await
+    conn_log(&format!(
+        "endpoint bound as {}; dialing daemon",
+        endpoint.id()
+    ));
+    let connection = endpoint
+        .connect(daemon, rho_ui_proto::IROH_ALPN)
+        .await
         .map_err(|error| anyhow::anyhow!("connect to daemon: {error}"))?;
     conn_log("iroh connection established; authenticating");
     match rho_rpc::authenticate_iroh_client(&connection, endpoint.id()).await? {
@@ -116,59 +143,99 @@ async fn run(daemon: &str, mut receiver: UnboundedReceiver<ClientMessage>, event
             let _ = events.unbounded_send(Event::Phase(Phase::Enroll(code.to_string())));
             return Ok(());
         }
-        rho_iroh_auth::ClientAuthResult::Unavailable => anyhow::bail!("daemon cannot accept another enrollment right now"),
+        rho_iroh_auth::ClientAuthResult::Unavailable => {
+            anyhow::bail!("daemon cannot accept another enrollment right now")
+        }
     }
-    let (send, recv) = connection.open_bi().await
+    let (send, recv) = connection
+        .open_bi()
+        .await
         .map_err(|error| anyhow::anyhow!("open stream: {error}"))?;
     conn_log("control stream open; subscribing");
-    send.set_priority(1).map_err(|error| anyhow::anyhow!("set control stream priority: {error}"))?;
+    send.set_priority(1)
+        .map_err(|error| anyhow::anyhow!("set control stream priority: {error}"))?;
     let mut send = rho_rpc::Writer::new(send);
     let mut recv = rho_rpc::Reader::new(recv);
     rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
     spawn_local(async move {
         while let Some(message) = receiver.next().await {
-            if rho_ui_proto::write_frame(&mut send, &message).await.is_err() { break; }
+            if rho_ui_proto::write_frame(&mut send, &message)
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
     });
-    futures::try_join!(read_loop(&events, &mut recv), read_agent_streams(events.clone(), connection))?;
+    futures::try_join!(
+        read_loop(&events, &mut recv),
+        read_agent_streams(events.clone(), connection)
+    )?;
     Ok(())
 }
 
-async fn read_loop(events: &UnboundedSender<Event>, recv: &mut rho_rpc::Reader) -> anyhow::Result<()> {
+async fn read_loop(
+    events: &UnboundedSender<Event>,
+    recv: &mut rho_rpc::Reader,
+) -> anyhow::Result<()> {
     loop {
-        let message = rho_ui_proto::read_frame(recv).await
+        let message = rho_ui_proto::read_frame(recv)
+            .await
             .map_err(|error| anyhow::anyhow!("daemon connection lost: {error}"))?;
         let _ = events.unbounded_send(Event::Message(message));
     }
 }
 
-async fn read_agent_streams(events: UnboundedSender<Event>, connection: iroh::endpoint::Connection) -> anyhow::Result<()> {
+async fn read_agent_streams(
+    events: UnboundedSender<Event>,
+    connection: iroh::endpoint::Connection,
+) -> anyhow::Result<()> {
     const FRAME_BUDGET: usize = 64 * 1024 * 1024;
     let budget = Arc::new(tokio::sync::Semaphore::new(FRAME_BUDGET));
     let generations = Rc::new(RefCell::new(AgentStreamGenerations::default()));
     loop {
-        let recv = connection.accept_uni().await
+        let recv = connection
+            .accept_uni()
+            .await
             .map_err(|error| anyhow::anyhow!("accept agent stream: {error}"))?;
         let events = events.clone();
         let budget = Arc::clone(&budget);
         let generations = Rc::clone(&generations);
         spawn_local(async move {
             if let Err(error) = read_agent_stream(events.clone(), recv, budget, generations).await {
-                let _ = events.unbounded_send(Event::Phase(Phase::Failed(format!("agent stream closed: {error:#}"))));
+                let _ = events.unbounded_send(Event::Phase(Phase::Failed(format!(
+                    "agent stream closed: {error:#}"
+                ))));
             }
         });
     }
 }
 
-async fn read_agent_stream(events: UnboundedSender<Event>, recv: iroh::endpoint::RecvStream, budget: Arc<tokio::sync::Semaphore>, generations: Rc<RefCell<AgentStreamGenerations>>) -> anyhow::Result<()> {
+async fn read_agent_stream(
+    events: UnboundedSender<Event>,
+    recv: iroh::endpoint::RecvStream,
+    budget: Arc<tokio::sync::Semaphore>,
+    generations: Rc<RefCell<AgentStreamGenerations>>,
+) -> anyhow::Result<()> {
     let mut recv = rho_rpc::Reader::new(recv);
-    let header = read_budgeted(&mut recv, &budget).await?
+    let header = read_budgeted(&mut recv, &budget)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("agent stream closed before its header"))?;
-    let ServerMessage::AgentStreamOpened { agent_id } = header else { anyhow::bail!("invalid agent stream header") };
+    let ServerMessage::AgentStreamOpened { agent_id } = header else {
+        anyhow::bail!("invalid agent stream header")
+    };
     let generation = generations.borrow_mut().open(agent_id);
     loop {
-        let Some(message) = read_budgeted(&mut recv, &budget).await? else { return Ok(()) };
-        let ServerMessage::Agent { agent_id: frame_agent_id, .. } = &message else { anyhow::bail!("invalid message on agent stream") };
+        let Some(message) = read_budgeted(&mut recv, &budget).await? else {
+            return Ok(());
+        };
+        let ServerMessage::Agent {
+            agent_id: frame_agent_id,
+            ..
+        } = &message
+        else {
+            anyhow::bail!("invalid message on agent stream")
+        };
         anyhow::ensure!(*frame_agent_id == agent_id, "agent stream id changed");
         if generations.borrow().is_current(agent_id, generation) {
             let _ = events.unbounded_send(Event::Message(message));
@@ -176,8 +243,15 @@ async fn read_agent_stream(events: UnboundedSender<Event>, recv: iroh::endpoint:
     }
 }
 
-async fn read_budgeted(recv: &mut rho_rpc::Reader, budget: &Arc<tokio::sync::Semaphore>) -> anyhow::Result<Option<ServerMessage>> {
-    let message = rho_rpc::read_frame_allocated_optional(recv, rho_ui_proto::MAX_FRAME_LEN, |len| Arc::clone(budget).acquire_many_owned(len as u32)).await?;
+async fn read_budgeted(
+    recv: &mut rho_rpc::Reader,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> anyhow::Result<Option<ServerMessage>> {
+    let message =
+        rho_rpc::read_frame_allocated_optional(recv, rho_ui_proto::MAX_FRAME_LEN, |len| {
+            Arc::clone(budget).acquire_many_owned(len as u32)
+        })
+        .await?;
     Ok(message.map(|(message, _allocation, _)| message))
 }
 
