@@ -2,7 +2,7 @@
 
 use editor::Editor;
 use editor::display_map::{Block, DisplayRow};
-use gpui::{App, Entity, Focusable as _, TestAppContext, WindowHandle};
+use gpui::{App, AppContext as _, Entity, Focusable as _, TestAppContext, WindowHandle};
 use rho_core::UnixMs;
 use rho_ui_proto::remote::{
     AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlock, UiBlockDiff, UiBlockUpdate,
@@ -435,6 +435,10 @@ fn feed_frames(
             workspace.handle_events(events, window, cx);
         })
         .expect("update workspace");
+    cx.update_window((*workspace).into(), |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .expect("flush queued frames");
     cx.run_until_parked();
 }
 

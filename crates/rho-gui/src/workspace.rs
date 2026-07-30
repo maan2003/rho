@@ -24,7 +24,7 @@ use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
 use crate::chime::Chime;
-use crate::connection::{ConnEvent, Connection, GitApprovalDecision};
+use crate::connection::{AgentFrameAllocation, ConnEvent, Connection, GitApprovalDecision};
 use crate::draft_view::DraftModel;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
@@ -134,6 +134,11 @@ pub struct Workspace {
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
+    /// Agent frames accumulated since the last draw. Applying a streaming
+    /// update immediately can monopolize the foreground thread, preventing
+    /// both a draw and input dispatch when several agents are active.
+    pending_frames: Vec<PendingAgentFrame>,
+    frame_flush_scheduled: bool,
     draft_model: Entity<DraftModel>,
     /// Registered workdirs from the daemon; selection vocabulary for new
     /// agents.
@@ -206,6 +211,14 @@ pub struct Workspace {
     iris_context_agent: Arc<Mutex<Option<AgentId>>>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
+}
+
+struct PendingAgentFrame {
+    agent_id: AgentId,
+    frame: rho_ui_proto::remote::AgentRemoteFrame,
+    /// Keeps the connection's decode-budget reservation until the frame is
+    /// applied, preserving transport backpressure while it waits for a draw.
+    allocation: Option<AgentFrameAllocation>,
 }
 
 enum ConnectionStatus {
@@ -346,6 +359,8 @@ impl Workspace {
             remote_projects: HashMap::new(),
             pending_diff_loads: HashMap::new(),
             pending_syncs: HashMap::new(),
+            pending_frames: Vec::new(),
+            frame_flush_scheduled: false,
             draft_model,
             workdirs: Vec::new(),
             draft_workstream: None,
@@ -437,30 +452,63 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut frames = Vec::new();
-        let mut allocations = Vec::new();
         for event in events {
             match event {
                 ConnEvent::Frame {
                     agent_id,
                     frame,
                     allocation,
-                } => {
-                    frames.push((agent_id, frame));
-                    allocations.push(allocation);
-                }
+                } => self.queue_frame(agent_id, frame, allocation, window, cx),
                 event => {
-                    if !frames.is_empty() {
-                        self.handle_frame_batch(std::mem::take(&mut frames), window, cx);
-                        allocations.clear();
-                    }
+                    // Preserve protocol order: a control event always sees
+                    // all preceding agent state before it is handled.
+                    self.flush_pending_frames(window, cx);
                     self.handle_event(event, window, cx);
                 }
             }
         }
-        if !frames.is_empty() {
-            self.handle_frame_batch(frames, window, cx);
+    }
+
+    fn queue_frame(
+        &mut self,
+        agent_id: AgentId,
+        frame: rho_ui_proto::remote::AgentRemoteFrame,
+        allocation: Option<AgentFrameAllocation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_frames.push(PendingAgentFrame {
+            agent_id,
+            frame,
+            allocation,
+        });
+        if self.frame_flush_scheduled {
+            return;
         }
+        self.frame_flush_scheduled = true;
+        cx.on_next_frame(window, |this, window, cx| {
+            this.frame_flush_scheduled = false;
+            this.flush_pending_frames(window, cx);
+        });
+        // `on_next_frame` attaches to a draw; make sure an otherwise idle
+        // window gets one to consume the queued transport state.
+        cx.notify();
+    }
+
+    fn flush_pending_frames(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_frames.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_frames);
+        let mut allocations = Vec::with_capacity(pending.len());
+        let frames = pending
+            .into_iter()
+            .map(|frame| {
+                allocations.push(frame.allocation);
+                (frame.agent_id, frame.frame)
+            })
+            .collect();
+        self.handle_frame_batch(frames, window, cx);
         drop(allocations);
     }
 
