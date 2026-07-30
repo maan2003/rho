@@ -112,6 +112,7 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 
 [dev-dependencies]
 backtrace = "0.3"
+editor = { path = "../../vendor/zed/crates/editor", features = ["wrap-test-support"] }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["test-support"] }
 libc = "0.2"
 

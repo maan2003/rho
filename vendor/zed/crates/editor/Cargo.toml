@@ -34,7 +34,9 @@ native = [
     "dep:telemetry",
     "dep:workspace",
 ]
+wrap-test-support = []
 test-support = [
+    "wrap-test-support",
     "text/test-support",
     "language/test-support",
     "gpui/test-support",

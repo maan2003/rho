@@ -92,6 +92,10 @@ pub use fold_map::{
 };
 pub use inlay_map::{InlayOffset, InlayPoint};
 pub use invisibles::{is_invisible, replacement};
+#[cfg(feature = "wrap-test-support")]
+pub use tab_map::TabEdit;
+#[cfg(feature = "wrap-test-support")]
+pub use wrap_map::WrapSyncTrace;
 pub use wrap_map::{WrapPoint, WrapRow, WrapSnapshot};
 
 use collections::{HashMap, HashSet, IndexSet};
@@ -372,6 +376,21 @@ pub struct SemanticTokenHighlight {
 }
 
 impl DisplayMap {
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_wrap_sync_traces(&mut self, cx: &mut Context<Self>) -> Vec<WrapSyncTrace> {
+        self.wrap_map
+            .update(cx, |wrap_map, _| wrap_map.take_sync_traces())
+    }
+
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_wrap_width_changes(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<(Option<Pixels>, Option<Pixels>)> {
+        self.wrap_map
+            .update(cx, |wrap_map, _| wrap_map.take_wrap_width_changes())
+    }
+
     pub fn new(
         buffer: Entity<MultiBuffer>,
         font: Font,

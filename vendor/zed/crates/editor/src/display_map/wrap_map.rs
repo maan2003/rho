@@ -45,6 +45,18 @@ pub struct WrapMap {
     background_task: Option<Task<()>>,
     font_with_size: (Font, Pixels),
     row_scales: RowScaleSnapshot,
+    #[cfg(feature = "wrap-test-support")]
+    sync_traces: Vec<WrapSyncTrace>,
+    #[cfg(feature = "wrap-test-support")]
+    wrap_width_changes: Vec<(Option<Pixels>, Option<Pixels>)>,
+}
+
+#[cfg(feature = "wrap-test-support")]
+#[derive(Clone, Debug)]
+pub struct WrapSyncTrace {
+    pub input: Vec<TabEdit>,
+    pub output: Vec<WrapEdit>,
+    pub old_input_row_start: WrapRow,
 }
 
 #[derive(Clone)]
@@ -138,6 +150,10 @@ impl WrapMap {
                 snapshot: WrapSnapshot::new(tab_snapshot),
                 background_task: None,
                 row_scales,
+                #[cfg(feature = "wrap-test-support")]
+                sync_traces: Vec::new(),
+                #[cfg(feature = "wrap-test-support")]
+                wrap_width_changes: Vec::new(),
             };
             this.set_wrap_width(wrap_width, cx);
             mem::take(&mut this.edits_since_sync);
@@ -159,6 +175,14 @@ impl WrapMap {
         edits: Vec<TabEdit>,
         cx: &mut Context<Self>,
     ) -> (WrapSnapshot, WrapPatch) {
+        #[cfg(feature = "wrap-test-support")]
+        let input_edits = edits.clone();
+        #[cfg(feature = "wrap-test-support")]
+        let old_input_row_start = input_edits.first().map(|edit| {
+            self.snapshot
+                .tab_point_to_wrap_point(TabPoint::new(edit.old.start.row(), 0))
+                .row()
+        });
         if self.wrap_width.is_some() {
             self.pending_edits
                 .push_back((tab_snapshot, self.row_scales.clone(), edits));
@@ -170,7 +194,26 @@ impl WrapMap {
             self.snapshot.interpolated = false;
         }
 
-        (self.snapshot.clone(), mem::take(&mut self.edits_since_sync))
+        let output_edits = mem::take(&mut self.edits_since_sync);
+        #[cfg(feature = "wrap-test-support")]
+        if !input_edits.is_empty() {
+            self.sync_traces.push(WrapSyncTrace {
+                input: input_edits,
+                output: output_edits.edits().to_vec(),
+                old_input_row_start: old_input_row_start.unwrap(),
+            });
+        }
+        (self.snapshot.clone(), output_edits)
+    }
+
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_sync_traces(&mut self) -> Vec<WrapSyncTrace> {
+        mem::take(&mut self.sync_traces)
+    }
+
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_wrap_width_changes(&mut self) -> Vec<(Option<Pixels>, Option<Pixels>)> {
+        mem::take(&mut self.wrap_width_changes)
     }
 
     #[ztracing::instrument(skip_all)]
@@ -208,6 +251,8 @@ impl WrapMap {
             return false;
         }
 
+        #[cfg(feature = "wrap-test-support")]
+        self.wrap_width_changes.push((self.wrap_width, wrap_width));
         self.wrap_width = wrap_width;
         self.rewrap(cx);
         true
@@ -744,9 +789,11 @@ impl WrapSnapshot {
         let mut old_cursor = self.transforms.cursor::<TransformSummary>(());
         let mut new_cursor = new_snapshot.transforms.cursor::<TransformSummary>(());
         for mut tab_edit in tab_edits.iter().cloned() {
-            tab_edit.old.start.0.column = 0;
+            // Wrapping can change from the visual row containing the edit
+            // through the end of its physical row. Keep the precise start so
+            // unchanged visual rows earlier on a long physical row are not
+            // reported as replaced.
             tab_edit.old.end.0 += Point::new(1, 0);
-            tab_edit.new.start.0.column = 0;
             tab_edit.new.end.0 += Point::new(1, 0);
 
             old_cursor.seek(&tab_edit.old.start, Bias::Right);

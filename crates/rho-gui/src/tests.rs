@@ -1303,6 +1303,298 @@ fn queued_streaming_updates_to_one_block_render_once_to_final_state(cx: &mut Tes
 }
 
 #[gpui::test]
+fn streaming_suffix_only_reaches_wrap_map_as_the_tail_row(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let mut original = (0..160)
+        .map(|row| format!("streamed response row {row}: **settled markdown** stays concealed"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    original.push('\n');
+    original.push_str(&"one long streamed markdown paragraph ".repeat(300));
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("write a long response")],
+            vec![assistant(&original, Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.display_map.update(cx, |map, cx| {
+                    map.snapshot(cx);
+                    map.take_wrap_sync_traces(cx);
+                    map.take_wrap_width_changes(cx);
+                });
+            });
+        })
+        .expect("clear initial wrap edits");
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 1,
+                    block: UiBlockDiff::AssistantText(UiTextDiff {
+                        keep_bytes: original.len(),
+                        value: " appended suffix".to_owned(),
+                    }),
+                }],
+            },
+            status: None,
+            context_used: None,
+            usage: None,
+        },
+    );
+
+    let (batches, width_changes) = workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.display_map.update(cx, |map, cx| {
+                    map.snapshot(cx);
+                    (
+                        map.take_wrap_sync_traces(cx),
+                        map.take_wrap_width_changes(cx),
+                    )
+                })
+            })
+        })
+        .expect("read wrap edits");
+    assert_incremental_wrap(&batches, &width_changes, 160, 1);
+
+    let first_suffix = " first";
+    let second_suffix = " second";
+    feed_frames(
+        &workspace,
+        cx,
+        [
+            (
+                agent(1),
+                AgentRemoteFrame::Diff {
+                    blocks: UiBlocksDiff {
+                        truncate_to: None,
+                        updates: vec![UiBlockUpdate {
+                            index: 1,
+                            block: UiBlockDiff::AssistantText(UiTextDiff {
+                                keep_bytes: original.len() + " appended suffix".len(),
+                                value: first_suffix.to_owned(),
+                            }),
+                        }],
+                    },
+                    status: None,
+                    context_used: None,
+                    usage: None,
+                },
+            ),
+            (
+                agent(1),
+                AgentRemoteFrame::Diff {
+                    blocks: UiBlocksDiff {
+                        truncate_to: None,
+                        updates: vec![UiBlockUpdate {
+                            index: 1,
+                            block: UiBlockDiff::AssistantText(UiTextDiff {
+                                keep_bytes: original.len()
+                                    + " appended suffix".len()
+                                    + first_suffix.len(),
+                                value: second_suffix.to_owned(),
+                            }),
+                        }],
+                    },
+                    status: None,
+                    context_used: None,
+                    usage: None,
+                },
+            ),
+        ],
+    );
+    let (batches, width_changes) = workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.display_map.update(cx, |map, cx| {
+                    map.snapshot(cx);
+                    (
+                        map.take_wrap_sync_traces(cx),
+                        map.take_wrap_width_changes(cx),
+                    )
+                })
+            })
+        })
+        .expect("read coalesced wrap edits");
+    assert_incremental_wrap(&batches, &width_changes, 160, 1);
+}
+
+fn assert_incremental_wrap(
+    traces: &[editor::display_map::WrapSyncTrace],
+    width_changes: &[(Option<gpui::Pixels>, Option<gpui::Pixels>)],
+    first_changed_row: u32,
+    expected_input_edits: usize,
+) {
+    assert!(
+        width_changes.is_empty(),
+        "streaming changed the editor wrap width: {width_changes:?}"
+    );
+    assert!(!traces.is_empty(), "the streamed append must reach WrapMap");
+    let edits = traces
+        .iter()
+        .flat_map(|trace| &trace.input)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        edits.len(),
+        expected_input_edits,
+        "unexpected wrap input edits: {traces:#?}"
+    );
+    assert!(
+        edits.iter().all(|edit| {
+            edit.old.start.row() >= first_changed_row
+                && edit.old.start.row() == edit.old.end.row()
+                && edit.new.start.row() == edit.new.end.row()
+        }),
+        "streaming invalidated unchanged physical rows: {traces:#?}"
+    );
+    assert!(
+        traces.iter().all(|trace| {
+            trace
+                .output
+                .iter()
+                .all(|edit| edit.old.start >= trace.old_input_row_start)
+        }),
+        "WrapMap invalidated display rows before its input row: {traces:#?}"
+    );
+    assert!(
+        traces.iter().flat_map(|trace| &trace.output).all(|edit| {
+            edit.old.end.0.saturating_sub(edit.old.start.0) <= 1
+                && edit.new.end.0.saturating_sub(edit.new.start.0) <= 1
+        }),
+        "a streamed tail append replaced unchanged wrapped rows: {traces:#?}"
+    );
+}
+
+/// Manual end-to-end benchmark for the path guarded above. It intentionally
+/// uses protocol diffs and the production workspace/transcript/editor stack;
+/// run with:
+///
+/// ```text
+/// cargo test --release -p rho-gui --bin rho-gui \
+///     benchmark_streaming_suffix_wrap_pipeline -- --ignored --nocapture
+/// ```
+#[gpui::test]
+#[ignore = "manual streaming benchmark"]
+fn benchmark_streaming_suffix_wrap_pipeline(cx: &mut TestAppContext) {
+    const APPENDS: usize = 50;
+    let workspace = test_workspace(cx);
+    let mut streamed = "one long streamed markdown paragraph ".repeat(2_000);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("write a long response")],
+            vec![assistant(&streamed, Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.display_map.update(cx, |map, cx| {
+                    map.snapshot(cx);
+                    map.take_wrap_sync_traces(cx);
+                    map.take_wrap_width_changes(cx);
+                });
+            });
+        })
+        .expect("clear initial wrap edits");
+
+    let started = std::time::Instant::now();
+    for _ in 0..APPENDS {
+        let keep_bytes = streamed.len();
+        let suffix = " next";
+        feed_frame(
+            &workspace,
+            cx,
+            agent(1),
+            AgentRemoteFrame::Diff {
+                blocks: UiBlocksDiff {
+                    truncate_to: None,
+                    updates: vec![UiBlockUpdate {
+                        index: 1,
+                        block: UiBlockDiff::AssistantText(UiTextDiff {
+                            keep_bytes,
+                            value: suffix.to_owned(),
+                        }),
+                    }],
+                },
+                status: None,
+                context_used: None,
+                usage: None,
+            },
+        );
+        streamed.push_str(suffix);
+    }
+    let elapsed = started.elapsed();
+
+    let (batches, width_changes) = workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.display_map.update(cx, |map, cx| {
+                    map.snapshot(cx);
+                    (
+                        map.take_wrap_sync_traces(cx),
+                        map.take_wrap_width_changes(cx),
+                    )
+                })
+            })
+        })
+        .expect("read benchmark wrap edits");
+    assert!(
+        width_changes.is_empty(),
+        "streaming changed wrap width: {width_changes:?}"
+    );
+    let edit_count = batches.iter().map(|trace| trace.input.len()).sum::<usize>();
+    assert_eq!(edit_count, APPENDS, "unexpected wrap edits: {batches:#?}");
+    assert!(batches.iter().flat_map(|trace| &trace.input).all(|edit| {
+        edit.old.start.row() == edit.old.end.row() && edit.new.start.row() == edit.new.end.row()
+    }));
+    let output_rows = batches
+        .iter()
+        .flat_map(|trace| &trace.output)
+        .map(|edit| edit.old.end.0.saturating_sub(edit.old.start.0))
+        .collect::<Vec<_>>();
+    let output_rows_total = output_rows.iter().copied().map(u64::from).sum::<u64>();
+    let output_rows_min = output_rows.iter().copied().min().unwrap_or(0);
+    let output_rows_max = output_rows.iter().copied().max().unwrap_or(0);
+    let output_patch_starts_at_physical_row = batches.iter().all(|trace| {
+        trace
+            .output
+            .iter()
+            .all(|edit| edit.old.start == trace.old_input_row_start)
+    });
+    eprintln!(
+        "streaming_wrap_pipeline bytes={} appends={} input_edits={} output_patches={} output_rows_mean={:.1} output_rows_min={} output_rows_max={} output_starts_at_physical_row={} wrap_width_changes={} total={elapsed:?} per_append={:?}",
+        streamed.len(),
+        APPENDS,
+        edit_count,
+        output_rows.len(),
+        output_rows_total as f64 / output_rows.len().max(1) as f64,
+        output_rows_min,
+        output_rows_max,
+        output_patch_starts_at_physical_row,
+        width_changes.len(),
+        elapsed / APPENDS as u32,
+    );
+}
+
+#[gpui::test]
 fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
